@@ -1,0 +1,30 @@
+[package]
+name = "corro-consul"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "corro-consul"
+path = "src/main.rs"
+
+[dependencies]
+consul = { path = "../consul" }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+serde = { workspace = true }
+seahash = "4.1.0"
+eyre = { workspace = true }
+hyper = { workspace = true }
+corro-types = { path = "../corro-types" }
+serde_json = { workspace = true }
+clap = "*"
+camino = { workspace = true }
+config = { workspace = true }
+bb8-rusqlite = { workspace = true }
+bb8 = { workspace = true }
+rusqlite = { workspace = true }
+tripwire = { path = "../tripwire" }
+spawn = { path = "../spawn" }
+hostname = { workspace = true }
