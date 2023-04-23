@@ -60,11 +60,11 @@ tower = { version = "0.4.13", features = ["limit", "load-shed", "buffer"] }
 tower-http = { version = "0.4.0", features = ["trace"] }
 trust-dns-resolver = "0.22.0"
 spawn = { path = "../spawn" }
-rangemap = "1.3.0"
+rangemap = { version = "1.3.0" }
 corro-types = { path = "../corro-types" }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio-postgres = { workspace = true }
 
 # [patch.crates-io]

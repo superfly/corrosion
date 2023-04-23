@@ -6,11 +6,12 @@ use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, ToSql};
 use serde_json::Value;
 use tokio::{sync::mpsc::Sender, task::block_in_place};
-use tracing::error;
+use tracing::{error, trace};
 
 use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, Message, MessageV1},
+    handle_inner_change,
     types::change::Change,
     Bookie, SqlitePool,
 };
@@ -33,6 +34,7 @@ pub async fn api_v1_db_execute(
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
 ) -> (StatusCode, axum::Json<RqliteResponse>) {
     let res: Result<_, rusqlite::Error> = {
+        trace!("getting conn...");
         let mut conn = match rw_pool.get().await {
             Ok(conn) => conn,
             Err(e) => {
@@ -49,6 +51,7 @@ pub async fn api_v1_db_execute(
                 );
             }
         };
+        trace!("got conn");
 
         let start = Instant::now();
         block_in_place(move || {
@@ -67,32 +70,27 @@ pub async fn api_v1_db_execute(
 
                             let first = params.next();
                             match first.as_ref().and_then(|q| q.as_str()) {
-                                Some(q) => {
-                                    println!("got q: {q}");
-                                    tx.execute(
-                                        &q,
-                                        params_from_iter(params.map(|v| match v {
-                                            Value::Null => rusqlite::types::Value::Null,
-                                            Value::Bool(b) => {
-                                                rusqlite::types::Value::Text(b.to_string())
-                                            }
-                                            Value::Number(n) => match (n.as_i64(), n.as_f64()) {
-                                                (Some(n), None) => {
-                                                    rusqlite::types::Value::Integer(n)
-                                                }
-                                                (None, Some(f)) => rusqlite::types::Value::Real(f),
-                                                _ => rusqlite::types::Value::Text(n.to_string()),
-                                            },
-                                            Value::String(s) => rusqlite::types::Value::Text(s),
-                                            Value::Array(a) => {
-                                                serde_json::to_string(&a).unwrap().into()
-                                            }
-                                            Value::Object(o) => {
-                                                serde_json::to_string(&o).unwrap().into()
-                                            }
-                                        })),
-                                    )
-                                }
+                                Some(q) => tx.execute(
+                                    &q,
+                                    params_from_iter(params.map(|v| match v {
+                                        Value::Null => rusqlite::types::Value::Null,
+                                        Value::Bool(b) => {
+                                            rusqlite::types::Value::Text(b.to_string())
+                                        }
+                                        Value::Number(n) => match (n.as_i64(), n.as_f64()) {
+                                            (Some(n), None) => rusqlite::types::Value::Integer(n),
+                                            (None, Some(f)) => rusqlite::types::Value::Real(f),
+                                            _ => rusqlite::types::Value::Text(n.to_string()),
+                                        },
+                                        Value::String(s) => rusqlite::types::Value::Text(s),
+                                        Value::Array(a) => {
+                                            serde_json::to_string(&a).unwrap().into()
+                                        }
+                                        Value::Object(o) => {
+                                            serde_json::to_string(&o).unwrap().into()
+                                        }
+                                    })),
+                                ),
                                 None => return None,
                             }
                         }
@@ -125,8 +123,6 @@ pub async fn api_v1_db_execute(
             let (changes, max_version): (Vec<Change>, i64) = {
                 let mut prepped = tx.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, site_id FROM crsql_changes WHERE site_id IS NULL AND db_version > ?"#)?;
 
-                let mut max_version = previous_end_version;
-
                 let mapped = prepped.query_map([previous_end_version], |row| {
                     let change = Change {
                         table: row.get(0)?,
@@ -137,11 +133,18 @@ pub async fn api_v1_db_execute(
                         db_version: row.get(5)?,
                         site_id: row.get(6)?,
                     };
-                    max_version = cmp::max(max_version, change.db_version);
                     Ok(change)
                 })?;
 
                 let changes = mapped.collect::<Result<Vec<Change>, rusqlite::Error>>()?;
+
+                for change in changes.iter() {
+                    // special value...
+                    handle_inner_change(&tx, change)?;
+                }
+
+                let db_version: i64 =
+                    tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
 
                 // upsert local bookkeeping, the current node has seen all its owns so just update the single row
                 tx.prepare_cached(
@@ -152,9 +155,9 @@ pub async fn api_v1_db_execute(
                             end_version = excluded.end_version;
                 "#,
                 )?
-                .execute(params![actor_id.0, 0, max_version])?;
+                .execute(params![actor_id.0, 0, db_version])?;
 
-                (changes, max_version)
+                (changes, db_version)
             };
 
             let msg = if !changes.is_empty() {
@@ -178,8 +181,6 @@ pub async fn api_v1_db_execute(
             Ok((results, msg, elapsed))
         })
     };
-
-    println!("should've dropped conn...");
 
     let (results, elapsed) = match res {
         Ok((results, msg, elapsed)) => {

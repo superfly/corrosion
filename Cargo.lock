@@ -242,7 +242,7 @@ dependencies = [
 [[package]]
 name = "bb8-rusqlite"
 version = "0.1.0"
-source = "git+https://github.com/jeromegn/bb8-rusqlite?rev=bcd8470#bcd8470363bdddc2c07aadf0a5f292ce1e43d1ef"
+source = "git+https://github.com/jeromegn/bb8-rusqlite?rev=7dec4e0#7dec4e0fea659967e6f90a2c4b871fcb43b9f724"
 dependencies = [
  "async-trait",
  "bb8",

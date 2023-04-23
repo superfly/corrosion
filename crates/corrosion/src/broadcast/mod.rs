@@ -1,4 +1,5 @@
 use std::{
+    cmp, io,
     iter::Peekable,
     net::SocketAddr,
     num::NonZeroU32,
@@ -8,7 +9,7 @@ use std::{
 };
 
 use backoff::Backoff;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use foca::{Foca, Member, NoCustomBroadcast, Notification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
@@ -24,7 +25,7 @@ use tokio::{
     sync::mpsc::{channel, Receiver, Sender},
     time::{interval, MissedTickBehavior},
 };
-use tokio_util::codec::{Encoder, LengthDelimitedCodec};
+use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
@@ -81,9 +82,17 @@ pub enum MessageV1 {
 #[derive(Debug, thiserror::Error)]
 pub enum MessageEncodeError {
     #[error(transparent)]
-    Serialize(#[from] speedy::Error),
+    Encode(#[from] speedy::Error),
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MessageDecodeError {
+    #[error(transparent)]
+    Decode(#[from] speedy::Error),
+    #[error("corrupted message, crc mismatch (got: {0}, expected {1})")]
+    Corrupted(u32, u32),
 }
 
 impl Message {
@@ -93,18 +102,41 @@ impl Message {
 
     pub fn encode(&self, buf: &mut BytesMut) -> Result<(), MessageEncodeError> {
         self.write_to_stream(buf.writer())?;
-        let bytes = buf.split().freeze();
-
+        let mut bytes = buf.split();
         let hash = crc32fast::hash(&bytes);
+        bytes.put_u32(hash);
 
         let mut codec = LengthDelimitedCodec::builder()
             .length_field_type::<u32>()
             .new_codec();
-        codec.encode(bytes, buf)?;
-
-        buf.put_u32(hash);
+        codec.encode(bytes.split().freeze(), buf)?;
 
         Ok(())
+    }
+
+    pub fn from_buf(buf: &mut BytesMut) -> Result<Message, MessageDecodeError> {
+        let len = buf.len();
+        trace!("successfully decoded a frame, len: {len}");
+
+        let mut crc_bytes = buf.split_off(len - 4);
+
+        let crc = crc_bytes.get_u32();
+        let new_crc = crc32fast::hash(&buf);
+        if crc != new_crc {
+            return Err(MessageDecodeError::Corrupted(crc, new_crc));
+        }
+
+        Ok(Message::from_slice(&buf)?)
+    }
+
+    pub fn decode(
+        codec: &mut LengthDelimitedCodec,
+        buf: &mut BytesMut,
+    ) -> eyre::Result<Option<Self>> {
+        Ok(match codec.decode(buf)? {
+            Some(mut buf) => Some(Self::from_buf(&mut buf)?),
+            None => None,
+        })
     }
 }
 
@@ -571,6 +603,9 @@ impl PendingBroadcast {
             max_transmissions /= 2;
         }
 
+        // do at least a few!
+        // max_transmissions = cmp::max(max_transmissions, 20);
+
         Self {
             http,
             payload,
@@ -589,125 +624,6 @@ fn serialize_broadcast<'a>(msg: &Message, buf: &mut BytesMut) -> eyre::Result<By
 
     Ok(buf.split().freeze())
 }
-
-// fn handle_priority_broadcast<
-//     B: BroadcastHandler<Actor, Broadcast = &'static [u8], Error = BroadcastsDisabledError>,
-// >(
-//     msg: &Message,
-//     foca: &Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, B>,
-//     // agent: &Agent,
-//     socket: &Arc<UdpSocket>,
-//     client: &ClientPool,
-//     // sent_at: Instant,
-// ) -> eyre::Result<()> {
-//     // TODO: bring that from upstream to reduce allocs
-//     let mut buf = BytesMut::new();
-//     let serialized = serialize_broadcast(msg, &mut buf)?;
-
-//     let big = serialized.len() > EFFECTIVE_CAP;
-
-//     priority_broadcast_serialized(serialized, foca, socket, client, big);
-
-//     Ok(())
-// }
-
-// fn priority_broadcast_serialized<
-//     B: BroadcastHandler<Actor, Broadcast = &'static [u8], Error = BroadcastsDisabledError>,
-// >(
-//     serialized: Bytes,
-//     _foca: &Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, B>,
-//     // agent: &Agent,
-//     _socket: &Arc<UdpSocket>,
-//     _client: &ClientPool,
-//     http: bool,
-//     // sent_at: Instant,
-// ) {
-//     let cap = if http {
-//         HTTP_BROADCAST_SIZE
-//     } else {
-//         FRAGMENTS_AT
-//     };
-
-//     let mut buf = BytesMut::with_capacity(cap);
-
-//     // // first, send broadcast to subscribing nodes
-//     // for actor in foca.iter_members().map(|member| member.id()) {
-//     //     trace!("checking actor: {actor:?} for priority broadcast");
-//     //     let subs = {
-//     //         let members = agent.0.members.read();
-//     //         let subs = members.subscriptions(&actor.id());
-//     //         // save some time
-//     //         if subs.is_empty() {
-//     //             // trace!("actor {} has no subs", actor.name());
-//     //             continue;
-//     //         }
-
-//     //         if actor.id() == agent.actor_id() {
-//     //             // trace!("actor {} is us!", actor.name());
-//     //             continue;
-//     //         }
-//     //         subs.to_vec()
-//     //     };
-
-//     //     trace!("actor {} has subs!", actor.name());
-
-//     //     let iter = BroadcastIter::new_priority(
-//     //         &mut buf,
-//     //         serialized.iter().filter_map(|(bytes, ctx)| {
-//     //             if actor.region() == agent.region() {
-//     //                 None
-//     //             } else {
-//     //                 let ctx_ref = ctx.as_ref()?;
-//     //                 subs.iter().find_map(|filter| {
-//     //                     match_expr(filter.input(), filter.expr(), ctx_ref).then_some(bytes)
-//     //                 })
-//     //             }
-//     //         }),
-//     //         cap,
-//     //     );
-
-//     //     debug!(
-//     //         "priority broadcasting a matching broadcast to {}",
-//     //         actor.name()
-//     //     );
-//     //     if http {
-//     //         let chunks: Vec<Bytes> = iter.collect();
-//     //         counter!("corrosion.broadcast.send.count", chunks.len() as u64, "reason" => "subscription", "target" => actor.name().to_string());
-//     //         streaming_http_broadcast(chunks, client, actor.addr(), agent.clock());
-//     //     } else {
-//     //         for bytes in iter {
-//     //             increment_counter!("corrosion.broadcast.send.count", "reason" => "subscription", "target" => actor.name().to_string());
-//     //             single_broadcast(bytes, socket.clone(), actor.addr());
-//     //         }
-//     //     }
-//     // }
-
-//     // // send everything to all regional members
-//     // let regional: Vec<&Actor> = foca
-//     //     .iter_members()
-//     //     .map(|member| member.id())
-//     //     .filter(|actor| actor.id() != agent.actor_id())
-//     //     .filter(|actor| actor.region() == agent.region())
-//     //     .collect();
-
-//     let iter = BroadcastIter::new_priority(&mut buf, vec![serialized].iter(), cap);
-
-//     // if http {
-//     //     let chunks: Vec<Bytes> = iter.collect();
-//     //     for actor in regional.iter() {
-//     //         counter!("corrosion.broadcast.send.count", chunks.len() as u64, "reason" => "region", "target" => actor.name().to_string());
-//     //         streaming_http_broadcast(chunks.clone(), client, actor.addr(), agent.clock());
-//     //     }
-//     // } else {
-//     //     for bytes in iter {
-//     //         for actor in regional.iter() {
-//     //             increment_counter!("corrosion.broadcast.send.count", "reason" => "region", "target" => actor.name().to_string());
-//     //             single_broadcast(bytes.clone(), socket.clone(), actor.addr());
-//     //         }
-//     //     }
-//     // }
-//     // histogram!("corrosion.payload.send.lag.seconds", sent_at.elapsed().as_secs_f64(), "priority" => "high");
-// }
 
 pub struct BroadcastIter<'b, I: Iterator<Item = &'b Bytes>> {
     buf: &'b mut BytesMut,
@@ -787,41 +703,6 @@ fn single_broadcast(payload: Bytes, socket: Arc<UdpSocket>, addr: SocketAddr) {
         }
     });
 }
-
-// fn streaming_http_broadcast(
-//     chunks: Vec<Bytes>,
-//     client: &ClientPool,
-//     addr: SocketAddr,
-//     clock: &uhlc::HLC,
-// ) {
-//     let start = Instant::now();
-//     debug!(
-//         "streaming http broadcast, first bytes: {:?}",
-//         chunks.iter().map(|chunk| chunk[0]).collect::<Vec<u8>>()
-//     );
-
-//     let req = client.request(http_broadcast_request(
-//         addr,
-//         clock,
-//         hyper::Body::wrap_stream(futures::StreamExt::inspect(
-//             futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>)),
-//             |r| {
-//                 if let Ok(b) = r {
-//                     histogram!("corrosion.broadcast.sent.bytes", b.len() as f64, "transport" => "http-stream");
-//                 }
-//             },
-//         )),
-//     ));
-
-//     tokio::spawn(async move {
-//         match req.await {
-//             Ok(res) => {
-//                 histogram!("corrosion.gossip.broadcast.response.time.seconds", start.elapsed().as_secs_f64(), "status" => res.status().to_string(), "kind" => "streaming");
-//             }
-//             Err(e) => error!("error sending priority broadcast (streaming): {e}"),
-//         }
-//     });
-// }
 
 fn single_http_broadcast(payload: Bytes, client: &ClientPool, addr: SocketAddr, clock: &uhlc::HLC) {
     let start = Instant::now();

@@ -11,10 +11,10 @@ pub mod types;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    error::Error,
     fmt,
     fs::DirEntry,
     io::{self, Read, Write},
-    mem::size_of,
     net::SocketAddr,
     ops::RangeInclusive,
     path::Path,
@@ -24,7 +24,10 @@ use std::{
 
 use crate::{
     actor::Actor,
-    api::{http::api_v1_db_execute, peer::peer_api_v1_broadcast},
+    api::{
+        http::api_v1_db_execute,
+        peer::{peer_api_v1_broadcast, peer_api_v1_sync_post},
+    },
     broadcast::{runtime_loop, MessageV1},
     config::DEFAULT_GOSSIP_PORT,
     sqlite::{init_cr_conn, CrConn},
@@ -33,19 +36,22 @@ use crate::{
 
 use self::config::Config;
 use actor::ActorId;
+use api::peer::{generate_sync, SyncMessage};
 use axum::{
     error_handling::HandleErrorLayer, extract::DefaultBodyLimit, routing::post, BoxError,
     Extension, Router,
 };
-use broadcast::{BroadcastInput, BroadcastSrc, FocaInput, Message, FRAGMENTS_AT};
+use broadcast::{
+    BroadcastInput, BroadcastSrc, ClientPool, FocaInput, Message, MessageDecodeError, FRAGMENTS_AT,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use consul::Client as ConsulClient;
 use fallible_iterator::FallibleIterator;
 use foca::Notification;
-use futures::{FutureExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
-use metrics::{counter, histogram, increment_counter};
-use parking_lot::RwLock;
+use metrics::{counter, gauge, histogram, increment_counter};
+use parking_lot::{RwLock, RwLockReadGuard};
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
@@ -62,7 +68,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tokio_util::codec::{Decoder, LengthDelimitedCodec};
+use tokio_util::{codec::LengthDelimitedCodec, io::StreamReader};
 use tower::{buffer::BufferLayer, limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
@@ -71,11 +77,10 @@ use trust_dns_resolver::{
     error::ResolveErrorKind,
     proto::rr::{RData, RecordType},
 };
-use types::agent::Agent;
+use types::{agent::Agent, change::Change};
 use uuid::Uuid;
 
-// const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
-// const CONSUL_PULL_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
 // const GOSSIP_HANDLE_THRESHOLD: Duration = Duration::from_secs(4);
 
@@ -85,36 +90,59 @@ async fn main() -> eyre::Result<()> {
 }
 
 #[derive(Default, Clone)]
-pub struct Bookie(Arc<RwLock<HashMap<ActorId, Arc<RwLock<RangeInclusiveSet<i64>>>>>>);
+pub struct Booked(Arc<RwLock<RangeInclusiveSet<i64>>>);
+
+impl Booked {
+    pub fn insert(&self, start: i64, end: i64) {
+        self.0.write().insert(start..=end);
+    }
+
+    pub fn contains(&self, version: i64) -> bool {
+        self.0.read().contains(&version)
+    }
+
+    pub fn contains_range(&self, mut range: RangeInclusive<i64>) -> bool {
+        let r = self.0.read();
+        range.all(|v| r.contains(&v))
+    }
+
+    pub fn last(&self) -> Option<i64> {
+        self.0.read().iter().map(|range| range.end()).max().copied()
+    }
+
+    pub fn read(&self) -> RwLockReadGuard<RangeInclusiveSet<i64>> {
+        self.0.read()
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct Bookie(Arc<RwLock<HashMap<ActorId, Booked>>>);
 
 impl Bookie {
     pub fn add(&self, actor_id: ActorId, start: i64, end: i64) {
         if let Some(booked) = { self.0.read().get(&actor_id).cloned() } {
-            booked.write().insert(start..=end);
+            booked.insert(start, end);
             return;
         }
         let mut w = self.0.write();
         let booked = w.entry(actor_id).or_default();
-        booked.write().insert(start..=end);
+        booked.insert(start, end);
     }
 
     pub fn contains(&self, actor_id: ActorId, version: i64) -> bool {
         self.0
             .read()
             .get(&actor_id)
-            .map(|booked| booked.read().contains(&version))
+            .map(|booked| booked.contains(version))
             .unwrap_or(false)
     }
 
     // check if a whole range is fully contained in bookkeeping
-    pub fn contains_range(&self, actor_id: ActorId, mut range: RangeInclusive<i64>) -> bool {
+    pub fn contains_range(&self, actor_id: ActorId, range: RangeInclusive<i64>) -> bool {
         let booked = self.0.read().get(&actor_id).cloned();
 
         booked
-            .map(|booked| {
-                let r = booked.read();
-                range.all(|v| r.contains(&v))
-            })
+            .map(|booked| booked.contains_range(range))
             .unwrap_or(false)
     }
 
@@ -122,7 +150,11 @@ impl Bookie {
         self.0
             .read()
             .get(&actor_id)
-            .and_then(|booked| booked.read().iter().map(|range| range.end()).max().copied())
+            .and_then(|booked| booked.last())
+    }
+
+    pub fn read(&self) -> RwLockReadGuard<HashMap<ActorId, Booked>> {
+        self.0.read()
     }
 }
 
@@ -138,6 +170,7 @@ pub struct AgentOptions {
 
 pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, AgentOptions)> {
     debug!("setting up corrosion @ {}", conf.base_path);
+
     let state_path = conf.base_path.join("state");
     if !state_path.exists() {
         std::fs::create_dir_all(&state_path)?;
@@ -212,7 +245,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         .max_size(5)
         .min_idle(Some(1))
         .max_lifetime(Some(Duration::from_secs(30)))
-        .build_unchecked(CrConnManager::new(&state_db_path));
+        .build_unchecked(CrConnManager::new_read_only(&state_db_path));
     debug!("built RO pool");
 
     let mut bk: HashMap<ActorId, RangeInclusiveSet<i64>> = HashMap::new();
@@ -238,7 +271,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let bookie = Bookie(Arc::new(RwLock::new(
         bk.into_iter()
-            .map(|(k, v)| (k, Arc::new(RwLock::new(v))))
+            .map(|(k, v)| (k, Booked(Arc::new(RwLock::new(v)))))
             .collect(),
     )));
 
@@ -340,19 +373,19 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     );
 
     let peer_api = Router::new()
-        // .route(
-        //     "/v1/sync",
-        //     post(peer_api_v1_sync_post).route_layer(
-        //         tower::ServiceBuilder::new()
-        //             .layer(HandleErrorLayer::new(|_error: BoxError| async {
-        //                 increment_counter!("corrosion.api.peer.shed.count", "route" => "POST /v1/sync");
-        //                 Ok::<_, Infallible>((StatusCode::SERVICE_UNAVAILABLE, "sync has reached its concurrency limit".to_string()))
-        //             }))
-        //             // only allow 2 syncs at the same time...
-        //             .layer(LoadShedLayer::new())
-        //             .layer(ConcurrencyLimitLayer::new(3)),
-        //     ),
-        // )
+        .route(
+            "/v1/sync",
+            post(peer_api_v1_sync_post).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        increment_counter!("corrosion.api.peer.shed.count", "route" => "POST /v1/sync");
+                        Ok::<_, Infallible>((StatusCode::SERVICE_UNAVAILABLE, "sync has reached its concurrency limit".to_string()))
+                    }))
+                    // only allow 2 syncs at the same time...
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(3)),
+            ),
+        )
         .route(
             "/v1/broadcast",
             post(peer_api_v1_broadcast).route_layer(
@@ -370,6 +403,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             tower::ServiceBuilder::new()
                 .layer(Extension(actor_id))
                 .layer(Extension(foca_tx.clone()))
+                .layer(Extension(agent.read_only_pool().clone()))
                 .layer(Extension(agent.tx_bcast().clone()))
                 .layer(Extension(agent.bookie().clone()))
                 .layer(Extension(bcast_msg_tx.clone()))
@@ -505,7 +539,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         );
     }
 
-    // TODO: consul loop
+    spawn_counted(
+        sync_loop(agent.clone(), client.clone(), tripwire.clone())
+            .inspect(|_| info!("corrosion agent sync loop is done")),
+    );
 
     // let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
@@ -560,7 +597,7 @@ async fn handle_gossip_to_send(socket: Arc<UdpSocket>, mut to_send_rx: Receiver<
     let mut buf = BytesMut::with_capacity(FRAGMENTS_AT);
 
     while let Some((actor, payload)) = to_send_rx.recv().await {
-        debug!("got gossip to send to {actor:?}");
+        trace!("got gossip to send to {actor:?}");
         let addr = actor.addr();
         buf.put_u8(0);
         buf.put_slice(&payload);
@@ -601,52 +638,9 @@ async fn handle_gossip(
     let mut rebroadcast = vec![];
 
     for msg in messages {
-        match msg {
-            Message::V1(MessageV1::Change {
-                actor_id,
-                start_version,
-                end_version,
-                ref changeset,
-            }) => {
-                if bookie.contains_range(actor_id, start_version..=end_version) {
-                    trace!("already seen this one!");
-                    continue;
-                }
-                let mut conn = agent.read_write_pool().get().await?;
-
-                block_in_place(move || {
-                    let tx = conn.transaction()?;
-
-                    for change in changeset.iter() {
-                        tx.execute(
-                            r#"
-                            INSERT INTO crsql_changes
-                                ("table", pk, cid, val, col_version, db_version, site_id)
-                            VALUES
-                                (?,       ?,  ?,   ?,   ?,           ?,          ?);"#,
-                            params![
-                                change.table,
-                                change.pk,
-                                change.cid,
-                                change.val,
-                                change.col_version,
-                                change.db_version,
-                                change.site_id
-                            ],
-                        )?;
-                    }
-
-                    tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);", params![actor_id.0, start_version, end_version])?;
-
-                    tx.commit()?;
-
-                    Ok::<_, eyre::Report>(())
-                })?;
-
-                bookie.add(actor_id, start_version, end_version);
-            }
+        if process_msg(agent.actor_id(), &msg, bookie, agent.read_write_pool()).await? {
+            rebroadcast.push(msg);
         }
-        rebroadcast.push(msg);
     }
 
     for msg in rebroadcast {
@@ -968,24 +962,8 @@ pub async fn handle_broadcast(
     histogram!("corrosion.broadcast.recv.bytes", buf.len() as f64);
     loop {
         // decode a length-delimited "frame"
-        match codec.decode(buf) {
-            Ok(Some(bytes)) => {
-                trace!("successfully decoded a frame, len: {}", bytes.len());
-                // let mut cursor = bytes.freeze();
-
-                if buf.remaining() >= size_of::<u32>() {
-                    let crc = buf.get_u32();
-                    let new_crc = crc32fast::hash(&bytes);
-                    trace!("crc: {crc}, new_crc: {new_crc}");
-                    if crc != new_crc {
-                        eyre::bail!("mistmatched crc32! {crc} != {new_crc}");
-                    }
-                } else {
-                    warn!("not enough bytes to crc32 (remaining: {})", buf.remaining());
-                }
-
-                let msg = Message::from_slice(&bytes)?;
-
+        match Message::decode(codec, buf) {
+            Ok(Some(msg)) => {
                 trace!("broadcast: {msg:?}");
 
                 match msg {
@@ -1031,6 +1009,371 @@ pub async fn handle_broadcast(
         }
     }
     Ok(())
+}
+
+async fn process_msg(
+    local_actor_id: ActorId,
+    msg: &Message,
+    bookie: &Bookie,
+    pool: &SqlitePool,
+) -> Result<bool, bb8::RunError<bb8_rusqlite::Error>> {
+    match msg {
+        Message::V1(MessageV1::Change {
+            actor_id,
+            start_version,
+            end_version,
+            changeset,
+        }) => {
+            if bookie.contains_range(*actor_id, *start_version..=*end_version) {
+                trace!(
+                    "already seen this one! from: {}, range: {start_version}..={end_version}",
+                    actor_id.hyphenated()
+                );
+                return Ok(false);
+            }
+
+            debug!(
+                "received {} changes to process from: {}, range: {start_version}..={end_version}",
+                changeset.len(),
+                actor_id.hyphenated()
+            );
+
+            let mut conn = pool.get().await?;
+
+            let new_local_db_version = block_in_place(move || {
+                let tx = conn.transaction()?;
+
+                for change in changeset.iter() {
+                    tx.prepare_cached(
+                        r#"
+                    INSERT INTO crsql_changes
+                        ("table", pk, cid, val, col_version, db_version, site_id)
+                    VALUES
+                        (?,       ?,  ?,   ?,   ?,           ?,          ?)"#,
+                    )?
+                    .execute(())?;
+
+                    handle_inner_change(&tx, change)?;
+                }
+
+                let updated = tx.prepare_cached("UPDATE __corro_bookkeeping SET end_version = ? WHERE actor_id = ? AND start_version = ?")?.execute(params![end_version, actor_id.0, start_version])?;
+
+                if updated == 0 {
+                    tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);")?.execute(params![actor_id.0, start_version, end_version])?;
+                }
+
+                let db_version: i64 =
+                    tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
+
+                tx.prepare_cached(
+                    r#"
+                        INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT (actor_id, start_version) DO UPDATE SET
+                                end_version = excluded.end_version;
+                    "#,
+                )?
+                .execute(params![local_actor_id.0, 0, db_version])?;
+
+                tx.commit()?;
+
+                Ok::<_, bb8_rusqlite::Error>(db_version)
+            })?;
+
+            bookie.add(*actor_id, *start_version, *end_version);
+
+            // cover the whole range here
+            bookie.add(local_actor_id, 0, new_local_db_version);
+        }
+    }
+    Ok(true)
+}
+
+fn handle_inner_change(tx: &Transaction, change: &Change) -> rusqlite::Result<()> {
+    // deletes are gonna suck!
+
+    let updated = if change.cid == "__crsql_del" {
+        tx.prepare_cached("
+            UPDATE __corro_changes SET cid = ?, val = NULL, col_version = ?, db_version = ?, site_id = ? WHERE tbl_name = ? AND pk = ?;
+        ")?.execute(params!["__crsql_del", change.col_version, change.db_version, &change.site_id, change.table.as_str(), change.pk.as_str()])?
+    } else {
+        tx.prepare_cached("
+            UPDATE __corro_changes SET val = ?, col_version = ?, db_version = ?, site_id = ? WHERE tbl_name = ? AND pk = ? AND cid = ?;
+        ")?.execute(params![&change.val, change.col_version, change.db_version, &change.site_id, change.table.as_str(), change.pk.as_str(), change.cid.as_str()])?
+    };
+    // need to insert...
+    if updated == 0 {
+        tx.prepare_cached(
+            "
+            INSERT INTO __corro_changes (tbl_name, pk, cid, val, col_version, db_version, site_id)
+                VALUES (?,?,?,?,?,?,?)
+        ",
+        )?
+        .execute(params![
+            change.table.as_str(),
+            change.pk.as_str(),
+            change.cid.as_str(),
+            &change.val,
+            change.col_version,
+            change.db_version,
+            &change.site_id
+        ])?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncClientError {
+    #[error(transparent)]
+    Rusqlite(#[from] rusqlite::Error),
+    #[error("bad status code: {0}")]
+    Status(StatusCode),
+    #[error("service unavailable right now")]
+    Unavailable,
+    #[error(transparent)]
+    Serde(#[from] serde_json::Error),
+    #[error(transparent)]
+    Hyper(#[from] hyper::Error),
+    #[error("request timed out")]
+    RequestTimedOut,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    #[error("no good candidates found")]
+    NoGoodCandidate,
+    #[error("could not decode message: {0}")]
+    Decoded(#[from] MessageDecodeError),
+}
+
+impl SyncClientError {
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, SyncClientError::Unavailable)
+    }
+}
+
+struct SyncWith {
+    actor_id: ActorId,
+    addr: SocketAddr,
+}
+
+async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClientError> {
+    let sync = generate_sync(agent.bookie(), agent.actor_id());
+    for (actor_id, needed) in sync.need.iter() {
+        gauge!("corrosion.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
+    }
+    for (actor_id, version) in sync.heads.iter() {
+        gauge!("corrosion.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
+    }
+
+    let sync = Arc::new(sync);
+
+    let mut boff = backoff::Backoff::new(5)
+        .timeout_range(Duration::from_millis(100), Duration::from_secs(1))
+        .iter();
+
+    loop {
+        let (actor_id, addr) = {
+            let low_rtt_candidates = {
+                let members = agent.0.members.read();
+
+                members
+                    .states
+                    .iter()
+                    .filter(|(id, _state)| **id != agent.actor_id())
+                    .map(|(id, state)| (*id, state.addr))
+                    .collect::<Vec<(ActorId, SocketAddr)>>()
+            };
+
+            if low_rtt_candidates.is_empty() {
+                warn!("could not find any good candidate for sync");
+                return Err(SyncClientError::NoGoodCandidate);
+            }
+
+            // low_rtt_candidates.truncate(low_rtt_candidates.len() / 2);
+
+            let mut rng = StdRng::from_entropy();
+
+            let mut choices = low_rtt_candidates.into_iter().choose_multiple(&mut rng, 2);
+
+            choices.sort_by(|a, b| {
+                sync.need_len_for_actor(&b.0)
+                    .cmp(&sync.need_len_for_actor(&a.0))
+            });
+
+            if let Some(chosen) = choices.get(0).cloned() {
+                chosen
+            } else {
+                return Err(SyncClientError::NoGoodCandidate);
+            }
+        };
+
+        info!(
+            "syncing with {}, need len: {}",
+            actor_id.hyphenated(),
+            sync.need_len(),
+        );
+
+        let start = Instant::now();
+        let res =
+            handle_sync_receive(agent, client, &SyncWith { actor_id, addr }, sync.clone()).await;
+
+        match res {
+            Ok(n) => {
+                let elapsed = start.elapsed();
+                info!(
+                    "synced {n} ops w/ {} in {}s @ {} ops/s",
+                    actor_id.hyphenated(),
+                    elapsed.as_secs_f64(),
+                    n as f64 / elapsed.as_secs_f64()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                if e.is_unavailable() {
+                    increment_counter!("corrosion.sync.client.busy.servers");
+                    if let Some(dur) = boff.next() {
+                        tokio::time::sleep(dur).await;
+                        continue;
+                    }
+                }
+                error!(?actor_id, ?addr, "could not properly sync: {e}");
+                return Err(e);
+            }
+        }
+    }
+}
+
+async fn handle_sync_receive(
+    agent: &Agent,
+    client: &ClientPool,
+    with: &SyncWith,
+    sync: Arc<SyncMessage>,
+) -> Result<usize, SyncClientError> {
+    let SyncWith { actor_id, addr } = with;
+    let actor_id = *actor_id;
+    // println!("syncing with {actor_id:?}");
+
+    increment_counter!("corrosion.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+
+    histogram!(
+        "corrosion.sync.client.request.operations.need.count",
+        sync.need.len() as f64
+    );
+    let data = serde_json::to_vec(&*sync)?;
+
+    gauge!(
+        "corrosion.sync.client.request.size.bytes",
+        data.len() as f64
+    );
+
+    let req = hyper::Request::builder()
+        .method(hyper::Method::POST)
+        .uri(format!("http://{addr}/v1/sync"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(hyper::header::ACCEPT, "application/json")
+        .header(
+            "corro-clock",
+            serde_json::to_string(&agent.clock().new_timestamp())
+                .expect("could not serialize clock"),
+        )
+        .body(hyper::Body::wrap_stream(futures::stream::iter(
+            data.chunks(4 * 1024 * 1024)
+                .map(|v| Bytes::from(v.to_vec()))
+                .collect::<Vec<Bytes>>()
+                .into_iter()
+                .map(Ok::<_, std::io::Error>),
+        )))
+        .unwrap();
+
+    increment_counter!("corrosion.sync.client.request.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+
+    let start = Instant::now();
+    let res = match timeout(Duration::from_secs(15), client.request(req)).await {
+        Ok(Ok(res)) => {
+            histogram!("corrosion.sync.client.response.time.seconds", start.elapsed().as_secs_f64(), "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "status" => res.status().to_string());
+            res
+        }
+        Ok(Err(e)) => {
+            increment_counter!("corrosion.sync.client.request.error", "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "error" => e.to_string());
+            return Err(e.into());
+        }
+        Err(_e) => {
+            increment_counter!("corrosion.sync.client.request.error", "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "error" => "timed out waiting for headers");
+            return Err(SyncClientError::RequestTimedOut);
+        }
+    };
+
+    let status = res.status();
+    if status != hyper::StatusCode::OK {
+        if status == hyper::StatusCode::SERVICE_UNAVAILABLE {
+            return Err(SyncClientError::Unavailable);
+        }
+        return Err(SyncClientError::Status(status));
+    }
+
+    let body = StreamReader::new(res.into_body().map_err(|e| {
+        if let Some(io_error) = e
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+        {
+            return io::Error::from(io_error.kind());
+        }
+        io::Error::new(io::ErrorKind::Other, e)
+    }));
+
+    let mut framed = LengthDelimitedCodec::builder()
+        .length_field_type::<u32>()
+        .new_read(body)
+        .inspect_ok(|b| counter!("corrosion.sync.client.chunk.recv.bytes", b.len() as u64));
+
+    let mut count = 0;
+
+    while let Some(buf_res) = framed.next().await {
+        let mut buf = buf_res?;
+        let msg = Message::from_buf(&mut buf)?;
+        process_msg(
+            agent.actor_id(),
+            &msg,
+            agent.bookie(),
+            agent.read_write_pool(),
+        )
+        .await?;
+        match msg {
+            Message::V1(MessageV1::Change { ref changeset, .. }) => count += changeset.len(),
+        }
+    }
+
+    Ok(count)
+}
+
+async fn sync_loop(agent: Agent, client: ClientPool, mut tripwire: Tripwire) {
+    let mut sync_backoff = backoff::Backoff::new(0)
+        .timeout_range(Duration::from_secs(1), MAX_SYNC_BACKOFF)
+        .iter();
+    let next_sync_at = tokio::time::sleep(sync_backoff.next().unwrap());
+    tokio::pin!(next_sync_at);
+
+    loop {
+        tokio::select! {
+            _ = &mut next_sync_at => {
+                // ignoring here, there is trying and logging going on inside
+                match handle_sync(&agent, &client).preemptible(&mut tripwire).await {
+                    tripwire::Outcome::Preempted(_) => {
+                        warn!("aborted sync by tripwire");
+                        break;
+                    },
+                    tripwire::Outcome::Completed(_res) => {
+
+                    }
+                }
+                next_sync_at.as_mut().reset(tokio::time::Instant::now() + sync_backoff.next().unwrap());
+            },
+            _ = &mut tripwire => {
+                break;
+            }
+        }
+    }
 }
 
 pub async fn apply_schema<P: AsRef<Path>>(w_pool: &SqlitePool, schema_path: P) -> eyre::Result<()> {
@@ -1122,6 +1465,20 @@ fn init_migration(tx: &Transaction) -> Result<(), eyre::Report> {
     
         foca_state JSON
     ) WITHOUT ROWID;
+
+    -- temporary table while cr-sqlite is fixed...
+    CREATE TABLE __corro_changes(
+        tbl_name TEXT NOT NULL,
+        pk TEXT NOT NULL,
+        cid TEXT NOT NULL,
+        val ANY,
+        col_version INTEGER NOT NULL,
+        db_version INTEGER NOT NULL,
+        site_id BLOB NOT NULL
+      ) STRICT;
+
+      CREATE INDEX __corro_changes_site_id_db_version ON __corro_changes (site_id, db_version ASC);
+      CREATE INDEX __corro_changes_all ON __corro_changes (tbl_name, pk, cid);
     "#,
     )?;
     Ok(())
@@ -1210,20 +1567,27 @@ fn set_user_version(conn: &Connection, v: usize) -> rusqlite::Result<()> {
 pub mod tests {
     use std::net::SocketAddr;
 
+    use futures::{StreamExt, TryStreamExt};
     use serde::Deserialize;
     use serde_json::json;
     use spawn::wait_for_all_pending_handles;
     use tempfile::TempDir;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, MissedTickBehavior};
+    use tracing::info_span;
     use uuid::Uuid;
 
-    use crate::config::ConfigBuilder;
+    use crate::{api::peer::generate_sync, config::ConfigBuilder, types::change::SqliteValue};
     use corro_types::api::{RqliteResponse, Statement};
 
     use super::*;
 
     const TEST_SCHEMA: &str = r#"
         CREATE TABLE IF NOT EXISTS tests (
+            id INTEGER NOT NULL PRIMARY KEY,
+            text TEXT NOT NULL DEFAULT ""
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS tests2 (
             id INTEGER NOT NULL PRIMARY KEY,
             text TEXT NOT NULL DEFAULT ""
         ) WITHOUT ROWID;
@@ -1444,6 +1808,240 @@ pub mod tests {
 
         assert_eq!(svc.id, 2);
         assert_eq!(svc.text, "hello world 2");
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stress_test() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let agents = futures::stream::iter(
+            (0..10).map(|n| "127.0.0.1:0".parse().map(move |addr| (n, addr))),
+        )
+        .try_chunks(50)
+        .try_fold(vec![], {
+            let tripwire = tripwire.clone();
+            move |mut agents: Vec<TestAgent>, to_launch| {
+                let tripwire = tripwire.clone();
+                async move {
+                    for (n, gossip_ln) in to_launch {
+                        println!("LAUNCHING AGENT #{n}");
+                        let mut rng = StdRng::from_entropy();
+                        let bootstrap = agents
+                            .iter()
+                            .map(|ta| ta.agent.gossip_addr())
+                            .choose_multiple(&mut rng, 10);
+                        agents.push(
+                            launch_test_agent_w_gossip(
+                                &format!("test-{n}"),
+                                gossip_ln,
+                                bootstrap.iter().map(SocketAddr::to_string).collect(),
+                                "test",
+                                tripwire.clone(),
+                            )
+                            .await
+                            .unwrap(),
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Ok(agents)
+                }
+            }
+        })
+        .await?;
+
+        let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
+
+        let addrs: Vec<SocketAddr> = agents.iter().filter_map(|ta| ta.agent.api_addr()).collect();
+
+        let count = 200;
+
+        let iter = (0..count).flat_map(|n| {
+            serde_json::from_value::<Vec<Statement>>(json!([
+                [
+                    "INSERT INTO tests (id,text) VALUES (?,?)",
+                    n,
+                    "hello world {n}"
+                ],
+                [
+                    "INSERT INTO tests2 (id,text) VALUES (?,?)",
+                    n,
+                    "hello world {n}"
+                ],
+                [
+                    "INSERT INTO tests (id,text) VALUES (?,?)",
+                    n + 10000,
+                    "hello world {n}"
+                ],
+                [
+                    "INSERT INTO tests2 (id,text) VALUES (?,?)",
+                    n + 10000,
+                    "hello world {n}"
+                ]
+            ]))
+            .unwrap()
+        });
+
+        tokio::spawn(async move {
+            tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(5), {
+                let addrs = addrs.clone();
+                let client = client.clone();
+                move |statements| {
+                    let addrs = addrs.clone();
+                    let client = client.clone();
+                    Ok(async move {
+                        let mut rng = StdRng::from_entropy();
+                        let chosen = addrs.iter().choose(&mut rng).unwrap();
+
+                        let res = client
+                            .request(
+                                hyper::Request::builder()
+                                    .method(hyper::Method::POST)
+                                    .uri(format!("http://{chosen}/db/execute?transaction"))
+                                    .header(hyper::header::CONTENT_TYPE, "application/json")
+                                    .body(serde_json::to_vec(&statements)?.into())?,
+                            )
+                            .await?;
+
+                        Ok::<_, eyre::Report>(res)
+                    })
+                }
+            })
+            .try_buffer_unordered(10)
+            .try_collect::<Vec<hyper::Response<hyper::Body>>>()
+            .await?;
+            Ok::<_, eyre::Report>(())
+        });
+
+        let ops_count = 4 * count;
+
+        println!("expecting {ops_count} ops");
+
+        let start = Instant::now();
+
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            println!("checking status after {}s", start.elapsed().as_secs_f32());
+            let mut v = vec![];
+            for ta in agents.iter() {
+                let conn = ta.agent.read_only_pool().get().await?;
+                let count: i64 =
+                    conn.query_row("SELECT count(*) FROM crsql_changes;", [], |row| row.get(0))?;
+                println!(
+                    "agent {} has {count} versions",
+                    ta.agent.actor_id().hyphenated(),
+                );
+
+                let bookie = ta.agent.bookie();
+
+                println!(
+                    "agent {}'s last version: {:?}",
+                    ta.agent.actor_id().hyphenated(),
+                    bookie.last(&ta.agent.actor_id())
+                );
+
+                // println!(
+                //     "agent {}'s sync: {:?}",
+                //     ta.agent.actor_id().hyphenated(),
+                //     generate_sync(bookie, ta.agent.actor_id())
+                // );
+
+                type HMKey = (String, String, String);
+                type HMValue = (SqliteValue, i64, i64, Uuid);
+                type HM = HashMap<(String, String, String), (SqliteValue, i64, i64, Uuid)>;
+
+                let mut prepped = conn.prepare_cached("SELECT * FROM crsql_changes")?;
+
+                let actor_id = ta.agent.actor_id().hyphenated();
+                let span = info_span!("consistency", %actor_id);
+                let _entered = span.enter();
+
+                let crsql_data = prepped
+                    .query_map([], |row| {
+                        Ok((
+                            (
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ),
+                            (row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?),
+                        ))
+                    })?
+                    .collect::<Result<HM, rusqlite::Error>>()?;
+
+                let mut prepped = conn.prepare_cached("SELECT * FROM __corro_changes")?;
+
+                let mut corro_data = prepped
+                    .query_map([], |row| {
+                        Ok((
+                            (
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ),
+                            (row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?),
+                        ))
+                    })?
+                    .collect::<Result<HM, rusqlite::Error>>()?;
+
+                for (k, v) in crsql_data {
+                    match corro_data.remove(&k) {
+                        Some((corro_val, corro_col_v, corro_db_v, corro_site_id)) => {
+                            let (crsql_val, crsql_col_v, crsql_db_v, crsql_site_id) = v;
+                            if (&corro_val, &corro_col_v, &corro_db_v, &corro_site_id)
+                                != (&crsql_val, &crsql_col_v, &crsql_db_v, &crsql_site_id)
+                            {
+                                if corro_val != crsql_val {
+                                    warn!(%crsql_site_id, "mismatched val for {k:?} (crsql: {crsql_val:?} != corro {corro_val:?})");
+                                }
+                                if corro_col_v != crsql_col_v {
+                                    warn!(%crsql_site_id, "mismatched col_v for {k:?} (crsql: {crsql_col_v:?} != corro {corro_col_v:?})");
+                                }
+                                if corro_db_v != crsql_db_v {
+                                    warn!(%crsql_site_id, "mismatched db_v for {k:?} (crsql: {crsql_db_v:?} != corro {corro_db_v:?})");
+                                }
+                                if corro_site_id != crsql_site_id {
+                                    warn!(%crsql_site_id, "mismatched site_id for {k:?} (crsql: {crsql_site_id:?} != corro {corro_site_id:?})");
+                                }
+                            }
+                        }
+                        None => {
+                            warn!("Missing {k:?} from corro's data. Value: {v:?}");
+                        }
+                    }
+                }
+
+                for (k, v) in corro_data {
+                    warn!("extraneous key in corrosion's data: {k:?} => {v:?}");
+                }
+
+                v.push((count as usize, 0));
+            }
+            if v.len() != agents.len() {
+                println!("got {} actors, expecting {}", v.len(), agents.len());
+            }
+            if v.len() == agents.len()
+                && v.iter().all(|(n, needed)| *n == ops_count && *needed == 0)
+            {
+                break;
+            }
+
+            if start.elapsed() > Duration::from_secs(60) {
+                panic!(
+                    "failed to disseminate all updates to all nodes in {}s",
+                    start.elapsed().as_secs_f32()
+                );
+            }
+        }
+        println!("fully disseminated in {}s", start.elapsed().as_secs_f32());
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;

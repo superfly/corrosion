@@ -15,7 +15,7 @@ pub struct Change {
     pub site_id: [u8; 16],
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, Readable, Writable, PartialEq)]
 pub enum SqliteValue {
     Null,
     Integer(i64),

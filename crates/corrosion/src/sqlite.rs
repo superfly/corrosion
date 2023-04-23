@@ -5,10 +5,34 @@ use std::{
 
 use bb8::ManageConnection;
 use bb8_rusqlite::RusqliteConnectionManager;
+use once_cell::sync::Lazy;
 use rusqlite::{Connection, OpenFlags};
+use tempfile::TempDir;
 use tracing::{error, trace};
 
 pub type SqlitePool = bb8::Pool<CrConnManager>;
+
+const CRSQL_EXT_GENERIC_NAME: &str = "crsqlite";
+
+#[cfg(target_os = "macos")]
+pub const CRSQL_EXT_FILENAME: &str = "crsqlite.dylib";
+#[cfg(target_os = "linux")]
+pub const CRSQL_EXT_FILENAME: &str = "crsqlite.so";
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub const CRSQL_EXT: &[u8] = include_bytes!("../../../crsqlite-darwin-aarch64.dylib");
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub const CRSQL_EXT: &[u8] = include_bytes!("../../../crsqlite-linux-x86_64.so");
+
+// TODO: support windows
+
+// need to keep this alive!
+static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
+    let dir = TempDir::new().expect("could not create temp dir!");
+    std::fs::write(dir.path().join(CRSQL_EXT_GENERIC_NAME), CRSQL_EXT)
+        .expect("could not write crsql ext file");
+    dir
+});
 
 pub struct CrConnManager(RusqliteConnectionManager);
 
@@ -80,25 +104,23 @@ impl Drop for CrConn {
 #[derive(Debug)]
 pub struct CrSqlite;
 
-// #[async_trait::async_trait]
-// impl CustomizeConnection<CrConn, bb8_rusqlite::Error> for CrSqlite {
-//     async fn on_acquire(&self, conn: &mut CrConn) -> Result<(), bb8_rusqlite::Error> {
-//         Ok(init_cr_conn(conn)?)
-//     }
-// }
-
 pub fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let ext_dir = &CRSQL_EXT_DIR;
+    trace!(
+        "loading crsqlite extension from path: {}",
+        ext_dir.path().display()
+    );
     unsafe {
         conn.load_extension_enable()?;
         conn.load_extension(
-            "../../crsqlite-linux-x86_64.so",
+            ext_dir.path().join(CRSQL_EXT_GENERIC_NAME),
             Some("sqlite3_crsqlite_init"),
         )?;
         conn.load_extension_disable()?;
     }
     trace!("loaded crsqlite extension");
 
-    // WAL journal mode and NORMAL synchronous for best performance / crash resilience
+    // WAL journal mode and synchronous NORMAL for best performance / crash resilience compromise
     conn.execute_batch(
         r#"
             PRAGMA journal_mode = WAL;

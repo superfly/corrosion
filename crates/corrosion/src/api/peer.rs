@@ -1,3 +1,7 @@
+use std::cmp;
+use std::collections::HashMap;
+use std::ops::RangeInclusive;
+use std::time::{Duration, Instant};
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::http::{HeaderMap, StatusCode};
@@ -8,16 +12,24 @@ use axum::{
 };
 use bytes::BytesMut;
 use futures::StreamExt;
-use tokio::sync::mpsc::Sender;
+use metrics::{counter, histogram};
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{channel, Sender};
+use tokio::task::block_in_place;
+use tokio::time::timeout;
 use tokio_util::codec::LengthDelimitedCodec;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
-use crate::Bookie;
+use crate::broadcast::MessageV1;
+use crate::sqlite::SqlitePool;
+use crate::types::change::Change;
 use crate::{
     actor::ActorId,
     broadcast::{BroadcastSrc, FocaInput, Message},
     handle_payload,
 };
+use crate::{Booked, Bookie};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn peer_api_v1_broadcast(
@@ -91,6 +103,67 @@ pub async fn peer_api_v1_broadcast(
     StatusCode::ACCEPTED
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SyncMessage {
+    pub actor_id: ActorId,
+    pub heads: HashMap<ActorId, i64>,
+    pub need: HashMap<ActorId, Vec<RangeInclusive<i64>>>,
+}
+
+impl SyncMessage {
+    pub fn need_len(&self) -> i64 {
+        self.need
+            .values()
+            .flat_map(|v| v.iter().map(|range| (range.end() - range.start()) + 1))
+            .sum()
+    }
+
+    pub fn need_len_for_actor(&self, actor_id: &ActorId) -> i64 {
+        self.need
+            .get(actor_id)
+            .map(|v| {
+                v.iter()
+                    .map(|range| (range.end() - range.start()) + 1)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+}
+
+// generates a `SyncMessage` to tell another node what versions we're missing
+pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncMessage {
+    let mut sync = SyncMessage {
+        actor_id,
+        heads: Default::default(),
+        need: Default::default(),
+    };
+
+    let actors: Vec<(ActorId, Booked)> = {
+        bookie
+            .0
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    };
+
+    for (actor_id, booked) in actors {
+        let last_version = match booked.last() {
+            Some(v) => v,
+            None => continue,
+        };
+
+        sync.need.insert(
+            actor_id,
+            booked.0.read().gaps(&(0..=last_version)).collect(),
+        );
+
+        sync.heads.insert(actor_id, last_version);
+    }
+
+    sync
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
     #[error(transparent)]
@@ -122,262 +195,280 @@ pub enum SyncError {
 #[error("unknown accept header value '{0}'")]
 pub struct UnknownAcceptHeaderValue(String);
 
-// fn process_one(one: OneVersion) -> eyre::Result<bool> {
-//     let op = match one.got {
-//         Some(true) => fetch_one(&mut *one.tx, one.actor_index, &one.version)?,
-//         Some(false) => None,
-//         None => return Ok(false),
-//     };
-//     one.sender.send((
-//         ChangeId {
-//             actor_id: one.actor_id,
-//             version: Version(one.version),
-//         },
-//         op,
-//     ))?;
-//     Ok(true)
-// }
+const MAX_CHANGES: i32 = 20;
 
-// fn fetch_one<'a>(
-//     tx: &'a mut corro_types::persy::Transaction,
-//     actor_index: &'a ActorIndex,
-//     version: &'a u64,
-// ) -> eyre::Result<Option<Vec<u8>>> {
-//     Ok(match actor_index.one_tx(&mut *tx, version)? {
-//         Some(persy_id) if !persy_id.is_empty() => tx.read("ops", &persy_id.parse()?)?,
-//         Some(_) | None => None,
-//     })
-// }
+fn send_msg(
+    actor_id: ActorId,
+    start: i64,
+    end: i64,
+    changeset: &mut Vec<Change>,
+    sender: &Sender<Message>,
+) {
+    let changeset_len = changeset.len();
 
-// fn process_one_local<'a>(
-//     tx: &'a mut corro_types::persy::Transaction,
-//     actor_id: ActorId,
-//     actor_index: &'a ActorIndex,
-//     version: u64,
-//     sender: &'a UnboundedSender<(ChangeId, Option<Vec<u8>>)>,
-// ) -> eyre::Result<bool> {
-//     let op = fetch_one(&mut *tx, actor_index, &version)?;
+    // build the Message
+    let msg = Message::V1(MessageV1::Change {
+        actor_id,
+        start_version: start,
+        end_version: end,
+        changeset: changeset.drain(..).collect(),
+    });
 
-//     sender.send((
-//         ChangeId {
-//             actor_id,
-//             version: Version(version),
-//         },
-//         op,
-//     ))?;
-//     Ok(true)
-// }
+    trace!(
+        "sending msg: actor: {}, start: {start}, end: {end}, changes len: {changeset_len}",
+        actor_id.hyphenated(),
+    );
 
-// fn process_sync(
-//     ops_db: &OpsDb,
-//     sync: SyncMessage,
-//     local_actor_id: ActorId,
-//     sender: UnboundedSender<(ChangeId, Option<Vec<u8>>)>,
-// ) -> eyre::Result<()> {
-//     let heads: HashMap<ActorId, Version> = sync
-//         .heads
-//         .into_iter()
-//         .map(|change_id| (change_id.actor_id, change_id.version))
-//         .collect();
+    // async send the data... not ideal but it'll have to do
+    // TODO: figure out a better way to backpressure here, maybe drop this range?
+    tokio::spawn({
+        let sender = sender.clone();
+        async move {
+            if let Err(e) = sender.send(msg).await {
+                println!("could not send change: {e}");
+            }
+        }
+    });
+}
 
-//     let actor_ids: Vec<ActorId> = ops_db.actor_ids();
+fn process_range(
+    conn: &Connection,
+    actor_id: ActorId,
+    mut start: i64,
+    end: i64,
+    sender: &Sender<Message>,
+) -> eyre::Result<()> {
+    trace!(
+        "processing range {start}..={end} for {}",
+        actor_id.hyphenated()
+    );
 
-//     let mut ops_tx = ops_db.begin("sync-server")?;
+    let original_start = start;
 
-//     for actor_id in actor_ids {
-//         let mut processed = 0;
-//         let known_index = match ops_tx.known_index_cached(&actor_id) {
-//             None => continue,
-//             Some(known) => known,
-//         };
+    let mut prepped = conn.prepare_cached(
+        r#"
+            SELECT tbl_name, pk, cid, val, col_version, db_version, site_id
+                FROM __corro_changes
+                WHERE site_id = ? AND db_version >= ? AND db_version <= ?
+                ORDER BY db_version ASC
+        "#,
+    )?;
 
-//         if !known_index.read().synced() {
-//             continue;
-//         }
+    trace!(
+        "prepped query successfully, querying with {}, {}",
+        actor_id.hyphenated(),
+        original_start
+    );
 
-//         let (index, tx, is_local) = if actor_id == local_actor_id {
-//             (ops_tx.local_ops_index(), ops_tx.local_tx(), true)
-//         } else {
-//             (ops_tx.actor_index(actor_id)?, ops_tx.tx(), false)
-//         };
+    let mut rows = prepped.query_map(params![actor_id.0, original_start, end], |row| {
+        Ok(Change {
+            table: row.get(0)?,
+            pk: row.get(1)?,
+            cid: row.get(2)?,
+            val: row.get(3)?,
+            col_version: row.get(4)?,
+            db_version: row.get(5)?,
+            site_id: row.get(6)?,
+        })
+    })?;
 
-//         if let Some(versions) = sync.need.get(&actor_id).cloned() {
-//             trace!(
-//                 "sync needs for {}, count: {}",
-//                 actor_id.0.as_simple(),
-//                 versions.len()
-//             );
+    let mut last_version = start;
+    let mut count = MAX_CHANGES;
 
-//             for vr in versions {
-//                 match vr {
-//                     VersionRange::Single(version) => {
-//                         let success = if is_local {
-//                             process_one_local(tx, actor_id, &index, version, &sender)?
-//                         } else {
-//                             process_one(OneVersion {
-//                                 got: known_index.read().map.get(&version).copied(),
-//                                 tx,
-//                                 actor_index: &index,
-//                                 actor_id,
-//                                 version,
+    let mut changeset = vec![];
 
-//                                 sender: &sender,
-//                             })?
-//                         };
-//                         if success {
-//                             processed += 1;
-//                         }
-//                     }
-//                     // TODO: process with a persy range instead of one by one
-//                     VersionRange::Range(range) => {
-//                         for version in range[0]..range[1] {
-//                             let success = if is_local {
-//                                 process_one_local(tx, actor_id, &index, version, &sender)?
-//                             } else {
-//                                 process_one(OneVersion {
-//                                     actor_index: &index,
-//                                     actor_id,
-//                                     version,
-//                                     got: known_index.read().map.get(&version).copied(),
-//                                     sender: &sender,
-//                                     tx,
-//                                 })?
-//                             };
-//                             if success {
-//                                 processed += 1;
-//                             }
-//                         }
-//                     }
-//                 }
-//             }
-//         }
+    while let Some(row) = rows.next() {
+        // trace!("processing a row {row:?}");
 
-//         let start_version = heads.get(&actor_id).map(|v| v.0).unwrap_or_default() + 1;
+        let change = row?;
 
-//         if let Some(last_version) = index.last_key_tx(tx)? {
-//             for version in start_version..=last_version {
-//                 let success = if is_local {
-//                     process_one_local(tx, actor_id, &index, version, &sender)?
-//                 } else {
-//                     process_one(OneVersion {
-//                         actor_index: &index,
-//                         actor_id,
-//                         version,
-//                         got: known_index.read().map.get(&version).copied(),
-//                         sender: &sender,
-//                         tx,
-//                     })?
-//                 };
-//                 if success {
-//                     processed += 1;
-//                 }
-//             }
-//         }
+        if change.db_version > end {
+            warn!("went overboard, that shouldn't happen!");
+            break;
+        }
 
-//         counter!("corrosion.sync.server.changes.processed", processed as u64, "actor_id" => actor_id.0.to_string());
-//     }
+        // we don't want to send much more than this!
+        if count <= 0 {
+            trace!(
+                "count is under 0: {count}, last_version: {last_version}, change.db_version: {}",
+                change.db_version
+            );
+            // ... but we wanna send all the data between versions, that's for sure.
+            if change.db_version > last_version {
+                send_msg(actor_id, start, last_version, &mut changeset, &sender);
 
-//     debug!("done with sync process");
+                // this is the new start value
+                start = last_version + 1;
+                // reset the count
+                count = MAX_CHANGES;
+            }
+        }
 
-//     Ok(())
-// }
+        // current last version we've seen
+        last_version = change.db_version;
 
-// pub async fn peer_api_v1_sync_post(
-//     headers: HeaderMap,
-//     RawBody(req_body): RawBody,
-//     Extension(ops_db): Extension<OpsDb>,
-//     Extension(clock): Extension<Arc<uhlc::HLC>>,
-//     Extension(actor): Extension<Actor>,
-// ) -> impl IntoResponse {
-//     match headers.get("corro-clock") {
-//         Some(value) => match serde_json::from_slice::<'_, uhlc::Timestamp>(value.as_bytes()) {
-//             Ok(ts) => {
-//                 if let Err(e) = clock.update_with_timestamp(&ts) {
-//                     error!("clock drifted too much! {e}");
-//                 }
-//             }
-//             Err(e) => {
-//                 error!("could not parse timestamp: {e}");
-//             }
-//         },
-//         None => {
-//             debug!("old corroded geezer");
-//         }
-//     }
+        // put that change in the changeset for the next msg send
+        changeset.push(change);
 
-//     let (mut sender, body) = hyper::body::Body::channel();
-//     let (tx, rx) = unbounded_channel::<(ChangeId, Option<Vec<u8>>)>();
+        // decrement count
+        count -= 1;
+    }
 
-//     tokio::spawn(async move {
-//         // let start = Instant::now();
-//         let mut rx = tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
-//             .map(|(change_id, data)| {
-//                 let framed_len = size_of::<u128>()
-//                     + size_of::<u64>()
-//                     + data.as_ref().map(|data| data.len()).unwrap_or_default();
-//                 let mut buf = BytesMut::with_capacity(size_of::<u32>() + framed_len);
-//                 buf.put_uint(framed_len as u64, size_of::<u32>());
-//                 buf.put_u128(change_id.actor_id.0.as_u128());
-//                 buf.put_u64(change_id.version.0);
-//                 if let Some(ref data) = data {
-//                     buf.put(&data[..]);
-//                 }
-//                 buf.freeze()
-//             })
-//             .chunks(512);
-//         while let Some(bytes) = rx.next().await {
-//             let buf_len = bytes.iter().map(|b| b.len()).sum();
-//             let mut buf = BytesMut::with_capacity(buf_len);
-//             for b in bytes {
-//                 buf.extend(b);
-//             }
+    // no more messages!
 
-//             match timeout(Duration::from_secs(5), sender.send_data(buf.freeze())).await {
-//                 Err(_) => {
-//                     error!("sending data timed out");
-//                     break;
-//                 }
-//                 // this only happens if the channel closes...
-//                 Ok(Err(e)) => {
-//                     debug!("error sending data: {e}");
-//                     break;
-//                 }
-//                 Ok(_) => {}
-//             }
+    trace!("(after loop) sending pending changes");
 
-//             counter!("corrosion.sync.server.chunk.sent.bytes", buf_len as u64);
-//         }
-//     });
+    send_msg(actor_id, start, end, &mut changeset, &sender);
 
-//     tokio::spawn(async move {
-//         let bytes = hyper::body::to_bytes(req_body).await?;
+    trace!("done processing original range: {original_start}..={end}");
 
-//         tokio::runtime::Handle::current()
-//             .spawn_blocking(move || {
-//                 let sync = serde_json::from_slice(bytes.as_ref())?;
+    Ok(())
+}
 
-//                 let now = Instant::now();
-//                 match process_sync(&ops_db, sync, actor.id(), tx) {
-//                     Ok(_) => {
-//                         histogram!(
-//                             "corrosion.sync.server.process.time.seconds",
-//                             now.elapsed().as_secs_f64()
-//                         );
-//                     }
-//                     Err(e) => {
-//                         error!("could not process sync request: {e}");
-//                     }
-//                 }
+async fn process_sync(
+    pool: SqlitePool,
+    bookie: Bookie,
+    sync: SyncMessage,
+    sender: Sender<Message>,
+) -> eyre::Result<()> {
+    let conn = pool.get().await?;
 
-//                 Ok::<_, eyre::Report>(())
-//             })
-//             .await??;
+    let bookie: HashMap<ActorId, Booked> =
+        { bookie.read().iter().map(|(k, v)| (*k, v.clone())).collect() };
 
-//         Ok::<_, eyre::Report>(())
-//     });
+    for (actor_id, booked) in bookie {
+        if let Some(needed) = sync.need.get(&actor_id) {
+            for range in needed {
+                let overlapping: Vec<RangeInclusive<i64>> =
+                    { booked.read().overlapping(&range).cloned().collect() };
 
-//     hyper::Response::builder()
-//         .header(hyper::header::CONTENT_TYPE, "application/json")
-//         .body(body)
-//         .unwrap()
-// }
+                for overlap in overlapping {
+                    block_in_place(|| {
+                        process_range(
+                            &conn,
+                            actor_id,
+                            *overlap.start(),
+                            *cmp::max(overlap.end(), range.end()),
+                            &sender,
+                        )
+                    })?;
+                }
+            }
+        }
+
+        if actor_id == sync.actor_id {
+            trace!("skipping itself!");
+            // don't send the requester's data
+            continue;
+        }
+
+        let their_last_version = sync.heads.get(&actor_id).copied().unwrap_or(0);
+        let our_last_version = booked.last().unwrap_or(0);
+
+        trace!("their last version: {their_last_version} vs ours: {our_last_version}");
+
+        if their_last_version >= our_last_version {
+            // nothing to teach the other node!
+            continue;
+        }
+        block_in_place(|| {
+            process_range(
+                &conn,
+                actor_id,
+                their_last_version,
+                our_last_version,
+                &sender,
+            )
+        })?;
+    }
+
+    debug!("done with sync process");
+
+    Ok(())
+}
+
+pub async fn peer_api_v1_sync_post(
+    headers: HeaderMap,
+    Extension(pool): Extension<SqlitePool>,
+    Extension(bookie): Extension<Bookie>,
+    Extension(clock): Extension<Arc<uhlc::HLC>>,
+    RawBody(req_body): RawBody,
+) -> impl IntoResponse {
+    match headers.get("corro-clock") {
+        Some(value) => match serde_json::from_slice::<'_, uhlc::Timestamp>(value.as_bytes()) {
+            Ok(ts) => {
+                if let Err(e) = clock.update_with_timestamp(&ts) {
+                    error!("clock drifted too much! {e}");
+                }
+            }
+            Err(e) => {
+                error!("could not parse timestamp: {e}");
+            }
+        },
+        None => {
+            debug!("old corroded geezer");
+        }
+    }
+
+    let (mut sender, body) = hyper::body::Body::channel();
+    let (tx, mut rx) = channel::<Message>(256);
+
+    tokio::spawn(async move {
+        let mut buf = BytesMut::new();
+
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = msg.encode(&mut buf) {
+                error!("could not encode message, skipping: {e}");
+                continue;
+            }
+
+            let buf_len = buf.len();
+
+            match timeout(
+                Duration::from_secs(5),
+                sender.send_data(buf.split().freeze()),
+            )
+            .await
+            {
+                Err(_) => {
+                    error!("sending data timed out");
+                    break;
+                }
+                // this only happens if the channel closes...
+                Ok(Err(e)) => {
+                    debug!("error sending data: {e}");
+                    break;
+                }
+                Ok(_) => {}
+            }
+
+            counter!("corrosion.sync.server.chunk.sent.bytes", buf_len as u64);
+        }
+    });
+
+    tokio::spawn(async move {
+        let bytes = hyper::body::to_bytes(req_body).await?;
+
+        let sync = serde_json::from_slice(bytes.as_ref())?;
+
+        let now = Instant::now();
+        match process_sync(pool, bookie, sync, tx).await {
+            Ok(_) => {
+                histogram!(
+                    "corrosion.sync.server.process.time.seconds",
+                    now.elapsed().as_secs_f64()
+                );
+            }
+            Err(e) => {
+                error!("could not process sync request: {e}");
+            }
+        }
+
+        Ok::<_, eyre::Report>(())
+    });
+
+    hyper::Response::builder()
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .unwrap()
+}
