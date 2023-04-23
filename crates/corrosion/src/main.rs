@@ -1051,7 +1051,15 @@ async fn process_msg(
                     VALUES
                         (?,       ?,  ?,   ?,   ?,           ?,          ?)"#,
                     )?
-                    .execute(())?;
+                    .execute(params![
+                        change.table.as_str(),
+                        change.pk.as_str(),
+                        change.cid.as_str(),
+                        &change.val,
+                        change.col_version,
+                        change.db_version,
+                        &change.site_id
+                    ])?;
 
                     handle_inner_change(&tx, change)?;
                 }
@@ -1209,7 +1217,8 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
         };
 
         info!(
-            "syncing with {}, need len: {}",
+            "syncing between {} <=> {}, need len: {}",
+            sync.actor_id.hyphenated(),
             actor_id.hyphenated(),
             sync.need_len(),
         );
@@ -1958,70 +1967,70 @@ pub mod tests {
                 type HMValue = (SqliteValue, i64, i64, Uuid);
                 type HM = HashMap<(String, String, String), (SqliteValue, i64, i64, Uuid)>;
 
-                let mut prepped = conn.prepare_cached("SELECT * FROM crsql_changes")?;
+                // let mut prepped = conn.prepare_cached("SELECT * FROM crsql_changes")?;
 
-                let actor_id = ta.agent.actor_id().hyphenated();
-                let span = info_span!("consistency", %actor_id);
-                let _entered = span.enter();
+                // let actor_id = ta.agent.actor_id().hyphenated();
+                // let span = info_span!("consistency", %actor_id);
+                // let _entered = span.enter();
 
-                let crsql_data = prepped
-                    .query_map([], |row| {
-                        Ok((
-                            (
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ),
-                            (row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?),
-                        ))
-                    })?
-                    .collect::<Result<HM, rusqlite::Error>>()?;
+                // let crsql_data = prepped
+                //     .query_map([], |row| {
+                //         Ok((
+                //             (
+                //                 row.get::<_, String>(0)?,
+                //                 row.get::<_, String>(1)?,
+                //                 row.get::<_, String>(2)?,
+                //             ),
+                //             (row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?),
+                //         ))
+                //     })?
+                //     .collect::<Result<HM, rusqlite::Error>>()?;
 
-                let mut prepped = conn.prepare_cached("SELECT * FROM __corro_changes")?;
+                // let mut prepped = conn.prepare_cached("SELECT * FROM __corro_changes")?;
 
-                let mut corro_data = prepped
-                    .query_map([], |row| {
-                        Ok((
-                            (
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ),
-                            (row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?),
-                        ))
-                    })?
-                    .collect::<Result<HM, rusqlite::Error>>()?;
+                // let mut corro_data = prepped
+                //     .query_map([], |row| {
+                //         Ok((
+                //             (
+                //                 row.get::<_, String>(0)?,
+                //                 row.get::<_, String>(1)?,
+                //                 row.get::<_, String>(2)?,
+                //             ),
+                //             (row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?),
+                //         ))
+                //     })?
+                //     .collect::<Result<HM, rusqlite::Error>>()?;
 
-                for (k, v) in crsql_data {
-                    match corro_data.remove(&k) {
-                        Some((corro_val, corro_col_v, corro_db_v, corro_site_id)) => {
-                            let (crsql_val, crsql_col_v, crsql_db_v, crsql_site_id) = v;
-                            if (&corro_val, &corro_col_v, &corro_db_v, &corro_site_id)
-                                != (&crsql_val, &crsql_col_v, &crsql_db_v, &crsql_site_id)
-                            {
-                                if corro_val != crsql_val {
-                                    warn!(%crsql_site_id, "mismatched val for {k:?} (crsql: {crsql_val:?} != corro {corro_val:?})");
-                                }
-                                if corro_col_v != crsql_col_v {
-                                    warn!(%crsql_site_id, "mismatched col_v for {k:?} (crsql: {crsql_col_v:?} != corro {corro_col_v:?})");
-                                }
-                                if corro_db_v != crsql_db_v {
-                                    warn!(%crsql_site_id, "mismatched db_v for {k:?} (crsql: {crsql_db_v:?} != corro {corro_db_v:?})");
-                                }
-                                if corro_site_id != crsql_site_id {
-                                    warn!(%crsql_site_id, "mismatched site_id for {k:?} (crsql: {crsql_site_id:?} != corro {corro_site_id:?})");
-                                }
-                            }
-                        }
-                        None => {
-                            warn!("Missing {k:?} from corro's data. Value: {v:?}");
-                        }
-                    }
-                }
+                // for (k, v) in crsql_data {
+                //     match corro_data.remove(&k) {
+                //         Some((corro_val, corro_col_v, corro_db_v, corro_site_id)) => {
+                //             let (crsql_val, crsql_col_v, crsql_db_v, crsql_site_id) = v;
+                //             if (&corro_val, &corro_col_v, &corro_db_v, &corro_site_id)
+                //                 != (&crsql_val, &crsql_col_v, &crsql_db_v, &crsql_site_id)
+                //             {
+                //                 if corro_val != crsql_val {
+                //                     warn!(%crsql_site_id, "mismatched val for {k:?} (crsql: {crsql_val:?} != corro {corro_val:?})");
+                //                 }
+                //                 if corro_col_v != crsql_col_v {
+                //                     warn!(%crsql_site_id, "mismatched col_v for {k:?} (crsql: {crsql_col_v:?} != corro {corro_col_v:?})");
+                //                 }
+                //                 if corro_db_v != crsql_db_v {
+                //                     warn!(%crsql_site_id, "mismatched db_v for {k:?} (crsql: {crsql_db_v:?} != corro {corro_db_v:?})");
+                //                 }
+                //                 if corro_site_id != crsql_site_id {
+                //                     warn!(%crsql_site_id, "mismatched site_id for {k:?} (crsql: {crsql_site_id:?} != corro {corro_site_id:?})");
+                //                 }
+                //             }
+                //         }
+                //         None => {
+                //             warn!("Missing {k:?} from corro's data. Value: {v:?}");
+                //         }
+                //     }
+                // }
 
-                for (k, v) in corro_data {
-                    warn!("extraneous key in corrosion's data: {k:?} => {v:?}");
-                }
+                // for (k, v) in corro_data {
+                //     warn!("extraneous key in corrosion's data: {k:?} => {v:?}");
+                // }
 
                 v.push((count as usize, 0));
             }
