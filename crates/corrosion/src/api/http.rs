@@ -33,6 +33,18 @@ pub async fn api_v1_db_execute(
     Extension(bookie): Extension<Bookie>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
 ) -> (StatusCode, axum::Json<RqliteResponse>) {
+    if statements.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(RqliteResponse {
+                results: vec![RqliteResult::Error {
+                    error: "at least 1 statement is required".into(),
+                }],
+                time: None,
+            }),
+        );
+    }
+
     let res: Result<_, rusqlite::Error> = {
         trace!("getting conn...");
         let mut conn = match rw_pool.get().await {
@@ -123,7 +135,9 @@ pub async fn api_v1_db_execute(
                 .collect::<Vec<RqliteResult>>();
 
             let last_version = bookie.last(&actor_id).unwrap_or(0);
+            trace!("last_version: {last_version}");
             let version = last_version + 1;
+            trace!("version: {version}");
 
             let (changes, db_version) = {
                 let mut prepped = tx.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version FROM crsql_changes WHERE site_id IS NULL AND db_version > ?"#)?;
@@ -147,18 +161,17 @@ pub async fn api_v1_db_execute(
                 let changes = mapped.collect::<Result<Vec<Change>, rusqlite::Error>>()?;
 
                 let db_version = if end_version > start_version {
+                    tx.prepare_cached(
+                        r#"
+                        INSERT INTO __corro_bookkeeping (actor_id, version, db_version)
+                            VALUES (?, ?, ?);
+                    "#,
+                    )?
+                    .execute(params![actor_id.0, version, end_version])?;
                     Some(end_version)
                 } else {
                     None
                 };
-
-                tx.prepare_cached(
-                    r#"
-                    INSERT INTO __corro_bookkeeping (actor_id, version, db_version)
-                        VALUES (?, ?, ?);
-                "#,
-                )?
-                .execute(params![actor_id.0, version, db_version])?;
 
                 (changes, db_version)
             };

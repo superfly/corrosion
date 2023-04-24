@@ -33,3 +33,4 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 corrosion = { path = "../corrosion" }
 corro-tests = { path = "../corro-tests" }
+tempfile = { workspace = true }

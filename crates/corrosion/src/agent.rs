@@ -81,7 +81,9 @@ pub struct AgentOptions {
 pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, AgentOptions)> {
     debug!("setting up corrosion @ {}", conf.base_path);
 
-    let state_path = conf.base_path.join("state");
+    let base_path = conf.base_path;
+
+    let state_path = base_path.join("state");
     if !state_path.exists() {
         std::fs::create_dir_all(&state_path)?;
     }
@@ -93,7 +95,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             .create(true)
             .read(true)
             .write(true)
-            .open(conf.base_path.join("actor_id"))?;
+            .open(base_path.join("actor_id"))?;
 
         let mut uuid_str = String::new();
         actor_id_file.read_to_string(&mut uuid_str)?;
@@ -147,7 +149,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         .build(CrConnManager::new(&state_db_path))
         .await?;
 
-    apply_schema(&rw_pool, conf.base_path.join("schema")).await?;
+    apply_schema(&rw_pool, &conf.schema_path).await?;
 
     debug!("built RW pool");
 
@@ -217,6 +219,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         subscribers: Default::default(),
         bookie,
         tx_bcast,
+        base_path,
     }));
 
     let opts = AgentOptions {
@@ -952,6 +955,7 @@ async fn process_msg(
                     tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
 
                 for change in changeset.iter() {
+                    info!("change: {change:?}");
                     tx.prepare_cached(
                         r#"
                     INSERT INTO crsql_changes
@@ -1441,10 +1445,12 @@ pub mod tests {
     async fn insert_rows_and_gossip() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-        let ta1 = launch_test_agent("test1", vec![], tripwire.clone()).await?;
+        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
         let ta2 = launch_test_agent(
-            "test2",
-            vec![ta1.agent.gossip_addr().to_string()],
+            |conf| {
+                conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+                    .build()
+            },
             tripwire.clone(),
         )
         .await?;
@@ -1628,7 +1634,7 @@ pub mod tests {
             move |mut agents: Vec<TestAgent>, to_launch| {
                 let tripwire = tripwire.clone();
                 async move {
-                    for (n, gossip_ln) in to_launch {
+                    for (n, gossip_addr) in to_launch {
                         println!("LAUNCHING AGENT #{n}");
                         let mut rng = StdRng::from_entropy();
                         let bootstrap = agents
@@ -1636,11 +1642,17 @@ pub mod tests {
                             .map(|ta| ta.agent.gossip_addr())
                             .choose_multiple(&mut rng, 10);
                         agents.push(
-                            launch_test_agent_w_gossip(
-                                &format!("test-{n}"),
-                                gossip_ln,
-                                bootstrap.iter().map(SocketAddr::to_string).collect(),
-                                "test",
+                            launch_test_agent(
+                                |conf| {
+                                    conf.gossip_addr(gossip_addr)
+                                        .bootstrap(
+                                            bootstrap
+                                                .iter()
+                                                .map(SocketAddr::to_string)
+                                                .collect::<Vec<String>>(),
+                                        )
+                                        .build()
+                                },
                                 tripwire.clone(),
                             )
                             .await

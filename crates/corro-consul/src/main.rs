@@ -389,6 +389,7 @@ pub async fn update_consul_services(
         info!("upserting service '{id}'");
 
         let hash = hash_service(&svc);
+        to_upsert.push((svc.id.clone(), hash));
         upsert_service_statements(&mut statements, node, svc, hash, updated_at)?;
         stats.upserted += 1;
     }
@@ -406,7 +407,9 @@ pub async fn update_consul_services(
         stats.deleted += 1;
     }
 
-    corrosion.execute(statements).await?;
+    if !statements.is_empty() {
+        corrosion.execute(statements).await?;
+    }
 
     for (id, hash) in to_upsert {
         hashes.insert(id, hash);
@@ -464,6 +467,7 @@ pub async fn update_consul_checks(
         info!("upserting check '{id}'");
 
         let hash = hash_check(&check);
+        to_upsert.push((check.id.clone(), hash));
         upsert_check_statements(&mut statements, node, check, hash, updated_at)?;
         stats.upserted += 1;
     }
@@ -481,7 +485,9 @@ pub async fn update_consul_checks(
         stats.deleted += 1;
     }
 
-    corrosion.execute(statements).await?;
+    if !statements.is_empty() {
+        corrosion.execute(statements).await?;
+    }
 
     for (id, hash) in to_upsert {
         hashes.insert(id, hash);
@@ -581,19 +587,105 @@ mod tests {
     use super::*;
 
     use corro_tests::launch_test_agent;
+    use rusqlite::OptionalExtension;
+    use tokio::time::sleep;
     use tripwire::Tripwire;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn insert_rows_and_gossip() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-        let ta1 = launch_test_agent("test1", vec![], tripwire.clone()).await?;
-        let ta2 = launch_test_agent(
-            "test2",
-            vec![ta1.agent.gossip_addr().to_string()],
+
+        let tmpdir = tempfile::tempdir()?;
+        let schema_path = tmpdir.path().join("schema");
+        tokio::fs::create_dir(&schema_path).await?;
+        tokio::fs::copy(
+            "../../tests/fixtures/consul.sql",
+            schema_path.join("consul.sql"),
+        )
+        .await?;
+
+        let ta1 = launch_test_agent(
+            |conf| conf.schema_path(schema_path.display().to_string()).build(),
             tripwire.clone(),
         )
         .await?;
+        let ta2 = launch_test_agent(
+            |conf| {
+                conf.schema_path(schema_path.display().to_string())
+                    .bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+                    .build()
+            },
+            tripwire.clone(),
+        )
+        .await?;
+
+        let ta1_client = CorrosionClient::new(&CorrosionConfig {
+            api_addr: ta1.agent.api_addr().unwrap(),
+            base_path: ta1.agent.base_path().display().to_string().into(),
+        });
+
+        let mut services = HashMap::new();
+
+        let svc = AgentService {
+            id: "service-id".into(),
+            name: "service-name".into(),
+            tags: vec![],
+            meta: vec![("app_id".to_string(), "123".to_string())]
+                .into_iter()
+                .collect(),
+            port: 1337,
+            address: "127.0.0.1".into(),
+        };
+
+        services.insert("service-id".into(), svc.clone());
+
+        let mut hashes = HashMap::new();
+
+        let applied =
+            update_consul_services(&ta1_client, services.clone(), &mut hashes, "node-1", false)
+                .await?;
+
+        assert_eq!(applied.upserted, 1);
+        assert_eq!(applied.deleted, 0);
+
+        assert_eq!(hashes.get("service-id"), Some(&hash_service(&svc)));
+
+        let applied =
+            update_consul_services(&ta1_client, services, &mut hashes, "node-1", false).await?;
+
+        assert_eq!(applied.upserted, 0);
+        assert_eq!(applied.deleted, 0);
+
+        sleep(Duration::from_secs(2)).await;
+
+        let ta2_client = CorrosionClient::new(&CorrosionConfig {
+            api_addr: ta2.agent.api_addr().unwrap(),
+            base_path: ta2.agent.base_path().display().to_string().into(),
+        });
+
+        let conn = ta2_client.pool().get().await?;
+        let app_id: i64 =
+            conn.query_row("SELECT app_id FROM consul_services LIMIT 1", (), |row| {
+                row.get(0)
+            })?;
+        assert_eq!(app_id, 123);
+
+        let applied =
+            update_consul_services(&ta1_client, HashMap::new(), &mut hashes, "node-1", false)
+                .await?;
+
+        assert_eq!(applied.upserted, 0);
+        assert_eq!(applied.deleted, 1);
+
+        sleep(Duration::from_secs(1)).await;
+
+        let app_id: Option<i64> = conn
+            .query_row("SELECT app_id FROM consul_services LIMIT 1", (), |row| {
+                row.get(0)
+            })
+            .optional()?;
+        assert_eq!(app_id, None);
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;

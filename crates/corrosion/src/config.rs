@@ -16,6 +16,7 @@ pub struct Config {
     pub bootstrap: Vec<String>,
     #[serde(default)]
     pub log_format: LogFormat,
+    pub schema_path: Utf8PathBuf,
 }
 
 impl Config {
@@ -36,12 +37,13 @@ impl Config {
 
 #[derive(Debug, Default)]
 pub struct ConfigBuilder {
-    base_path: Option<Utf8PathBuf>,
+    pub base_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
     api_addr: Option<SocketAddr>,
     metrics_addr: Option<SocketAddr>,
     bootstrap: Option<Vec<String>>,
     log_format: Option<LogFormat>,
+    schema_path: Option<Utf8PathBuf>,
 }
 
 impl ConfigBuilder {
@@ -75,14 +77,22 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn schema_path<S: Into<Utf8PathBuf>>(mut self, path: S) -> Self {
+        self.schema_path = Some(path.into());
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigError> {
+        let base_path = self.base_path.unwrap_or_else(default_base_path);
+        let schema_path = self.schema_path.unwrap_or(base_path.join("schema"));
         Ok(Config {
-            base_path: self.base_path.unwrap_or_else(default_base_path),
+            base_path,
             gossip_addr: self.gossip_addr.ok_or(ConfigError::GossipAddrRequired)?,
             api_addr: self.api_addr,
             metrics_addr: self.metrics_addr,
             bootstrap: self.bootstrap.unwrap_or_default(),
             log_format: self.log_format.unwrap_or_default(),
+            schema_path,
         })
     }
 }

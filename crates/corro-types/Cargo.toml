@@ -29,3 +29,4 @@ compact_str = { workspace = true }
 uhlc = { workspace = true }
 serde_with = { workspace = true }
 rangemap = { workspace = true }
+camino = { workspace = true }

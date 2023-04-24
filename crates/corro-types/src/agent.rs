@@ -1,5 +1,6 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc};
 
+use camino::Utf8PathBuf;
 use parking_lot::{RwLock, RwLockReadGuard};
 use rangemap::RangeInclusiveMap;
 use tokio::sync::mpsc::Sender;
@@ -22,6 +23,7 @@ pub struct AgentInner {
     pub bookie: Bookie,
     pub subscribers: Subscribers,
     pub tx_bcast: Sender<BroadcastInput>,
+    pub base_path: Utf8PathBuf,
 }
 
 impl Agent {
@@ -58,6 +60,10 @@ impl Agent {
 
     pub fn bookie(&self) -> &Bookie {
         &self.0.bookie
+    }
+
+    pub fn base_path(&self) -> &Path {
+        self.0.base_path.as_std_path()
     }
 }
 

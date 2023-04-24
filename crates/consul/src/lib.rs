@@ -25,23 +25,42 @@ pub struct Client {
 
 impl Client {
     pub fn new(config: Config) -> ConsulResult<Self> {
-        let scheme = if config.tls.is_some() { "https" } else { "http" };
+        let scheme = if config.tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
         let ctor = if let Some(tls) = config.tls {
             // HTTPS path
             let mut root_store = RootCertStore::empty();
-            let mut cacert_file = BufReader::new(OpenOptions::new().read(true).open(&tls.ca_file).map_err(Error::TlsSetup)?);
+            let mut cacert_file = BufReader::new(
+                OpenOptions::new()
+                    .read(true)
+                    .open(&tls.ca_file)
+                    .map_err(Error::TlsSetup)?,
+            );
             for cacert in rustls_pemfile::certs(&mut cacert_file).map_err(Error::TlsSetup)? {
                 root_store.add(&Certificate(cacert))?;
             }
 
-            let mut cert_file = BufReader::new(OpenOptions::new().read(true).open(&tls.cert_file).map_err(Error::TlsSetup)?);
+            let mut cert_file = BufReader::new(
+                OpenOptions::new()
+                    .read(true)
+                    .open(&tls.cert_file)
+                    .map_err(Error::TlsSetup)?,
+            );
             let certs = rustls_pemfile::certs(&mut cert_file)
                 .map_err(Error::TlsSetup)?
                 .into_iter()
                 .map(Certificate)
                 .collect();
 
-            let mut key_file = BufReader::new(OpenOptions::new().read(true).open(&tls.key_file).map_err(Error::TlsSetup)?);
+            let mut key_file = BufReader::new(
+                OpenOptions::new()
+                    .read(true)
+                    .open(&tls.key_file)
+                    .map_err(Error::TlsSetup)?,
+            );
             let key = rustls_pemfile::pkcs8_private_keys(&mut key_file)
                 .map_err(Error::TlsSetup)?
                 .into_iter()
@@ -84,7 +103,11 @@ impl Client {
     }
 
     async fn request<P: Display, T: DeserializeOwned>(&self, path: P) -> ConsulResult<T> {
-        let res = match self.client.get(format!("{}{}", &self.addr, &path).parse()?).await {
+        let res = match self
+            .client
+            .get(format!("{}{}", &self.addr, &path).parse()?)
+            .await
+        {
             Ok(res) => res,
             Err(e) => {
                 return Err(e.into());
@@ -119,7 +142,7 @@ pub enum Error {
     Webpki(#[from] webpki::Error),
 }
 
-#[derive(Debug, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize)]
 #[serde(rename_all(deserialize = "PascalCase"))]
 pub struct AgentService {
     #[serde(rename(deserialize = "ID"))]

@@ -1,12 +1,11 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
 use corro_types::agent::Agent;
 use corrosion::{
     agent::start,
-    config::{Config, ConfigBuilder},
+    config::{Config, ConfigBuilder, ConfigError},
 };
 use tempfile::TempDir;
-use tracing::trace;
 use tripwire::Tripwire;
 
 const TEST_SCHEMA: &str = r#"
@@ -27,58 +26,24 @@ pub struct TestAgent {
     _tmpdir: Arc<TempDir>,
 }
 
-pub async fn launch_test_agent(
-    id: &str,
-    bootstrap: Vec<String>,
-    tripwire: Tripwire,
-) -> eyre::Result<TestAgent> {
-    launch_test_agent_w_gossip(id, "127.0.0.1:0".parse()?, bootstrap, "test", tripwire).await
-}
-
-pub async fn launch_test_agent_with_region(
-    id: &str,
-    bootstrap: Vec<String>,
-    region: &str,
-    tripwire: Tripwire,
-) -> eyre::Result<TestAgent> {
-    launch_test_agent_w_gossip(id, "127.0.0.1:0".parse()?, bootstrap, region, tripwire).await
-}
-
-pub async fn launch_test_agent_w_builder<F: FnOnce(ConfigBuilder) -> eyre::Result<Config>>(
+pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigError>>(
     f: F,
     tripwire: Tripwire,
 ) -> eyre::Result<TestAgent> {
     let tmpdir = tempfile::tempdir()?;
 
-    let conf = f(Config::builder().base_path(tmpdir.path().display().to_string()))?;
+    let conf = f(Config::builder()
+        .api_addr("127.0.0.1:0".parse()?)
+        .gossip_addr("127.0.0.1:0".parse()?)
+        .base_path(tmpdir.path().display().to_string()))?;
 
-    let schema_path = tmpdir.path().join("schema");
-    tokio::fs::create_dir(&schema_path).await?;
-    tokio::fs::write(schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes()).await?;
+    if conf.schema_path == conf.base_path.join("schema") {
+        tokio::fs::create_dir(&conf.schema_path).await?;
+        tokio::fs::write(conf.schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes()).await?;
+    }
 
     start(conf, tripwire).await.map(|agent| TestAgent {
         agent,
         _tmpdir: Arc::new(tmpdir),
     })
-}
-
-pub async fn launch_test_agent_w_gossip(
-    id: &str,
-    gossip_addr: SocketAddr,
-    bootstrap: Vec<String>,
-    _region: &str,
-    tripwire: Tripwire,
-) -> eyre::Result<TestAgent> {
-    trace!("launching test agent {id}");
-    launch_test_agent_w_builder(
-        move |conf| {
-            Ok(conf
-                .gossip_addr(gossip_addr)
-                .api_addr("127.0.0.1:0".parse()?)
-                .bootstrap(bootstrap)
-                .build()?)
-        },
-        tripwire,
-    )
-    .await
 }
