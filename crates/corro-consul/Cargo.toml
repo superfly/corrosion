@@ -28,3 +28,8 @@ rusqlite = { workspace = true }
 tripwire = { path = "../tripwire" }
 spawn = { path = "../spawn" }
 hostname = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+corrosion = { path = "../corrosion" }
+corro-tests = { path = "../corro-tests" }

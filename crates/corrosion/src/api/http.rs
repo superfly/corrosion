@@ -8,11 +8,12 @@ use serde_json::Value;
 use tokio::{sync::mpsc::Sender, task::block_in_place};
 use tracing::{error, trace};
 
-use crate::{
+use corro_types::{
     actor::ActorId,
+    agent::Bookie,
     broadcast::{BroadcastInput, Message, MessageV1},
-    types::change::Change,
-    Bookie, SqlitePool,
+    change::Change,
+    sqlite::SqlitePool,
 };
 
 // #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -219,13 +220,14 @@ pub async fn api_v1_db_execute(
 
 #[cfg(test)]
 mod tests {
+    use corro_types::sqlite::CrConnManager;
     use serde_json::json;
     use tokio::sync::mpsc::channel;
     use uuid::Uuid;
 
     use super::*;
 
-    use crate::{apply_schema, CrConnManager};
+    use crate::agent::apply_schema;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn rqlite_db_execute() -> eyre::Result<()> {

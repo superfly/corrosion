@@ -1,5 +1,4 @@
 use std::{
-    io,
     iter::Peekable,
     net::SocketAddr,
     num::NonZeroU32,
@@ -9,8 +8,8 @@ use std::{
 };
 
 use backoff::Backoff;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use foca::{Foca, Member, NoCustomBroadcast, Notification, Timer};
+use bytes::{BufMut, Bytes, BytesMut};
+use foca::{Foca, NoCustomBroadcast, Notification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future, FutureExt, StreamExt,
@@ -19,24 +18,18 @@ use hyper::client::HttpConnector;
 use metrics::{gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
-use speedy::{Readable, Writable};
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{channel, Receiver, Sender},
     time::{interval, MissedTickBehavior},
 };
-use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
-use crate::{
-    actor::{Actor, ActorId},
-    types::change::Change,
+use corro_types::{
+    actor::Actor,
+    broadcast::{BroadcastInput, DispatchRuntime, FocaInput, Message},
 };
-
-use self::runtime::DispatchRuntime;
-
-pub mod runtime;
 
 // TODO: do not hard code...
 pub const FRAGMENTS_AT: usize = 1420 // wg0 MTU
@@ -49,103 +42,6 @@ pub const EFFECTIVE_HTTP_BROADCAST_SIZE: usize = HTTP_BROADCAST_SIZE - 1;
 const BIG_PAYLOAD_THRESHOLD: usize = 32 * 1024;
 
 pub type ClientPool = hyper::Client<HttpConnector, hyper::Body>;
-
-#[derive(Debug)]
-pub enum BroadcastSrc {
-    Http(SocketAddr),
-    Udp(SocketAddr),
-}
-
-#[derive(Debug)]
-pub enum FocaInput {
-    Announce(Actor),
-    Data(Bytes, BroadcastSrc),
-    ClusterSize(NonZeroU32),
-    ApplyMany(Vec<Member<Actor>>),
-}
-
-#[derive(Debug, Clone, Readable, Writable)]
-pub enum Message {
-    V1(MessageV1),
-}
-
-#[derive(Debug, Clone, Readable, Writable)]
-pub enum MessageV1 {
-    Change {
-        actor_id: ActorId,
-        // internal version
-        version: i64,
-
-        changeset: Vec<Change>,
-    },
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum MessageEncodeError {
-    #[error(transparent)]
-    Encode(#[from] speedy::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum MessageDecodeError {
-    #[error(transparent)]
-    Decode(#[from] speedy::Error),
-    #[error("corrupted message, crc mismatch (got: {0}, expected {1})")]
-    Corrupted(u32, u32),
-}
-
-impl Message {
-    pub fn from_slice<S: AsRef<[u8]>>(slice: S) -> Result<Self, speedy::Error> {
-        Self::read_from_buffer(slice.as_ref())
-    }
-
-    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), MessageEncodeError> {
-        self.write_to_stream(buf.writer())?;
-        let mut bytes = buf.split();
-        let hash = crc32fast::hash(&bytes);
-        bytes.put_u32(hash);
-
-        let mut codec = LengthDelimitedCodec::builder()
-            .length_field_type::<u32>()
-            .new_codec();
-        codec.encode(bytes.split().freeze(), buf)?;
-
-        Ok(())
-    }
-
-    pub fn from_buf(buf: &mut BytesMut) -> Result<Message, MessageDecodeError> {
-        let len = buf.len();
-        trace!("successfully decoded a frame, len: {len}");
-
-        let mut crc_bytes = buf.split_off(len - 4);
-
-        let crc = crc_bytes.get_u32();
-        let new_crc = crc32fast::hash(&buf);
-        if crc != new_crc {
-            return Err(MessageDecodeError::Corrupted(crc, new_crc));
-        }
-
-        Ok(Message::from_slice(&buf)?)
-    }
-
-    pub fn decode(
-        codec: &mut LengthDelimitedCodec,
-        buf: &mut BytesMut,
-    ) -> eyre::Result<Option<Self>> {
-        Ok(match codec.decode(buf)? {
-            Some(mut buf) => Some(Self::from_buf(&mut buf)?),
-            None => None,
-        })
-    }
-}
-
-#[derive(Debug)]
-pub enum BroadcastInput {
-    Rebroadcast(Message),
-    AddBroadcast(Message),
-}
 
 pub fn runtime_loop(
     actor: Actor,

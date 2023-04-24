@@ -15,8 +15,6 @@ pub struct Config {
     #[serde(default)]
     pub bootstrap: Vec<String>,
     #[serde(default)]
-    pub consul: Option<consul::Config>,
-    #[serde(default)]
     pub log_format: LogFormat,
 }
 
@@ -43,7 +41,6 @@ pub struct ConfigBuilder {
     api_addr: Option<SocketAddr>,
     metrics_addr: Option<SocketAddr>,
     bootstrap: Option<Vec<String>>,
-    consul: Option<consul::Config>,
     log_format: Option<LogFormat>,
 }
 
@@ -73,11 +70,6 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn consul(mut self, consul: Option<consul::Config>) -> Self {
-        self.consul = consul;
-        self
-    }
-
     pub fn log_format(mut self, log_format: LogFormat) -> Self {
         self.log_format = Some(log_format);
         self
@@ -89,7 +81,6 @@ impl ConfigBuilder {
             gossip_addr: self.gossip_addr.ok_or(ConfigError::GossipAddrRequired)?,
             api_addr: self.api_addr,
             metrics_addr: self.metrics_addr,
-            consul: self.consul,
             bootstrap: self.bootstrap.unwrap_or_default(),
             log_format: self.log_format.unwrap_or_default(),
         })

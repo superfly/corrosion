@@ -575,3 +575,30 @@ pub async fn update_consul(
     let (svcs, checks) = tokio::join!(fut_services, fut_checks);
     [svcs, checks]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use corro_tests::launch_test_agent;
+    use tripwire::Tripwire;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn insert_rows_and_gossip() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let ta1 = launch_test_agent("test1", vec![], tripwire.clone()).await?;
+        let ta2 = launch_test_agent(
+            "test2",
+            vec![ta1.agent.gossip_addr().to_string()],
+            tripwire.clone(),
+        )
+        .await?;
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+}

@@ -1,13 +1,3 @@
-pub mod actor;
-pub mod api;
-pub mod broadcast;
-pub mod config;
-pub mod filters;
-pub mod json_schema;
-pub mod pubsub;
-pub mod sqlite;
-pub mod types;
-
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -22,40 +12,37 @@ use std::{
 };
 
 use crate::{
-    actor::Actor,
     api::{
         http::api_v1_db_execute,
-        peer::{peer_api_v1_broadcast, peer_api_v1_sync_post},
+        peer::{generate_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncMessage},
     },
-    broadcast::{runtime_loop, MessageV1},
-    config::DEFAULT_GOSSIP_PORT,
-    sqlite::{init_cr_conn, CrConn},
-    types::{agent::AgentInner, members::Members},
+    broadcast::{runtime_loop, ClientPool, FRAGMENTS_AT},
+    config::{Config, DEFAULT_GOSSIP_PORT},
 };
 
-use self::config::Config;
-use actor::ActorId;
-use api::peer::{generate_sync, SyncMessage};
+use corro_types::{
+    actor::{Actor, ActorId},
+    agent::{Agent, AgentInner, Booked, Bookie},
+    broadcast::{BroadcastInput, BroadcastSrc, FocaInput, Message, MessageDecodeError, MessageV1},
+    members::Members,
+    sqlite::{init_cr_conn, CrConn, CrConnManager, SqlitePool},
+};
+
 use axum::{
     error_handling::HandleErrorLayer, extract::DefaultBodyLimit, routing::post, BoxError,
     Extension, Router,
 };
-use broadcast::{
-    BroadcastInput, BroadcastSrc, ClientPool, FocaInput, Message, MessageDecodeError, FRAGMENTS_AT,
-};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use consul::Client as ConsulClient;
 use fallible_iterator::FallibleIterator;
 use foca::Notification;
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveMap;
 use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
 use spawn::spawn_counted;
-use sqlite::{CrConnManager, SqlitePool};
 use sqlite3_parser::{
     ast::{Cmd, CreateTableBody, Stmt},
     lexer::{sql::Parser, Input},
@@ -76,74 +63,10 @@ use trust_dns_resolver::{
     error::ResolveErrorKind,
     proto::rr::{RData, RecordType},
 };
-use types::agent::Agent;
 use uuid::Uuid;
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
-
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
-    Ok(())
-}
-
-#[derive(Default, Clone)]
-pub struct Booked(Arc<RwLock<RangeInclusiveMap<i64, Option<i64>>>>);
-
-impl Booked {
-    pub fn insert(&self, version: i64, db_version: Option<i64>) {
-        self.0.write().insert(version..=version, db_version);
-    }
-
-    pub fn contains(&self, version: i64) -> bool {
-        self.0.read().contains_key(&version)
-    }
-
-    pub fn last(&self) -> Option<i64> {
-        self.0.read().iter().map(|(k, _v)| *k.end()).max()
-    }
-
-    pub fn read(&self) -> RwLockReadGuard<RangeInclusiveMap<i64, Option<i64>>> {
-        self.0.read()
-    }
-}
-
-#[derive(Default, Clone)]
-pub struct Bookie(Arc<RwLock<HashMap<ActorId, Booked>>>);
-
-impl Bookie {
-    pub fn add(&self, actor_id: ActorId, version: i64, db_version: Option<i64>) {
-        {
-            if let Some(booked) = self.0.read().get(&actor_id) {
-                booked.insert(version, db_version);
-                return;
-            }
-        };
-
-        let mut w = self.0.write();
-        let booked = w.entry(actor_id).or_default();
-        booked.insert(version, db_version);
-    }
-
-    pub fn contains(&self, actor_id: ActorId, version: i64) -> bool {
-        self.0
-            .read()
-            .get(&actor_id)
-            .map(|booked| booked.contains(version))
-            .unwrap_or(false)
-    }
-
-    pub fn last(&self, actor_id: &ActorId) -> Option<i64> {
-        self.0
-            .read()
-            .get(&actor_id)
-            .and_then(|booked| booked.last())
-    }
-
-    pub fn read(&self) -> RwLockReadGuard<HashMap<ActorId, Booked>> {
-        self.0.read()
-    }
-}
 
 pub struct AgentOptions {
     actor_id: ActorId,
@@ -256,9 +179,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         }
     }
 
-    let bookie = Bookie(Arc::new(RwLock::new(
+    let bookie = Bookie::new(Arc::new(RwLock::new(
         bk.into_iter()
-            .map(|(k, v)| (k, Booked(Arc::new(RwLock::new(v)))))
+            .map(|(k, v)| (k, Booked::new(Arc::new(RwLock::new(v)))))
             .collect(),
     )));
 
@@ -291,7 +214,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         api_addr,
         members: RwLock::new(Members::default()),
         clock: clock.clone(),
-        consul: conf.consul.map(|c| ConsulClient::new(c).unwrap()),
         subscribers: Default::default(),
         bookie,
         tx_bcast,
@@ -1494,95 +1416,26 @@ fn set_user_version(conn: &Connection, v: usize) -> rusqlite::Result<()> {
 
 #[cfg(test)]
 pub mod tests {
-    use std::net::SocketAddr;
+    use std::{
+        collections::HashMap,
+        net::SocketAddr,
+        time::{Duration, Instant},
+    };
 
     use futures::{StreamExt, TryStreamExt};
+    use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
     use serde::Deserialize;
     use serde_json::json;
     use spawn::wait_for_all_pending_handles;
-    use tempfile::TempDir;
     use tokio::time::{sleep, MissedTickBehavior};
-    use tracing::info_span;
+    use tracing::{info, info_span};
+    use tripwire::Tripwire;
     use uuid::Uuid;
 
-    use crate::{api::peer::generate_sync, config::ConfigBuilder};
+    use crate::api::peer::generate_sync;
     use corro_types::api::{RqliteResponse, Statement};
 
-    use super::*;
-
-    const TEST_SCHEMA: &str = r#"
-        CREATE TABLE IF NOT EXISTS tests (
-            id INTEGER NOT NULL PRIMARY KEY,
-            text TEXT NOT NULL DEFAULT ""
-        ) WITHOUT ROWID;
-
-        CREATE TABLE IF NOT EXISTS tests2 (
-            id INTEGER NOT NULL PRIMARY KEY,
-            text TEXT NOT NULL DEFAULT ""
-        ) WITHOUT ROWID;
-    "#;
-
-    #[derive(Clone)]
-    pub struct TestAgent {
-        pub agent: Agent,
-        _tmpdir: Arc<TempDir>,
-    }
-
-    pub async fn launch_test_agent(
-        id: &str,
-        bootstrap: Vec<String>,
-        tripwire: Tripwire,
-    ) -> eyre::Result<TestAgent> {
-        launch_test_agent_w_gossip(id, "127.0.0.1:0".parse()?, bootstrap, "test", tripwire).await
-    }
-
-    pub async fn launch_test_agent_with_region(
-        id: &str,
-        bootstrap: Vec<String>,
-        region: &str,
-        tripwire: Tripwire,
-    ) -> eyre::Result<TestAgent> {
-        launch_test_agent_w_gossip(id, "127.0.0.1:0".parse()?, bootstrap, region, tripwire).await
-    }
-
-    pub async fn launch_test_agent_w_builder<F: FnOnce(ConfigBuilder) -> eyre::Result<Config>>(
-        f: F,
-        tripwire: Tripwire,
-    ) -> eyre::Result<TestAgent> {
-        let tmpdir = tempfile::tempdir()?;
-
-        let conf = f(Config::builder().base_path(tmpdir.path().display().to_string()))?;
-
-        let schema_path = tmpdir.path().join("schema");
-        tokio::fs::create_dir(&schema_path).await?;
-        tokio::fs::write(schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes()).await?;
-
-        start(conf, tripwire).await.map(|agent| TestAgent {
-            agent,
-            _tmpdir: Arc::new(tmpdir),
-        })
-    }
-
-    pub async fn launch_test_agent_w_gossip(
-        id: &str,
-        gossip_addr: SocketAddr,
-        bootstrap: Vec<String>,
-        _region: &str,
-        tripwire: Tripwire,
-    ) -> eyre::Result<TestAgent> {
-        trace!("launching test agent {id}");
-        launch_test_agent_w_builder(
-            move |conf| {
-                Ok(conf
-                    .gossip_addr(gossip_addr)
-                    .api_addr("127.0.0.1:0".parse()?)
-                    .bootstrap(bootstrap)
-                    .build()?)
-            },
-            tripwire,
-        )
-        .await
-    }
+    use corro_tests::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn insert_rows_and_gossip() -> eyre::Result<()> {

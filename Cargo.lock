@@ -548,7 +548,9 @@ dependencies = [
  "clap",
  "config",
  "consul",
+ "corro-tests",
  "corro-types",
+ "corrosion",
  "eyre",
  "futures",
  "hostname",
@@ -561,6 +563,20 @@ dependencies = [
  "spawn",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "tripwire",
+]
+
+[[package]]
+name = "corro-tests"
+version = "0.1.0"
+dependencies = [
+ "corro-types",
+ "corrosion",
+ "eyre",
+ "tempfile",
+ "tokio",
+ "tracing",
  "tripwire",
 ]
 
@@ -568,8 +584,31 @@ dependencies = [
 name = "corro-types"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bb8",
+ "bb8-rusqlite",
+ "bytes",
+ "compact_str",
+ "crc32fast",
+ "exprt",
+ "foca",
+ "metrics",
+ "once_cell",
+ "parking_lot",
+ "rand",
+ "rangemap",
+ "rusqlite",
  "serde",
  "serde_json",
+ "serde_with",
+ "speedy",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uhlc",
+ "uuid",
 ]
 
 [[package]]
@@ -588,6 +627,7 @@ dependencies = [
  "compact_str",
  "config",
  "consul",
+ "corro-tests",
  "corro-types",
  "crc32fast",
  "exprt",

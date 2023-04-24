@@ -21,15 +21,16 @@ use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
-use crate::broadcast::MessageV1;
-use crate::sqlite::SqlitePool;
-use crate::types::change::Change;
-use crate::{
+use crate::agent::handle_payload;
+
+use corro_types::{
     actor::ActorId,
+    agent::{Booked, Bookie},
+    broadcast::MessageV1,
     broadcast::{BroadcastSrc, FocaInput, Message},
-    handle_payload,
+    change::Change,
+    sqlite::SqlitePool,
 };
-use crate::{Booked, Bookie};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn peer_api_v1_broadcast(
@@ -138,14 +139,8 @@ pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncMessage {
         need: Default::default(),
     };
 
-    let actors: Vec<(ActorId, Booked)> = {
-        bookie
-            .0
-            .read()
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect()
-    };
+    let actors: Vec<(ActorId, Booked)> =
+        { bookie.read().iter().map(|(k, v)| (*k, v.clone())).collect() };
 
     for (actor_id, booked) in actors {
         let last_version = match booked.last() {
@@ -153,10 +148,8 @@ pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncMessage {
             None => continue,
         };
 
-        sync.need.insert(
-            actor_id,
-            booked.0.read().gaps(&(1..=last_version)).collect(),
-        );
+        sync.need
+            .insert(actor_id, booked.read().gaps(&(1..=last_version)).collect());
 
         sync.heads.insert(actor_id, last_version);
     }

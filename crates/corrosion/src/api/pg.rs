@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use corro_types::sqlite::SqlitePool;
 use futures::stream;
 use futures::Stream;
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -20,8 +21,6 @@ use rusqlite::{types::ValueRef, Statement, ToSql};
 use tokio::net::TcpListener;
 use tracing::debug;
 use tracing::info;
-
-use crate::SqlitePool;
 
 pub struct SqliteBackend {
     pool: SqlitePool,
