@@ -81,7 +81,6 @@ use uuid::Uuid;
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
-// const GOSSIP_HANDLE_THRESHOLD: Duration = Duration::from_secs(4);
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {

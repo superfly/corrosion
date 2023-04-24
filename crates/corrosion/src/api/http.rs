@@ -6,7 +6,7 @@ use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, ToSql};
 use serde_json::Value;
 use tokio::{sync::mpsc::Sender, task::block_in_place};
-use tracing::{debug, error, trace};
+use tracing::{error, trace};
 
 use crate::{
     actor::ActorId,
@@ -122,9 +122,7 @@ pub async fn api_v1_db_execute(
                 .collect::<Vec<RqliteResult>>();
 
             let last_version = bookie.last(&actor_id).unwrap_or(0);
-            debug!(actor_id = %actor_id.0, "last_version: {last_version}");
             let version = last_version + 1;
-            debug!(actor_id = %actor_id.0, "version: {version}");
 
             let (changes, db_version) = {
                 let mut prepped = tx.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version FROM crsql_changes WHERE site_id IS NULL AND db_version > ?"#)?;
@@ -168,6 +166,7 @@ pub async fn api_v1_db_execute(
             let elapsed = start.elapsed();
 
             let msg = if !changes.is_empty() {
+                bookie.add(actor_id, version, db_version);
                 Some(BroadcastInput::AddBroadcast(Message::V1(
                     MessageV1::Change {
                         actor_id,
@@ -178,12 +177,6 @@ pub async fn api_v1_db_execute(
             } else {
                 None
             };
-
-            debug!(actor_id = %actor_id.0, "recording version: {version}");
-
-            bookie.add(actor_id, version, db_version);
-
-            debug!(actor_id = %actor_id.0, "recorded version: {version}");
 
             Ok((results, msg, elapsed))
         })
