@@ -1,5 +1,5 @@
 use std::{
-    cmp, io,
+    io,
     iter::Peekable,
     net::SocketAddr,
     num::NonZeroU32,
@@ -73,8 +73,9 @@ pub enum Message {
 pub enum MessageV1 {
     Change {
         actor_id: ActorId,
-        start_version: i64,
-        end_version: i64,
+        // internal version
+        version: i64,
+
         changeset: Vec<Change>,
     },
 }

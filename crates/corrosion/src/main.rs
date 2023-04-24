@@ -16,7 +16,6 @@ use std::{
     fs::DirEntry,
     io::{self, Read, Write},
     net::SocketAddr,
-    ops::RangeInclusive,
     path::Path,
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
@@ -53,7 +52,7 @@ use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::{RwLock, RwLockReadGuard};
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
-use rangemap::RangeInclusiveSet;
+use rangemap::RangeInclusiveMap;
 use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
 use spawn::spawn_counted;
 use sqlite::{CrConnManager, SqlitePool};
@@ -77,7 +76,7 @@ use trust_dns_resolver::{
     error::ResolveErrorKind,
     proto::rr::{RData, RecordType},
 };
-use types::{agent::Agent, change::Change};
+use types::agent::Agent;
 use uuid::Uuid;
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
@@ -90,27 +89,22 @@ async fn main() -> eyre::Result<()> {
 }
 
 #[derive(Default, Clone)]
-pub struct Booked(Arc<RwLock<RangeInclusiveSet<i64>>>);
+pub struct Booked(Arc<RwLock<RangeInclusiveMap<i64, Option<i64>>>>);
 
 impl Booked {
-    pub fn insert(&self, start: i64, end: i64) {
-        self.0.write().insert(start..=end);
+    pub fn insert(&self, version: i64, db_version: Option<i64>) {
+        self.0.write().insert(version..=version, db_version);
     }
 
     pub fn contains(&self, version: i64) -> bool {
-        self.0.read().contains(&version)
-    }
-
-    pub fn contains_range(&self, mut range: RangeInclusive<i64>) -> bool {
-        let r = self.0.read();
-        range.all(|v| r.contains(&v))
+        self.0.read().contains_key(&version)
     }
 
     pub fn last(&self) -> Option<i64> {
-        self.0.read().iter().map(|range| range.end()).max().copied()
+        self.0.read().iter().map(|(k, _v)| *k.end()).max()
     }
 
-    pub fn read(&self) -> RwLockReadGuard<RangeInclusiveSet<i64>> {
+    pub fn read(&self) -> RwLockReadGuard<RangeInclusiveMap<i64, Option<i64>>> {
         self.0.read()
     }
 }
@@ -119,14 +113,17 @@ impl Booked {
 pub struct Bookie(Arc<RwLock<HashMap<ActorId, Booked>>>);
 
 impl Bookie {
-    pub fn add(&self, actor_id: ActorId, start: i64, end: i64) {
-        if let Some(booked) = { self.0.read().get(&actor_id).cloned() } {
-            booked.insert(start, end);
-            return;
-        }
+    pub fn add(&self, actor_id: ActorId, version: i64, db_version: Option<i64>) {
+        {
+            if let Some(booked) = self.0.read().get(&actor_id) {
+                booked.insert(version, db_version);
+                return;
+            }
+        };
+
         let mut w = self.0.write();
         let booked = w.entry(actor_id).or_default();
-        booked.insert(start, end);
+        booked.insert(version, db_version);
     }
 
     pub fn contains(&self, actor_id: ActorId, version: i64) -> bool {
@@ -134,15 +131,6 @@ impl Bookie {
             .read()
             .get(&actor_id)
             .map(|booked| booked.contains(version))
-            .unwrap_or(false)
-    }
-
-    // check if a whole range is fully contained in bookkeeping
-    pub fn contains_range(&self, actor_id: ActorId, range: RangeInclusive<i64>) -> bool {
-        let booked = self.0.read().get(&actor_id).cloned();
-
-        booked
-            .map(|booked| booked.contains_range(range))
             .unwrap_or(false)
     }
 
@@ -248,13 +236,12 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         .build_unchecked(CrConnManager::new_read_only(&state_db_path));
     debug!("built RO pool");
 
-    let mut bk: HashMap<ActorId, RangeInclusiveSet<i64>> = HashMap::new();
+    let mut bk: HashMap<ActorId, RangeInclusiveMap<i64, Option<i64>>> = HashMap::new();
 
     {
         let conn = ro_pool.get().await?;
-        let mut prepped = conn.prepare_cached(
-            "SELECT actor_id, start_version, end_version FROM __corro_bookkeeping",
-        )?;
+        let mut prepped =
+            conn.prepare_cached("SELECT actor_id, version, db_version FROM __corro_bookkeeping")?;
         let mut rows = prepped.query([])?;
 
         loop {
@@ -263,7 +250,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 None => break,
                 Some(row) => {
                     let ranges = bk.entry(ActorId(row.get::<_, Uuid>(0)?)).or_default();
-                    ranges.insert(row.get(1)?..=row.get(2)?);
+                    let v = row.get(1)?;
+                    ranges.insert(v..=v, row.get(2)?);
                 }
             }
         }
@@ -638,7 +626,7 @@ async fn handle_gossip(
     let mut rebroadcast = vec![];
 
     for msg in messages {
-        if process_msg(agent.actor_id(), &msg, bookie, agent.read_write_pool()).await? {
+        if process_msg(&msg, bookie, agent.read_write_pool()).await? {
             rebroadcast.push(msg);
         }
     }
@@ -970,13 +958,12 @@ pub async fn handle_broadcast(
                     Message::V1(v1) => match v1 {
                         MessageV1::Change {
                             actor_id,
-                            start_version,
-                            end_version,
+                            version,
                             changeset,
                         } => {
                             increment_counter!("corrosion.broadcast.recv.count", "kind" => "operation");
 
-                            if bookie.contains_range(actor_id, start_version..=end_version) {
+                            if bookie.contains(actor_id, version) {
                                 trace!("already seen, stop disseminating");
                                 continue;
                             }
@@ -985,8 +972,7 @@ pub async fn handle_broadcast(
                                 bcast_tx
                                     .send(Message::V1(MessageV1::Change {
                                         actor_id,
-                                        start_version,
-                                        end_version,
+                                        version,
                                         changeset,
                                     }))
                                     .await
@@ -1012,7 +998,6 @@ pub async fn handle_broadcast(
 }
 
 async fn process_msg(
-    local_actor_id: ActorId,
     msg: &Message,
     bookie: &Bookie,
     pool: &SqlitePool,
@@ -1020,28 +1005,30 @@ async fn process_msg(
     match msg {
         Message::V1(MessageV1::Change {
             actor_id,
-            start_version,
-            end_version,
+            version,
             changeset,
         }) => {
-            if bookie.contains_range(*actor_id, *start_version..=*end_version) {
+            if bookie.contains(*actor_id, *version) {
                 trace!(
-                    "already seen this one! from: {}, range: {start_version}..={end_version}",
+                    "already seen this one! from: {}, version: {version}",
                     actor_id.hyphenated()
                 );
                 return Ok(false);
             }
 
-            debug!(
-                "received {} changes to process from: {}, range: {start_version}..={end_version}",
+            trace!(
+                "received {} changes to process from: {}, version: {version}",
                 changeset.len(),
                 actor_id.hyphenated()
             );
 
             let mut conn = pool.get().await?;
 
-            let new_local_db_version = block_in_place(move || {
+            let db_version = block_in_place(move || {
                 let tx = conn.transaction()?;
+
+                let start_version: i64 =
+                    tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
 
                 for change in changeset.iter() {
                     tx.prepare_cached(
@@ -1060,74 +1047,29 @@ async fn process_msg(
                         change.db_version,
                         &change.site_id
                     ])?;
-
-                    handle_inner_change(&tx, change)?;
                 }
 
-                let updated = tx.prepare_cached("UPDATE __corro_bookkeeping SET end_version = ? WHERE actor_id = ? AND start_version = ?")?.execute(params![end_version, actor_id.0, start_version])?;
+                let end_version: i64 = tx
+                    .prepare_cached("SELECT MAX(db_version) FROM crsql_changes;")?
+                    .query_row((), |row| row.get(0))?;
 
-                if updated == 0 {
-                    tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);")?.execute(params![actor_id.0, start_version, end_version])?;
-                }
+                let db_version = if end_version > start_version {
+                    Some(end_version)
+                } else {
+                    None
+                };
 
-                let db_version: i64 =
-                    tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
-
-                tx.prepare_cached(
-                    r#"
-                        INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version)
-                            VALUES (?, ?, ?)
-                            ON CONFLICT (actor_id, start_version) DO UPDATE SET
-                                end_version = excluded.end_version;
-                    "#,
-                )?
-                .execute(params![local_actor_id.0, 0, db_version])?;
+                tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, version, db_version) VALUES (?, ?, ?);")?.execute(params![actor_id.0, version, db_version])?;
 
                 tx.commit()?;
 
                 Ok::<_, bb8_rusqlite::Error>(db_version)
             })?;
 
-            bookie.add(*actor_id, *start_version, *end_version);
-
-            // cover the whole range here
-            bookie.add(local_actor_id, 0, new_local_db_version);
+            bookie.add(*actor_id, *version, db_version);
         }
     }
     Ok(true)
-}
-
-fn handle_inner_change(tx: &Transaction, change: &Change) -> rusqlite::Result<()> {
-    // deletes are gonna suck!
-
-    let updated = if change.cid == "__crsql_del" {
-        tx.prepare_cached("
-            UPDATE __corro_changes SET cid = ?, val = NULL, col_version = ?, db_version = ?, site_id = ? WHERE tbl_name = ? AND pk = ?;
-        ")?.execute(params!["__crsql_del", change.col_version, change.db_version, &change.site_id, change.table.as_str(), change.pk.as_str()])?
-    } else {
-        tx.prepare_cached("
-            UPDATE __corro_changes SET val = ?, col_version = ?, db_version = ?, site_id = ? WHERE tbl_name = ? AND pk = ? AND cid = ?;
-        ")?.execute(params![&change.val, change.col_version, change.db_version, &change.site_id, change.table.as_str(), change.pk.as_str(), change.cid.as_str()])?
-    };
-    // need to insert...
-    if updated == 0 {
-        tx.prepare_cached(
-            "
-            INSERT INTO __corro_changes (tbl_name, pk, cid, val, col_version, db_version, site_id)
-                VALUES (?,?,?,?,?,?,?)
-        ",
-        )?
-        .execute(params![
-            change.table.as_str(),
-            change.pk.as_str(),
-            change.cid.as_str(),
-            &change.val,
-            change.col_version,
-            change.db_version,
-            &change.site_id
-        ])?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1217,7 +1159,7 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
         };
 
         info!(
-            "syncing between {} <=> {}, need len: {}",
+            "syncing from: {} to: {}, need len: {}",
             sync.actor_id.hyphenated(),
             actor_id.hyphenated(),
             sync.need_len(),
@@ -1341,13 +1283,7 @@ async fn handle_sync_receive(
     while let Some(buf_res) = framed.next().await {
         let mut buf = buf_res?;
         let msg = Message::from_buf(&mut buf)?;
-        process_msg(
-            agent.actor_id(),
-            &msg,
-            agent.bookie(),
-            agent.read_write_pool(),
-        )
-        .await?;
+        process_msg(&msg, agent.bookie(), agent.read_write_pool()).await?;
         match msg {
             Message::V1(MessageV1::Change { ref changeset, .. }) => count += changeset.len(),
         }
@@ -1457,39 +1393,24 @@ impl Migration for fn(&Transaction) -> eyre::Result<()> {
 fn init_migration(tx: &Transaction) -> Result<(), eyre::Report> {
     tx.execute_batch(
         r#"
-    CREATE TABLE __corro_bookkeeping (
-        actor_id BLOB NOT NULL,
-        start_version INTEGER NOT NULL,
-        end_version INTEGER NOT NULL,
-        PRIMARY KEY (actor_id, start_version)
-    ) WITHOUT ROWID;
-    
-    CREATE INDEX __corro_bookkeeping_end_version ON __corro_bookkeeping (end_version);
-    
-    CREATE TABLE __corro_members (
-        id BLOB PRIMARY KEY NOT NULL,
-        address TEXT NOT NULL,
-    
-        state TEXT NOT NULL DEFAULT 'down',
-    
-        foca_state JSON
-    ) WITHOUT ROWID;
-
-    -- temporary table while cr-sqlite is fixed...
-    CREATE TABLE __corro_changes(
-        tbl_name TEXT NOT NULL,
-        pk TEXT NOT NULL,
-        cid TEXT NOT NULL,
-        val ANY,
-        col_version INTEGER NOT NULL,
-        db_version INTEGER NOT NULL,
-        site_id BLOB NOT NULL
-      ) STRICT;
-
-      CREATE INDEX __corro_changes_site_id_db_version ON __corro_changes (site_id, db_version ASC);
-      CREATE INDEX __corro_changes_all ON __corro_changes (tbl_name, pk, cid);
-    "#,
+            CREATE TABLE __corro_bookkeeping (
+                actor_id BLOB NOT NULL,
+                version INTEGER NOT NULL,
+                db_version INTEGER,
+                PRIMARY KEY (actor_id, version)
+            ) WITHOUT ROWID;
+                        
+            CREATE TABLE __corro_members (
+                id BLOB PRIMARY KEY NOT NULL,
+                address TEXT NOT NULL,
+            
+                state TEXT NOT NULL DEFAULT 'down',
+            
+                foca_state JSON
+            ) WITHOUT ROWID;
+        "#,
     )?;
+
     Ok(())
 }
 
@@ -1585,7 +1506,7 @@ pub mod tests {
     use tracing::info_span;
     use uuid::Uuid;
 
-    use crate::{api::peer::generate_sync, config::ConfigBuilder, types::change::SqliteValue};
+    use crate::{api::peer::generate_sync, config::ConfigBuilder};
     use corro_types::api::{RqliteResponse, Statement};
 
     use super::*;
@@ -1685,7 +1606,7 @@ pub mod tests {
             "INSERT INTO tests (id,text) VALUES (?,?)",
             1,
             "hello world 1"
-        ]]))?;
+        ],]))?;
 
         println!("stmts: {req_body:?}");
 
@@ -1704,6 +1625,13 @@ pub mod tests {
 
         let body: RqliteResponse =
             serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+
+        let dbversion: i64 = ta1.agent.read_only_pool().get().await?.query_row(
+            "SELECT crsql_dbversion();",
+            (),
+            |row| row.get(0),
+        )?;
+        assert_eq!(dbversion, 1);
 
         println!("body: {body:?}");
 
@@ -1774,19 +1702,28 @@ pub mod tests {
 
         println!("body: {body:?}");
 
-        let bk = ta1.agent.read_only_pool().get().await?.query_row(
-            "SELECT actor_id, start_version, end_version FROM __corro_bookkeeping",
-            [],
-            |row| {
+        let bk: Vec<(Uuid, i64, i64)> = ta1
+            .agent
+            .read_only_pool()
+            .get()
+            .await?
+            .prepare("SELECT actor_id, version, db_version FROM __corro_bookkeeping")?
+            .query_map((), |row| {
                 Ok((
                     row.get::<_, Uuid>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                 ))
-            },
-        )?;
+            })?
+            .collect::<rusqlite::Result<_>>()?;
 
-        assert_eq!(bk, (ta1.agent.actor_id().0, 0, 2));
+        assert_eq!(
+            bk,
+            vec![
+                (ta1.agent.actor_id().0, 1, 1),
+                (ta1.agent.actor_id().0, 2, 2)
+            ]
+        );
 
         let svc: TestRecord = ta1.agent.read_only_pool().get().await?.query_row(
             "SELECT id, text FROM tests WHERE id = 2;",
@@ -1941,98 +1878,39 @@ pub mod tests {
             println!("checking status after {}s", start.elapsed().as_secs_f32());
             let mut v = vec![];
             for ta in agents.iter() {
+                let span = info_span!("consistency", actor_id = %ta.agent.actor_id().0);
+                let _entered = span.enter();
+
                 let conn = ta.agent.read_only_pool().get().await?;
-                let count: i64 =
-                    conn.query_row("SELECT count(*) FROM crsql_changes;", [], |row| row.get(0))?;
-                println!(
-                    "agent {} has {count} versions",
-                    ta.agent.actor_id().hyphenated(),
-                );
+                let counts: HashMap<Uuid, i64> = conn
+                    .prepare_cached(
+                        "SELECT COALESCE(site_id, crsql_siteid()), count(*) FROM crsql_changes GROUP BY site_id;",
+                    )?
+                    .query_map([], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+
+                info!("versions count: {counts:?}");
+
+                let actual_count: i64 =
+                    conn.query_row("SELECT count(*) FROM crsql_changes;", (), |row| row.get(0))?;
+                info!("actual count: {actual_count}");
 
                 let bookie = ta.agent.bookie();
 
-                println!(
-                    "agent {}'s last version: {:?}",
-                    ta.agent.actor_id().hyphenated(),
-                    bookie.last(&ta.agent.actor_id())
-                );
+                info!("last version: {:?}", bookie.last(&ta.agent.actor_id()));
 
-                // println!(
-                //     "agent {}'s sync: {:?}",
-                //     ta.agent.actor_id().hyphenated(),
-                //     generate_sync(bookie, ta.agent.actor_id())
-                // );
+                let sync = generate_sync(bookie, ta.agent.actor_id());
+                let needed = sync.need_len();
 
-                type HMKey = (String, String, String);
-                type HMValue = (SqliteValue, i64, i64, Uuid);
-                type HM = HashMap<(String, String, String), (SqliteValue, i64, i64, Uuid)>;
+                info!("generated sync: {sync:?}");
+                info!("needed: {needed}");
 
-                // let mut prepped = conn.prepare_cached("SELECT * FROM crsql_changes")?;
-
-                // let actor_id = ta.agent.actor_id().hyphenated();
-                // let span = info_span!("consistency", %actor_id);
-                // let _entered = span.enter();
-
-                // let crsql_data = prepped
-                //     .query_map([], |row| {
-                //         Ok((
-                //             (
-                //                 row.get::<_, String>(0)?,
-                //                 row.get::<_, String>(1)?,
-                //                 row.get::<_, String>(2)?,
-                //             ),
-                //             (row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?),
-                //         ))
-                //     })?
-                //     .collect::<Result<HM, rusqlite::Error>>()?;
-
-                // let mut prepped = conn.prepare_cached("SELECT * FROM __corro_changes")?;
-
-                // let mut corro_data = prepped
-                //     .query_map([], |row| {
-                //         Ok((
-                //             (
-                //                 row.get::<_, String>(0)?,
-                //                 row.get::<_, String>(1)?,
-                //                 row.get::<_, String>(2)?,
-                //             ),
-                //             (row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?),
-                //         ))
-                //     })?
-                //     .collect::<Result<HM, rusqlite::Error>>()?;
-
-                // for (k, v) in crsql_data {
-                //     match corro_data.remove(&k) {
-                //         Some((corro_val, corro_col_v, corro_db_v, corro_site_id)) => {
-                //             let (crsql_val, crsql_col_v, crsql_db_v, crsql_site_id) = v;
-                //             if (&corro_val, &corro_col_v, &corro_db_v, &corro_site_id)
-                //                 != (&crsql_val, &crsql_col_v, &crsql_db_v, &crsql_site_id)
-                //             {
-                //                 if corro_val != crsql_val {
-                //                     warn!(%crsql_site_id, "mismatched val for {k:?} (crsql: {crsql_val:?} != corro {corro_val:?})");
-                //                 }
-                //                 if corro_col_v != crsql_col_v {
-                //                     warn!(%crsql_site_id, "mismatched col_v for {k:?} (crsql: {crsql_col_v:?} != corro {corro_col_v:?})");
-                //                 }
-                //                 if corro_db_v != crsql_db_v {
-                //                     warn!(%crsql_site_id, "mismatched db_v for {k:?} (crsql: {crsql_db_v:?} != corro {corro_db_v:?})");
-                //                 }
-                //                 if corro_site_id != crsql_site_id {
-                //                     warn!(%crsql_site_id, "mismatched site_id for {k:?} (crsql: {crsql_site_id:?} != corro {corro_site_id:?})");
-                //                 }
-                //             }
-                //         }
-                //         None => {
-                //             warn!("Missing {k:?} from corro's data. Value: {v:?}");
-                //         }
-                //     }
-                // }
-
-                // for (k, v) in corro_data {
-                //     warn!("extraneous key in corrosion's data: {k:?} => {v:?}");
-                // }
-
-                v.push((count as usize, 0));
+                v.push((counts.values().sum::<i64>(), needed));
             }
             if v.len() != agents.len() {
                 println!("got {} actors, expecting {}", v.len(), agents.len());

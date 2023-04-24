@@ -1,4 +1,3 @@
-use std::cmp;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
@@ -20,6 +19,7 @@ use tokio::task::block_in_place;
 use tokio::time::timeout;
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, trace, warn};
+use uuid::Uuid;
 
 use crate::broadcast::MessageV1;
 use crate::sqlite::SqlitePool;
@@ -155,7 +155,7 @@ pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncMessage {
 
         sync.need.insert(
             actor_id,
-            booked.0.read().gaps(&(0..=last_version)).collect(),
+            booked.0.read().gaps(&(1..=last_version)).collect(),
         );
 
         sync.heads.insert(actor_id, last_version);
@@ -195,27 +195,18 @@ pub enum SyncError {
 #[error("unknown accept header value '{0}'")]
 pub struct UnknownAcceptHeaderValue(String);
 
-const MAX_CHANGES: i32 = 20;
-
-fn send_msg(
-    actor_id: ActorId,
-    start: i64,
-    end: i64,
-    changeset: &mut Vec<Change>,
-    sender: &Sender<Message>,
-) {
+fn send_msg(actor_id: ActorId, version: i64, changeset: Vec<Change>, sender: &Sender<Message>) {
     let changeset_len = changeset.len();
 
     // build the Message
     let msg = Message::V1(MessageV1::Change {
         actor_id,
-        start_version: start,
-        end_version: end,
-        changeset: changeset.drain(..).collect(),
+        version,
+        changeset,
     });
 
     trace!(
-        "sending msg: actor: {}, start: {start}, end: {end}, changes len: {changeset_len}",
+        "sending msg: actor: {}, version: {version}, changes len: {changeset_len}",
         actor_id.hyphenated(),
     );
 
@@ -232,100 +223,88 @@ fn send_msg(
 }
 
 fn process_range(
+    booked: &Booked,
     conn: &Connection,
+    range: &RangeInclusive<i64>,
     actor_id: ActorId,
-    mut start: i64,
-    end: i64,
+    is_local: bool,
     sender: &Sender<Message>,
 ) -> eyre::Result<()> {
+    let (start, end) = (range.start(), range.end());
     trace!(
         "processing range {start}..={end} for {}",
         actor_id.hyphenated()
     );
 
-    let original_start = start;
+    let overlapping: Vec<(i64, Option<i64>)> = {
+        booked
+            .read()
+            .overlapping(range)
+            .map(|(k, v)| (*k.end(), v.clone()))
+            .collect()
+    };
 
+    for (version, db_version) in overlapping {
+        match db_version {
+            Some(db_version) => block_in_place(|| {
+                process_version(&conn, version, db_version, actor_id, is_local, &sender)
+            })?,
+            None => {
+                send_msg(actor_id, version, vec![], sender);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn process_version(
+    conn: &Connection,
+    version: i64,
+    db_version: i64,
+    actor_id: ActorId,
+    is_local: bool,
+    sender: &Sender<Message>,
+) -> eyre::Result<()> {
     let mut prepped = conn.prepare_cached(
         r#"
-            SELECT tbl_name, pk, cid, val, col_version, db_version, site_id
-                FROM __corro_changes
-                WHERE site_id = ? AND db_version >= ? AND db_version <= ?
-                ORDER BY db_version ASC
+            SELECT "table", pk, cid, val, col_version, db_version, COALESCE(site_id, crsql_siteid())
+                FROM crsql_changes
+                WHERE site_id IS ? AND db_version = ?
         "#,
     )?;
 
     trace!(
         "prepped query successfully, querying with {}, {}",
         actor_id.hyphenated(),
-        original_start
+        version
     );
 
-    let mut rows = prepped.query_map(params![actor_id.0, original_start, end], |row| {
-        Ok(Change {
-            table: row.get(0)?,
-            pk: row.get(1)?,
-            cid: row.get(2)?,
-            val: row.get(3)?,
-            col_version: row.get(4)?,
-            db_version: row.get(5)?,
-            site_id: row.get(6)?,
-        })
-    })?;
+    let site_id: Option<Uuid> = if is_local { None } else { Some(actor_id.0) };
 
-    let mut last_version = start;
-    let mut count = MAX_CHANGES;
+    let changeset: Vec<Change> = prepped
+        .query_map(params![site_id, db_version], |row| {
+            Ok(Change {
+                table: row.get(0)?,
+                pk: row.get(1)?,
+                cid: row.get(2)?,
+                val: row.get(3)?,
+                col_version: row.get(4)?,
+                db_version: row.get(5)?,
+                site_id: row.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<Change>>>()?;
 
-    let mut changeset = vec![];
+    send_msg(actor_id, version, changeset, &sender);
 
-    while let Some(row) = rows.next() {
-        // trace!("processing a row {row:?}");
-
-        let change = row?;
-
-        if change.db_version > end {
-            warn!("went overboard, that shouldn't happen!");
-            break;
-        }
-
-        // we don't want to send much more than this!
-        if count <= 0 {
-            trace!(
-                "count is under 0: {count}, last_version: {last_version}, change.db_version: {}",
-                change.db_version
-            );
-            // ... but we wanna send all the data between versions, that's for sure.
-            if change.db_version > last_version {
-                send_msg(actor_id, start, last_version, &mut changeset, &sender);
-
-                // this is the new start value
-                start = last_version + 1;
-                // reset the count
-                count = MAX_CHANGES;
-            }
-        }
-
-        // current last version we've seen
-        last_version = change.db_version;
-
-        // put that change in the changeset for the next msg send
-        changeset.push(change);
-
-        // decrement count
-        count -= 1;
-    }
-
-    // no more messages!
-
-    trace!("(after loop) sending pending changes");
-
-    send_msg(actor_id, start, end, &mut changeset, &sender);
-
-    trace!("done processing original range: {original_start}..={end}");
+    trace!("done processing db version: {db_version}");
 
     Ok(())
 }
 
 async fn process_sync(
+    local_actor_id: ActorId,
     pool: SqlitePool,
     bookie: Bookie,
     sync: SyncMessage,
@@ -337,31 +316,22 @@ async fn process_sync(
         { bookie.read().iter().map(|(k, v)| (*k, v.clone())).collect() };
 
     for (actor_id, booked) in bookie {
-        if let Some(needed) = sync.need.get(&actor_id) {
-            for range in needed {
-                let overlapping: Vec<RangeInclusive<i64>> =
-                    { booked.read().overlapping(&range).cloned().collect() };
-
-                for overlap in overlapping {
-                    block_in_place(|| {
-                        process_range(
-                            &conn,
-                            actor_id,
-                            *overlap.start(),
-                            *cmp::max(overlap.end(), range.end()),
-                            &sender,
-                        )
-                    })?;
-                }
-            }
-        }
-
         if actor_id == sync.actor_id {
             trace!("skipping itself!");
             // don't send the requester's data
             continue;
         }
 
+        let is_local = actor_id == local_actor_id;
+
+        // 1. process needed versions
+        if let Some(needed) = sync.need.get(&actor_id) {
+            for range in needed {
+                process_range(&booked, &conn, range, actor_id, is_local, &sender)?;
+            }
+        }
+
+        // 2. process newer-than-heads
         let their_last_version = sync.heads.get(&actor_id).copied().unwrap_or(0);
         let our_last_version = booked.last().unwrap_or(0);
 
@@ -371,15 +341,15 @@ async fn process_sync(
             // nothing to teach the other node!
             continue;
         }
-        block_in_place(|| {
-            process_range(
-                &conn,
-                actor_id,
-                their_last_version,
-                our_last_version,
-                &sender,
-            )
-        })?;
+
+        process_range(
+            &booked,
+            &conn,
+            &((their_last_version + 1)..=our_last_version),
+            actor_id,
+            is_local,
+            &sender,
+        )?;
     }
 
     debug!("done with sync process");
@@ -389,6 +359,7 @@ async fn process_sync(
 
 pub async fn peer_api_v1_sync_post(
     headers: HeaderMap,
+    Extension(actor_id): Extension<ActorId>,
     Extension(pool): Extension<SqlitePool>,
     Extension(bookie): Extension<Bookie>,
     Extension(clock): Extension<Arc<uhlc::HLC>>,
@@ -452,7 +423,7 @@ pub async fn peer_api_v1_sync_post(
         let sync = serde_json::from_slice(bytes.as_ref())?;
 
         let now = Instant::now();
-        match process_sync(pool, bookie, sync, tx).await {
+        match process_sync(actor_id, pool, bookie, sync, tx).await {
             Ok(_) => {
                 histogram!(
                     "corrosion.sync.server.process.time.seconds",

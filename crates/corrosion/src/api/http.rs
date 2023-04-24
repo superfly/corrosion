@@ -6,12 +6,11 @@ use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, ToSql};
 use serde_json::Value;
 use tokio::{sync::mpsc::Sender, task::block_in_place};
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 
 use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, Message, MessageV1},
-    handle_inner_change,
     types::change::Change,
     Bookie, SqlitePool,
 };
@@ -56,6 +55,10 @@ pub async fn api_v1_db_execute(
         let start = Instant::now();
         block_in_place(move || {
             let tx = conn.transaction()?;
+
+            let start_version: i64 = tx
+                .prepare_cached("SELECT crsql_dbversion();")?
+                .query_row((), |row| row.get(0))?;
 
             let mut total_rows_affected = 0;
 
@@ -118,12 +121,17 @@ pub async fn api_v1_db_execute(
                 })
                 .collect::<Vec<RqliteResult>>();
 
-            let previous_end_version = bookie.last(&actor_id).unwrap_or(0);
+            let last_version = bookie.last(&actor_id).unwrap_or(0);
+            debug!(actor_id = %actor_id.0, "last_version: {last_version}");
+            let version = last_version + 1;
+            debug!(actor_id = %actor_id.0, "version: {version}");
 
-            let (changes, max_version): (Vec<Change>, i64) = {
-                let mut prepped = tx.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, site_id FROM crsql_changes WHERE site_id IS NULL AND db_version > ?"#)?;
+            let (changes, db_version) = {
+                let mut prepped = tx.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version FROM crsql_changes WHERE site_id IS NULL AND db_version > ?"#)?;
 
-                let mapped = prepped.query_map([previous_end_version], |row| {
+                let mut end_version = start_version;
+
+                let mapped = prepped.query_map([start_version], |row| {
                     let change = Change {
                         table: row.get(0)?,
                         pk: row.get(1)?,
@@ -131,41 +139,39 @@ pub async fn api_v1_db_execute(
                         val: row.get(3)?,
                         col_version: row.get(4)?,
                         db_version: row.get(5)?,
-                        site_id: row.get(6)?,
+                        site_id: actor_id.0.into_bytes(),
                     };
+                    end_version = cmp::max(end_version, change.db_version);
                     Ok(change)
                 })?;
 
                 let changes = mapped.collect::<Result<Vec<Change>, rusqlite::Error>>()?;
 
-                for change in changes.iter() {
-                    // special value...
-                    handle_inner_change(&tx, change)?;
-                }
+                let db_version = if end_version > start_version {
+                    Some(end_version)
+                } else {
+                    None
+                };
 
-                let db_version: i64 =
-                    tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
-
-                // upsert local bookkeeping, the current node has seen all its owns so just update the single row
                 tx.prepare_cached(
                     r#"
-                    INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version)
-                        VALUES (?, ?, ?)
-                        ON CONFLICT (actor_id, start_version) DO UPDATE SET
-                            end_version = excluded.end_version;
+                    INSERT INTO __corro_bookkeeping (actor_id, version, db_version)
+                        VALUES (?, ?, ?);
                 "#,
                 )?
-                .execute(params![actor_id.0, 0, db_version])?;
+                .execute(params![actor_id.0, version, db_version])?;
 
                 (changes, db_version)
             };
+
+            tx.commit()?;
+            let elapsed = start.elapsed();
 
             let msg = if !changes.is_empty() {
                 Some(BroadcastInput::AddBroadcast(Message::V1(
                     MessageV1::Change {
                         actor_id,
-                        start_version: previous_end_version,
-                        end_version: max_version,
+                        version,
                         changeset: changes,
                     },
                 )))
@@ -173,10 +179,11 @@ pub async fn api_v1_db_execute(
                 None
             };
 
-            tx.commit()?;
-            let elapsed = start.elapsed();
+            debug!(actor_id = %actor_id.0, "recording version: {version}");
 
-            bookie.add(actor_id, previous_end_version, max_version);
+            bookie.add(actor_id, version, db_version);
+
+            debug!(actor_id = %actor_id.0, "recorded version: {version}");
 
             Ok((results, msg, elapsed))
         })
@@ -268,11 +275,7 @@ mod tests {
 
         assert!(matches!(
             msg,
-            BroadcastInput::AddBroadcast(Message::V1(MessageV1::Change {
-                start_version: 0,
-                end_version: 1,
-                ..
-            }))
+            BroadcastInput::AddBroadcast(Message::V1(MessageV1::Change { version: 1, .. }))
         ));
 
         assert_eq!(bookie.last(&actor_id), Some(1));
