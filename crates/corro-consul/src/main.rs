@@ -116,26 +116,7 @@ async fn main() -> eyre::Result<()> {
     let corrosion = CorrosionClient::new(&config.corrosion);
     let consul = consul::Client::new(config.consul)?;
 
-    {
-        let mut conn = corrosion.pool().get().await?;
-
-        let tx = conn.transaction()?;
-
-        tx.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS __corro_consul_services (
-                id TEXT NOT NULL PRIMARY KEY,
-                hash BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS __corro_consul_checks (
-                id TEXT NOT NULL PRIMARY KEY,
-                hash BLOB NOT NULL
-            );
-            ",
-        )?;
-
-        tx.commit()?;
-    }
+    setup(&corrosion).await?;
 
     let mut consul_services: HashMap<String, u64> = HashMap::new();
     let mut consul_checks: HashMap<String, u64> = HashMap::new();
@@ -203,6 +184,28 @@ async fn main() -> eyre::Result<()> {
 
     wait_for_all_pending_handles().await;
 
+    Ok(())
+}
+
+async fn setup(corrosion: &CorrosionClient) -> eyre::Result<()> {
+    let mut conn = corrosion.pool().get().await?;
+
+    let tx = conn.transaction()?;
+
+    tx.execute_batch(
+        "
+            CREATE TABLE IF NOT EXISTS __corro_consul_services (
+                id TEXT NOT NULL PRIMARY KEY,
+                hash BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS __corro_consul_checks (
+                id TEXT NOT NULL PRIMARY KEY,
+                hash BLOB NOT NULL
+            );
+            ",
+    )?;
+
+    tx.commit()?;
     Ok(())
 }
 
@@ -408,6 +411,7 @@ pub async fn update_consul_services(
     }
 
     if !statements.is_empty() {
+        println!("JSON: {:?}", serde_json::to_string_pretty(&statements));
         corrosion.execute(statements).await?;
     }
 
@@ -625,6 +629,8 @@ mod tests {
             base_path: ta1.agent.base_path().display().to_string().into(),
         });
 
+        setup(&ta1_client).await?;
+
         let mut services = HashMap::new();
 
         let svc = AgentService {
@@ -649,13 +655,29 @@ mod tests {
         assert_eq!(applied.upserted, 1);
         assert_eq!(applied.deleted, 0);
 
-        assert_eq!(hashes.get("service-id"), Some(&hash_service(&svc)));
+        let svc_hash = hash_service(&svc);
+
+        assert_eq!(hashes.get("service-id"), Some(&svc_hash));
+
+        {
+            let conn = ta1_client.pool().get().await?;
+            let hash_bytes = conn.query_row(
+                "SELECT hash FROM __corro_consul_services WHERE id = ?",
+                ["service-id"],
+                |row| row.get(0),
+            )?;
+
+            let hash = u64::from_be_bytes(hash_bytes);
+            assert_eq!(svc_hash, hash);
+        }
 
         let applied =
             update_consul_services(&ta1_client, services, &mut hashes, "node-1", false).await?;
 
         assert_eq!(applied.upserted, 0);
         assert_eq!(applied.deleted, 0);
+
+        assert_eq!(hashes.get("service-id"), Some(&hash_service(&svc)));
 
         sleep(Duration::from_secs(2)).await;
 
@@ -664,12 +686,14 @@ mod tests {
             base_path: ta2.agent.base_path().display().to_string().into(),
         });
 
-        let conn = ta2_client.pool().get().await?;
-        let app_id: i64 =
-            conn.query_row("SELECT app_id FROM consul_services LIMIT 1", (), |row| {
-                row.get(0)
-            })?;
-        assert_eq!(app_id, 123);
+        {
+            let conn = ta2_client.pool().get().await?;
+            let app_id: i64 =
+                conn.query_row("SELECT app_id FROM consul_services LIMIT 1", (), |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(app_id, 123);
+        }
 
         let applied =
             update_consul_services(&ta1_client, HashMap::new(), &mut hashes, "node-1", false)
@@ -678,14 +702,32 @@ mod tests {
         assert_eq!(applied.upserted, 0);
         assert_eq!(applied.deleted, 1);
 
+        assert_eq!(hashes.get("service-id"), None);
+
+        {
+            let conn = ta1_client.pool().get().await?;
+            let hash_bytes: Option<[u8; 8]> = conn
+                .query_row(
+                    "SELECT hash FROM __corro_consul_services WHERE id = ?",
+                    ("service-id",),
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            assert_eq!(hash_bytes, None);
+        }
+
         sleep(Duration::from_secs(1)).await;
 
-        let app_id: Option<i64> = conn
-            .query_row("SELECT app_id FROM consul_services LIMIT 1", (), |row| {
-                row.get(0)
-            })
-            .optional()?;
-        assert_eq!(app_id, None);
+        {
+            let conn = ta2_client.pool().get().await?;
+            let app_id: Option<i64> = conn
+                .query_row("SELECT app_id FROM consul_services LIMIT 1", (), |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            assert_eq!(app_id, None);
+        }
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;

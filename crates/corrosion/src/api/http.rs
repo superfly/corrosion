@@ -4,7 +4,6 @@ use axum::Extension;
 use corro_types::api::{RqliteResponse, RqliteResult, Statement};
 use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, ToSql};
-use serde_json::Value;
 use tokio::{sync::mpsc::Sender, task::block_in_place};
 use tracing::{error, trace};
 
@@ -44,6 +43,8 @@ pub async fn api_v1_db_execute(
             }),
         );
     }
+
+    println!("HTTP STATEMENTS: {statements:?}",);
 
     let res: Result<_, rusqlite::Error> = {
         trace!("getting conn...");
@@ -86,27 +87,7 @@ pub async fn api_v1_db_execute(
 
                             let first = params.next();
                             match first.as_ref().and_then(|q| q.as_str()) {
-                                Some(q) => tx.execute(
-                                    &q,
-                                    params_from_iter(params.map(|v| match v {
-                                        Value::Null => rusqlite::types::Value::Null,
-                                        Value::Bool(b) => {
-                                            rusqlite::types::Value::Text(b.to_string())
-                                        }
-                                        Value::Number(n) => match (n.as_i64(), n.as_f64()) {
-                                            (Some(n), None) => rusqlite::types::Value::Integer(n),
-                                            (None, Some(f)) => rusqlite::types::Value::Real(f),
-                                            _ => rusqlite::types::Value::Text(n.to_string()),
-                                        },
-                                        Value::String(s) => rusqlite::types::Value::Text(s),
-                                        Value::Array(a) => {
-                                            serde_json::to_string(&a).unwrap().into()
-                                        }
-                                        Value::Object(o) => {
-                                            serde_json::to_string(&o).unwrap().into()
-                                        }
-                                    })),
-                                ),
+                                Some(q) => tx.execute(&q, params_from_iter(params)),
                                 None => return None,
                             }
                         }
@@ -234,7 +215,6 @@ pub async fn api_v1_db_execute(
 #[cfg(test)]
 mod tests {
     use corro_types::sqlite::CrConnManager;
-    use serde_json::json;
     use tokio::sync::mpsc::channel;
     use uuid::Uuid;
 
@@ -266,9 +246,9 @@ mod tests {
             Extension(bookie.clone()),
             axum::Json(vec![Statement::WithParams(vec![
                 "insert into consul_services (id, name, address) values (?,?,?)".into(),
-                json!("service-id"),
-                json!("service-name"),
-                json!("blah"),
+                "service-id".into(),
+                "service-name".into(),
+                "blah".into(),
             ])]),
         )
         .await;
@@ -295,8 +275,8 @@ mod tests {
             Extension(bookie.clone()),
             axum::Json(vec![Statement::WithParams(vec![
                 "update consul_services SET name = ? where id = ?".into(),
-                json!("service-name"),
-                json!("service-id"),
+                "service-name".into(),
+                "service-id".into(),
             ])]),
         )
         .await;
