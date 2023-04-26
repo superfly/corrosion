@@ -60,7 +60,7 @@
 //                 .clone()
 //         }
 //     };
-//     increment_counter!("corrosion.subscriptions.update.count", "id" => id.to_string());
+//     increment_counter!("corro.subscriptions.update.count", "id" => id.to_string());
 //     {
 //         let mut sub = conn_subs.write();
 //         sub.subscriptions.insert(
@@ -84,7 +84,7 @@
 //     debug!("updating actor subscriptions from API");
 
 //     if let Err(e) = update_tx.try_send(generate_broadcasted_subscriptions(subscribers)) {
-//         increment_counter!("corrosion.channel.error", "type" => "full", "name" => "update_actor_subscription.update");
+//         increment_counter!("corro.channel.error", "type" => "full", "name" => "update_actor_subscription.update");
 //         error!("error dispatching actor subscriptions update: {e}");
 //     }
 // }

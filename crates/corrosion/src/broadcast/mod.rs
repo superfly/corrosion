@@ -141,7 +141,7 @@ pub fn runtime_loop(
                             }
                         }
                         FocaInput::Data(data, from) => {
-                            histogram!("corrosion.gossip.recv.bytes", data.len() as f64);
+                            histogram!("corro.gossip.recv.bytes", data.len() as f64);
                             if let Err(e) = foca.write().handle_data(&data, &mut runtime) {
                                 error!("error handling foca data from {from:?}: {e}");
                             }
@@ -177,7 +177,7 @@ pub fn runtime_loop(
                     Branch::Metrics => {
                         {
                             let foca = foca.read();
-                            gauge!("corrosion.gossip.members", foca.num_members() as f64);
+                            gauge!("corro.gossip.members", foca.num_members() as f64);
                             gauge!(
                                 "corrosion.gossip.updates_backlog",
                                 foca.updates_backlog() as f64
@@ -364,7 +364,7 @@ pub fn runtime_loop(
                                         config.max_transmissions.get(),
                                         true,
                                     ));
-                                    increment_counter!("corrosion.broadcast.added.count", "transport" => "http", "reason" => "broadcast");
+                                    increment_counter!("corro.broadcast.added.count", "transport" => "http", "reason" => "broadcast");
 
                                     // reset this since we already reached the max buffer len we care about
                                     http_bcast_interval.reset();
@@ -379,7 +379,7 @@ pub fn runtime_loop(
                                         false,
                                     ));
 
-                                    increment_counter!("corrosion.broadcast.added.count", "transport" => "udp", "reason" => "broadcast");
+                                    increment_counter!("corro.broadcast.added.count", "transport" => "udp", "reason" => "broadcast");
 
                                     // reset this since we already reached the max buffer len we care about
                                     bcast_interval.reset();
@@ -401,7 +401,7 @@ pub fn runtime_loop(
                             config.max_transmissions.get(),
                             false,
                         ));
-                        increment_counter!("corrosion.broadcast.added.count", "transport" => "udp", "reason" => "deadline");
+                        increment_counter!("corro.broadcast.added.count", "transport" => "udp", "reason" => "deadline");
                     }
                 }
                 Branch::HttpBroadcastDeadline => {
@@ -413,7 +413,7 @@ pub fn runtime_loop(
                             config.max_transmissions.get(),
                             true,
                         ));
-                        increment_counter!("corrosion.broadcast.added.count", "transport" => "http", "reason" => "deadline");
+                        increment_counter!("corro.broadcast.added.count", "transport" => "http", "reason" => "deadline");
                     }
                 }
                 Branch::WokePendingBroadcast(pending) => to_broadcast = Some(pending),
@@ -666,7 +666,7 @@ fn single_broadcast(payload: Bytes, socket: Arc<UdpSocket>, addr: SocketAddr) {
         trace!("singly broadcasting to {addr}");
         match socket.send_to(payload.as_ref(), addr).await {
             Ok(n) => {
-                histogram!("corrosion.broadcast.sent.bytes", n as f64, "transport" => "udp");
+                histogram!("corro.broadcast.sent.bytes", n as f64, "transport" => "udp");
                 trace!("sent {n} bytes to {addr}");
             }
             Err(e) => {
@@ -691,7 +691,7 @@ fn single_http_broadcast(payload: Bytes, client: &ClientPool, addr: SocketAddr, 
         ))
         .inspect(move |res| match res {
             Ok(_) => {
-                histogram!("corrosion.broadcast.sent.bytes", len as f64, "transport" => "http");
+                histogram!("corro.broadcast.sent.bytes", len as f64, "transport" => "http");
             }
             Err(e) => {
                 error!(
@@ -703,7 +703,7 @@ fn single_http_broadcast(payload: Bytes, client: &ClientPool, addr: SocketAddr, 
     tokio::spawn(async move {
         match req.await {
             Ok(res) => {
-                histogram!("corrosion.gossip.broadcast.response.time.seconds", start.elapsed().as_secs_f64(), "status" => res.status().to_string(), "kind" => "single");
+                histogram!("corro.gossip.broadcast.response.time.seconds", start.elapsed().as_secs_f64(), "status" => res.status().to_string(), "kind" => "single");
             }
             Err(e) => error!("error sending priority broadcast (single): {e}"),
         }

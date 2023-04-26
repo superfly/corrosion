@@ -415,7 +415,7 @@ pub async fn peer_api_v1_sync_post(
                 Ok(_) => {}
             }
 
-            counter!("corrosion.sync.server.chunk.sent.bytes", buf_len as u64);
+            counter!("corro.sync.server.chunk.sent.bytes", buf_len as u64);
         }
     });
 

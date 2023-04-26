@@ -212,7 +212,7 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
             _ => {}
         };
         if let Err(e) = self.notifications.try_send(notification) {
-            increment_counter!("corrosion.channel.error", "type" => "full", "name" => "dispatch.notifications");
+            increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications");
             error!("error dispatching notification: {e}");
         }
     }
@@ -222,14 +222,14 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
         let packet = data.to_vec();
 
         if let Err(e) = self.to_send.try_send((to, packet.into())) {
-            increment_counter!("corrosion.channel.error", "type" => "full", "name" => "dispatch.to_send");
+            increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_send");
             error!("error dispatching broadcast packet: {e}");
         }
     }
 
     fn submit_after(&mut self, event: Timer<T>, after: Duration) {
         if let Err(e) = self.to_schedule.try_send((after, event)) {
-            increment_counter!("corrosion.channel.error", "type" => "full", "name" => "dispatch.to_schedule");
+            increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_schedule");
             error!("error dispatching scheduled event: {e}");
         }
     }

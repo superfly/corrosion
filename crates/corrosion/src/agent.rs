@@ -297,7 +297,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             post(peer_api_v1_sync_post).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
-                        increment_counter!("corrosion.api.peer.shed.count", "route" => "POST /v1/sync");
+                        increment_counter!("corro.api.peer.shed.count", "route" => "POST /v1/sync");
                         Ok::<_, Infallible>((StatusCode::SERVICE_UNAVAILABLE, "sync has reached its concurrency limit".to_string()))
                     }))
                     // only allow 2 syncs at the same time...
@@ -310,7 +310,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             post(peer_api_v1_broadcast).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
-                        increment_counter!("corrosion.api.peer.shed.count", "route" => "POST /v1/broadcast");
+                        increment_counter!("corro.api.peer.shed.count", "route" => "POST /v1/broadcast");
                         Ok::<_, Infallible>((StatusCode::SERVICE_UNAVAILABLE, "broadcast has reached its concurrency limit".to_string()))
                     }))
                     .layer(LoadShedLayer::new())
@@ -568,7 +568,7 @@ async fn handle_gossip_to_send(socket: Arc<UdpSocket>, mut to_send_rx: Receiver<
             match timeout(Duration::from_secs(5), socket.send_to(bytes.as_ref(), addr)).await {
                 Ok(Ok(n)) => {
                     trace!("successfully sent gossip to {addr}");
-                    histogram!("corrosion.gossip.sent.bytes", n as f64, "actor_id" => actor.id().hyphenated().to_string());
+                    histogram!("corro.gossip.sent.bytes", n as f64, "actor_id" => actor.id().hyphenated().to_string());
                 }
                 Ok(Err(e)) => {
                     error!("could not send SWIM message via udp to {addr}: {e}");
@@ -578,7 +578,7 @@ async fn handle_gossip_to_send(socket: Arc<UdpSocket>, mut to_send_rx: Receiver<
                 }
             }
         });
-        increment_counter!("corrosion.gossip.send.count", "actor_id" => actor.id().hyphenated().to_string());
+        increment_counter!("corro.gossip.send.count", "actor_id" => actor.id().hyphenated().to_string());
     }
 }
 
@@ -590,7 +590,7 @@ async fn handle_gossip(
     high_priority: bool,
 ) -> eyre::Result<()> {
     let priority_label = if high_priority { "high" } else { "normal" };
-    counter!("corrosion.broadcast.recv.count", messages.len() as u64, "priority" => priority_label);
+    counter!("corro.broadcast.recv.count", messages.len() as u64, "priority" => priority_label);
 
     let bookie = agent.bookie();
 
@@ -628,7 +628,7 @@ async fn handle_notifications(
                 let added = { agent.0.members.write().add_member(&actor) };
                 info!("Member Up {actor:?} (added: {added})");
                 if added {
-                    increment_counter!("corrosion.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
+                    increment_counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
                     // actually added a member
                     // notify of new cluster size
                     let members_len = { agent.0.members.read().states.len() as u32 };
@@ -643,7 +643,7 @@ async fn handle_notifications(
                 let removed = { agent.0.members.write().remove_member(&actor) };
                 info!("Member Down {actor:?} (removed: {removed})");
                 if removed {
-                    increment_counter!("corrosion.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
+                    increment_counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
                     // actually removed a member
                     // notify of new cluster size
                     let member_len = { agent.0.members.read().states.len() as u32 };
@@ -679,7 +679,7 @@ async fn handle_db_cleanup(rw_pool: SqlitePool) -> eyre::Result<()> {
             conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
         if busy {
             warn!("could not truncate sqlite WAL, database busy");
-            increment_counter!("corrosion.db.wal.truncate.busy");
+            increment_counter!("corro.db.wal.truncate.busy");
         } else {
             debug!("successfully truncated sqlite WAL!");
             histogram!(
@@ -877,7 +877,7 @@ pub async fn handle_payload(
             2 => PayloadKind::PriorityBroadcast,
             n => PayloadKind::Unknown(n),
         };
-        increment_counter!("corrosion.payload.recv.count", "kind" => kind.to_string());
+        increment_counter!("corro.payload.recv.count", "kind" => kind.to_string());
         kind
     });
 
@@ -919,7 +919,7 @@ pub async fn handle_broadcast(
     bookie: &Bookie,
     bcast_tx: &Sender<Message>,
 ) -> eyre::Result<()> {
-    histogram!("corrosion.broadcast.recv.bytes", buf.len() as f64);
+    histogram!("corro.broadcast.recv.bytes", buf.len() as f64);
     loop {
         // decode a length-delimited "frame"
         match Message::decode(codec, buf) {
@@ -933,7 +933,7 @@ pub async fn handle_broadcast(
                         changeset,
                         ts,
                     }) => {
-                        increment_counter!("corrosion.broadcast.recv.count", "kind" => "operation");
+                        increment_counter!("corro.broadcast.recv.count", "kind" => "operation");
 
                         if bookie.contains(actor_id, version) {
                             trace!("already seen, stop disseminating");
@@ -1107,10 +1107,10 @@ struct SyncWith {
 async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClientError> {
     let sync = generate_sync(agent.bookie(), agent.actor_id());
     for (actor_id, needed) in sync.need.iter() {
-        gauge!("corrosion.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
+        gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
     }
     for (actor_id, version) in sync.heads.iter() {
-        gauge!("corrosion.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
+        gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
     }
 
     let sync = Arc::new(sync);
@@ -1179,7 +1179,7 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
             }
             Err(e) => {
                 if e.is_unavailable() {
-                    increment_counter!("corrosion.sync.client.busy.servers");
+                    increment_counter!("corro.sync.client.busy.servers");
                     if let Some(dur) = boff.next() {
                         tokio::time::sleep(dur).await;
                         continue;
@@ -1202,7 +1202,7 @@ async fn handle_sync_receive(
     let actor_id = *actor_id;
     // println!("syncing with {actor_id:?}");
 
-    increment_counter!("corrosion.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+    increment_counter!("corro.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
 
     histogram!(
         "corrosion.sync.client.request.operations.need.count",
@@ -1234,20 +1234,20 @@ async fn handle_sync_receive(
         )))
         .unwrap();
 
-    increment_counter!("corrosion.sync.client.request.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+    increment_counter!("corro.sync.client.request.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
 
     let start = Instant::now();
     let res = match timeout(Duration::from_secs(15), client.request(req)).await {
         Ok(Ok(res)) => {
-            histogram!("corrosion.sync.client.response.time.seconds", start.elapsed().as_secs_f64(), "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "status" => res.status().to_string());
+            histogram!("corro.sync.client.response.time.seconds", start.elapsed().as_secs_f64(), "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "status" => res.status().to_string());
             res
         }
         Ok(Err(e)) => {
-            increment_counter!("corrosion.sync.client.request.error", "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "error" => e.to_string());
+            increment_counter!("corro.sync.client.request.error", "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "error" => e.to_string());
             return Err(e.into());
         }
         Err(_e) => {
-            increment_counter!("corrosion.sync.client.request.error", "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "error" => "timed out waiting for headers");
+            increment_counter!("corro.sync.client.request.error", "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "error" => "timed out waiting for headers");
             return Err(SyncClientError::RequestTimedOut);
         }
     };
@@ -1273,7 +1273,7 @@ async fn handle_sync_receive(
     let mut framed = LengthDelimitedCodec::builder()
         .length_field_type::<u32>()
         .new_read(body)
-        .inspect_ok(|b| counter!("corrosion.sync.client.chunk.recv.bytes", b.len() as u64));
+        .inspect_ok(|b| counter!("corro.sync.client.chunk.recv.bytes", b.len() as u64));
 
     let mut count = 0;
 
