@@ -47,6 +47,7 @@ strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
@@ -54,7 +55,6 @@ uhlc = { workspace = true }
 uuid = { workspace = true }
 webpki = { workspace = true }
 lru = { workspace = true }
-tokio-util = { workspace = true }
 crc32fast = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
@@ -63,6 +63,7 @@ spawn = { path = "../spawn" }
 rangemap = { workspace = true }
 corro-types = { path = "../corro-types" }
 tempfile = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 tokio-postgres = { workspace = true }

@@ -1,45 +1,17 @@
 use std::{collections::HashMap, fmt, net::SocketAddr, str::FromStr, sync::Arc};
 
 use compact_str::CompactString;
-use exprt::{parser::ast::Expr, typecheck::schema::Schema};
-use once_cell::sync::Lazy;
+use exprt::parser::ast::Expr;
 use parking_lot::RwLock;
 use serde::{
     de::{self, Visitor},
     Deserialize, Serialize,
 };
+use speedy::{Context, Readable, Writable};
 use tokio::sync::mpsc::UnboundedSender;
 use uhlc::Timestamp;
 
-use crate::filters::parse_expr;
-
-type DisplayFromStr = serde_with::As<serde_with::DisplayFromStr>;
-type OptionDisplayFromStr = serde_with::As<Option<serde_with::DisplayFromStr>>;
-
-pub static SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    exprt::schema! {
-        functions: [],
-        fields: [
-            app_id: Integer,
-            organization_id: Integer,
-            network_id: Integer,
-
-            app.network_id: Integer,
-
-            ip_assignment.app_id: Integer,
-
-            consul_service.network_id: Integer,
-            consul_service.app_id: Integer,
-            consul_service.organization_id: Integer,
-            consul_service.node: String,
-            consul_service.meta.protocol: String,
-
-            consul_check.node: String,
-
-            node.name: String,
-        ]
-    }
-});
+use crate::{change::SqliteValue, filters::parse_expr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct SubscriberId(pub SocketAddr);
@@ -57,6 +29,22 @@ pub struct SubscriptionId(pub CompactString);
 impl fmt::Display for SubscriptionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+impl<'a, C: Context> Readable<'a, C> for SubscriptionId {
+    fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, <C as Context>::Error> {
+        let s = <&str as Readable<'a, C>>::read_from(reader)?;
+        Ok(Self(s.into()))
+    }
+}
+
+impl<'a, C: Context> Writable<C> for SubscriptionId {
+    fn write_to<T: ?Sized + speedy::Writer<C>>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), <C as Context>::Error> {
+        self.0.as_bytes().write_to(writer)
     }
 }
 
@@ -85,16 +73,24 @@ pub enum SubscriptionMessage {
     GoingAway,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum ChangeKind {
+    Update { column: String, value: SqliteValue },
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum SubscriptionEvent {
     Change {
-        // op: Operation,
-        #[serde(with = "DisplayFromStr")]
-        id: u128,
-    },
-    Node {
-        // node: Node,
+        table: String,
+        primary_key: String,
+
+        #[serde(flatten)]
+        kind: ChangeKind,
+
+        db_version: i64,
     },
     Error {
         error: String,
@@ -107,8 +103,8 @@ pub enum Subscription {
     Add {
         id: SubscriptionId,
         filter: Option<String>,
-        #[serde(with = "OptionDisplayFromStr")]
-        apply_index: Option<u128>,
+        #[serde(default)]
+        from_db_version: Option<i64>,
         #[serde(default)]
         broadcast_interest: bool,
     },

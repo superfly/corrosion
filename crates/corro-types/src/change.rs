@@ -1,7 +1,8 @@
 use rusqlite::{
-    types::{FromSql, ToSqlOutput, Value, ValueRef},
+    types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
     ToSql,
 };
+use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -15,13 +16,54 @@ pub struct Change {
     pub site_id: [u8; 16],
 }
 
-#[derive(Debug, Clone, Readable, Writable, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
+#[serde(untagged)]
 pub enum SqliteValue {
     Null,
     Integer(i64),
     Real(f64),
-    Text(Vec<u8>),
+    Text(String),
     Blob(Vec<u8>),
+}
+
+impl SqliteValue {
+    pub fn as_str(&self) -> Option<&str> {
+        if let Self::Text(ref s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+}
+
+impl From<&str> for SqliteValue {
+    fn from(value: &str) -> Self {
+        Self::Text(value.into())
+    }
+}
+
+impl From<Vec<u8>> for SqliteValue {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Blob(value)
+    }
+}
+
+impl From<String> for SqliteValue {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<u16> for SqliteValue {
+    fn from(value: u16) -> Self {
+        Self::Integer(value as i64)
+    }
+}
+
+impl From<i64> for SqliteValue {
+    fn from(value: i64) -> Self {
+        Self::Integer(value)
+    }
 }
 
 impl FromSql for SqliteValue {
@@ -30,7 +72,9 @@ impl FromSql for SqliteValue {
             ValueRef::Null => SqliteValue::Null,
             ValueRef::Integer(i) => SqliteValue::Integer(i),
             ValueRef::Real(f) => SqliteValue::Real(f),
-            ValueRef::Text(t) => SqliteValue::Text(t.into()),
+            ValueRef::Text(t) => SqliteValue::Text(
+                String::from_utf8(t.into()).map_err(|e| FromSqlError::Other(Box::new(e)))?,
+            ),
             ValueRef::Blob(b) => SqliteValue::Blob(b.into()),
         })
     }
@@ -42,7 +86,7 @@ impl ToSql for SqliteValue {
             SqliteValue::Null => ToSqlOutput::Owned(Value::Null),
             SqliteValue::Integer(i) => ToSqlOutput::Owned(Value::Integer(*i)),
             SqliteValue::Real(f) => ToSqlOutput::Owned(Value::Real(*f)),
-            SqliteValue::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_slice())),
+            SqliteValue::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
             SqliteValue::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b.as_slice())),
         })
     }

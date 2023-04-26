@@ -1,7 +1,10 @@
-use std::{cmp, time::Instant};
+use std::{cmp, sync::Arc, time::Instant};
 
 use axum::Extension;
-use corro_types::api::{RqliteResponse, RqliteResult, Statement};
+use corro_types::{
+    api::{RqliteResponse, RqliteResult, Statement},
+    broadcast::UhlcTimestamp,
+};
 use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, ToSql};
 use tokio::{sync::mpsc::Sender, task::block_in_place};
@@ -30,6 +33,7 @@ pub async fn api_v1_db_execute(
     Extension(tx_local_bcast): Extension<Sender<BroadcastInput>>,
     Extension(actor_id): Extension<ActorId>,
     Extension(bookie): Extension<Bookie>,
+    Extension(clock): Extension<Arc<uhlc::HLC>>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
 ) -> (StatusCode, axum::Json<RqliteResponse>) {
     if statements.is_empty() {
@@ -43,8 +47,6 @@ pub async fn api_v1_db_execute(
             }),
         );
     }
-
-    println!("HTTP STATEMENTS: {statements:?}",);
 
     let res: Result<_, rusqlite::Error> = {
         trace!("getting conn...");
@@ -144,11 +146,16 @@ pub async fn api_v1_db_execute(
                 let db_version = if end_version > start_version {
                     tx.prepare_cached(
                         r#"
-                        INSERT INTO __corro_bookkeeping (actor_id, version, db_version)
-                            VALUES (?, ?, ?);
+                        INSERT INTO __corro_bookkeeping (actor_id, version, db_version, ts)
+                            VALUES (?, ?, ?, ?);
                     "#,
                     )?
-                    .execute(params![actor_id.0, version, end_version])?;
+                    .execute(params![
+                        actor_id.0,
+                        version,
+                        end_version,
+                        UhlcTimestamp::from(clock.new_timestamp())
+                    ])?;
                     Some(end_version)
                 } else {
                     None
@@ -161,12 +168,14 @@ pub async fn api_v1_db_execute(
             let elapsed = start.elapsed();
 
             let msg = if !changes.is_empty() {
-                bookie.add(actor_id, version, db_version);
+                let ts = clock.new_timestamp().into();
+                bookie.add(actor_id, version, db_version, ts);
                 Some(BroadcastInput::AddBroadcast(Message::V1(
                     MessageV1::Change {
                         actor_id,
                         version,
                         changeset: changes,
+                        ts,
                     },
                 )))
             } else {
@@ -239,11 +248,14 @@ mod tests {
 
         let bookie = Bookie::default();
 
+        let clock = Arc::new(uhlc::HLC::default());
+
         let (status_code, body) = api_v1_db_execute(
             Extension(pool.clone()),
             Extension(tx.clone()),
             Extension(actor_id),
             Extension(bookie.clone()),
+            Extension(clock.clone()),
             axum::Json(vec![Statement::WithParams(vec![
                 "insert into consul_services (id, name, address) values (?,?,?)".into(),
                 "service-id".into(),
@@ -273,6 +285,7 @@ mod tests {
             Extension(tx),
             Extension(actor_id),
             Extension(bookie.clone()),
+            Extension(clock.clone()),
             axum::Json(vec![Statement::WithParams(vec![
                 "update consul_services SET name = ? where id = ?".into(),
                 "service-name".into(),

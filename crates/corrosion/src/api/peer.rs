@@ -10,6 +10,7 @@ use axum::{
     Extension,
 };
 use bytes::BytesMut;
+use corro_types::broadcast::UhlcTimestamp;
 use futures::StreamExt;
 use metrics::{counter, histogram};
 use rusqlite::{params, Connection};
@@ -188,7 +189,13 @@ pub enum SyncError {
 #[error("unknown accept header value '{0}'")]
 pub struct UnknownAcceptHeaderValue(String);
 
-fn send_msg(actor_id: ActorId, version: i64, changeset: Vec<Change>, sender: &Sender<Message>) {
+fn send_msg(
+    actor_id: ActorId,
+    version: i64,
+    changeset: Vec<Change>,
+    sender: &Sender<Message>,
+    ts: UhlcTimestamp,
+) {
     let changeset_len = changeset.len();
 
     // build the Message
@@ -196,6 +203,7 @@ fn send_msg(actor_id: ActorId, version: i64, changeset: Vec<Change>, sender: &Se
         actor_id,
         version,
         changeset,
+        ts,
     });
 
     trace!(
@@ -229,7 +237,7 @@ fn process_range(
         actor_id.hyphenated()
     );
 
-    let overlapping: Vec<(i64, Option<i64>)> = {
+    let overlapping: Vec<(i64, (Option<i64>, UhlcTimestamp))> = {
         booked
             .read()
             .overlapping(range)
@@ -237,13 +245,13 @@ fn process_range(
             .collect()
     };
 
-    for (version, db_version) in overlapping {
+    for (version, (db_version, ts)) in overlapping {
         match db_version {
             Some(db_version) => block_in_place(|| {
-                process_version(&conn, version, db_version, actor_id, is_local, &sender)
+                process_version(&conn, version, db_version, ts, actor_id, is_local, &sender)
             })?,
             None => {
-                send_msg(actor_id, version, vec![], sender);
+                send_msg(actor_id, version, vec![], sender, ts);
             }
         }
     }
@@ -255,6 +263,7 @@ fn process_version(
     conn: &Connection,
     version: i64,
     db_version: i64,
+    ts: UhlcTimestamp,
     actor_id: ActorId,
     is_local: bool,
     sender: &Sender<Message>,
@@ -289,7 +298,7 @@ fn process_version(
         })?
         .collect::<rusqlite::Result<Vec<Change>>>()?;
 
-    send_msg(actor_id, version, changeset, &sender);
+    send_msg(actor_id, version, changeset, &sender, ts);
 
     trace!("done processing db version: {db_version}");
 

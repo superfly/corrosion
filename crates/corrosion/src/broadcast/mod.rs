@@ -12,23 +12,27 @@ use bytes::{BufMut, Bytes, BytesMut};
 use foca::{Foca, NoCustomBroadcast, Notification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
-    Future, FutureExt, StreamExt,
+    Future, FutureExt,
 };
 use hyper::client::HttpConnector;
 use metrics::{gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
+use rusqlite::params;
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{channel, Receiver, Sender},
     time::{interval, MissedTickBehavior},
 };
+use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
 use corro_types::{
     actor::Actor,
+    agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaInput, Message},
+    members::MemberEvent,
 };
 
 // TODO: do not hard code...
@@ -45,14 +49,16 @@ pub type ClientPool = hyper::Client<HttpConnector, hyper::Body>;
 
 pub fn runtime_loop(
     actor: Actor,
+    agent: Agent,
     socket: Arc<UdpSocket>,
     mut rx_foca: Receiver<FocaInput>,
     mut rx_bcast: Receiver<BroadcastInput>,
+    member_events: tokio::sync::broadcast::Receiver<MemberEvent>,
     to_send_tx: Sender<(Actor, Bytes)>,
     notifications_tx: Sender<Notification<Actor>>,
     client: ClientPool,
     clock: Arc<uhlc::HLC>,
-    mut _tripwire: Tripwire,
+    mut tripwire: Tripwire,
 ) {
     debug!("starting runtime loop for actor: {actor:?}");
     let rng = StdRng::from_entropy();
@@ -226,10 +232,10 @@ pub fn runtime_loop(
             Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>,
         >::new();
 
-        //     // let member_events_chunks =
-        //     //     tokio_stream::wrappers::BroadcastStream::new(member_events.resubscribe())
-        //     //         .chunks_timeout(100, Duration::from_secs(30));
-        //     // tokio::pin!(member_events_chunks);
+        let member_events_chunks =
+            tokio_stream::wrappers::BroadcastStream::new(member_events.resubscribe())
+                .chunks_timeout(100, Duration::from_secs(30));
+        tokio::pin!(member_events_chunks);
 
         enum Branch {
             Broadcast(BroadcastInput),
@@ -237,13 +243,13 @@ pub fn runtime_loop(
             BroadcastDeadline,
             HttpBroadcastDeadline,
             WokePendingBroadcast(PendingBroadcast),
-            // MemberEvents(Vec<Result<MemberEvent, BroadcastStreamRecvError>>),
-            // Tripped,
+            MemberEvents(Vec<Result<MemberEvent, BroadcastStreamRecvError>>),
+            Tripped,
             Metrics,
         }
 
-        //     let mut tripped = false;
-        //     let mut member_events_done = false;
+        let mut tripped = false;
+        let mut member_events_done = false;
 
         loop {
             let branch = tokio::select! {
@@ -281,20 +287,20 @@ pub fn runtime_loop(
                         continue;
                     }
                 },
-                // evts =  member_events_chunks.next(), if !member_events_done && !tripped => match evts {
-                //     Some(evts) if !evts.is_empty() => Branch::MemberEvents(evts),
-                //     Some(_) => {
-                //         continue;
-                //     }
-                //     None => {
-                //         member_events_done = true;
-                //         continue;
-                //     }
-                // },
-                // _ = &mut tripwire, if !tripped => {
-                //     tripped = true;
-                //     Branch::Tripped
-                // },
+                evts =  member_events_chunks.next(), if !member_events_done && !tripped => match evts {
+                    Some(evts) if !evts.is_empty() => Branch::MemberEvents(evts),
+                    Some(_) => {
+                        continue;
+                    }
+                    None => {
+                        member_events_done = true;
+                        continue;
+                    }
+                },
+                _ = &mut tripwire, if !tripped => {
+                    tripped = true;
+                    Branch::Tripped
+                },
                 _ = metrics_interval.tick() => {
                     Branch::Metrics
                 }
@@ -303,11 +309,9 @@ pub fn runtime_loop(
             let mut to_broadcast = None;
 
             match branch {
-                // TODO: track cluster membership
-                // Branch::Tripped => {
-                // }
-                // Branch::MemberEvents(evts) => {
-                // }
+                Branch::Tripped => {
+                    // TODO: leave cluster, save all last member states
+                }
                 Branch::Broadcast(input) => {
                     match input {
                         BroadcastInput::Rebroadcast(msg) => {
@@ -413,6 +417,80 @@ pub fn runtime_loop(
                     }
                 }
                 Branch::WokePendingBroadcast(pending) => to_broadcast = Some(pending),
+                Branch::MemberEvents(evts) => {
+                    let splitted: Vec<_> = evts
+                        .iter()
+                        .flatten()
+                        .filter_map(|evt| {
+                            let actor = evt.actor();
+                            let foca_state = {
+                                let read = foca.read();
+                                // need to bind this...
+                                let foca_state = read
+                                    .iter_members()
+                                    .find(|member| member.id().id() == actor.id())
+                                    .and_then(|member| match serde_json::to_string(member) {
+                                        Ok(foca_state) => Some(foca_state),
+                                        Err(e) => {
+                                            error!("could not serialize foca member state: {e}");
+                                            None
+                                        }
+                                    });
+                                foca_state
+                            };
+
+                            foca_state.map(|foca_state| {
+                                (actor.id(), actor.addr(), evt.as_str(), foca_state)
+                            })
+                        })
+                        .collect();
+
+                    let mut conn = match agent.read_write_pool().get().await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            error!("could not acquire a r/w conn to process member events: {e}");
+                            continue;
+                        }
+                    };
+
+                    let tx = match conn.transaction() {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            error!("could not start transaction to update member events: {e}");
+                            continue;
+                        }
+                    };
+
+                    for (id, address, state, foca_state) in splitted {
+                        let db_res = tx
+                            .prepare_cached(
+                                "
+                            INSERT INTO __corro_members (id, address, state, foca_state)
+                                VALUES (?, ?, ?, ?)
+                            ON CONFLICT (id) DO UPDATE SET
+                                address = excluded.address,
+                                state = excluded.state,
+                                foca_state = excluded.foca_state;
+                        ",
+                            )
+                            .and_then(|mut prepped| {
+                                prepped.execute(params![
+                                    id.0,
+                                    address.to_string(),
+                                    state,
+                                    foca_state
+                                ])
+                            });
+
+                        if let Err(e) = db_res {
+                            error!("could not upsert member state: {e}");
+                        }
+                    }
+
+                    if let Err(e) = tx.commit() {
+                        error!("could not commit member states upsert tx: {e}");
+                    }
+                }
                 Branch::Metrics => {
                     gauge!(
                         "corrosion.gossip.broadcast.channel.capacity",

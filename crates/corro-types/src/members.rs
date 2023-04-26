@@ -63,3 +63,18 @@ pub enum MemberEvent {
     Up(Actor),
     Down(Actor),
 }
+
+impl MemberEvent {
+    pub fn actor(&self) -> &Actor {
+        match self {
+            MemberEvent::Up(actor) => actor,
+            MemberEvent::Down(actor) => actor,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemberEvent::Up(_) => "up",
+            MemberEvent::Down(_) => "down",
+        }
+    }
+}

@@ -5,7 +5,12 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use rangemap::RangeInclusiveMap;
 use tokio::sync::mpsc::Sender;
 
-use crate::{actor::ActorId, broadcast::BroadcastInput, pubsub::Subscribers, sqlite::SqlitePool};
+use crate::{
+    actor::ActorId,
+    broadcast::{BroadcastInput, UhlcTimestamp},
+    pubsub::Subscribers,
+    sqlite::SqlitePool,
+};
 
 use super::members::Members;
 
@@ -67,7 +72,8 @@ impl Agent {
     }
 }
 
-pub type BookedInner = Arc<RwLock<RangeInclusiveMap<i64, Option<i64>>>>;
+pub type BookedVersion = RangeInclusiveMap<i64, (Option<i64>, UhlcTimestamp)>;
+pub type BookedInner = Arc<RwLock<BookedVersion>>;
 
 #[derive(Default, Clone)]
 pub struct Booked(BookedInner);
@@ -77,8 +83,8 @@ impl Booked {
         Self(inner)
     }
 
-    pub fn insert(&self, version: i64, db_version: Option<i64>) {
-        self.0.write().insert(version..=version, db_version);
+    pub fn insert(&self, version: i64, db_version: Option<i64>, ts: UhlcTimestamp) {
+        self.0.write().insert(version..=version, (db_version, ts));
     }
 
     pub fn contains(&self, version: i64) -> bool {
@@ -89,7 +95,7 @@ impl Booked {
         self.0.read().iter().map(|(k, _v)| *k.end()).max()
     }
 
-    pub fn read(&self) -> RwLockReadGuard<RangeInclusiveMap<i64, Option<i64>>> {
+    pub fn read(&self) -> RwLockReadGuard<BookedVersion> {
         self.0.read()
     }
 }
@@ -104,17 +110,17 @@ impl Bookie {
         Self(inner)
     }
 
-    pub fn add(&self, actor_id: ActorId, version: i64, db_version: Option<i64>) {
+    pub fn add(&self, actor_id: ActorId, version: i64, db_version: Option<i64>, ts: UhlcTimestamp) {
         {
             if let Some(booked) = self.0.read().get(&actor_id) {
-                booked.insert(version, db_version);
+                booked.insert(version, db_version, ts);
                 return;
             }
         };
 
         let mut w = self.0.write();
         let booked = w.entry(actor_id).or_default();
-        booked.insert(version, db_version);
+        booked.insert(version, db_version, ts);
     }
 
     pub fn contains(&self, actor_id: ActorId, version: i64) -> bool {

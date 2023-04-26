@@ -3,7 +3,6 @@ use std::{
     convert::Infallible,
     error::Error,
     fmt,
-    fs::DirEntry,
     io::{self, Read, Write},
     net::SocketAddr,
     path::Path,
@@ -20,11 +19,12 @@ use crate::{
     config::{Config, DEFAULT_GOSSIP_PORT},
 };
 
+use arc_swap::ArcSwapOption;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, AgentInner, Booked, Bookie},
+    agent::{Agent, AgentInner, Booked, BookedVersion, Bookie},
     broadcast::{BroadcastInput, BroadcastSrc, FocaInput, Message, MessageDecodeError, MessageV1},
-    members::Members,
+    members::{MemberEvent, Members},
     sqlite::{init_cr_conn, CrConn, CrConnManager, SqlitePool},
 };
 
@@ -33,14 +33,17 @@ use axum::{
     Extension, Router,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use exprt::typecheck::{
+    schema::{FieldDef, Schema},
+    typecheck::Type,
+};
 use fallible_iterator::FallibleIterator;
-use foca::Notification;
+use foca::{Member, Notification};
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
-use rangemap::RangeInclusiveMap;
 use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
 use spawn::spawn_counted;
 use sqlite3_parser::{
@@ -67,6 +70,8 @@ use uuid::Uuid;
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
+
+static SCHEMA: ArcSwapOption<Schema> = ArcSwapOption::const_empty();
 
 pub struct AgentOptions {
     actor_id: ActorId,
@@ -160,12 +165,12 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         .build_unchecked(CrConnManager::new_read_only(&state_db_path));
     debug!("built RO pool");
 
-    let mut bk: HashMap<ActorId, RangeInclusiveMap<i64, Option<i64>>> = HashMap::new();
+    let mut bk: HashMap<ActorId, BookedVersion> = HashMap::new();
 
     {
         let conn = ro_pool.get().await?;
-        let mut prepped =
-            conn.prepare_cached("SELECT actor_id, version, db_version FROM __corro_bookkeeping")?;
+        let mut prepped = conn
+            .prepare_cached("SELECT actor_id, version, db_version, ts FROM __corro_bookkeeping")?;
         let mut rows = prepped.query([])?;
 
         loop {
@@ -175,7 +180,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 Some(row) => {
                     let ranges = bk.entry(ActorId(row.get::<_, Uuid>(0)?)).or_default();
                     let v = row.get(1)?;
-                    ranges.insert(v..=v, row.get(2)?);
+                    ranges.insert(v..=v, (row.get(2)?, row.get(3)?));
                 }
             }
         }
@@ -270,13 +275,15 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     info!("Started UDP gossip listener on {gossip_addr}");
 
     let (foca_tx, foca_rx) = channel(10240);
+    let (member_events_tx, member_events_rx) = tokio::sync::broadcast::channel::<MemberEvent>(512);
 
     runtime_loop(
         Actor::new(actor_id, agent.gossip_addr()),
-        // agent.clone(),
+        agent.clone(),
         udp_gossip.clone(),
         foca_rx,
         rx_bcast,
+        member_events_rx.resubscribe(),
         to_send_tx,
         notifications_tx,
         client.clone(),
@@ -403,6 +410,45 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         }
     });
 
+    let states = match agent.read_only_pool().get().await {
+        Ok(conn) => {
+            match conn.prepare("SELECT foca_state FROM __corro_members") {
+                Ok(mut prepped) => {
+                    match prepped
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
+                {
+                    Ok(foca_states) => {
+                        foca_states.iter().filter_map(|state| match serde_json::from_str(state.as_str()) {
+                            Ok(fs) => Some(fs),
+                            Err(e) => {
+                                error!("could not deserialize foca member state: {e} (json: {state})");
+                                None
+                            }
+                        }).collect::<Vec<Member<Actor>>>()
+                    }
+                    Err(e) => {
+                        error!("could not query for foca member states: {e}");
+                        vec![]
+                    },
+                }
+                }
+                Err(e) => {
+                    error!("could not prepare query for foca member states: {e}");
+                    vec![]
+                }
+            }
+        }
+        Err(e) => {
+            error!("could not acquire conn for foca member states: {e}");
+            vec![]
+        }
+    };
+
+    if !states.is_empty() {
+        foca_tx.send(FocaInput::ApplyMany(states)).await.ok();
+    }
+
     let api = Router::new()
         .route(
             "/db/execute",
@@ -464,6 +510,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         agent.clone(),
         notifications_rx,
         foca_tx.clone(),
+        member_events_tx,
     ));
 
     let gossip_chunker =
@@ -572,6 +619,7 @@ async fn handle_notifications(
     agent: Agent,
     mut notification_rx: Receiver<Notification<Actor>>,
     foca_tx: Sender<FocaInput>,
+    member_events: tokio::sync::broadcast::Sender<MemberEvent>,
 ) {
     while let Some(notification) = notification_rx.recv().await {
         trace!("handle notification");
@@ -588,7 +636,7 @@ async fn handle_notifications(
                         foca_tx.send(FocaInput::ClusterSize(size)).await.ok();
                     }
 
-                    // TODO: update SWIM state
+                    member_events.send(MemberEvent::Up(actor.clone())).ok();
                 }
             }
             Notification::MemberDown(actor) => {
@@ -602,7 +650,7 @@ async fn handle_notifications(
                     if let Ok(size) = member_len.try_into() {
                         foca_tx.send(FocaInput::ClusterSize(size)).await.ok();
                     }
-                    // TODO: update SWIM state
+                    member_events.send(MemberEvent::Down(actor.clone())).ok();
                 }
             }
             Notification::Active => {
@@ -879,31 +927,49 @@ pub async fn handle_broadcast(
                 trace!("broadcast: {msg:?}");
 
                 match msg {
-                    Message::V1(v1) => match v1 {
-                        MessageV1::Change {
-                            actor_id,
-                            version,
-                            changeset,
-                        } => {
-                            increment_counter!("corrosion.broadcast.recv.count", "kind" => "operation");
+                    Message::V1(MessageV1::Change {
+                        actor_id,
+                        version,
+                        changeset,
+                        ts,
+                    }) => {
+                        increment_counter!("corrosion.broadcast.recv.count", "kind" => "operation");
 
-                            if bookie.contains(actor_id, version) {
-                                trace!("already seen, stop disseminating");
-                                continue;
-                            }
-
-                            if actor_id != self_actor_id {
-                                bcast_tx
-                                    .send(Message::V1(MessageV1::Change {
-                                        actor_id,
-                                        version,
-                                        changeset,
-                                    }))
-                                    .await
-                                    .ok();
-                            }
+                        if bookie.contains(actor_id, version) {
+                            trace!("already seen, stop disseminating");
+                            continue;
                         }
-                    },
+
+                        if actor_id != self_actor_id {
+                            bcast_tx
+                                .send(Message::V1(MessageV1::Change {
+                                    actor_id,
+                                    version,
+                                    changeset,
+                                    ts,
+                                }))
+                                .await
+                                .ok();
+                        }
+                    }
+                    Message::V1(MessageV1::UpsertSubscription {
+                        actor_id,
+                        id,
+                        filter,
+                        ts,
+                    }) => {
+                        if actor_id != self_actor_id {
+                            bcast_tx
+                                .send(Message::V1(MessageV1::UpsertSubscription {
+                                    actor_id,
+                                    id,
+                                    filter,
+                                    ts,
+                                }))
+                                .await
+                                .ok();
+                        }
+                    }
                 }
             }
             Ok(None) => {
@@ -931,6 +997,7 @@ async fn process_msg(
             actor_id,
             version,
             changeset,
+            ts,
         }) => {
             if bookie.contains(*actor_id, *version) {
                 trace!(
@@ -955,7 +1022,6 @@ async fn process_msg(
                     tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
 
                 for change in changeset.iter() {
-                    info!("change: {change:?}");
                     tx.prepare_cached(
                         r#"
                     INSERT INTO crsql_changes
@@ -984,15 +1050,21 @@ async fn process_msg(
                     None
                 };
 
-                tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, version, db_version) VALUES (?, ?, ?);")?.execute(params![actor_id.0, version, db_version])?;
+                tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id.0, version, db_version, ts])?;
 
                 tx.commit()?;
 
                 Ok::<_, bb8_rusqlite::Error>(db_version)
             })?;
 
-            bookie.add(*actor_id, *version, db_version);
+            bookie.add(*actor_id, *version, db_version, *ts);
         }
+        Message::V1(MessageV1::UpsertSubscription {
+            actor_id: _,
+            id: _,
+            filter: _,
+            ts: _,
+        }) => {}
     }
     Ok(true)
 }
@@ -1211,6 +1283,9 @@ async fn handle_sync_receive(
         process_msg(&msg, agent.bookie(), agent.read_write_pool()).await?;
         match msg {
             Message::V1(MessageV1::Change { ref changeset, .. }) => count += changeset.len(),
+            _ => {
+                count += 1;
+            }
         }
     }
 
@@ -1246,9 +1321,8 @@ async fn sync_loop(agent: Agent, client: ClientPool, mut tripwire: Tripwire) {
     }
 }
 
-pub async fn apply_schema<P: AsRef<Path>>(w_pool: &SqlitePool, schema_path: P) -> eyre::Result<()> {
-    let mut conn = w_pool.get().await?;
-
+// Corrosion's base migrations, should be a noop if up to date!
+pub fn migrate(conn: &mut Connection) -> eyre::Result<()> {
     let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
         init_migration as fn(&Transaction) -> eyre::Result<()>,
     )];
@@ -1268,10 +1342,25 @@ pub async fn apply_schema<P: AsRef<Path>>(w_pool: &SqlitePool, schema_path: P) -
         set_user_version(&tx, target_version)?;
         tx.commit()?;
     }
+    Ok(())
+}
 
-    let dir = std::fs::read_dir(schema_path)?;
-    let entries: Vec<DirEntry> = dir.collect::<Result<Vec<_>, io::Error>>()?;
-    let mut entries: Vec<DirEntry> = entries
+pub async fn apply_schema<P: AsRef<Path>>(w_pool: &SqlitePool, schema_path: P) -> eyre::Result<()> {
+    info!("Applying schema changes...");
+    let start = Instant::now();
+    let mut conn = w_pool.get().await?;
+
+    block_in_place(|| migrate(&mut conn))?;
+
+    let mut dir = tokio::fs::read_dir(schema_path).await?;
+
+    let mut entries = vec![];
+
+    while let Some(entry) = dir.next_entry().await? {
+        entries.push(entry);
+    }
+
+    let mut entries: Vec<_> = entries
         .into_iter()
         .filter_map(|entry| {
             entry
@@ -1282,25 +1371,34 @@ pub async fn apply_schema<P: AsRef<Path>>(w_pool: &SqlitePool, schema_path: P) -
         .collect();
     entries.sort_by_key(|entry| entry.path());
 
-    let tx = conn.transaction()?;
-    for entry in entries {
-        println!("applying schema file: {}", entry.path().display());
+    let mut schema = Schema::default();
 
-        let mut q = String::new();
-        std::fs::File::open(entry.path())?.read_to_string(&mut q)?;
+    block_in_place(|| {
+        let tx = conn.transaction()?;
+        for entry in entries {
+            println!("applying schema file: {}", entry.path().display());
 
-        let cmds = prepare_sql(q.as_bytes())?;
+            let mut q = String::new();
+            std::fs::File::open(entry.path())?.read_to_string(&mut q)?;
 
-        tx.execute_batch(
-            &cmds
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<String>>()
-                .join("\n"),
-        )?;
-        // tx.execute_batch(&q)?;
-    }
-    tx.commit()?;
+            let cmds = prepare_sql(q.as_bytes(), &mut schema)?;
+
+            tx.execute_batch(
+                &cmds
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>()
+                    .join("\n"),
+            )?;
+        }
+        tx.commit()?;
+        Ok::<_, eyre::Report>(())
+    })?;
+
+    // swap in the new schema
+    SCHEMA.store(Some(Arc::new(schema)));
+
+    info!("Done applying schema changes (took: {:?})", start.elapsed());
 
     Ok::<_, eyre::Report>(())
 }
@@ -1322,6 +1420,7 @@ fn init_migration(tx: &Transaction) -> Result<(), eyre::Report> {
                 actor_id BLOB NOT NULL,
                 version INTEGER NOT NULL,
                 db_version INTEGER,
+                ts TEXT NOT NULL,
                 PRIMARY KEY (actor_id, version)
             ) WITHOUT ROWID;
                         
@@ -1333,13 +1432,25 @@ fn init_migration(tx: &Transaction) -> Result<(), eyre::Report> {
             
                 foca_state JSON
             ) WITHOUT ROWID;
+
+            CREATE TABLE __corro_subs (
+                actor_id BLOB NOT NULL,
+                id TEXT NOT NULL,
+            
+                filter TEXT NOT NULL DEFAULT "",
+                priority INTEGER NOT NULL DEFAULT 0,
+
+                ts TEXT NOT NULL,
+            
+                PRIMARY KEY (actor_id, id)
+            ) WITHOUT ROWID;
         "#,
     )?;
 
     Ok(())
 }
 
-fn prepare_sql<I: Input>(input: I) -> eyre::Result<Vec<Cmd>> {
+fn prepare_sql<I: Input>(input: I, schema: &mut Schema) -> eyre::Result<Vec<Cmd>> {
     let mut cmds = vec![];
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(input);
     loop {
@@ -1356,26 +1467,62 @@ fn prepare_sql<I: Input>(input: I) -> eyre::Result<Vec<Cmd>> {
                     ..
                 }) = cmd
                 {
-                    if let CreateTableBody::ColumnsAndConstraints {
-                        // ref mut columns,
-                        ..
-                    } = body
-                    {
+                    if let CreateTableBody::ColumnsAndConstraints { ref columns, .. } = body {
                         if !tbl_name.name.0.contains("crsql")
                             & !tbl_name.name.0.contains("sqlite")
                             & !tbl_name.name.0.starts_with("__corro")
                         {
-                            // let mut sub_schema = JsonSchema::default();
-                            // sub_schema.id = Some(format!("/data/{}", tbl_name.name));
+                            for def in columns.iter() {
+                                let field_type = match def
+                                    .col_type
+                                    .as_ref()
+                                    .map(|t| t.name.to_ascii_uppercase())
+                                    .as_deref()
+                                {
+                                    // TODO: magic JSON...
+                                    // Some("JSON") => {
+                                    //     Type::Map(Box::new(Type::String), Box::new(Type::Infer))
+                                    // }
 
-                            // for def in columns.iter_mut() {
-                            //     add_prop(&mut sub_schema, def);
-                            // }
+                                    // 1. If the declared type contains the string "INT" then it is assigned INTEGER affinity.
+                                    Some(s) if s.contains("INT") => Type::Integer,
+                                    // 2. If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
+                                    Some(s)
+                                        if s.contains("CHAR")
+                                            || s.contains("CLOB")
+                                            || s.contains("TEXT")
+                                            || s == "JSON" =>
+                                    {
+                                        Type::String
+                                    }
 
-                            // sub_schema.additional_properties = Some(true);
-                            // schema.defs.insert(tbl_name.name.to_string(), sub_schema);
+                                    // 3. If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
+                                    Some(s) if s.contains("BLOB") || s == "JSONB" => {
+                                        Type::Array(Box::new(Type::Integer))
+                                    }
+                                    None => Type::Array(Box::new(Type::Integer)),
 
-                            println!("SELECTING crsql_as_crr for {}", tbl_name.name.0);
+                                    // 4. If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
+                                    Some(s)
+                                        if s.contains("REAL")
+                                            || s.contains("FLOA")
+                                            || s.contains("DOUB")
+                                            || s == "ANY" =>
+                                    {
+                                        Type::Float
+                                    }
+
+                                    // 5. Otherwise, the affinity is NUMERIC.
+                                    Some(_s) => Type::Float,
+                                };
+
+                                schema.fields.push(FieldDef {
+                                    name: format!("{}.{}", tbl_name.name.0, def.col_name),
+                                    r#type: field_type,
+                                });
+                            }
+
+                            debug!("SELECTING crsql_as_crr for {}", tbl_name.name.0);
 
                             let select = format!("SELECT crsql_as_crr('{}');", tbl_name.name.0);
                             let mut select_parser = Parser::new(select.as_bytes());
@@ -1466,8 +1613,6 @@ pub mod tests {
             "hello world 1"
         ],]))?;
 
-        println!("stmts: {req_body:?}");
-
         let res = client
             .request(
                 hyper::Request::builder()
@@ -1539,8 +1684,6 @@ pub mod tests {
             2,
             "hello world 2"
         ]]))?;
-
-        println!("stmts: {req_body:?}");
 
         let res = client
             .request(
