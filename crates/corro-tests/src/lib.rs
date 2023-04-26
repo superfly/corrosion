@@ -8,7 +8,7 @@ use corrosion::{
 use tempfile::TempDir;
 use tripwire::Tripwire;
 
-const TEST_SCHEMA: &str = r#"
+pub const TEST_SCHEMA: &str = r#"
         CREATE TABLE IF NOT EXISTS tests (
             id INTEGER NOT NULL PRIMARY KEY,
             text TEXT NOT NULL DEFAULT ""

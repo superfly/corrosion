@@ -235,12 +235,16 @@ mod tests {
     async fn rqlite_db_execute() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let dir = tempfile::tempdir()?;
+        let schema_path = dir.path().join("schema");
+        tokio::fs::create_dir_all(&schema_path).await?;
+
+        tokio::fs::write(schema_path.join("test.sql"), corro_tests::TEST_SCHEMA).await?;
 
         let pool = bb8::Pool::builder()
             .max_size(1)
             .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
 
-        apply_schema(&pool, "../../schema").await?;
+        apply_schema(&pool, schema_path).await?;
 
         let (tx, mut rx) = channel(1);
 
@@ -257,10 +261,9 @@ mod tests {
             Extension(bookie.clone()),
             Extension(clock.clone()),
             axum::Json(vec![Statement::WithParams(vec![
-                "insert into consul_services (id, name, address) values (?,?,?)".into(),
+                "insert into tests (id, text) values (?,?)".into(),
                 "service-id".into(),
                 "service-name".into(),
-                "blah".into(),
             ])]),
         )
         .await;
@@ -287,7 +290,7 @@ mod tests {
             Extension(bookie.clone()),
             Extension(clock.clone()),
             axum::Json(vec![Statement::WithParams(vec![
-                "update consul_services SET name = ? where id = ?".into(),
+                "update tests SET text = ? where id = ?".into(),
                 "service-name".into(),
                 "service-id".into(),
             ])]),
