@@ -9,8 +9,8 @@ docker run --rm -t \
     -e RUST_BACKTRACE=1 \
     -v rustup-home:/usr/local/rustup \
     -v cargo-registry-cache:/usr/local/cargo/registry \
-    -v cargo-target-dir:/var/cache/cargo-fly-proxy \
-    -e CARGO_TARGET_DIR=/var/cache/cargo-fly-proxy \
+    -v cargo-target-dir:/var/cache/cargo-corrosion \
+    -e CARGO_TARGET_DIR=/var/cache/cargo-corrosion \
     -e BUILDKITE_BUILD_ID="${BUILDKITE_BUILD_ID}" \
     -e BUILDKITE_BUILD_NUMBER="${BUILDKITE_BUILD_NUMBER}" \
     -e BUILDKITE_JOB_ID="${BUILDKITE_JOB_ID}" \
