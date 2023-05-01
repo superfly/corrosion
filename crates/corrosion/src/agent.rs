@@ -20,14 +20,11 @@ use crate::{
 };
 
 use arc_swap::ArcSwapOption;
-use compact_str::format_compact;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, AgentInner, Booked, BookedVersion, Bookie},
     broadcast::{BroadcastInput, BroadcastSrc, FocaInput, Message, MessageDecodeError, MessageV1},
-    change::Change,
-    filters::{match_expr, AggregateChange, Column, Schema},
-    // filters::Context,
+    filters::{match_expr, AggregateChange, Schema},
     members::{MemberEvent, Members},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
     sqlite::{init_cr_conn, prepare_sql, CrConn, CrConnManager, SqlitePool},
@@ -38,23 +35,14 @@ use axum::{
     Extension, Router,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-// use exprt::typecheck::{
-//     schema::{FieldDef, Schema},
-//     typecheck::Type,
-// };
-use fallible_iterator::FallibleIterator;
 use foca::{Member, Notification};
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
-use rusqlite::{params, types::Type, Connection, OptionalExtension, ToSql, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
 use spawn::spawn_counted;
-use sqlite3_parser::{
-    ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt},
-    lexer::{sql::Parser, Input},
-};
 use tokio::{
     net::{TcpListener, UdpSocket},
     sync::mpsc::{channel, Receiver, Sender},
@@ -989,129 +977,6 @@ pub async fn handle_broadcast(
     }
     Ok(())
 }
-
-// pub fn build_filter_context<'s>(change: &'s Change) -> eyre::Result<Option<Context<'s>>> {
-//     let schema = match SCHEMA.load().as_ref() {
-//         Some(schema) => schema,
-//         None => return Ok(None),
-//     };
-
-//     let mut ctx = Context::new(&schema);
-
-//     ctx.set_field_value(format_compact!("{}.{}", change.table, change.cid), change.val)?;
-
-//     let op_info = op.info();
-//     ctx.set_field_value("op.type", op_info.op_type)?;
-//     ctx.set_field_value("record.type", op_info.record_type)?;
-
-//     // start with these
-//     if let Some(applied) = applied {
-//         if let Some(app_id) = applied.app_id {
-//             ctx.set_field_value("app_id", app_id)?;
-//         }
-//         if let Some(org_id) = applied.organization_id {
-//             ctx.set_field_value("organization_id", org_id)?;
-//         }
-//         if let Some(net_id) = applied.network_id {
-//             ctx.set_field_value("network_id", net_id)?;
-//         }
-//     }
-
-//     match op {
-//         Operation::V1(op) => {
-//             use OperationV1::*;
-//             match op {
-//                 UpsertApp(ref app) => {
-//                     ctx.set_field_value("app_id", app.id)?;
-//                     ctx.set_field_value("organization_id", app.organization_id)?;
-//                     ctx.set_field_value("network_id", app.network_id)?;
-//                     ctx.set_field_value("app.network_id", app.network_id)?;
-//                 }
-//                 UpsertOrganization(ref org) => {
-//                     ctx.set_field_value("organization_id", org.id)?;
-//                 }
-//                 UpsertNetwork(ref net) => {
-//                     ctx.set_field_value("network_id", net.id)?;
-//                     ctx.set_field_value("organization_id", net.organization_id)?;
-//                 }
-//                 UpsertIpAssignment(ref ipa) => {
-//                     ctx.set_field_value("app_id", ipa.app_id)?;
-//                     ctx.set_field_value("ip_assignment.app_id", ipa.app_id)?;
-//                 }
-//                 DeleteApp { .. } => {}
-//                 DeleteOrganization { .. } => {}
-//                 DeleteNetwork { .. } => {}
-//                 DeleteIpAssignment { .. } => {}
-//                 UpsertConsulService(ref svc) => {
-//                     if let Some(app_id) = svc.app_id {
-//                         ctx.set_field_value("app_id", app_id)?;
-//                         ctx.set_field_value("consul_service.app_id", app_id)?;
-//                     }
-//                     if let Some(network_id) = svc.network_id {
-//                         ctx.set_field_value("network_id", network_id)?;
-//                         ctx.set_field_value("consul_service.network_id", network_id)?;
-//                     }
-//                     if let Some(protocol) = svc.meta.get("protocol") {
-//                         ctx.set_field_value("consul_service.meta.protocol", protocol.as_str())?;
-//                     }
-//                     ctx.set_field_value("consul_service.node", svc.node.as_str())?;
-//                 }
-//                 UpsertConsulCheck(ref check) => {
-//                     ctx.set_field_value("consul_check.node", check.node.as_str())?;
-//                 }
-//                 DeleteConsulService { .. } => {}
-//                 DeleteConsulCheck { .. } => {}
-//                 UpsertMachine(ref machine) => {
-//                     ctx.set_field_value("app_id", machine.app_id)?;
-//                     ctx.set_field_value("organization_id", machine.organization_id)?;
-//                     ctx.set_field_value("network_id", machine.network_id)?;
-//                 }
-//                 UpsertMachineVersion(_) => {}
-//                 DeleteMachine { .. } => {}
-//                 DeleteMachineVersion { .. } => {}
-//                 UpsertMachineVersionStatus(_) => {}
-//                 DeleteMachineVersionStatus { .. } => {}
-//                 UpsertWireguardPeer(ref peer) => {
-//                     ctx.set_field_value("organization_id", peer.organization_id)?;
-//                     ctx.set_field_value("network_id", peer.network_id)?;
-//                 }
-//                 DeleteWireguardPeer { .. } => {}
-//                 UpsertVhost(Vhost { app_id, .. }) => {
-//                     ctx.set_field_value("app_id", *app_id)?;
-//                 }
-//                 DeleteVhost { .. } => {}
-//             }
-//         }
-//         Operation::V2(op) => {
-//             use OperationV2::*;
-//             match op {
-//                 UpsertConsulService(ref svc) => {
-//                     if let Some(app_id) = svc.app_id {
-//                         ctx.set_field_value("app_id", app_id)?;
-//                         ctx.set_field_value("consul_service.app_id", app_id)?;
-//                     }
-//                     if let Some(network_id) = svc.network_id {
-//                         ctx.set_field_value("network_id", network_id)?;
-//                         ctx.set_field_value("consul_service.network_id", network_id)?;
-//                     }
-//                     if let Some(organization_id) = svc.organization_id {
-//                         ctx.set_field_value("organization_id", organization_id)?;
-//                     }
-//                     if let Some(protocol) = svc.meta.get("protocol") {
-//                         ctx.set_field_value("consul_service.meta.protocol", protocol.as_str())?;
-//                     }
-//                 }
-//                 UpsertApp(ref app) => {
-//                     ctx.set_field_value("app_id", app.id)?;
-//                     ctx.set_field_value("organization_id", app.organization_id)?;
-//                     ctx.set_field_value("network_id", app.network_id)?;
-//                     ctx.set_field_value("app.network_id", app.network_id)?;
-//                 }
-//             }
-//         }
-//     }
-//     Ok(ctx)
-// }
 
 async fn process_msg(
     agent: &Agent,
