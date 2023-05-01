@@ -655,8 +655,12 @@ dependencies = [
  "camino",
  "compact_str 0.7.0",
  "crc32fast",
+ "enquote",
  "exprt",
+ "fallible-iterator",
  "foca",
+ "hex",
+ "itertools",
  "metrics",
  "once_cell",
  "parking_lot",
@@ -667,11 +671,13 @@ dependencies = [
  "serde_json",
  "serde_with",
  "speedy",
+ "sqlite3-parser",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uhlc",
  "uuid",
 ]
@@ -943,12 +949,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "either"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fcaabb2fef8c910e7f4c7ce9f67a1283a1715879a7c230ca9d6d1ae31f16d91"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071a31f4ee85403370b58aca746f01041ede6f0da2730960ad001edc2b71b394"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "enquote"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06c36cb11dbde389f4096111698d8b567c0720e3452fd5ac3e6b4e47e1939932"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
@@ -1525,6 +1546,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "924e5d73ea28f59011fec52a0d12185d496a9b075d360657aed2a5707f701153"
 dependencies = [
  "nom",
+]
+
+[[package]]
+name = "itertools"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+dependencies = [
+ "either",
 ]
 
 [[package]]

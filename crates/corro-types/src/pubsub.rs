@@ -1,17 +1,18 @@
 use std::{collections::HashMap, fmt, net::SocketAddr, str::FromStr, sync::Arc};
 
 use compact_str::CompactString;
-use exprt::parser::ast::Expr;
+// use exprt::parser::ast::Expr;
 use parking_lot::RwLock;
 use serde::{
     de::{self, Visitor},
     Deserialize, Serialize,
 };
 use speedy::{Context, Readable, Writable};
+use sqlite3_parser::ast::Expr;
 use tokio::sync::mpsc::UnboundedSender;
 use uhlc::Timestamp;
 
-use crate::{change::SqliteValue, filters::parse_expr};
+use crate::{change::SqliteValue, filters::parse_filter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct SubscriberId(pub SocketAddr);
@@ -137,53 +138,53 @@ impl PartialEq for SubscriptionFilter {
 
 impl Eq for SubscriptionFilter {}
 
-impl Serialize for SubscriptionFilter {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
+// impl Serialize for SubscriptionFilter {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: serde::Serializer,
+//     {
+//         serializer.serialize_str(&self.0)
+//     }
+// }
 
-impl<'de> Deserialize<'de> for SubscriptionFilter {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_string(SubscriptionFilterVisitor)
-    }
-}
+// impl<'de> Deserialize<'de> for SubscriptionFilter {
+//     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+//     where
+//         D: serde::Deserializer<'de>,
+//     {
+//         deserializer.deserialize_string(SubscriptionFilterVisitor)
+//     }
+// }
 
-struct SubscriptionFilterVisitor;
+// struct SubscriptionFilterVisitor;
 
-impl<'de> Visitor<'de> for SubscriptionFilterVisitor {
-    type Value = SubscriptionFilter;
+// impl<'de> Visitor<'de> for SubscriptionFilterVisitor {
+//     type Value = SubscriptionFilter;
 
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        write!(formatter, "a string")
-    }
+//     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+//         write!(formatter, "a string")
+//     }
 
-    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.visit_string(s.to_owned())
-    }
+//     fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+//     where
+//         E: de::Error,
+//     {
+//         self.visit_string(s.to_owned())
+//     }
 
-    fn visit_string<E>(self, s: String) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        s.parse().map_err(de::Error::custom)
-    }
-}
+//     fn visit_string<E>(self, s: String) -> Result<Self::Value, E>
+//     where
+//         E: de::Error,
+//     {
+//         s.parse().map_err(de::Error::custom)
+//     }
+// }
 
-impl FromStr for SubscriptionFilter {
-    type Err = crate::filters::ParseError;
+// impl FromStr for SubscriptionFilter {
+//     type Err = crate::filters::ParseError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let expr = parse_expr(s)?;
-        Ok(SubscriptionFilter::new(s.to_owned(), expr))
-    }
-}
+//     fn from_str(s: &str) -> Result<Self, Self::Err> {
+//         let expr = parse_filter(s)?;
+//         Ok(SubscriptionFilter::new(s.to_owned(), expr))
+//     }
+// }

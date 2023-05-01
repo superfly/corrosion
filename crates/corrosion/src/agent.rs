@@ -20,12 +20,16 @@ use crate::{
 };
 
 use arc_swap::ArcSwapOption;
+use compact_str::format_compact;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, AgentInner, Booked, BookedVersion, Bookie},
     broadcast::{BroadcastInput, BroadcastSrc, FocaInput, Message, MessageDecodeError, MessageV1},
+    change::Change,
+    filters::{Column, Schema},
+    // filters::Context,
     members::{MemberEvent, Members},
-    sqlite::{init_cr_conn, CrConn, CrConnManager, SqlitePool},
+    sqlite::{init_cr_conn, prepare_sql, CrConn, CrConnManager, SqlitePool},
 };
 
 use axum::{
@@ -33,10 +37,10 @@ use axum::{
     Extension, Router,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use exprt::typecheck::{
-    schema::{FieldDef, Schema},
-    typecheck::Type,
-};
+// use exprt::typecheck::{
+//     schema::{FieldDef, Schema},
+//     typecheck::Type,
+// };
 use fallible_iterator::FallibleIterator;
 use foca::{Member, Notification};
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
@@ -44,10 +48,10 @@ use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
-use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
+use rusqlite::{params, types::Type, Connection, OptionalExtension, ToSql, Transaction};
 use spawn::spawn_counted;
 use sqlite3_parser::{
-    ast::{Cmd, CreateTableBody, Stmt},
+    ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt},
     lexer::{sql::Parser, Input},
 };
 use tokio::{
@@ -597,7 +601,7 @@ async fn handle_gossip(
     let mut rebroadcast = vec![];
 
     for msg in messages {
-        if process_msg(&msg, bookie, agent.read_write_pool()).await? {
+        if let Some(msg) = process_msg(msg, bookie, agent.read_write_pool()).await? {
             rebroadcast.push(msg);
         }
     }
@@ -987,24 +991,147 @@ pub async fn handle_broadcast(
     Ok(())
 }
 
+// pub fn build_filter_context<'s>(change: &'s Change) -> eyre::Result<Option<Context<'s>>> {
+//     let schema = match SCHEMA.load().as_ref() {
+//         Some(schema) => schema,
+//         None => return Ok(None),
+//     };
+
+//     let mut ctx = Context::new(&schema);
+
+//     ctx.set_field_value(format_compact!("{}.{}", change.table, change.cid), change.val)?;
+
+//     let op_info = op.info();
+//     ctx.set_field_value("op.type", op_info.op_type)?;
+//     ctx.set_field_value("record.type", op_info.record_type)?;
+
+//     // start with these
+//     if let Some(applied) = applied {
+//         if let Some(app_id) = applied.app_id {
+//             ctx.set_field_value("app_id", app_id)?;
+//         }
+//         if let Some(org_id) = applied.organization_id {
+//             ctx.set_field_value("organization_id", org_id)?;
+//         }
+//         if let Some(net_id) = applied.network_id {
+//             ctx.set_field_value("network_id", net_id)?;
+//         }
+//     }
+
+//     match op {
+//         Operation::V1(op) => {
+//             use OperationV1::*;
+//             match op {
+//                 UpsertApp(ref app) => {
+//                     ctx.set_field_value("app_id", app.id)?;
+//                     ctx.set_field_value("organization_id", app.organization_id)?;
+//                     ctx.set_field_value("network_id", app.network_id)?;
+//                     ctx.set_field_value("app.network_id", app.network_id)?;
+//                 }
+//                 UpsertOrganization(ref org) => {
+//                     ctx.set_field_value("organization_id", org.id)?;
+//                 }
+//                 UpsertNetwork(ref net) => {
+//                     ctx.set_field_value("network_id", net.id)?;
+//                     ctx.set_field_value("organization_id", net.organization_id)?;
+//                 }
+//                 UpsertIpAssignment(ref ipa) => {
+//                     ctx.set_field_value("app_id", ipa.app_id)?;
+//                     ctx.set_field_value("ip_assignment.app_id", ipa.app_id)?;
+//                 }
+//                 DeleteApp { .. } => {}
+//                 DeleteOrganization { .. } => {}
+//                 DeleteNetwork { .. } => {}
+//                 DeleteIpAssignment { .. } => {}
+//                 UpsertConsulService(ref svc) => {
+//                     if let Some(app_id) = svc.app_id {
+//                         ctx.set_field_value("app_id", app_id)?;
+//                         ctx.set_field_value("consul_service.app_id", app_id)?;
+//                     }
+//                     if let Some(network_id) = svc.network_id {
+//                         ctx.set_field_value("network_id", network_id)?;
+//                         ctx.set_field_value("consul_service.network_id", network_id)?;
+//                     }
+//                     if let Some(protocol) = svc.meta.get("protocol") {
+//                         ctx.set_field_value("consul_service.meta.protocol", protocol.as_str())?;
+//                     }
+//                     ctx.set_field_value("consul_service.node", svc.node.as_str())?;
+//                 }
+//                 UpsertConsulCheck(ref check) => {
+//                     ctx.set_field_value("consul_check.node", check.node.as_str())?;
+//                 }
+//                 DeleteConsulService { .. } => {}
+//                 DeleteConsulCheck { .. } => {}
+//                 UpsertMachine(ref machine) => {
+//                     ctx.set_field_value("app_id", machine.app_id)?;
+//                     ctx.set_field_value("organization_id", machine.organization_id)?;
+//                     ctx.set_field_value("network_id", machine.network_id)?;
+//                 }
+//                 UpsertMachineVersion(_) => {}
+//                 DeleteMachine { .. } => {}
+//                 DeleteMachineVersion { .. } => {}
+//                 UpsertMachineVersionStatus(_) => {}
+//                 DeleteMachineVersionStatus { .. } => {}
+//                 UpsertWireguardPeer(ref peer) => {
+//                     ctx.set_field_value("organization_id", peer.organization_id)?;
+//                     ctx.set_field_value("network_id", peer.network_id)?;
+//                 }
+//                 DeleteWireguardPeer { .. } => {}
+//                 UpsertVhost(Vhost { app_id, .. }) => {
+//                     ctx.set_field_value("app_id", *app_id)?;
+//                 }
+//                 DeleteVhost { .. } => {}
+//             }
+//         }
+//         Operation::V2(op) => {
+//             use OperationV2::*;
+//             match op {
+//                 UpsertConsulService(ref svc) => {
+//                     if let Some(app_id) = svc.app_id {
+//                         ctx.set_field_value("app_id", app_id)?;
+//                         ctx.set_field_value("consul_service.app_id", app_id)?;
+//                     }
+//                     if let Some(network_id) = svc.network_id {
+//                         ctx.set_field_value("network_id", network_id)?;
+//                         ctx.set_field_value("consul_service.network_id", network_id)?;
+//                     }
+//                     if let Some(organization_id) = svc.organization_id {
+//                         ctx.set_field_value("organization_id", organization_id)?;
+//                     }
+//                     if let Some(protocol) = svc.meta.get("protocol") {
+//                         ctx.set_field_value("consul_service.meta.protocol", protocol.as_str())?;
+//                     }
+//                 }
+//                 UpsertApp(ref app) => {
+//                     ctx.set_field_value("app_id", app.id)?;
+//                     ctx.set_field_value("organization_id", app.organization_id)?;
+//                     ctx.set_field_value("network_id", app.network_id)?;
+//                     ctx.set_field_value("app.network_id", app.network_id)?;
+//                 }
+//             }
+//         }
+//     }
+//     Ok(ctx)
+// }
+
 async fn process_msg(
-    msg: &Message,
+    msg: Message,
     bookie: &Bookie,
     pool: &SqlitePool,
-) -> Result<bool, bb8::RunError<bb8_rusqlite::Error>> {
-    match msg {
+) -> Result<Option<Message>, bb8::RunError<bb8_rusqlite::Error>> {
+    Ok(match msg {
         Message::V1(MessageV1::Change {
             actor_id,
             version,
             changeset,
             ts,
         }) => {
-            if bookie.contains(*actor_id, *version) {
+            if bookie.contains(actor_id, version) {
                 trace!(
                     "already seen this one! from: {}, version: {version}",
                     actor_id.hyphenated()
                 );
-                return Ok(false);
+                return Ok(None);
             }
 
             trace!(
@@ -1015,13 +1142,15 @@ async fn process_msg(
 
             let mut conn = pool.get().await?;
 
-            let db_version = block_in_place(move || {
+            let (db_version, changeset) = block_in_place(move || {
                 let tx = conn.transaction()?;
 
                 let start_version: i64 =
                     tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
 
-                for change in changeset.iter() {
+                let mut impactful_changeset = vec![];
+
+                for change in changeset {
                     tx.prepare_cached(
                         r#"
                     INSERT INTO crsql_changes
@@ -1038,6 +1167,13 @@ async fn process_msg(
                         change.db_version,
                         &change.site_id
                     ])?;
+                    let rows_impacted: i64 = tx
+                        .prepare_cached("SELECT crsql_rows_impacted()")?
+                        .query_row((), |row| row.get(0))?;
+
+                    if rows_impacted > 0 {
+                        impactful_changeset.push(change);
+                    }
                 }
 
                 let end_version: i64 = tx
@@ -1054,19 +1190,21 @@ async fn process_msg(
 
                 tx.commit()?;
 
-                Ok::<_, bb8_rusqlite::Error>(db_version)
+                Ok::<_, bb8_rusqlite::Error>((db_version, impactful_changeset))
             })?;
 
-            bookie.add(*actor_id, *version, db_version, *ts);
+            let msg = Message::V1(MessageV1::Change {
+                actor_id,
+                version,
+                changeset,
+                ts,
+            });
+
+            bookie.add(actor_id, version, db_version, ts);
+            Some(msg)
         }
-        Message::V1(MessageV1::UpsertSubscription {
-            actor_id: _,
-            id: _,
-            filter: _,
-            ts: _,
-        }) => {}
-    }
-    Ok(true)
+        Message::V1(v1) => Some(Message::V1(v1)),
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1280,13 +1418,12 @@ async fn handle_sync_receive(
     while let Some(buf_res) = framed.next().await {
         let mut buf = buf_res?;
         let msg = Message::from_buf(&mut buf)?;
-        process_msg(&msg, agent.bookie(), agent.read_write_pool()).await?;
-        match msg {
-            Message::V1(MessageV1::Change { ref changeset, .. }) => count += changeset.len(),
-            _ => {
-                count += 1;
-            }
-        }
+        let len = match &msg {
+            Message::V1(MessageV1::Change { ref changeset, .. }) => changeset.len(),
+            _ => 1,
+        };
+        process_msg(msg, agent.bookie(), agent.read_write_pool()).await?;
+        count += len;
     }
 
     Ok(count)
@@ -1450,107 +1587,6 @@ fn init_migration(tx: &Transaction) -> Result<(), eyre::Report> {
     Ok(())
 }
 
-fn prepare_sql<I: Input>(input: I, schema: &mut Schema) -> eyre::Result<Vec<Cmd>> {
-    let mut cmds = vec![];
-    let mut parser = sqlite3_parser::lexer::sql::Parser::new(input);
-    loop {
-        match parser.next() {
-            Ok(None) => break,
-            Err(err) => {
-                eprintln!("Err: {err}");
-                return Err(err.into());
-            }
-            Ok(Some(mut cmd)) => {
-                let extra_cmd = if let Cmd::Stmt(Stmt::CreateTable {
-                    ref tbl_name,
-                    ref mut body,
-                    ..
-                }) = cmd
-                {
-                    if let CreateTableBody::ColumnsAndConstraints { ref columns, .. } = body {
-                        if !tbl_name.name.0.contains("crsql")
-                            & !tbl_name.name.0.contains("sqlite")
-                            & !tbl_name.name.0.starts_with("__corro")
-                        {
-                            for def in columns.iter() {
-                                let field_type = match def
-                                    .col_type
-                                    .as_ref()
-                                    .map(|t| t.name.to_ascii_uppercase())
-                                    .as_deref()
-                                {
-                                    // TODO: magic JSON...
-                                    // Some("JSON") => {
-                                    //     Type::Map(Box::new(Type::String), Box::new(Type::Infer))
-                                    // }
-
-                                    // 1. If the declared type contains the string "INT" then it is assigned INTEGER affinity.
-                                    Some(s) if s.contains("INT") => Type::Integer,
-                                    // 2. If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
-                                    Some(s)
-                                        if s.contains("CHAR")
-                                            || s.contains("CLOB")
-                                            || s.contains("TEXT")
-                                            || s == "JSON" =>
-                                    {
-                                        Type::String
-                                    }
-
-                                    // 3. If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
-                                    Some(s) if s.contains("BLOB") || s == "JSONB" => {
-                                        Type::Array(Box::new(Type::Integer))
-                                    }
-                                    None => Type::Array(Box::new(Type::Integer)),
-
-                                    // 4. If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
-                                    Some(s)
-                                        if s.contains("REAL")
-                                            || s.contains("FLOA")
-                                            || s.contains("DOUB")
-                                            || s == "ANY" =>
-                                    {
-                                        Type::Float
-                                    }
-
-                                    // 5. Otherwise, the affinity is NUMERIC.
-                                    Some(_s) => Type::Float,
-                                };
-
-                                schema.fields.push(FieldDef {
-                                    name: format!("{}.{}", tbl_name.name.0, def.col_name),
-                                    r#type: field_type,
-                                });
-                            }
-
-                            debug!("SELECTING crsql_as_crr for {}", tbl_name.name.0);
-
-                            let select = format!("SELECT crsql_as_crr('{}');", tbl_name.name.0);
-                            let mut select_parser = Parser::new(select.as_bytes());
-                            Some(
-                                select_parser
-                                    .next()?
-                                    .ok_or(eyre::eyre!("could not parse select crsql"))?,
-                            )
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                cmds.push(cmd);
-                if let Some(extra_cmd) = extra_cmd {
-                    cmds.push(extra_cmd);
-                }
-            }
-        }
-    }
-
-    Ok(cmds)
-}
-
 // Read user version field from the SQLite db
 fn user_version(conn: &Connection) -> Result<usize, rusqlite::Error> {
     #[allow(deprecated)] // To keep compatibility with lower rusqlite versions
@@ -1573,6 +1609,7 @@ pub mod tests {
         time::{Duration, Instant},
     };
 
+    use fallible_iterator::FallibleIterator;
     use futures::{StreamExt, TryStreamExt};
     use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
     use serde::Deserialize;
@@ -1940,6 +1977,28 @@ pub mod tests {
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_filter() -> eyre::Result<()> {
+        // let input = "
+        //     tests.id IN ('hello', 'world') OR tests2.id = 'foobar' OR test2.name IS NOT NULL
+        // ";
+
+        // let input = format!("SELECT * FROM __corro_filter WHERE {input}");
+
+        let input = "CREATE TRIGGER tests INSERT
+        ON Product BEGIN
+            SELECT * FROM tests WHERE id = NEW.id;
+        END";
+
+        let mut parser = sqlite3_parser::lexer::sql::Parser::new(input.as_bytes());
+
+        while let Some(cmd) = parser.next()? {
+            println!("{cmd:#?}");
+        }
 
         Ok(())
     }

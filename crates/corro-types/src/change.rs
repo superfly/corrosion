@@ -16,6 +16,49 @@ pub struct Change {
     pub site_id: [u8; 16],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SqliteValueRef<'a> {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+impl<'a> SqliteValueRef<'a> {
+    pub fn is_null(&self) -> bool {
+        matches!(self, SqliteValueRef::Null)
+    }
+
+    pub fn as_integer(&self) -> Option<&i64> {
+        match self {
+            SqliteValueRef::Integer(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    pub fn as_real(&self) -> Option<&f64> {
+        match self {
+            SqliteValueRef::Real(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            SqliteValueRef::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_blob(&self) -> Option<&[u8]> {
+        match self {
+            SqliteValueRef::Blob(b) => Some(b),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
 #[serde(untagged)]
 pub enum SqliteValue {
@@ -32,6 +75,16 @@ impl SqliteValue {
             Some(s)
         } else {
             None
+        }
+    }
+
+    pub fn as_ref<'a>(&'a self) -> SqliteValueRef<'a> {
+        match self {
+            SqliteValue::Null => SqliteValueRef::Null,
+            SqliteValue::Integer(i) => SqliteValueRef::Integer(*i),
+            SqliteValue::Real(f) => SqliteValueRef::Real(*f),
+            SqliteValue::Text(s) => SqliteValueRef::Text(s.as_str()),
+            SqliteValue::Blob(v) => SqliteValueRef::Blob(v.as_slice()),
         }
     }
 }

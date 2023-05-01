@@ -1,519 +1,1167 @@
-use std::{
-    net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr},
-    num::ParseIntError,
-    ops::RangeInclusive,
-};
+use std::{cmp::Ordering, collections::HashMap, ops::Deref};
 
-pub use exprt::parser::ast::Expr;
-use exprt::{
-    parser::{
-        ast::{Atom, ExprKind, Field, FunctionCall, Index, Indexed},
-        tokenizer::Span,
-    },
-    typecheck::{
-        schema::{FieldDef, Schema},
-        typecheck::Type,
-    },
+use enquote::unquote;
+use fallible_iterator::FallibleIterator;
+use itertools::Itertools;
+use rusqlite::types::Type;
+// pub use exprt::parser::ast::Expr;
+// use exprt::{
+//     parser::{
+//         ast::{Atom, ExprKind, Field, FunctionCall, Index, Indexed},
+//         tokenizer::Span,
+//     },
+//     typecheck::{
+//         schema::{FieldDef, Schema},
+//         typecheck::Type,
+//     },
+// };
+use sqlite3_parser::{
+    ast::{Cmd, Expr, Literal, OneSelect, Operator, Stmt},
+    lexer::sql::Parser,
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, trace, warn};
+
+use crate::change::{Change, SqliteValueRef};
+
+const CORRO_EVENT: &str = "evt_type";
+const CORRO_TABLE: &str = "tbl_name";
 
 #[derive(Debug, Clone)]
-pub enum FilterValue<'v> {
-    Ip(IpAddr),
-    String(&'v str),
-    Integer(i64),
-    Bool(bool),
+pub struct Column {
+    pub name: String,
+    pub sqlite_type: Type,
+    pub primary_key: bool,
+    pub nullable: bool,
 }
 
-impl<'v> FilterValue<'v> {
-    fn get_type(&self) -> Type {
-        match self {
-            FilterValue::Ip(ip) => match ip {
-                IpAddr::V4(_) => Type::Ipv4,
-                IpAddr::V6(_) => Type::Ipv6,
-            },
-            FilterValue::String(_) => Type::String,
-            FilterValue::Integer(_) => Type::Integer,
-            FilterValue::Bool(_) => Type::Bool,
-        }
-    }
-    fn is_type(&self, t: &Type) -> bool {
-        match t {
-            t if !t.is_const() => &self.get_type() == t,
-            Type::Const(t) => &self.get_type() == t.as_ref(),
-            _ => false,
-        }
-    }
-}
-
-impl<'v> From<i64> for FilterValue<'v> {
-    fn from(i: i64) -> Self {
-        FilterValue::Integer(i)
-    }
-}
-
-impl<'v> From<&'v str> for FilterValue<'v> {
-    fn from(v: &'v str) -> Self {
-        FilterValue::String(v)
-    }
-}
-
-impl<'v> From<IpAddr> for FilterValue<'v> {
-    fn from(ip: IpAddr) -> Self {
-        FilterValue::Ip(ip)
-    }
-}
-
-impl<'v> From<bool> for FilterValue<'v> {
-    fn from(b: bool) -> Self {
-        FilterValue::Bool(b)
-    }
-}
-
-pub struct Context<'s> {
-    schema: &'s Schema,
-    values: Vec<Option<FilterValue<'s>>>,
-}
-
-impl<'s> Context<'s> {
-    pub fn new(schema: &'s Schema) -> Self {
-        Self {
-            schema,
-            values: vec![None; schema.fields.len()],
-        }
-    }
-
-    pub fn set_field_value<'v: 's, V: Into<FilterValue<'v>>>(
-        &mut self,
-        name: &str,
-        value: V,
-    ) -> Result<(), ContextError> {
-        let (field_idx, field) = self
-            .schema
-            .fields
-            .iter()
-            .enumerate()
-            .find(|(_, fd)| fd.name == name)
-            .ok_or_else(|| ContextError::NoSuchField(name.to_owned()))?;
-        let value = value.into();
-        let field_type = &field.r#type;
-        let value_type = value.get_type();
-        if field_type != &value_type {
-            return Err(ContextError::FieldTypeMismatch(
-                field_type.clone(),
-                value_type,
-            ));
-        }
-
-        self.values[field_idx] = Some(value);
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ContextError {
-    #[error("no such field: {0}")]
-    NoSuchField(String),
-    #[error("filter value type mismatch. expected: {0:?}, got: {1:?}")]
-    FieldTypeMismatch(Type, Type),
-}
+// schema contains a mapping of
+pub type Schema = HashMap<String, Vec<Column>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
+    #[error("unknown table {0}")]
+    UnknownTable(String),
+    #[error("unknown event {0}")]
+    UnknownEvent(String),
     #[error(transparent)]
-    Parse(#[from] exprt::parser::parser::ParseError),
-    #[error("unimplemented filter type '{0}'")]
-    Unimplemented(&'static str),
-    #[error(transparent)]
-    ParseInt(#[from] ParseIntError),
-    #[error(transparent)]
-    ParseAddr(#[from] AddrParseError),
+    Parse(#[from] sqlite3_parser::lexer::sql::Error),
+    #[error("unsupported command")]
+    UnsupportedCmd(Cmd),
+    #[error("unsupported statement")]
+    UnsupportedStmt(Stmt),
+    #[error("unsupported select")]
+    UnsupportedSelect(OneSelect),
+    #[error("unsupported expr: {0}")]
+    UnsupportedExpr(Expr),
+    #[error("unsupported left-hand-side expr: {0}")]
+    UnsupportedLhsExpr(Expr),
+    #[error("unsupported binary operator: {0:?}")]
+    UnsupportedOperator(Operator),
+    #[error("unsupported right-hand-side expr: {0}")]
+    UnsupportedRhsExpr(Expr),
+    #[error("invalid column {1} for table {0}")]
+    InvalidColumn(String, String),
+    #[error("unsupported right-hand-side literal: {0:?}")]
+    UnsupportedLiteral(Literal),
+    #[error("literal was expected")]
+    ExpectedLiteral,
+    #[error("left-hand-side identifier / name expected")]
+    ExpectedLhsIdentifier,
+    #[error("qualified name in 'table.column' format is required, got: '{0}'")]
+    QualifiedNameRequired(String),
+    #[error("invalid blob literal: {0}")]
+    InvalidBlobLiteral(#[from] hex::FromHexError),
+    #[error("numeric literal was neither a i64 or f64")]
+    NumericNeitherIntegerNorReal,
+    #[error("wrong literal type for column type")]
+    WrongLiteralType,
+    #[error("column is not nullable")]
+    ColumnIsNotNullable,
+    #[error("unsupported binary operator {0:?}")]
+    UnsupportedBinaryOp(Operator),
 }
 
-pub fn parse_expr(input: &str) -> Result<Expr, ParseError> {
-    let mut expr = exprt::parser::parser::parse(input)?;
+#[derive(Debug)]
+pub enum SupportedExpr {
+    TableName {
+        name: String,
+        not_equal: bool,
+    },
+    EventType {
+        evt: ChangeEvent,
+        not_equal: bool,
+    },
 
-    trace!("parsed expr: {expr:#?}");
+    LiteralInteger(BinaryOp, ColumnLit<i64>),
+    LiteralReal(BinaryOp, ColumnLit<f64>),
+    LiteralText(BinaryOp, ColumnLit<String>),
+    LiteralBlob(BinaryOp, ColumnLit<Vec<u8>>),
 
-    normalize_expr(&mut expr)?;
+    // BinaryLiteral(FilterLhs, BinaryOp, FilterRhs),
+    BinaryAnd(Box<SupportedExpr>, Box<SupportedExpr>),
+    BinaryOr(Box<SupportedExpr>, Box<SupportedExpr>),
+    Parenthesized(Vec<SupportedExpr>),
 
-    Ok(expr)
+    ListOfInteger {
+        table: String,
+        name: String,
+        list: Vec<RhsType<i64>>,
+        not: bool,
+    },
+    ListOfReal {
+        table: String,
+        name: String,
+        list: Vec<RhsType<f64>>,
+        not: bool,
+    },
+    ListOfText {
+        table: String,
+        name: String,
+        list: Vec<RhsType<String>>,
+        not: bool,
+    },
+    ListOfBlob {
+        table: String,
+        name: String,
+        list: Vec<RhsType<Vec<u8>>>,
+        not: bool,
+    },
+
+    IsNull(FilterLhs),
+    NotNull(FilterLhs),
 }
 
-fn normalize_expr(expr: &mut Expr) -> Result<(), ParseError> {
-    match &mut expr.inner {
-        ExprKind::Atom(atom) => match atom {
-            Atom::StringLiteral(_) => expr.r#type = Type::Const(Box::new(Type::String)),
-            Atom::NumberLiteral(_) => expr.r#type = Type::Const(Box::new(Type::Integer)),
-            Atom::Ipv4(_) => expr.r#type = Type::Const(Box::new(Type::Ipv4)),
-            Atom::Ipv4Cidr(_) => return Err(ParseError::Unimplemented("ipv4 cidr")),
-            Atom::Ipv6(_) => expr.r#type = Type::Const(Box::new(Type::Ipv6)),
-            Atom::Ipv6Cidr(_) => return Err(ParseError::Unimplemented("ipv6 cidr")),
-        },
-        ExprKind::Field(_) => {}
-        ExprKind::FunctionCall(FunctionCall { ref mut args, .. }) => {
-            for expr in args.iter_mut() {
-                normalize_expr(expr)?;
-            }
+#[derive(Debug)]
+pub enum SupportedRhsLiteral {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+#[derive(Debug)]
+pub struct ColumnLit<Rhs> {
+    table: String,
+    name: String,
+    rhs: RhsType<Rhs>,
+}
+
+impl<T> Deref for ColumnLit<T> {
+    type Target = RhsType<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rhs
+    }
+}
+
+#[derive(Debug)]
+pub enum RhsType<T> {
+    Nullable(Option<T>),
+    NotNullable(T),
+}
+
+impl<T> RhsType<T> {
+    pub fn is_nullable(&self) -> bool {
+        match self {
+            RhsType::Nullable(_) => true,
+            RhsType::NotNullable(_) => false,
         }
-        ExprKind::Array {
-            ref mut elements, ..
+    }
+    pub fn as_ref(&self) -> Option<&T> {
+        match self {
+            RhsType::Nullable(t) => t.as_ref(),
+            RhsType::NotNullable(ref t) => Some(t),
+        }
+    }
+}
+
+impl<T: Deref> RhsType<T> {
+    pub fn as_deref(&self) -> Option<&T::Target> {
+        match self {
+            RhsType::Nullable(t) => t.as_deref(),
+            RhsType::NotNullable(t) => Some(t.deref()),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum BinaryOp {
+    Equals,
+    Greater,
+    GreaterEquals,
+    Is,
+    IsNot,
+    Less,
+    LessEquals,
+    NotEquals,
+}
+
+#[derive(Debug, Clone)]
+pub enum FilterLhs {
+    Column {
+        table: String,
+        name: String,
+        sqlite_type: Type,
+        nullable: bool,
+    },
+    TableName,
+    EventType,
+}
+
+#[derive(Debug)]
+pub enum FilterRhs {
+    Literal(SupportedRhsLiteral),
+    TableName(String),
+    EventType(ChangeEvent),
+}
+
+pub fn parse_filter(schema: &Schema, input: &str) -> Result<Filter, ParseError> {
+    // kind of a hack...
+    let input = format!("SELECT dummy FROM dummy WHERE {input}");
+
+    let mut parser = Parser::new(input.as_bytes());
+
+    // only parse the first statement
+    let cmd = parser.next()?.unwrap();
+
+    let filter = match cmd {
+        Cmd::Stmt(stmt) => match stmt {
+            Stmt::Select(select) => match select.body.select {
+                OneSelect::Select {
+                    where_clause: Some(where_clause),
+                    ..
+                } => Filter {
+                    expr: (where_clause, schema).try_into()?,
+                },
+                select => return Err(ParseError::UnsupportedSelect(select)),
+            },
+            stmt => return Err(ParseError::UnsupportedStmt(stmt)),
+        },
+        cmd => return Err(ParseError::UnsupportedCmd(cmd)),
+    };
+
+    Ok(filter)
+}
+
+impl TryFrom<(Expr, &Schema)> for FilterLhs {
+    type Error = ParseError;
+
+    fn try_from((lhs, schema): (Expr, &Schema)) -> Result<Self, Self::Error> {
+        match lhs {
+            Expr::Id(id) => match id.0.as_str() {
+                CORRO_TABLE => Ok(FilterLhs::TableName),
+                CORRO_EVENT => Ok(FilterLhs::EventType),
+                _ => Err(ParseError::QualifiedNameRequired(id.0.clone())),
+            },
+            Expr::Name(name) => match name.0.as_str() {
+                CORRO_TABLE => Ok(FilterLhs::TableName),
+                CORRO_EVENT => Ok(FilterLhs::EventType),
+                _ => Err(ParseError::QualifiedNameRequired(name.0.clone())),
+            },
+            Expr::Qualified(tbl_name, name) => {
+                if let Some(cols) = schema.get(tbl_name.0.as_str()) {
+                    if let Some(col) = cols.iter().find(|col| col.name == name.0) {
+                        Ok(FilterLhs::Column {
+                            table: tbl_name.0.clone(),
+                            name: name.0.clone(),
+                            sqlite_type: col.sqlite_type.clone(),
+                            nullable: col.nullable,
+                        })
+                    } else {
+                        Err(ParseError::InvalidColumn(
+                            tbl_name.0.clone(),
+                            name.0.clone(),
+                        ))
+                    }
+                } else {
+                    Err(ParseError::UnknownTable(tbl_name.0.clone()))
+                }
+            }
+            _ => Err(ParseError::ExpectedLhsIdentifier),
+        }
+    }
+}
+
+impl TryFrom<Literal> for SupportedRhsLiteral {
+    type Error = ParseError;
+
+    fn try_from(lit: Literal) -> Result<Self, Self::Error> {
+        match lit {
+            Literal::Null => Ok(SupportedRhsLiteral::Null),
+            Literal::Blob(b) => Ok(SupportedRhsLiteral::Blob(hex::decode(b)?)),
+            Literal::String(s) => Ok(SupportedRhsLiteral::Text(unquote(s.as_str()).unwrap_or(s))),
+            Literal::Numeric(n) => match n.parse::<i64>() {
+                Ok(i) => Ok(SupportedRhsLiteral::Integer(i)),
+                Err(_) => match n.parse::<f64>() {
+                    Ok(f) => Ok(SupportedRhsLiteral::Real(f)),
+                    Err(_) => Err(ParseError::NumericNeitherIntegerNorReal),
+                },
+            },
+            _ => Err(ParseError::UnsupportedLiteral(lit)),
+        }
+    }
+}
+
+impl TryFrom<(Expr, &Schema, FilterLhs, Operator)> for SupportedExpr {
+    type Error = ParseError;
+
+    fn try_from(
+        (rhs, schema, lhs, op): (Expr, &Schema, FilterLhs, Operator),
+    ) -> Result<Self, Self::Error> {
+        match rhs {
+            Expr::Literal(lit) => {
+                let rhs: SupportedRhsLiteral = lit.try_into()?;
+                match (lhs, op, rhs) {
+                    (FilterLhs::TableName, op, SupportedRhsLiteral::Text(name)) => {
+                        let not_equal = match op {
+                            Operator::Equals | Operator::Is => false,
+                            Operator::NotEquals | Operator::IsNot => true,
+                            _ => return Err(ParseError::UnsupportedBinaryOp(op)),
+                        };
+
+                        match schema.get(&name) {
+                            Some(_) => Ok(SupportedExpr::TableName { name, not_equal }),
+                            None => Err(ParseError::UnknownTable(name)),
+                        }
+                    }
+                    (FilterLhs::TableName, _, _) => Err(ParseError::WrongLiteralType),
+                    (FilterLhs::EventType, op, SupportedRhsLiteral::Text(s)) => {
+                        let not_equal = match op {
+                            Operator::Equals | Operator::Is => false,
+                            Operator::NotEquals | Operator::IsNot => true,
+                            _ => return Err(ParseError::UnsupportedBinaryOp(op)),
+                        };
+                        Ok(SupportedExpr::EventType {
+                            evt: ChangeEvent::from_str(s.as_str())
+                                .ok_or(ParseError::UnknownEvent(s))?,
+                            not_equal,
+                        })
+                    }
+                    (FilterLhs::EventType, _, _) => Err(ParseError::WrongLiteralType),
+                    (
+                        FilterLhs::Column {
+                            nullable: false, ..
+                        },
+                        _,
+                        SupportedRhsLiteral::Null,
+                    ) => Err(ParseError::WrongLiteralType),
+                    (
+                        FilterLhs::Column {
+                            nullable: true,
+                            sqlite_type,
+                            table,
+                            name,
+                        },
+                        op,
+                        rhs @ SupportedRhsLiteral::Null,
+                    ) => {
+                        let op = op.try_into()?;
+                        let expr = match sqlite_type {
+                            Type::Integer => SupportedExpr::LiteralInteger(
+                                op,
+                                ColumnLit {
+                                    table,
+                                    name,
+                                    rhs: RhsType::Nullable(None),
+                                },
+                            ),
+                            Type::Real => SupportedExpr::LiteralReal(
+                                op,
+                                ColumnLit {
+                                    table,
+                                    name,
+                                    rhs: RhsType::Nullable(None),
+                                },
+                            ),
+                            Type::Text => SupportedExpr::LiteralText(
+                                op,
+                                ColumnLit {
+                                    table,
+                                    name,
+                                    rhs: RhsType::Nullable(None),
+                                },
+                            ),
+                            Type::Blob => SupportedExpr::LiteralBlob(
+                                op,
+                                ColumnLit {
+                                    table,
+                                    name,
+                                    rhs: RhsType::Nullable(None),
+                                },
+                            ),
+                            _ => unreachable!(),
+                        };
+                        Ok(expr)
+                    }
+                    (
+                        FilterLhs::Column {
+                            nullable,
+                            sqlite_type,
+                            table,
+                            name,
+                        },
+                        op,
+                        rhs,
+                    ) => {
+                        let op = op.try_into()?;
+                        let expr = match (sqlite_type, rhs) {
+                            (Type::Integer, SupportedRhsLiteral::Integer(i)) => {
+                                SupportedExpr::LiteralInteger(
+                                    op,
+                                    ColumnLit {
+                                        table,
+                                        name,
+                                        rhs: if nullable {
+                                            RhsType::Nullable(Some(i))
+                                        } else {
+                                            RhsType::NotNullable(i)
+                                        },
+                                    },
+                                )
+                            }
+                            (Type::Real, SupportedRhsLiteral::Real(f)) => {
+                                SupportedExpr::LiteralReal(
+                                    op,
+                                    ColumnLit {
+                                        table,
+                                        name,
+                                        rhs: if nullable {
+                                            RhsType::Nullable(Some(f))
+                                        } else {
+                                            RhsType::NotNullable(f)
+                                        },
+                                    },
+                                )
+                            }
+                            (Type::Text, SupportedRhsLiteral::Text(s)) => {
+                                SupportedExpr::LiteralText(
+                                    op,
+                                    ColumnLit {
+                                        table,
+                                        name,
+                                        rhs: if nullable {
+                                            RhsType::Nullable(Some(s))
+                                        } else {
+                                            RhsType::NotNullable(s)
+                                        },
+                                    },
+                                )
+                            }
+                            (Type::Blob, SupportedRhsLiteral::Blob(b)) => {
+                                SupportedExpr::LiteralBlob(
+                                    op,
+                                    ColumnLit {
+                                        table,
+                                        name,
+                                        rhs: if nullable {
+                                            RhsType::Nullable(Some(b))
+                                        } else {
+                                            RhsType::NotNullable(b)
+                                        },
+                                    },
+                                )
+                            }
+                            _ => unreachable!(),
+                        };
+                        Ok(expr)
+                    }
+                }
+            }
+            _ => Err(ParseError::ExpectedLiteral),
+        }
+    }
+}
+
+impl TryFrom<Operator> for BinaryOp {
+    type Error = ParseError;
+
+    fn try_from(value: Operator) -> Result<Self, Self::Error> {
+        Ok(match value {
+            Operator::Equals => BinaryOp::Equals,
+            Operator::Greater => BinaryOp::Greater,
+            Operator::GreaterEquals => BinaryOp::GreaterEquals,
+            Operator::Is => BinaryOp::Is,
+            Operator::IsNot => BinaryOp::IsNot,
+            Operator::Less => BinaryOp::Less,
+            Operator::LessEquals => BinaryOp::LessEquals,
+            Operator::NotEquals => BinaryOp::NotEquals,
+            op => return Err(ParseError::UnsupportedBinaryOp(op)),
+        })
+    }
+}
+
+impl TryFrom<(Expr, &FilterLhs)> for ColumnLit<i64> {
+    type Error = ParseError;
+
+    fn try_from((rhs, lhs): (Expr, &FilterLhs)) -> Result<Self, Self::Error> {
+        match (rhs, lhs) {
+            (Expr::Literal(lit), lhs) => match (lit.try_into()?, lhs) {
+                (
+                    SupportedRhsLiteral::Integer(i),
+                    FilterLhs::Column {
+                        table,
+                        name,
+                        sqlite_type: Type::Integer,
+                        nullable,
+                    },
+                ) => Ok(ColumnLit {
+                    table: table.clone(),
+                    name: name.clone(),
+                    rhs: (i, *nullable).into(),
+                }),
+                // FIXME: that's the wrong error
+                _ => Err(ParseError::ExpectedLiteral),
+            },
+            _ => Err(ParseError::ExpectedLiteral),
+        }
+    }
+}
+
+impl TryFrom<(Expr, &FilterLhs)> for ColumnLit<f64> {
+    type Error = ParseError;
+
+    fn try_from((rhs, lhs): (Expr, &FilterLhs)) -> Result<Self, Self::Error> {
+        match (rhs, lhs) {
+            (Expr::Literal(lit), lhs) => match (lit.try_into()?, lhs) {
+                (
+                    SupportedRhsLiteral::Real(i),
+                    FilterLhs::Column {
+                        table,
+                        name,
+                        sqlite_type: Type::Real,
+                        nullable,
+                    },
+                ) => Ok(ColumnLit {
+                    table: table.clone(),
+                    name: name.clone(),
+                    rhs: (i, *nullable).into(),
+                }),
+                // FIXME: that's the wrong error
+                _ => Err(ParseError::ExpectedLiteral),
+            },
+            _ => Err(ParseError::ExpectedLiteral),
+        }
+    }
+}
+
+impl TryFrom<(Expr, &FilterLhs)> for ColumnLit<String> {
+    type Error = ParseError;
+
+    fn try_from((rhs, lhs): (Expr, &FilterLhs)) -> Result<Self, Self::Error> {
+        match (rhs, lhs) {
+            (Expr::Literal(lit), lhs) => match (lit.try_into()?, lhs) {
+                (
+                    SupportedRhsLiteral::Text(i),
+                    FilterLhs::Column {
+                        table,
+                        name,
+                        sqlite_type: Type::Text,
+                        nullable,
+                    },
+                ) => Ok(ColumnLit {
+                    table: table.clone(),
+                    name: name.clone(),
+                    rhs: (i, *nullable).into(),
+                }),
+                // FIXME: that's the wrong error
+                _ => Err(ParseError::ExpectedLiteral),
+            },
+            _ => Err(ParseError::ExpectedLiteral),
+        }
+    }
+}
+
+impl TryFrom<(Expr, &FilterLhs)> for ColumnLit<Vec<u8>> {
+    type Error = ParseError;
+
+    fn try_from((rhs, lhs): (Expr, &FilterLhs)) -> Result<Self, Self::Error> {
+        match (rhs, lhs) {
+            (Expr::Literal(lit), lhs) => match (lit.try_into()?, lhs) {
+                (
+                    SupportedRhsLiteral::Blob(i),
+                    FilterLhs::Column {
+                        table,
+                        name,
+                        sqlite_type: Type::Blob,
+                        nullable,
+                    },
+                ) => Ok(ColumnLit {
+                    table: table.clone(),
+                    name: name.clone(),
+                    rhs: (i, *nullable).into(),
+                }),
+                // FIXME: that's the wrong error
+                _ => Err(ParseError::ExpectedLiteral),
+            },
+            _ => Err(ParseError::ExpectedLiteral),
+        }
+    }
+}
+
+impl From<(i64, bool)> for RhsType<i64> {
+    fn from((i, nullable): (i64, bool)) -> Self {
+        if nullable {
+            RhsType::Nullable(Some(i))
+        } else {
+            RhsType::NotNullable(i)
+        }
+    }
+}
+
+impl From<(String, bool)> for RhsType<String> {
+    fn from((i, nullable): (String, bool)) -> Self {
+        if nullable {
+            RhsType::Nullable(Some(i))
+        } else {
+            RhsType::NotNullable(i)
+        }
+    }
+}
+
+impl From<(f64, bool)> for RhsType<f64> {
+    fn from((i, nullable): (f64, bool)) -> Self {
+        if nullable {
+            RhsType::Nullable(Some(i))
+        } else {
+            RhsType::NotNullable(i)
+        }
+    }
+}
+
+impl From<(Vec<u8>, bool)> for RhsType<Vec<u8>> {
+    fn from((i, nullable): (Vec<u8>, bool)) -> Self {
+        if nullable {
+            RhsType::Nullable(Some(i))
+        } else {
+            RhsType::NotNullable(i)
+        }
+    }
+}
+
+impl TryFrom<(Expr, &Schema)> for SupportedExpr {
+    type Error = ParseError;
+
+    fn try_from((expr, schema): (Expr, &Schema)) -> Result<Self, Self::Error> {
+        match expr {
+            Expr::Binary(lhs, op, rhs) => match op {
+                op @ Operator::And | op @ Operator::Or => {
+                    let lhs: SupportedExpr = (*lhs, schema).try_into()?;
+                    let rhs: SupportedExpr = (*rhs, schema).try_into()?;
+                    match op {
+                        Operator::And => Ok(SupportedExpr::BinaryAnd(Box::new(lhs), Box::new(rhs))),
+                        Operator::Or => Ok(SupportedExpr::BinaryOr(Box::new(lhs), Box::new(rhs))),
+                        _ => unreachable!(),
+                    }
+                }
+                op => {
+                    let lhs: FilterLhs = (*lhs, schema).try_into()?;
+                    (*rhs, schema, lhs, op).try_into()
+                }
+            },
+            Expr::Parenthesized(exprs) => Ok(SupportedExpr::Parenthesized(
+                exprs
+                    .into_iter()
+                    .map(|expr| (expr, schema).try_into())
+                    .collect::<Result<Vec<SupportedExpr>, Self::Error>>()?,
+            )),
+            Expr::InList {
+                ref lhs,
+                rhs: Some(ref rhs),
+                not,
+            } => {
+                let lhs: FilterLhs = (*lhs.clone(), schema).try_into()?;
+
+                match &lhs {
+                    lhs @ FilterLhs::Column {
+                        table,
+                        name,
+                        sqlite_type,
+                        nullable,
+                    } => match sqlite_type {
+                        Type::Integer => Ok(SupportedExpr::ListOfInteger {
+                            table: table.clone(),
+                            name: name.clone(),
+                            list: rhs
+                                .iter()
+                                .map(|rhs| {
+                                    (rhs.clone(), lhs)
+                                        .try_into()
+                                        .map(|lit: ColumnLit<_>| lit.rhs)
+                                })
+                                .collect::<Result<Vec<_>, Self::Error>>()?,
+                            not,
+                        }),
+                        Type::Real => Ok(SupportedExpr::ListOfReal {
+                            table: table.clone(),
+                            name: name.clone(),
+                            list: rhs
+                                .iter()
+                                .map(|rhs| {
+                                    (rhs.clone(), lhs)
+                                        .try_into()
+                                        .map(|lit: ColumnLit<_>| lit.rhs)
+                                })
+                                .collect::<Result<Vec<_>, Self::Error>>()?,
+                            not,
+                        }),
+                        Type::Text => Ok(SupportedExpr::ListOfText {
+                            table: table.clone(),
+                            name: name.clone(),
+                            list: rhs
+                                .iter()
+                                .map(|rhs| {
+                                    (rhs.clone(), lhs)
+                                        .try_into()
+                                        .map(|lit: ColumnLit<_>| lit.rhs)
+                                })
+                                .collect::<Result<Vec<_>, Self::Error>>()?,
+                            not,
+                        }),
+                        Type::Blob => Ok(SupportedExpr::ListOfBlob {
+                            table: table.clone(),
+                            name: name.clone(),
+                            list: rhs
+                                .iter()
+                                .map(|rhs| {
+                                    (rhs.clone(), lhs)
+                                        .try_into()
+                                        .map(|lit: ColumnLit<_>| lit.rhs)
+                                })
+                                .collect::<Result<Vec<_>, Self::Error>>()?,
+                            not,
+                        }),
+                        Type::Null => unreachable!(),
+                    },
+                    _ => return Err(ParseError::UnsupportedExpr(expr.clone())),
+                }
+            }
+            Expr::IsNull(lhs) => {
+                let lhs: FilterLhs = (*lhs, schema).try_into()?;
+                if let FilterLhs::Column { nullable: true, .. } = &lhs {
+                    Ok(SupportedExpr::IsNull(lhs))
+                } else {
+                    Err(ParseError::ColumnIsNotNullable)
+                }
+            }
+            Expr::NotNull(lhs) => {
+                let lhs: FilterLhs = (*lhs, schema).try_into()?;
+                if let FilterLhs::Column { nullable: true, .. } = &lhs {
+                    Ok(SupportedExpr::NotNull(lhs))
+                } else {
+                    Err(ParseError::ColumnIsNotNullable)
+                }
+            }
+            _ => return Err(ParseError::UnsupportedExpr(expr.clone())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl ChangeEvent {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "insert" => Some(ChangeEvent::Insert),
+            "update" => Some(ChangeEvent::Update),
+            "delete" => Some(ChangeEvent::Delete),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Filter {
+    expr: SupportedExpr,
+}
+
+#[derive(Debug)]
+pub enum AggregateChange<'a> {
+    Insert {
+        table: &'a str,
+        pk: &'a str,
+        values: Vec<(&'a str, SqliteValueRef<'a>)>,
+    },
+    Update {
+        table: &'a str,
+        pk: &'a str,
+        values: Vec<(&'a str, SqliteValueRef<'a>)>,
+    },
+    Delete {
+        table: &'a str,
+        pk: &'a str,
+    },
+}
+
+impl<'a> AggregateChange<'a> {
+    pub fn from_changes(changes: &'a [Change], schema: &Schema) -> Vec<Self> {
+        let grouped = changes
+            .iter()
+            .group_by(|change| (change.table.as_str(), change.pk.as_str()));
+
+        grouped
+            .into_iter()
+            .filter_map(|((table, pk), group)| {
+                let mut group = group.peekable();
+                let event = schema.get(table).and_then(|cols| {
+                    group.peek().and_then(|change| {
+                        if change.cid == "__crsql_del" {
+                            Some(ChangeEvent::Delete)
+                        } else {
+                            match cols.iter().find(|col| col.name == change.cid) {
+                                Some(col) => {
+                                    if col.primary_key {
+                                        // can't change a primary key, so if this is present in the change, it's an insert
+                                        Some(ChangeEvent::Insert)
+                                    } else {
+                                        Some(ChangeEvent::Update)
+                                    }
+                                }
+                                None => None,
+                            }
+                        }
+                    })
+                })?;
+
+                Some(match event {
+                    ChangeEvent::Insert => AggregateChange::Insert {
+                        table,
+                        pk,
+                        values: group
+                            .map(|change| (change.cid.as_str(), change.val.as_ref()))
+                            .collect(),
+                    },
+                    ChangeEvent::Update => AggregateChange::Update {
+                        table,
+                        pk,
+                        values: group
+                            .map(|change| (change.cid.as_str(), change.val.as_ref()))
+                            .collect(),
+                    },
+                    ChangeEvent::Delete => AggregateChange::Delete { table, pk },
+                })
+            })
+            .collect::<Vec<AggregateChange>>()
+    }
+
+    pub fn table(&self) -> &str {
+        match self {
+            AggregateChange::Insert { table, .. } => table,
+            AggregateChange::Update { table, .. } => table,
+            AggregateChange::Delete { table, .. } => table,
+        }
+    }
+
+    pub fn as_change_event(&self) -> ChangeEvent {
+        match self {
+            AggregateChange::Insert { .. } => ChangeEvent::Insert,
+            AggregateChange::Update { .. } => ChangeEvent::Update,
+            AggregateChange::Delete { .. } => ChangeEvent::Delete,
+        }
+    }
+
+    pub fn values(&self) -> Option<&Vec<(&'a str, SqliteValueRef)>> {
+        match self {
+            AggregateChange::Insert { values, .. } => Some(values),
+            AggregateChange::Update { values, .. } => Some(values),
+            AggregateChange::Delete { .. } => None,
+        }
+    }
+}
+
+fn matching_fun(expr: &SupportedExpr, agg: &AggregateChange) -> bool {
+    match expr {
+        SupportedExpr::TableName { name, not_equal } => {
+            (*not_equal && name != agg.table()) || (!*not_equal && name == agg.table())
+        }
+        SupportedExpr::EventType { evt, not_equal } => {
+            (*not_equal && *evt != agg.as_change_event())
+                || (!*not_equal && *evt == agg.as_change_event())
+        }
+        SupportedExpr::LiteralInteger(op, ColumnLit { table, name, rhs }) => match agg.values() {
+            Some(values) => {
+                agg.table() == table
+                    && values.iter().any(|(col, value)| {
+                        name == *col && match_lit_value(rhs.as_ref(), *op, value.as_integer())
+                    })
+            }
+            None => false,
+        },
+        SupportedExpr::LiteralReal(op, ColumnLit { table, name, rhs }) => match agg.values() {
+            Some(values) => {
+                agg.table() == table
+                    && values.iter().any(|(col, value)| {
+                        name == *col && match_lit_value(rhs.as_ref(), *op, value.as_real())
+                    })
+            }
+            None => false,
+        },
+        SupportedExpr::LiteralText(op, ColumnLit { table, name, rhs }) => match agg.values() {
+            Some(values) => {
+                agg.table() == table
+                    && values.iter().any(|(col, value)| {
+                        name == *col && match_lit_value(rhs.as_deref(), *op, value.as_text())
+                    })
+            }
+            None => false,
+        },
+        SupportedExpr::LiteralBlob(op, ColumnLit { table, name, rhs }) => match agg.values() {
+            Some(values) => {
+                agg.table() == table
+                    && values.iter().any(|(col, value)| {
+                        name == *col && match_lit_value(rhs.as_deref(), *op, value.as_blob())
+                    })
+            }
+            None => false,
+        },
+        SupportedExpr::BinaryAnd(a, b) => {
+            matching_fun(a.as_ref(), agg) && matching_fun(b.as_ref(), agg)
+        }
+        SupportedExpr::BinaryOr(a, b) => {
+            matching_fun(a.as_ref(), agg) || matching_fun(b.as_ref(), agg)
+        }
+        SupportedExpr::Parenthesized(exprs) => exprs.iter().any(|expr| matching_fun(expr, agg)),
+        SupportedExpr::ListOfInteger {
+            table,
+            name,
+            list,
+            not,
         } => {
-            if !elements.is_empty() {
-                for expr in elements.iter_mut() {
-                    normalize_expr(expr)?;
-                }
-                expr.r#type = Type::Array(Box::new(elements[0].r#type.clone()));
-            }
-        }
-        ExprKind::Indexed(Indexed {
-            ref mut kind,
-            ref mut expr,
-        }) => {
-            if let Index::Expr(ref mut expr) = kind {
-                normalize_expr(expr)?;
-            }
-            normalize_expr(expr.as_mut())?;
-        }
-        ExprKind::DynamicField(_) => {}
-        ExprKind::Not(ref mut expr) => {
-            normalize_expr(expr.as_mut())?;
-        }
-        ExprKind::BitwiseAnd(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::BitwiseOr(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Xor(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Add(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Sub(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Mul(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Mod(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Div(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Or(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::And(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Eq(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::NEq(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Gt(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Gte(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Lt(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Lte(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Contains(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::Matches(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-        ExprKind::In(ref mut expr1, ref mut expr2) => {
-            normalize_expr(expr1)?;
-            normalize_expr(expr2)?;
-        }
-    }
-
-    Ok(())
-}
-
-pub fn eq_value(
-    input: &str,
-    ctx: &Context,
-    field: &FieldDef,
-    field_idx: usize,
-    expr: &Expr,
-) -> bool {
-    match ctx.values.get(field_idx) {
-        Some(Some(value)) => match &expr.r#type {
-            Type::Placeholder => match &expr.inner {
-                ExprKind::Field(Field { .. }) => match field.name.as_str() {
-                    t => {
-                        warn!("unimplemented eq rhs enum type: {t:?}");
-                        false
-                    }
-                },
-                inner => {
-                    warn!("expected a field, got: {inner:?}");
-                    false
-                }
-            },
-
-            Type::Integer => match &expr.inner {
-                ExprKind::Atom(Atom::NumberLiteral(Span { range, .. })) => match value {
-                    FilterValue::Integer(v) => input[range.clone()]
-                        .parse::<i64>()
-                        .map(|parsed| parsed == *v)
-                        .unwrap_or_default(),
-                    _ => false,
-                },
-                t => {
-                    warn!("could not match type Integer with inner: {t:?}");
-                    false
-                }
-            },
-
-            Type::String => match &expr.inner {
-                ExprKind::Atom(Atom::StringLiteral(Span { range, .. })) => match value {
-                    FilterValue::String(v) => &input[(range.start() + 1)..=(range.end() - 1)] == *v,
-                    _ => false,
-                },
-                t => {
-                    warn!("could not match type String with inner: {t:?}");
-                    false
-                }
-            },
-
-            Type::Const(_) => match &expr.inner {
-                ExprKind::Atom(atom) => match atom {
-                    Atom::StringLiteral(Span { range, .. }) => match value {
-                        FilterValue::String(v) => {
-                            &input[(range.start() + 1)..=(range.end() - 1)] == *v
+            agg.table() == table
+                && match agg.values() {
+                    Some(values) => values.iter().any(|(col, value)| {
+                        name == *col && {
+                            let any_matched = list.iter().any(|lit| {
+                                match_lit_value(lit.as_ref(), BinaryOp::Equals, value.as_integer())
+                            });
+                            (!*not && any_matched) || (*not && !any_matched)
                         }
-                        _ => false,
-                    },
-                    Atom::NumberLiteral(Span { range, .. }) => match value {
-                        FilterValue::Integer(v) => input[range.clone()]
-                            .parse::<i64>()
-                            .map(|parsed| parsed == *v)
-                            .unwrap_or_default(),
-                        _ => false,
-                    },
-                    Atom::Ipv4(Span { range, .. }) => match value {
-                        FilterValue::Ip(IpAddr::V4(v)) => input[range.clone()]
-                            .parse::<Ipv4Addr>()
-                            .map(|parsed| parsed == *v)
-                            .unwrap_or_default(),
-                        _ => false,
-                    },
-                    Atom::Ipv6(Span { range, .. }) => match value {
-                        FilterValue::Ip(IpAddr::V6(v)) => input[range.clone()]
-                            .parse::<Ipv6Addr>()
-                            .map(|parsed| parsed == *v)
-                            .unwrap_or_default(),
-                        _ => false,
-                    },
-                    Atom::Ipv4Cidr(_) | Atom::Ipv6Cidr(_) => {
-                        warn!("unsupport atom: cidr");
-                        false
-                    }
-                },
-                t => {
-                    warn!("const types should have an inner type of atom, got: {t:?}");
-                    false
+                    }),
+                    None => false,
                 }
-            },
-
-            Type::Array(arr_type) => {
-                trace!("checking arr type for {arr_type:?}");
-                match arr_type {
-                    t if t.as_ref() == &value.get_type() => {
-                        // only go ahead if they're the same type, arrays are homogenous
-                        field_value_in(input, ctx, field, field_idx, expr)
-                    }
-                    _ => false,
-                }
-            }
-            t => {
-                warn!("unimplemented eq rhs type: {t:?}");
-                false
-            }
-        },
-        None | Some(None) => false,
-    }
-}
-
-fn field_value_in(
-    input: &str,
-    ctx: &Context,
-    field: &FieldDef,
-    field_idx: usize,
-    expr: &Expr,
-) -> bool {
-    match ctx.values.get(field_idx) {
-        Some(Some(value)) => match &expr.r#type {
-            Type::Array(arr_type) if !value.is_type(arr_type.as_ref()) => {
-                trace!("no correct type: {arr_type:?} vs {:?}", value.get_type());
-                false
-            }
-            Type::Array(_) => match &expr.inner {
-                ExprKind::Array { elements, .. } => {
-                    for ex in elements.iter() {
-                        if eq_value(input, ctx, field, field_idx, ex) {
-                            return true;
+        }
+        SupportedExpr::ListOfReal {
+            table,
+            name,
+            list,
+            not,
+        } => {
+            agg.table() == table
+                && match agg.values() {
+                    Some(values) => values.iter().any(|(col, value)| {
+                        name == *col && {
+                            let any_matched = list.iter().any(|lit| {
+                                match_lit_value(lit.as_ref(), BinaryOp::Equals, value.as_real())
+                            });
+                            (!*not && any_matched) || (*not && !any_matched)
                         }
-                    }
-                    trace!("did not find any matching!");
-                    false
+                    }),
+                    None => false,
                 }
-                k => {
-                    warn!("expected array, got {k:?}");
-                    false
+        }
+        SupportedExpr::ListOfText {
+            table,
+            name,
+            list,
+            not,
+        } => {
+            agg.table() == table
+                && match agg.values() {
+                    Some(values) => values.iter().any(|(col, value)| {
+                        name == *col && {
+                            let any_matched = list.iter().any(|lit| {
+                                match_lit_value(lit.as_deref(), BinaryOp::Equals, value.as_text())
+                            });
+                            (!*not && any_matched) || (*not && !any_matched)
+                        }
+                    }),
+                    None => false,
                 }
+        }
+        SupportedExpr::ListOfBlob {
+            table,
+            name,
+            list,
+            not,
+        } => {
+            agg.table() == table
+                && match agg.values() {
+                    Some(values) => values.iter().any(|(col, value)| {
+                        name == *col && {
+                            let any_matched = list.iter().any(|lit| {
+                                match_lit_value(lit.as_deref(), BinaryOp::Equals, value.as_blob())
+                            });
+                            (!*not && any_matched) || (*not && !any_matched)
+                        }
+                    }),
+                    None => false,
+                }
+        }
+        SupportedExpr::IsNull(_) => todo!(),
+        SupportedExpr::NotNull(_) => todo!(),
+    }
+}
+
+fn match_lit_value<T: PartialEq + PartialOrd + ?Sized>(
+    rhs: Option<&T>,
+    op: BinaryOp,
+    lhs: Option<&T>,
+) -> bool {
+    match op {
+        BinaryOp::Equals | BinaryOp::Is => rhs == lhs,
+        BinaryOp::NotEquals | BinaryOp::IsNot => rhs != lhs,
+        BinaryOp::Greater => match rhs.partial_cmp(&lhs) {
+            Some(Ordering::Less) => true,
+            _ => false,
+        },
+        BinaryOp::GreaterEquals => match rhs.partial_cmp(&lhs) {
+            Some(Ordering::Less | Ordering::Equal) => true,
+            _ => false,
+        },
+        BinaryOp::Less => match rhs.partial_cmp(&lhs) {
+            Some(Ordering::Greater) => true,
+            _ => false,
+        },
+        BinaryOp::LessEquals => match rhs.partial_cmp(&lhs) {
+            Some(Ordering::Greater | Ordering::Equal) => true,
+            _ => false,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //     use crate::pubsub::SCHEMA;
+
+    use itertools::Itertools;
+    use uuid::Uuid;
+
+    use crate::{change::Change, sqlite::prepare_sql};
+
+    use super::*;
+
+    #[test]
+    fn kitchen_sink() {
+        _ = tracing_subscriber::fmt::try_init();
+
+        let mut schema = Schema::default();
+
+        prepare_sql(
+            b"
+            CREATE TABLE test (
+                id BIGINT PRIMARY KEY NOT NULL,
+                foo JSON NOT NULL DEFAULT '{}',
+                bar JSONB NOT NULL DEFAULT '{}'
+            ) WITHOUT ROWID;
+        "
+            .as_slice(),
+            &mut schema,
+        )
+        .unwrap();
+
+        let jsonb = hex::encode(br#"{"foo": "bar"}"#);
+
+        let filter = parse_filter(
+            &schema,
+            format!(r#"(evt_type = 'insert' AND test.id = 1 AND test.foo = '{{"foo": "bar"}}') OR (evt_type = 'update' AND test.bar = x'{jsonb}')"#)
+                .as_str(),
+        )
+        .unwrap();
+
+        println!("filter: {filter:#?}");
+
+        let actor1 = Uuid::new_v4();
+        let actor2 = Uuid::new_v4();
+
+        let changes = vec![
+            // insert
+            Change {
+                table: "test".into(),
+                pk: "1".into(),
+                cid: "id".into(),
+                val: crate::change::SqliteValue::Integer(1),
+                col_version: 1,
+                db_version: 123,
+                site_id: actor1.to_bytes_le(),
             },
-            t => {
-                trace!("wrong type: {t:?}");
-                false
+            Change {
+                table: "test".into(),
+                pk: "1".into(),
+                cid: "foo".into(),
+                val: crate::change::SqliteValue::Text(r#"{"foo": "bar"}"#.into()),
+                col_version: 1,
+                db_version: 123,
+                site_id: actor1.to_bytes_le(),
+            },
+            Change {
+                table: "test".into(),
+                pk: "1".into(),
+                cid: "bar".into(),
+                val: crate::change::SqliteValue::Text("{}".into()),
+                col_version: 1,
+                db_version: 123,
+                site_id: actor1.to_bytes_le(),
+            },
+            // update
+            Change {
+                table: "test".into(),
+                pk: "2".into(),
+                cid: "bar".into(),
+                val: crate::change::SqliteValue::Blob(br#"{"foo": "bar"}"#.to_vec()),
+                col_version: 2,
+                db_version: 123,
+                site_id: actor2.to_bytes_le(),
+            },
+        ];
+
+        let aggs = AggregateChange::from_changes(changes.as_slice(), &schema);
+        println!("aggs: {aggs:#?}");
+
+        for agg in aggs {
+            println!("matching on {agg:?} ...");
+            if matching_fun(&filter.expr, &agg) {
+                println!("matched! {agg:?}");
             }
-        },
-
-        None | Some(None) => false,
-    }
-}
-
-pub fn match_expr(input: &str, expr: &Expr, ctx: &Context) -> bool {
-    trace!("match expr {:#?}: {}", expr.inner, expr.to_text(input));
-    match &expr.inner {
-        ExprKind::Eq(field_expr, expr2) => match match_field(input, field_expr, ctx) {
-            Some((field_idx, field)) => eq_value(input, ctx, field, field_idx, expr2),
-            None => false,
-        },
-        ExprKind::NEq(field_expr, expr2) => match match_field(input, field_expr, ctx) {
-            Some((field_idx, field)) => !eq_value(input, ctx, field, field_idx, expr2),
-            None => false,
-        },
-        ExprKind::Not(expr) => !match_expr(input, expr.as_ref(), ctx),
-        ExprKind::Or(expr1, expr2) => {
-            match_expr(input, expr1.as_ref(), ctx) || match_expr(input, expr2.as_ref(), ctx)
-        }
-        ExprKind::And(expr1, expr2) => {
-            match_expr(input, expr1.as_ref(), ctx) && match_expr(input, expr2.as_ref(), ctx)
-        }
-        ExprKind::In(field_expr, expr_arr) => match match_field(input, field_expr, ctx) {
-            Some((field_idx, field)) => field_value_in(input, ctx, field, field_idx, expr_arr),
-            None => false,
-        },
-        inner => {
-            warn!("unimplemented expr kind: {inner:?}");
-            false
         }
     }
+
+    //     #[test]
+    //     fn matches_field_value_in() {
+    //         _ = tracing_subscriber::fmt::try_init();
+    //         let schema = &*SCHEMA;
+
+    //         let mut ctx = Context::new(schema);
+    //         ctx.set_field_value("network_id", 12345).unwrap();
+
+    //         let input = format!(
+    //             "network_id in {{ {} }}",
+    //             (1..20000)
+    //                 .map(|i| i.to_string())
+    //                 .collect::<Vec<String>>()
+    //                 .join(" ")
+    //         );
+    //         let expr = parse_expr(&input).unwrap();
+    //         assert!(match_expr(&input, &expr, &ctx));
+    //     }
+
+    //     #[test]
+    //     fn matches_complex_or() {
+    //         _ = tracing_subscriber::fmt::try_init();
+    //         let schema = &*SCHEMA;
+
+    //         let mut ctx = Context::new(schema);
+    //         ctx.set_field_value("record.type", RecordType::ConsulService)
+    //             .unwrap();
+    //         ctx.set_field_value("app_id", 2).unwrap();
+
+    //         let input = "((record.type eq consul_service) or (record.type eq ip_assignment)) and app_id in { 1 2 3 }";
+    //         let expr = parse_expr(input).unwrap();
+
+    //         assert!(match_expr(input, &expr, &ctx));
+    // }
 }
-
-pub fn match_field<'s>(
-    input: &'s str,
-    expr: &'s Expr,
-    ctx: &'s Context,
-) -> Option<(usize, &'s FieldDef)> {
-    debug!("match field: {expr:?}");
-    match &expr.inner {
-        ExprKind::Field(x) => {
-            let start_idx = x.chain.first().unwrap().range.start();
-            let end_idx = x.chain.last().unwrap().range.end();
-            let name = &input[RangeInclusive::new(*start_idx, *end_idx)];
-            ctx.schema
-                .fields
-                .iter()
-                .enumerate()
-                .find(|(_, fd)| fd.name == name)
-        }
-        inner => {
-            warn!("asked to match field with non-field expr: {inner:?}");
-            None
-        }
-    }
-}
-
-// #[cfg(test)]
-// mod tests {
-//     use crate::pubsub::SCHEMA;
-
-//     use super::*;
-
-//     #[test]
-//     fn matches_custom_corrosion_stuff() {
-//         _ = tracing_subscriber::fmt::try_init();
-//         let schema = &*SCHEMA;
-
-//         let mut ctx = Context::new(schema);
-//         ctx.set_field_value("op.type", OpType::Upsert).unwrap();
-//         ctx.set_field_value("record.type", RecordType::App).unwrap();
-
-//         let input = r#"op.type eq upsert"#;
-//         let expr = parse_expr(input).unwrap();
-//         assert!(match_expr(input, &expr, &ctx));
-
-//         let input = r#"record.type eq app"#;
-//         let expr = parse_expr(input).unwrap();
-//         assert!(match_expr(input, &expr, &ctx));
-//     }
-
-//     #[test]
-//     fn matches_field_value_in() {
-//         _ = tracing_subscriber::fmt::try_init();
-//         let schema = &*SCHEMA;
-
-//         let mut ctx = Context::new(schema);
-//         ctx.set_field_value("network_id", 12345).unwrap();
-
-//         let input = format!(
-//             "network_id in {{ {} }}",
-//             (1..20000)
-//                 .map(|i| i.to_string())
-//                 .collect::<Vec<String>>()
-//                 .join(" ")
-//         );
-//         let expr = parse_expr(&input).unwrap();
-//         assert!(match_expr(&input, &expr, &ctx));
-//     }
-
-//     #[test]
-//     fn matches_complex_or() {
-//         _ = tracing_subscriber::fmt::try_init();
-//         let schema = &*SCHEMA;
-
-//         let mut ctx = Context::new(schema);
-//         ctx.set_field_value("record.type", RecordType::ConsulService)
-//             .unwrap();
-//         ctx.set_field_value("app_id", 2).unwrap();
-
-//         let input = "((record.type eq consul_service) or (record.type eq ip_assignment)) and app_id in { 1 2 3 }";
-//         let expr = parse_expr(input).unwrap();
-
-//         assert!(match_expr(input, &expr, &ctx));
-//     }
-// }

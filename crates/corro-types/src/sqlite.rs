@@ -5,10 +5,20 @@ use std::{
 
 use bb8::ManageConnection;
 use bb8_rusqlite::RusqliteConnectionManager;
+use fallible_iterator::FallibleIterator;
 use once_cell::sync::Lazy;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{types::Type, Connection, OpenFlags};
+use sqlite3_parser::{
+    ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt},
+    lexer::{
+        sql::{Parser, ParserError},
+        Input,
+    },
+};
 use tempfile::TempDir;
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
+
+use crate::filters::{Column, Schema};
 
 pub type SqlitePool = bb8::Pool<CrConnManager>;
 
@@ -129,4 +139,122 @@ pub fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     )?;
 
     Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PrepareSqlError {
+    #[error(transparent)]
+    Parse(#[from] sqlite3_parser::lexer::sql::Error),
+}
+
+pub fn prepare_sql<I: Input>(input: I, schema: &mut Schema) -> Result<Vec<Cmd>, PrepareSqlError> {
+    let mut cmds = vec![];
+    let mut parser = sqlite3_parser::lexer::sql::Parser::new(input);
+    loop {
+        match parser.next() {
+            Ok(None) => break,
+            Err(err) => {
+                eprintln!("Err: {err}");
+                return Err(err.into());
+            }
+            Ok(Some(mut cmd)) => {
+                let extra_cmd = if let Cmd::Stmt(Stmt::CreateTable {
+                    ref tbl_name,
+                    ref mut body,
+                    ..
+                }) = cmd
+                {
+                    if let CreateTableBody::ColumnsAndConstraints { ref columns, .. } = body {
+                        if !tbl_name.name.0.contains("crsql")
+                            & !tbl_name.name.0.contains("sqlite")
+                            & !tbl_name.name.0.starts_with("__corro")
+                        {
+                            let fields: Vec<_> = columns
+                                .iter()
+                                .map(|def| {
+                                    Column {
+                                        name: def.col_name.0.clone(),
+                                        sqlite_type: match def
+                                            .col_type
+                                            .as_ref()
+                                            .map(|t| t.name.to_ascii_uppercase())
+                                            .as_deref()
+                                        {
+                                            // TODO: magic JSON...
+                                            // Some("JSON") => {
+                                            //     Type::Map(Box::new(Type::String), Box::new(Type::Infer))
+                                            // }
+
+                                            // 1. If the declared type contains the string "INT" then it is assigned INTEGER affinity.
+                                            Some(s) if s.contains("INT") => Type::Integer,
+                                            // 2. If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
+                                            Some(s)
+                                                if s.contains("CHAR")
+                                                    || s.contains("CLOB")
+                                                    || s.contains("TEXT")
+                                                    || s == "JSON" =>
+                                            {
+                                                Type::Text
+                                            }
+
+                                            // 3. If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
+                                            Some(s) if s.contains("BLOB") || s == "JSONB" => {
+                                                Type::Blob
+                                            }
+                                            None => Type::Blob,
+
+                                            // 4. If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
+                                            Some(s)
+                                                if s.contains("REAL")
+                                                    || s.contains("FLOA")
+                                                    || s.contains("DOUB")
+                                                    || s == "ANY" =>
+                                            {
+                                                Type::Real
+                                            }
+
+                                            // 5. Otherwise, the affinity is NUMERIC.
+                                            Some(_s) => Type::Real,
+                                        },
+                                        primary_key: def.constraints.iter().any(|constraint| {
+                                            matches!(
+                                                constraint.constraint,
+                                                ColumnConstraint::PrimaryKey { .. }
+                                            )
+                                        }),
+                                        nullable: def.constraints.iter().any(|constraint| {
+                                            matches!(
+                                                constraint.constraint,
+                                                ColumnConstraint::NotNull { nullable: true, .. }
+                                            )
+                                        }),
+                                    }
+                                })
+                                .collect();
+
+                            schema.insert(tbl_name.name.0.clone(), fields);
+
+                            debug!("SELECTING crsql_as_crr for {}", tbl_name.name.0);
+
+                            let select = format!("SELECT crsql_as_crr('{}');", tbl_name.name.0);
+                            let mut select_parser = Parser::new(select.as_bytes());
+                            Some(select_parser.next()?.expect("could not parse crsql_as_crr"))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                cmds.push(cmd);
+                if let Some(extra_cmd) = extra_cmd {
+                    cmds.push(extra_cmd);
+                }
+            }
+        }
+    }
+
+    Ok(cmds)
 }

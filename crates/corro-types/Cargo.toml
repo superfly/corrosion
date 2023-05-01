@@ -30,3 +30,9 @@ uhlc = { workspace = true }
 serde_with = { workspace = true }
 rangemap = { workspace = true }
 camino = { workspace = true }
+sqlite3-parser = { workspace = true }
+fallible-iterator = { workspace = true }
+tracing-subscriber = { workspace = true }
+itertools = { workspace = true }
+enquote = "1.1.0"
+hex = "0.4.3"
