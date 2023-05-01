@@ -26,9 +26,10 @@ use corro_types::{
     agent::{Agent, AgentInner, Booked, BookedVersion, Bookie},
     broadcast::{BroadcastInput, BroadcastSrc, FocaInput, Message, MessageDecodeError, MessageV1},
     change::Change,
-    filters::{Column, Schema},
+    filters::{match_expr, AggregateChange, Column, Schema},
     // filters::Context,
     members::{MemberEvent, Members},
+    pubsub::{SubscriptionEvent, SubscriptionMessage},
     sqlite::{init_cr_conn, prepare_sql, CrConn, CrConnManager, SqlitePool},
 };
 
@@ -596,12 +597,10 @@ async fn handle_gossip(
     let priority_label = if high_priority { "high" } else { "normal" };
     counter!("corro.broadcast.recv.count", messages.len() as u64, "priority" => priority_label);
 
-    let bookie = agent.bookie();
-
     let mut rebroadcast = vec![];
 
     for msg in messages {
-        if let Some(msg) = process_msg(msg, bookie, agent.read_write_pool()).await? {
+        if let Some(msg) = process_msg(&agent, msg).await? {
             rebroadcast.push(msg);
         }
     }
@@ -1115,10 +1114,11 @@ pub async fn handle_broadcast(
 // }
 
 async fn process_msg(
+    agent: &Agent,
     msg: Message,
-    bookie: &Bookie,
-    pool: &SqlitePool,
 ) -> Result<Option<Message>, bb8::RunError<bb8_rusqlite::Error>> {
+    let bookie = agent.bookie();
+    let pool = agent.read_write_pool();
     Ok(match msg {
         Message::V1(MessageV1::Change {
             actor_id,
@@ -1192,6 +1192,35 @@ async fn process_msg(
 
                 Ok::<_, bb8_rusqlite::Error>((db_version, impactful_changeset))
             })?;
+
+            if let Some(db_version) = db_version {
+                if let Some(schema) = SCHEMA.load().as_ref() {
+                    let aggs =
+                        AggregateChange::from_changes(changeset.as_slice(), schema, db_version);
+                    let subscribers = agent.subscribers().read();
+                    for (_sub, subscriptions) in subscribers.iter() {
+                        let subs = subscriptions.read();
+                        for (id, info) in subs.subscriptions.iter() {
+                            if let Some(filter) = info.filter.as_ref() {
+                                for agg in aggs.iter() {
+                                    if match_expr(filter, agg) {
+                                        if let Ok(change) = serde_json::to_value(agg) {
+                                            if let Err(e) =
+                                                subs.sender.send(SubscriptionMessage::Event {
+                                                    id: id.clone(),
+                                                    event: SubscriptionEvent::Change(change),
+                                                })
+                                            {
+                                                error!("could not send sub message: {e}")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             let msg = Message::V1(MessageV1::Change {
                 actor_id,
@@ -1422,7 +1451,7 @@ async fn handle_sync_receive(
             Message::V1(MessageV1::Change { ref changeset, .. }) => changeset.len(),
             _ => 1,
         };
-        process_msg(msg, agent.bookie(), agent.read_write_pool()).await?;
+        process_msg(agent, msg).await?;
         count += len;
     }
 

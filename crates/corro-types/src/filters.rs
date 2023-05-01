@@ -4,24 +4,14 @@ use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use itertools::Itertools;
 use rusqlite::types::Type;
-// pub use exprt::parser::ast::Expr;
-// use exprt::{
-//     parser::{
-//         ast::{Atom, ExprKind, Field, FunctionCall, Index, Indexed},
-//         tokenizer::Span,
-//     },
-//     typecheck::{
-//         schema::{FieldDef, Schema},
-//         typecheck::Type,
-//     },
-// };
+use serde::{Deserialize, Serialize};
 use sqlite3_parser::{
     ast::{Cmd, Expr, Literal, OneSelect, Operator, Stmt},
     lexer::sql::Parser,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{error, trace};
 
-use crate::change::{Change, SqliteValueRef};
+use crate::change::{Change, SqliteValue, SqliteValueRef};
 
 const CORRO_EVENT: &str = "evt_type";
 const CORRO_TABLE: &str = "tbl_name";
@@ -79,6 +69,8 @@ pub enum ParseError {
     ColumnIsNotNullable,
     #[error("unsupported binary operator {0:?}")]
     UnsupportedBinaryOp(Operator),
+    #[error("unsupported null operator {0:?}")]
+    UnsupportedNullOp(Operator),
 }
 
 #[derive(Debug)]
@@ -88,47 +80,57 @@ pub enum SupportedExpr {
         not_equal: bool,
     },
     EventType {
-        evt: ChangeEvent,
+        evt: String,
         not_equal: bool,
     },
 
-    LiteralInteger(BinaryOp, ColumnLit<i64>),
-    LiteralReal(BinaryOp, ColumnLit<f64>),
-    LiteralText(BinaryOp, ColumnLit<String>),
-    LiteralBlob(BinaryOp, ColumnLit<Vec<u8>>),
+    LiteralInteger {
+        table: String,
+        col: String,
+        op: BinaryOp,
+        lhs: i64,
+    },
+    LiteralReal {
+        table: String,
+        col: String,
+        op: BinaryOp,
+        lhs: f64,
+    },
+    LiteralText {
+        table: String,
+        col: String,
+        op: BinaryOp,
+        lhs: String,
+    },
+    LiteralBlob {
+        table: String,
+        col: String,
+        op: BinaryOp,
+        lhs: Vec<u8>,
+    },
+    LiteralNull {
+        table: String,
+        col: String,
+        op: NullOp,
+    },
 
     // BinaryLiteral(FilterLhs, BinaryOp, FilterRhs),
     BinaryAnd(Box<SupportedExpr>, Box<SupportedExpr>),
     BinaryOr(Box<SupportedExpr>, Box<SupportedExpr>),
     Parenthesized(Vec<SupportedExpr>),
-
-    ListOfInteger {
-        table: String,
-        name: String,
-        list: Vec<RhsType<i64>>,
-        not: bool,
-    },
-    ListOfReal {
-        table: String,
-        name: String,
-        list: Vec<RhsType<f64>>,
-        not: bool,
-    },
-    ListOfText {
-        table: String,
-        name: String,
-        list: Vec<RhsType<String>>,
-        not: bool,
-    },
-    ListOfBlob {
-        table: String,
-        name: String,
-        list: Vec<RhsType<Vec<u8>>>,
+    InList {
+        list: Vec<SupportedExpr>,
         not: bool,
     },
 
     IsNull(FilterLhs),
     NotNull(FilterLhs),
+}
+
+#[derive(Debug)]
+pub enum NullOp {
+    Is,
+    IsNot,
 }
 
 #[derive(Debug)]
@@ -138,51 +140,6 @@ pub enum SupportedRhsLiteral {
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
-}
-
-#[derive(Debug)]
-pub struct ColumnLit<Rhs> {
-    table: String,
-    name: String,
-    rhs: RhsType<Rhs>,
-}
-
-impl<T> Deref for ColumnLit<T> {
-    type Target = RhsType<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.rhs
-    }
-}
-
-#[derive(Debug)]
-pub enum RhsType<T> {
-    Nullable(Option<T>),
-    NotNullable(T),
-}
-
-impl<T> RhsType<T> {
-    pub fn is_nullable(&self) -> bool {
-        match self {
-            RhsType::Nullable(_) => true,
-            RhsType::NotNullable(_) => false,
-        }
-    }
-    pub fn as_ref(&self) -> Option<&T> {
-        match self {
-            RhsType::Nullable(t) => t.as_ref(),
-            RhsType::NotNullable(ref t) => Some(t),
-        }
-    }
-}
-
-impl<T: Deref> RhsType<T> {
-    pub fn as_deref(&self) -> Option<&T::Target> {
-        match self {
-            RhsType::Nullable(t) => t.as_deref(),
-            RhsType::NotNullable(t) => Some(t.deref()),
-        }
-    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -199,12 +156,7 @@ pub enum BinaryOp {
 
 #[derive(Debug, Clone)]
 pub enum FilterLhs {
-    Column {
-        table: String,
-        name: String,
-        sqlite_type: Type,
-        nullable: bool,
-    },
+    Column { table: String, name: String },
     TableName,
     EventType,
 }
@@ -216,7 +168,7 @@ pub enum FilterRhs {
     EventType(ChangeEvent),
 }
 
-pub fn parse_filter(schema: &Schema, input: &str) -> Result<Filter, ParseError> {
+pub fn parse_expr(input: &str) -> Result<SupportedExpr, ParseError> {
     // kind of a hack...
     let input = format!("SELECT dummy FROM dummy WHERE {input}");
 
@@ -225,15 +177,13 @@ pub fn parse_filter(schema: &Schema, input: &str) -> Result<Filter, ParseError> 
     // only parse the first statement
     let cmd = parser.next()?.unwrap();
 
-    let filter = match cmd {
+    let expr = match cmd {
         Cmd::Stmt(stmt) => match stmt {
             Stmt::Select(select) => match select.body.select {
                 OneSelect::Select {
                     where_clause: Some(where_clause),
                     ..
-                } => Filter {
-                    expr: (where_clause, schema).try_into()?,
-                },
+                } => where_clause.try_into()?,
                 select => return Err(ParseError::UnsupportedSelect(select)),
             },
             stmt => return Err(ParseError::UnsupportedStmt(stmt)),
@@ -241,13 +191,13 @@ pub fn parse_filter(schema: &Schema, input: &str) -> Result<Filter, ParseError> 
         cmd => return Err(ParseError::UnsupportedCmd(cmd)),
     };
 
-    Ok(filter)
+    Ok(expr)
 }
 
-impl TryFrom<(Expr, &Schema)> for FilterLhs {
+impl TryFrom<Expr> for FilterLhs {
     type Error = ParseError;
 
-    fn try_from((lhs, schema): (Expr, &Schema)) -> Result<Self, Self::Error> {
+    fn try_from(lhs: Expr) -> Result<Self, Self::Error> {
         match lhs {
             Expr::Id(id) => match id.0.as_str() {
                 CORRO_TABLE => Ok(FilterLhs::TableName),
@@ -259,25 +209,10 @@ impl TryFrom<(Expr, &Schema)> for FilterLhs {
                 CORRO_EVENT => Ok(FilterLhs::EventType),
                 _ => Err(ParseError::QualifiedNameRequired(name.0.clone())),
             },
-            Expr::Qualified(tbl_name, name) => {
-                if let Some(cols) = schema.get(tbl_name.0.as_str()) {
-                    if let Some(col) = cols.iter().find(|col| col.name == name.0) {
-                        Ok(FilterLhs::Column {
-                            table: tbl_name.0.clone(),
-                            name: name.0.clone(),
-                            sqlite_type: col.sqlite_type.clone(),
-                            nullable: col.nullable,
-                        })
-                    } else {
-                        Err(ParseError::InvalidColumn(
-                            tbl_name.0.clone(),
-                            name.0.clone(),
-                        ))
-                    }
-                } else {
-                    Err(ParseError::UnknownTable(tbl_name.0.clone()))
-                }
-            }
+            Expr::Qualified(tbl_name, name) => Ok(FilterLhs::Column {
+                table: tbl_name.0.clone(),
+                name: name.0.clone(),
+            }),
             _ => Err(ParseError::ExpectedLhsIdentifier),
         }
     }
@@ -303,12 +238,10 @@ impl TryFrom<Literal> for SupportedRhsLiteral {
     }
 }
 
-impl TryFrom<(Expr, &Schema, FilterLhs, Operator)> for SupportedExpr {
+impl TryFrom<(Expr, FilterLhs, Operator)> for SupportedExpr {
     type Error = ParseError;
 
-    fn try_from(
-        (rhs, schema, lhs, op): (Expr, &Schema, FilterLhs, Operator),
-    ) -> Result<Self, Self::Error> {
+    fn try_from((rhs, lhs, op): (Expr, FilterLhs, Operator)) -> Result<Self, Self::Error> {
         match rhs {
             Expr::Literal(lit) => {
                 let rhs: SupportedRhsLiteral = lit.try_into()?;
@@ -320,151 +253,60 @@ impl TryFrom<(Expr, &Schema, FilterLhs, Operator)> for SupportedExpr {
                             _ => return Err(ParseError::UnsupportedBinaryOp(op)),
                         };
 
-                        match schema.get(&name) {
-                            Some(_) => Ok(SupportedExpr::TableName { name, not_equal }),
-                            None => Err(ParseError::UnknownTable(name)),
-                        }
+                        Ok(SupportedExpr::TableName { name, not_equal })
                     }
+
                     (FilterLhs::TableName, _, _) => Err(ParseError::WrongLiteralType),
+
                     (FilterLhs::EventType, op, SupportedRhsLiteral::Text(s)) => {
                         let not_equal = match op {
                             Operator::Equals | Operator::Is => false,
                             Operator::NotEquals | Operator::IsNot => true,
                             _ => return Err(ParseError::UnsupportedBinaryOp(op)),
                         };
-                        Ok(SupportedExpr::EventType {
-                            evt: ChangeEvent::from_str(s.as_str())
-                                .ok_or(ParseError::UnknownEvent(s))?,
-                            not_equal,
+                        Ok(SupportedExpr::EventType { evt: s, not_equal })
+                    }
+
+                    (FilterLhs::EventType, _, _) => Err(ParseError::WrongLiteralType),
+
+                    (FilterLhs::Column { table, name }, op, SupportedRhsLiteral::Null) => {
+                        let op = op.try_into()?;
+                        Ok(SupportedExpr::LiteralNull {
+                            table,
+                            col: name,
+                            op,
                         })
                     }
-                    (FilterLhs::EventType, _, _) => Err(ParseError::WrongLiteralType),
-                    (
-                        FilterLhs::Column {
-                            nullable: false, ..
-                        },
-                        _,
-                        SupportedRhsLiteral::Null,
-                    ) => Err(ParseError::WrongLiteralType),
-                    (
-                        FilterLhs::Column {
-                            nullable: true,
-                            sqlite_type,
-                            table,
-                            name,
-                        },
-                        op,
-                        rhs @ SupportedRhsLiteral::Null,
-                    ) => {
+
+                    (FilterLhs::Column { table, name }, op, rhs) => {
                         let op = op.try_into()?;
-                        let expr = match sqlite_type {
-                            Type::Integer => SupportedExpr::LiteralInteger(
+                        Ok(match rhs {
+                            SupportedRhsLiteral::Integer(value) => SupportedExpr::LiteralInteger {
+                                table,
+                                col: name,
                                 op,
-                                ColumnLit {
-                                    table,
-                                    name,
-                                    rhs: RhsType::Nullable(None),
-                                },
-                            ),
-                            Type::Real => SupportedExpr::LiteralReal(
+                                lhs: value,
+                            },
+                            SupportedRhsLiteral::Real(value) => SupportedExpr::LiteralReal {
+                                table,
+                                col: name,
                                 op,
-                                ColumnLit {
-                                    table,
-                                    name,
-                                    rhs: RhsType::Nullable(None),
-                                },
-                            ),
-                            Type::Text => SupportedExpr::LiteralText(
+                                lhs: value,
+                            },
+                            SupportedRhsLiteral::Text(value) => SupportedExpr::LiteralText {
+                                table,
+                                col: name,
                                 op,
-                                ColumnLit {
-                                    table,
-                                    name,
-                                    rhs: RhsType::Nullable(None),
-                                },
-                            ),
-                            Type::Blob => SupportedExpr::LiteralBlob(
+                                lhs: value,
+                            },
+                            SupportedRhsLiteral::Blob(value) => SupportedExpr::LiteralBlob {
+                                table,
+                                col: name,
                                 op,
-                                ColumnLit {
-                                    table,
-                                    name,
-                                    rhs: RhsType::Nullable(None),
-                                },
-                            ),
-                            _ => unreachable!(),
-                        };
-                        Ok(expr)
-                    }
-                    (
-                        FilterLhs::Column {
-                            nullable,
-                            sqlite_type,
-                            table,
-                            name,
-                        },
-                        op,
-                        rhs,
-                    ) => {
-                        let op = op.try_into()?;
-                        let expr = match (sqlite_type, rhs) {
-                            (Type::Integer, SupportedRhsLiteral::Integer(i)) => {
-                                SupportedExpr::LiteralInteger(
-                                    op,
-                                    ColumnLit {
-                                        table,
-                                        name,
-                                        rhs: if nullable {
-                                            RhsType::Nullable(Some(i))
-                                        } else {
-                                            RhsType::NotNullable(i)
-                                        },
-                                    },
-                                )
-                            }
-                            (Type::Real, SupportedRhsLiteral::Real(f)) => {
-                                SupportedExpr::LiteralReal(
-                                    op,
-                                    ColumnLit {
-                                        table,
-                                        name,
-                                        rhs: if nullable {
-                                            RhsType::Nullable(Some(f))
-                                        } else {
-                                            RhsType::NotNullable(f)
-                                        },
-                                    },
-                                )
-                            }
-                            (Type::Text, SupportedRhsLiteral::Text(s)) => {
-                                SupportedExpr::LiteralText(
-                                    op,
-                                    ColumnLit {
-                                        table,
-                                        name,
-                                        rhs: if nullable {
-                                            RhsType::Nullable(Some(s))
-                                        } else {
-                                            RhsType::NotNullable(s)
-                                        },
-                                    },
-                                )
-                            }
-                            (Type::Blob, SupportedRhsLiteral::Blob(b)) => {
-                                SupportedExpr::LiteralBlob(
-                                    op,
-                                    ColumnLit {
-                                        table,
-                                        name,
-                                        rhs: if nullable {
-                                            RhsType::Nullable(Some(b))
-                                        } else {
-                                            RhsType::NotNullable(b)
-                                        },
-                                    },
-                                )
-                            }
-                            _ => unreachable!(),
-                        };
-                        Ok(expr)
+                                lhs: value,
+                            },
+                            SupportedRhsLiteral::Null => unreachable!(),
+                        })
                     }
                 }
             }
@@ -491,163 +333,27 @@ impl TryFrom<Operator> for BinaryOp {
     }
 }
 
-impl TryFrom<(Expr, &FilterLhs)> for ColumnLit<i64> {
+impl TryFrom<Operator> for NullOp {
     type Error = ParseError;
 
-    fn try_from((rhs, lhs): (Expr, &FilterLhs)) -> Result<Self, Self::Error> {
-        match (rhs, lhs) {
-            (Expr::Literal(lit), lhs) => match (lit.try_into()?, lhs) {
-                (
-                    SupportedRhsLiteral::Integer(i),
-                    FilterLhs::Column {
-                        table,
-                        name,
-                        sqlite_type: Type::Integer,
-                        nullable,
-                    },
-                ) => Ok(ColumnLit {
-                    table: table.clone(),
-                    name: name.clone(),
-                    rhs: (i, *nullable).into(),
-                }),
-                // FIXME: that's the wrong error
-                _ => Err(ParseError::ExpectedLiteral),
-            },
-            _ => Err(ParseError::ExpectedLiteral),
-        }
+    fn try_from(value: Operator) -> Result<Self, Self::Error> {
+        Ok(match value {
+            Operator::Is => NullOp::Is,
+            Operator::IsNot => NullOp::IsNot,
+            op => return Err(ParseError::UnsupportedNullOp(op)),
+        })
     }
 }
 
-impl TryFrom<(Expr, &FilterLhs)> for ColumnLit<f64> {
+impl TryFrom<Expr> for SupportedExpr {
     type Error = ParseError;
 
-    fn try_from((rhs, lhs): (Expr, &FilterLhs)) -> Result<Self, Self::Error> {
-        match (rhs, lhs) {
-            (Expr::Literal(lit), lhs) => match (lit.try_into()?, lhs) {
-                (
-                    SupportedRhsLiteral::Real(i),
-                    FilterLhs::Column {
-                        table,
-                        name,
-                        sqlite_type: Type::Real,
-                        nullable,
-                    },
-                ) => Ok(ColumnLit {
-                    table: table.clone(),
-                    name: name.clone(),
-                    rhs: (i, *nullable).into(),
-                }),
-                // FIXME: that's the wrong error
-                _ => Err(ParseError::ExpectedLiteral),
-            },
-            _ => Err(ParseError::ExpectedLiteral),
-        }
-    }
-}
-
-impl TryFrom<(Expr, &FilterLhs)> for ColumnLit<String> {
-    type Error = ParseError;
-
-    fn try_from((rhs, lhs): (Expr, &FilterLhs)) -> Result<Self, Self::Error> {
-        match (rhs, lhs) {
-            (Expr::Literal(lit), lhs) => match (lit.try_into()?, lhs) {
-                (
-                    SupportedRhsLiteral::Text(i),
-                    FilterLhs::Column {
-                        table,
-                        name,
-                        sqlite_type: Type::Text,
-                        nullable,
-                    },
-                ) => Ok(ColumnLit {
-                    table: table.clone(),
-                    name: name.clone(),
-                    rhs: (i, *nullable).into(),
-                }),
-                // FIXME: that's the wrong error
-                _ => Err(ParseError::ExpectedLiteral),
-            },
-            _ => Err(ParseError::ExpectedLiteral),
-        }
-    }
-}
-
-impl TryFrom<(Expr, &FilterLhs)> for ColumnLit<Vec<u8>> {
-    type Error = ParseError;
-
-    fn try_from((rhs, lhs): (Expr, &FilterLhs)) -> Result<Self, Self::Error> {
-        match (rhs, lhs) {
-            (Expr::Literal(lit), lhs) => match (lit.try_into()?, lhs) {
-                (
-                    SupportedRhsLiteral::Blob(i),
-                    FilterLhs::Column {
-                        table,
-                        name,
-                        sqlite_type: Type::Blob,
-                        nullable,
-                    },
-                ) => Ok(ColumnLit {
-                    table: table.clone(),
-                    name: name.clone(),
-                    rhs: (i, *nullable).into(),
-                }),
-                // FIXME: that's the wrong error
-                _ => Err(ParseError::ExpectedLiteral),
-            },
-            _ => Err(ParseError::ExpectedLiteral),
-        }
-    }
-}
-
-impl From<(i64, bool)> for RhsType<i64> {
-    fn from((i, nullable): (i64, bool)) -> Self {
-        if nullable {
-            RhsType::Nullable(Some(i))
-        } else {
-            RhsType::NotNullable(i)
-        }
-    }
-}
-
-impl From<(String, bool)> for RhsType<String> {
-    fn from((i, nullable): (String, bool)) -> Self {
-        if nullable {
-            RhsType::Nullable(Some(i))
-        } else {
-            RhsType::NotNullable(i)
-        }
-    }
-}
-
-impl From<(f64, bool)> for RhsType<f64> {
-    fn from((i, nullable): (f64, bool)) -> Self {
-        if nullable {
-            RhsType::Nullable(Some(i))
-        } else {
-            RhsType::NotNullable(i)
-        }
-    }
-}
-
-impl From<(Vec<u8>, bool)> for RhsType<Vec<u8>> {
-    fn from((i, nullable): (Vec<u8>, bool)) -> Self {
-        if nullable {
-            RhsType::Nullable(Some(i))
-        } else {
-            RhsType::NotNullable(i)
-        }
-    }
-}
-
-impl TryFrom<(Expr, &Schema)> for SupportedExpr {
-    type Error = ParseError;
-
-    fn try_from((expr, schema): (Expr, &Schema)) -> Result<Self, Self::Error> {
+    fn try_from(expr: Expr) -> Result<Self, Self::Error> {
         match expr {
             Expr::Binary(lhs, op, rhs) => match op {
                 op @ Operator::And | op @ Operator::Or => {
-                    let lhs: SupportedExpr = (*lhs, schema).try_into()?;
-                    let rhs: SupportedExpr = (*rhs, schema).try_into()?;
+                    let lhs: SupportedExpr = (*lhs).try_into()?;
+                    let rhs: SupportedExpr = (*rhs).try_into()?;
                     match op {
                         Operator::And => Ok(SupportedExpr::BinaryAnd(Box::new(lhs), Box::new(rhs))),
                         Operator::Or => Ok(SupportedExpr::BinaryOr(Box::new(lhs), Box::new(rhs))),
@@ -655,109 +361,40 @@ impl TryFrom<(Expr, &Schema)> for SupportedExpr {
                     }
                 }
                 op => {
-                    let lhs: FilterLhs = (*lhs, schema).try_into()?;
-                    (*rhs, schema, lhs, op).try_into()
+                    let lhs: FilterLhs = (*lhs).try_into()?;
+                    (*rhs, lhs, op).try_into()
                 }
             },
             Expr::Parenthesized(exprs) => Ok(SupportedExpr::Parenthesized(
                 exprs
                     .into_iter()
-                    .map(|expr| (expr, schema).try_into())
+                    .map(|expr| (expr).try_into())
                     .collect::<Result<Vec<SupportedExpr>, Self::Error>>()?,
             )),
             Expr::InList {
-                ref lhs,
-                rhs: Some(ref rhs),
+                lhs,
+                rhs: Some(rhs),
                 not,
             } => {
-                let lhs: FilterLhs = (*lhs.clone(), schema).try_into()?;
+                let lhs: FilterLhs = (*lhs).try_into()?;
 
-                match &lhs {
-                    lhs @ FilterLhs::Column {
-                        table,
-                        name,
-                        sqlite_type,
-                        nullable,
-                    } => match sqlite_type {
-                        Type::Integer => Ok(SupportedExpr::ListOfInteger {
-                            table: table.clone(),
-                            name: name.clone(),
-                            list: rhs
-                                .iter()
-                                .map(|rhs| {
-                                    (rhs.clone(), lhs)
-                                        .try_into()
-                                        .map(|lit: ColumnLit<_>| lit.rhs)
-                                })
-                                .collect::<Result<Vec<_>, Self::Error>>()?,
-                            not,
-                        }),
-                        Type::Real => Ok(SupportedExpr::ListOfReal {
-                            table: table.clone(),
-                            name: name.clone(),
-                            list: rhs
-                                .iter()
-                                .map(|rhs| {
-                                    (rhs.clone(), lhs)
-                                        .try_into()
-                                        .map(|lit: ColumnLit<_>| lit.rhs)
-                                })
-                                .collect::<Result<Vec<_>, Self::Error>>()?,
-                            not,
-                        }),
-                        Type::Text => Ok(SupportedExpr::ListOfText {
-                            table: table.clone(),
-                            name: name.clone(),
-                            list: rhs
-                                .iter()
-                                .map(|rhs| {
-                                    (rhs.clone(), lhs)
-                                        .try_into()
-                                        .map(|lit: ColumnLit<_>| lit.rhs)
-                                })
-                                .collect::<Result<Vec<_>, Self::Error>>()?,
-                            not,
-                        }),
-                        Type::Blob => Ok(SupportedExpr::ListOfBlob {
-                            table: table.clone(),
-                            name: name.clone(),
-                            list: rhs
-                                .iter()
-                                .map(|rhs| {
-                                    (rhs.clone(), lhs)
-                                        .try_into()
-                                        .map(|lit: ColumnLit<_>| lit.rhs)
-                                })
-                                .collect::<Result<Vec<_>, Self::Error>>()?,
-                            not,
-                        }),
-                        Type::Null => unreachable!(),
-                    },
-                    _ => return Err(ParseError::UnsupportedExpr(expr.clone())),
-                }
+                Ok(SupportedExpr::InList {
+                    list: rhs
+                        .into_iter()
+                        .map(|rhs| (rhs, lhs.clone(), Operator::Equals).try_into())
+                        .collect::<Result<Vec<_>, Self::Error>>()?,
+                    not,
+                })
             }
-            Expr::IsNull(lhs) => {
-                let lhs: FilterLhs = (*lhs, schema).try_into()?;
-                if let FilterLhs::Column { nullable: true, .. } = &lhs {
-                    Ok(SupportedExpr::IsNull(lhs))
-                } else {
-                    Err(ParseError::ColumnIsNotNullable)
-                }
-            }
-            Expr::NotNull(lhs) => {
-                let lhs: FilterLhs = (*lhs, schema).try_into()?;
-                if let FilterLhs::Column { nullable: true, .. } = &lhs {
-                    Ok(SupportedExpr::NotNull(lhs))
-                } else {
-                    Err(ParseError::ColumnIsNotNullable)
-                }
-            }
+            Expr::IsNull(lhs) => Ok(SupportedExpr::IsNull((*lhs).try_into()?)),
+            Expr::NotNull(lhs) => Ok(SupportedExpr::NotNull((*lhs).try_into()?)),
             _ => return Err(ParseError::UnsupportedExpr(expr.clone())),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChangeEvent {
     Insert,
     Update,
@@ -765,6 +402,14 @@ pub enum ChangeEvent {
 }
 
 impl ChangeEvent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChangeEvent::Insert => "insert",
+            ChangeEvent::Update => "update",
+            ChangeEvent::Delete => "delete",
+        }
+    }
+
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "insert" => Some(ChangeEvent::Insert),
@@ -780,26 +425,59 @@ pub struct Filter {
     expr: SupportedExpr,
 }
 
-#[derive(Debug)]
-pub enum AggregateChange<'a> {
-    Insert {
-        table: &'a str,
-        pk: &'a str,
-        values: Vec<(&'a str, SqliteValueRef<'a>)>,
-    },
-    Update {
-        table: &'a str,
-        pk: &'a str,
-        values: Vec<(&'a str, SqliteValueRef<'a>)>,
-    },
-    Delete {
-        table: &'a str,
-        pk: &'a str,
-    },
+impl Deref for Filter {
+    type Target = SupportedExpr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.expr
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AggregateChange<'a> {
+    pub version: i64,
+    #[serde(rename = "type")]
+    pub evt_type: ChangeEvent,
+    pub table: &'a str,
+    pub pk: PrimaryKey,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub data: HashMap<&'a str, SqliteValueRef<'a>>,
+}
+
+// TODO: optimize, sometimes we may be able to get a ref from the values vec
+type PrimaryKey = Vec<SqliteValue>;
+
+fn split_pk(pk: &str) -> Vec<String> {
+    let mut iter = pk.split('|');
+
+    let mut keys = vec![];
+    let mut last_key = String::new();
+    while let Some(s) = iter.next() {
+        trace!("got {s}, last_key = {last_key}");
+        if last_key.is_empty() {
+            last_key.push_str(s);
+        } else {
+            last_key.push('|');
+            last_key.push_str(s);
+        }
+        match unquote(last_key.as_str()) {
+            Ok(s) => {
+                keys.push(s);
+                last_key.clear();
+            }
+            Err(e) => {
+                trace!("could not unquote {s}: {e}");
+            }
+        }
+    }
+    if !last_key.is_empty() {
+        keys.push(last_key);
+    }
+    keys
 }
 
 impl<'a> AggregateChange<'a> {
-    pub fn from_changes(changes: &'a [Change], schema: &Schema) -> Vec<Self> {
+    pub fn from_changes(changes: &'a [Change], schema: &Schema, version: i64) -> Vec<Self> {
         let grouped = changes
             .iter()
             .group_by(|change| (change.table.as_str(), change.pk.as_str()));
@@ -808,202 +486,165 @@ impl<'a> AggregateChange<'a> {
             .into_iter()
             .filter_map(|((table, pk), group)| {
                 let mut group = group.peekable();
-                let event = schema.get(table).and_then(|cols| {
-                    group.peek().and_then(|change| {
-                        if change.cid == "__crsql_del" {
-                            Some(ChangeEvent::Delete)
-                        } else {
-                            match cols.iter().find(|col| col.name == change.cid) {
-                                Some(col) => {
-                                    if col.primary_key {
-                                        // can't change a primary key, so if this is present in the change, it's an insert
-                                        Some(ChangeEvent::Insert)
-                                    } else {
-                                        Some(ChangeEvent::Update)
+                let (evt_type, pk) = schema.get(table).and_then(|cols| {
+                    group
+                        .peek()
+                        .and_then(|change| {
+                            if change.cid == "__crsql_del" {
+                                Some(ChangeEvent::Delete)
+                            } else {
+                                match cols.iter().find(|col| col.name == change.cid) {
+                                    Some(col) => {
+                                        if col.primary_key {
+                                            // can't change a primary key, so if this is present in the change, it's an insert
+                                            Some(ChangeEvent::Insert)
+                                        } else {
+                                            Some(ChangeEvent::Update)
+                                        }
                                     }
+                                    None => None,
                                 }
-                                None => None,
                             }
-                        }
-                    })
+                        })
+                        .map(|event| {
+                            let pk_cols = cols.iter().filter(|col| col.primary_key);
+
+                            let pk = {
+                                let mut pks = split_pk(pk);
+                                pk_cols
+                                    .filter_map(|col| {
+                                        let s = pks.remove(0);
+                                        Some(match col.sqlite_type {
+                                            Type::Integer => {
+                                                dbg!(SqliteValue::Integer(s.parse().ok()?))
+                                            }
+                                            Type::Real => {
+                                                dbg!(SqliteValue::Real(s.parse().ok()?))
+                                            }
+                                            Type::Text => dbg!(SqliteValue::Text(s)),
+                                            Type::Blob => return None,
+                                            Type::Null => unreachable!(),
+                                        })
+                                    })
+                                    .collect::<PrimaryKey>()
+                            };
+                            (event, pk)
+                        })
                 })?;
 
-                Some(match event {
-                    ChangeEvent::Insert => AggregateChange::Insert {
-                        table,
-                        pk,
-                        values: group
-                            .map(|change| (change.cid.as_str(), change.val.as_ref()))
-                            .collect(),
-                    },
-                    ChangeEvent::Update => AggregateChange::Update {
-                        table,
-                        pk,
-                        values: group
-                            .map(|change| (change.cid.as_str(), change.val.as_ref()))
-                            .collect(),
-                    },
-                    ChangeEvent::Delete => AggregateChange::Delete { table, pk },
+                let data = match evt_type {
+                    ChangeEvent::Insert | ChangeEvent::Update => group
+                        .map(|change| (change.cid.as_str(), change.val.as_ref()))
+                        .collect(),
+                    _ => HashMap::new(),
+                };
+
+                Some(AggregateChange {
+                    table,
+                    pk,
+                    version,
+                    evt_type,
+                    data,
                 })
             })
             .collect::<Vec<AggregateChange>>()
     }
-
-    pub fn table(&self) -> &str {
-        match self {
-            AggregateChange::Insert { table, .. } => table,
-            AggregateChange::Update { table, .. } => table,
-            AggregateChange::Delete { table, .. } => table,
-        }
-    }
-
-    pub fn as_change_event(&self) -> ChangeEvent {
-        match self {
-            AggregateChange::Insert { .. } => ChangeEvent::Insert,
-            AggregateChange::Update { .. } => ChangeEvent::Update,
-            AggregateChange::Delete { .. } => ChangeEvent::Delete,
-        }
-    }
-
-    pub fn values(&self) -> Option<&Vec<(&'a str, SqliteValueRef)>> {
-        match self {
-            AggregateChange::Insert { values, .. } => Some(values),
-            AggregateChange::Update { values, .. } => Some(values),
-            AggregateChange::Delete { .. } => None,
-        }
-    }
 }
 
-fn matching_fun(expr: &SupportedExpr, agg: &AggregateChange) -> bool {
+pub fn match_expr(expr: &SupportedExpr, agg: &AggregateChange) -> bool {
     match expr {
         SupportedExpr::TableName { name, not_equal } => {
-            (*not_equal && name != agg.table()) || (!*not_equal && name == agg.table())
+            (*not_equal && name != agg.table) || (!*not_equal && name == agg.table)
         }
-        SupportedExpr::EventType { evt, not_equal } => {
-            (*not_equal && *evt != agg.as_change_event())
-                || (!*not_equal && *evt == agg.as_change_event())
+        SupportedExpr::EventType { evt, not_equal } => match ChangeEvent::from_str(evt.as_str()) {
+            Some(evt) => {
+                (*not_equal && evt != agg.evt_type) || (!*not_equal && evt == agg.evt_type)
+            }
+            None => false,
+        },
+        SupportedExpr::LiteralInteger {
+            table,
+            col,
+            op,
+            lhs,
+        } => {
+            agg.table == table
+                && agg.data.iter().any(|(name, value)| {
+                    *name == col && match_lit_value(Some(lhs), *op, value.as_integer())
+                })
         }
-        SupportedExpr::LiteralInteger(op, ColumnLit { table, name, rhs }) => match agg.values() {
-            Some(values) => {
-                agg.table() == table
-                    && values.iter().any(|(col, value)| {
-                        name == *col && match_lit_value(rhs.as_ref(), *op, value.as_integer())
-                    })
-            }
-            None => false,
-        },
-        SupportedExpr::LiteralReal(op, ColumnLit { table, name, rhs }) => match agg.values() {
-            Some(values) => {
-                agg.table() == table
-                    && values.iter().any(|(col, value)| {
-                        name == *col && match_lit_value(rhs.as_ref(), *op, value.as_real())
-                    })
-            }
-            None => false,
-        },
-        SupportedExpr::LiteralText(op, ColumnLit { table, name, rhs }) => match agg.values() {
-            Some(values) => {
-                agg.table() == table
-                    && values.iter().any(|(col, value)| {
-                        name == *col && match_lit_value(rhs.as_deref(), *op, value.as_text())
-                    })
-            }
-            None => false,
-        },
-        SupportedExpr::LiteralBlob(op, ColumnLit { table, name, rhs }) => match agg.values() {
-            Some(values) => {
-                agg.table() == table
-                    && values.iter().any(|(col, value)| {
-                        name == *col && match_lit_value(rhs.as_deref(), *op, value.as_blob())
-                    })
-            }
-            None => false,
-        },
+        SupportedExpr::LiteralReal {
+            table,
+            col,
+            op,
+            lhs,
+        } => {
+            agg.table == table
+                && agg.data.iter().any(|(name, value)| {
+                    *name == col && match_lit_value(Some(lhs), *op, value.as_real())
+                })
+        }
+        SupportedExpr::LiteralText {
+            table,
+            col,
+            op,
+            lhs,
+        } => {
+            agg.table == table
+                && agg.data.iter().any(|(name, value)| {
+                    *name == col && match_lit_value(Some(lhs.as_str()), *op, value.as_text())
+                })
+        }
+        SupportedExpr::LiteralBlob {
+            table,
+            col,
+            op,
+            lhs,
+        } => {
+            agg.table == table
+                && agg.data.iter().any(|(name, value)| {
+                    *name == col && match_lit_value(Some(lhs.as_slice()), *op, value.as_blob())
+                })
+        }
+        SupportedExpr::LiteralNull { table, col, op } => {
+            agg.table == table
+                && agg.data.iter().any(|(name, value)| {
+                    *name == col
+                        && match op {
+                            NullOp::Is => value.is_null(),
+                            NullOp::IsNot => !value.is_null(),
+                        }
+                })
+        }
         SupportedExpr::BinaryAnd(a, b) => {
-            matching_fun(a.as_ref(), agg) && matching_fun(b.as_ref(), agg)
+            match_expr(a.as_ref(), agg) && match_expr(b.as_ref(), agg)
         }
-        SupportedExpr::BinaryOr(a, b) => {
-            matching_fun(a.as_ref(), agg) || matching_fun(b.as_ref(), agg)
+        SupportedExpr::BinaryOr(a, b) => match_expr(a.as_ref(), agg) || match_expr(b.as_ref(), agg),
+        SupportedExpr::Parenthesized(exprs) => exprs.iter().any(|expr| match_expr(expr, agg)),
+        SupportedExpr::InList { list, not } => {
+            let any_matched = list.iter().any(|expr| match_expr(expr, agg));
+            (!*not && any_matched) || (*not && !any_matched)
         }
-        SupportedExpr::Parenthesized(exprs) => exprs.iter().any(|expr| matching_fun(expr, agg)),
-        SupportedExpr::ListOfInteger {
-            table,
-            name,
-            list,
-            not,
-        } => {
-            agg.table() == table
-                && match agg.values() {
-                    Some(values) => values.iter().any(|(col, value)| {
-                        name == *col && {
-                            let any_matched = list.iter().any(|lit| {
-                                match_lit_value(lit.as_ref(), BinaryOp::Equals, value.as_integer())
-                            });
-                            (!*not && any_matched) || (*not && !any_matched)
-                        }
-                    }),
-                    None => false,
-                }
-        }
-        SupportedExpr::ListOfReal {
-            table,
-            name,
-            list,
-            not,
-        } => {
-            agg.table() == table
-                && match agg.values() {
-                    Some(values) => values.iter().any(|(col, value)| {
-                        name == *col && {
-                            let any_matched = list.iter().any(|lit| {
-                                match_lit_value(lit.as_ref(), BinaryOp::Equals, value.as_real())
-                            });
-                            (!*not && any_matched) || (*not && !any_matched)
-                        }
-                    }),
-                    None => false,
-                }
-        }
-        SupportedExpr::ListOfText {
-            table,
-            name,
-            list,
-            not,
-        } => {
-            agg.table() == table
-                && match agg.values() {
-                    Some(values) => values.iter().any(|(col, value)| {
-                        name == *col && {
-                            let any_matched = list.iter().any(|lit| {
-                                match_lit_value(lit.as_deref(), BinaryOp::Equals, value.as_text())
-                            });
-                            (!*not && any_matched) || (*not && !any_matched)
-                        }
-                    }),
-                    None => false,
-                }
-        }
-        SupportedExpr::ListOfBlob {
-            table,
-            name,
-            list,
-            not,
-        } => {
-            agg.table() == table
-                && match agg.values() {
-                    Some(values) => values.iter().any(|(col, value)| {
-                        name == *col && {
-                            let any_matched = list.iter().any(|lit| {
-                                match_lit_value(lit.as_deref(), BinaryOp::Equals, value.as_blob())
-                            });
-                            (!*not && any_matched) || (*not && !any_matched)
-                        }
-                    }),
-                    None => false,
-                }
-        }
-        SupportedExpr::IsNull(_) => todo!(),
-        SupportedExpr::NotNull(_) => todo!(),
+        SupportedExpr::IsNull(lhs) => match lhs {
+            FilterLhs::Column { table, name, .. } => {
+                agg.table == table
+                    && agg
+                        .data
+                        .iter()
+                        .any(|(col, value)| name == *col && matches!(value, SqliteValueRef::Null))
+            }
+            _ => false,
+        },
+        SupportedExpr::NotNull(lhs) => match lhs {
+            FilterLhs::Column { table, name, .. } => {
+                agg.table == table
+                    && agg
+                        .data
+                        .iter()
+                        .any(|(col, value)| name == *col && !matches!(value, SqliteValueRef::Null))
+            }
+            _ => false,
+        },
     }
 }
 
@@ -1016,19 +657,19 @@ fn match_lit_value<T: PartialEq + PartialOrd + ?Sized>(
         BinaryOp::Equals | BinaryOp::Is => rhs == lhs,
         BinaryOp::NotEquals | BinaryOp::IsNot => rhs != lhs,
         BinaryOp::Greater => match rhs.partial_cmp(&lhs) {
-            Some(Ordering::Less) => true,
-            _ => false,
-        },
-        BinaryOp::GreaterEquals => match rhs.partial_cmp(&lhs) {
-            Some(Ordering::Less | Ordering::Equal) => true,
-            _ => false,
-        },
-        BinaryOp::Less => match rhs.partial_cmp(&lhs) {
             Some(Ordering::Greater) => true,
             _ => false,
         },
-        BinaryOp::LessEquals => match rhs.partial_cmp(&lhs) {
+        BinaryOp::GreaterEquals => match rhs.partial_cmp(&lhs) {
             Some(Ordering::Greater | Ordering::Equal) => true,
+            _ => false,
+        },
+        BinaryOp::Less => match rhs.partial_cmp(&lhs) {
+            Some(Ordering::Less) => true,
+            _ => false,
+        },
+        BinaryOp::LessEquals => match rhs.partial_cmp(&lhs) {
+            Some(Ordering::Less | Ordering::Equal) => true,
             _ => false,
         },
     }
@@ -1036,9 +677,6 @@ fn match_lit_value<T: PartialEq + PartialOrd + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    //     use crate::pubsub::SCHEMA;
-
-    use itertools::Itertools;
     use uuid::Uuid;
 
     use crate::{change::Change, sqlite::prepare_sql};
@@ -1054,9 +692,12 @@ mod tests {
         prepare_sql(
             b"
             CREATE TABLE test (
-                id BIGINT PRIMARY KEY NOT NULL,
+                id BIGINT NOT NULL,
+                b TEXT NOT NULL,
                 foo JSON NOT NULL DEFAULT '{}',
-                bar JSONB NOT NULL DEFAULT '{}'
+                bar JSONB NOT NULL DEFAULT '{}',
+
+                PRIMARY KEY (id, b)
             ) WITHOUT ROWID;
         "
             .as_slice(),
@@ -1066,14 +707,13 @@ mod tests {
 
         let jsonb = hex::encode(br#"{"foo": "bar"}"#);
 
-        let filter = parse_filter(
-            &schema,
+        let expr = parse_expr(
             format!(r#"(evt_type = 'insert' AND test.id = 1 AND test.foo = '{{"foo": "bar"}}') OR (evt_type = 'update' AND test.bar = x'{jsonb}')"#)
                 .as_str(),
         )
         .unwrap();
 
-        println!("filter: {filter:#?}");
+        println!("expr: {expr:#?}");
 
         let actor1 = Uuid::new_v4();
         let actor2 = Uuid::new_v4();
@@ -1082,7 +722,7 @@ mod tests {
             // insert
             Change {
                 table: "test".into(),
-                pk: "1".into(),
+                pk: "'1'|'hello'".into(),
                 cid: "id".into(),
                 val: crate::change::SqliteValue::Integer(1),
                 col_version: 1,
@@ -1091,7 +731,16 @@ mod tests {
             },
             Change {
                 table: "test".into(),
-                pk: "1".into(),
+                pk: "'1'|'hello'".into(),
+                cid: "b".into(),
+                val: crate::change::SqliteValue::Text("hello".into()),
+                col_version: 1,
+                db_version: 123,
+                site_id: actor1.to_bytes_le(),
+            },
+            Change {
+                table: "test".into(),
+                pk: "'1'|'hello'".into(),
                 cid: "foo".into(),
                 val: crate::change::SqliteValue::Text(r#"{"foo": "bar"}"#.into()),
                 col_version: 1,
@@ -1100,7 +749,7 @@ mod tests {
             },
             Change {
                 table: "test".into(),
-                pk: "1".into(),
+                pk: "'1'|'hello'".into(),
                 cid: "bar".into(),
                 val: crate::change::SqliteValue::Text("{}".into()),
                 col_version: 1,
@@ -1110,7 +759,7 @@ mod tests {
             // update
             Change {
                 table: "test".into(),
-                pk: "2".into(),
+                pk: "'2'|'hello'".into(),
                 cid: "bar".into(),
                 val: crate::change::SqliteValue::Blob(br#"{"foo": "bar"}"#.to_vec()),
                 col_version: 2,
@@ -1119,15 +768,49 @@ mod tests {
             },
         ];
 
-        let aggs = AggregateChange::from_changes(changes.as_slice(), &schema);
+        let aggs = AggregateChange::from_changes(changes.as_slice(), &schema, 1);
         println!("aggs: {aggs:#?}");
 
         for agg in aggs {
             println!("matching on {agg:?} ...");
-            if matching_fun(&filter.expr, &agg) {
+            if match_expr(&expr, &agg) {
                 println!("matched! {agg:?}");
             }
+
+            println!("json: {}", serde_json::to_string_pretty(&agg).unwrap());
         }
+    }
+
+    #[test]
+    fn unquoting() {
+        let pk = "'hell|hell'|'world'";
+        let mut iter = pk.split('|');
+
+        let mut keys = vec![];
+        let mut last_key = String::new();
+        while let Some(s) = iter.next() {
+            println!("got {s}, last_key = {last_key}");
+            if last_key.is_empty() {
+                last_key.push_str(s);
+            } else {
+                last_key.push('|');
+                last_key.push_str(s);
+            }
+            match unquote(last_key.as_str()) {
+                Ok(s) => {
+                    keys.push(s);
+                    last_key.clear();
+                }
+                Err(e) => {
+                    error!("could not unquote {s}: {e}");
+                }
+            }
+        }
+        if !last_key.is_empty() {
+            keys.push(last_key);
+        }
+
+        println!("keys: {keys:#?}");
     }
 
     //     #[test]

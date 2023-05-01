@@ -9,11 +9,8 @@ use fallible_iterator::FallibleIterator;
 use once_cell::sync::Lazy;
 use rusqlite::{types::Type, Connection, OpenFlags};
 use sqlite3_parser::{
-    ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt},
-    lexer::{
-        sql::{Parser, ParserError},
-        Input,
-    },
+    ast::{Cmd, ColumnConstraint, CreateTableBody, Expr, Stmt, TableConstraint},
+    lexer::{sql::Parser, Input},
 };
 use tempfile::TempDir;
 use tracing::{debug, error, trace};
@@ -164,7 +161,12 @@ pub fn prepare_sql<I: Input>(input: I, schema: &mut Schema) -> Result<Vec<Cmd>, 
                     ..
                 }) = cmd
                 {
-                    if let CreateTableBody::ColumnsAndConstraints { ref columns, .. } = body {
+                    if let CreateTableBody::ColumnsAndConstraints {
+                        ref columns,
+                        ref constraints,
+                        ..
+                    } = body
+                    {
                         if !tbl_name.name.0.contains("crsql")
                             & !tbl_name.name.0.contains("sqlite")
                             & !tbl_name.name.0.starts_with("__corro")
@@ -216,15 +218,35 @@ pub fn prepare_sql<I: Input>(input: I, schema: &mut Schema) -> Result<Vec<Cmd>, 
                                             // 5. Otherwise, the affinity is NUMERIC.
                                             Some(_s) => Type::Real,
                                         },
-                                        primary_key: def.constraints.iter().any(|constraint| {
+                                        primary_key: def.constraints.iter().any(|named| {
                                             matches!(
-                                                constraint.constraint,
+                                                named.constraint,
                                                 ColumnConstraint::PrimaryKey { .. }
                                             )
-                                        }),
-                                        nullable: def.constraints.iter().any(|constraint| {
+                                        }) || constraints
+                                            .as_ref()
+                                            .map(|ref constraints| {
+                                                constraints.iter().any(|ref named| {
+                                                    match &named.constraint {
+                                                        TableConstraint::PrimaryKey {
+                                                            columns,
+                                                            ..
+                                                        } => columns.iter().any(|col| {
+                                                            match &col.expr {
+                                                                Expr::Id(id) => {
+                                                                    id.0 == def.col_name.0
+                                                                }
+                                                                _ => false,
+                                                            }
+                                                        }),
+                                                        _ => false,
+                                                    }
+                                                })
+                                            })
+                                            .unwrap_or(false),
+                                        nullable: def.constraints.iter().any(|named| {
                                             matches!(
-                                                constraint.constraint,
+                                                named.constraint,
                                                 ColumnConstraint::NotNull { nullable: true, .. }
                                             )
                                         }),
