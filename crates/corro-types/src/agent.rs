@@ -9,7 +9,7 @@ use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, UhlcTimestamp},
     pubsub::Subscribers,
-    sqlite::SqlitePool,
+    sqlite::{NormalizedSchema, SqlitePool},
 };
 
 use super::members::Members;
@@ -29,6 +29,7 @@ pub struct AgentInner {
     pub subscribers: Subscribers,
     pub tx_bcast: Sender<BroadcastInput>,
     pub base_path: Utf8PathBuf,
+    pub schema: RwLock<NormalizedSchema>,
 }
 
 impl Agent {

@@ -3,7 +3,6 @@ use std::{cmp::Ordering, collections::HashMap, ops::Deref};
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use itertools::Itertools;
-use rusqlite::types::Type;
 use serde::{Deserialize, Serialize};
 use sqlite3_parser::{
     ast::{Cmd, Expr, Literal, OneSelect, Operator, Stmt},
@@ -11,7 +10,10 @@ use sqlite3_parser::{
 };
 use tracing::{error, trace};
 
-use crate::change::{Change, SqliteValue, SqliteValueRef};
+use crate::{
+    change::{Change, SqliteValue, SqliteValueRef},
+    sqlite::Type,
+};
 
 const CORRO_EVENT: &str = "evt_type";
 const CORRO_TABLE: &str = "tbl_name";
@@ -19,7 +21,7 @@ const CORRO_TABLE: &str = "tbl_name";
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: String,
-    pub sqlite_type: Type,
+    pub sql_type: Type,
     pub primary_key: bool,
     pub nullable: bool,
 }
@@ -514,14 +516,10 @@ impl<'a> AggregateChange<'a> {
                                 pk_cols
                                     .filter_map(|col| {
                                         let s = pks.remove(0);
-                                        Some(match col.sqlite_type {
-                                            Type::Integer => {
-                                                dbg!(SqliteValue::Integer(s.parse().ok()?))
-                                            }
-                                            Type::Real => {
-                                                dbg!(SqliteValue::Real(s.parse().ok()?))
-                                            }
-                                            Type::Text => dbg!(SqliteValue::Text(s)),
+                                        Some(match col.sql_type {
+                                            Type::Integer => SqliteValue::Integer(s.parse().ok()?),
+                                            Type::Real => SqliteValue::Real(s.parse().ok()?),
+                                            Type::Text => SqliteValue::Text(s),
                                             Type::Blob => return None,
                                             Type::Null => unreachable!(),
                                         })

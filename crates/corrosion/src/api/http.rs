@@ -223,7 +223,7 @@ pub async fn api_v1_db_execute(
 
 #[cfg(test)]
 mod tests {
-    use corro_types::sqlite::CrConnManager;
+    use corro_types::sqlite::{CrConnManager, NormalizedSchema};
     use tokio::sync::mpsc::channel;
     use uuid::Uuid;
 
@@ -244,7 +244,10 @@ mod tests {
             .max_size(1)
             .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
 
-        apply_schema(&pool, schema_path).await?;
+        {
+            let mut conn = pool.get().await?;
+            apply_schema(&mut conn, schema_path, &NormalizedSchema::default())?;
+        }
 
         let (tx, mut rx) = channel(1);
 

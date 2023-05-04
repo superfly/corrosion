@@ -660,6 +660,7 @@ dependencies = [
  "fallible-iterator",
  "foca",
  "hex",
+ "indexmap",
  "itertools",
  "metrics",
  "once_cell",

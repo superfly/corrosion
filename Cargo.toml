@@ -61,6 +61,7 @@ trust-dns-resolver = "0.22.0"
 rangemap = { version = "1.3.0" }
 arc-swap = { version = "1.6.0" }
 itertools = { version = "*" }
+indexmap = { version = "*" }
 
 [profile.release]
 debug = 1

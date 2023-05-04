@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     path::Path,
     sync::{atomic::AtomicI64, Arc},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::{
@@ -27,7 +27,10 @@ use corro_types::{
     filters::{match_expr, AggregateChange, Schema},
     members::{MemberEvent, Members},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
-    sqlite::{init_cr_conn, prepare_sql, CrConn, CrConnManager, SqlitePool},
+    sqlite::{
+        init_cr_conn, parse_sql, CrConn, CrConnManager, Migration, NormalizedColumn,
+        NormalizedSchema, SqlitePool,
+    },
 };
 
 use axum::{
@@ -41,8 +44,9 @@ use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
-use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use spawn::spawn_counted;
+use sqlite3_parser::ast::{Cmd, Name, QualifiedName, Stmt};
 use tokio::{
     net::{TcpListener, UdpSocket},
     sync::mpsc::{channel, Receiver, Sender},
@@ -147,8 +151,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         .build(CrConnManager::new(&state_db_path))
         .await?;
 
-    apply_schema(&rw_pool, &conf.schema_path).await?;
-
     debug!("built RW pool");
 
     let ro_pool = bb8::Builder::new()
@@ -157,6 +159,13 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         .max_lifetime(Some(Duration::from_secs(30)))
         .build_unchecked(CrConnManager::new_read_only(&state_db_path));
     debug!("built RO pool");
+
+    let schema = {
+        let mut conn = rw_pool.get().await?;
+        migrate(&mut conn)?;
+        let schema = init_schema(&conn)?;
+        apply_schema(&mut conn, &conf.schema_path, &schema)?
+    };
 
     let mut bk: HashMap<ActorId, BookedVersion> = HashMap::new();
 
@@ -218,6 +227,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         bookie,
         tx_bcast,
         base_path,
+        schema: RwLock::new(schema),
     }));
 
     let opts = AgentOptions {
@@ -1352,43 +1362,54 @@ async fn sync_loop(agent: Agent, client: ClientPool, mut tripwire: Tripwire) {
     }
 }
 
-// Corrosion's base migrations, should be a noop if up to date!
-pub fn migrate(conn: &mut Connection) -> eyre::Result<()> {
-    let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
-        init_migration as fn(&Transaction) -> eyre::Result<()>,
-    )];
+pub fn init_schema(conn: &Connection) -> eyre::Result<NormalizedSchema> {
+    let mut dump = String::new();
 
-    let target_version = migrations.len();
+    let tables: HashMap<String, String> = conn
+            .prepare(
+                r#"SELECT name, sql FROM sqlite_schema
+    WHERE type = "table" AND name != "sqlite_sequence" AND name NOT LIKE '__corro_%' AND name NOT LIKE '%crsql%' ORDER BY tbl_name"#,
+            )?
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
 
-    let current_version = user_version(&conn)?;
-    {
-        let tx = conn.transaction()?;
-        for (i, migration) in migrations.into_iter().enumerate() {
-            let new_version = i + 1;
-            if new_version <= current_version {
-                continue;
-            }
-            migration.migrate(&tx)?;
-        }
-        set_user_version(&tx, target_version)?;
-        tx.commit()?;
+    for sql in tables.values() {
+        dump.push_str(sql.as_str());
     }
-    Ok(())
+
+    let indexes: HashMap<String, String> = conn
+            .prepare(
+                r#"SELECT name, sql FROM sqlite_schema
+    WHERE type = "index" AND name != "sqlite_sequence" AND name NOT LIKE '__corro_%' AND name NOT LIKE '%crsql%' ORDER BY tbl_name"#,
+            )?
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+    for sql in indexes.values() {
+        dump.push_str(sql.as_str());
+    }
+
+    Ok(parse_sql(dump.as_str())?)
 }
 
-pub async fn apply_schema<P: AsRef<Path>>(w_pool: &SqlitePool, schema_path: P) -> eyre::Result<()> {
+pub fn apply_schema<P: AsRef<Path>>(
+    conn: &mut Connection,
+    schema_path: P,
+    schema: &NormalizedSchema,
+) -> eyre::Result<NormalizedSchema> {
     info!("Applying schema changes...");
     let start = Instant::now();
-    let mut conn = w_pool.get().await?;
 
-    block_in_place(|| migrate(&mut conn))?;
-
-    let mut dir = tokio::fs::read_dir(schema_path).await?;
+    let mut dir = std::fs::read_dir(schema_path)?;
 
     let mut entries = vec![];
 
-    while let Some(entry) = dir.next_entry().await? {
-        entries.push(entry);
+    while let Some(entry) = dir.next() {
+        entries.push(entry?);
     }
 
     let mut entries: Vec<_> = entries
@@ -1400,51 +1421,310 @@ pub async fn apply_schema<P: AsRef<Path>>(w_pool: &SqlitePool, schema_path: P) -
                 .and_then(|ext| if ext == "sql" { Some(entry) } else { None })
         })
         .collect();
+
     entries.sort_by_key(|entry| entry.path());
 
-    let mut schema = Schema::default();
+    let mut new_sql = String::new();
 
-    block_in_place(|| {
-        let tx = conn.transaction()?;
-        for entry in entries {
-            println!("applying schema file: {}", entry.path().display());
+    for entry in entries.iter() {
+        std::fs::File::open(entry.path())?.read_to_string(&mut new_sql)?;
+    }
 
-            let mut q = String::new();
-            std::fs::File::open(entry.path())?.read_to_string(&mut q)?;
+    let new_schema = parse_sql(&new_sql)?;
 
-            let cmds = prepare_sql(q.as_bytes(), &mut schema)?;
+    let tx = conn.transaction()?;
 
+    // iterate over dropped tables
+    for name in schema
+        .tables
+        .keys()
+        .collect::<HashSet<_>>()
+        .difference(&new_schema.tables.keys().collect::<HashSet<_>>())
+    {
+        // TODO: add options and check flag
+        eyre::bail!("cannot drop table '{name}' without specifying destructive flag");
+    }
+
+    let new_table_names = new_schema
+        .tables
+        .keys()
+        .collect::<HashSet<_>>()
+        .difference(&schema.tables.keys().collect::<HashSet<_>>())
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    info!("new table names: {new_table_names:?}");
+
+    let new_tables_iter = new_schema
+        .tables
+        .iter()
+        .filter(|(table, _)| new_table_names.contains(table));
+
+    for (name, table) in new_tables_iter {
+        info!("creating table '{name}'");
+        tx.execute_batch(
+            &Cmd::Stmt(Stmt::CreateTable {
+                temporary: false,
+                if_not_exists: false,
+                tbl_name: QualifiedName::single(Name(name.clone())),
+                body: table.raw.clone(),
+            })
+            .to_string(),
+        )?;
+
+        tx.execute_batch(&format!("SELECT crsql_as_crr('{name}');"))?;
+
+        for (idx_name, index) in table.indexes.iter() {
+            info!("creating index '{idx_name}'");
             tx.execute_batch(
-                &cmds
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<String>>()
-                    .join("\n"),
+                &Cmd::Stmt(Stmt::CreateIndex {
+                    unique: false,
+                    if_not_exists: false,
+                    idx_name: QualifiedName::single(Name(idx_name.clone())),
+                    tbl_name: Name(index.tbl_name.clone()),
+                    columns: index.columns.clone(),
+                    where_clause: index.where_clause.clone(),
+                })
+                .to_string(),
             )?;
         }
-        tx.commit()?;
-        Ok::<_, eyre::Report>(())
-    })?;
+    }
 
-    // swap in the new schema
-    SCHEMA.store(Some(Arc::new(schema)));
+    // iterate intersecting tables
+    for name in new_schema
+        .tables
+        .keys()
+        .collect::<HashSet<_>>()
+        .intersection(&schema.tables.keys().collect::<HashSet<_>>())
+        .cloned()
+    {
+        info!("processing table '{name}'");
+        let table = schema.tables.get(name).unwrap();
+        info!(
+            "current cols: {:?}",
+            table.columns.keys().collect::<Vec<&String>>()
+        );
+        let new_table = new_schema.tables.get(name).unwrap();
+        info!(
+            "new cols: {:?}",
+            new_table.columns.keys().collect::<Vec<&String>>()
+        );
+
+        // 1. Check column drops... don't allow unless flag is passed
+
+        let dropped_cols = table
+            .columns
+            .keys()
+            .collect::<HashSet<_>>()
+            .difference(&new_table.columns.keys().collect::<HashSet<_>>())
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        debug!("dropped cols: {dropped_cols:?}");
+
+        for col_name in dropped_cols {
+            // TODO: add options and check flag
+            eyre::bail!("cannot drop column '{col_name}' from table '{name}' without specifying destructive flag");
+        }
+
+        // 2. check for changed columns
+
+        let changed_cols: HashMap<String, NormalizedColumn> = table
+            .columns
+            .iter()
+            .filter_map(|(name, col)| {
+                new_table
+                    .columns
+                    .get(name)
+                    .and_then(|new_col| (new_col != col).then(|| (name.clone(), col.clone())))
+            })
+            .collect();
+
+        info!(
+            "changed cols: {:?}",
+            changed_cols.keys().collect::<Vec<_>>()
+        );
+
+        let new_col_names = new_table
+            .columns
+            .keys()
+            .collect::<HashSet<_>>()
+            .difference(&table.columns.keys().collect::<HashSet<_>>())
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        info!("new columns: {new_col_names:?}");
+
+        let new_cols_iter = new_table
+            .columns
+            .iter()
+            .filter(|(col_name, _)| new_col_names.contains(col_name));
+
+        if changed_cols.is_empty() {
+            // 2.1. no changed columns, add missing ones
+
+            tx.execute_batch(&format!("SELECT crsql_begin_alter('{name}');"))?;
+
+            for (col_name, col) in new_cols_iter {
+                info!("adding column '{col_name}'");
+                if col.primary_key {
+                    eyre::bail!("can't add a column as primary key (column: '{col_name}')");
+                }
+                if !col.nullable && col.default_value.is_none() {
+                    eyre::bail!("non-nullable columns need a default value (column: '{col_name}')");
+                }
+                tx.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {}", col))?;
+            }
+            tx.execute_batch(&format!("SELECT crsql_commit_alter('{name}');"))?;
+        } else {
+            // 2.2 we do have changed columns, try to do something about that
+
+            let primary_keys = table
+                .columns
+                .values()
+                .filter_map(|col| col.primary_key.then(|| &col.name))
+                .collect::<Vec<&String>>();
+
+            let new_primary_keys = new_table
+                .columns
+                .values()
+                .filter_map(|col| col.primary_key.then(|| &col.name))
+                .collect::<Vec<&String>>();
+
+            if primary_keys != new_primary_keys {
+                eyre::bail!("cannot change table '{name}' primary keys (expected: {primary_keys:?}, wanted: {new_primary_keys:?})");
+            }
+
+            // "12-step" process to modifying a table
+
+            // first, create our new table with a temp name
+            let tmp_name = format!(
+                "{name}_{}",
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+            );
+
+            let create_tmp_table = Cmd::Stmt(Stmt::CreateTable {
+                temporary: false,
+                if_not_exists: false,
+                tbl_name: QualifiedName::single(Name(tmp_name.clone())),
+                body: new_table.raw.clone(),
+            });
+
+            tx.execute_batch("SELECT crsql_begin_alter('{name}');")?;
+
+            info!("creating tmp table '{tmp_name}'");
+            tx.execute_batch(&create_tmp_table.to_string())?;
+
+            let col_names = table
+                .columns
+                .keys()
+                .cloned()
+                .collect::<Vec<String>>()
+                .join(",");
+
+            info!("inserting data from '{name}' into '{tmp_name}'");
+            let inserted = tx.execute(
+                &format!("INSERT INTO {tmp_name} ({col_names}) SELECT {col_names} FROM {name}"),
+                (),
+            )?;
+
+            info!("re-inserted {inserted} rows into the new table for {name}");
+
+            info!("dropping old table '{name}', renaming '{tmp_name}' to '{name}'");
+            tx.execute_batch(&format!(
+                "DROP TABLE {name};
+                 ALTER TABLE {tmp_name} RENAME TO {name}"
+            ))?;
+
+            tx.execute_batch(&format!("SELECT crsql_commit_alter('{name}');"))?;
+        }
+
+        let new_index_names = new_table
+            .indexes
+            .keys()
+            .collect::<HashSet<_>>()
+            .difference(&table.indexes.keys().collect::<HashSet<_>>())
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        let new_indexes_iter = new_table
+            .indexes
+            .iter()
+            .filter(|(index, _)| new_index_names.contains(index));
+
+        for (idx_name, index) in new_indexes_iter {
+            info!("creating new index '{idx_name}'");
+            tx.execute_batch(
+                &Cmd::Stmt(Stmt::CreateIndex {
+                    unique: false,
+                    if_not_exists: false,
+                    idx_name: QualifiedName::single(Name(idx_name.clone())),
+                    tbl_name: Name(index.tbl_name.clone()),
+                    columns: index.columns.clone(),
+                    where_clause: index.where_clause.clone(),
+                })
+                .to_string(),
+            )?;
+        }
+
+        let dropped_indexes = table
+            .indexes
+            .keys()
+            .collect::<HashSet<_>>()
+            .difference(&new_table.indexes.keys().collect::<HashSet<_>>())
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        for idx_name in dropped_indexes {
+            info!("dropping index '{idx_name}'");
+            tx.execute_batch(&format!("DROP INDEX {idx_name}"))?;
+        }
+
+        let changed_indexes_iter = table.indexes.iter().filter_map(|(idx_name, index)| {
+            let pindex = new_table.indexes.get(idx_name)?;
+            if pindex != index {
+                Some((idx_name, pindex))
+            } else {
+                None
+            }
+        });
+
+        for (idx_name, index) in changed_indexes_iter {
+            info!("replacing index '{idx_name}' (drop + create)");
+            tx.execute_batch(&format!(
+                "DROP INDEX {idx_name}; {}",
+                &Cmd::Stmt(Stmt::CreateIndex {
+                    unique: false,
+                    if_not_exists: false,
+                    idx_name: QualifiedName::single(Name(idx_name.clone())),
+                    tbl_name: Name(index.tbl_name.clone()),
+                    columns: index.columns.clone(),
+                    where_clause: index.where_clause.clone(),
+                })
+                .to_string(),
+            ))?;
+        }
+    }
+
+    tx.commit()?;
 
     info!("Done applying schema changes (took: {:?})", start.elapsed());
 
-    Ok::<_, eyre::Report>(())
+    Ok::<_, eyre::Report>(new_schema)
 }
 
-trait Migration {
-    fn migrate(&self, tx: &Transaction) -> eyre::Result<()>;
+fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
+        init_migration as fn(&Transaction) -> rusqlite::Result<()>,
+    )];
+
+    corro_types::sqlite::migrate(conn, migrations)
 }
 
-impl Migration for fn(&Transaction) -> eyre::Result<()> {
-    fn migrate(&self, tx: &Transaction) -> eyre::Result<()> {
-        self(tx)
-    }
-}
-
-fn init_migration(tx: &Transaction) -> Result<(), eyre::Report> {
+fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         r#"
             CREATE TABLE __corro_bookkeeping (
@@ -1481,20 +1761,6 @@ fn init_migration(tx: &Transaction) -> Result<(), eyre::Report> {
     Ok(())
 }
 
-// Read user version field from the SQLite db
-fn user_version(conn: &Connection) -> Result<usize, rusqlite::Error> {
-    #[allow(deprecated)] // To keep compatibility with lower rusqlite versions
-    conn.query_row::<_, &[&dyn ToSql], _>("PRAGMA user_version", &[], |row| row.get(0))
-        .map(|v: i64| v as usize)
-}
-
-// Set user version field from the SQLite db
-fn set_user_version(conn: &Connection, v: usize) -> rusqlite::Result<()> {
-    let v = v as u32;
-    conn.pragma_update(None, "user_version", &v)?;
-    Ok(())
-}
-
 #[cfg(test)]
 pub mod tests {
     use std::{
@@ -1503,7 +1769,6 @@ pub mod tests {
         time::{Duration, Instant},
     };
 
-    use fallible_iterator::FallibleIterator;
     use futures::{StreamExt, TryStreamExt};
     use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
     use serde::Deserialize;
@@ -1514,8 +1779,12 @@ pub mod tests {
     use tripwire::Tripwire;
     use uuid::Uuid;
 
-    use crate::api::peer::generate_sync;
-    use corro_types::api::{RqliteResponse, Statement};
+    use super::*;
+
+    use corro_types::{
+        api::{RqliteResponse, Statement},
+        sqlite::CrConnManager,
+    };
 
     use corro_tests::*;
 
@@ -1875,24 +2144,84 @@ pub mod tests {
         Ok(())
     }
 
-    #[test]
-    fn sqlite_filter() -> eyre::Result<()> {
-        // let input = "
-        //     tests.id IN ('hello', 'world') OR tests2.id = 'foobar' OR test2.name IS NOT NULL
-        // ";
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn schema_application() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let dir = tempfile::tempdir()?;
+        let schema_path = dir.path().join("schema");
+        tokio::fs::create_dir_all(&schema_path).await?;
 
-        // let input = format!("SELECT * FROM __corro_filter WHERE {input}");
+        tokio::fs::write(schema_path.join("test.sql"), corro_tests::TEST_SCHEMA).await?;
 
-        let input = "CREATE TRIGGER tests INSERT
-        ON Product BEGIN
-            SELECT * FROM tests WHERE id = NEW.id;
-        END";
+        let pool = bb8::Pool::builder()
+            .max_size(1)
+            .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
 
-        let mut parser = sqlite3_parser::lexer::sql::Parser::new(input.as_bytes());
+        let schema = {
+            let mut conn = pool.get().await?;
+            let schema = init_schema(&conn)?;
+            apply_schema(&mut conn, &schema_path, &schema)?
+        };
 
-        while let Some(cmd) = parser.next()? {
-            println!("{cmd:#?}");
-        }
+        println!("initial schema: {schema:#?}");
+
+        println!("SECOND ATTEMPT ------");
+
+        tokio::fs::remove_file(schema_path.join("test.sql")).await?;
+
+        tokio::fs::write(
+            schema_path.join("consul.sql"),
+            r#"
+
+        CREATE TABLE IF NOT EXISTS tests (
+            id INTEGER NOT NULL PRIMARY KEY,
+            text TEXT NOT NULL DEFAULT "",
+            meta JSON NOT NULL DEFAULT '{}',
+
+            app_id INTEGER AS (CAST(JSON_EXTRACT(meta, '$.app_id') AS INTEGER)),
+            instance_id TEXT AS (
+                COALESCE(
+                    JSON_EXTRACT(meta, '$.machine_id'),
+                    SUBSTR(JSON_EXTRACT(meta, '$.alloc_id'), 1, 8),
+                    CASE
+                        WHEN INSTR(id, '_nomad-task-') = 1 THEN SUBSTR(id, 13, 8)
+                        ELSE NULL
+                    END
+                )
+            )
+        ) WITHOUT ROWID;
+
+
+        CREATE TABLE IF NOT EXISTS tests2 (
+            id INTEGER NOT NULL PRIMARY KEY,
+            text TEXT NOT NULL DEFAULT ""
+        ) WITHOUT ROWID;
+        
+        
+        CREATE TABLE IF NOT EXISTS consul_checks (
+            node TEXT NOT NULL DEFAULT "",
+            id TEXT NOT NULL DEFAULT "",
+            service_id TEXT NOT NULL DEFAULT "",
+            service_name TEXT NOT NULL DEFAULT "",
+            name TEXT NOT NULL DEFAULT "",
+            status TEXT,
+            output TEXT NOT NULL DEFAULT "",
+            updated_at BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (node, id)
+        ) WITHOUT ROWID;
+        
+        CREATE INDEX consul_checks_node_id_updated_at ON consul_checks (node, id, updated_at);
+
+        "#,
+        )
+        .await?;
+
+        let _new_schema = {
+            let mut conn = pool.get().await?;
+            apply_schema(&mut conn, &schema_path, &schema)?
+        };
+
+        // println!("new schema: {new_schema:#?}");
 
         Ok(())
     }
