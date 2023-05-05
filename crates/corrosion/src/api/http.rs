@@ -229,7 +229,7 @@ mod tests {
 
     use super::*;
 
-    use crate::agent::apply_schema;
+    use crate::agent::{apply_schema, migrate};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn rqlite_db_execute() -> eyre::Result<()> {
@@ -246,6 +246,7 @@ mod tests {
 
         {
             let mut conn = pool.get().await?;
+            migrate(&mut conn)?;
             apply_schema(&mut conn, schema_path, &NormalizedSchema::default())?;
         }
 

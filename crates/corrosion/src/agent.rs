@@ -1716,7 +1716,7 @@ pub fn apply_schema<P: AsRef<Path>>(
     Ok::<_, eyre::Report>(new_schema)
 }
 
-fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
         init_migration as fn(&Transaction) -> rusqlite::Result<()>,
     )];
