@@ -27,6 +27,8 @@ use corro_types::{
 //     q: Option<String>,
 // }
 
+const MAX_STATEMENTS_PER_REQUEST: usize = 50;
+
 pub async fn api_v1_db_execute(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Extension(rw_pool): Extension<SqlitePool>,
@@ -42,6 +44,18 @@ pub async fn api_v1_db_execute(
             axum::Json(RqliteResponse {
                 results: vec![RqliteResult::Error {
                     error: "at least 1 statement is required".into(),
+                }],
+                time: None,
+            }),
+        );
+    }
+
+    if statements.len() > MAX_STATEMENTS_PER_REQUEST {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(RqliteResponse {
+                results: vec![RqliteResult::Error {
+                    error: format!("too many statements, please restrict the number of statements per request to {MAX_STATEMENTS_PER_REQUEST}"),
                 }],
                 time: None,
             }),

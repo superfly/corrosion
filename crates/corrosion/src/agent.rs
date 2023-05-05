@@ -2042,7 +2042,7 @@ pub mod tests {
         });
 
         tokio::spawn(async move {
-            tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(5), {
+            tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
                 let addrs = addrs.clone();
                 let client = client.clone();
                 move |statements| {
