@@ -7,7 +7,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::{
     actor::ActorId,
-    broadcast::{BroadcastInput, UhlcTimestamp},
+    broadcast::BroadcastInput,
     pubsub::Subscribers,
     sqlite::{NormalizedSchema, SqlitePool},
 };
@@ -73,7 +73,7 @@ impl Agent {
     }
 }
 
-pub type BookedVersion = RangeInclusiveMap<i64, (Option<i64>, UhlcTimestamp)>;
+pub type BookedVersion = RangeInclusiveMap<i64, (Option<i64>, u64)>;
 pub type BookedInner = Arc<RwLock<BookedVersion>>;
 
 #[derive(Default, Clone)]
@@ -84,7 +84,7 @@ impl Booked {
         Self(inner)
     }
 
-    pub fn insert(&self, version: i64, db_version: Option<i64>, ts: UhlcTimestamp) {
+    pub fn insert(&self, version: i64, db_version: Option<i64>, ts: u64) {
         self.0.write().insert(version..=version, (db_version, ts));
     }
 
@@ -111,7 +111,7 @@ impl Bookie {
         Self(inner)
     }
 
-    pub fn add(&self, actor_id: ActorId, version: i64, db_version: Option<i64>, ts: UhlcTimestamp) {
+    pub fn add(&self, actor_id: ActorId, version: i64, db_version: Option<i64>, ts: u64) {
         {
             if let Some(booked) = self.0.read().get(&actor_id) {
                 booked.insert(version, db_version, ts);

@@ -474,12 +474,7 @@ pub fn runtime_loop(
                         ",
                             )
                             .and_then(|mut prepped| {
-                                prepped.execute(params![
-                                    id.0,
-                                    address.to_string(),
-                                    state,
-                                    foca_state
-                                ])
+                                prepped.execute(params![id, address.to_string(), state, foca_state])
                             });
 
                         if let Err(e) = db_res {
@@ -504,7 +499,7 @@ pub fn runtime_loop(
             }
 
             if let Some(mut pending) = to_broadcast.take() {
-                trace!("{} to broadcast: {pending:?}", actor_id.hyphenated());
+                trace!("{} to broadcast: {pending:?}", actor_id);
                 let broadcast_to = {
                     foca.read()
                         .iter_members()

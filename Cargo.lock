@@ -663,6 +663,7 @@ dependencies = [
  "indexmap",
  "itertools",
  "metrics",
+ "nom",
  "once_cell",
  "parking_lot",
  "rand",
@@ -675,11 +676,13 @@ dependencies = [
  "sqlite3-parser",
  "tempfile",
  "thiserror",
+ "time 0.3.20",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uhlc",
+ "ulid",
  "uuid",
 ]
 
@@ -737,6 +740,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-stream",
+ "tokio-tungstenite",
  "tokio-util",
  "tower",
  "tower-http",
@@ -746,6 +750,7 @@ dependencies = [
  "tripwire",
  "trust-dns-resolver",
  "uhlc",
+ "ulid",
  "uuid",
  "webpki",
 ]
@@ -3475,6 +3480,17 @@ dependencies = [
  "log",
  "serde",
  "spin 0.9.8",
+ "uuid",
+]
+
+[[package]]
+name = "ulid"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13a3aaa69b04e5b66cc27309710a569ea23593612387d67daaf102e73aa974fd"
+dependencies = [
+ "rand",
+ "serde",
  "uuid",
 ]
 

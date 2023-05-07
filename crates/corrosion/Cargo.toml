@@ -53,6 +53,7 @@ tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }
+ulid = { workspace = true }
 webpki = { workspace = true }
 lru = { workspace = true }
 crc32fast = { workspace = true }
@@ -70,6 +71,7 @@ tracing-filter = { version = "0.1.0-alpha.2", features = ["smallvec"] }
 
 [dev-dependencies]
 tokio-postgres = { workspace = true }
+tokio-tungstenite = { workspace = true }
 corro-tests = { path = "../corro-tests" }
 
 # [patch.crates-io]

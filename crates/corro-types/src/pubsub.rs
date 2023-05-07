@@ -6,12 +6,11 @@ use serde::{
     de::{self, Visitor},
     Deserialize, Serialize,
 };
-use serde_json::Value;
 use speedy::{Context, Readable, Writable};
 use tokio::sync::mpsc::UnboundedSender;
 use uhlc::Timestamp;
 
-use crate::filters::{parse_expr, SupportedExpr};
+use crate::filters::{parse_expr, OwnedAggregateChange, SupportedExpr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct SubscriberId(pub SocketAddr);
@@ -25,6 +24,12 @@ impl fmt::Display for SubscriberId {
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SubscriptionId(pub CompactString);
+
+impl SubscriptionId {
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
 
 impl fmt::Display for SubscriptionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -57,26 +62,25 @@ pub struct Subscriber {
 #[derive(Debug)]
 pub struct SubscriptionInfo {
     pub filter: Option<SubscriptionFilter>,
-    pub broadcast: bool,
+    pub is_priority: bool,
     pub updated_at: Timestamp,
 }
 
 pub type Subscriptions = Arc<RwLock<Subscriber>>;
 pub type Subscribers = Arc<RwLock<HashMap<SubscriberId, Subscriptions>>>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SubscriptionMessage {
     Event {
         id: SubscriptionId,
         event: SubscriptionEvent,
     },
-    GoingAway,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum SubscriptionEvent {
-    Change(Value),
+    Change(OwnedAggregateChange),
     Error { error: String },
 }
 
@@ -89,7 +93,7 @@ pub enum Subscription {
         #[serde(default)]
         from_db_version: Option<i64>,
         #[serde(default)]
-        broadcast_interest: bool,
+        is_priority: bool,
     },
     Remove {
         id: SubscriptionId,

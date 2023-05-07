@@ -14,17 +14,18 @@ use crate::{
     api::{
         http::api_v1_db_execute,
         peer::{generate_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncMessage},
+        pubsub::api_v1_subscribe_post,
     },
     broadcast::{runtime_loop, ClientPool, FRAGMENTS_AT},
     config::{Config, DEFAULT_GOSSIP_PORT},
 };
 
-use arc_swap::ArcSwapOption;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, AgentInner, Booked, BookedVersion, Bookie},
     broadcast::{BroadcastInput, BroadcastSrc, FocaInput, Message, MessageDecodeError, MessageV1},
-    filters::{match_expr, AggregateChange, Schema},
+    change::Change,
+    filters::{match_expr, AggregateChange},
     members::{MemberEvent, Members},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
     sqlite::{
@@ -34,8 +35,10 @@ use corro_types::{
 };
 
 use axum::{
-    error_handling::HandleErrorLayer, extract::DefaultBodyLimit, routing::post, BoxError,
-    Extension, Router,
+    error_handling::HandleErrorLayer,
+    extract::DefaultBodyLimit,
+    routing::{get, post},
+    BoxError, Extension, Router,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use foca::{Member, Notification};
@@ -63,19 +66,16 @@ use trust_dns_resolver::{
     error::ResolveErrorKind,
     proto::rr::{RData, RecordType},
 };
-use uuid::Uuid;
+use ulid::Ulid;
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
-
-static SCHEMA: ArcSwapOption<Schema> = ArcSwapOption::const_empty();
 
 pub struct AgentOptions {
     actor_id: ActorId,
     gossip_listener: TcpListener,
     api_listener: Option<TcpListener>,
     bootstrap: Vec<String>,
-    clock: Arc<uhlc::HLC>,
     rx_bcast: Receiver<BroadcastInput>,
     tripwire: Tripwire,
 }
@@ -92,25 +92,25 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let state_db_path = state_path.join("state.sqlite");
 
-    let actor_uuid = {
+    let actor_id = {
         let mut actor_id_file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(base_path.join("actor_id"))?;
 
-        let mut uuid_str = String::new();
-        actor_id_file.read_to_string(&mut uuid_str)?;
+        let mut ulid_str = String::new();
+        actor_id_file.read_to_string(&mut ulid_str)?;
 
-        let actor_uuid = if uuid_str.is_empty() {
-            let uuid = Uuid::new_v4();
-            actor_id_file.write_all(uuid.to_string().as_bytes())?;
-            uuid
+        let actor_id = ActorId(if ulid_str.is_empty() {
+            let ulid = Ulid::new();
+            actor_id_file.write_all(ulid.to_string().as_bytes())?;
+            ulid
         } else {
-            uuid_str.parse()?
-        };
+            ulid_str.parse()?
+        });
 
-        debug!("actor_id file's uuid: {actor_uuid}");
+        debug!("actor_id from file: {actor_id}");
 
         {
             let mut conn = CrConn(Connection::open(&state_db_path)?);
@@ -120,31 +120,32 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         let conn = Connection::open(&state_db_path)?;
 
         trace!("got actor_id setup conn");
-        let crsql_siteid: Uuid = conn
-            .query_row("SELECT site_id FROM __crsql_siteid LIMIT 1;", [], |row| {
-                row.get::<_, Vec<u8>>(0)
+        let crsql_siteid = ActorId(
+            conn.query_row("SELECT site_id FROM __crsql_siteid LIMIT 1;", [], |row| {
+                row.get::<_, [u8; 16]>(0)
             })
             .optional()?
-            .and_then(|raw| Uuid::from_slice(&raw).ok())
-            .unwrap_or(Uuid::nil());
+            .map(|raw| Ulid::from(u128::from_be_bytes(raw)))
+            .unwrap_or(Ulid::nil()),
+        );
 
         debug!("crsql_siteid: {crsql_siteid:?}");
 
-        if crsql_siteid != actor_uuid {
+        if crsql_siteid != actor_id {
             warn!(
                 "mismatched crsql_siteid {} and actor_id from file {}, override crsql's",
-                crsql_siteid.hyphenated(),
-                actor_uuid.hyphenated()
+                crsql_siteid, actor_id
             );
-            conn.execute("UPDATE __crsql_siteid SET site_id = ?;", [actor_uuid])?;
+            conn.execute(
+                "UPDATE __crsql_siteid SET site_id = ?;",
+                [actor_id.to_bytes()],
+            )?;
         }
 
-        actor_uuid
+        actor_id
     };
 
-    info!("Actor ID: {}", actor_uuid);
-
-    let actor_id = ActorId(actor_uuid);
+    info!("Actor ID: {}", actor_id);
 
     let rw_pool = bb8::Builder::new()
         .max_size(1)
@@ -171,8 +172,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     {
         let conn = ro_pool.get().await?;
-        let mut prepped = conn
-            .prepare_cached("SELECT actor_id, version, db_version, ts FROM __corro_bookkeeping")?;
+        let mut prepped = conn.prepare_cached(
+            "SELECT actor_id, start_version, end_version, db_version, ts FROM __corro_bookkeeping",
+        )?;
         let mut rows = prepped.query([])?;
 
         loop {
@@ -180,9 +182,13 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             match row {
                 None => break,
                 Some(row) => {
-                    let ranges = bk.entry(ActorId(row.get::<_, Uuid>(0)?)).or_default();
-                    let v = row.get(1)?;
-                    ranges.insert(v..=v, (row.get(2)?, row.get(3)?));
+                    let ranges = bk.entry(row.get(0)?).or_default();
+                    let start_v = row.get(1)?;
+                    let end_v: Option<i64> = row.get(2)?;
+                    ranges.insert(
+                        start_v..=end_v.unwrap_or(start_v),
+                        (row.get(3)?, row.get(4)?),
+                    );
                 }
             }
         }
@@ -208,7 +214,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let clock = Arc::new(
         uhlc::HLCBuilder::default()
-            .with_id(actor_id.0.into())
+            .with_id((&actor_id.0 .0.to_be_bytes()).try_into().unwrap())
             .with_max_delta(Duration::from_millis(300))
             .build(),
     );
@@ -235,7 +241,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         gossip_listener,
         api_listener,
         bootstrap: conf.bootstrap,
-        clock,
         rx_bcast,
         tripwire,
     };
@@ -259,9 +264,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         bootstrap,
         mut tripwire,
         rx_bcast,
-        clock,
     } = opts;
-    info!("Current Actor ID: {}", actor_id.hyphenated());
+    info!("Current Actor ID: {}", actor_id);
 
     let (to_send_tx, to_send_rx) = channel(10240);
     let (notifications_tx, notifications_rx) = channel(10240);
@@ -323,14 +327,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         )
         .layer(
             tower::ServiceBuilder::new()
-                .layer(Extension(actor_id))
                 .layer(Extension(foca_tx.clone()))
-                .layer(Extension(agent.read_only_pool().clone()))
-                .layer(Extension(agent.tx_bcast().clone()))
-                .layer(Extension(agent.bookie().clone()))
+                .layer(Extension(agent.clone()))
                 .layer(Extension(bcast_msg_tx.clone()))
-                .layer(Extension(clock.clone()))
-                .layer(Extension(tripwire.clone())),
+                ,
         )
         .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http());
@@ -467,15 +467,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     .layer(ConcurrencyLimitLayer::new(128)),
             ),
         )
+        .route("/v1/subscribe", get(api_v1_subscribe_post))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
-                .layer(Extension(actor_id))
-                .layer(Extension(agent.read_write_pool().clone()))
-                .layer(Extension(agent.clock().clone()))
-                .layer(Extension(agent.tx_bcast().clone()))
-                .layer(Extension(agent.subscribers().clone()))
-                .layer(Extension(agent.bookie().clone()))
+                .layer(Extension(agent.clone()))
                 .layer(Extension(tripwire.clone())),
         )
         .layer(DefaultBodyLimit::disable())
@@ -571,7 +567,7 @@ async fn handle_gossip_to_send(socket: Arc<UdpSocket>, mut to_send_rx: Receiver<
             match timeout(Duration::from_secs(5), socket.send_to(bytes.as_ref(), addr)).await {
                 Ok(Ok(n)) => {
                     trace!("successfully sent gossip to {addr}");
-                    histogram!("corro.gossip.sent.bytes", n as f64, "actor_id" => actor.id().hyphenated().to_string());
+                    histogram!("corro.gossip.sent.bytes", n as f64, "actor_id" => actor.id().to_string());
                 }
                 Ok(Err(e)) => {
                     error!("could not send SWIM message via udp to {addr}: {e}");
@@ -581,7 +577,7 @@ async fn handle_gossip_to_send(socket: Arc<UdpSocket>, mut to_send_rx: Receiver<
                 }
             }
         });
-        increment_counter!("corro.gossip.send.count", "actor_id" => actor.id().hyphenated().to_string());
+        increment_counter!("corro.gossip.send.count", "actor_id" => actor.id().to_string());
     }
 }
 
@@ -1004,7 +1000,7 @@ async fn process_msg(
             if bookie.contains(actor_id, version) {
                 trace!(
                     "already seen this one! from: {}, version: {version}",
-                    actor_id.hyphenated()
+                    actor_id
                 );
                 return Ok(None);
             }
@@ -1012,7 +1008,7 @@ async fn process_msg(
             trace!(
                 "received {} changes to process from: {}, version: {version}",
                 changeset.len(),
-                actor_id.hyphenated()
+                actor_id
             );
 
             let mut conn = pool.get().await?;
@@ -1061,7 +1057,7 @@ async fn process_msg(
                     None
                 };
 
-                tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id.0, version, db_version, ts])?;
+                tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, ts])?;
 
                 tx.commit()?;
 
@@ -1069,32 +1065,7 @@ async fn process_msg(
             })?;
 
             if let Some(db_version) = db_version {
-                if let Some(schema) = SCHEMA.load().as_ref() {
-                    let aggs =
-                        AggregateChange::from_changes(changeset.as_slice(), schema, db_version);
-                    let subscribers = agent.subscribers().read();
-                    for (_sub, subscriptions) in subscribers.iter() {
-                        let subs = subscriptions.read();
-                        for (id, info) in subs.subscriptions.iter() {
-                            if let Some(filter) = info.filter.as_ref() {
-                                for agg in aggs.iter() {
-                                    if match_expr(filter, agg) {
-                                        if let Ok(change) = serde_json::to_value(agg) {
-                                            if let Err(e) =
-                                                subs.sender.send(SubscriptionMessage::Event {
-                                                    id: id.clone(),
-                                                    event: SubscriptionEvent::Change(change),
-                                                })
-                                            {
-                                                error!("could not send sub message: {e}")
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                process_subs(agent, &changeset, db_version);
             }
 
             let msg = Message::V1(MessageV1::Change {
@@ -1109,6 +1080,34 @@ async fn process_msg(
         }
         Message::V1(v1) => Some(Message::V1(v1)),
     })
+}
+
+pub fn process_subs(agent: &Agent, changeset: &Vec<Change>, db_version: i64) {
+    trace!("process subs...");
+    let schema = agent.0.schema.read();
+    let aggs = AggregateChange::from_changes(changeset.iter(), &schema, db_version);
+    trace!("agg changes: {aggs:?}");
+    for agg in aggs {
+        let subscribers = agent.subscribers().read();
+        trace!("subs: {subscribers:?}");
+        for (sub, subscriptions) in subscribers.iter() {
+            trace!("looking at sub {sub}");
+            let subs = subscriptions.read();
+            for (id, info) in subs.subscriptions.iter() {
+                if let Some(filter) = info.filter.as_ref() {
+                    if match_expr(filter, &agg) {
+                        trace!("matched subscriber: {id} w/ info: {info:?}!");
+                        if let Err(e) = subs.sender.send(SubscriptionMessage::Event {
+                            id: id.clone(),
+                            event: SubscriptionEvent::Change(agg.to_owned()),
+                        }) {
+                            error!("could not send sub message: {e}")
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1199,8 +1198,8 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
 
         info!(
             "syncing from: {} to: {}, need len: {}",
-            sync.actor_id.hyphenated(),
-            actor_id.hyphenated(),
+            sync.actor_id,
+            actor_id,
             sync.need_len(),
         );
 
@@ -1213,7 +1212,7 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
                 let elapsed = start.elapsed();
                 info!(
                     "synced {n} ops w/ {} in {}s @ {} ops/s",
-                    actor_id.hyphenated(),
+                    actor_id,
                     elapsed.as_secs_f64(),
                     n as f64 / elapsed.as_secs_f64()
                 );
@@ -1716,7 +1715,7 @@ pub fn apply_schema<P: AsRef<Path>>(
     Ok::<_, eyre::Report>(new_schema)
 }
 
-pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+pub fn migrate(conn: &mut CrConn) -> rusqlite::Result<()> {
     let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
         init_migration as fn(&Transaction) -> rusqlite::Result<()>,
     )];
@@ -1727,16 +1726,19 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
 fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         r#"
+            -- internal bookeeping
             CREATE TABLE __corro_bookkeeping (
-                actor_id BLOB NOT NULL,
-                version INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                start_version INTEGER NOT NULL,
+                end_version INTEGER,
                 db_version INTEGER,
                 ts TEXT NOT NULL,
-                PRIMARY KEY (actor_id, version)
+                PRIMARY KEY (actor_id, start_version)
             ) WITHOUT ROWID;
-                        
+            
+            -- SWIM memberships
             CREATE TABLE __corro_members (
-                id BLOB PRIMARY KEY NOT NULL,
+                id TEXT PRIMARY KEY NOT NULL,
                 address TEXT NOT NULL,
             
                 state TEXT NOT NULL DEFAULT 'down',
@@ -1744,17 +1746,21 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 foca_state JSON
             ) WITHOUT ROWID;
 
+            -- all subscriptions ever
             CREATE TABLE __corro_subs (
-                actor_id BLOB NOT NULL,
+                actor_id TEXT NOT NULL,
                 id TEXT NOT NULL,
             
                 filter TEXT NOT NULL DEFAULT "",
-                priority INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
 
-                ts TEXT NOT NULL,
+                ts TEXT,
             
                 PRIMARY KEY (actor_id, id)
             ) WITHOUT ROWID;
+
+            -- that's how we'll propagate subscription changes
+            SELECT crsql_as_crr('__corro_subs');
         "#,
     )?;
 
@@ -1769,20 +1775,25 @@ pub mod tests {
         time::{Duration, Instant},
     };
 
-    use futures::{StreamExt, TryStreamExt};
+    use futures::{SinkExt, StreamExt, TryStreamExt};
     use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
     use serde::Deserialize;
     use serde_json::json;
     use spawn::wait_for_all_pending_handles;
     use tokio::time::{sleep, MissedTickBehavior};
+    use tokio_tungstenite::tungstenite::Message;
     use tracing::{info, info_span};
     use tripwire::Tripwire;
-    use uuid::Uuid;
+
+    use crate::api::http::make_broadcastable_changes;
 
     use super::*;
 
     use corro_types::{
         api::{RqliteResponse, Statement},
+        change::SqliteValue,
+        filters::{ChangeEvent, OwnedAggregateChange},
+        pubsub::{Subscription, SubscriptionId},
         sqlite::CrConnManager,
     };
 
@@ -1903,15 +1914,15 @@ pub mod tests {
 
         println!("body: {body:?}");
 
-        let bk: Vec<(Uuid, i64, i64)> = ta1
+        let bk: Vec<(ActorId, i64, i64)> = ta1
             .agent
             .read_only_pool()
             .get()
             .await?
-            .prepare("SELECT actor_id, version, db_version FROM __corro_bookkeeping")?
+            .prepare("SELECT actor_id, start_version, db_version FROM __corro_bookkeeping")?
             .query_map((), |row| {
                 Ok((
-                    row.get::<_, Uuid>(0)?,
+                    row.get::<_, ActorId>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                 ))
@@ -1920,10 +1931,7 @@ pub mod tests {
 
         assert_eq!(
             bk,
-            vec![
-                (ta1.agent.actor_id().0, 1, 1),
-                (ta1.agent.actor_id().0, 2, 2)
-            ]
+            vec![(ta1.agent.actor_id(), 1, 1), (ta1.agent.actor_id(), 2, 2)]
         );
 
         let svc: TestRecord = ta1.agent.read_only_pool().get().await?.query_row(
@@ -2089,7 +2097,7 @@ pub mod tests {
                 let _entered = span.enter();
 
                 let conn = ta.agent.read_only_pool().get().await?;
-                let counts: HashMap<Uuid, i64> = conn
+                let counts: HashMap<ActorId, i64> = conn
                     .prepare_cached(
                         "SELECT COALESCE(site_id, crsql_siteid()), count(*) FROM crsql_changes GROUP BY site_id;",
                     )?
@@ -2196,6 +2204,11 @@ pub mod tests {
             id INTEGER NOT NULL PRIMARY KEY,
             text TEXT NOT NULL DEFAULT ""
         ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS testsblob (
+            id BLOB NOT NULL PRIMARY KEY,
+            text TEXT NOT NULL DEFAULT ""
+        ) WITHOUT ROWID;
         
         
         CREATE TABLE IF NOT EXISTS consul_checks (
@@ -2222,6 +2235,99 @@ pub mod tests {
         };
 
         // println!("new schema: {new_schema:#?}");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn basic_pubsub() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let ta = launch_test_agent(
+            |conf| conf.api_addr("127.0.0.1:0".parse().unwrap()).build(),
+            tripwire.clone(),
+        )
+        .await?;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{}/v1/subscribe",
+            ta.agent.api_addr().unwrap()
+        ))
+        .await?;
+
+        let id = SubscriptionId("blah".into());
+
+        ws.send(Message::binary(
+            serde_json::to_vec(&Subscription::Add {
+                id: id.clone(),
+                filter: Some("tbl_name = 'testsblob'".into()),
+                from_db_version: None,
+                is_priority: true,
+            })
+            .unwrap(),
+        ))
+        .await?;
+
+        println!("sent message!");
+
+        make_broadcastable_changes(&ta.agent, |tx| {
+            tx.execute(
+                "INSERT INTO testsblob (id,text) VALUES (?,?)",
+                params![&[1u8, 2u8, 3u8], "hello"],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let msg = ws.next().await.unwrap().unwrap();
+
+        let parsed: SubscriptionMessage = serde_json::from_slice(&msg.into_data()).unwrap();
+
+        println!("{parsed:#?}");
+
+        assert_eq!(
+            parsed,
+            SubscriptionMessage::Event {
+                id,
+                event: SubscriptionEvent::Change(OwnedAggregateChange {
+                    version: 1,
+                    evt_type: ChangeEvent::Insert,
+                    table: "testsblob".into(),
+                    pk: vec![(String::from("id"), SqliteValue::Blob(vec![1, 2, 3]))]
+                        .into_iter()
+                        .collect(),
+                    data: vec![(String::from("text"), SqliteValue::Text("hello".into()))]
+                        .into_iter()
+                        .collect(),
+                })
+            }
+        );
+
+        let conn = ta.agent.read_only_pool().get().await?;
+
+        let changes = conn
+                    .prepare_cached(
+                        r#"SELECT "table", pk, cid, val, col_version, db_version, COALESCE(site_id, crsql_siteid()) FROM crsql_changes"#,
+                    )?
+                    .query_map([], |row| {
+                        Ok(Change {
+                            table: row.get(0)?,
+                            pk: row.get(1)?,
+                            cid: row.get(2)?,
+                            val: row.get(3)?,
+                            col_version: row.get(4)?,
+                            db_version: row.get(5)?,
+                            site_id: row.get(6)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        println!("changes: {changes:#?}");
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
 
         Ok(())
     }

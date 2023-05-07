@@ -8,11 +8,11 @@ use sqlite3_parser::{
     ast::{Cmd, Expr, Literal, OneSelect, Operator, Stmt},
     lexer::sql::Parser,
 };
-use tracing::{error, trace};
+use tracing::error;
 
 use crate::{
-    change::{Change, SqliteValue, SqliteValueRef},
-    sqlite::Type,
+    change::{Change, SqliteValue},
+    sqlite::{NormalizedSchema, Type},
 };
 
 const CORRO_EVENT: &str = "evt_type";
@@ -25,9 +25,6 @@ pub struct Column {
     pub primary_key: bool,
     pub nullable: bool,
 }
-
-// schema contains a mapping of
-pub type Schema = HashMap<String, Vec<Column>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -435,114 +432,137 @@ impl Deref for Filter {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AggregateChange<'a> {
     pub version: i64,
+    pub table: &'a str,
+    pub pk: PrimaryKey<'a>,
     #[serde(rename = "type")]
     pub evt_type: ChangeEvent,
-    pub table: &'a str,
-    pub pk: PrimaryKey,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub data: HashMap<&'a str, SqliteValueRef<'a>>,
+    pub data: HashMap<&'a str, SqliteValue>,
 }
 
-// TODO: optimize, sometimes we may be able to get a ref from the values vec
-type PrimaryKey = Vec<SqliteValue>;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OwnedAggregateChange {
+    pub version: i64,
+    pub evt_type: ChangeEvent,
+    pub table: String,
+    pub pk: OwnedPrimaryKey,
+    pub data: HashMap<String, SqliteValue>,
+}
 
-fn split_pk(pk: &str) -> Vec<String> {
-    let mut iter = pk.split('|');
+type PrimaryKey<'a> = HashMap<&'a str, SqliteValue>;
+type OwnedPrimaryKey = HashMap<String, SqliteValue>;
+
+fn split_pk(pk: &str) -> Vec<SqliteValue> {
+    let mut iter = pk.split('|').peekable();
 
     let mut keys = vec![];
+
     let mut last_key = String::new();
     while let Some(s) = iter.next() {
-        trace!("got {s}, last_key = {last_key}");
         if last_key.is_empty() {
             last_key.push_str(s);
         } else {
             last_key.push('|');
             last_key.push_str(s);
         }
-        match unquote(last_key.as_str()) {
-            Ok(s) => {
-                keys.push(s);
-                last_key.clear();
-            }
-            Err(e) => {
-                trace!("could not unquote {s}: {e}");
-            }
+        if let Some(key) = parse_sqlite_quoted_str(last_key.as_str()) {
+            keys.push(key);
+            last_key.clear();
         }
     }
     if !last_key.is_empty() {
-        keys.push(last_key);
+        if let Some(key) = parse_sqlite_quoted_str(last_key.as_str()) {
+            keys.push(key)
+        } else {
+            error!("unparsable str for sql value: {last_key}");
+        }
     }
     keys
 }
 
 impl<'a> AggregateChange<'a> {
-    pub fn from_changes(changes: &'a [Change], schema: &Schema, version: i64) -> Vec<Self> {
-        let grouped = changes
-            .iter()
-            .group_by(|change| (change.table.as_str(), change.pk.as_str()));
+    pub fn to_owned(&self) -> OwnedAggregateChange {
+        OwnedAggregateChange {
+            version: self.version,
+            evt_type: self.evt_type,
+            table: self.table.to_owned(),
+            pk: self
+                .pk
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+            data: self
+                .data
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.to_owned()))
+                .collect(),
+        }
+    }
+
+    pub fn from_changes<I: Iterator<Item = &'a Change>>(
+        changes: I,
+        schema: &'a NormalizedSchema,
+        version: i64,
+    ) -> Vec<Self> {
+        let grouped = changes.group_by(|change| (change.table.as_str(), change.pk.as_str()));
 
         grouped
             .into_iter()
             .filter_map(|((table, pk), group)| {
-                let mut group = group.peekable();
-                let (evt_type, pk) = schema.get(table).and_then(|cols| {
-                    group
-                        .peek()
-                        .and_then(|change| {
-                            if change.cid == "__crsql_del" {
-                                Some(ChangeEvent::Delete)
+                schema.tables.get(table).and_then(|schema_table| {
+                    let pk: PrimaryKey = {
+                        let pk = split_pk(pk);
+                        schema_table
+                            .pk
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, pk_name)| {
+                                pk.get(i).map(|v| (pk_name.as_str(), v.clone()))
+                            })
+                            .collect()
+                    };
+
+                    let mut group = group.peekable();
+                    let change_event = group.peek().map(|change| {
+                        if change.cid == "__crsql_del" {
+                            ChangeEvent::Delete
+                        } else {
+                            if change.col_version == 1 {
+                                ChangeEvent::Insert
                             } else {
-                                match cols.iter().find(|col| col.name == change.cid) {
-                                    Some(col) => {
-                                        if col.primary_key {
-                                            // can't change a primary key, so if this is present in the change, it's an insert
-                                            Some(ChangeEvent::Insert)
-                                        } else {
-                                            Some(ChangeEvent::Update)
-                                        }
-                                    }
-                                    None => None,
-                                }
+                                ChangeEvent::Update
                             }
-                        })
-                        .map(|event| {
-                            let pk_cols = cols.iter().filter(|col| col.primary_key);
+                        }
+                    })?;
 
-                            let pk = {
-                                let mut pks = split_pk(pk);
-                                pk_cols
-                                    .filter_map(|col| {
-                                        let s = pks.remove(0);
-                                        Some(match col.sql_type {
-                                            Type::Integer => SqliteValue::Integer(s.parse().ok()?),
-                                            Type::Real => SqliteValue::Real(s.parse().ok()?),
-                                            Type::Text => SqliteValue::Text(s),
-                                            Type::Blob => return None,
-                                            Type::Null => unreachable!(),
-                                        })
-                                    })
-                                    .collect::<PrimaryKey>()
-                            };
-                            (event, pk)
-                        })
-                })?;
-
-                let data = match evt_type {
-                    ChangeEvent::Insert | ChangeEvent::Update => group
-                        .map(|change| (change.cid.as_str(), change.val.as_ref()))
-                        .collect(),
-                    _ => HashMap::new(),
-                };
-
-                Some(AggregateChange {
-                    table,
-                    pk,
-                    version,
-                    evt_type,
-                    data,
+                    Some(AggregateChange {
+                        version,
+                        table,
+                        pk,
+                        evt_type: change_event,
+                        data: match change_event {
+                            ChangeEvent::Insert | ChangeEvent::Update => group
+                                .map(|change| {
+                                    (
+                                        change.cid.as_str(),
+                                        match &change.val {
+                                            v @ SqliteValue::Text(ref input) => {
+                                                match parse_sqlite_quoted_str(input) {
+                                                    Some(v) => v,
+                                                    None => v.clone(),
+                                                }
+                                            }
+                                            v => v.clone(),
+                                        },
+                                    )
+                                })
+                                .collect(),
+                            ChangeEvent::Delete => HashMap::new(),
+                        },
+                    })
                 })
             })
             .collect::<Vec<AggregateChange>>()
@@ -629,7 +649,7 @@ pub fn match_expr(expr: &SupportedExpr, agg: &AggregateChange) -> bool {
                     && agg
                         .data
                         .iter()
-                        .any(|(col, value)| name == *col && matches!(value, SqliteValueRef::Null))
+                        .any(|(col, value)| name == *col && value.is_null())
             }
             _ => false,
         },
@@ -639,7 +659,7 @@ pub fn match_expr(expr: &SupportedExpr, agg: &AggregateChange) -> bool {
                     && agg
                         .data
                         .iter()
-                        .any(|(col, value)| name == *col && !matches!(value, SqliteValueRef::Null))
+                        .any(|(col, value)| name == *col && !value.is_null())
             }
             _ => false,
         },
@@ -673,11 +693,49 @@ fn match_lit_value<T: PartialEq + PartialOrd + ?Sized>(
     }
 }
 
+pub fn parse_sqlite_quoted_str(input: &str) -> Option<SqliteValue> {
+    use nom::{
+        bytes::complete::{escaped_transform, tag, take_while},
+        character::complete::none_of,
+        combinator::{map_parser, map_res, recognize},
+        multi::{many0, separated_list0},
+        sequence::delimited,
+        AsChar, IResult,
+    };
+
+    fn parse_quoted_blob(input: &str) -> IResult<&str, Vec<u8>> {
+        let decoder = map_res(take_while(AsChar::is_hex_digit), hex::decode);
+        delimited(tag("X'"), decoder, tag("'"))(input)
+    }
+
+    fn parse_quoted_text(input: &str) -> IResult<&str, String> {
+        let seq = recognize(separated_list0(tag("''"), many0(none_of("'"))));
+        let unquote = escaped_transform(none_of("'"), '\'', tag("'"));
+        let res = delimited(tag("'"), map_parser(seq, unquote), tag("'"))(input)?;
+
+        Ok(res)
+    }
+
+    Some(if let Ok(i) = input.parse::<i64>() {
+        SqliteValue::Integer(i)
+    } else if let Ok(f) = input.parse::<f64>() {
+        SqliteValue::Real(f)
+    } else if input == "NULL" {
+        SqliteValue::Null
+    } else if let Ok((_, v)) = parse_quoted_blob(input) {
+        SqliteValue::Blob(v)
+    } else {
+        return parse_quoted_text(input)
+            .map(|(_, s)| SqliteValue::Text(s))
+            .ok();
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use uuid::Uuid;
+    use ulid::Ulid;
 
-    use crate::{change::Change, sqlite::prepare_sql};
+    use crate::{change::Change, sqlite::parse_sql};
 
     use super::*;
 
@@ -685,10 +743,8 @@ mod tests {
     fn kitchen_sink() {
         _ = tracing_subscriber::fmt::try_init();
 
-        let mut schema = Schema::default();
-
-        prepare_sql(
-            b"
+        let schema = parse_sql(
+            "
             CREATE TABLE test (
                 id BIGINT NOT NULL,
                 b TEXT NOT NULL,
@@ -697,9 +753,7 @@ mod tests {
 
                 PRIMARY KEY (id, b)
             ) WITHOUT ROWID;
-        "
-            .as_slice(),
-            &mut schema,
+        ",
         )
         .unwrap();
 
@@ -713,8 +767,8 @@ mod tests {
 
         println!("expr: {expr:#?}");
 
-        let actor1 = Uuid::new_v4();
-        let actor2 = Uuid::new_v4();
+        let actor1 = Ulid::new();
+        let actor2 = Ulid::new();
 
         let changes = vec![
             // insert
@@ -725,7 +779,7 @@ mod tests {
                 val: crate::change::SqliteValue::Integer(1),
                 col_version: 1,
                 db_version: 123,
-                site_id: actor1.to_bytes_le(),
+                site_id: actor1.0.to_be_bytes(),
             },
             Change {
                 table: "test".into(),
@@ -734,7 +788,7 @@ mod tests {
                 val: crate::change::SqliteValue::Text("hello".into()),
                 col_version: 1,
                 db_version: 123,
-                site_id: actor1.to_bytes_le(),
+                site_id: actor1.0.to_be_bytes(),
             },
             Change {
                 table: "test".into(),
@@ -743,7 +797,7 @@ mod tests {
                 val: crate::change::SqliteValue::Text(r#"{"foo": "bar"}"#.into()),
                 col_version: 1,
                 db_version: 123,
-                site_id: actor1.to_bytes_le(),
+                site_id: actor1.0.to_be_bytes(),
             },
             Change {
                 table: "test".into(),
@@ -752,7 +806,7 @@ mod tests {
                 val: crate::change::SqliteValue::Text("{}".into()),
                 col_version: 1,
                 db_version: 123,
-                site_id: actor1.to_bytes_le(),
+                site_id: actor1.0.to_be_bytes(),
             },
             // update
             Change {
@@ -762,11 +816,11 @@ mod tests {
                 val: crate::change::SqliteValue::Blob(br#"{"foo": "bar"}"#.to_vec()),
                 col_version: 2,
                 db_version: 123,
-                site_id: actor2.to_bytes_le(),
+                site_id: actor2.0.to_be_bytes(),
             },
         ];
 
-        let aggs = AggregateChange::from_changes(changes.as_slice(), &schema, 1);
+        let aggs = AggregateChange::from_changes(changes.iter(), &schema, 1);
         println!("aggs: {aggs:#?}");
 
         for agg in aggs {
@@ -775,74 +829,47 @@ mod tests {
                 println!("matched! {agg:?}");
             }
 
-            println!("json: {}", serde_json::to_string_pretty(&agg).unwrap());
+            println!(
+                "json: {}",
+                serde_json::to_string_pretty(&agg.to_owned()).unwrap()
+            );
         }
     }
 
     #[test]
     fn unquoting() {
-        let pk = "'hell|hell'|'world'";
-        let mut iter = pk.split('|');
+        let pk = "'hell|hell'|1.2345|NULL|'world'|X'010203'|123456";
 
-        let mut keys = vec![];
-        let mut last_key = String::new();
-        while let Some(s) = iter.next() {
-            println!("got {s}, last_key = {last_key}");
-            if last_key.is_empty() {
-                last_key.push_str(s);
-            } else {
-                last_key.push('|');
-                last_key.push_str(s);
-            }
-            match unquote(last_key.as_str()) {
-                Ok(s) => {
-                    keys.push(s);
-                    last_key.clear();
-                }
-                Err(e) => {
-                    error!("could not unquote {s}: {e}");
-                }
-            }
-        }
-        if !last_key.is_empty() {
-            keys.push(last_key);
-        }
+        assert_eq!(
+            dbg!(split_pk(pk)),
+            vec![
+                SqliteValue::Text("hell|hell".to_owned()),
+                SqliteValue::Real(1.2345),
+                SqliteValue::Null,
+                SqliteValue::Text("world".into()),
+                SqliteValue::Blob(vec![1, 2, 3]),
+                SqliteValue::Integer(123456),
+            ],
+        );
 
-        println!("keys: {keys:#?}");
+        let tests = vec!["'mystring'", "123456", "1.23456", "X'010203'", "NULL"];
+
+        let parsed = tests
+            .into_iter()
+            .filter_map(|s| parse_sqlite_quoted_str(s))
+            .collect::<Vec<_>>();
+
+        println!("parsed: {parsed:?}");
+
+        assert_eq!(
+            parsed,
+            vec![
+                SqliteValue::Text("mystring".into()),
+                SqliteValue::Integer(123456),
+                SqliteValue::Real(1.23456),
+                SqliteValue::Blob(vec![1, 2, 3]),
+                SqliteValue::Null
+            ]
+        );
     }
-
-    //     #[test]
-    //     fn matches_field_value_in() {
-    //         _ = tracing_subscriber::fmt::try_init();
-    //         let schema = &*SCHEMA;
-
-    //         let mut ctx = Context::new(schema);
-    //         ctx.set_field_value("network_id", 12345).unwrap();
-
-    //         let input = format!(
-    //             "network_id in {{ {} }}",
-    //             (1..20000)
-    //                 .map(|i| i.to_string())
-    //                 .collect::<Vec<String>>()
-    //                 .join(" ")
-    //         );
-    //         let expr = parse_expr(&input).unwrap();
-    //         assert!(match_expr(&input, &expr, &ctx));
-    //     }
-
-    //     #[test]
-    //     fn matches_complex_or() {
-    //         _ = tracing_subscriber::fmt::try_init();
-    //         let schema = &*SCHEMA;
-
-    //         let mut ctx = Context::new(schema);
-    //         ctx.set_field_value("record.type", RecordType::ConsulService)
-    //             .unwrap();
-    //         ctx.set_field_value("app_id", 2).unwrap();
-
-    //         let input = "((record.type eq consul_service) or (record.type eq ip_assignment)) and app_id in { 1 2 3 }";
-    //         let expr = parse_expr(input).unwrap();
-
-    //         assert!(match_expr(input, &expr, &ctx));
-    // }
 }

@@ -18,6 +18,11 @@ pub const TEST_SCHEMA: &str = r#"
             id INTEGER NOT NULL PRIMARY KEY,
             text TEXT NOT NULL DEFAULT ""
         ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS testsblob (
+            id BLOB NOT NULL PRIMARY KEY,
+            text TEXT NOT NULL DEFAULT ""
+        ) WITHOUT ROWID;
     "#;
 
 #[derive(Clone)]

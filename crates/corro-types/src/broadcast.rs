@@ -9,11 +9,11 @@ use rusqlite::{
     ToSql,
 };
 use speedy::{Readable, Writable};
+use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 use tracing::{error, trace};
-use uhlc::{ParseTimestampError, NTP64};
-use uuid::Uuid;
+use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
     actor::{Actor, ActorId},
@@ -55,7 +55,7 @@ pub enum MessageV1 {
         version: i64,
         changeset: Vec<Change>,
 
-        ts: UhlcTimestamp,
+        ts: u64,
     },
     UpsertSubscription {
         actor_id: ActorId,
@@ -63,49 +63,40 @@ pub enum MessageV1 {
         id: SubscriptionId,
         filter: String,
 
-        ts: UhlcTimestamp,
+        ts: u64,
     },
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum UhlcTimestampError {
-    #[error("could not parse timestamp")]
-    Parse(ParseTimestampError),
+pub enum TimestampParseError {
+    #[error("could not parse timestamp: {0:?}")]
+    Parse(ParseNTP64Error),
 }
 
 #[derive(Debug, Clone, Copy, Readable, Writable, PartialEq, Eq)]
-pub struct UhlcTimestamp {
-    time: u64,
-    id: Uuid,
-}
+pub struct Timestamp(pub u64);
 
-impl From<uhlc::Timestamp> for UhlcTimestamp {
-    fn from(ts: uhlc::Timestamp) -> Self {
-        Self {
-            time: ts.get_time().0,
-            id: Uuid::from_bytes(
-                ts.get_id()
-                    .as_slice()
-                    .try_into()
-                    .expect("wrong kind of ID supplied to UHLC clock"),
-            ),
-        }
+impl Timestamp {
+    pub fn to_time(&self) -> OffsetDateTime {
+        let t = NTP64(self.0);
+        OffsetDateTime::from_unix_timestamp(t.as_secs() as i64).unwrap()
+            + time::Duration::nanoseconds(t.subsec_nanos() as i64)
     }
 }
 
-impl FromSql for UhlcTimestamp {
+impl From<uhlc::Timestamp> for Timestamp {
+    fn from(ts: uhlc::Timestamp) -> Self {
+        Self(ts.get_time().as_u64())
+    }
+}
+
+impl FromSql for Timestamp {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         match value {
             rusqlite::types::ValueRef::Text(b) => match std::str::from_utf8(b) {
-                Ok(s) => match s.parse::<uhlc::Timestamp>() {
-                    Ok(ts) => Ok(UhlcTimestamp {
-                        time: ts.get_time().0,
-                        id: Uuid::from_bytes(match ts.get_id().as_slice().try_into() {
-                            Ok(id) => id,
-                            Err(e) => return Err(FromSqlError::Other(Box::new(e))),
-                        }),
-                    }),
-                    Err(e) => Err(FromSqlError::Other(Box::new(UhlcTimestampError::Parse(e)))),
+                Ok(s) => match s.parse::<NTP64>() {
+                    Ok(ntp) => Ok(Timestamp(ntp.as_u64())),
+                    Err(e) => Err(FromSqlError::Other(Box::new(TimestampParseError::Parse(e)))),
                 },
                 Err(e) => Err(FromSqlError::Other(Box::new(e))),
             },
@@ -114,12 +105,10 @@ impl FromSql for UhlcTimestamp {
     }
 }
 
-impl ToSql for UhlcTimestamp {
+impl ToSql for Timestamp {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         Ok(rusqlite::types::ToSqlOutput::Owned(
-            rusqlite::types::Value::Text(
-                uhlc::Timestamp::new(NTP64(self.time), self.id.into()).to_string(),
-            ),
+            rusqlite::types::Value::Text(NTP64(self.0).to_string()),
         ))
     }
 }

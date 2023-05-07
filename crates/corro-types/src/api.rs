@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::change::SqliteValue;
 
@@ -24,11 +23,6 @@ pub struct RqliteResponse {
 pub enum RqliteResult {
     Execute {
         rows_affected: usize,
-        time: Option<f64>,
-    },
-    Query {
-        types: HashMap<String, String>,
-        rows: Vec<HashMap<String, Value>>,
         time: Option<f64>,
     },
     Error {

@@ -1,9 +1,13 @@
+use std::ops::Deref;
+
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
     ToSql,
 };
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
+
+use crate::filters::parse_sqlite_quoted_str;
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub struct Change {
@@ -16,7 +20,7 @@ pub struct Change {
     pub site_id: [u8; 16],
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum SqliteValueRef<'a> {
     Null,
@@ -58,6 +62,16 @@ impl<'a> SqliteValueRef<'a> {
             _ => None,
         }
     }
+
+    pub fn to_owned(&self) -> SqliteValue {
+        match self {
+            SqliteValueRef::Null => SqliteValue::Null,
+            SqliteValueRef::Integer(v) => SqliteValue::Integer(*v),
+            SqliteValueRef::Real(v) => SqliteValue::Real(*v),
+            SqliteValueRef::Text(v) => SqliteValue::Text((*v).to_owned()),
+            SqliteValueRef::Blob(v) => SqliteValue::Blob(v.to_vec()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
@@ -76,6 +90,38 @@ impl SqliteValue {
             Some(s)
         } else {
             None
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, SqliteValue::Null)
+    }
+
+    pub fn as_integer(&self) -> Option<&i64> {
+        match self {
+            SqliteValue::Integer(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    pub fn as_real(&self) -> Option<&f64> {
+        match self {
+            SqliteValue::Real(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            SqliteValue::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_blob(&self) -> Option<&[u8]> {
+        match self {
+            SqliteValue::Blob(b) => Some(b),
+            _ => None,
         }
     }
 
@@ -143,5 +189,40 @@ impl ToSql for SqliteValue {
             SqliteValue::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
             SqliteValue::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b.as_slice())),
         })
+    }
+}
+
+#[derive(Debug, Clone, Readable, Writable)]
+pub struct SqliteQuotedValue {
+    pub value: SqliteValue,
+    src: String,
+}
+
+impl Deref for SqliteQuotedValue {
+    type Target = SqliteValue;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl FromSql for SqliteQuotedValue {
+    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        Ok(match value {
+            ValueRef::Text(t) => {
+                let src = String::from_utf8_lossy(t).into_owned();
+                Self {
+                    value: parse_sqlite_quoted_str(&src).ok_or(FromSqlError::InvalidType)?,
+                    src,
+                }
+            }
+            _ => return Err(FromSqlError::InvalidType),
+        })
+    }
+}
+
+impl ToSql for SqliteQuotedValue {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Borrowed(ValueRef::Text(self.src.as_bytes())))
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
-use std::{net::SocketAddr, sync::Arc};
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -10,7 +10,7 @@ use axum::{
     Extension,
 };
 use bytes::BytesMut;
-use corro_types::broadcast::UhlcTimestamp;
+use corro_types::agent::Agent;
 use futures::StreamExt;
 use metrics::{counter, histogram};
 use rusqlite::{params, Connection};
@@ -20,7 +20,6 @@ use tokio::task::block_in_place;
 use tokio::time::timeout;
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, trace, warn};
-use uuid::Uuid;
 
 use crate::agent::handle_payload;
 
@@ -37,17 +36,15 @@ use corro_types::{
 pub async fn peer_api_v1_broadcast(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Extension(actor_id): Extension<ActorId>,
+    Extension(agent): Extension<Agent>,
     Extension(gossip_msg_tx): Extension<Sender<Message>>,
     Extension(foca_tx): Extension<Sender<FocaInput>>,
-    Extension(bookie): Extension<Bookie>,
-    Extension(clock): Extension<Arc<uhlc::HLC>>,
     RawBody(mut body): RawBody,
 ) -> impl IntoResponse {
     match headers.get("corro-clock") {
         Some(value) => match serde_json::from_slice::<'_, uhlc::Timestamp>(value.as_bytes()) {
             Ok(ts) => {
-                if let Err(e) = clock.update_with_timestamp(&ts) {
+                if let Err(e) = agent.clock().update_with_timestamp(&ts) {
                     warn!("clock drifted too much! {e}");
                 }
             }
@@ -78,8 +75,8 @@ pub async fn peer_api_v1_broadcast(
                         &mut codec,
                         bytes,
                         &foca_tx,
-                        actor_id,
-                        &bookie,
+                        agent.actor_id(),
+                        agent.bookie(),
                         &gossip_msg_tx,
                     )
                     .await
@@ -194,7 +191,7 @@ fn send_msg(
     version: i64,
     changeset: Vec<Change>,
     sender: &Sender<Message>,
-    ts: UhlcTimestamp,
+    ts: u64,
 ) {
     let changeset_len = changeset.len();
 
@@ -208,7 +205,7 @@ fn send_msg(
 
     trace!(
         "sending msg: actor: {}, version: {version}, changes len: {changeset_len}",
-        actor_id.hyphenated(),
+        actor_id,
     );
 
     // async send the data... not ideal but it'll have to do
@@ -232,12 +229,9 @@ fn process_range(
     sender: &Sender<Message>,
 ) -> eyre::Result<()> {
     let (start, end) = (range.start(), range.end());
-    trace!(
-        "processing range {start}..={end} for {}",
-        actor_id.hyphenated()
-    );
+    trace!("processing range {start}..={end} for {}", actor_id);
 
-    let overlapping: Vec<(i64, (Option<i64>, UhlcTimestamp))> = {
+    let overlapping: Vec<(i64, (Option<i64>, u64))> = {
         booked
             .read()
             .overlapping(range)
@@ -263,7 +257,7 @@ fn process_version(
     conn: &Connection,
     version: i64,
     db_version: i64,
-    ts: UhlcTimestamp,
+    ts: u64,
     actor_id: ActorId,
     is_local: bool,
     sender: &Sender<Message>,
@@ -278,11 +272,15 @@ fn process_version(
 
     trace!(
         "prepped query successfully, querying with {}, {}",
-        actor_id.hyphenated(),
+        actor_id,
         version
     );
 
-    let site_id: Option<Uuid> = if is_local { None } else { Some(actor_id.0) };
+    let site_id: Option<[u8; 16]> = if is_local {
+        None
+    } else {
+        Some(actor_id.to_bytes())
+    };
 
     let changeset: Vec<Change> = prepped
         .query_map(params![site_id, db_version], |row| {
@@ -307,8 +305,8 @@ fn process_version(
 
 async fn process_sync(
     local_actor_id: ActorId,
-    pool: SqlitePool,
-    bookie: Bookie,
+    pool: &SqlitePool,
+    bookie: &Bookie,
     sync: SyncMessage,
     sender: Sender<Message>,
 ) -> eyre::Result<()> {
@@ -361,16 +359,13 @@ async fn process_sync(
 
 pub async fn peer_api_v1_sync_post(
     headers: HeaderMap,
-    Extension(actor_id): Extension<ActorId>,
-    Extension(pool): Extension<SqlitePool>,
-    Extension(bookie): Extension<Bookie>,
-    Extension(clock): Extension<Arc<uhlc::HLC>>,
+    Extension(agent): Extension<Agent>,
     RawBody(req_body): RawBody,
 ) -> impl IntoResponse {
     match headers.get("corro-clock") {
         Some(value) => match serde_json::from_slice::<'_, uhlc::Timestamp>(value.as_bytes()) {
             Ok(ts) => {
-                if let Err(e) = clock.update_with_timestamp(&ts) {
+                if let Err(e) = agent.clock().update_with_timestamp(&ts) {
                     error!("clock drifted too much! {e}");
                 }
             }
@@ -425,7 +420,15 @@ pub async fn peer_api_v1_sync_post(
         let sync = serde_json::from_slice(bytes.as_ref())?;
 
         let now = Instant::now();
-        match process_sync(actor_id, pool, bookie, sync, tx).await {
+        match process_sync(
+            agent.actor_id(),
+            agent.read_only_pool(),
+            agent.bookie(),
+            sync,
+            tx,
+        )
+        .await
+        {
             Ok(_) => {
                 histogram!(
                     "corrosion.sync.server.process.time.seconds",
