@@ -610,13 +610,16 @@ mod tests {
         .await?;
 
         let ta1 = launch_test_agent(
-            |conf| conf.schema_path(schema_path.display().to_string()).build(),
+            |conf| {
+                conf.add_schema_path(schema_path.display().to_string())
+                    .build()
+            },
             tripwire.clone(),
         )
         .await?;
         let ta2 = launch_test_agent(
             |conf| {
-                conf.schema_path(schema_path.display().to_string())
+                conf.add_schema_path(schema_path.display().to_string())
                     .bootstrap(vec![ta1.agent.gossip_addr().to_string()])
                     .build()
             },
@@ -626,7 +629,7 @@ mod tests {
 
         let ta1_client = CorrosionClient::new(&CorrosionConfig {
             api_addr: ta1.agent.api_addr().unwrap(),
-            base_path: ta1.agent.base_path().display().to_string().into(),
+            base_path: ta1.agent.base_path(),
         });
 
         setup(&ta1_client).await?;
@@ -683,7 +686,7 @@ mod tests {
 
         let ta2_client = CorrosionClient::new(&CorrosionConfig {
             api_addr: ta2.agent.api_addr().unwrap(),
-            base_path: ta2.agent.base_path().display().to_string().into(),
+            base_path: ta2.agent.base_path(),
         });
 
         {

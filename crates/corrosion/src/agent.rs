@@ -17,14 +17,16 @@ use crate::{
         pubsub::api_v1_subscribe_post,
     },
     broadcast::{runtime_loop, ClientPool, FRAGMENTS_AT},
-    config::{Config, DEFAULT_GOSSIP_PORT},
 };
 
+use arc_swap::ArcSwap;
+use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, AgentInner, Booked, BookedVersion, Bookie},
     broadcast::{BroadcastInput, BroadcastSrc, FocaInput, Message, MessageDecodeError, MessageV1},
     change::Change,
+    config::{Config, ConfigError, DEFAULT_GOSSIP_PORT},
     filters::{match_expr, AggregateChange},
     members::{MemberEvent, Members},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
@@ -83,7 +85,7 @@ pub struct AgentOptions {
 pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, AgentOptions)> {
     debug!("setting up corrosion @ {}", conf.base_path);
 
-    let base_path = conf.base_path;
+    let base_path = conf.base_path.as_path();
 
     let state_path = base_path.join("state");
     if !state_path.exists() {
@@ -163,7 +165,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         let mut conn = rw_pool.get().await?;
         migrate(&mut conn)?;
         let schema = init_schema(&conn)?;
-        apply_schema(&mut conn, &conf.schema_path, &schema)?
+        apply_schema(&mut conn, &conf.schema_paths, &schema)?
     };
 
     let mut bk: HashMap<ActorId, BookedVersion> = HashMap::new();
@@ -219,10 +221,20 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let (tx_bcast, rx_bcast) = channel(10240);
 
+    let opts = AgentOptions {
+        actor_id,
+        gossip_listener,
+        api_listener,
+        bootstrap: conf.bootstrap.clone(),
+        rx_bcast,
+        tripwire,
+    };
+
     let agent = Agent(Arc::new(AgentInner {
         actor_id,
         ro_pool,
         rw_pool,
+        config: ArcSwap::from_pointee(conf),
         gossip_addr,
         api_addr,
         members: RwLock::new(Members::default()),
@@ -230,18 +242,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         subscribers: Default::default(),
         bookie,
         tx_bcast,
-        base_path,
         schema: RwLock::new(schema),
     }));
-
-    let opts = AgentOptions {
-        actor_id,
-        gossip_listener,
-        api_listener,
-        bootstrap: conf.bootstrap,
-        rx_bcast,
-        tripwire,
-    };
 
     Ok((agent, opts))
 }
@@ -252,6 +254,42 @@ pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
     tokio::spawn(run(agent.clone(), opts).inspect(|_| info!("corrosion agent run is done")));
 
     Ok(agent)
+}
+
+pub fn load_config(path: &Utf8Path) -> Result<Config, ConfigError> {
+    Config::read_from_file_and_env(path.as_str())
+}
+
+pub async fn reload(agent: &Agent, new_conf: Config) -> eyre::Result<()> {
+    let old_conf = agent.config();
+
+    if old_conf.base_path != new_conf.base_path {
+        warn!("reloaded ineffectual change: base_path");
+    }
+    if old_conf.gossip_addr != new_conf.gossip_addr {
+        warn!("reloaded ineffectual change: gossip_addr");
+    }
+    if old_conf.api_addr != new_conf.api_addr {
+        warn!("reloaded ineffectual change: api_addr");
+    }
+    if old_conf.metrics_addr != new_conf.metrics_addr {
+        warn!("reloaded ineffectual change: metrics_addr");
+    }
+    if old_conf.bootstrap != new_conf.bootstrap {
+        warn!("reloaded ineffectual change: bootstrap");
+    }
+    if old_conf.log_format != new_conf.log_format {
+        warn!("reloaded ineffectual change: log_format");
+    }
+
+    let mut conn = agent.read_write_pool().get().await?;
+    let new_schema =
+        block_in_place(|| apply_schema(&mut conn, &new_conf.schema_paths, &agent.0.schema.read()))?;
+
+    *agent.0.schema.write() = new_schema;
+    agent.set_config(new_conf);
+
+    Ok(())
 }
 
 pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
@@ -1393,43 +1431,40 @@ pub fn init_schema(conn: &Connection) -> eyre::Result<NormalizedSchema> {
     Ok(parse_sql(dump.as_str())?)
 }
 
-pub fn apply_schema<P: AsRef<Path>>(
-    conn: &mut Connection,
-    schema_path: P,
+pub fn make_schema<P: AsRef<Path>>(
+    tx: &Transaction,
+    schema_paths: &[P],
     schema: &NormalizedSchema,
 ) -> eyre::Result<NormalizedSchema> {
-    info!("Applying schema changes...");
-    let start = Instant::now();
-
-    let mut dir = std::fs::read_dir(schema_path)?;
-
-    let mut entries = vec![];
-
-    while let Some(entry) = dir.next() {
-        entries.push(entry?);
-    }
-
-    let mut entries: Vec<_> = entries
-        .into_iter()
-        .filter_map(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| if ext == "sql" { Some(entry) } else { None })
-        })
-        .collect();
-
-    entries.sort_by_key(|entry| entry.path());
-
     let mut new_sql = String::new();
 
-    for entry in entries.iter() {
-        std::fs::File::open(entry.path())?.read_to_string(&mut new_sql)?;
+    for schema_path in schema_paths.iter() {
+        let mut dir = std::fs::read_dir(schema_path)?;
+
+        let mut entries = vec![];
+
+        while let Some(entry) = dir.next() {
+            entries.push(entry?);
+        }
+
+        let mut entries: Vec<_> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| if ext == "sql" { Some(entry) } else { None })
+            })
+            .collect();
+
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries.iter() {
+            std::fs::File::open(entry.path())?.read_to_string(&mut new_sql)?;
+        }
     }
 
     let new_schema = parse_sql(&new_sql)?;
-
-    let tx = conn.transaction()?;
 
     // iterate over dropped tables
     for name in schema
@@ -1705,6 +1740,20 @@ pub fn apply_schema<P: AsRef<Path>>(
             ))?;
         }
     }
+
+    Ok(new_schema)
+}
+
+pub fn apply_schema<P: AsRef<Path>>(
+    conn: &mut Connection,
+    schema_paths: &[P],
+    schema: &NormalizedSchema,
+) -> eyre::Result<NormalizedSchema> {
+    info!("Applying schema changes...");
+    let start = Instant::now();
+
+    let tx = conn.transaction()?;
+    let new_schema = make_schema(&tx, schema_paths, schema)?;
 
     tx.commit()?;
 
@@ -2166,7 +2215,7 @@ pub mod tests {
         let schema = {
             let mut conn = pool.get().await?;
             let schema = init_schema(&conn)?;
-            apply_schema(&mut conn, &schema_path, &schema)?
+            apply_schema(&mut conn, &[&schema_path], &schema)?
         };
 
         println!("initial schema: {schema:#?}");
@@ -2229,7 +2278,7 @@ pub mod tests {
 
         let _new_schema = {
             let mut conn = pool.get().await?;
-            apply_schema(&mut conn, &schema_path, &schema)?
+            apply_schema(&mut conn, &[schema_path], &schema)?
         };
 
         // println!("new schema: {new_schema:#?}");
@@ -2322,6 +2371,66 @@ pub mod tests {
                     .collect::<rusqlite::Result<Vec<_>>>()?;
 
         println!("changes: {changes:#?}");
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn reloading() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let ta = launch_test_agent(
+            |conf| conf.api_addr("127.0.0.1:0".parse().unwrap()).build(),
+            tripwire.clone(),
+        )
+        .await?;
+
+        let dir = tempfile::tempdir()?;
+        tokio::fs::write(
+            dir.path().join("test2.sql"),
+            br#"CREATE TABLE IF NOT EXISTS consul_checks (
+            node TEXT NOT NULL DEFAULT "",
+            id TEXT NOT NULL DEFAULT "",
+            service_id TEXT NOT NULL DEFAULT "",
+            service_name TEXT NOT NULL DEFAULT "",
+            name TEXT NOT NULL DEFAULT "",
+            status TEXT,
+            output TEXT NOT NULL DEFAULT "",
+            updated_at BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (node, id)
+        ) WITHOUT ROWID;
+        
+        CREATE INDEX consul_checks_node_id_updated_at ON consul_checks (node, id, updated_at);"#,
+        )
+        .await?;
+
+        let mut conf: Config = ta.agent.config().as_ref().clone();
+        conf.schema_paths
+            .push(dir.path().display().to_string().into());
+
+        assert!(ta
+            .agent
+            .0
+            .schema
+            .read()
+            .tables
+            .get("consul_checks")
+            .is_none());
+
+        reload(&ta.agent, conf).await?;
+
+        assert!(ta
+            .agent
+            .0
+            .schema
+            .read()
+            .tables
+            .get("consul_checks")
+            .is_some());
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;

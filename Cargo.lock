@@ -648,12 +648,14 @@ dependencies = [
 name = "corro-types"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "bb8",
  "bb8-rusqlite",
  "bytes",
  "camino",
  "compact_str 0.7.0",
+ "config",
  "crc32fast",
  "enquote",
  "exprt",

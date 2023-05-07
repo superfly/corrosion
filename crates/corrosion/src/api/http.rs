@@ -249,8 +249,10 @@ pub async fn api_v1_db_execute(
 mod tests {
     use std::sync::Arc;
 
+    use arc_swap::ArcSwap;
     use corro_types::{
         actor::ActorId,
+        config::Config,
         sqlite::{CrConnManager, NormalizedSchema},
     };
     use tokio::sync::mpsc::{channel, error::TryRecvError};
@@ -276,7 +278,7 @@ mod tests {
         {
             let mut conn = rw_pool.get().await?;
             migrate(&mut conn)?;
-            apply_schema(&mut conn, schema_path, &NormalizedSchema::default())?;
+            apply_schema(&mut conn, &[&schema_path], &NormalizedSchema::default())?;
         }
 
         let (tx, mut rx) = channel(1);
@@ -287,6 +289,13 @@ mod tests {
                 .max_size(1)
                 .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite"))),
             rw_pool,
+            config: ArcSwap::from_pointee(
+                Config::builder()
+                    .base_path(dir.path().display().to_string())
+                    .add_schema_path(schema_path.display().to_string())
+                    .gossip_addr("127.0.0.1:1234".parse()?)
+                    .build()?,
+            ),
             gossip_addr: "127.0.0.1:0".parse().unwrap(),
             api_addr: Default::default(),
             members: Default::default(),
@@ -294,7 +303,6 @@ mod tests {
             bookie: Default::default(),
             subscribers: Default::default(),
             tx_bcast: tx,
-            base_path: Default::default(),
             schema: Default::default(),
         }));
 

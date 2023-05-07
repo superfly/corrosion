@@ -1,5 +1,6 @@
-use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use parking_lot::{RwLock, RwLockReadGuard};
 use rangemap::RangeInclusiveMap;
@@ -8,6 +9,7 @@ use tokio::sync::mpsc::Sender;
 use crate::{
     actor::ActorId,
     broadcast::BroadcastInput,
+    config::Config,
     pubsub::Subscribers,
     sqlite::{NormalizedSchema, SqlitePool},
 };
@@ -21,6 +23,7 @@ pub struct AgentInner {
     pub actor_id: ActorId,
     pub ro_pool: SqlitePool,
     pub rw_pool: SqlitePool,
+    pub config: ArcSwap<Config>,
     pub gossip_addr: SocketAddr,
     pub api_addr: Option<SocketAddr>,
     pub members: RwLock<Members>,
@@ -28,7 +31,6 @@ pub struct AgentInner {
     pub bookie: Bookie,
     pub subscribers: Subscribers,
     pub tx_bcast: Sender<BroadcastInput>,
-    pub base_path: Utf8PathBuf,
     pub schema: RwLock<NormalizedSchema>,
 }
 
@@ -68,8 +70,16 @@ impl Agent {
         &self.0.bookie
     }
 
-    pub fn base_path(&self) -> &Path {
-        self.0.base_path.as_std_path()
+    pub fn base_path(&self) -> Utf8PathBuf {
+        self.0.config.load().base_path.clone()
+    }
+
+    pub fn config(&self) -> arc_swap::Guard<Arc<Config>, arc_swap::strategy::DefaultStrategy> {
+        self.0.config.load()
+    }
+
+    pub fn set_config(&self, new_conf: Config) {
+        self.0.config.store(Arc::new(new_conf))
     }
 }
 

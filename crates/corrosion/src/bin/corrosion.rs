@@ -2,9 +2,11 @@ use std::net::SocketAddr;
 
 use camino::Utf8PathBuf;
 use clap::Parser;
-use corrosion::config::LogFormat;
+use corro_types::config::LogFormat;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use spawn::wait_for_all_pending_handles;
+use tokio::signal::unix::SignalKind;
+use tracing::{error, info};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -15,7 +17,7 @@ async fn main() -> eyre::Result<()> {
     let app = <App as clap::Parser>::parse();
 
     println!("Using config file: {}", app.config);
-    let config = corrosion::config::Config::read_from_file_and_env(app.config.as_str())
+    let config = corrosion::agent::load_config(app.config.as_path())
         .expect("could not read config from file");
 
     let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
@@ -44,15 +46,37 @@ async fn main() -> eyre::Result<()> {
         setup_prometheus(metrics_addr).expect("could not setup prometheus");
     }
 
-    let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
+    let (mut tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
-    let _agent = corrosion::agent::start(config.clone(), tripwire.clone())
+    let agent = corrosion::agent::start(config.clone(), tripwire.clone())
         .await
         .expect("could not start agent");
-    // spawn_counted(
-    //     corro_admin::start(config.admin_path.into_std_path_buf(), agent, tripwire)
-    //         .inspect(|_| info!("corrosion admin start is done")),
-    // );
+
+    let mut hangup = tokio::signal::unix::signal(SignalKind::hangup())?;
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = hangup.recv() => {},
+                _ = &mut tripwire => {
+                    break;
+                }
+            }
+            info!("Reloading config from '{}'", app.config);
+
+            let new_conf = match corrosion::agent::load_config(app.config.as_path()) {
+                Ok(conf) => conf,
+                Err(e) => {
+                    error!("could not load new config: {e}");
+                    continue;
+                }
+            };
+
+            if let Err(e) = corrosion::agent::reload(&agent, new_conf).await {
+                error!("could not reload config: {e}");
+            }
+        }
+    });
 
     tripwire_worker.await;
 

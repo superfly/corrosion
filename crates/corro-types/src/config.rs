@@ -16,7 +16,13 @@ pub struct Config {
     pub bootstrap: Vec<String>,
     #[serde(default)]
     pub log_format: LogFormat,
-    pub schema_path: Utf8PathBuf,
+    pub schema_paths: Vec<Utf8PathBuf>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error(transparent)]
+    Config(#[from] config::ConfigError),
 }
 
 impl Config {
@@ -26,7 +32,7 @@ impl Config {
 
     /// Reads configuration from a TOML file, given its path. Environment
     /// variables can override whatever is set in the config file.
-    pub fn read_from_file_and_env(config_path: &str) -> eyre::Result<Self> {
+    pub fn read_from_file_and_env(config_path: &str) -> Result<Self, ConfigError> {
         let config = config::Config::builder()
             .add_source(config::File::new(config_path, config::FileFormat::Toml))
             .add_source(config::Environment::default().separator("__"))
@@ -43,7 +49,7 @@ pub struct ConfigBuilder {
     metrics_addr: Option<SocketAddr>,
     bootstrap: Option<Vec<String>>,
     log_format: Option<LogFormat>,
-    schema_path: Option<Utf8PathBuf>,
+    schema_paths: Option<Vec<Utf8PathBuf>>,
 }
 
 impl ConfigBuilder {
@@ -77,32 +83,36 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn schema_path<S: Into<Utf8PathBuf>>(mut self, path: S) -> Self {
-        self.schema_path = Some(path.into());
+    pub fn add_schema_path<S: Into<Utf8PathBuf>>(mut self, path: S) -> Self {
+        self.schema_paths
+            .get_or_insert_with(|| Vec::new())
+            .push(path.into());
         self
     }
 
-    pub fn build(self) -> Result<Config, ConfigError> {
+    pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let base_path = self.base_path.unwrap_or_else(default_base_path);
-        let schema_path = self.schema_path.unwrap_or(base_path.join("schema"));
+        let schema_paths = self
+            .schema_paths
+            .unwrap_or_else(|| vec![base_path.join("schema")]);
         Ok(Config {
             base_path,
-            gossip_addr: self.gossip_addr.ok_or(ConfigError::GossipAddrRequired)?,
+            gossip_addr: self
+                .gossip_addr
+                .ok_or(ConfigBuilderError::GossipAddrRequired)?,
             api_addr: self.api_addr,
             metrics_addr: self.metrics_addr,
             bootstrap: self.bootstrap.unwrap_or_default(),
             log_format: self.log_format.unwrap_or_default(),
-            schema_path,
+            schema_paths,
         })
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
+pub enum ConfigBuilderError {
     #[error("gossip_addr required")]
     GossipAddrRequired,
-    #[error("api_addr required")]
-    ApiAddrRequired,
 }
 
 fn default_base_path() -> Utf8PathBuf {
@@ -110,7 +120,7 @@ fn default_base_path() -> Utf8PathBuf {
 }
 
 /// Log format (JSON only)
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 #[allow(missing_docs)]
 pub enum LogFormat {

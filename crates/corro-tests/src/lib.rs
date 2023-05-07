@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use corro_types::agent::Agent;
-use corrosion::{
-    agent::start,
-    config::{Config, ConfigBuilder, ConfigError},
+use corro_types::{
+    agent::Agent,
+    config::{Config, ConfigBuilder, ConfigBuilderError},
 };
+use corrosion::agent::start;
 use tempfile::TempDir;
 use tripwire::Tripwire;
 
@@ -31,21 +31,22 @@ pub struct TestAgent {
     _tmpdir: Arc<TempDir>,
 }
 
-pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigError>>(
+pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError>>(
     f: F,
     tripwire: Tripwire,
 ) -> eyre::Result<TestAgent> {
     let tmpdir = tempfile::tempdir()?;
 
+    let schema_path = tmpdir.path().join("schema");
+
     let conf = f(Config::builder()
         .api_addr("127.0.0.1:0".parse()?)
         .gossip_addr("127.0.0.1:0".parse()?)
-        .base_path(tmpdir.path().display().to_string()))?;
+        .base_path(tmpdir.path().display().to_string())
+        .add_schema_path(schema_path.display().to_string()))?;
 
-    if conf.schema_path == conf.base_path.join("schema") {
-        tokio::fs::create_dir(&conf.schema_path).await?;
-        tokio::fs::write(conf.schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes()).await?;
-    }
+    tokio::fs::create_dir(&schema_path).await?;
+    tokio::fs::write(schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes()).await?;
 
     start(conf, tripwire).await.map(|agent| TestAgent {
         agent,
