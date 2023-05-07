@@ -7,4 +7,5 @@ pub mod config;
 pub mod filters;
 pub mod members;
 pub mod pubsub;
+pub mod schema;
 pub mod sqlite;

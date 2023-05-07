@@ -12,7 +12,7 @@ use tracing::error;
 
 use crate::{
     change::{Change, SqliteValue},
-    sqlite::{NormalizedSchema, Type},
+    schema::{NormalizedSchema, Type},
 };
 
 const CORRO_EVENT: &str = "evt_type";
@@ -735,7 +735,7 @@ pub fn parse_sqlite_quoted_str(input: &str) -> Option<SqliteValue> {
 mod tests {
     use ulid::Ulid;
 
-    use crate::{change::Change, sqlite::parse_sql};
+    use crate::{change::Change, schema::parse_sql};
 
     use super::*;
 

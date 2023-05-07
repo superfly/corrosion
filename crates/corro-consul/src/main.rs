@@ -596,7 +596,7 @@ mod tests {
     use tripwire::Tripwire;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn insert_rows_and_gossip() -> eyre::Result<()> {
+    async fn basic_operations() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 

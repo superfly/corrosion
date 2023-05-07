@@ -4,14 +4,16 @@ use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use parking_lot::{RwLock, RwLockReadGuard};
 use rangemap::RangeInclusiveMap;
-use tokio::sync::mpsc::Sender;
+use tokio::{sync::mpsc::Sender, task::block_in_place};
+use tracing::warn;
 
 use crate::{
     actor::ActorId,
     broadcast::BroadcastInput,
     config::Config,
     pubsub::Subscribers,
-    sqlite::{NormalizedSchema, SqlitePool},
+    schema::{apply_schema, NormalizedSchema, SchemaError},
+    sqlite::SqlitePool,
 };
 
 use super::members::Members;
@@ -81,6 +83,46 @@ impl Agent {
     pub fn set_config(&self, new_conf: Config) {
         self.0.config.store(Arc::new(new_conf))
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReloadError {
+    #[error(transparent)]
+    Schema(#[from] SchemaError),
+    #[error(transparent)]
+    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+}
+
+pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> {
+    let old_conf = agent.config();
+
+    if old_conf.base_path != new_conf.base_path {
+        warn!("reloaded ineffectual change: base_path");
+    }
+    if old_conf.gossip_addr != new_conf.gossip_addr {
+        warn!("reloaded ineffectual change: gossip_addr");
+    }
+    if old_conf.api_addr != new_conf.api_addr {
+        warn!("reloaded ineffectual change: api_addr");
+    }
+    if old_conf.metrics_addr != new_conf.metrics_addr {
+        warn!("reloaded ineffectual change: metrics_addr");
+    }
+    if old_conf.bootstrap != new_conf.bootstrap {
+        warn!("reloaded ineffectual change: bootstrap");
+    }
+    if old_conf.log_format != new_conf.log_format {
+        warn!("reloaded ineffectual change: log_format");
+    }
+
+    let mut conn = agent.read_write_pool().get().await?;
+    let new_schema =
+        block_in_place(|| apply_schema(&mut conn, &new_conf.schema_paths, &agent.0.schema.read()))?;
+
+    *agent.0.schema.write() = new_schema;
+    agent.set_config(new_conf);
+
+    Ok(())
 }
 
 pub type BookedVersion = RangeInclusiveMap<i64, (Option<i64>, u64)>;

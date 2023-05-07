@@ -253,14 +253,15 @@ mod tests {
     use corro_types::{
         actor::ActorId,
         config::Config,
-        sqlite::{CrConnManager, NormalizedSchema},
+        schema::{apply_schema, NormalizedSchema},
+        sqlite::CrConnManager,
     };
     use tokio::sync::mpsc::{channel, error::TryRecvError};
     use ulid::Ulid;
 
     use super::*;
 
-    use crate::agent::{apply_schema, migrate};
+    use crate::agent::migrate;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn rqlite_db_execute() -> eyre::Result<()> {

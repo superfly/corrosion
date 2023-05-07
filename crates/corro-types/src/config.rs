@@ -11,12 +11,18 @@ pub struct Config {
     pub gossip_addr: SocketAddr,
     #[serde(default)]
     pub api_addr: Option<SocketAddr>,
+    #[serde(default = "default_admin_path")]
+    pub admin_path: Utf8PathBuf,
     pub metrics_addr: Option<SocketAddr>,
     #[serde(default)]
     pub bootstrap: Vec<String>,
     #[serde(default)]
     pub log_format: LogFormat,
     pub schema_paths: Vec<Utf8PathBuf>,
+}
+
+fn default_admin_path() -> Utf8PathBuf {
+    "/var/run/corrosion/admin.sock".into()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -32,7 +38,7 @@ impl Config {
 
     /// Reads configuration from a TOML file, given its path. Environment
     /// variables can override whatever is set in the config file.
-    pub fn read_from_file_and_env(config_path: &str) -> Result<Self, ConfigError> {
+    pub fn load(config_path: &str) -> Result<Self, ConfigError> {
         let config = config::Config::builder()
             .add_source(config::File::new(config_path, config::FileFormat::Toml))
             .add_source(config::Environment::default().separator("__"))
@@ -46,6 +52,7 @@ pub struct ConfigBuilder {
     pub base_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
     api_addr: Option<SocketAddr>,
+    admin_path: Option<Utf8PathBuf>,
     metrics_addr: Option<SocketAddr>,
     bootstrap: Option<Vec<String>>,
     log_format: Option<LogFormat>,
@@ -90,6 +97,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn admin_path<S: Into<Utf8PathBuf>>(mut self, path: S) -> Self {
+        self.admin_path = Some(path.into());
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let base_path = self.base_path.unwrap_or_else(default_base_path);
         let schema_paths = self
@@ -101,6 +113,7 @@ impl ConfigBuilder {
                 .gossip_addr
                 .ok_or(ConfigBuilderError::GossipAddrRequired)?,
             api_addr: self.api_addr,
+            admin_path: self.admin_path.unwrap_or_else(default_admin_path),
             metrics_addr: self.metrics_addr,
             bootstrap: self.bootstrap.unwrap_or_default(),
             log_format: self.log_format.unwrap_or_default(),

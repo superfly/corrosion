@@ -2,9 +2,10 @@ use std::net::SocketAddr;
 
 use camino::Utf8PathBuf;
 use clap::Parser;
-use corro_types::config::LogFormat;
+use corro_admin::AdminConfig;
+use corro_types::config::{Config, LogFormat};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use spawn::wait_for_all_pending_handles;
+use spawn::{spawn_counted, wait_for_all_pending_handles};
 use tokio::signal::unix::SignalKind;
 use tracing::{error, info};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
@@ -13,12 +14,16 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    // do this first!
+    let mut hangup = tokio::signal::unix::signal(SignalKind::hangup())?;
+
     println!("Starting Corrosion v{VERSION}");
     let app = <App as clap::Parser>::parse();
 
-    println!("Using config file: {}", app.config);
-    let config = corrosion::agent::load_config(app.config.as_path())
-        .expect("could not read config from file");
+    let config_path = app.config;
+
+    println!("Using config file: {}", config_path);
+    let config = Config::load(config_path.as_str()).expect("could not read config from file");
 
     let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
     println!("tracing-filter directives: {directives}");
@@ -46,36 +51,50 @@ async fn main() -> eyre::Result<()> {
         setup_prometheus(metrics_addr).expect("could not setup prometheus");
     }
 
-    let (mut tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
+    let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
     let agent = corrosion::agent::start(config.clone(), tripwire.clone())
         .await
         .expect("could not start agent");
 
-    let mut hangup = tokio::signal::unix::signal(SignalKind::hangup())?;
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = hangup.recv() => {},
-                _ = &mut tripwire => {
-                    break;
+    tokio::spawn({
+        let agent = agent.clone();
+        let config_path = config_path.clone();
+        let mut tripwire = tripwire.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    _ = hangup.recv() => {},
+                    _ = &mut tripwire => {
+                        break;
+                    }
                 }
-            }
-            info!("Reloading config from '{}'", app.config);
+                info!("Reloading config from '{}'", config_path);
 
-            let new_conf = match corrosion::agent::load_config(app.config.as_path()) {
-                Ok(conf) => conf,
-                Err(e) => {
-                    error!("could not load new config: {e}");
-                    continue;
+                let new_conf = match Config::load(config_path.as_str()) {
+                    Ok(conf) => conf,
+                    Err(e) => {
+                        error!("could not load new config: {e}");
+                        continue;
+                    }
+                };
+
+                if let Err(e) = corro_types::agent::reload(&agent, new_conf).await {
+                    error!("could not reload config: {e}");
                 }
-            };
-
-            if let Err(e) = corrosion::agent::reload(&agent, new_conf).await {
-                error!("could not reload config: {e}");
             }
         }
+    });
+
+    spawn_counted(async move {
+        corro_admin::start_server(
+            agent,
+            AdminConfig {
+                listen_path: config.admin_path,
+                config_path,
+            },
+            tripwire,
+        )
     });
 
     tripwire_worker.await;

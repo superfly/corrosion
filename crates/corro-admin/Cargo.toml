@@ -1,0 +1,20 @@
+[package]
+name = "corro-admin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+corro-types = { path = "../corro-types" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tripwire = { path = "../tripwire" }
+thiserror = { workspace = true }
+spawn = { path = "../spawn" }
+tokio-serde = { version = "0.8", features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+camino = { workspace = true }
+rusqlite = { workspace = true }
+time = { workspace = true }
