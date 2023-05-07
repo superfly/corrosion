@@ -120,16 +120,14 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         let conn = Connection::open(&state_db_path)?;
 
         trace!("got actor_id setup conn");
-        let crsql_siteid = ActorId(
-            conn.query_row("SELECT site_id FROM __crsql_siteid LIMIT 1;", [], |row| {
-                row.get::<_, [u8; 16]>(0)
+        let crsql_siteid = conn
+            .query_row("SELECT site_id FROM __crsql_siteid LIMIT 1;", [], |row| {
+                row.get::<_, ActorId>(0)
             })
             .optional()?
-            .map(|raw| Ulid::from(u128::from_be_bytes(raw)))
-            .unwrap_or(Ulid::nil()),
-        );
+            .unwrap_or(ActorId(Ulid::nil()));
 
-        debug!("crsql_siteid: {crsql_siteid:?}");
+        debug!("crsql_siteid as ActorId: {crsql_siteid:?}");
 
         if crsql_siteid != actor_id {
             warn!(
