@@ -88,7 +88,6 @@ impl CorrosionClient {
     }
 }
 
-/// Proxies stuff!
 #[derive(Parser)]
 #[clap(version = "0.1.0")]
 pub(crate) struct App {

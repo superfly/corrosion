@@ -40,7 +40,7 @@ pub fn start_server(
 
     let ln = UnixListener::bind(&config.listen_path)?;
 
-    tokio::spawn(async move {
+    spawn_counted(async move {
         loop {
             let stream = tokio::select! {
                 accept_res = ln.accept() => match accept_res {
@@ -87,6 +87,18 @@ pub enum LogLevel {
     Info,
     Warn,
     Error,
+}
+
+impl From<LogLevel> for tracing::Level {
+    fn from(value: LogLevel) -> Self {
+        match value {
+            LogLevel::Trace => tracing::Level::TRACE,
+            LogLevel::Debug => tracing::Level::DEBUG,
+            LogLevel::Info => tracing::Level::INFO,
+            LogLevel::Warn => tracing::Level::WARN,
+            LogLevel::Error => tracing::Level::ERROR,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

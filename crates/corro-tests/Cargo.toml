@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tempfile = { workspace = true }
-tracing = { workspace = true }
-eyre = { workspace = true }
-tokio = { workspace = true }
-tripwire = { path = "../tripwire" }
-corrosion = { path = "../corrosion" }
 corro-types = { path = "../corro-types" }
+corrosion = { path = "../corrosion" }
+eyre = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tripwire = { path = "../tripwire" }

@@ -5,7 +5,7 @@ use clap::Parser;
 use corro_admin::AdminConfig;
 use corro_types::config::{Config, LogFormat};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use spawn::{spawn_counted, wait_for_all_pending_handles};
+use spawn::wait_for_all_pending_handles;
 use tokio::signal::unix::SignalKind;
 use tracing::{error, info};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
@@ -86,16 +86,14 @@ async fn main() -> eyre::Result<()> {
         }
     });
 
-    spawn_counted(async move {
-        corro_admin::start_server(
-            agent,
-            AdminConfig {
-                listen_path: config.admin_path,
-                config_path,
-            },
-            tripwire,
-        )
-    });
+    corro_admin::start_server(
+        agent,
+        AdminConfig {
+            listen_path: config.admin_path,
+            config_path,
+        },
+        tripwire,
+    )?;
 
     tripwire_worker.await;
 
@@ -104,7 +102,6 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Proxies stuff!
 #[derive(Parser)]
 #[clap(version = VERSION)]
 pub(crate) struct App {

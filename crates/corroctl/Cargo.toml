@@ -1,20 +1,32 @@
 [package]
-name = "corro-admin"
+name = "corroctl"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "corroctl"
+path = "src/main.rs"
+
 [dependencies]
 camino = { workspace = true }
+clap = { version = "4", features = ["env"] }
+corro-admin = { path = "../corro-admin" }
 corro-types = { path = "../corro-types" }
+eyre = { workspace = true }
 futures = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spawn = { path = "../spawn" }
-thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tokio-serde = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
+
+[dev-dependencies]
+corrosion = { path = "../corrosion" }
+corro-tests = { path = "../corro-tests" }
+toml = { workspace = true }

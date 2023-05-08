@@ -28,7 +28,7 @@ pub const TEST_SCHEMA: &str = r#"
 #[derive(Clone)]
 pub struct TestAgent {
     pub agent: Agent,
-    _tmpdir: Arc<TempDir>,
+    pub tmpdir: Arc<TempDir>,
 }
 
 pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError>>(
@@ -42,6 +42,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
     let conf = f(Config::builder()
         .api_addr("127.0.0.1:0".parse()?)
         .gossip_addr("127.0.0.1:0".parse()?)
+        .admin_path(tmpdir.path().join("admin.sock").display().to_string())
         .base_path(tmpdir.path().display().to_string())
         .add_schema_path(schema_path.display().to_string()))?;
 
@@ -50,6 +51,6 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 
     start(conf, tripwire).await.map(|agent| TestAgent {
         agent,
-        _tmpdir: Arc::new(tmpdir),
+        tmpdir: Arc::new(tmpdir),
     })
 }

@@ -21,7 +21,7 @@ pub struct Config {
     pub schema_paths: Vec<Utf8PathBuf>,
 }
 
-fn default_admin_path() -> Utf8PathBuf {
+pub fn default_admin_path() -> Utf8PathBuf {
     "/var/run/corrosion/admin.sock".into()
 }
 

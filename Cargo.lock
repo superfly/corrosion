@@ -709,6 +709,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "corroctl"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "clap",
+ "corro-admin",
+ "corro-tests",
+ "corro-types",
+ "corrosion",
+ "eyre",
+ "futures",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "spawn",
+ "time 0.3.20",
+ "tokio",
+ "tokio-serde",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "tripwire",
+]
+
+[[package]]
 name = "corrosion"
 version = "0.1.0"
 dependencies = [
