@@ -13,11 +13,17 @@ use uhlc::Timestamp;
 use crate::filters::{parse_expr, OwnedAggregateChange, SupportedExpr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct SubscriberId(pub SocketAddr);
+pub enum SubscriberId {
+    Local { addr: SocketAddr },
+    Global,
+}
 
 impl fmt::Display for SubscriberId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        match self {
+            SubscriberId::Local { addr } => addr.fmt(f),
+            SubscriberId::Global => f.write_str("global"),
+        }
     }
 }
 
@@ -54,9 +60,47 @@ impl<'a, C: Context> Writable<C> for SubscriptionId {
 }
 
 #[derive(Debug)]
-pub struct Subscriber {
-    pub subscriptions: HashMap<SubscriptionId, SubscriptionInfo>,
-    pub sender: UnboundedSender<SubscriptionMessage>,
+pub enum Subscriber {
+    Local {
+        subscriptions: HashMap<SubscriptionId, SubscriptionInfo>,
+        sender: UnboundedSender<SubscriptionMessage>,
+    },
+    Global {
+        subscriptions: HashMap<SubscriptionId, SubscriptionInfo>,
+    },
+}
+
+impl Subscriber {
+    pub fn insert(&mut self, id: SubscriptionId, info: SubscriptionInfo) {
+        match self {
+            Subscriber::Local { subscriptions, .. } => subscriptions,
+            Subscriber::Global { subscriptions } => subscriptions,
+        }
+        .insert(id, info);
+    }
+
+    pub fn remove(&mut self, id: &SubscriptionId) -> Option<SubscriptionInfo> {
+        match self {
+            Subscriber::Local { subscriptions, .. } => subscriptions,
+            Subscriber::Global { subscriptions } => subscriptions,
+        }
+        .remove(id)
+    }
+
+    pub fn as_local(
+        &self,
+    ) -> Option<(
+        &HashMap<SubscriptionId, SubscriptionInfo>,
+        &UnboundedSender<SubscriptionMessage>,
+    )> {
+        match self {
+            Subscriber::Local {
+                subscriptions,
+                sender,
+            } => Some((subscriptions, sender)),
+            Subscriber::Global { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]

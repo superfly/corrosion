@@ -13,7 +13,7 @@ use crate::{
     api::{
         http::api_v1_db_execute,
         peer::{generate_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncMessage},
-        pubsub::api_v1_subscribe_post,
+        pubsub::api_v1_subscribe_ws,
     },
     broadcast::{runtime_loop, ClientPool, FRAGMENTS_AT},
 };
@@ -462,7 +462,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     .layer(ConcurrencyLimitLayer::new(128)),
             ),
         )
-        .route("/v1/subscribe", get(api_v1_subscribe_post))
+        .route("/v1/subscribe", get(api_v1_subscribe_ws))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
@@ -1088,15 +1088,17 @@ pub fn process_subs(agent: &Agent, changeset: &Vec<Change>, db_version: i64) {
         for (sub, subscriptions) in subscribers.iter() {
             trace!("looking at sub {sub}");
             let subs = subscriptions.read();
-            for (id, info) in subs.subscriptions.iter() {
-                if let Some(filter) = info.filter.as_ref() {
-                    if match_expr(filter, &agg) {
-                        trace!("matched subscriber: {id} w/ info: {info:?}!");
-                        if let Err(e) = subs.sender.send(SubscriptionMessage::Event {
-                            id: id.clone(),
-                            event: SubscriptionEvent::Change(agg.to_owned()),
-                        }) {
-                            error!("could not send sub message: {e}")
+            if let Some((subs, sender)) = subs.as_local() {
+                for (id, info) in subs.iter() {
+                    if let Some(filter) = info.filter.as_ref() {
+                        if match_expr(filter, &agg) {
+                            trace!("matched subscriber: {id} w/ info: {info:?}!");
+                            if let Err(e) = sender.send(SubscriptionMessage::Event {
+                                id: id.clone(),
+                                event: SubscriptionEvent::Change(agg.to_owned()),
+                            }) {
+                                error!("could not send sub message: {e}")
+                            }
                         }
                     }
                 }
@@ -1933,6 +1935,7 @@ pub mod tests {
             SubscriptionMessage::Event {
                 id,
                 event: SubscriptionEvent::Change(OwnedAggregateChange {
+                    actor_id: ta.agent.actor_id(),
                     version: 1,
                     evt_type: ChangeEvent::Insert,
                     table: "testsblob".into(),

@@ -8,5 +8,5 @@ What to figure out:
 - soft deletes
 - ~~filters + subscriptions~~
 - ~~schema versioning (hash of sqlite_master for each table?)~~ (probably not needed anymore with stricter constraints with the schema)
-- corroctl
+- ~~corroctl~~
 - ~~dynamic reload of schema~~

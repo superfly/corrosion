@@ -17,6 +17,10 @@ impl ActorId {
     pub fn to_bytes(&self) -> [u8; 16] {
         self.0 .0.to_be_bytes()
     }
+
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Ulid(u128::from_be_bytes(bytes)))
+    }
 }
 
 impl Deref for ActorId {

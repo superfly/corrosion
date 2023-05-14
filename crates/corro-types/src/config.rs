@@ -18,6 +18,7 @@ pub struct Config {
     pub bootstrap: Vec<String>,
     #[serde(default)]
     pub log_format: LogFormat,
+    #[serde(default)]
     pub schema_paths: Vec<Utf8PathBuf>,
 }
 
@@ -56,7 +57,7 @@ pub struct ConfigBuilder {
     metrics_addr: Option<SocketAddr>,
     bootstrap: Option<Vec<String>>,
     log_format: Option<LogFormat>,
-    schema_paths: Option<Vec<Utf8PathBuf>>,
+    schema_paths: Vec<Utf8PathBuf>,
 }
 
 impl ConfigBuilder {
@@ -91,9 +92,7 @@ impl ConfigBuilder {
     }
 
     pub fn add_schema_path<S: Into<Utf8PathBuf>>(mut self, path: S) -> Self {
-        self.schema_paths
-            .get_or_insert_with(|| Vec::new())
-            .push(path.into());
+        self.schema_paths.push(path.into());
         self
     }
 
@@ -104,9 +103,6 @@ impl ConfigBuilder {
 
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let base_path = self.base_path.unwrap_or_else(default_base_path);
-        let schema_paths = self
-            .schema_paths
-            .unwrap_or_else(|| vec![base_path.join("schema")]);
         Ok(Config {
             base_path,
             gossip_addr: self
@@ -117,7 +113,7 @@ impl ConfigBuilder {
             metrics_addr: self.metrics_addr,
             bootstrap: self.bootstrap.unwrap_or_default(),
             log_format: self.log_format.unwrap_or_default(),
-            schema_paths,
+            schema_paths: self.schema_paths,
         })
     }
 }

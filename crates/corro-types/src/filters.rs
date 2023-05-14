@@ -9,14 +9,17 @@ use sqlite3_parser::{
     lexer::sql::Parser,
 };
 use tracing::error;
+use ulid::Ulid;
 
 use crate::{
+    actor::ActorId,
     change::{Change, SqliteValue},
     schema::{NormalizedSchema, Type},
 };
 
 const CORRO_EVENT: &str = "evt_type";
 const CORRO_TABLE: &str = "tbl_name";
+const CORRO_ACTOR: &str = "actor_id";
 
 #[derive(Debug, Clone)]
 pub struct Column {
@@ -34,6 +37,8 @@ pub enum ParseError {
     UnknownEvent(String),
     #[error(transparent)]
     Parse(#[from] sqlite3_parser::lexer::sql::Error),
+    #[error("unparsable actor id: {0}")]
+    ActorId(#[from] ulid::DecodeError),
     #[error("unsupported command")]
     UnsupportedCmd(Cmd),
     #[error("unsupported statement")]
@@ -76,11 +81,15 @@ pub enum ParseError {
 pub enum SupportedExpr {
     TableName {
         name: String,
-        not_equal: bool,
+        op: BinaryOp,
     },
     EventType {
         evt: String,
-        not_equal: bool,
+        op: BinaryOp,
+    },
+    ActorId {
+        actor_id: ActorId,
+        op: BinaryOp,
     },
 
     LiteralInteger {
@@ -158,6 +167,7 @@ pub enum FilterLhs {
     Column { table: String, name: String },
     TableName,
     EventType,
+    ActorId,
 }
 
 #[derive(Debug)]
@@ -201,11 +211,13 @@ impl TryFrom<Expr> for FilterLhs {
             Expr::Id(id) => match id.0.as_str() {
                 CORRO_TABLE => Ok(FilterLhs::TableName),
                 CORRO_EVENT => Ok(FilterLhs::EventType),
+                CORRO_ACTOR => Ok(FilterLhs::ActorId),
                 _ => Err(ParseError::QualifiedNameRequired(id.0.clone())),
             },
             Expr::Name(name) => match name.0.as_str() {
                 CORRO_TABLE => Ok(FilterLhs::TableName),
                 CORRO_EVENT => Ok(FilterLhs::EventType),
+                CORRO_ACTOR => Ok(FilterLhs::ActorId),
                 _ => Err(ParseError::QualifiedNameRequired(name.0.clone())),
             },
             Expr::Qualified(tbl_name, name) => Ok(FilterLhs::Column {
@@ -246,27 +258,29 @@ impl TryFrom<(Expr, FilterLhs, Operator)> for SupportedExpr {
                 let rhs: SupportedRhsLiteral = lit.try_into()?;
                 match (lhs, op, rhs) {
                     (FilterLhs::TableName, op, SupportedRhsLiteral::Text(name)) => {
-                        let not_equal = match op {
-                            Operator::Equals | Operator::Is => false,
-                            Operator::NotEquals | Operator::IsNot => true,
-                            _ => return Err(ParseError::UnsupportedBinaryOp(op)),
-                        };
+                        let op = op.try_into()?;
 
-                        Ok(SupportedExpr::TableName { name, not_equal })
+                        Ok(SupportedExpr::TableName { name, op })
                     }
 
                     (FilterLhs::TableName, _, _) => Err(ParseError::WrongLiteralType),
 
                     (FilterLhs::EventType, op, SupportedRhsLiteral::Text(s)) => {
-                        let not_equal = match op {
-                            Operator::Equals | Operator::Is => false,
-                            Operator::NotEquals | Operator::IsNot => true,
-                            _ => return Err(ParseError::UnsupportedBinaryOp(op)),
-                        };
-                        Ok(SupportedExpr::EventType { evt: s, not_equal })
+                        let op = op.try_into()?;
+                        Ok(SupportedExpr::EventType { evt: s, op })
                     }
 
                     (FilterLhs::EventType, _, _) => Err(ParseError::WrongLiteralType),
+
+                    (FilterLhs::ActorId, op, SupportedRhsLiteral::Text(s)) => {
+                        let op = op.try_into()?;
+                        Ok(SupportedExpr::ActorId {
+                            actor_id: ActorId(s.parse::<Ulid>()?),
+                            op,
+                        })
+                    }
+
+                    (FilterLhs::ActorId, _, _) => Err(ParseError::WrongLiteralType),
 
                     (FilterLhs::Column { table, name }, op, SupportedRhsLiteral::Null) => {
                         let op = op.try_into()?;
@@ -434,6 +448,7 @@ impl Deref for Filter {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AggregateChange<'a> {
+    pub actor_id: ActorId,
     pub version: i64,
     pub table: &'a str,
     pub pk: PrimaryKey<'a>,
@@ -445,10 +460,13 @@ pub struct AggregateChange<'a> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OwnedAggregateChange {
+    pub actor_id: ActorId,
     pub version: i64,
-    pub evt_type: ChangeEvent,
     pub table: String,
     pub pk: OwnedPrimaryKey,
+    #[serde(rename = "type")]
+    pub evt_type: ChangeEvent,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub data: HashMap<String, SqliteValue>,
 }
 
@@ -486,6 +504,7 @@ fn split_pk(pk: &str) -> Vec<SqliteValue> {
 impl<'a> AggregateChange<'a> {
     pub fn to_owned(&self) -> OwnedAggregateChange {
         OwnedAggregateChange {
+            actor_id: self.actor_id,
             version: self.version,
             evt_type: self.evt_type,
             table: self.table.to_owned(),
@@ -507,11 +526,12 @@ impl<'a> AggregateChange<'a> {
         schema: &'a NormalizedSchema,
         version: i64,
     ) -> Vec<Self> {
-        let grouped = changes.group_by(|change| (change.table.as_str(), change.pk.as_str()));
+        let grouped =
+            changes.group_by(|change| (change.table.as_str(), change.pk.as_str(), change.site_id));
 
         grouped
             .into_iter()
-            .filter_map(|((table, pk), group)| {
+            .filter_map(|((table, pk, actor_id), group)| {
                 schema.tables.get(table).and_then(|schema_table| {
                     let pk: PrimaryKey = {
                         let pk = split_pk(pk);
@@ -539,6 +559,7 @@ impl<'a> AggregateChange<'a> {
                     })?;
 
                     Some(AggregateChange {
+                        actor_id: ActorId::from_bytes(actor_id),
                         version,
                         table,
                         pk,
@@ -571,15 +592,17 @@ impl<'a> AggregateChange<'a> {
 
 pub fn match_expr(expr: &SupportedExpr, agg: &AggregateChange) -> bool {
     match expr {
-        SupportedExpr::TableName { name, not_equal } => {
-            (*not_equal && name != agg.table) || (!*not_equal && name == agg.table)
+        SupportedExpr::TableName { name, op } => {
+            match_lit_value(Some(agg.table), *op, Some(name.as_str()))
         }
-        SupportedExpr::EventType { evt, not_equal } => match ChangeEvent::from_str(evt.as_str()) {
-            Some(evt) => {
-                (*not_equal && evt != agg.evt_type) || (!*not_equal && evt == agg.evt_type)
-            }
-            None => false,
-        },
+        SupportedExpr::EventType { evt, op } => {
+            match_lit_value(Some(agg.evt_type.as_str()), *op, Some(evt.as_str()))
+        }
+        SupportedExpr::ActorId { actor_id, op } => match_lit_value(
+            Some(&agg.actor_id.to_bytes()),
+            *op,
+            Some(&actor_id.to_bytes()),
+        ),
         SupportedExpr::LiteralInteger {
             table,
             col,

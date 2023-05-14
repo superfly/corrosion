@@ -5,8 +5,9 @@ use axum::{
         ws::{self, WebSocket},
         ConnectInfo, WebSocketUpgrade,
     },
+    http::StatusCode,
     response::IntoResponse,
-    Extension,
+    Extension, Json,
 };
 use corro_types::{
     agent::Agent,
@@ -21,6 +22,7 @@ use corro_types::{
 use metrics::increment_counter;
 use parking_lot::RwLock;
 use rusqlite::params;
+use serde_json::json;
 use tokio::{
     sync::mpsc::{unbounded_channel, UnboundedSender},
     task::block_in_place,
@@ -43,10 +45,10 @@ pub enum SubscribeError {
 fn add_subscriber(
     agent: &Agent,
     conn_id: SubscriberId,
-    tx: UnboundedSender<SubscriptionMessage>,
+    sub: Subscriber,
     id: SubscriptionId,
     filter: Option<SubscriptionFilter>,
-    broadcast: bool,
+    is_priority: bool,
 ) {
     trace!("add subscription");
     let conn_subs = {
@@ -57,12 +59,7 @@ fn add_subscriber(
             drop(map);
             let mut map = agent.subscribers().write();
             map.entry(conn_id)
-                .or_insert_with(|| {
-                    Arc::new(RwLock::new(Subscriber {
-                        subscriptions: HashMap::new(),
-                        sender: tx.clone(),
-                    }))
-                })
+                .or_insert_with(|| Arc::new(RwLock::new(sub)))
                 .clone()
         }
     };
@@ -73,17 +70,17 @@ fn add_subscriber(
 
     {
         let mut sub = conn_subs.write();
-        sub.subscriptions.insert(
+        sub.insert(
             id.clone(),
             SubscriptionInfo {
                 filter,
-                is_priority: broadcast,
+                is_priority,
                 updated_at,
             },
         );
     }
 
-    if broadcast {
+    if is_priority {
         if let Some(filter) = filter_input.clone() {
             let agent = agent.clone();
             let id = id.clone();
@@ -98,7 +95,9 @@ fn add_subscriber(
                         ON CONFLICT (actor_id, id) DO UPDATE SET
                             filter = excluded.filter,
                             active = excluded.active,
-                            ts = excluded.ts;",
+                            ts = excluded.ts
+                        WHERE excluded.filter != filter
+                           OR excluded.active != active;",
                     )?
                     .execute(params![
                         actor_id,
@@ -122,6 +121,55 @@ fn add_subscriber(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn api_v1_subscribe_post(
+    Extension(agent): Extension<Agent>,
+    Json(sub): Json<Subscription>,
+) -> impl IntoResponse {
+    match sub {
+        Subscription::Add { id, filter, .. } => {
+            let filter = match filter {
+                None => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({"error": "filter is required for global subscription"})),
+                    )
+                }
+                Some(f) => {
+                    match parse_expr(f.as_str()).map(|expr| SubscriptionFilter::new(f, expr)) {
+                        Ok(filter) => filter,
+                        Err(e) => {
+                            return (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                Json(json!({"error": e.to_string()})),
+                            )
+                        }
+                    }
+                }
+            };
+            add_subscriber(
+                &agent,
+                SubscriberId::Global,
+                Subscriber::Global {
+                    subscriptions: HashMap::new(),
+                },
+                id,
+                Some(filter),
+                true,
+            );
+            (StatusCode::OK, Json(json!({"ok": true})))
+        }
+        Subscription::Remove { id } => {
+            agent
+                .subscribers()
+                .read()
+                .get(&SubscriberId::Global)
+                .map(|subs| subs.write().remove(&id));
+            (StatusCode::OK, Json(json!({"ok": true})))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn api_v1_subscribe_ws(
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Extension(agent): Extension<Agent>,
@@ -139,7 +187,7 @@ async fn handle_socket(
 ) {
     trace!("subscribe post!");
 
-    let sub_id = SubscriberId(addr);
+    let sub_id = SubscriberId::Local { addr };
 
     let (tx, mut rx) = unbounded_channel();
 
@@ -266,14 +314,24 @@ async fn handle_socket(
                                     }
                                 });
                             } else {
-                                add_subscriber(&agent, sub_id, tx.clone(), id, filter, is_priority);
+                                add_subscriber(
+                                    &agent,
+                                    sub_id,
+                                    Subscriber::Local {
+                                        subscriptions: HashMap::new(),
+                                        sender: tx.clone(),
+                                    },
+                                    id,
+                                    filter,
+                                    is_priority,
+                                );
                             }
                         }
                         Subscription::Remove { id } => {
                             let map = agent.subscribers().read();
                             let should_update = if let Some(subs) = map.get(&sub_id) {
                                 let mut subs = subs.write();
-                                if let Some(info) = subs.subscriptions.remove(&id) {
+                                if let Some(info) = subs.remove(&id) {
                                     info.is_priority
                                 } else {
                                     false
@@ -328,9 +386,9 @@ async fn handle_socket(
 
     if let Some(subs) = to_delete {
         let now = Timestamp::from(agent.clock().new_timestamp());
-        let res =
-            make_broadcastable_changes(&agent, |tx| {
-                for (id, info) in subs.read().subscriptions.iter() {
+        let res = make_broadcastable_changes(&agent, |tx| {
+            if let Some((subs, _)) = subs.read().as_local() {
+                for (id, info) in subs.iter() {
                     if info.is_priority {
                         tx.prepare_cached(
                         "UPDATE __corro_subs SET active = ?, ts = ? WHERE actor_id = ? AND id = ?",
@@ -338,9 +396,10 @@ async fn handle_socket(
                     .execute(params![false, now, agent.actor_id(), id.as_str()])?;
                     }
                 }
-                Ok(())
-            })
-            .await;
+            }
+            Ok(())
+        })
+        .await;
 
         if let Err(e) = res {
             error!("could not clean up subs: {e}");
@@ -436,7 +495,17 @@ async fn catch_up_subscriber(
         Ok::<_, rusqlite::Error>(())
     })?;
 
-    add_subscriber(agent, sub_id, tx, id, filter, is_priority);
+    add_subscriber(
+        agent,
+        sub_id,
+        Subscriber::Local {
+            subscriptions: HashMap::new(),
+            sender: tx,
+        },
+        id,
+        filter,
+        is_priority,
+    );
 
     Ok(())
 }
