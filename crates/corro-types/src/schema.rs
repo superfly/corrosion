@@ -111,8 +111,6 @@ pub enum SchemaError {
     TemporaryTable(Cmd),
     #[error("table as select arenot supported: {0}")]
     TableAsSelect(Cmd),
-    #[error("not nullable column '{name}' on table '{tbl_name}' needs a default value for forward schema compatibility")]
-    NotNullableColumnNeedsDefault { tbl_name: String, name: String },
     #[error("foreign keys are not supported (table: '{tbl_name}', column: '{name}')")]
     ForeignKey { tbl_name: String, name: String },
     #[error("missing table for index (table: '{tbl_name}', index: '{name}')")]
@@ -338,12 +336,6 @@ pub fn make_schema<P: AsRef<Path>>(
                 info!("adding column '{col_name}'");
                 if col.primary_key {
                     return Err(SchemaError::AddPrimaryKey(name.clone(), col_name.clone()));
-                }
-                if !col.nullable && col.default_value.is_none() {
-                    return Err(SchemaError::NotNullableColumnNeedsDefault {
-                        tbl_name: name.clone(),
-                        name: col_name.clone(),
-                    });
                 }
                 tx.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {}", col))?;
             }
@@ -670,13 +662,6 @@ fn prepare_table(
                 let nullable = !not_nullable;
 
                 let primary_key = pk.contains(&def.col_name.0);
-
-                if !primary_key && (!nullable && default_value.is_none()) {
-                    return Err(SchemaError::NotNullableColumnNeedsDefault {
-                        tbl_name: tbl_name.name.0.clone(),
-                        name: def.col_name.0.clone(),
-                    });
-                }
 
                 if def
                     .constraints
