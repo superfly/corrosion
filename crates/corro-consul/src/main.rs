@@ -410,8 +410,8 @@ pub async fn update_consul_services(
     }
 
     if !statements.is_empty() {
-        println!("JSON: {:?}", serde_json::to_string_pretty(&statements));
         corrosion.execute(statements).await?;
+        info!("updated consul services");
     }
 
     for (id, hash) in to_upsert {
@@ -490,6 +490,7 @@ pub async fn update_consul_checks(
 
     if !statements.is_empty() {
         corrosion.execute(statements).await?;
+        info!("updated consul checks");
     }
 
     for (id, hash) in to_upsert {
