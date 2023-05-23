@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::{
     actor::ActorId,
-    broadcast::BroadcastInput,
+    broadcast::{BroadcastInput, Timestamp},
     config::Config,
     pubsub::Subscribers,
     schema::{apply_schema, NormalizedSchema, SchemaError},
@@ -125,7 +125,7 @@ pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> 
     Ok(())
 }
 
-pub type BookedVersion = RangeInclusiveMap<i64, (Option<i64>, u64)>;
+pub type BookedVersion = RangeInclusiveMap<i64, (Option<i64>, Timestamp)>;
 pub type BookedInner = Arc<RwLock<BookedVersion>>;
 
 #[derive(Default, Clone)]
@@ -136,7 +136,7 @@ impl Booked {
         Self(inner)
     }
 
-    pub fn insert(&self, version: i64, db_version: Option<i64>, ts: u64) {
+    pub fn insert(&self, version: i64, db_version: Option<i64>, ts: Timestamp) {
         self.0.write().insert(version..=version, (db_version, ts));
     }
 
@@ -163,7 +163,7 @@ impl Bookie {
         Self(inner)
     }
 
-    pub fn add(&self, actor_id: ActorId, version: i64, db_version: Option<i64>, ts: u64) {
+    pub fn add(&self, actor_id: ActorId, version: i64, db_version: Option<i64>, ts: Timestamp) {
         {
             if let Some(booked) = self.0.read().get(&actor_id) {
                 booked.insert(version, db_version, ts);

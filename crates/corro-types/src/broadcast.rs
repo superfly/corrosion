@@ -55,7 +55,7 @@ pub enum MessageV1 {
         version: i64,
         changeset: Vec<Change>,
 
-        ts: u64,
+        ts: Timestamp,
     },
     UpsertSubscription {
         actor_id: ActorId,

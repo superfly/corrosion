@@ -114,7 +114,7 @@ where
         let elapsed = start.elapsed();
 
         if !changes.is_empty() {
-            let ts = agent.clock().new_timestamp().get_time().as_u64();
+            let ts: Timestamp = agent.clock().new_timestamp().into();
             agent.bookie().add(actor_id, version, db_version, ts);
 
             if let Some(db_version) = db_version {

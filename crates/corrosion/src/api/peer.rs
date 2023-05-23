@@ -11,6 +11,7 @@ use axum::{
 };
 use bytes::BytesMut;
 use corro_types::agent::Agent;
+use corro_types::broadcast::Timestamp;
 use futures::StreamExt;
 use metrics::{counter, histogram};
 use rusqlite::{params, Connection};
@@ -191,7 +192,7 @@ fn send_msg(
     version: i64,
     changeset: Vec<Change>,
     sender: &Sender<Message>,
-    ts: u64,
+    ts: Timestamp,
 ) {
     let changeset_len = changeset.len();
 
@@ -231,7 +232,7 @@ fn process_range(
     let (start, end) = (range.start(), range.end());
     trace!("processing range {start}..={end} for {}", actor_id);
 
-    let overlapping: Vec<(i64, (Option<i64>, u64))> = {
+    let overlapping: Vec<(i64, (Option<i64>, Timestamp))> = {
         booked
             .read()
             .overlapping(range)
@@ -257,7 +258,7 @@ fn process_version(
     conn: &Connection,
     version: i64,
     db_version: i64,
-    ts: u64,
+    ts: Timestamp,
     actor_id: ActorId,
     is_local: bool,
     sender: &Sender<Message>,
