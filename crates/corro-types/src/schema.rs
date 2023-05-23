@@ -148,7 +148,7 @@ pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
     let indexes: HashMap<String, String> = conn
             .prepare(
                 r#"SELECT name, sql FROM sqlite_schema
-    WHERE type = "index" AND name != "sqlite_sequence" AND name NOT LIKE '__corro_%' AND name NOT LIKE '%crsql%' ORDER BY tbl_name"#,
+    WHERE type = "index" AND name NOT LIKE 'sqlite_autoindex_%' AND name NOT LIKE '__corro_%' AND name NOT LIKE '%crsql%' ORDER BY tbl_name"#,
             )?
             .query_map((), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
