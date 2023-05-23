@@ -36,6 +36,7 @@ pub fn start_server(
     config: AdminConfig,
     mut tripwire: Tripwire,
 ) -> Result<(), AdminError> {
+    _ = std::fs::remove_file(&config.listen_path);
     info!("Starting Corrosion admin socket at {}", config.listen_path);
 
     let ln = UnixListener::bind(&config.listen_path)?;
