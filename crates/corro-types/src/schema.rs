@@ -219,7 +219,7 @@ pub fn make_schema<P: AsRef<Path>>(
         .cloned()
         .collect::<HashSet<_>>();
 
-    info!("new table names: {new_table_names:?}");
+    debug!("new table names: {new_table_names:?}");
 
     let new_tables_iter = new_schema
         .tables
@@ -264,14 +264,14 @@ pub fn make_schema<P: AsRef<Path>>(
         .intersection(&schema.tables.keys().collect::<HashSet<_>>())
         .cloned()
     {
-        info!("processing table '{name}'");
+        debug!("processing table '{name}'");
         let table = schema.tables.get(name).unwrap();
-        info!(
+        debug!(
             "current cols: {:?}",
             table.columns.keys().collect::<Vec<&String>>()
         );
         let new_table = new_schema.tables.get(name).unwrap();
-        info!(
+        debug!(
             "new cols: {:?}",
             new_table.columns.keys().collect::<Vec<&String>>()
         );
@@ -309,7 +309,7 @@ pub fn make_schema<P: AsRef<Path>>(
             })
             .collect();
 
-        info!(
+        debug!(
             "changed cols: {:?}",
             changed_cols.keys().collect::<Vec<_>>()
         );
@@ -534,9 +534,9 @@ pub fn parse_sql(sql: &str) -> Result<NormalizedSchema, SchemaError> {
                         prepare_table(tbl_name, columns, constraints.as_ref(), options)?
                     {
                         schema.tables.insert(tbl_name.name.0.clone(), table);
-                        info!("inserted table: {}", tbl_name.name.0);
+                        debug!("inserted table: {}", tbl_name.name.0);
                     } else {
-                        info!("skipped table: {}", tbl_name.name.0);
+                        debug!("skipped table: {}", tbl_name.name.0);
                     }
                 }
                 Stmt::CreateIndex {
@@ -575,7 +575,7 @@ fn prepare_index(
     columns: &Vec<SortedColumn>,
     where_clause: Option<&Expr>,
 ) -> Result<Option<NormalizedIndex>, SchemaError> {
-    info!("preparing index: {}", name.name.0);
+    debug!("preparing index: {}", name.name.0);
     if tbl_name.0.contains("crsql")
         & tbl_name.0.contains("sqlite")
         & tbl_name.0.starts_with("__corro")
@@ -597,12 +597,12 @@ fn prepare_table(
     constraints: Option<&Vec<NamedTableConstraint>>,
     options: &TableOptions,
 ) -> Result<Option<NormalizedTable>, SchemaError> {
-    info!("preparing table: {}", tbl_name.name.0);
+    debug!("preparing table: {}", tbl_name.name.0);
     if tbl_name.name.0.contains("crsql")
         & tbl_name.name.0.contains("sqlite")
         & tbl_name.name.0.starts_with("__corro")
     {
-        info!("skipping table because of name");
+        debug!("skipping table because of name");
         return Ok(None);
     }
 
@@ -643,7 +643,7 @@ fn prepare_table(
         columns: columns
             .iter()
             .map(|def| {
-                info!("visiting column: {}", def.col_name.0);
+                debug!("visiting column: {}", def.col_name.0);
                 let default_value = def.constraints.iter().find_map(|named| {
                     if let ColumnConstraint::Default(ref expr) = named.constraint {
                         Some(expr.to_string())
