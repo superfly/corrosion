@@ -22,7 +22,9 @@ use arc_swap::ArcSwap;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, AgentInner, Booked, BookedVersion, Bookie},
-    broadcast::{BroadcastInput, BroadcastSrc, FocaInput, Message, MessageDecodeError, MessageV1},
+    broadcast::{
+        BroadcastInput, BroadcastSrc, FocaInput, Message, MessageDecodeError, MessageV1, Timestamp,
+    },
     change::Change,
     config::{Config, DEFAULT_GOSSIP_PORT},
     filters::{match_expr, AggregateChange},
@@ -182,7 +184,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                     let end_v: Option<i64> = row.get(2)?;
                     ranges.insert(
                         start_v..=end_v.unwrap_or(start_v),
-                        (row.get(3)?, row.get(4)?),
+                        (row.get(3)?, row.get::<_, Timestamp>(4)?.0),
                     );
                 }
             }
