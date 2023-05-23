@@ -46,7 +46,7 @@ serde = "1.0.159"
 serde_json = "1.0.95"
 serde_with = "2.3.2"
 speedy = { version = "0.8.6", features = ["uuid"] }
-sqlite3-parser = "0.6.0"
+sqlite3-parser = "0.8.0"
 strum = { version = "0.24.1", features = ["derive"] }
 tempfile = "3.5.0"
 thiserror = "1.0.40"
