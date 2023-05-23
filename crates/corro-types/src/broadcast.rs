@@ -1,4 +1,4 @@
-use std::{io, net::SocketAddr, num::NonZeroU32, time::Duration};
+use std::{fmt, io, net::SocketAddr, num::NonZeroU32, time::Duration};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use foca::{Identity, Member, Notification, Runtime, Timer};
@@ -81,6 +81,12 @@ impl Timestamp {
         let t = NTP64(self.0);
         OffsetDateTime::from_unix_timestamp(t.as_secs() as i64).unwrap()
             + time::Duration::nanoseconds(t.subsec_nanos() as i64)
+    }
+}
+
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        NTP64(self.0).fmt(f)
     }
 }
 

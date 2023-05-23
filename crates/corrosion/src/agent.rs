@@ -1038,6 +1038,7 @@ async fn process_msg(
                         .query_row((), |row| row.get(0))?;
 
                     if rows_impacted > 0 {
+                        info!("inserted {rows_impacted} into crsql_changes");
                         impactful_changeset.push(change);
                     }
                 }
@@ -1051,6 +1052,10 @@ async fn process_msg(
                 } else {
                     None
                 };
+                info!(
+                    "inserting bookkeeping row: {}, start: {}, end: {:?}, ts: {}",
+                    actor_id, version, db_version, ts
+                );
 
                 tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, ts])?;
 
