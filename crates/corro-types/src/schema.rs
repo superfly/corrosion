@@ -142,6 +142,7 @@ pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
 
     for sql in tables.values() {
         dump.push_str(sql.as_str());
+        dump.push(';');
     }
 
     let indexes: HashMap<String, String> = conn
@@ -156,6 +157,7 @@ pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
 
     for sql in indexes.values() {
         dump.push_str(sql.as_str());
+        dump.push(';');
     }
 
     Ok(parse_sql(dump.as_str())?)
