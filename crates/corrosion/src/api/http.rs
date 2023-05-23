@@ -100,7 +100,7 @@ where
                     actor_id,
                     version,
                     end_version,
-                    Timestamp::from(agent.clock().new_timestamp()).to_time()
+                    Timestamp::from(agent.clock().new_timestamp())
                 ])?;
                 Some(end_version)
             } else {

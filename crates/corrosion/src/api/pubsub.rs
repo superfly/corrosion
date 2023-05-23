@@ -104,7 +104,7 @@ fn add_subscriber(
                         id.as_str(),
                         filter,
                         true,
-                        Timestamp::from(updated_at).to_time()
+                        Timestamp::from(updated_at)
                     ])?;
 
                     Ok(())
