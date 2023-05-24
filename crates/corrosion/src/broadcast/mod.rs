@@ -25,7 +25,7 @@ use tokio::{
     time::{interval, MissedTickBehavior},
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, log::info, trace, warn};
 use tripwire::Tripwire;
 
 use corro_types::{
@@ -66,13 +66,13 @@ pub fn runtime_loop(
 
     let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
 
-    let foca = Arc::new(RwLock::new(Foca::with_custom_broadcast(
+    let mut foca = Foca::with_custom_broadcast(
         actor,
         config.read().clone(),
         rng,
         foca::BincodeCodec(bincode::DefaultOptions::new()),
         NoCustomBroadcast,
-    )));
+    );
 
     let (to_schedule_tx, mut to_schedule_rx) = channel(10240);
 
@@ -91,18 +91,28 @@ pub fn runtime_loop(
     });
 
     tokio::spawn({
-        let foca = foca.clone();
         let config = config.clone();
+        let agent = agent.clone();
+        let mut tripwire = tripwire.clone();
         async move {
             let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
             let mut last_cluster_size = unsafe { NonZeroU32::new_unchecked(1) };
 
-            #[derive(Debug)]
+            let member_events_chunks =
+                tokio_stream::wrappers::BroadcastStream::new(member_events.resubscribe())
+                    .chunks_timeout(100, Duration::from_secs(30));
+            tokio::pin!(member_events_chunks);
+
             enum Branch {
                 Foca(FocaInput),
                 HandleTimer(Timer<Actor>),
+                MemberEvents(Vec<Result<MemberEvent, BroadcastStreamRecvError>>),
                 Metrics,
+                Tripped,
             }
+
+            let mut tripped = false;
+            let mut member_events_done = false;
 
             loop {
                 let branch = tokio::select! {
@@ -125,24 +135,111 @@ pub fn runtime_loop(
                             break;
                         }
                     },
+                    evts =  member_events_chunks.next(), if !member_events_done && !tripped => match evts {
+                        Some(evts) if !evts.is_empty() => Branch::MemberEvents(evts),
+                        Some(_) => {
+                            continue;
+                        }
+                        None => {
+                            member_events_done = true;
+                            continue;
+                        }
+                    },
                     _ = metrics_interval.tick() => {
                         Branch::Metrics
-                    }
+                    },
+                    _ = &mut tripwire, if !tripped => {
+                        tripped = true;
+                        Branch::Tripped
+                    },
                 };
 
-                trace!("handling foca branch: {branch:?}");
-
                 match branch {
+                    Branch::Tripped => {
+                        // TODO: save all last member states
+                        let states: Vec<_> = {
+                            let members = agent.0.members.read();
+                            foca.iter_members()
+                                .filter_map(|member| {
+                                    members.get(&member.id().id()).and_then(|state| {
+                                        match serde_json::to_string(member) {
+                                            Ok(foca_state) => Some((
+                                                member.id().id(),
+                                                state.addr,
+                                                "up",
+                                                foca_state,
+                                            )),
+                                            Err(e) => {
+                                                error!(
+                                                    "could not serialize foca member state: {e}"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    })
+                                })
+                                .collect()
+                        };
+
+                        {
+                            match agent.read_write_pool().get().await {
+                                Ok(mut conn) => match conn.transaction() {
+                                    Ok(tx) => {
+                                        for (id, address, state, foca_state) in states {
+                                            let db_res = tx.prepare_cached(
+                                                    "
+                                                INSERT INTO __corro_members (id, address, state, foca_state)
+                                                    VALUES (?, ?, ?, ?)
+                                                ON CONFLICT (id) DO UPDATE SET
+                                                    address = excluded.address,
+                                                    state = excluded.state,
+                                                    foca_state = excluded.foca_state;
+                                            ",
+                                                )
+                                                .and_then(|mut prepped| {
+                                                    prepped.execute(params![
+                                                        id,
+                                                        address.to_string(),
+                                                        state,
+                                                        foca_state
+                                                    ])
+                                                });
+
+                                            if let Err(e) = db_res {
+                                                error!("could not upsert member state: {e}");
+                                            }
+                                        }
+                                        if let Err(e) = tx.commit() {
+                                            error!("could not commit member states upsert tx: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("could not start transaction to update member events: {e}");
+                                    }
+                                },
+                                Err(e) => {
+                                    error!(
+                                    "could not acquire a r/w conn to process member events: {e}"
+                                );
+                                }
+                            }
+                        }
+
+                        if let Err(e) = foca.leave_cluster(&mut runtime) {
+                            error!("could not leave cluster: {e}");
+                        }
+                        break;
+                    }
                     Branch::Foca(input) => match input {
                         FocaInput::Announce(actor) => {
                             trace!("announcing actor: {actor:?}");
-                            if let Err(e) = foca.write().announce(actor, &mut runtime) {
+                            if let Err(e) = foca.announce(actor, &mut runtime) {
                                 error!("foca announce error: {e}");
                             }
                         }
                         FocaInput::Data(data, from) => {
                             histogram!("corro.gossip.recv.bytes", data.len() as f64);
-                            if let Err(e) = foca.write().handle_data(&data, &mut runtime) {
+                            if let Err(e) = foca.handle_data(&data, &mut runtime) {
                                 error!("error handling foca data from {from:?}: {e}");
                             }
                         }
@@ -152,7 +249,7 @@ pub fn runtime_loop(
                             if diff > 5 {
                                 debug!("Adjusting cluster size to {size}");
                                 let new_config = make_foca_config(size);
-                                if let Err(e) = foca.write().set_config(new_config.clone()) {
+                                if let Err(e) = foca.set_config(new_config.clone()) {
                                     error!("foca set_config error: {e}");
                                 } else {
                                     last_cluster_size = size;
@@ -162,21 +259,95 @@ pub fn runtime_loop(
                             }
                         }
                         FocaInput::ApplyMany(updates) => {
-                            if let Err(e) =
-                                foca.write().apply_many(updates.into_iter(), &mut runtime)
-                            {
+                            if let Err(e) = foca.apply_many(updates.into_iter(), &mut runtime) {
                                 error!("foca apply_many error: {e}");
                             }
                         }
                     },
+                    Branch::MemberEvents(evts) => {
+                        let splitted: Vec<_> = evts
+                            .iter()
+                            .flatten()
+                            .filter_map(|evt| {
+                                let actor = evt.actor();
+                                let foca_state = {
+                                    // need to bind this...
+                                    let foca_state = foca
+                                        .iter_members()
+                                        .find(|member| member.id().id() == actor.id())
+                                        .and_then(|member| match serde_json::to_string(member) {
+                                            Ok(foca_state) => Some(foca_state),
+                                            Err(e) => {
+                                                error!(
+                                                    "could not serialize foca member state: {e}"
+                                                );
+                                                None
+                                            }
+                                        });
+                                    foca_state
+                                };
+
+                                foca_state.map(|foca_state| {
+                                    (actor.id(), actor.addr(), evt.as_str(), foca_state)
+                                })
+                            })
+                            .collect();
+
+                        let mut conn = match agent.read_write_pool().get().await {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                error!(
+                                    "could not acquire a r/w conn to process member events: {e}"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let tx = match conn.transaction() {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                error!("could not start transaction to update member events: {e}");
+                                continue;
+                            }
+                        };
+
+                        for (id, address, state, foca_state) in splitted {
+                            let db_res = tx
+                                .prepare_cached(
+                                    "
+                                INSERT INTO __corro_members (id, address, state, foca_state)
+                                    VALUES (?, ?, ?, ?)
+                                ON CONFLICT (id) DO UPDATE SET
+                                    address = excluded.address,
+                                    state = excluded.state,
+                                    foca_state = excluded.foca_state;
+                            ",
+                                )
+                                .and_then(|mut prepped| {
+                                    prepped.execute(params![
+                                        id,
+                                        address.to_string(),
+                                        state,
+                                        foca_state
+                                    ])
+                                });
+
+                            if let Err(e) = db_res {
+                                error!("could not upsert member state: {e}");
+                            }
+                        }
+
+                        if let Err(e) = tx.commit() {
+                            error!("could not commit member states upsert tx: {e}");
+                        }
+                    }
                     Branch::HandleTimer(timer) => {
-                        if let Err(e) = foca.write().handle_timer(timer, &mut runtime) {
+                        if let Err(e) = foca.handle_timer(timer, &mut runtime) {
                             error!("foca: error handling timer: {e}");
                         }
                     }
                     Branch::Metrics => {
                         {
-                            let foca = foca.read();
                             gauge!("corro.gossip.members", foca.num_members() as f64);
                             gauge!(
                                 "corrosion.gossip.updates_backlog",
@@ -202,7 +373,7 @@ pub fn runtime_loop(
                 }
             }
 
-            warn!("foca is done");
+            info!("foca is done");
         }
     });
 
@@ -232,24 +403,17 @@ pub fn runtime_loop(
             Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>,
         >::new();
 
-        let member_events_chunks =
-            tokio_stream::wrappers::BroadcastStream::new(member_events.resubscribe())
-                .chunks_timeout(100, Duration::from_secs(30));
-        tokio::pin!(member_events_chunks);
-
         enum Branch {
             Broadcast(BroadcastInput),
             SendBroadcast(Message),
             BroadcastDeadline,
             HttpBroadcastDeadline,
             WokePendingBroadcast(PendingBroadcast),
-            MemberEvents(Vec<Result<MemberEvent, BroadcastStreamRecvError>>),
             Tripped,
             Metrics,
         }
 
         let mut tripped = false;
-        let mut member_events_done = false;
 
         loop {
             let branch = tokio::select! {
@@ -287,16 +451,7 @@ pub fn runtime_loop(
                         continue;
                     }
                 },
-                evts =  member_events_chunks.next(), if !member_events_done && !tripped => match evts {
-                    Some(evts) if !evts.is_empty() => Branch::MemberEvents(evts),
-                    Some(_) => {
-                        continue;
-                    }
-                    None => {
-                        member_events_done = true;
-                        continue;
-                    }
-                },
+
                 _ = &mut tripwire, if !tripped => {
                     tripped = true;
                     Branch::Tripped
@@ -417,75 +572,6 @@ pub fn runtime_loop(
                     }
                 }
                 Branch::WokePendingBroadcast(pending) => to_broadcast = Some(pending),
-                Branch::MemberEvents(evts) => {
-                    let splitted: Vec<_> = evts
-                        .iter()
-                        .flatten()
-                        .filter_map(|evt| {
-                            let actor = evt.actor();
-                            let foca_state = {
-                                let read = foca.read();
-                                // need to bind this...
-                                let foca_state = read
-                                    .iter_members()
-                                    .find(|member| member.id().id() == actor.id())
-                                    .and_then(|member| match serde_json::to_string(member) {
-                                        Ok(foca_state) => Some(foca_state),
-                                        Err(e) => {
-                                            error!("could not serialize foca member state: {e}");
-                                            None
-                                        }
-                                    });
-                                foca_state
-                            };
-
-                            foca_state.map(|foca_state| {
-                                (actor.id(), actor.addr(), evt.as_str(), foca_state)
-                            })
-                        })
-                        .collect();
-
-                    let mut conn = match agent.read_write_pool().get().await {
-                        Ok(conn) => conn,
-                        Err(e) => {
-                            error!("could not acquire a r/w conn to process member events: {e}");
-                            continue;
-                        }
-                    };
-
-                    let tx = match conn.transaction() {
-                        Ok(tx) => tx,
-                        Err(e) => {
-                            error!("could not start transaction to update member events: {e}");
-                            continue;
-                        }
-                    };
-
-                    for (id, address, state, foca_state) in splitted {
-                        let db_res = tx
-                            .prepare_cached(
-                                "
-                            INSERT INTO __corro_members (id, address, state, foca_state)
-                                VALUES (?, ?, ?, ?)
-                            ON CONFLICT (id) DO UPDATE SET
-                                address = excluded.address,
-                                state = excluded.state,
-                                foca_state = excluded.foca_state;
-                        ",
-                            )
-                            .and_then(|mut prepped| {
-                                prepped.execute(params![id, address.to_string(), state, foca_state])
-                            });
-
-                        if let Err(e) = db_res {
-                            error!("could not upsert member state: {e}");
-                        }
-                    }
-
-                    if let Err(e) = tx.commit() {
-                        error!("could not commit member states upsert tx: {e}");
-                    }
-                }
                 Branch::Metrics => {
                     gauge!(
                         "corrosion.gossip.broadcast.channel.capacity",
@@ -501,12 +587,15 @@ pub fn runtime_loop(
             if let Some(mut pending) = to_broadcast.take() {
                 trace!("{} to broadcast: {pending:?}", actor_id);
                 let broadcast_to = {
-                    foca.read()
-                        .iter_members()
-                        .filter(|member| matches!(member.state(), foca::State::Alive))
-                        .map(|member| member.id())
-                        .filter(|a| a.id() != actor_id)
-                        .map(|a| a.addr())
+                    agent
+                        .0
+                        .members
+                        .read()
+                        .states
+                        .iter()
+                        .filter_map(|(member_id, state)| {
+                            (*member_id != actor_id).then(|| state.addr)
+                        })
                         .choose_multiple(&mut rng, pending.count)
                 };
 
