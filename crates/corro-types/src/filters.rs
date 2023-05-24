@@ -9,7 +9,7 @@ use sqlite3_parser::{
     lexer::sql::Parser,
 };
 use tracing::error;
-use ulid::Ulid;
+use uuid::Uuid;
 
 use crate::{
     actor::ActorId,
@@ -38,7 +38,7 @@ pub enum ParseError {
     #[error(transparent)]
     Parse(#[from] sqlite3_parser::lexer::sql::Error),
     #[error("unparsable actor id: {0}")]
-    ActorId(#[from] ulid::DecodeError),
+    ActorId(#[from] uuid::Error),
     #[error("unsupported command")]
     UnsupportedCmd(Cmd),
     #[error("unsupported statement")]
@@ -275,7 +275,7 @@ impl TryFrom<(Expr, FilterLhs, Operator)> for SupportedExpr {
                     (FilterLhs::ActorId, op, SupportedRhsLiteral::Text(s)) => {
                         let op = op.try_into()?;
                         Ok(SupportedExpr::ActorId {
-                            actor_id: ActorId(s.parse::<Ulid>()?),
+                            actor_id: ActorId(s.parse::<Uuid>()?),
                             op,
                         })
                     }
@@ -756,8 +756,6 @@ pub fn parse_sqlite_quoted_str(input: &str) -> Option<SqliteValue> {
 
 #[cfg(test)]
 mod tests {
-    use ulid::Ulid;
-
     use crate::{change::Change, schema::parse_sql};
 
     use super::*;
@@ -790,8 +788,8 @@ mod tests {
 
         println!("expr: {expr:#?}");
 
-        let actor1 = Ulid::new();
-        let actor2 = Ulid::new();
+        let actor1 = Uuid::new_v4();
+        let actor2 = Uuid::new_v4();
 
         let changes = vec![
             // insert
@@ -802,7 +800,7 @@ mod tests {
                 val: crate::change::SqliteValue::Integer(1),
                 col_version: 1,
                 db_version: 123,
-                site_id: actor1.0.to_be_bytes(),
+                site_id: actor1.into_bytes(),
             },
             Change {
                 table: "test".into(),
@@ -811,7 +809,7 @@ mod tests {
                 val: crate::change::SqliteValue::Text("hello".into()),
                 col_version: 1,
                 db_version: 123,
-                site_id: actor1.0.to_be_bytes(),
+                site_id: actor1.into_bytes(),
             },
             Change {
                 table: "test".into(),
@@ -820,7 +818,7 @@ mod tests {
                 val: crate::change::SqliteValue::Text(r#"{"foo": "bar"}"#.into()),
                 col_version: 1,
                 db_version: 123,
-                site_id: actor1.0.to_be_bytes(),
+                site_id: actor1.into_bytes(),
             },
             Change {
                 table: "test".into(),
@@ -829,7 +827,7 @@ mod tests {
                 val: crate::change::SqliteValue::Text("{}".into()),
                 col_version: 1,
                 db_version: 123,
-                site_id: actor1.0.to_be_bytes(),
+                site_id: actor1.into_bytes(),
             },
             // update
             Change {
@@ -839,7 +837,7 @@ mod tests {
                 val: crate::change::SqliteValue::Blob(br#"{"foo": "bar"}"#.to_vec()),
                 col_version: 2,
                 db_version: 123,
-                site_id: actor2.0.to_be_bytes(),
+                site_id: actor2.into_bytes(),
             },
         ];
 

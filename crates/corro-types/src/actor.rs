@@ -7,24 +7,28 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
-use ulid::Ulid;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
-pub struct ActorId(pub Ulid);
+pub struct ActorId(pub Uuid);
 
 impl ActorId {
     pub fn to_bytes(&self) -> [u8; 16] {
-        self.0 .0.to_be_bytes()
+        self.0.into_bytes()
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
     }
 
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(Ulid(u128::from_be_bytes(bytes)))
+        Self(Uuid::from_bytes(bytes))
     }
 }
 
 impl Deref for ActorId {
-    type Target = Ulid;
+    type Target = Uuid;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -45,7 +49,7 @@ where
 {
     #[inline]
     fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
-        Ok(ActorId(Ulid::from(reader.read_u128()?)))
+        Ok(ActorId(Uuid::from_bytes(reader.read_value()?)))
     }
 
     #[inline]
@@ -60,7 +64,7 @@ where
 {
     #[inline]
     fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
-        writer.write_u128(self.0 .0)
+        writer.write_bytes(self.0.as_bytes())
     }
 
     #[inline]
@@ -84,10 +88,6 @@ impl FromSql for ActorId {
                 String::from_utf8_lossy(s)
                     .parse()
                     .map_err(|e| FromSqlError::Other(Box::new(e)))?,
-            )),
-            rusqlite::types::ValueRef::Blob(v) => Ok(ActorId(
-                u128::from_be_bytes(v.try_into().map_err(|e| FromSqlError::Other(Box::new(e)))?)
-                    .into(),
             )),
             _ => Err(rusqlite::types::FromSqlError::InvalidType),
         }
@@ -122,7 +122,7 @@ impl Actor {
 
 impl From<SocketAddr> for Actor {
     fn from(value: SocketAddr) -> Self {
-        Self::new(ActorId(Ulid::nil()), value)
+        Self::new(ActorId(Uuid::nil()), value)
     }
 }
 

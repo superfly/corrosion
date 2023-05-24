@@ -63,7 +63,7 @@ use trust_dns_resolver::{
     error::ResolveErrorKind,
     proto::rr::{RData, RecordType},
 };
-use ulid::Ulid;
+use uuid::Uuid;
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
@@ -96,15 +96,15 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             .write(true)
             .open(base_path.join("actor_id"))?;
 
-        let mut ulid_str = String::new();
-        actor_id_file.read_to_string(&mut ulid_str)?;
+        let mut id_str = String::new();
+        actor_id_file.read_to_string(&mut id_str)?;
 
-        let actor_id = ActorId(if ulid_str.is_empty() {
-            let ulid = Ulid::new();
-            actor_id_file.write_all(ulid.to_string().as_bytes())?;
-            ulid
+        let actor_id = ActorId(if id_str.is_empty() {
+            let id = Uuid::new_v4();
+            actor_id_file.write_all(id.to_string().as_bytes())?;
+            id
         } else {
-            ulid_str.parse()?
+            id_str.parse()?
         });
 
         debug!("actor_id from file: {actor_id}");
@@ -122,7 +122,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 row.get::<_, ActorId>(0)
             })
             .optional()?
-            .unwrap_or(ActorId(Ulid::nil()));
+            .unwrap_or(ActorId(Uuid::nil()));
 
         debug!("crsql_siteid as ActorId: {crsql_siteid:?}");
 
@@ -209,7 +209,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let clock = Arc::new(
         uhlc::HLCBuilder::default()
-            .with_id((&actor_id.0 .0.to_be_bytes()).try_into().unwrap())
+            .with_id(actor_id.0.into())
             .with_max_delta(Duration::from_millis(300))
             .build(),
     );

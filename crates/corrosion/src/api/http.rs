@@ -257,7 +257,7 @@ mod tests {
         sqlite::CrConnManager,
     };
     use tokio::sync::mpsc::{channel, error::TryRecvError};
-    use ulid::Ulid;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -285,7 +285,7 @@ mod tests {
         let (tx, mut rx) = channel(1);
 
         let agent = Agent(Arc::new(corro_types::agent::AgentInner {
-            actor_id: ActorId(Ulid::new()),
+            actor_id: ActorId(Uuid::new_v4()),
             ro_pool: bb8::Pool::builder()
                 .max_size(1)
                 .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite"))),
