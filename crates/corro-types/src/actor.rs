@@ -89,6 +89,9 @@ impl FromSql for ActorId {
                     .parse()
                     .map_err(|e| FromSqlError::Other(Box::new(e)))?,
             )),
+            rusqlite::types::ValueRef::Blob(b) => Ok(ActorId(
+                Uuid::from_slice(b).map_err(|e| FromSqlError::Other(Box::new(e)))?,
+            )),
             _ => Err(rusqlite::types::FromSqlError::InvalidType),
         }
     }
