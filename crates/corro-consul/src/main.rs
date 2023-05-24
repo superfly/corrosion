@@ -13,7 +13,7 @@ use corro_types::api::{RqliteResponse, Statement};
 use hyper::{client::HttpConnector, Body};
 use metrics::{histogram, increment_counter};
 use serde::{Deserialize, Serialize};
-use spawn::wait_for_all_pending_handles;
+use spawn::{spawn_counted, wait_for_all_pending_handles};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tracing::{debug, error, info, trace};
 
@@ -158,31 +158,33 @@ async fn main() -> eyre::Result<()> {
 
     let mut pull_interval = interval(CONSUL_PULL_INTERVAL);
 
-    loop {
-        tokio::select! {
-            _ = pull_interval.tick() => {
-                let results = update_consul(&consul, node, &corrosion, &mut consul_services, &mut consul_checks, false).await;
-                debug!("got results: {results:?}");
-                for (kind, res) in results {
-                    match res {
-                        Ok(stats) if stats.upserted > 0 || stats.deleted > 0 => {
-                            info!("updated consul {kind}: {stats:?}");
-                        },
-                        Err(e) => {
-                            error!("could not update consul {kind}: {e}");
-                        },
-                        _ => {
-                            debug!("nothing to update");
+    spawn_counted(async move {
+        loop {
+            tokio::select! {
+                _ = pull_interval.tick() => {
+                    let results = update_consul(&consul, node, &corrosion, &mut consul_services, &mut consul_checks, false).await;
+                    debug!("got results: {results:?}");
+                    for (kind, res) in results {
+                        match res {
+                            Ok(stats) if stats.upserted > 0 || stats.deleted > 0 => {
+                                info!("updated consul {kind}: {stats:?}");
+                            },
+                            Err(e) => {
+                                error!("could not update consul {kind}: {e}");
+                            },
+                            _ => {
+                                debug!("nothing to update");
+                            }
                         }
                     }
+                },
+                _ = &mut tripwire => {
+                    debug!("tripped consul loop");
+                    break;
                 }
-            },
-            _ = &mut tripwire => {
-                debug!("tripped consul loop");
-                break;
             }
         }
-    }
+    });
 
     tripwire_worker.await;
 
