@@ -170,7 +170,9 @@ async fn main() -> eyre::Result<()> {
                         Err(e) => {
                             error!("could not update consul {kind}: {e}");
                         },
-                        _ => {}
+                        _ => {
+                            debug!("nothing to update");
+                        }
                     }
                 }
             },

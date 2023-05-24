@@ -1017,13 +1017,7 @@ async fn process_msg(
                 let mut impactful_changeset = vec![];
 
                 for change in changeset {
-                    info!("inserting change! \"table\": {:?}, pk: {:?}, cid: {:?}, val: {:?}, col_version: {:?}, db_version: {:?}, site_id: {:?}", change.table.as_str().to_sql(),
-                    change.pk.as_str().to_sql(),
-                    change.cid.as_str().to_sql(),
-                    change.val.to_sql(),
-                    change.col_version.to_sql(),
-                    change.db_version.to_sql(),
-                    change.site_id.to_sql());
+                    debug!("inserting change! {change:?}");
                     tx.prepare_cached(
                         r#"
                     INSERT INTO crsql_changes
@@ -1045,7 +1039,7 @@ async fn process_msg(
                         .query_row((), |row| row.get(0))?;
 
                     if rows_impacted > 0 {
-                        info!("inserted {rows_impacted} into crsql_changes");
+                        debug!("inserted {rows_impacted} into crsql_changes");
                         impactful_changeset.push(change);
                     }
                 }
@@ -1059,7 +1053,7 @@ async fn process_msg(
                 } else {
                     None
                 };
-                info!(
+                debug!(
                     "inserting bookkeeping row: {}, start: {}, end: {:?}, ts: {}",
                     actor_id, version, db_version, ts
                 );
