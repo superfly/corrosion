@@ -157,7 +157,6 @@ async fn main() -> eyre::Result<()> {
     }
 
     let mut pull_interval = interval(CONSUL_PULL_INTERVAL);
-    pull_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
