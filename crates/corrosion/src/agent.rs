@@ -1017,6 +1017,7 @@ async fn process_msg(
                 let mut impactful_changeset = vec![];
 
                 for change in changeset {
+                    info!("inserting change: {change:?}");
                     tx.prepare_cached(
                         r#"
                     INSERT INTO crsql_changes
