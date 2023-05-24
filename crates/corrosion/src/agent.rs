@@ -45,7 +45,7 @@ use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
     net::{TcpListener, UdpSocket},
@@ -1017,7 +1017,13 @@ async fn process_msg(
                 let mut impactful_changeset = vec![];
 
                 for change in changeset {
-                    info!("inserting change: {change:?}");
+                    info!("inserting change! \"table\": {:?}, pk: {:?}, cid: {:?}, val: {:?}, col_version: {:?}, db_version: {:?}, site_id: {:?}", change.table.as_str().to_sql(),
+                    change.pk.as_str().to_sql(),
+                    change.cid.as_str().to_sql(),
+                    change.val.to_sql(),
+                    change.col_version.to_sql(),
+                    change.db_version.to_sql(),
+                    change.site_id.to_sql());
                     tx.prepare_cached(
                         r#"
                     INSERT INTO crsql_changes
