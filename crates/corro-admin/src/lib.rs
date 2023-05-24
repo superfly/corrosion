@@ -39,6 +39,10 @@ pub fn start_server(
     _ = std::fs::remove_file(&config.listen_path);
     info!("Starting Corrosion admin socket at {}", config.listen_path);
 
+    if let Some(parent) = config.listen_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     let ln = UnixListener::bind(&config.listen_path)?;
 
     spawn_counted(async move {
