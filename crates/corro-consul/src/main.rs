@@ -107,6 +107,8 @@ async fn main() -> eyre::Result<()> {
 
     tracing_subscriber::fmt::init();
 
+    let (mut tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
+
     let node: &'static str = Box::leak(
         hostname::get()?
             .into_string()
@@ -157,12 +159,12 @@ async fn main() -> eyre::Result<()> {
     let mut pull_interval = interval(CONSUL_PULL_INTERVAL);
     pull_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    let (mut tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
-
     loop {
         tokio::select! {
             _ = pull_interval.tick() => {
-                for (kind, res) in update_consul(&consul, node, &corrosion, &mut consul_services, &mut consul_checks, false).await {
+                let results = update_consul(&consul, node, &corrosion, &mut consul_services, &mut consul_checks, false).await;
+                debug!("got results: {results:?}");
+                for (kind, res) in results {
                     match res {
                         Ok(stats) if stats.upserted > 0 || stats.deleted > 0 => {
                             info!("updated consul {kind}: {stats:?}");
@@ -362,8 +364,6 @@ pub async fn update_consul_services(
         .expect("could not get system time")
         .as_millis() as i64;
 
-    debug!("services count: {}", services.len());
-
     let mut to_upsert = vec![];
     let mut to_delete = vec![];
 
@@ -440,8 +440,6 @@ pub async fn update_consul_checks(
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("could not get system time")
         .as_millis() as i64;
-
-    debug!("checks count: {}", checks.len());
 
     let mut to_upsert = vec![];
     let mut to_delete = vec![];
