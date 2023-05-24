@@ -1678,22 +1678,22 @@ pub mod tests {
                 [
                     "INSERT INTO tests (id,text) VALUES (?,?)",
                     n,
-                    "hello world {n}"
+                    format!("hello world {n}")
                 ],
                 [
                     "INSERT INTO tests2 (id,text) VALUES (?,?)",
                     n,
-                    "hello world {n}"
+                    format!("hello world {n}")
                 ],
                 [
                     "INSERT INTO tests (id,text) VALUES (?,?)",
                     n + 10000,
-                    "hello world {n}"
+                    format!("hello world {n}")
                 ],
                 [
                     "INSERT INTO tests2 (id,text) VALUES (?,?)",
                     n + 10000,
-                    "hello world {n}"
+                    format!("hello world {n}")
                 ]
             ]))
             .unwrap()

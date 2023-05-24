@@ -105,6 +105,8 @@ async fn main() -> eyre::Result<()> {
     let config = Config::read_from_file_and_env(app.config.as_str())
         .expect("could not read config from file");
 
+    tracing_subscriber::fmt::init();
+
     let node: &'static str = Box::leak(
         hostname::get()?
             .into_string()
