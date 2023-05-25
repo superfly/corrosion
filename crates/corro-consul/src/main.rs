@@ -152,7 +152,7 @@ async fn main() -> eyre::Result<()> {
                 }
             };
 
-            consul_checks.insert(row.get::<_, String>(1)?, u64::from_be_bytes(row.get(1)?));
+            consul_checks.insert(row.get::<_, String>(0)?, u64::from_be_bytes(row.get(1)?));
         }
     }
 
