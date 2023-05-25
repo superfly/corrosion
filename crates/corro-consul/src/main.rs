@@ -14,7 +14,7 @@ use hyper::{client::HttpConnector, Body};
 use metrics::{histogram, increment_counter};
 use serde::{Deserialize, Serialize};
 use spawn::{spawn_counted, wait_for_all_pending_handles};
-use tokio::time::{interval, timeout, MissedTickBehavior};
+use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, trace};
 
 const CONSUL_PULL_INTERVAL: Duration = Duration::from_secs(1);
@@ -68,13 +68,13 @@ impl CorrosionClient {
         &self.pool
     }
 
-    pub async fn execute(&self, statements: Vec<Statement>) -> eyre::Result<RqliteResponse> {
+    pub async fn execute(&self, statements: &[Statement]) -> eyre::Result<RqliteResponse> {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(format!("http://{}/db/execute?transaction", self.api_addr))
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
-            .body(Body::from(serde_json::to_vec(&statements)?))?;
+            .body(Body::from(serde_json::to_vec(statements)?))?;
 
         let res = self.api_client.request(req).await?;
 
@@ -415,7 +415,9 @@ pub async fn update_consul_services(
     }
 
     if !statements.is_empty() {
-        corrosion.execute(statements).await?;
+        for chunk in statements.chunks(50) {
+            corrosion.execute(chunk).await?;
+        }
         info!("updated consul services");
     }
 
@@ -492,7 +494,9 @@ pub async fn update_consul_checks(
     }
 
     if !statements.is_empty() {
-        corrosion.execute(statements).await?;
+        for chunk in statements.chunks(50) {
+            corrosion.execute(chunk).await?;
+        }
         info!("updated consul checks");
     }
 

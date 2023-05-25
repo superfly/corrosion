@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::change::SqliteValue;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Statement {
     Simple(String),
