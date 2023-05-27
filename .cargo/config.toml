@@ -4,7 +4,6 @@ rustflags = [
     "-C", "link-arg=-fuse-ld=mold",
     "-C", "force-frame-pointers",
     "-C", "symbol-mangling-version=v0",
-    "-Z", "share-generics=y",
     "--cfg", "tokio_unstable"
 ]
 
