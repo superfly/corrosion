@@ -40,5 +40,6 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: corrosion,corroctl,corro-consul
+          archive: "corrosion-$target"
           target: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
