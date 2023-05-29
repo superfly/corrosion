@@ -35,6 +35,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
         if: startsWith(matrix.os, 'ubuntu')
+      - uses: rui314/setup-mold@v1
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: corrosion,corroctl,corro-consul

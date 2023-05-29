@@ -162,6 +162,8 @@ pub async fn api_v1_db_execute(
         );
     }
 
+    // FIXME: chunk changes by `n` rows, not statements
+    //        waiting on crsqlite changes that gives consistent rowids on crsql_changes
     if statements.len() > MAX_STATEMENTS_PER_REQUEST {
         return (
             StatusCode::BAD_REQUEST,
@@ -201,6 +203,7 @@ pub async fn api_v1_db_execute(
                             .as_slice(),
                     ),
                 };
+
                 Some(match res {
                     Ok(rows_affected) => {
                         total_rows_affected += rows_affected;
