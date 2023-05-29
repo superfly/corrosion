@@ -72,8 +72,8 @@ impl Agent {
         &self.0.bookie
     }
 
-    pub fn base_path(&self) -> Utf8PathBuf {
-        self.0.config.load().base_path.clone()
+    pub fn db_path(&self) -> Utf8PathBuf {
+        self.0.config.load().db_path.clone()
     }
 
     pub fn config(&self) -> arc_swap::Guard<Arc<Config>, arc_swap::strategy::DefaultStrategy> {
@@ -96,8 +96,8 @@ pub enum ReloadError {
 pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> {
     let old_conf = agent.config();
 
-    if old_conf.base_path != new_conf.base_path {
-        warn!("reloaded ineffectual change: base_path");
+    if old_conf.db_path != new_conf.db_path {
+        warn!("reloaded ineffectual change: db_path");
     }
     if old_conf.gossip_addr != new_conf.gossip_addr {
         warn!("reloaded ineffectual change: gossip_addr");

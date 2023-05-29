@@ -7,7 +7,7 @@ pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub base_path: Utf8PathBuf,
+    pub db_path: Utf8PathBuf,
     pub gossip_addr: SocketAddr,
     #[serde(default)]
     pub api_addr: Option<SocketAddr>,
@@ -50,7 +50,7 @@ impl Config {
 
 #[derive(Debug, Default)]
 pub struct ConfigBuilder {
-    pub base_path: Option<Utf8PathBuf>,
+    pub db_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
     api_addr: Option<SocketAddr>,
     admin_path: Option<Utf8PathBuf>,
@@ -61,8 +61,8 @@ pub struct ConfigBuilder {
 }
 
 impl ConfigBuilder {
-    pub fn base_path<S: Into<Utf8PathBuf>>(mut self, db_path: S) -> Self {
-        self.base_path = Some(db_path.into());
+    pub fn db_path<S: Into<Utf8PathBuf>>(mut self, db_path: S) -> Self {
+        self.db_path = Some(db_path.into());
         self
     }
 
@@ -102,9 +102,9 @@ impl ConfigBuilder {
     }
 
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
-        let base_path = self.base_path.unwrap_or_else(default_base_path);
+        let db_path = self.db_path.unwrap_or_else(default_db_path);
         Ok(Config {
-            base_path,
+            db_path,
             gossip_addr: self
                 .gossip_addr
                 .ok_or(ConfigBuilderError::GossipAddrRequired)?,
@@ -124,8 +124,8 @@ pub enum ConfigBuilderError {
     GossipAddrRequired,
 }
 
-fn default_base_path() -> Utf8PathBuf {
-    "./".into()
+fn default_db_path() -> Utf8PathBuf {
+    "./corro.db".into()
 }
 
 /// Log format (JSON only)

@@ -18,7 +18,6 @@ use uhlc::{ParseNTP64Error, NTP64};
 use crate::{
     actor::{Actor, ActorId},
     change::Change,
-    pubsub::SubscriptionId,
 };
 
 pub const FRAGMENTS_AT: usize = 1420 // wg0 MTU
@@ -56,14 +55,6 @@ pub enum MessageV1 {
         changeset: Vec<Change>,
 
         ts: Timestamp,
-    },
-    UpsertSubscription {
-        actor_id: ActorId,
-
-        id: SubscriptionId,
-        filter: String,
-
-        ts: u64,
     },
 }
 

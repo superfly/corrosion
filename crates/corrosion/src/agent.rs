@@ -2,8 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     error::Error,
-    fmt,
-    io::{self, Read, Write},
+    fmt, io,
     net::SocketAddr,
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
@@ -77,44 +76,24 @@ pub struct AgentOptions {
     tripwire: Tripwire,
 }
 
-pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, AgentOptions)> {
-    debug!("setting up corrosion @ {}", conf.base_path);
+pub async fn setup(
+    actor_id: ActorId,
+    conf: Config,
+    tripwire: Tripwire,
+) -> eyre::Result<(Agent, AgentOptions)> {
+    debug!("setting up corrosion @ {}", conf.db_path);
 
-    let base_path = conf.base_path.as_path();
-
-    let state_path = base_path.join("state");
-    if !state_path.exists() {
-        std::fs::create_dir_all(&state_path)?;
+    if let Some(parent) = conf.db_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
     }
 
-    let state_db_path = state_path.join("state.sqlite");
-
-    let actor_id = {
-        let mut actor_id_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(base_path.join("actor_id"))?;
-
-        let mut id_str = String::new();
-        actor_id_file.read_to_string(&mut id_str)?;
-
-        let actor_id = ActorId(if id_str.is_empty() {
-            let id = Uuid::new_v4();
-            actor_id_file.write_all(id.to_string().as_bytes())?;
-            id
-        } else {
-            id_str.parse()?
-        });
-
-        debug!("actor_id from file: {actor_id}");
-
+    {
         {
-            let mut conn = CrConn(Connection::open(&state_db_path)?);
+            let mut conn = CrConn(Connection::open(&conf.db_path)?);
             init_cr_conn(&mut conn)?;
         }
 
-        let conn = Connection::open(&state_db_path)?;
+        let conn = Connection::open(&conf.db_path)?;
 
         trace!("got actor_id setup conn");
         let crsql_siteid = conn
@@ -136,15 +115,13 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 [actor_id.to_bytes()],
             )?;
         }
-
-        actor_id
-    };
+    }
 
     info!("Actor ID: {}", actor_id);
 
     let rw_pool = bb8::Builder::new()
         .max_size(1)
-        .build(CrConnManager::new(&state_db_path))
+        .build(CrConnManager::new(&conf.db_path))
         .await?;
 
     debug!("built RW pool");
@@ -153,7 +130,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         .max_size(5)
         .min_idle(Some(1))
         .max_lifetime(Some(Duration::from_secs(30)))
-        .build_unchecked(CrConnManager::new_read_only(&state_db_path));
+        .build_unchecked(CrConnManager::new_read_only(&conf.db_path));
     debug!("built RO pool");
 
     let schema = {
@@ -243,8 +220,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     Ok((agent, opts))
 }
 
-pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
-    let (agent, opts) = setup(conf, tripwire.clone()).await?;
+pub async fn start(actor_id: ActorId, conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
+    let (agent, opts) = setup(actor_id, conf, tripwire.clone()).await?;
 
     tokio::spawn(run(agent.clone(), opts).inspect(|_| info!("corrosion agent run is done")));
 
@@ -944,24 +921,6 @@ pub async fn handle_broadcast(
                                 .ok();
                         }
                     }
-                    Message::V1(MessageV1::UpsertSubscription {
-                        actor_id,
-                        id,
-                        filter,
-                        ts,
-                    }) => {
-                        if actor_id != self_actor_id {
-                            bcast_tx
-                                .send(Message::V1(MessageV1::UpsertSubscription {
-                                    actor_id,
-                                    id,
-                                    filter,
-                                    ts,
-                                }))
-                                .await
-                                .ok();
-                        }
-                    }
                 }
             }
             Ok(None) => {
@@ -1079,7 +1038,6 @@ async fn process_msg(
             bookie.add(actor_id, version, db_version, ts);
             Some(msg)
         }
-        Message::V1(v1) => Some(Message::V1(v1)),
     })
 }
 

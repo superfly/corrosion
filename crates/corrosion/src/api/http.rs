@@ -292,7 +292,7 @@ mod tests {
             rw_pool,
             config: ArcSwap::from_pointee(
                 Config::builder()
-                    .base_path(dir.path().display().to_string())
+                    .db_path(dir.path().join("corrosion.db").display().to_string())
                     .add_schema_path(schema_path.display().to_string())
                     .gossip_addr("127.0.0.1:1234".parse()?)
                     .build()?,

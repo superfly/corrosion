@@ -11,3 +11,4 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tripwire = { path = "../tripwire" }
+uuid = { workspace = true }

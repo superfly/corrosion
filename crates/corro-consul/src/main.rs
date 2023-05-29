@@ -40,7 +40,7 @@ impl Config {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CorrosionConfig {
     api_addr: SocketAddr,
-    base_path: Utf8PathBuf,
+    db_path: Utf8PathBuf,
 }
 
 #[derive(Clone)]
@@ -57,9 +57,7 @@ impl CorrosionClient {
             pool: bb8::Pool::builder()
                 .max_size(5)
                 .max_lifetime(Some(Duration::from_secs(30)))
-                .build_unchecked(RusqliteConnectionManager::new(
-                    config.base_path.join("state").join("state.sqlite"),
-                )),
+                .build_unchecked(RusqliteConnectionManager::new(&config.db_path)),
             api_client: hyper::Client::builder().http2_only(true).build_http(),
         }
     }
@@ -636,7 +634,7 @@ mod tests {
 
         let ta1_client = CorrosionClient::new(&CorrosionConfig {
             api_addr: ta1.agent.api_addr().unwrap(),
-            base_path: ta1.agent.base_path(),
+            db_path: ta1.agent.db_path(),
         });
 
         setup(&ta1_client).await?;
@@ -693,7 +691,7 @@ mod tests {
 
         let ta2_client = CorrosionClient::new(&CorrosionConfig {
             api_addr: ta2.agent.api_addr().unwrap(),
-            base_path: ta2.agent.base_path(),
+            db_path: ta2.agent.db_path(),
         });
 
         {
