@@ -1,9 +1,13 @@
 # Corrosion
 
-## Running it
+## Launching on Fly
 
 ```
-./corrosion -c corrosion.toml
+fly launch --no-deploy --org <org> --region <region> --copy-config --name <app-name>
+fly volumes create corro_data -y -s 10 -r <region> -a <app-name>
+fly deploy --dockerfile examples/fly/Dockerfile -a <app-name> -c examples/fly/fly.toml
+fly machine clone -a <app-name> --region <other region> --select
+fly machine clone -a <app-name> --region <yet another region> --select
 ```
 
 ## Reading data
