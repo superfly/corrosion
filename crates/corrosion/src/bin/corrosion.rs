@@ -54,7 +54,8 @@ async fn main() -> eyre::Result<()> {
         }
     }
 
-    let config_parent_path: Utf8PathBuf = config_path
+    let db_parent_path: Utf8PathBuf = config
+        .db_path
         .parent()
         .map(|p| p.into())
         .unwrap_or_else(|| "./".into());
@@ -63,7 +64,7 @@ async fn main() -> eyre::Result<()> {
         .create(true)
         .read(true)
         .write(true)
-        .open(config_parent_path.join("actor_id"))
+        .open(db_parent_path.join("actor_id"))
         .await?;
 
     let mut id_str = String::new();

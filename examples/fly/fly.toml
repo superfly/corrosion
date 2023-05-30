@@ -1,0 +1,5 @@
+app = "corrosion2"
+
+[mounts]
+source = "corro_data"
+destination = "/var/lib/corrosion"

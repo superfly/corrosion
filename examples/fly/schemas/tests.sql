@@ -1,0 +1,1 @@
+CREATE TABLE tests (id BIGINT PRIMARY KEY, foo TEXT);
