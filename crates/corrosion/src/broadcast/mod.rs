@@ -350,25 +350,22 @@ pub fn runtime_loop(
                         {
                             gauge!("corro.gossip.members", foca.num_members() as f64);
                             gauge!(
-                                "corrosion.gossip.updates_backlog",
+                                "corro.gossip.updates_backlog",
                                 foca.updates_backlog() as f64
                             );
                         }
                         {
                             let config = config.read();
                             gauge!(
-                                "corrosion.gossip.config.max_transmissions",
+                                "corro.gossip.config.max_transmissions",
                                 config.max_transmissions.get() as f64
                             );
                             gauge!(
-                                "corrosion.gossip.config.num_indirect_probes",
+                                "corro.gossip.config.num_indirect_probes",
                                 config.num_indirect_probes.get() as f64
                             );
                         }
-                        gauge!(
-                            "corrosion.gossip.cluster_size",
-                            last_cluster_size.get() as f64
-                        );
+                        gauge!("corro.gossip.cluster_size", last_cluster_size.get() as f64);
                     }
                 }
             }
@@ -574,13 +571,10 @@ pub fn runtime_loop(
                 Branch::WokePendingBroadcast(pending) => to_broadcast = Some(pending),
                 Branch::Metrics => {
                     gauge!(
-                        "corrosion.gossip.broadcast.channel.capacity",
+                        "corro.gossip.broadcast.channel.capacity",
                         bcast_tx.capacity() as f64
                     );
-                    gauge!(
-                        "corrosion.broadcast.pending.count",
-                        idle_pendings.len() as f64
-                    );
+                    gauge!("corro.broadcast.pending.count", idle_pendings.len() as f64);
                 }
             }
 

@@ -666,7 +666,7 @@ async fn handle_db_cleanup(rw_pool: SqlitePool) -> eyre::Result<()> {
         } else {
             debug!("successfully truncated sqlite WAL!");
             histogram!(
-                "corrosion.db.wal.truncate.seconds",
+                "corro.db.wal.truncate.seconds",
                 start.elapsed().as_secs_f64()
             );
         }
@@ -1221,15 +1221,12 @@ async fn handle_sync_receive(
     increment_counter!("corro.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
 
     histogram!(
-        "corrosion.sync.client.request.operations.need.count",
+        "corro.sync.client.request.operations.need.count",
         sync.need.len() as f64
     );
     let data = serde_json::to_vec(&*sync)?;
 
-    gauge!(
-        "corrosion.sync.client.request.size.bytes",
-        data.len() as f64
-    );
+    gauge!("corro.sync.client.request.size.bytes", data.len() as f64);
 
     let req = hyper::Request::builder()
         .method(hyper::Method::POST)

@@ -432,7 +432,7 @@ pub async fn peer_api_v1_sync_post(
         {
             Ok(_) => {
                 histogram!(
-                    "corrosion.sync.server.process.time.seconds",
+                    "corro.sync.server.process.time.seconds",
                     now.elapsed().as_secs_f64()
                 );
             }
