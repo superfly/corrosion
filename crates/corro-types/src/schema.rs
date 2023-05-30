@@ -165,41 +165,11 @@ pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
     Ok(parse_sql(dump.as_str())?)
 }
 
-pub fn make_schema<P: AsRef<Path>>(
+pub fn make_schema_inner(
     tx: &Transaction,
-    schema_paths: &[P],
     schema: &NormalizedSchema,
-) -> Result<NormalizedSchema, SchemaError> {
-    let mut new_sql = String::new();
-
-    for schema_path in schema_paths.iter() {
-        let mut dir = std::fs::read_dir(schema_path)?;
-
-        let mut entries = vec![];
-
-        while let Some(entry) = dir.next() {
-            entries.push(entry?);
-        }
-
-        let mut entries: Vec<_> = entries
-            .into_iter()
-            .filter_map(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .and_then(|ext| if ext == "sql" { Some(entry) } else { None })
-            })
-            .collect();
-
-        entries.sort_by_key(|entry| entry.path());
-
-        for entry in entries.iter() {
-            std::fs::File::open(entry.path())?.read_to_string(&mut new_sql)?;
-        }
-    }
-
-    let new_schema = parse_sql(&new_sql)?;
-
+    new_schema: &NormalizedSchema,
+) -> Result<(), SchemaError> {
     // iterate over dropped tables
     for name in schema
         .tables
@@ -481,7 +451,73 @@ pub fn make_schema<P: AsRef<Path>>(
                 .to_string(),
             ))?;
         }
+
+        // insert all useful schema fields into __corro_schema from sqlite_schema
+
+        // tx.execute(
+        //     "DELETE FROM __corro_schema WHERE tbl_name = ?",
+        //     [name.as_str()],
+        // )?;
+
+        // tx.prepare_cached("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'file' AS source FROM sqlite_schema WHERE tblname = ? AND name IS NOT NULL")?.execute([name.as_str()])?;
     }
+
+    Ok(())
+}
+
+pub fn make_schema<P: AsRef<Path>>(
+    tx: &Transaction,
+    schema_paths: &[P],
+    schema: &NormalizedSchema,
+) -> Result<NormalizedSchema, SchemaError> {
+    let mut new_sql = String::new();
+
+    for schema_path in schema_paths.iter() {
+        let mut dir = std::fs::read_dir(schema_path)?;
+
+        let mut entries = vec![];
+
+        while let Some(entry) = dir.next() {
+            entries.push(entry?);
+        }
+
+        let mut entries: Vec<_> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| if ext == "sql" { Some(entry) } else { None })
+            })
+            .collect();
+
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries.iter() {
+            std::fs::File::open(entry.path())?.read_to_string(&mut new_sql)?;
+        }
+    }
+
+    let extra_schema = tx
+        .prepare_cached(
+            "SELECT sql FROM __corro_schema ORDER BY
+                CASE 
+                    WHEN type = 'table' THEN 1 
+                    ELSE 2
+                END
+            ",
+        )?
+        .query(())?
+        .and_then(|row| row.get(0))
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+
+    for extra in extra_schema {
+        new_sql.push_str(&extra);
+    }
+
+    let new_schema = parse_sql(&new_sql)?;
+
+    make_schema_inner(tx, schema, &new_schema)?;
 
     Ok(new_schema)
 }
@@ -504,8 +540,7 @@ pub fn apply_schema<P: AsRef<Path>>(
     Ok(new_schema)
 }
 
-pub fn parse_sql(sql: &str) -> Result<NormalizedSchema, SchemaError> {
-    let mut schema = NormalizedSchema::default();
+pub fn parse_sql_to_schema(schema: &mut NormalizedSchema, sql: &str) -> Result<(), SchemaError> {
     info!("parsing {sql}");
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
 
@@ -573,6 +608,14 @@ pub fn parse_sql(sql: &str) -> Result<NormalizedSchema, SchemaError> {
             Ok(Some(cmd)) => return Err(SchemaError::UnsupportedCmd(cmd)),
         }
     }
+
+    Ok(())
+}
+
+pub fn parse_sql(sql: &str) -> Result<NormalizedSchema, SchemaError> {
+    let mut schema = NormalizedSchema::default();
+
+    parse_sql_to_schema(&mut schema, sql)?;
 
     Ok(schema)
 }

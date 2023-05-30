@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     api::{
-        http::api_v1_db_execute,
+        http::{api_v1_db_execute, api_v1_db_schema},
         peer::{generate_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncMessage},
         pubsub::api_v1_subscribe_ws,
     },
@@ -437,6 +437,20 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     }))
                     .layer(LoadShedLayer::new())
                     .layer(ConcurrencyLimitLayer::new(128)),
+            ),
+        )
+        .route(
+            "/db/schema",
+            post(api_v1_db_schema).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(4)),
             ),
         )
         .route("/v1/subscribe", get(api_v1_subscribe_ws))
@@ -1284,7 +1298,6 @@ async fn handle_sync_receive(
         let msg = Message::from_buf(&mut buf)?;
         let len = match &msg {
             Message::V1(MessageV1::Change { ref changeset, .. }) => changeset.len(),
-            _ => 1,
         };
         process_msg(agent, msg).await?;
         count += len;
@@ -1351,6 +1364,18 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 state TEXT NOT NULL DEFAULT 'down',
             
                 foca_state JSON
+            ) WITHOUT ROWID;
+
+            -- tracked corrosion schema, useful for non-file schema changes
+            CREATE TABLE __corro_schema (
+                tbl_name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                sql TEXT NOT NULL,
+            
+                source TEXT NOT NULL,
+            
+                PRIMARY KEY (tbl_name, type, name)
             ) WITHOUT ROWID;
 
             -- all subscriptions ever

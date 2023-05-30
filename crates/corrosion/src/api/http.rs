@@ -9,11 +9,12 @@ use corro_types::{
     agent::Agent,
     api::{RqliteResponse, RqliteResult, Statement},
     broadcast::Timestamp,
+    schema::{make_schema_inner, parse_sql},
 };
 use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, ToSql, Transaction};
 use tokio::task::block_in_place;
-use tracing::{error, trace};
+use tracing::{error, info, trace};
 
 use corro_types::{
     broadcast::{BroadcastInput, Message, MessageV1},
@@ -143,6 +144,29 @@ where
     })
 }
 
+fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
+    match stmt {
+        Statement::Simple(q) => tx.execute(&q, []),
+        Statement::WithParams(params) => {
+            let mut params = params.into_iter();
+
+            let first = params.next();
+            match first.as_ref().and_then(|q| q.as_str()) {
+                Some(q) => tx.execute(&q, params_from_iter(params)),
+                None => Ok(0),
+            }
+        }
+        Statement::WithNamedParams(q, params) => tx.execute(
+            &q,
+            params
+                .iter()
+                .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
+                .collect::<Vec<(&str, &dyn ToSql)>>()
+                .as_slice(),
+        ),
+    }
+}
+
 const MAX_STATEMENTS_PER_REQUEST: usize = 50;
 
 pub async fn api_v1_db_execute(
@@ -183,26 +207,7 @@ pub async fn api_v1_db_execute(
             .iter()
             .filter_map(|stmt| {
                 let start = Instant::now();
-                let res = match stmt {
-                    Statement::Simple(q) => tx.execute(&q, []),
-                    Statement::WithParams(params) => {
-                        let mut params = params.into_iter();
-
-                        let first = params.next();
-                        match first.as_ref().and_then(|q| q.as_str()) {
-                            Some(q) => tx.execute(&q, params_from_iter(params)),
-                            None => return None,
-                        }
-                    }
-                    Statement::WithNamedParams(q, params) => tx.execute(
-                        &q,
-                        params
-                            .iter()
-                            .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
-                            .collect::<Vec<(&str, &dyn ToSql)>>()
-                            .as_slice(),
-                    ),
-                };
+                let res = execute_statement(&tx, stmt);
 
                 Some(match res {
                     Ok(rows_affected) => {
@@ -244,6 +249,88 @@ pub async fn api_v1_db_execute(
         axum::Json(RqliteResponse {
             results,
             time: Some(elapsed.as_secs_f64()),
+        }),
+    )
+}
+
+async fn execute_schema(agent: &Agent, statements: Vec<Statement>) -> eyre::Result<()> {
+    let new_sql: String = statements
+        .into_iter()
+        .map(|stmt| match stmt {
+            Statement::Simple(s) => Ok(s),
+            _ => eyre::bail!("only simple statements are supported"),
+        })
+        .collect::<Result<Vec<_>, eyre::Report>>()?
+        .join(";");
+
+    let partial_schema = parse_sql(&new_sql)?;
+
+    let mut conn = agent.read_write_pool().get().await?;
+
+    // hold onto this lock so nothing else makes changes
+    let mut schema_write = agent.0.schema.write();
+
+    let mut new_schema = schema_write.clone();
+
+    for (name, def) in partial_schema.tables.iter() {
+        new_schema.tables.insert(name.clone(), def.clone());
+    }
+
+    block_in_place(|| {
+        let tx = conn.transaction()?;
+
+        make_schema_inner(&tx, &schema_write, &new_schema)?;
+
+        for tbl_name in partial_schema.tables.keys() {
+            tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
+            let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND name IS NOT NULL", [tbl_name])?;
+            info!("updated {n} rows in __corro_schema for table {tbl_name}");
+        }
+
+        tx.commit()?;
+
+        Ok::<_, eyre::Report>(())
+    })?;
+
+    *schema_write = new_schema;
+
+    Ok(())
+}
+
+pub async fn api_v1_db_schema(
+    Extension(agent): Extension<Agent>,
+    axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
+) -> (StatusCode, axum::Json<RqliteResponse>) {
+    if statements.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(RqliteResponse {
+                results: vec![RqliteResult::Error {
+                    error: "at least 1 statement is required".into(),
+                }],
+                time: None,
+            }),
+        );
+    }
+
+    if let Err(e) = execute_schema(&agent, statements).await {
+        error!("could not merge schemas: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(RqliteResponse {
+                results: vec![RqliteResult::Error {
+                    error: e.to_string(),
+                }],
+                time: None,
+            }),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(RqliteResponse {
+            results: vec![],
+            time: None,
         }),
     )
 }

@@ -21,6 +21,8 @@ const CONSUL_PULL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
+    extra_services_columns: Vec<String>,
+    extra_statements: Vec<String>,
     corrosion: CorrosionConfig,
     consul: consul::Config,
 }
@@ -84,6 +86,25 @@ impl CorrosionClient {
 
         Ok(serde_json::from_slice(&bytes)?)
     }
+
+    pub async fn schema(&self, statements: &[Statement]) -> eyre::Result<RqliteResponse> {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{}/db/schema", self.api_addr))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::ACCEPT, "application/json")
+            .body(Body::from(serde_json::to_vec(statements)?))?;
+
+        let res = self.api_client.request(req).await?;
+
+        if !res.status().is_success() {
+            return Err(eyre::eyre!("bad response code {}", res.status()));
+        }
+
+        let bytes = hyper::body::to_bytes(res.into_body()).await?;
+
+        Ok(serde_json::from_slice(&bytes)?)
+    }
 }
 
 #[derive(Parser)]
@@ -92,6 +113,50 @@ pub(crate) struct App {
     /// Set the config file path
     #[clap(long, short, default_value = "corro-consul.toml")]
     pub(crate) config: Utf8PathBuf,
+}
+
+fn build_schema(
+    extra_services_columns: Vec<String>,
+    extra_statements: Vec<String>,
+) -> Vec<Statement> {
+    let extra = extra_services_columns.join(",");
+    let mut statements = vec![
+        Statement::Simple(format!("CREATE TABLE consul_services (
+            node TEXT NOT NULL,
+            id TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '[]',
+            meta TEXT NOT NULL DEFAULT '{{}}',
+            port INTEGER NOT NULL DEFAULT 0,
+            address TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+
+            {}
+            
+            PRIMARY KEY (node, id)
+        ) WITHOUT ROWID;", if extra.is_empty() { String::new() } else {format!("{extra},")})),
+        Statement::Simple("CREATE INDEX consul_services_node_id_updated_at ON consul_services (node, id, updated_at);".to_string()),
+
+        Statement::Simple("CREATE TABLE consul_checks (
+            node TEXT NOT NULL,
+            id TEXT NOT NULL,
+            service_id TEXT NOT NULL DEFAULT '',
+            service_name TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            output TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (node, id)
+        ) WITHOUT ROWID;".to_string()),
+        Statement::Simple("CREATE INDEX consul_checks_node_id_updated_at ON consul_checks (node, id, updated_at);".to_string()),
+        Statement::Simple("CREATE INDEX consul_checks_node_service_id ON consul_checks (node, service_id);".to_string()),
+    ];
+
+    for s in extra_statements {
+        statements.push(Statement::Simple(s));
+    }
+
+    statements
 }
 
 #[tokio::main]
@@ -115,9 +180,14 @@ async fn main() -> eyre::Result<()> {
     );
 
     let corrosion = CorrosionClient::new(&config.corrosion);
-    let consul = consul::Client::new(config.consul)?;
+    let consul = consul::Client::new(config.consul.clone())?;
 
-    setup(&corrosion).await?;
+    setup(
+        &corrosion,
+        config.extra_services_columns,
+        config.extra_statements,
+    )
+    .await?;
 
     let mut consul_services: HashMap<String, u64> = HashMap::new();
     let mut consul_checks: HashMap<String, u64> = HashMap::new();
@@ -191,13 +261,18 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-async fn setup(corrosion: &CorrosionClient) -> eyre::Result<()> {
-    let mut conn = corrosion.pool().get().await?;
+async fn setup(
+    corrosion: &CorrosionClient,
+    extra_services_columns: Vec<String>,
+    extra_statements: Vec<String>,
+) -> eyre::Result<()> {
+    {
+        let mut conn = corrosion.pool().get().await?;
 
-    let tx = conn.transaction()?;
+        let tx = conn.transaction()?;
 
-    tx.execute_batch(
-        "
+        tx.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS __corro_consul_services (
                 id TEXT NOT NULL PRIMARY KEY,
                 hash BLOB NOT NULL
@@ -207,9 +282,13 @@ async fn setup(corrosion: &CorrosionClient) -> eyre::Result<()> {
                 hash BLOB NOT NULL
             );
             ",
-    )?;
+        )?;
 
-    tx.commit()?;
+        tx.commit()?;
+    }
+    corrosion
+        .schema(&build_schema(extra_services_columns, extra_statements))
+        .await?;
     Ok(())
 }
 
@@ -605,27 +684,10 @@ mod tests {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
-        let tmpdir = tempfile::tempdir()?;
-        let schema_path = tmpdir.path().join("schema");
-        tokio::fs::create_dir(&schema_path).await?;
-        tokio::fs::copy(
-            "../../tests/fixtures/consul.sql",
-            schema_path.join("consul.sql"),
-        )
-        .await?;
-
-        let ta1 = launch_test_agent(
-            |conf| {
-                conf.add_schema_path(schema_path.display().to_string())
-                    .build()
-            },
-            tripwire.clone(),
-        )
-        .await?;
+        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
         let ta2 = launch_test_agent(
             |conf| {
-                conf.add_schema_path(schema_path.display().to_string())
-                    .bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+                conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
                     .build()
             },
             tripwire.clone(),
@@ -637,7 +699,12 @@ mod tests {
             db_path: ta1.agent.db_path(),
         });
 
-        setup(&ta1_client).await?;
+        setup(
+            &ta1_client,
+            vec!["app_id INTEGER AS (CAST (JSON_EXTRACT (meta, '$.app_id') AS INTEGER))".into()],
+            vec![],
+        )
+        .await?;
 
         let mut services = HashMap::new();
 
@@ -687,12 +754,19 @@ mod tests {
 
         assert_eq!(hashes.get("service-id"), Some(&hash_service(&svc)));
 
-        sleep(Duration::from_secs(2)).await;
-
         let ta2_client = CorrosionClient::new(&CorrosionConfig {
             api_addr: ta2.agent.api_addr().unwrap(),
             db_path: ta2.agent.db_path(),
         });
+
+        setup(
+            &ta2_client,
+            vec!["app_id INTEGER AS (CAST (JSON_EXTRACT (meta, '$.app_id') AS INTEGER))".into()],
+            vec![],
+        )
+        .await?;
+
+        sleep(Duration::from_secs(2)).await;
 
         {
             let conn = ta2_client.pool().get().await?;
