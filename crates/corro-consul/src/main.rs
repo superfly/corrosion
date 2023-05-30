@@ -185,6 +185,7 @@ async fn main() -> eyre::Result<()> {
     let corrosion = CorrosionClient::new(&config.corrosion);
     let consul = consul::Client::new(config.consul.clone())?;
 
+    info!("Setting up corrosion for corro-consul");
     setup(
         &corrosion,
         config.extra_services_columns,
@@ -198,6 +199,7 @@ async fn main() -> eyre::Result<()> {
     {
         let conn = corrosion.pool().get().await?;
 
+        info!("Populating initial service hashes");
         let mut prepped = conn.prepare("SELECT id, hash FROM __corro_consul_services")?;
         let mut rows = prepped.query([])?;
 
@@ -212,6 +214,7 @@ async fn main() -> eyre::Result<()> {
             consul_services.insert(row.get(0)?, u64::from_be_bytes(row.get(1)?));
         }
 
+        info!("Populating initial checks hashes");
         let mut prepped = conn.prepare("SELECT id, hash FROM __corro_consul_checks")?;
         let mut rows = prepped.query([])?;
 
@@ -230,6 +233,7 @@ async fn main() -> eyre::Result<()> {
     let mut pull_interval = interval(CONSUL_PULL_INTERVAL);
 
     spawn_counted(async move {
+        info!("Starting consul pull interval");
         loop {
             tokio::select! {
                 _ = pull_interval.tick() => {
@@ -274,6 +278,7 @@ async fn setup(
 
         let tx = conn.transaction()?;
 
+        info!("Creating internal tables");
         tx.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS __corro_consul_services (
@@ -289,6 +294,7 @@ async fn setup(
 
         tx.commit()?;
     }
+    info!("Ensuring schema...");
     corrosion
         .schema(&build_schema(extra_services_columns, extra_statements))
         .await?;
