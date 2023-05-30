@@ -21,8 +21,11 @@ const CONSUL_PULL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     extra_services_columns: Vec<String>,
+    #[serde(default)]
     extra_statements: Vec<String>,
+
     corrosion: CorrosionConfig,
     consul: consul::Config,
 }
