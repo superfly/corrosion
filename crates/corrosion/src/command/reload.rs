@@ -67,7 +67,7 @@ async fn handle_reload<P: AsRef<Path>>(path: P) -> eyre::Result<()> {
 mod tests {
     use super::*;
 
-    use camino::{Utf8Path, Utf8PathBuf};
+    use camino::Utf8PathBuf;
     use corro_admin::AdminConfig;
     use corro_tests::launch_test_agent;
     use spawn::wait_for_all_pending_handles;
@@ -99,8 +99,17 @@ mod tests {
         )?;
 
         let mut conf = ta.agent.config().as_ref().clone();
-        let new_path = Utf8Path::new("../../tests/fixtures").canonicalize_utf8()?;
-        conf.schema_paths.push(new_path.clone());
+        let new_path = ta.tmpdir.path().join("schema2");
+        tokio::fs::create_dir_all(&new_path).await?;
+
+        tokio::fs::write(
+            new_path.join("blah.sql"),
+            b"CREATE TABLE blah (id BIGINT PRIMARY KEY);",
+        )
+        .await?;
+
+        conf.schema_paths
+            .push(new_path.display().to_string().into());
 
         let conf_bytes = toml::to_vec(&conf)?;
 
@@ -114,6 +123,8 @@ mod tests {
             .schema_paths
             .iter()
             .any(|p| *p == new_path));
+
+        assert!(ta.agent.0.schema.read().tables.contains_key("blah"));
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
