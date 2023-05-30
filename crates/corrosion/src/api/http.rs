@@ -283,7 +283,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<Statement>) -> eyre::Resu
 
         for tbl_name in partial_schema.tables.keys() {
             tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
-            let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND name IS NOT NULL", [tbl_name])?;
+            let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL", [tbl_name])?;
             info!("updated {n} rows in __corro_schema for table {tbl_name}");
         }
 

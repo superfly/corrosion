@@ -451,15 +451,6 @@ pub fn make_schema_inner(
                 .to_string(),
             ))?;
         }
-
-        // insert all useful schema fields into __corro_schema from sqlite_schema
-
-        // tx.execute(
-        //     "DELETE FROM __corro_schema WHERE tbl_name = ?",
-        //     [name.as_str()],
-        // )?;
-
-        // tx.prepare_cached("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'file' AS source FROM sqlite_schema WHERE tblname = ? AND name IS NOT NULL")?.execute([name.as_str()])?;
     }
 
     Ok(())
@@ -513,6 +504,7 @@ pub fn make_schema<P: AsRef<Path>>(
 
     for extra in extra_schema {
         new_sql.push_str(&extra);
+        new_sql.push(';');
     }
 
     let new_schema = parse_sql(&new_sql)?;
