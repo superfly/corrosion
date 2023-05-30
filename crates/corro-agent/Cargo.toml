@@ -1,10 +1,9 @@
 [package]
-name = "corrosion"
+name = "corro-agent"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-corro-agent = { path = "../corro-agent" }
 async-trait = { workspace = true }
 axum = { workspace = true }
 axum-extra = { workspace = true }
@@ -66,8 +65,11 @@ clap = "4.2.4"
 metrics-exporter-prometheus = "0.12.0"
 tracing-filter = { version = "0.1.0-alpha.2", features = ["smallvec"] }
 corro-admin = { path = "../corro-admin" }
-tokio-serde = { workspace = true }
 
 [dev-dependencies]
+tokio-postgres = { workspace = true }
+tokio-tungstenite = { workspace = true }
 corro-tests = { path = "../corro-tests" }
-toml = { workspace = true }
+
+# [patch.crates-io]
+# sqlx = { workspace = true }

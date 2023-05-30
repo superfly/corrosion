@@ -611,121 +611,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "corro-consul"
-version = "0.1.0"
-dependencies = [
- "bb8",
- "bb8-rusqlite",
- "camino",
- "clap",
- "config",
- "consul",
- "corro-tests",
- "corro-types",
- "corrosion",
- "eyre",
- "futures",
- "hostname",
- "hyper",
- "metrics",
- "rusqlite",
- "seahash",
- "serde",
- "serde_json",
- "spawn",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tripwire",
-]
-
-[[package]]
-name = "corro-tests"
-version = "0.1.0"
-dependencies = [
- "corro-types",
- "corrosion",
- "eyre",
- "tempfile",
- "tokio",
- "tracing",
- "tripwire",
- "uuid",
-]
-
-[[package]]
-name = "corro-types"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "async-trait",
- "bb8",
- "bb8-rusqlite",
- "bytes",
- "camino",
- "compact_str 0.7.0",
- "config",
- "crc32fast",
- "enquote",
- "exprt",
- "fallible-iterator",
- "foca",
- "hex",
- "indexmap",
- "itertools",
- "metrics",
- "nom",
- "once_cell",
- "parking_lot",
- "rand",
- "rangemap",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_with",
- "speedy",
- "sqlite3-parser",
- "tempfile",
- "thiserror",
- "time 0.3.20",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uhlc",
- "ulid",
- "uuid",
-]
-
-[[package]]
-name = "corroctl"
-version = "0.1.0"
-dependencies = [
- "camino",
- "clap",
- "corro-admin",
- "corro-tests",
- "corro-types",
- "corrosion",
- "eyre",
- "futures",
- "rusqlite",
- "serde",
- "serde_json",
- "spawn",
- "time 0.3.20",
- "tokio",
- "tokio-serde",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "tripwire",
-]
-
-[[package]]
-name = "corrosion"
+name = "corro-agent"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
@@ -781,6 +667,165 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-filter",
+ "tracing-subscriber",
+ "tripwire",
+ "trust-dns-resolver",
+ "uhlc",
+ "ulid",
+ "uuid",
+ "webpki",
+]
+
+[[package]]
+name = "corro-consul"
+version = "0.1.0"
+dependencies = [
+ "bb8",
+ "bb8-rusqlite",
+ "camino",
+ "clap",
+ "config",
+ "consul",
+ "corro-tests",
+ "corro-types",
+ "corrosion",
+ "eyre",
+ "futures",
+ "hostname",
+ "hyper",
+ "metrics",
+ "rusqlite",
+ "seahash",
+ "serde",
+ "serde_json",
+ "spawn",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tripwire",
+]
+
+[[package]]
+name = "corro-tests"
+version = "0.1.0"
+dependencies = [
+ "corro-agent",
+ "corro-types",
+ "eyre",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tripwire",
+ "uuid",
+]
+
+[[package]]
+name = "corro-types"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bb8",
+ "bb8-rusqlite",
+ "bytes",
+ "camino",
+ "compact_str 0.7.0",
+ "config",
+ "crc32fast",
+ "enquote",
+ "exprt",
+ "fallible-iterator",
+ "foca",
+ "hex",
+ "indexmap",
+ "itertools",
+ "metrics",
+ "nom",
+ "once_cell",
+ "parking_lot",
+ "rand",
+ "rangemap",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "speedy",
+ "sqlite3-parser",
+ "tempfile",
+ "thiserror",
+ "time 0.3.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uhlc",
+ "ulid",
+ "uuid",
+]
+
+[[package]]
+name = "corrosion"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "axum-extra",
+ "backoff",
+ "bb8",
+ "bb8-rusqlite",
+ "bincode",
+ "bytes",
+ "camino",
+ "clap",
+ "compact_str 0.7.0",
+ "config",
+ "consul",
+ "corro-admin",
+ "corro-agent",
+ "corro-tests",
+ "corro-types",
+ "crc32fast",
+ "exprt",
+ "eyre",
+ "fallible-iterator",
+ "foca",
+ "futures",
+ "hyper",
+ "hyper-rustls",
+ "jsonschema",
+ "lru",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "once_cell",
+ "parking_lot",
+ "pgwire",
+ "quoted-string",
+ "rand",
+ "rangemap",
+ "rusqlite",
+ "rusqlite_migration",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "spawn",
+ "speedy",
+ "sqlite3-parser",
+ "strum",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-serde",
+ "tokio-stream",
+ "tokio-util",
+ "toml",
  "tower",
  "tower-http",
  "tracing",

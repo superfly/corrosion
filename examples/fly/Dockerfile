@@ -16,7 +16,7 @@ COPY . .
 # Will build and cache the binary and dependent crates in release mode
 RUN --mount=type=cache,target=/usr/local/cargo,from=rust:latest,source=/usr/local/cargo \
     --mount=type=cache,target=target \
-    cargo build --release && mv target/release/corrosion target/release/corroctl target/release/corro-consul ./
+    cargo build --release && mv target/release/corrosion target/release/corro-consul ./
 
 # Runtime image
 FROM debian:bullseye-slim
@@ -34,9 +34,8 @@ COPY examples/fly/schemas /app/schemas
 
 # Get compiled binaries from builder's cargo install directory
 COPY --from=builder /usr/src/app/corrosion /app/corrosion
-COPY --from=builder /usr/src/app/corroctl /app/corroctl
 COPY --from=builder /usr/src/app/corro-consul /app/corro-consul
 
 ENTRYPOINT ["/entrypoint"]
 # Run the app
-CMD ["/app/corrosion", "-c", "/app/config.toml"]
+CMD ["/app/corrosion", "agent", "-c", "/app/config.toml"]

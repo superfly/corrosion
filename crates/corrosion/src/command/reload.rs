@@ -1,35 +1,15 @@
 use std::path::Path;
 
-use camino::Utf8PathBuf;
-use clap::{Parser, Subcommand};
 use corro_admin::{Command, LogLevel, Response};
-use corro_types::config::{default_admin_path, Config};
+use corro_types::config::Config;
 use futures::{SinkExt, TryStreamExt};
 use tokio::net::UnixStream;
 use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{error, event, info};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Parser)]
-#[clap(version = VERSION)]
-struct Cli {
-    /// Set the Corrosion config file path, to infer values
-    #[clap(long, short, env = "CORRO_CONFIG")]
-    config: Option<Utf8PathBuf>,
-
-    /// Set the admin socket path for Corrosion
-    #[clap(long, short, env = "CORRO_ADMIN_SOCK")]
-    socket: Option<Utf8PathBuf>,
-
-    #[clap(subcommand)]
-    command: CliCommand,
-}
-
-#[derive(Subcommand)]
-enum CliCommand {
-    Reload,
+pub async fn run(config: Config) -> eyre::Result<()> {
+    handle_reload(&config.admin_path).await
 }
 
 type FramedStream = Framed<
@@ -38,28 +18,6 @@ type FramedStream = Framed<
     Command,
     Json<Response, Command>,
 >;
-
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
-    let cli = Cli::parse();
-
-    let socket_path = cli
-        .socket
-        .or_else(|| {
-            cli.config.and_then(|conf_path| {
-                Config::load(conf_path.as_str())
-                    .ok()
-                    .map(|conf| conf.admin_path)
-            })
-        })
-        .unwrap_or_else(default_admin_path);
-
-    match cli.command {
-        CliCommand::Reload => handle_reload(&socket_path).await?,
-    }
-
-    Ok(())
-}
 
 async fn connect<P: AsRef<Path>>(path: P) -> eyre::Result<FramedStream> {
     let stream = UnixStream::connect(path).await?;
@@ -109,7 +67,7 @@ async fn handle_reload<P: AsRef<Path>>(path: P) -> eyre::Result<()> {
 mod tests {
     use super::*;
 
-    use camino::Utf8Path;
+    use camino::{Utf8Path, Utf8PathBuf};
     use corro_admin::AdminConfig;
     use corro_tests::launch_test_agent;
     use spawn::wait_for_all_pending_handles;

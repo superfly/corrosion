@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
+use corro_agent::agent::start;
 use corro_types::{
     actor::ActorId,
     agent::Agent,
     config::{Config, ConfigBuilder, ConfigBuilderError},
 };
-use corrosion::agent::start;
 use tempfile::TempDir;
 use tripwire::Tripwire;
 use uuid::Uuid;

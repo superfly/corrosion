@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 use camino::Utf8PathBuf;
-use clap::Parser;
 use corro_admin::AdminConfig;
 use corro_types::{
     actor::ActorId,
@@ -17,26 +16,17 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use crate::VERSION;
 
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
+pub async fn run(config: Config, config_path: Utf8PathBuf) -> eyre::Result<()> {
     // do this first!
     let mut hangup = tokio::signal::unix::signal(SignalKind::hangup())?;
-
-    println!("Starting Corrosion v{VERSION}");
-    let app = <App as clap::Parser>::parse();
-
-    let config_path = app.config;
-
-    println!("Using config file: {}", config_path);
-    let config = Config::load(config_path.as_str()).expect("could not read config from file");
 
     let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
     println!("tracing-filter directives: {directives}");
     let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
     if let Some(diags) = diags {
-        eprintln!("While parsing env filters: {diags}");
+        eprintln!("While parsing env filters: {diags}, using default");
     }
 
     // Tracing
@@ -53,6 +43,8 @@ async fn main() -> eyre::Result<()> {
                 .init();
         }
     }
+
+    info!("Starting Corrosion Agent v{VERSION}");
 
     let db_parent_path: Utf8PathBuf = config
         .db_path
@@ -86,7 +78,7 @@ async fn main() -> eyre::Result<()> {
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
-    let agent = corrosion::agent::start(actor_id, config.clone(), tripwire.clone())
+    let agent = corro_agent::agent::start(actor_id, config.clone(), tripwire.clone())
         .await
         .expect("could not start agent");
 
@@ -133,14 +125,6 @@ async fn main() -> eyre::Result<()> {
     wait_for_all_pending_handles().await;
 
     Ok(())
-}
-
-#[derive(Parser)]
-#[clap(version = VERSION)]
-pub(crate) struct App {
-    /// Set the config file path
-    #[clap(long, short, default_value = "corrosion.toml")]
-    pub(crate) config: Utf8PathBuf,
 }
 
 fn setup_prometheus(addr: SocketAddr) -> eyre::Result<()> {
