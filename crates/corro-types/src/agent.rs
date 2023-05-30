@@ -119,7 +119,7 @@ pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> 
     let mut schema_write = agent.0.schema.write();
 
     let new_schema =
-        block_in_place(|| apply_schema(&mut conn, &new_conf.schema_paths, &agent.0.schema.read()))?;
+        block_in_place(|| apply_schema(&mut conn, &new_conf.schema_paths, &schema_write))?;
 
     agent.set_config(new_conf);
     *schema_write = new_schema;
