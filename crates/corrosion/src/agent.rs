@@ -1800,6 +1800,7 @@ pub mod tests {
 
         let schema = {
             let mut conn = pool.get().await?;
+            migrate(&mut conn)?;
             let schema = init_schema(&conn)?;
             apply_schema(&mut conn, &[&schema_path], &schema)?
         };
