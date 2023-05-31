@@ -23,8 +23,6 @@ use corro_types::{
 
 use crate::agent::process_subs;
 
-const MAX_ROWS_IMPACTED: i64 = 1024;
-
 // TODO: accept a few options
 // #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 // #[serde(rename_all = "snake_case")]
@@ -72,7 +70,7 @@ where
             .prepare_cached("SELECT crsql_rows_impacted()")?
             .query_row((), |row| row.get(0))?;
 
-        if rows_impacted > MAX_ROWS_IMPACTED {
+        if rows_impacted > agent.config().max_change_size {
             return Err(ChangeError::TooManyRowsImpacted);
         }
 
@@ -232,7 +230,7 @@ pub async fn api_v1_db_execute(
                     StatusCode::BAD_REQUEST,
                     axum::Json(RqliteResponse {
                         results: vec![RqliteResult::Error {
-                            error: format!("too many changed columns, please restrict the number of statements per request to {MAX_ROWS_IMPACTED}"),
+                            error: format!("too many changed columns, please restrict the number of statements per request to {}", agent.config().max_change_size),
                         }],
                         time: None,
                     }),

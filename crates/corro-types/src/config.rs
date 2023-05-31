@@ -4,6 +4,7 @@ use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
+pub const MAX_CHANGE_SIZE: i64 = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -20,10 +21,17 @@ pub struct Config {
     pub log_format: LogFormat,
     #[serde(default)]
     pub schema_paths: Vec<Utf8PathBuf>,
+
+    #[serde(default = "default_max_change_size")]
+    pub max_change_size: i64,
 }
 
 pub fn default_admin_path() -> Utf8PathBuf {
     "/var/run/corrosion/admin.sock".into()
+}
+
+pub fn default_max_change_size() -> i64 {
+    MAX_CHANGE_SIZE
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +66,7 @@ pub struct ConfigBuilder {
     bootstrap: Option<Vec<String>>,
     log_format: Option<LogFormat>,
     schema_paths: Vec<Utf8PathBuf>,
+    max_change_size: Option<i64>,
 }
 
 impl ConfigBuilder {
@@ -101,6 +110,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn max_change_size(mut self, size: i64) -> Self {
+        self.max_change_size = Some(size);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.unwrap_or_else(default_db_path);
         Ok(Config {
@@ -114,6 +128,7 @@ impl ConfigBuilder {
             bootstrap: self.bootstrap.unwrap_or_default(),
             log_format: self.log_format.unwrap_or_default(),
             schema_paths: self.schema_paths,
+            max_change_size: self.max_change_size.unwrap_or(MAX_CHANGE_SIZE),
         })
     }
 }
