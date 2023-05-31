@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
-axum-extra = { workspace = true }
 backoff = { path = "../backoff" }
 bb8 = { workspace = true }
 bb8-rusqlite = { workspace = true }
@@ -15,14 +15,13 @@ bytes = { workspace = true }
 camino = { workspace = true }
 compact_str = { workspace = true }
 config = { workspace = true }
-consul = { path = "../consul" }
-exprt = { workspace = true }
+corro-types = { path = "../corro-types" }
+crc32fast = { workspace = true }
 eyre = { workspace = true }
 fallible-iterator = { workspace = true }
 foca = { workspace = true }
 futures = { workspace = true }
 hyper = { workspace = true }
-hyper-rustls = { workspace = true }
 jsonschema = { workspace = true }
 metrics = { workspace = true }
 once_cell = { workspace = true }
@@ -30,46 +29,28 @@ parking_lot = { workspace = true }
 pgwire = { workspace = true }
 quoted-string = { workspace = true }
 rand = { workspace = true }
+rangemap = { workspace = true }
 rusqlite = { workspace = true }
-rusqlite_migration = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_with = { workspace = true }
+spawn = { path = "../spawn" }
 speedy = { workspace = true }
 sqlite3-parser = { workspace = true }
-strum = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
+trust-dns-resolver = { workspace = true }
 uhlc = { workspace = true }
 uuid = { workspace = true }
-ulid = { workspace = true }
-webpki = { workspace = true }
-lru = { workspace = true }
-crc32fast = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
-trust-dns-resolver = { workspace = true }
-spawn = { path = "../spawn" }
-rangemap = { workspace = true }
-corro-types = { path = "../corro-types" }
-tempfile = { workspace = true }
-arc-swap = { workspace = true }
-clap = "4.2.4"
-metrics-exporter-prometheus = "0.12.0"
-tracing-filter = { version = "0.1.0-alpha.2", features = ["smallvec"] }
-corro-admin = { path = "../corro-admin" }
 
 [dev-dependencies]
-tokio-postgres = { workspace = true }
 tokio-tungstenite = { workspace = true }
 corro-tests = { path = "../corro-tests" }
-
-# [patch.crates-io]
-# sqlx = { workspace = true }

@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-corro-types = { path = "../corro-types" }
 corro-agent = { path = "../corro-agent" }
+corro-types = { path = "../corro-types" }
 eyre = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

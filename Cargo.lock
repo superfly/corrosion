@@ -225,29 +225,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axum-extra"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe82ff817f40f735cdfd7092f810d3de63bf875f50d1f0c17928e28cdab64437"
-dependencies = [
- "axum",
- "axum-core",
- "bytes",
- "futures-util",
- "http",
- "http-body",
- "mime",
- "pin-project-lite",
- "serde",
- "serde_html_form",
- "tokio",
- "tower",
- "tower-http",
- "tower-layer",
- "tower-service",
-]
-
-[[package]]
 name = "backoff"
 version = "0.1.0"
 dependencies = [
@@ -368,17 +345,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bstr"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba3569f383e8f1598449f1a423e72e99569137b47740b1da11ef19af3d5c3223"
-dependencies = [
- "lazy_static",
- "memchr",
- "regex-automata",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -447,12 +413,6 @@ dependencies = [
  "wasm-bindgen",
  "winapi",
 ]
-
-[[package]]
-name = "cidr"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "300bccc729b1ada84523246038aad61fead689ac362bb9d44beea6f6a188c34b"
 
 [[package]]
 name = "clap"
@@ -617,32 +577,24 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
- "axum-extra",
  "backoff",
  "bb8",
  "bb8-rusqlite",
  "bincode",
  "bytes",
  "camino",
- "clap",
  "compact_str 0.7.0",
  "config",
- "consul",
- "corro-admin",
  "corro-tests",
  "corro-types",
  "crc32fast",
- "exprt",
  "eyre",
  "fallible-iterator",
  "foca",
  "futures",
  "hyper",
- "hyper-rustls",
  "jsonschema",
- "lru",
  "metrics",
- "metrics-exporter-prometheus",
  "once_cell",
  "parking_lot",
  "pgwire",
@@ -650,34 +602,26 @@ dependencies = [
  "rand",
  "rangemap",
  "rusqlite",
- "rusqlite_migration",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
- "serde_with",
  "spawn",
  "speedy",
  "sqlite3-parser",
- "strum",
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-postgres",
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
  "tower",
  "tower-http",
  "tracing",
- "tracing-filter",
  "tracing-subscriber",
  "tripwire",
  "trust-dns-resolver",
  "uhlc",
- "ulid",
  "uuid",
- "webpki",
 ]
 
 [[package]]
@@ -692,7 +636,6 @@ dependencies = [
  "consul",
  "corro-tests",
  "corro-types",
- "corrosion",
  "eyre",
  "futures",
  "hostname",
@@ -738,7 +681,6 @@ dependencies = [
  "config",
  "crc32fast",
  "enquote",
- "exprt",
  "fallible-iterator",
  "foca",
  "hex",
@@ -753,7 +695,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "serde_with",
  "speedy",
  "sqlite3-parser",
  "tempfile",
@@ -764,7 +705,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uhlc",
- "ulid",
  "uuid",
 ]
 
@@ -775,7 +715,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
- "axum-extra",
  "backoff",
  "bb8",
  "bb8-rusqlite",
@@ -785,21 +724,16 @@ dependencies = [
  "clap",
  "compact_str 0.7.0",
  "config",
- "consul",
  "corro-admin",
  "corro-agent",
  "corro-tests",
  "corro-types",
  "crc32fast",
- "exprt",
  "eyre",
  "fallible-iterator",
  "foca",
  "futures",
  "hyper",
- "hyper-rustls",
- "jsonschema",
- "lru",
  "metrics",
  "metrics-exporter-prometheus",
  "once_cell",
@@ -809,16 +743,12 @@ dependencies = [
  "rand",
  "rangemap",
  "rusqlite",
- "rusqlite_migration",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
- "serde_with",
  "spawn",
  "speedy",
  "sqlite3-parser",
- "strum",
  "tempfile",
  "thiserror",
  "tokio",
@@ -834,9 +764,7 @@ dependencies = [
  "tripwire",
  "trust-dns-resolver",
  "uhlc",
- "ulid",
  "uuid",
- "webpki",
 ]
 
 [[package]]
@@ -1119,19 +1047,6 @@ checksum = "aa68f1b12764fab894d2755d2518754e71b4fd80ecfb822714a1206c2aab39bf"
 dependencies = [
  "cc",
  "libc",
-]
-
-[[package]]
-name = "exprt"
-version = "0.1.0"
-source = "git+https://github.com/sahandevs/exprt?branch=main#90aeaad25b05b3b7b66807e115e80878b16eb64e"
-dependencies = [
- "bstr",
- "cidr",
- "paste",
- "peekmore",
- "regex",
- "thiserror",
 ]
 
 [[package]]
@@ -1509,7 +1424,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.4.9",
+ "socket2",
  "tokio",
  "tower-service",
  "tracing",
@@ -1625,7 +1540,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd302af1b90f2463a98fa5ad469fc212c8e3175a41c3068601bfa2727591c5be"
 dependencies = [
- "socket2 0.4.9",
+ "socket2",
  "widestring",
  "winapi",
  "winreg",
@@ -1779,15 +1694,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "abb12e687cfb44aa40f41fc3978ef76448f9b6038cad6aef4259d3c095a2382e"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "lru"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6e8aaa3f231bb4bd57b84b2d5dc3ae7f350265df8aa96492e0bc394a1571909"
-dependencies = [
- "hashbrown 0.12.3",
 ]
 
 [[package]]
@@ -2152,25 +2058,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "paste"
-version = "1.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f746c4065a8fa3fe23974dd82f15431cc8d40779821001404d10d2e79ca7d79"
-
-[[package]]
 name = "pathdiff"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8835116a5c179084a830efb3adc117ab007512b535bc1a21c991d3b32a6b44dd"
-
-[[package]]
-name = "peekmore"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d0adcb0436b76d531e8fe932b4fcaab6beae984ce200b38dad595d8e1e3dce8"
-dependencies = [
- "smallvec",
-]
 
 [[package]]
 name = "pem"
@@ -2570,16 +2461,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusqlite_migration"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef7dd29a4426624704d5966416682fb7ab3682f724986e9e3893eaca44accabc"
-dependencies = [
- "log",
- "rusqlite",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2750,19 +2631,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_html_form"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53192e38d5c88564b924dbe9b60865ecbb71b81d38c4e61c817cffd3e36ef696"
-dependencies = [
- "form_urlencoded",
- "indexmap",
- "itoa",
- "ryu",
- "serde",
-]
-
-[[package]]
 name = "serde_json"
 version = "1.0.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2912,16 +2780,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "socket2"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d283f86695ae989d1e18440a943880967156325ba025f05049946bff47bcc2b"
-dependencies = [
- "libc",
- "windows-sys 0.48.0",
-]
-
-[[package]]
 name = "spawn"
 version = "0.1.0"
 dependencies = [
@@ -3015,28 +2873,6 @@ name = "strsim"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73473c0e59e6d5812c5dfe2a064a6444949f089e20eec9a2e5506596494e4623"
-
-[[package]]
-name = "strum"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "063e6045c0e62079840579a7e47a355ae92f60eb74daaf156fb1e84ba164e63f"
-dependencies = [
- "strum_macros",
-]
-
-[[package]]
-name = "strum_macros"
-version = "0.24.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e385be0d24f186b4ce2f9982191e7101bb737312ad61c1f2f984f34bcf85d59"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "rustversion",
- "syn 1.0.109",
-]
 
 [[package]]
 name = "subtle"
@@ -3240,7 +3076,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2 0.4.9",
+ "socket2",
  "tokio-macros",
  "windows-sys 0.45.0",
 ]
@@ -3254,30 +3090,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.13",
-]
-
-[[package]]
-name = "tokio-postgres"
-version = "0.7.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e89f6234aa8fd43779746012fcf53603cdb91fdd8399aa0de868c2d56b6dde1"
-dependencies = [
- "async-trait",
- "byteorder",
- "bytes",
- "fallible-iterator",
- "futures-channel",
- "futures-util",
- "log",
- "parking_lot",
- "percent-encoding",
- "phf",
- "pin-project-lite",
- "postgres-protocol",
- "postgres-types",
- "socket2 0.5.2",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -3593,17 +3405,6 @@ dependencies = [
  "log",
  "serde",
  "spin 0.9.8",
- "uuid",
-]
-
-[[package]]
-name = "ulid"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13a3aaa69b04e5b66cc27309710a569ea23593612387d67daaf102e73aa974fd"
-dependencies = [
- "rand",
- "serde",
  "uuid",
 ]
 
