@@ -23,6 +23,8 @@ use corro_types::{
 
 use crate::agent::process_subs;
 
+const MAX_ROWS_IMPACTED: i64 = 1024;
+
 // TODO: accept a few options
 // #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 // #[serde(rename_all = "snake_case")]
@@ -39,6 +41,8 @@ pub enum ChangeError {
     ConnAcquisition(#[from] RunError<bb8_rusqlite::Error>),
     #[error("rusqlite: {0}")]
     Rusqlite(#[from] rusqlite::Error),
+    #[error("too many rows impacted")]
+    TooManyRowsImpacted,
 }
 
 pub async fn make_broadcastable_changes<F, T>(
@@ -63,6 +67,14 @@ where
             .query_row((), |row| row.get(0))?;
 
         let ret = f(&tx)?;
+
+        let rows_impacted: i64 = tx
+            .prepare_cached("SELECT crsql_rows_impacted()")?
+            .query_row((), |row| row.get(0))?;
+
+        if rows_impacted > MAX_ROWS_IMPACTED {
+            return Err(ChangeError::TooManyRowsImpacted);
+        }
 
         let last_version = agent.bookie().last(&actor_id).unwrap_or(0);
         trace!("last_version: {last_version}");
@@ -167,8 +179,6 @@ fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usi
     }
 }
 
-const MAX_STATEMENTS_PER_REQUEST: usize = 50;
-
 pub async fn api_v1_db_execute(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Extension(agent): Extension<Agent>,
@@ -180,20 +190,6 @@ pub async fn api_v1_db_execute(
             axum::Json(RqliteResponse {
                 results: vec![RqliteResult::Error {
                     error: "at least 1 statement is required".into(),
-                }],
-                time: None,
-            }),
-        );
-    }
-
-    // FIXME: chunk changes by `n` rows, not statements
-    //        waiting on crsqlite changes that gives consistent rowids on crsql_changes
-    if statements.len() > MAX_STATEMENTS_PER_REQUEST {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(RqliteResponse {
-                results: vec![RqliteResult::Error {
-                    error: format!("too many statements, please restrict the number of statements per request to {MAX_STATEMENTS_PER_REQUEST}"),
                 }],
                 time: None,
             }),
@@ -230,18 +226,31 @@ pub async fn api_v1_db_execute(
 
     let (results, elapsed) = match res {
         Ok(res) => res,
-        Err(e) => {
-            error!("could not execute statement(s): {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(RqliteResponse {
-                    results: vec![RqliteResult::Error {
-                        error: e.to_string(),
-                    }],
-                    time: None,
-                }),
-            );
-        }
+        Err(e) => match e {
+            ChangeError::TooManyRowsImpacted => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(RqliteResponse {
+                        results: vec![RqliteResult::Error {
+                            error: format!("too many changed columns, please restrict the number of statements per request to {MAX_ROWS_IMPACTED}"),
+                        }],
+                        time: None,
+                    }),
+                );
+            }
+            e => {
+                error!("could not execute statement(s): {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(RqliteResponse {
+                        results: vec![RqliteResult::Error {
+                            error: e.to_string(),
+                        }],
+                        time: None,
+                    }),
+                );
+            }
+        },
     };
 
     (
