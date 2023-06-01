@@ -401,7 +401,7 @@ mod tests {
                     .build()?,
             ),
             gossip_addr: "127.0.0.1:0".parse().unwrap(),
-            api_addr: Default::default(),
+            api_addr: "127.0.0.1:0".parse().unwrap(),
             members: Default::default(),
             clock: Default::default(),
             bookie: Default::default(),

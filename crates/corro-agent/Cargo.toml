@@ -22,7 +22,6 @@ fallible-iterator = { workspace = true }
 foca = { workspace = true }
 futures = { workspace = true }
 hyper = { workspace = true }
-jsonschema = { workspace = true }
 metrics = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }

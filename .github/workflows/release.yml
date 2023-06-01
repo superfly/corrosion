@@ -38,7 +38,7 @@ jobs:
       - uses: rui314/setup-mold@v1
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: corrosion,corro-consul
+          bin: corrosion
           archive: "corrosion-$target"
           target: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}

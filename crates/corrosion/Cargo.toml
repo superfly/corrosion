@@ -16,14 +16,17 @@ camino = { workspace = true }
 clap = { workspace = true }
 compact_str = { workspace = true }
 config = { workspace = true }
+consul-client = { path = "../consul-client" }
 corro-admin = { path = "../corro-admin" }
 corro-agent = { path = "../corro-agent" }
+corro-client = { path = "../corro-client" }
 corro-types = { path = "../corro-types" }
 crc32fast = { workspace = true }
 eyre = { workspace = true }
 fallible-iterator = { workspace = true }
 foca = { workspace = true }
 futures = { workspace = true }
+hostname = { workspace = true }
 hyper = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
@@ -35,6 +38,7 @@ rand = { workspace = true }
 rangemap = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
+seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spawn = { path = "../spawn" }

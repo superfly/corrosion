@@ -1,176 +1,26 @@
+use consul_client::{AgentCheck, AgentService, Client};
+use corro_client::CorrosionClient;
+use corro_types::{api::Statement, config::ConsulConfig};
+use metrics::{histogram, increment_counter};
+use serde::{Deserialize, Serialize};
+use spawn::{spawn_counted, wait_for_all_pending_handles};
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
     net::SocketAddr,
+    path::Path,
     time::{Duration, Instant, SystemTime},
 };
-
-use bb8_rusqlite::RusqliteConnectionManager;
-use camino::Utf8PathBuf;
-use clap::Parser;
-use consul::{AgentCheck, AgentService, Client};
-use corro_types::api::{RqliteResponse, Statement};
-use hyper::{client::HttpConnector, Body};
-use metrics::{histogram, increment_counter};
-use serde::{Deserialize, Serialize};
-use spawn::{spawn_counted, wait_for_all_pending_handles};
 use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, trace};
 
 const CONSUL_PULL_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Config {
-    #[serde(default)]
-    extra_services_columns: Vec<String>,
-    #[serde(default)]
-    extra_statements: Vec<String>,
-
-    corrosion: CorrosionConfig,
-    consul: consul::Config,
-}
-
-impl Config {
-    /// Reads configuration from a TOML file, given its path. Environment
-    /// variables can override whatever is set in the config file.
-    pub fn read_from_file_and_env(config_path: &str) -> eyre::Result<Self> {
-        let config = config::Config::builder()
-            .add_source(config::File::new(config_path, config::FileFormat::Toml))
-            .add_source(config::Environment::default().separator("__"))
-            .build()?;
-        Ok(config.try_deserialize()?)
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CorrosionConfig {
+pub async fn run<P: AsRef<Path>>(
+    config: &ConsulConfig,
     api_addr: SocketAddr,
-    db_path: Utf8PathBuf,
-}
-
-#[derive(Clone)]
-pub struct CorrosionClient {
-    api_addr: SocketAddr,
-    pool: bb8::Pool<bb8_rusqlite::RusqliteConnectionManager>,
-    api_client: hyper::Client<HttpConnector, Body>,
-}
-
-impl CorrosionClient {
-    pub fn new(config: &CorrosionConfig) -> Self {
-        Self {
-            api_addr: config.api_addr,
-            pool: bb8::Pool::builder()
-                .max_size(5)
-                .max_lifetime(Some(Duration::from_secs(30)))
-                .build_unchecked(RusqliteConnectionManager::new(&config.db_path)),
-            api_client: hyper::Client::builder().http2_only(true).build_http(),
-        }
-    }
-
-    pub fn pool(&self) -> &bb8::Pool<RusqliteConnectionManager> {
-        &self.pool
-    }
-
-    pub async fn execute(&self, statements: &[Statement]) -> eyre::Result<RqliteResponse> {
-        let req = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(format!("http://{}/db/execute?transaction", self.api_addr))
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::ACCEPT, "application/json")
-            .body(Body::from(serde_json::to_vec(statements)?))?;
-
-        let res = self.api_client.request(req).await?;
-
-        if !res.status().is_success() {
-            return Err(eyre::eyre!("bad response code {}", res.status()));
-        }
-
-        let bytes = hyper::body::to_bytes(res.into_body()).await?;
-
-        Ok(serde_json::from_slice(&bytes)?)
-    }
-
-    pub async fn schema(&self, statements: &[Statement]) -> eyre::Result<RqliteResponse> {
-        let req = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(format!("http://{}/db/schema", self.api_addr))
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::ACCEPT, "application/json")
-            .body(Body::from(serde_json::to_vec(statements)?))?;
-
-        let res = self.api_client.request(req).await?;
-
-        if !res.status().is_success() {
-            return Err(eyre::eyre!("bad response code {}", res.status()));
-        }
-
-        let bytes = hyper::body::to_bytes(res.into_body()).await?;
-
-        Ok(serde_json::from_slice(&bytes)?)
-    }
-}
-
-#[derive(Parser)]
-#[clap(version = "0.1.0")]
-pub(crate) struct App {
-    /// Set the config file path
-    #[clap(long, short, default_value = "corro-consul.toml")]
-    pub(crate) config: Utf8PathBuf,
-}
-
-fn build_schema(
-    extra_services_columns: Vec<String>,
-    extra_statements: Vec<String>,
-) -> Vec<Statement> {
-    let extra = extra_services_columns.join(",");
-    let mut statements = vec![
-        Statement::Simple(format!("CREATE TABLE consul_services (
-            node TEXT NOT NULL,
-            id TEXT NOT NULL,
-            name TEXT NOT NULL DEFAULT '',
-            tags TEXT NOT NULL DEFAULT '[]',
-            meta TEXT NOT NULL DEFAULT '{{}}',
-            port INTEGER NOT NULL DEFAULT 0,
-            address TEXT NOT NULL DEFAULT '',
-            updated_at INTEGER NOT NULL DEFAULT 0,
-
-            {}
-            
-            PRIMARY KEY (node, id)
-        ) WITHOUT ROWID;", if extra.is_empty() { String::new() } else {format!("{extra},")})),
-        Statement::Simple("CREATE INDEX consul_services_node_id_updated_at ON consul_services (node, id, updated_at);".to_string()),
-
-        Statement::Simple("CREATE TABLE consul_checks (
-            node TEXT NOT NULL,
-            id TEXT NOT NULL,
-            service_id TEXT NOT NULL DEFAULT '',
-            service_name TEXT NOT NULL DEFAULT '',
-            name TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT '',
-            output TEXT NOT NULL DEFAULT '',
-            updated_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (node, id)
-        ) WITHOUT ROWID;".to_string()),
-        Statement::Simple("CREATE INDEX consul_checks_node_id_updated_at ON consul_checks (node, id, updated_at);".to_string()),
-        Statement::Simple("CREATE INDEX consul_checks_node_service_id ON consul_checks (node, service_id);".to_string()),
-    ];
-
-    for s in extra_statements {
-        statements.push(Statement::Simple(s));
-    }
-
-    statements
-}
-
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
-    let app = <App as clap::Parser>::parse();
-
-    println!("Using config file: {}", app.config);
-
-    let config = Config::read_from_file_and_env(app.config.as_str())
-        .expect("could not read config from file");
-
+    db_path: P,
+) -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
 
     let (mut tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
@@ -182,14 +32,14 @@ async fn main() -> eyre::Result<()> {
             .into_boxed_str(),
     );
 
-    let corrosion = CorrosionClient::new(&config.corrosion);
-    let consul = consul::Client::new(config.consul.clone())?;
+    let corrosion = CorrosionClient::new(api_addr, db_path);
+    let consul = consul_client::Client::new(config.client.clone())?;
 
-    info!("Setting up corrosion for corro-consul");
+    info!("Setting up corrosion for consul sync");
     setup(
         &corrosion,
-        config.extra_services_columns,
-        config.extra_statements,
+        config.extra_services_columns.as_slice(),
+        config.extra_statements.as_slice(),
     )
     .await?;
 
@@ -270,8 +120,8 @@ async fn main() -> eyre::Result<()> {
 
 async fn setup(
     corrosion: &CorrosionClient,
-    extra_services_columns: Vec<String>,
-    extra_statements: Vec<String>,
+    extra_services_columns: &[String],
+    extra_statements: &[String],
 ) -> eyre::Result<()> {
     {
         let mut conn = corrosion.pool().get().await?;
@@ -299,6 +149,47 @@ async fn setup(
         .schema(&build_schema(extra_services_columns, extra_statements))
         .await?;
     Ok(())
+}
+
+fn build_schema(extra_services_columns: &[String], extra_statements: &[String]) -> Vec<Statement> {
+    let extra = extra_services_columns.join(",");
+    let mut statements = vec![
+        Statement::Simple(format!("CREATE TABLE consul_services (
+            node TEXT NOT NULL,
+            id TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '[]',
+            meta TEXT NOT NULL DEFAULT '{{}}',
+            port INTEGER NOT NULL DEFAULT 0,
+            address TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+
+            {}
+            
+            PRIMARY KEY (node, id)
+        ) WITHOUT ROWID;", if extra.is_empty() { String::new() } else {format!("{extra},")})),
+        Statement::Simple("CREATE INDEX consul_services_node_id_updated_at ON consul_services (node, id, updated_at);".to_string()),
+
+        Statement::Simple("CREATE TABLE consul_checks (
+            node TEXT NOT NULL,
+            id TEXT NOT NULL,
+            service_id TEXT NOT NULL DEFAULT '',
+            service_name TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            output TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (node, id)
+        ) WITHOUT ROWID;".to_string()),
+        Statement::Simple("CREATE INDEX consul_checks_node_id_updated_at ON consul_checks (node, id, updated_at);".to_string()),
+        Statement::Simple("CREATE INDEX consul_checks_node_service_id ON consul_checks (node, service_id);".to_string()),
+    ];
+
+    for s in extra_statements {
+        statements.push(Statement::Simple(s.clone()));
+    }
+
+    statements
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -703,15 +594,12 @@ mod tests {
         )
         .await?;
 
-        let ta1_client = CorrosionClient::new(&CorrosionConfig {
-            api_addr: ta1.agent.api_addr().unwrap(),
-            db_path: ta1.agent.db_path(),
-        });
+        let ta1_client = CorrosionClient::new(ta1.agent.api_addr(), ta1.agent.db_path());
 
         setup(
             &ta1_client,
-            vec!["app_id INTEGER AS (CAST (JSON_EXTRACT (meta, '$.app_id') AS INTEGER))".into()],
-            vec![],
+            &["app_id INTEGER AS (CAST (JSON_EXTRACT (meta, '$.app_id') AS INTEGER))".into()],
+            &[],
         )
         .await?;
 
@@ -763,15 +651,12 @@ mod tests {
 
         assert_eq!(hashes.get("service-id"), Some(&hash_service(&svc)));
 
-        let ta2_client = CorrosionClient::new(&CorrosionConfig {
-            api_addr: ta2.agent.api_addr().unwrap(),
-            db_path: ta2.agent.db_path(),
-        });
+        let ta2_client = CorrosionClient::new(ta2.agent.api_addr(), ta2.agent.db_path());
 
         setup(
             &ta2_client,
-            vec!["app_id INTEGER AS (CAST (JSON_EXTRACT (meta, '$.app_id') AS INTEGER))".into()],
-            vec![],
+            &["app_id INTEGER AS (CAST (JSON_EXTRACT (meta, '$.app_id') AS INTEGER))".into()],
+            &[],
         )
         .await?;
 

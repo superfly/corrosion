@@ -21,6 +21,16 @@ async fn main() -> eyre::Result<()> {
         }
         Some(cmd) => match cmd {
             Command::Agent => command::agent::run(config, config_path).await?,
+            Command::Consul(cmd) => match cmd {
+                ConsulCommand::Sync => match config.consul.as_ref() {
+                    Some(consul) => {
+                        command::consul::sync::run(consul, config.api_addr, &config.db_path).await?
+                    }
+                    None => {
+                        eprintln!("missing `consul` block in corrosion config");
+                    }
+                },
+            },
             Command::Reload => command::reload::run(config).await?,
         },
     }
@@ -44,6 +54,16 @@ enum Command {
     /// Launches the agent
     Agent,
 
+    /// Consul interactions
+    #[command(subcommand)]
+    Consul(ConsulCommand),
+
     /// Reload the config
     Reload,
+}
+
+#[derive(Subcommand)]
+enum ConsulCommand {
+    /// Synchronizes the local consul agent with Corrosion
+    Sync,
 }

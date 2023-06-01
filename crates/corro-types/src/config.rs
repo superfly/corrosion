@@ -10,8 +10,7 @@ pub const MAX_CHANGE_SIZE: i64 = 1024;
 pub struct Config {
     pub db_path: Utf8PathBuf,
     pub gossip_addr: SocketAddr,
-    #[serde(default)]
-    pub api_addr: Option<SocketAddr>,
+    pub api_addr: SocketAddr,
     #[serde(default = "default_admin_path")]
     pub admin_path: Utf8PathBuf,
     pub metrics_addr: Option<SocketAddr>,
@@ -24,6 +23,9 @@ pub struct Config {
 
     #[serde(default = "default_max_change_size")]
     pub max_change_size: i64,
+
+    #[serde(default)]
+    pub consul: Option<ConsulConfig>,
 }
 
 pub fn default_admin_path() -> Utf8PathBuf {
@@ -67,6 +69,7 @@ pub struct ConfigBuilder {
     log_format: Option<LogFormat>,
     schema_paths: Vec<Utf8PathBuf>,
     max_change_size: Option<i64>,
+    consul: Option<ConsulConfig>,
 }
 
 impl ConfigBuilder {
@@ -115,6 +118,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn consul(mut self, config: ConsulConfig) -> Self {
+        self.consul = Some(config);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.unwrap_or_else(default_db_path);
         Ok(Config {
@@ -122,13 +130,15 @@ impl ConfigBuilder {
             gossip_addr: self
                 .gossip_addr
                 .ok_or(ConfigBuilderError::GossipAddrRequired)?,
-            api_addr: self.api_addr,
+            api_addr: self.api_addr.ok_or(ConfigBuilderError::ApiAddrRequired)?,
             admin_path: self.admin_path.unwrap_or_else(default_admin_path),
             metrics_addr: self.metrics_addr,
             bootstrap: self.bootstrap.unwrap_or_default(),
             log_format: self.log_format.unwrap_or_default(),
             schema_paths: self.schema_paths,
             max_change_size: self.max_change_size.unwrap_or(MAX_CHANGE_SIZE),
+
+            consul: self.consul,
         })
     }
 }
@@ -137,6 +147,8 @@ impl ConfigBuilder {
 pub enum ConfigBuilderError {
     #[error("gossip_addr required")]
     GossipAddrRequired,
+    #[error("api_addr required")]
+    ApiAddrRequired,
 }
 
 fn default_db_path() -> Utf8PathBuf {
@@ -156,4 +168,15 @@ impl Default for LogFormat {
     fn default() -> Self {
         LogFormat::Plaintext
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConsulConfig {
+    #[serde(default)]
+    pub extra_services_columns: Vec<String>,
+    #[serde(default)]
+    pub extra_statements: Vec<String>,
+
+    pub client: consul_client::Config,
 }

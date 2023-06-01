@@ -70,7 +70,7 @@ const RANDOM_NODES_CHOICES: usize = 10;
 pub struct AgentOptions {
     actor_id: ActorId,
     gossip_listener: TcpListener,
-    api_listener: Option<TcpListener>,
+    api_listener: TcpListener,
     bootstrap: Vec<String>,
     rx_bcast: Receiver<BroadcastInput>,
     tripwire: Tripwire,
@@ -175,14 +175,8 @@ pub async fn setup(
     let gossip_listener = TcpListener::bind(conf.gossip_addr).await?;
     let gossip_addr = gossip_listener.local_addr()?;
 
-    let (api_listener, api_addr) = match conf.api_addr {
-        Some(api_addr) => {
-            let ln = TcpListener::bind(api_addr).await?;
-            let addr = ln.local_addr()?;
-            (Some(ln), Some(addr))
-        }
-        None => (None, None),
-    };
+    let api_listener = TcpListener::bind(conf.api_addr).await?;
+    let api_addr = api_listener.local_addr()?;
 
     let clock = Arc::new(
         uhlc::HLCBuilder::default()
@@ -463,24 +457,22 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http());
 
-    if let Some(api_listener) = api_listener {
-        let api_addr = api_listener.local_addr()?;
-        info!("Starting public API server on {api_addr}");
-        spawn_counted(
-            axum::Server::builder(AddrIncoming::from_listener(api_listener)?)
-                .executor(CountedExecutor)
-                .serve(
-                    api.clone()
-                        .into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .with_graceful_shutdown(
-                    tripwire
-                        .clone()
-                        .inspect(move |_| info!("corrosion api http tripped {api_addr}")),
-                )
-                .inspect(|_| info!("corrosion api is done")),
-        );
-    }
+    let api_addr = api_listener.local_addr()?;
+    info!("Starting public API server on {api_addr}");
+    spawn_counted(
+        axum::Server::builder(AddrIncoming::from_listener(api_listener)?)
+            .executor(CountedExecutor)
+            .serve(
+                api.clone()
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(
+                tripwire
+                    .clone()
+                    .inspect(move |_| info!("corrosion api http tripped {api_addr}")),
+            )
+            .inspect(|_| info!("corrosion api is done")),
+    );
 
     spawn_counted(
         sync_loop(agent.clone(), client.clone(), tripwire.clone())
@@ -1469,10 +1461,7 @@ pub mod tests {
             .request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!(
-                        "http://{}/db/execute",
-                        ta1.agent.api_addr().unwrap()
-                    ))
+                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
             )
@@ -1541,10 +1530,7 @@ pub mod tests {
             .request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!(
-                        "http://{}/db/execute",
-                        ta1.agent.api_addr().unwrap()
-                    ))
+                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
             )
@@ -1660,7 +1646,7 @@ pub mod tests {
 
         let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
 
-        let addrs: Vec<SocketAddr> = agents.iter().filter_map(|ta| ta.agent.api_addr()).collect();
+        let addrs: Vec<SocketAddr> = agents.iter().map(|ta| ta.agent.api_addr()).collect();
 
         let count = 200;
 
@@ -1891,11 +1877,9 @@ pub mod tests {
         )
         .await?;
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
-            "ws://{}/v1/subscribe",
-            ta.agent.api_addr().unwrap()
-        ))
-        .await?;
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/v1/subscribe", ta.agent.api_addr()))
+                .await?;
 
         let id = SubscriptionId("blah".into());
 

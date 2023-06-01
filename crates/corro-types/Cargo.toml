@@ -12,6 +12,7 @@ bytes = { workspace = true }
 camino = { workspace = true }
 compact_str = { workspace = true }
 config = { workspace = true }
+consul-client = { path = "../consul-client" }
 crc32fast = { workspace = true }
 enquote = { workspace = true }
 fallible-iterator = { workspace = true }

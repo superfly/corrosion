@@ -27,7 +27,7 @@ pub struct AgentInner {
     pub rw_pool: SqlitePool,
     pub config: ArcSwap<Config>,
     pub gossip_addr: SocketAddr,
-    pub api_addr: Option<SocketAddr>,
+    pub api_addr: SocketAddr,
     pub members: RwLock<Members>,
     pub clock: Arc<uhlc::HLC>,
     pub bookie: Bookie,
@@ -57,7 +57,7 @@ impl Agent {
     pub fn gossip_addr(&self) -> SocketAddr {
         self.0.gossip_addr
     }
-    pub fn api_addr(&self) -> Option<SocketAddr> {
+    pub fn api_addr(&self) -> SocketAddr {
         self.0.api_addr
     }
     pub fn subscribers(&self) -> &Subscribers {
