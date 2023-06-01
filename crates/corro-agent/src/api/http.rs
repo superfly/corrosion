@@ -403,6 +403,7 @@ mod tests {
                     .db_path(dir.path().join("corrosion.db").display().to_string())
                     .add_schema_path(schema_path.display().to_string())
                     .gossip_addr("127.0.0.1:1234".parse()?)
+                    .api_addr("127.0.0.1:8080".parse()?)
                     .build()?,
             ),
             gossip_addr: "127.0.0.1:0".parse().unwrap(),
