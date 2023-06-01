@@ -133,7 +133,12 @@ pub enum SyncError {
 #[error("unknown accept header value '{0}'")]
 pub struct UnknownAcceptHeaderValue(String);
 
-fn send_msg(actor_id: ActorId, version: i64, changeset: Changeset, sender: &Sender<SyncMessage>) {
+fn send_single_version(
+    actor_id: ActorId,
+    version: i64,
+    changeset: Changeset,
+    sender: &Sender<SyncMessage>,
+) {
     let msg = match changeset {
         Changeset::Empty => SyncMessage::V1(SyncMessageV1::Cleared {
             actor_id,
@@ -147,7 +152,11 @@ fn send_msg(actor_id: ActorId, version: i64, changeset: Changeset, sender: &Send
         }),
     };
 
-    trace!("sending msg: actor: {actor_id}, version: {version}",);
+    send_msg(msg, sender)
+}
+
+fn send_msg(msg: SyncMessage, sender: &Sender<SyncMessage>) {
+    trace!("sending sync msg: {msg:?}");
 
     // async send the data... not ideal but it'll have to do
     // TODO: figure out a better way to backpressure here, maybe drop this range?
@@ -172,21 +181,27 @@ fn process_range(
     let (start, end) = (range.start(), range.end());
     trace!("processing range {start}..={end} for {}", actor_id);
 
-    let overlapping: Vec<(i64, KnownDbVersion)> = {
+    let overlapping: Vec<(_, KnownDbVersion)> = {
         booked
             .read()
             .overlapping(range)
-            .map(|(k, v)| (*k.end(), v.clone()))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     };
 
-    for (version, db_version) in overlapping {
+    for (versions, db_version) in overlapping {
         match db_version {
             KnownDbVersion::Current { db_version, ts } => block_in_place(|| {
-                process_version(&conn, version, db_version, ts, actor_id, is_local, &sender)
+                for version in versions {
+                    process_version(&conn, version, db_version, ts, actor_id, is_local, &sender)?;
+                }
+                Ok::<_, eyre::Report>(())
             })?,
             KnownDbVersion::Cleared => {
-                send_msg(actor_id, version, Changeset::Empty, sender);
+                send_msg(
+                    SyncMessage::V1(SyncMessageV1::Cleared { actor_id, versions }),
+                    sender,
+                );
             }
         }
     }
@@ -237,7 +252,13 @@ fn process_version(
         })?
         .collect::<rusqlite::Result<Vec<Change>>>()?;
 
-    send_msg(actor_id, version, Changeset::Full { changes, ts }, &sender);
+    let changeset = if changes.is_empty() {
+        Changeset::Empty
+    } else {
+        Changeset::Full { changes, ts }
+    };
+
+    send_single_version(actor_id, version, changeset, &sender);
 
     trace!("done processing db version: {db_version}");
 
