@@ -10,12 +10,12 @@ use axum::{
     Extension,
 };
 use bytes::BytesMut;
-use corro_types::agent::Agent;
-use corro_types::broadcast::Timestamp;
+use corro_types::agent::{Agent, KnownDbVersion};
+use corro_types::broadcast::{Changeset, Timestamp};
+use corro_types::sync::{SyncMessage, SyncMessageV1};
 use futures::StreamExt;
 use metrics::{counter, histogram};
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::block_in_place;
 use tokio::time::timeout;
@@ -27,7 +27,6 @@ use crate::agent::handle_payload;
 use corro_types::{
     actor::ActorId,
     agent::{Booked, Bookie},
-    broadcast::MessageV1,
     broadcast::{BroadcastSrc, FocaInput, Message},
     change::Change,
     sqlite::SqlitePool,
@@ -103,59 +102,6 @@ pub async fn peer_api_v1_broadcast(
     StatusCode::ACCEPTED
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SyncMessage {
-    pub actor_id: ActorId,
-    pub heads: HashMap<ActorId, i64>,
-    pub need: HashMap<ActorId, Vec<RangeInclusive<i64>>>,
-}
-
-impl SyncMessage {
-    pub fn need_len(&self) -> i64 {
-        self.need
-            .values()
-            .flat_map(|v| v.iter().map(|range| (range.end() - range.start()) + 1))
-            .sum()
-    }
-
-    pub fn need_len_for_actor(&self, actor_id: &ActorId) -> i64 {
-        self.need
-            .get(actor_id)
-            .map(|v| {
-                v.iter()
-                    .map(|range| (range.end() - range.start()) + 1)
-                    .sum()
-            })
-            .unwrap_or(0)
-    }
-}
-
-// generates a `SyncMessage` to tell another node what versions we're missing
-pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncMessage {
-    let mut sync = SyncMessage {
-        actor_id,
-        heads: Default::default(),
-        need: Default::default(),
-    };
-
-    let actors: Vec<(ActorId, Booked)> =
-        { bookie.read().iter().map(|(k, v)| (*k, v.clone())).collect() };
-
-    for (actor_id, booked) in actors {
-        let last_version = match booked.last() {
-            Some(v) => v,
-            None => continue,
-        };
-
-        sync.need
-            .insert(actor_id, booked.read().gaps(&(1..=last_version)).collect());
-
-        sync.heads.insert(actor_id, last_version);
-    }
-
-    sync
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
     #[error(transparent)]
@@ -187,27 +133,21 @@ pub enum SyncError {
 #[error("unknown accept header value '{0}'")]
 pub struct UnknownAcceptHeaderValue(String);
 
-fn send_msg(
-    actor_id: ActorId,
-    version: i64,
-    changeset: Vec<Change>,
-    sender: &Sender<Message>,
-    ts: Timestamp,
-) {
-    let changeset_len = changeset.len();
+fn send_msg(actor_id: ActorId, version: i64, changeset: Changeset, sender: &Sender<SyncMessage>) {
+    let msg = match changeset {
+        Changeset::Empty => SyncMessage::V1(SyncMessageV1::Cleared {
+            actor_id,
+            versions: version..=version,
+        }),
+        Changeset::Full { changes, ts } => SyncMessage::V1(SyncMessageV1::Changeset {
+            actor_id,
+            version,
+            changes,
+            ts,
+        }),
+    };
 
-    // build the Message
-    let msg = Message::V1(MessageV1::Change {
-        actor_id,
-        version,
-        changeset,
-        ts,
-    });
-
-    trace!(
-        "sending msg: actor: {}, version: {version}, changes len: {changeset_len}",
-        actor_id,
-    );
+    trace!("sending msg: actor: {actor_id}, version: {version}",);
 
     // async send the data... not ideal but it'll have to do
     // TODO: figure out a better way to backpressure here, maybe drop this range?
@@ -227,12 +167,12 @@ fn process_range(
     range: &RangeInclusive<i64>,
     actor_id: ActorId,
     is_local: bool,
-    sender: &Sender<Message>,
+    sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
     let (start, end) = (range.start(), range.end());
     trace!("processing range {start}..={end} for {}", actor_id);
 
-    let overlapping: Vec<(i64, (Option<i64>, Timestamp))> = {
+    let overlapping: Vec<(i64, KnownDbVersion)> = {
         booked
             .read()
             .overlapping(range)
@@ -240,13 +180,13 @@ fn process_range(
             .collect()
     };
 
-    for (version, (db_version, ts)) in overlapping {
+    for (version, db_version) in overlapping {
         match db_version {
-            Some(db_version) => block_in_place(|| {
+            KnownDbVersion::Current { db_version, ts } => block_in_place(|| {
                 process_version(&conn, version, db_version, ts, actor_id, is_local, &sender)
             })?,
-            None => {
-                send_msg(actor_id, version, vec![], sender, ts);
+            KnownDbVersion::Cleared => {
+                send_msg(actor_id, version, Changeset::Empty, sender);
             }
         }
     }
@@ -261,7 +201,7 @@ fn process_version(
     ts: Timestamp,
     actor_id: ActorId,
     is_local: bool,
-    sender: &Sender<Message>,
+    sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
     let mut prepped = conn.prepare_cached(
         r#"
@@ -283,7 +223,7 @@ fn process_version(
         Some(actor_id.to_bytes())
     };
 
-    let changeset: Vec<Change> = prepped
+    let changes: Vec<Change> = prepped
         .query_map(params![site_id, db_version], |row| {
             Ok(Change {
                 table: row.get(0)?,
@@ -297,7 +237,7 @@ fn process_version(
         })?
         .collect::<rusqlite::Result<Vec<Change>>>()?;
 
-    send_msg(actor_id, version, changeset, &sender, ts);
+    send_msg(actor_id, version, Changeset::Full { changes, ts }, &sender);
 
     trace!("done processing db version: {db_version}");
 
@@ -309,15 +249,20 @@ async fn process_sync(
     pool: &SqlitePool,
     bookie: &Bookie,
     sync: SyncMessage,
-    sender: Sender<Message>,
+    sender: Sender<SyncMessage>,
 ) -> eyre::Result<()> {
+    let sync_state = match sync.state() {
+        Some(state) => state,
+        None => eyre::bail!("unexpected sync message: {sync:?}"),
+    };
+
     let conn = pool.get().await?;
 
     let bookie: HashMap<ActorId, Booked> =
         { bookie.read().iter().map(|(k, v)| (*k, v.clone())).collect() };
 
     for (actor_id, booked) in bookie {
-        if actor_id == sync.actor_id {
+        if actor_id == sync_state.actor_id {
             trace!("skipping itself!");
             // don't send the requester's data
             continue;
@@ -326,14 +271,14 @@ async fn process_sync(
         let is_local = actor_id == local_actor_id;
 
         // 1. process needed versions
-        if let Some(needed) = sync.need.get(&actor_id) {
+        if let Some(needed) = sync_state.need.get(&actor_id) {
             for range in needed {
                 process_range(&booked, &conn, range, actor_id, is_local, &sender)?;
             }
         }
 
         // 2. process newer-than-heads
-        let their_last_version = sync.heads.get(&actor_id).copied().unwrap_or(0);
+        let their_last_version = sync_state.heads.get(&actor_id).copied().unwrap_or(0);
         let our_last_version = booked.last().unwrap_or(0);
 
         trace!("their last version: {their_last_version} vs ours: {our_last_version}");
@@ -380,7 +325,7 @@ pub async fn peer_api_v1_sync_post(
     }
 
     let (mut sender, body) = hyper::body::Body::channel();
-    let (tx, mut rx) = channel::<Message>(256);
+    let (tx, mut rx) = channel::<SyncMessage>(256);
 
     tokio::spawn(async move {
         let mut buf = BytesMut::new();

@@ -9,7 +9,7 @@ use speedy::{Readable, Writable};
 
 use crate::filters::parse_sqlite_quoted_str;
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Readable, Writable)]
 pub struct Change {
     pub table: String,
     pub pk: String,

@@ -2602,8 +2602,7 @@ dependencies = [
 [[package]]
 name = "speedy"
 version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7642861d1a1569b105c57008df95fb12ba648f7f90358f46e99bdfbf26729b84"
+source = "git+https://github.com/koute/speedy?rev=c0f715d3b16758f4a1d278e7affbd3e7bb9f1ff7#c0f715d3b16758f4a1d278e7affbd3e7bb9f1ff7"
 dependencies = [
  "memoffset",
  "speedy-derive",
@@ -2613,8 +2612,7 @@ dependencies = [
 [[package]]
 name = "speedy-derive"
 version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d395866cb6778625150f77a430cc0af764ce0300f6a3d3413477785fa34b6c7"
+source = "git+https://github.com/koute/speedy?rev=c0f715d3b16758f4a1d278e7affbd3e7bb9f1ff7#c0f715d3b16758f4a1d278e7affbd3e7bb9f1ff7"
 dependencies = [
  "proc-macro2",
  "quote",

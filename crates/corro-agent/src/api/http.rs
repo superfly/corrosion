@@ -6,9 +6,9 @@ use std::{
 use axum::Extension;
 use bb8::RunError;
 use corro_types::{
-    agent::Agent,
+    agent::{Agent, KnownDbVersion},
     api::{RqliteResponse, RqliteResult, Statement},
-    broadcast::Timestamp,
+    broadcast::{Changeset, Timestamp},
     schema::{make_schema_inner, parse_sql},
 };
 use hyper::StatusCode;
@@ -130,7 +130,13 @@ where
 
             if !changes.is_empty() {
                 let ts: Timestamp = agent.clock().new_timestamp().into();
-                book_writer.insert(version, db_version, ts);
+                book_writer.insert(
+                    version,
+                    match db_version {
+                        Some(db_version) => KnownDbVersion::Current { db_version, ts },
+                        None => KnownDbVersion::Cleared,
+                    },
+                );
 
                 if let Some(db_version) = db_version {
                     process_subs(agent, &changes, db_version);
@@ -143,8 +149,7 @@ where
                             MessageV1::Change {
                                 actor_id,
                                 version,
-                                changeset: changes,
-                                ts,
+                                changeset: Changeset::Full { changes, ts },
                             },
                         )))
                         .await

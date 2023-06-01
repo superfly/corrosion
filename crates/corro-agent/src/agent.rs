@@ -11,7 +11,7 @@ use std::{
 use crate::{
     api::{
         http::{api_v1_db_execute, api_v1_db_schema},
-        peer::{generate_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncMessage},
+        peer::{peer_api_v1_broadcast, peer_api_v1_sync_post},
         pubsub::api_v1_subscribe_ws,
     },
     broadcast::{runtime_loop, ClientPool, FRAGMENTS_AT},
@@ -20,8 +20,8 @@ use crate::{
 use arc_swap::ArcSwap;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, AgentInner, Booked, BookedVersion, Bookie},
-    broadcast::{BroadcastInput, BroadcastSrc, FocaInput, Message, MessageDecodeError, MessageV1},
+    agent::{Agent, AgentInner, Booked, BookedVersions, Bookie, KnownDbVersion},
+    broadcast::{BroadcastInput, BroadcastSrc, Changeset, FocaInput, Message, MessageV1},
     change::Change,
     config::{Config, DEFAULT_GOSSIP_PORT},
     filters::{match_expr, AggregateChange},
@@ -29,6 +29,7 @@ use corro_types::{
     pubsub::{SubscriptionEvent, SubscriptionMessage},
     schema::{apply_schema, init_schema},
     sqlite::{init_cr_conn, CrConn, CrConnManager, Migration, SqlitePool},
+    sync::{generate_sync, SyncMessage, SyncMessageDecodeError, SyncMessageV1, SyncStateV1},
 };
 
 use axum::{
@@ -140,7 +141,7 @@ pub async fn setup(
         apply_schema(&mut conn, &conf.schema_paths, &schema)?
     };
 
-    let mut bk: HashMap<ActorId, BookedVersion> = HashMap::new();
+    let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 
     {
         let conn = ro_pool.get().await?;
@@ -159,7 +160,13 @@ pub async fn setup(
                     let end_v: Option<i64> = row.get(2)?;
                     ranges.insert(
                         start_v..=end_v.unwrap_or(start_v),
-                        (row.get(3)?, row.get(4)?),
+                        match row.get(3)? {
+                            Some(db_version) => KnownDbVersion::Current {
+                                db_version,
+                                ts: row.get(4)?,
+                            },
+                            None => KnownDbVersion::Cleared,
+                        },
                     );
                 }
             }
@@ -906,7 +913,6 @@ pub async fn handle_broadcast(
                         actor_id,
                         version,
                         changeset,
-                        ts,
                     }) => {
                         increment_counter!("corro.broadcast.recv.count", "kind" => "operation");
 
@@ -921,7 +927,6 @@ pub async fn handle_broadcast(
                                     actor_id,
                                     version,
                                     changeset,
-                                    ts,
                                 }))
                                 .await
                                 .ok();
@@ -944,121 +949,174 @@ pub async fn handle_broadcast(
     Ok(())
 }
 
+fn store_empty_changeset(
+    tx: Transaction,
+    actor_id: ActorId,
+    version: i64,
+) -> Result<(), rusqlite::Error> {
+    tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, rusqlite::types::Null, rusqlite::types::Null])?;
+
+    tx.commit()?;
+    return Ok(());
+}
+
+async fn process_single_version(
+    agent: &Agent,
+    actor_id: ActorId,
+    version: i64,
+    changeset: Changeset,
+) -> Result<Option<Changeset>, bb8::RunError<bb8_rusqlite::Error>> {
+    let bookie = agent.bookie();
+
+    if bookie.contains(actor_id, version) {
+        trace!(
+            "already seen this one! from: {}, version: {version}",
+            actor_id
+        );
+        return Ok(None);
+    }
+
+    trace!(
+        "received {} changes to process from: {}, version: {version}",
+        changeset.len(),
+        actor_id
+    );
+
+    let mut conn = agent.read_write_pool().get().await?;
+
+    let booked = bookie.for_actor(actor_id);
+    let (db_version, changeset) = {
+        let mut booked_write = booked.write();
+
+        if booked_write.contains(version) {
+            return Ok(None);
+        }
+
+        let (db_version, changeset) = block_in_place(move || {
+            let tx = conn.transaction()?;
+
+            let (changes, ts) = match changeset {
+                Changeset::Empty => {
+                    store_empty_changeset(tx, actor_id, version)?;
+                    return Ok((None, Changeset::Empty));
+                }
+                Changeset::Full { changes, .. } if changes.is_empty() => {
+                    store_empty_changeset(tx, actor_id, version)?;
+                    return Ok((None, Changeset::Empty));
+                }
+                Changeset::Full { changes, ts } => (changes, ts),
+            };
+
+            let start_version: i64 =
+                tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
+
+            let mut impactful_changeset = vec![];
+
+            for change in changes {
+                debug!("inserting change! {change:?}");
+                tx.prepare_cached(
+                    r#"
+            INSERT INTO crsql_changes
+                ("table", pk, cid, val, col_version, db_version, site_id)
+            VALUES
+                (?,       ?,  ?,   ?,   ?,           ?,          ?)"#,
+                )?
+                .execute(params![
+                    change.table.as_str(),
+                    change.pk.as_str(),
+                    change.cid.as_str(),
+                    &change.val,
+                    change.col_version,
+                    change.db_version,
+                    &change.site_id
+                ])?;
+                let rows_impacted: i64 = tx
+                    .prepare_cached("SELECT crsql_rows_impacted()")?
+                    .query_row((), |row| row.get(0))?;
+
+                if rows_impacted > 0 {
+                    debug!("inserted {rows_impacted} into crsql_changes");
+                    impactful_changeset.push(change);
+                }
+            }
+
+            let end_version: i64 = tx
+                .prepare_cached("SELECT MAX(db_version) FROM crsql_changes;")?
+                .query_row((), |row| row.get(0))?;
+
+            let db_version = if end_version > start_version {
+                Some(end_version)
+            } else {
+                None
+            };
+            debug!(
+                "inserting bookkeeping row: {}, start: {}, end: {:?}, ts: {:?}",
+                actor_id, version, db_version, ts
+            );
+
+            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, ts])?;
+
+            let new_changeset = if impactful_changeset.is_empty() {
+                Changeset::Empty
+            } else {
+                Changeset::Full {
+                    changes: impactful_changeset,
+                    ts,
+                }
+            };
+
+            tx.commit()?;
+
+            Ok::<_, bb8_rusqlite::Error>((db_version, new_changeset))
+        })?;
+
+        booked_write.insert(
+            version,
+            match (db_version, changeset.ts()) {
+                (Some(db_version), Some(ts)) => KnownDbVersion::Current { db_version, ts },
+                (Some(db_version), None) => {
+                    panic!("should not be possible: missing timestamp for still-current db_version {db_version}");
+                }
+                (None, Some(ts)) => {
+                    panic!("should not be possible: missing db_version, but we have a timestamp {ts}");
+                }
+                (None, None) => KnownDbVersion::Cleared,
+            },
+        );
+        (db_version, changeset)
+    };
+
+    if let Some(db_version) = db_version {
+        process_subs(agent, changeset.changes(), db_version);
+    }
+
+    Ok(Some(changeset))
+}
+
 async fn process_msg(
     agent: &Agent,
     msg: Message,
 ) -> Result<Option<Message>, bb8::RunError<bb8_rusqlite::Error>> {
-    let bookie = agent.bookie();
-    let pool = agent.read_write_pool();
     Ok(match msg {
         Message::V1(MessageV1::Change {
             actor_id,
             version,
             changeset,
-            ts,
         }) => {
-            if bookie.contains(actor_id, version) {
-                trace!(
-                    "already seen this one! from: {}, version: {version}",
-                    actor_id
-                );
-                return Ok(None);
-            }
+            let changeset = process_single_version(agent, actor_id, version, changeset).await?;
 
-            trace!(
-                "received {} changes to process from: {}, version: {version}",
-                changeset.len(),
-                actor_id
-            );
-
-            let mut conn = pool.get().await?;
-
-            let booked = bookie.for_actor(actor_id);
-            let (db_version, changeset) = {
-                let mut booked_write = booked.write();
-
-                if booked_write.contains(version) {
-                    return Ok(None);
-                }
-
-                let (db_version, changeset) = block_in_place(move || {
-                    let tx = conn.transaction()?;
-
-                    let start_version: i64 =
-                        tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
-
-                    let mut impactful_changeset = vec![];
-
-                    for change in changeset {
-                        debug!("inserting change! {change:?}");
-                        tx.prepare_cached(
-                            r#"
-                    INSERT INTO crsql_changes
-                        ("table", pk, cid, val, col_version, db_version, site_id)
-                    VALUES
-                        (?,       ?,  ?,   ?,   ?,           ?,          ?)"#,
-                        )?
-                        .execute(params![
-                            change.table.as_str(),
-                            change.pk.as_str(),
-                            change.cid.as_str(),
-                            &change.val,
-                            change.col_version,
-                            change.db_version,
-                            &change.site_id
-                        ])?;
-                        let rows_impacted: i64 = tx
-                            .prepare_cached("SELECT crsql_rows_impacted()")?
-                            .query_row((), |row| row.get(0))?;
-
-                        if rows_impacted > 0 {
-                            debug!("inserted {rows_impacted} into crsql_changes");
-                            impactful_changeset.push(change);
-                        }
-                    }
-
-                    let end_version: i64 = tx
-                        .prepare_cached("SELECT MAX(db_version) FROM crsql_changes;")?
-                        .query_row((), |row| row.get(0))?;
-
-                    let db_version = if end_version > start_version {
-                        Some(end_version)
-                    } else {
-                        None
-                    };
-                    debug!(
-                        "inserting bookkeeping row: {}, start: {}, end: {:?}, ts: {}",
-                        actor_id, version, db_version, ts
-                    );
-
-                    tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, ts])?;
-
-                    tx.commit()?;
-
-                    Ok::<_, bb8_rusqlite::Error>((db_version, impactful_changeset))
-                })?;
-
-                booked_write.insert(version, db_version, ts);
-                (db_version, changeset)
-            };
-
-            if let Some(db_version) = db_version {
-                process_subs(agent, &changeset, db_version);
-            }
-
-            let msg = Message::V1(MessageV1::Change {
-                actor_id,
-                version,
-                changeset,
-                ts,
-            });
-
-            Some(msg)
+            changeset.map(|changeset| {
+                Message::V1(MessageV1::Change {
+                    actor_id,
+                    version,
+                    changeset,
+                })
+            })
         }
     })
 }
 
-pub fn process_subs(agent: &Agent, changeset: &Vec<Change>, db_version: i64) {
+pub fn process_subs(agent: &Agent, changeset: &[Change], db_version: i64) {
     trace!("process subs...");
     let schema = agent.0.schema.read();
     let aggs = AggregateChange::from_changes(changeset.iter(), &schema, db_version);
@@ -1109,7 +1167,9 @@ pub enum SyncClientError {
     #[error("no good candidates found")]
     NoGoodCandidate,
     #[error("could not decode message: {0}")]
-    Decoded(#[from] MessageDecodeError),
+    Decoded(#[from] SyncMessageDecodeError),
+    #[error("unexpected sync message")]
+    UnexpectedSyncMessage,
 }
 
 impl SyncClientError {
@@ -1124,15 +1184,13 @@ struct SyncWith {
 }
 
 async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClientError> {
-    let sync = generate_sync(agent.bookie(), agent.actor_id());
-    for (actor_id, needed) in sync.need.iter() {
+    let sync_state = generate_sync(agent.bookie(), agent.actor_id());
+    for (actor_id, needed) in sync_state.need.iter() {
         gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
     }
-    for (actor_id, version) in sync.heads.iter() {
+    for (actor_id, version) in sync_state.heads.iter() {
         gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
     }
-
-    let sync = Arc::new(sync);
 
     let mut boff = backoff::Backoff::new(5)
         .timeout_range(Duration::from_millis(100), Duration::from_secs(1))
@@ -1163,8 +1221,9 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
             let mut choices = low_rtt_candidates.into_iter().choose_multiple(&mut rng, 2);
 
             choices.sort_by(|a, b| {
-                sync.need_len_for_actor(&b.0)
-                    .cmp(&sync.need_len_for_actor(&a.0))
+                sync_state
+                    .need_len_for_actor(&b.0)
+                    .cmp(&sync_state.need_len_for_actor(&a.0))
             });
 
             if let Some(chosen) = choices.get(0).cloned() {
@@ -1176,20 +1235,25 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
 
         info!(
             "syncing from: {} to: {}, need len: {}",
-            sync.actor_id,
+            agent.actor_id(),
             actor_id,
-            sync.need_len(),
+            sync_state.need_len(),
         );
 
         let start = Instant::now();
-        let res =
-            handle_sync_receive(agent, client, &SyncWith { actor_id, addr }, sync.clone()).await;
+        let res = handle_sync_receive(
+            agent,
+            client,
+            &SyncWith { actor_id, addr },
+            sync_state.clone(),
+        )
+        .await;
 
         match res {
             Ok(n) => {
                 let elapsed = start.elapsed();
                 info!(
-                    "synced {n} ops w/ {} in {}s @ {} ops/s",
+                    "synced {n} changes w/ {} in {}s @ {} changes/s",
                     actor_id,
                     elapsed.as_secs_f64(),
                     n as f64 / elapsed.as_secs_f64()
@@ -1215,7 +1279,7 @@ async fn handle_sync_receive(
     agent: &Agent,
     client: &ClientPool,
     with: &SyncWith,
-    sync: Arc<SyncMessage>,
+    sync: SyncStateV1,
 ) -> Result<usize, SyncClientError> {
     let SyncWith { actor_id, addr } = with;
     let actor_id = *actor_id;
@@ -1227,7 +1291,9 @@ async fn handle_sync_receive(
         "corro.sync.client.request.operations.need.count",
         sync.need.len() as f64
     );
-    let data = serde_json::to_vec(&*sync)?;
+
+    let sync_msg: SyncMessage = sync.into();
+    let data = serde_json::to_vec(&sync_msg)?;
 
     gauge!("corro.sync.client.request.size.bytes", data.len() as f64);
 
@@ -1235,7 +1301,7 @@ async fn handle_sync_receive(
         .method(hyper::Method::POST)
         .uri(format!("http://{addr}/v1/sync"))
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .header(hyper::header::ACCEPT, "application/json")
+        .header(hyper::header::ACCEPT, "application/octet-stream")
         .header(
             "corro-clock",
             serde_json::to_string(&agent.clock().new_timestamp())
@@ -1295,11 +1361,31 @@ async fn handle_sync_receive(
 
     while let Some(buf_res) = framed.next().await {
         let mut buf = buf_res?;
-        let msg = Message::from_buf(&mut buf)?;
-        let len = match &msg {
-            Message::V1(MessageV1::Change { ref changeset, .. }) => changeset.len(),
+        let msg = SyncMessage::from_buf(&mut buf)?;
+        let len = match msg {
+            SyncMessage::V1(SyncMessageV1::Changeset {
+                actor_id,
+                version,
+                changes,
+                ts,
+            }) => {
+                let len = changes.len();
+                process_single_version(agent, actor_id, version, Changeset::Full { changes, ts })
+                    .await?;
+                len
+            }
+            SyncMessage::V1(SyncMessageV1::Cleared { actor_id, versions }) => {
+                let len = ((versions.end() - versions.start()) + 1) as usize;
+                for version in versions {
+                    process_single_version(agent, actor_id, version, Changeset::Empty).await?;
+                }
+
+                len
+            }
+            SyncMessage::V1(SyncMessageV1::State(_)) => {
+                return Err(SyncClientError::UnexpectedSyncMessage);
+            }
         };
-        process_msg(agent, msg).await?;
         count += len;
     }
 
@@ -1352,7 +1438,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 start_version INTEGER NOT NULL,
                 end_version INTEGER,
                 db_version INTEGER,
-                ts TEXT NOT NULL,
+                ts TEXT,
                 PRIMARY KEY (actor_id, start_version)
             ) WITHOUT ROWID;
             

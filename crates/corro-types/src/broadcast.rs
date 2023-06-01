@@ -8,6 +8,7 @@ use rusqlite::{
     types::{FromSql, FromSqlError},
     ToSql,
 };
+use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
@@ -52,10 +53,44 @@ pub enum MessageV1 {
         actor_id: ActorId,
         // internal version
         version: i64,
-        changeset: Vec<Change>,
-
-        ts: Timestamp,
+        changeset: Changeset,
     },
+}
+
+#[derive(Debug, Clone, Readable, Writable)]
+pub enum Changeset {
+    Empty,
+    Full { changes: Vec<Change>, ts: Timestamp },
+}
+
+impl Changeset {
+    pub fn len(&self) -> usize {
+        match self {
+            Changeset::Empty => 0,
+            Changeset::Full { changes, .. } => changes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Changeset::Empty => true,
+            Changeset::Full { changes, .. } => changes.is_empty(),
+        }
+    }
+
+    pub fn ts(&self) -> Option<Timestamp> {
+        match self {
+            Changeset::Empty => None,
+            Changeset::Full { ts, .. } => Some(*ts),
+        }
+    }
+
+    pub fn changes(&self) -> &[Change] {
+        match self {
+            Changeset::Empty => &[],
+            Changeset::Full { changes, .. } => &changes,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,7 +99,8 @@ pub enum TimestampParseError {
     Parse(ParseNTP64Error),
 }
 
-#[derive(Debug, Clone, Copy, Readable, Writable, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Readable, Writable, PartialEq, Eq)]
+#[serde(transparent)]
 pub struct Timestamp(pub u64);
 
 impl Timestamp {

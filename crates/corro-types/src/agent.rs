@@ -127,8 +127,14 @@ pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> 
     Ok(())
 }
 
-pub type BookedVersion = RangeInclusiveMap<i64, (Option<i64>, Timestamp)>;
-pub type BookedInner = Arc<RwLock<BookedVersion>>;
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum KnownDbVersion {
+    Current { db_version: i64, ts: Timestamp },
+    Cleared,
+}
+
+pub type BookedVersions = RangeInclusiveMap<i64, KnownDbVersion>;
+pub type BookedInner = Arc<RwLock<BookedVersions>>;
 
 #[derive(Default, Clone)]
 pub struct Booked(BookedInner);
@@ -138,8 +144,8 @@ impl Booked {
         Self(inner)
     }
 
-    pub fn insert(&self, version: i64, db_version: Option<i64>, ts: Timestamp) {
-        self.0.write().insert(version..=version, (db_version, ts));
+    pub fn insert(&self, version: i64, db_version: KnownDbVersion) {
+        self.0.write().insert(version..=version, db_version);
     }
 
     pub fn contains(&self, version: i64) -> bool {
@@ -150,7 +156,7 @@ impl Booked {
         self.0.read().iter().map(|(k, _v)| *k.end()).max()
     }
 
-    pub fn read(&self) -> RwLockReadGuard<BookedVersion> {
+    pub fn read(&self) -> RwLockReadGuard<BookedVersions> {
         self.0.read()
     }
 
@@ -159,11 +165,11 @@ impl Booked {
     }
 }
 
-pub struct BookWriter<'a>(RwLockWriteGuard<'a, BookedVersion>);
+pub struct BookWriter<'a>(RwLockWriteGuard<'a, BookedVersions>);
 
 impl<'a> BookWriter<'a> {
-    pub fn insert(&mut self, version: i64, db_version: Option<i64>, ts: Timestamp) {
-        self.0.insert(version..=version, (db_version, ts));
+    pub fn insert(&mut self, version: i64, db_version: KnownDbVersion) {
+        self.0.insert(version..=version, db_version);
     }
 
     pub fn contains(&self, version: i64) -> bool {
@@ -185,17 +191,17 @@ impl Bookie {
         Self(inner)
     }
 
-    pub fn add(&self, actor_id: ActorId, version: i64, db_version: Option<i64>, ts: Timestamp) {
+    pub fn add(&self, actor_id: ActorId, version: i64, db_version: KnownDbVersion) {
         {
             if let Some(booked) = self.0.read().get(&actor_id) {
-                booked.insert(version, db_version, ts);
+                booked.insert(version, db_version);
                 return;
             }
         };
 
         let mut w = self.0.write();
         let booked = w.entry(actor_id).or_default();
-        booked.insert(version, db_version, ts);
+        booked.insert(version, db_version);
     }
 
     pub fn for_actor(&self, actor_id: ActorId) -> Booked {
