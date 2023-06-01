@@ -2,7 +2,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rangemap::RangeInclusiveMap;
 use tokio::{sync::mpsc::Sender, task::block_in_place};
 use tracing::warn;
@@ -153,6 +153,26 @@ impl Booked {
     pub fn read(&self) -> RwLockReadGuard<BookedVersion> {
         self.0.read()
     }
+
+    pub fn write(&self) -> BookWriter {
+        BookWriter(self.0.write())
+    }
+}
+
+pub struct BookWriter<'a>(RwLockWriteGuard<'a, BookedVersion>);
+
+impl<'a> BookWriter<'a> {
+    pub fn insert(&mut self, version: i64, db_version: Option<i64>, ts: Timestamp) {
+        self.0.insert(version..=version, (db_version, ts));
+    }
+
+    pub fn contains(&self, version: i64) -> bool {
+        self.0.contains_key(&version)
+    }
+
+    pub fn last(&self) -> Option<i64> {
+        self.0.iter().map(|(k, _v)| *k.end()).max()
+    }
 }
 
 pub type BookieInner = Arc<RwLock<HashMap<ActorId, Booked>>>;
@@ -176,6 +196,11 @@ impl Bookie {
         let mut w = self.0.write();
         let booked = w.entry(actor_id).or_default();
         booked.insert(version, db_version, ts);
+    }
+
+    pub fn for_actor(&self, actor_id: ActorId) -> Booked {
+        let mut w = self.0.write();
+        w.entry(actor_id).or_default().clone()
     }
 
     pub fn contains(&self, actor_id: ActorId, version: i64) -> bool {

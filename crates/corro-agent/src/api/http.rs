@@ -74,81 +74,87 @@ where
             return Err(ChangeError::TooManyRowsImpacted);
         }
 
-        let last_version = agent.bookie().last(&actor_id).unwrap_or(0);
-        trace!("last_version: {last_version}");
-        let version = last_version + 1;
-        trace!("version: {version}");
+        let booked = agent.bookie().for_actor(actor_id);
+        let elapsed = {
+            let mut book_writer = booked.write();
 
-        let (changes, db_version) = {
-            let mut prepped = tx.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version FROM crsql_changes WHERE site_id IS NULL AND db_version > ?"#)?;
+            let last_version = book_writer.last().unwrap_or(0);
+            trace!("last_version: {last_version}");
+            let version = last_version + 1;
+            trace!("version: {version}");
 
-            let mut end_version = start_version;
+            let (changes, db_version) = {
+                let mut prepped = tx.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version FROM crsql_changes WHERE site_id IS NULL AND db_version > ?"#)?;
 
-            let mapped = prepped.query_map([start_version], |row| {
-                let change = Change {
-                    table: row.get(0)?,
-                    pk: row.get(1)?,
-                    cid: row.get(2)?,
-                    val: row.get(3)?,
-                    col_version: row.get(4)?,
-                    db_version: row.get(5)?,
-                    site_id: actor_id.to_bytes(),
-                };
-                end_version = cmp::max(end_version, change.db_version);
-                Ok(change)
-            })?;
+                let mut end_version = start_version;
 
-            let changes = mapped.collect::<Result<Vec<Change>, rusqlite::Error>>()?;
+                let mapped = prepped.query_map([start_version], |row| {
+                    let change = Change {
+                        table: row.get(0)?,
+                        pk: row.get(1)?,
+                        cid: row.get(2)?,
+                        val: row.get(3)?,
+                        col_version: row.get(4)?,
+                        db_version: row.get(5)?,
+                        site_id: actor_id.to_bytes(),
+                    };
+                    end_version = cmp::max(end_version, change.db_version);
+                    Ok(change)
+                })?;
 
-            let db_version = if end_version > start_version {
-                tx.prepare_cached(
-                    r#"
+                let changes = mapped.collect::<Result<Vec<Change>, rusqlite::Error>>()?;
+
+                let db_version = if end_version > start_version {
+                    tx.prepare_cached(
+                        r#"
                         INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts)
                             VALUES (?, ?, ?, ?);
                     "#,
-                )?
-                .execute(params![
-                    actor_id,
-                    version,
-                    end_version,
-                    Timestamp::from(agent.clock().new_timestamp())
-                ])?;
-                Some(end_version)
-            } else {
-                None
+                    )?
+                    .execute(params![
+                        actor_id,
+                        version,
+                        end_version,
+                        Timestamp::from(agent.clock().new_timestamp())
+                    ])?;
+                    Some(end_version)
+                } else {
+                    None
+                };
+
+                (changes, db_version)
             };
 
-            (changes, db_version)
-        };
+            tx.commit()?;
+            let elapsed = start.elapsed();
 
-        tx.commit()?;
-        let elapsed = start.elapsed();
+            if !changes.is_empty() {
+                let ts: Timestamp = agent.clock().new_timestamp().into();
+                book_writer.insert(version, db_version, ts);
 
-        if !changes.is_empty() {
-            let ts: Timestamp = agent.clock().new_timestamp().into();
-            agent.bookie().add(actor_id, version, db_version, ts);
-
-            if let Some(db_version) = db_version {
-                process_subs(agent, &changes, db_version);
-            }
-
-            let tx_bcast = agent.tx_bcast().clone();
-            tokio::spawn(async move {
-                if let Err(e) = tx_bcast
-                    .send(BroadcastInput::AddBroadcast(Message::V1(
-                        MessageV1::Change {
-                            actor_id,
-                            version,
-                            changeset: changes,
-                            ts,
-                        },
-                    )))
-                    .await
-                {
-                    error!("could not send change message for broadcast: {e}");
+                if let Some(db_version) = db_version {
+                    process_subs(agent, &changes, db_version);
                 }
-            });
-        }
+
+                let tx_bcast = agent.tx_bcast().clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tx_bcast
+                        .send(BroadcastInput::AddBroadcast(Message::V1(
+                            MessageV1::Change {
+                                actor_id,
+                                version,
+                                changeset: changes,
+                                ts,
+                            },
+                        )))
+                        .await
+                    {
+                        error!("could not send change message for broadcast: {e}");
+                    }
+                });
+            }
+            elapsed
+        };
 
         Ok::<_, ChangeError>((ret, elapsed))
     })

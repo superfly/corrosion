@@ -642,9 +642,9 @@ async fn handle_notifications(
             Notification::Idle => {
                 warn!("Current node is considered IDLE");
             }
+            // this happens when we leave the cluster
             Notification::Defunct => {
-                error!("Current node is considered DEFUNCT");
-                // TODO: reissue identity
+                debug!("Current node is considered DEFUNCT");
             }
             Notification::Rejoin(id) => {
                 info!("Rejoined the cluster with id: {id:?}");
@@ -981,62 +981,74 @@ async fn process_msg(
 
             let mut conn = pool.get().await?;
 
-            let (db_version, changeset) = block_in_place(move || {
-                let tx = conn.transaction()?;
+            let booked = bookie.for_actor(actor_id);
+            let (db_version, changeset) = {
+                let mut booked_write = booked.write();
 
-                let start_version: i64 =
-                    tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
+                if booked_write.contains(version) {
+                    return Ok(None);
+                }
 
-                let mut impactful_changeset = vec![];
+                let (db_version, changeset) = block_in_place(move || {
+                    let tx = conn.transaction()?;
 
-                for change in changeset {
-                    debug!("inserting change! {change:?}");
-                    tx.prepare_cached(
-                        r#"
+                    let start_version: i64 =
+                        tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
+
+                    let mut impactful_changeset = vec![];
+
+                    for change in changeset {
+                        debug!("inserting change! {change:?}");
+                        tx.prepare_cached(
+                            r#"
                     INSERT INTO crsql_changes
                         ("table", pk, cid, val, col_version, db_version, site_id)
                     VALUES
                         (?,       ?,  ?,   ?,   ?,           ?,          ?)"#,
-                    )?
-                    .execute(params![
-                        change.table.as_str(),
-                        change.pk.as_str(),
-                        change.cid.as_str(),
-                        &change.val,
-                        change.col_version,
-                        change.db_version,
-                        &change.site_id
-                    ])?;
-                    let rows_impacted: i64 = tx
-                        .prepare_cached("SELECT crsql_rows_impacted()")?
+                        )?
+                        .execute(params![
+                            change.table.as_str(),
+                            change.pk.as_str(),
+                            change.cid.as_str(),
+                            &change.val,
+                            change.col_version,
+                            change.db_version,
+                            &change.site_id
+                        ])?;
+                        let rows_impacted: i64 = tx
+                            .prepare_cached("SELECT crsql_rows_impacted()")?
+                            .query_row((), |row| row.get(0))?;
+
+                        if rows_impacted > 0 {
+                            debug!("inserted {rows_impacted} into crsql_changes");
+                            impactful_changeset.push(change);
+                        }
+                    }
+
+                    let end_version: i64 = tx
+                        .prepare_cached("SELECT MAX(db_version) FROM crsql_changes;")?
                         .query_row((), |row| row.get(0))?;
 
-                    if rows_impacted > 0 {
-                        debug!("inserted {rows_impacted} into crsql_changes");
-                        impactful_changeset.push(change);
-                    }
-                }
+                    let db_version = if end_version > start_version {
+                        Some(end_version)
+                    } else {
+                        None
+                    };
+                    debug!(
+                        "inserting bookkeeping row: {}, start: {}, end: {:?}, ts: {}",
+                        actor_id, version, db_version, ts
+                    );
 
-                let end_version: i64 = tx
-                    .prepare_cached("SELECT MAX(db_version) FROM crsql_changes;")?
-                    .query_row((), |row| row.get(0))?;
+                    tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, ts])?;
 
-                let db_version = if end_version > start_version {
-                    Some(end_version)
-                } else {
-                    None
-                };
-                debug!(
-                    "inserting bookkeeping row: {}, start: {}, end: {:?}, ts: {}",
-                    actor_id, version, db_version, ts
-                );
+                    tx.commit()?;
 
-                tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, ts])?;
+                    Ok::<_, bb8_rusqlite::Error>((db_version, impactful_changeset))
+                })?;
 
-                tx.commit()?;
-
-                Ok::<_, bb8_rusqlite::Error>((db_version, impactful_changeset))
-            })?;
+                booked_write.insert(version, db_version, ts);
+                (db_version, changeset)
+            };
 
             if let Some(db_version) = db_version {
                 process_subs(agent, &changeset, db_version);
@@ -1049,7 +1061,6 @@ async fn process_msg(
                 ts,
             });
 
-            bookie.add(actor_id, version, db_version, ts);
             Some(msg)
         }
     })
