@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     api::{
-        http::{api_v1_db_execute, api_v1_db_schema},
+        http::{api_v1_db_execute, api_v1_db_query, api_v1_db_schema},
         peer::{peer_api_v1_broadcast, peer_api_v1_sync_post},
         pubsub::api_v1_subscribe_ws,
     },
@@ -429,6 +429,20 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         .route(
             "/db/execute",
             post(api_v1_db_execute).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(128)),
+            ),
+        )
+        .route(
+            "/db/query",
+            post(api_v1_db_query).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((

@@ -5,11 +5,13 @@ use std::{
 
 use axum::Extension;
 use bb8::RunError;
+use compact_str::{CompactString, ToCompactString};
 use corro_types::{
     agent::{Agent, KnownDbVersion},
-    api::{RqliteResponse, RqliteResult, Statement},
+    api::{QueryResultBuilder, RqliteResponse, RqliteResult, Statement},
     broadcast::{Changeset, Timestamp},
     schema::{make_schema_inner, parse_sql},
+    sqlite::SqlitePool,
 };
 use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, ToSql, Transaction};
@@ -269,6 +271,187 @@ pub async fn api_v1_db_execute(
             time: Some(elapsed.as_secs_f64()),
         }),
     )
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum QueryError {
+    #[error("pool connection acquisition error")]
+    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    #[error("sqlite error: {0}")]
+    Rusqlite(#[from] rusqlite::Error),
+}
+
+async fn query_statements(
+    pool: &SqlitePool,
+    statements: &[Statement],
+    associative: bool,
+) -> Result<Vec<RqliteResult>, QueryError> {
+    let conn = pool.get().await?;
+
+    let mut results = vec![];
+
+    block_in_place(|| {
+        for stmt in statements.iter() {
+            let start = Instant::now();
+            let prepped_res = match stmt {
+                Statement::Simple(q) => conn.prepare(q.as_str()),
+                Statement::WithParams(params) => match params.first().and_then(|v| v.as_str()) {
+                    Some(q) => conn.prepare(q),
+                    None => {
+                        let builder = QueryResultBuilder::new(
+                            vec![],
+                            vec![],
+                            Some(start.elapsed().as_secs_f64()),
+                        );
+                        results.push(if associative {
+                            builder.build_associative()
+                        } else {
+                            builder.build_associative()
+                        });
+                        continue;
+                    }
+                },
+                Statement::WithNamedParams(q, _) => conn.prepare(q.as_str()),
+            };
+
+            let mut prepped = match prepped_res {
+                Ok(prepped) => prepped,
+                Err(e) => {
+                    results.push(RqliteResult::Error {
+                        error: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            let col_names: Vec<CompactString> = prepped
+                .column_names()
+                .into_iter()
+                .map(|s| s.to_compact_string())
+                .collect();
+
+            let col_types: Vec<Option<CompactString>> = prepped
+                .columns()
+                .into_iter()
+                .map(|c| c.decl_type().map(|t| t.to_compact_string()))
+                .collect();
+
+            let rows_res = match stmt {
+                Statement::Simple(_) => prepped.query(()),
+                Statement::WithParams(params) => {
+                    let mut iter = params.iter();
+                    // skip 1
+                    iter.next();
+                    prepped.query(params_from_iter(iter))
+                }
+                Statement::WithNamedParams(_, params) => prepped.query(
+                    params
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
+                        .collect::<Vec<(&str, &dyn ToSql)>>()
+                        .as_slice(),
+                ),
+            };
+            let elapsed = start.elapsed();
+
+            let sqlite_rows = match rows_res {
+                Ok(rows) => rows,
+                Err(e) => {
+                    results.push(RqliteResult::Error {
+                        error: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            results.push(rows_to_rqlite(
+                sqlite_rows,
+                col_names,
+                col_types,
+                elapsed,
+                associative,
+            ));
+        }
+    });
+
+    Ok(results)
+}
+
+fn rows_to_rqlite<'stmt>(
+    mut sqlite_rows: rusqlite::Rows<'stmt>,
+    col_names: Vec<CompactString>,
+    col_types: Vec<Option<CompactString>>,
+    elapsed: Duration,
+    associative: bool,
+) -> RqliteResult {
+    let mut builder = QueryResultBuilder::new(col_names, col_types, Some(elapsed.as_secs_f64()));
+
+    loop {
+        match sqlite_rows.next() {
+            Ok(Some(row)) => {
+                if let Err(e) = builder.add_row(row) {
+                    return RqliteResult::Error {
+                        error: e.to_string(),
+                    };
+                }
+            }
+            Ok(None) => {
+                break;
+            }
+            Err(e) => {
+                return RqliteResult::Error {
+                    error: e.to_string(),
+                };
+            }
+        }
+    }
+
+    if associative {
+        builder.build_associative()
+    } else {
+        builder.build()
+    }
+}
+
+pub async fn api_v1_db_query(
+    // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    Extension(agent): Extension<Agent>,
+    axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
+) -> (StatusCode, axum::Json<RqliteResponse>) {
+    if statements.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(RqliteResponse {
+                results: vec![RqliteResult::Error {
+                    error: "at least 1 statement is required".into(),
+                }],
+                time: None,
+            }),
+        );
+    }
+
+    let start = Instant::now();
+    match query_statements(agent.read_only_pool(), &statements, false).await {
+        Ok(results) => {
+            let elapsed = start.elapsed();
+            (
+                StatusCode::OK,
+                axum::Json(RqliteResponse {
+                    results,
+                    time: Some(elapsed.as_secs_f64()),
+                }),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(RqliteResponse {
+                results: vec![RqliteResult::Error {
+                    error: e.to_string(),
+                }],
+                time: None,
+            }),
+        ),
+    }
 }
 
 async fn execute_schema(agent: &Agent, statements: Vec<Statement>) -> eyre::Result<()> {

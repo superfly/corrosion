@@ -1,6 +1,10 @@
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
-use corro_types::config::Config;
+use corro_client::CorrosionClient;
+use corro_types::{
+    api::{RqliteResult, Statement},
+    config::Config,
+};
 
 pub mod command;
 
@@ -12,8 +16,8 @@ async fn main() -> eyre::Result<()> {
 
     let config_path = cli.config;
 
-    println!("Using config file: {}", config_path);
-    let config = Config::load(config_path.as_str()).expect("could not read config from file");
+    let config = Config::load(config_path.as_str())
+        .expect("could not read config from file at {config_path}");
 
     match cli.command {
         None => {
@@ -31,6 +35,81 @@ async fn main() -> eyre::Result<()> {
                     }
                 },
             },
+            Command::Query {
+                query,
+                columns: show_columns,
+                timer,
+            } => {
+                let client = CorrosionClient::new(config.api_addr, config.db_path);
+                let res = client.query(&[Statement::Simple(query)]).await?;
+
+                for res in res.results {
+                    match res {
+                        RqliteResult::QueryAssociative { rows, time, .. } => {
+                            for row in rows {
+                                println!(
+                                    "{}",
+                                    row.values()
+                                        .map(|v| v.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join("|")
+                                );
+                            }
+                            if let Some(elapsed) = timer.then_some(time).flatten() {
+                                println!("Run Time: real {elapsed}");
+                            }
+                        }
+                        RqliteResult::Query {
+                            values,
+                            time,
+                            columns,
+                            ..
+                        } => {
+                            if show_columns {
+                                println!("{}", columns.join("|"));
+                            }
+                            for row in values {
+                                println!(
+                                    "{}",
+                                    row.iter()
+                                        .map(|v| v.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join("|")
+                                );
+                            }
+                            if let Some(elapsed) = timer.then_some(time).flatten() {
+                                println!("Run Time: real {elapsed}");
+                            }
+                        }
+                        RqliteResult::Error { error } => {
+                            eprintln!("Error: {error}");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Command::Exec { query, timer } => {
+                let client = CorrosionClient::new(config.api_addr, config.db_path);
+                let res = client.execute(&[Statement::Simple(query)]).await?;
+
+                for res in res.results {
+                    match res {
+                        RqliteResult::Execute {
+                            rows_affected,
+                            time,
+                        } => {
+                            println!("Rows affected: {rows_affected}");
+                            if let Some(elapsed) = timer.then_some(time).flatten() {
+                                println!("Run Time: real {elapsed}");
+                            }
+                        }
+                        RqliteResult::Error { error } => {
+                            eprintln!("Error: {error}");
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Command::Reload => command::reload::run(config).await?,
         },
     }
@@ -40,10 +119,10 @@ async fn main() -> eyre::Result<()> {
 
 #[derive(Parser)]
 #[clap(version = VERSION)]
-pub(crate) struct Cli {
+struct Cli {
     /// Set the config file path
     #[clap(long, short, global = true, default_value = "corrosion.toml")]
-    pub(crate) config: Utf8PathBuf,
+    config: Utf8PathBuf,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -57,6 +136,22 @@ enum Command {
     /// Consul interactions
     #[command(subcommand)]
     Consul(ConsulCommand),
+
+    /// Query data from Corrosion w/ a SQL statement
+    Query {
+        query: String,
+        #[arg(long, default_value = "false")]
+        columns: bool,
+        #[arg(long, default_value = "false")]
+        timer: bool,
+    },
+
+    /// Execute a SQL statement that mutates the state of Corrosion
+    Exec {
+        query: String,
+        #[arg(long, default_value = "false")]
+        timer: bool,
+    },
 
     /// Reload the config
     Reload,

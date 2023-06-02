@@ -27,6 +27,25 @@ impl CorrosionClient {
         &self.pool
     }
 
+    pub async fn query(&self, statements: &[Statement]) -> Result<RqliteResponse, Error> {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{}/db/query", self.api_addr))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::ACCEPT, "application/json")
+            .body(Body::from(serde_json::to_vec(statements)?))?;
+
+        let res = self.api_client.request(req).await?;
+
+        if !res.status().is_success() {
+            return Err(Error::UnexpectedStatusCode(res.status()));
+        }
+
+        let bytes = hyper::body::to_bytes(res.into_body()).await?;
+
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     pub async fn execute(&self, statements: &[Statement]) -> Result<RqliteResponse, Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)

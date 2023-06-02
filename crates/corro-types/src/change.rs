@@ -1,4 +1,7 @@
-use std::ops::Deref;
+use std::{
+    fmt::{self, Write},
+    ops::Deref,
+};
 
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
@@ -189,6 +192,24 @@ impl ToSql for SqliteValue {
             SqliteValue::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
             SqliteValue::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b.as_slice())),
         })
+    }
+}
+
+impl fmt::Display for SqliteValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SqliteValue::Null => f.write_str(""),
+            SqliteValue::Integer(v) => v.fmt(f),
+            SqliteValue::Real(v) => v.fmt(f),
+            SqliteValue::Text(v) => v.fmt(f),
+            SqliteValue::Blob(v) => {
+                f.write_str("x'")?;
+                for b in v.iter() {
+                    write!(f, "{b:x}")?;
+                }
+                f.write_char('\'')
+            }
+        }
     }
 }
 
