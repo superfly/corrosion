@@ -114,6 +114,7 @@ pub type Subscriptions = Arc<RwLock<Subscriber>>;
 pub type Subscribers = Arc<RwLock<HashMap<SubscriberId, Subscriptions>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum SubscriptionMessage {
     Event {
         id: SubscriptionId,
@@ -133,7 +134,7 @@ pub enum SubscriptionEvent {
 pub enum Subscription {
     Add {
         id: SubscriptionId,
-        filter: Option<String>,
+        where_clause: Option<String>,
         #[serde(default)]
         from_db_version: Option<i64>,
         #[serde(default)]

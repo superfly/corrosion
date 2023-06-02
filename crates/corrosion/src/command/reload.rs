@@ -1,15 +1,14 @@
 use std::path::Path;
 
 use corro_admin::{Command, LogLevel, Response};
-use corro_types::config::Config;
 use futures::{SinkExt, TryStreamExt};
 use tokio::net::UnixStream;
 use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{error, event, info};
 
-pub async fn run(config: Config) -> eyre::Result<()> {
-    handle_reload(&config.admin_path).await
+pub async fn run<P: AsRef<Path>>(admin_path: P) -> eyre::Result<()> {
+    handle_reload(admin_path).await
 }
 
 type FramedStream = Framed<

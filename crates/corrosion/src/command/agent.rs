@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::VERSION;
 
-pub async fn run(config: Config, config_path: Utf8PathBuf) -> eyre::Result<()> {
+pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> {
     // do this first!
     let mut hangup = tokio::signal::unix::signal(SignalKind::hangup())?;
 
@@ -114,8 +114,8 @@ pub async fn run(config: Config, config_path: Utf8PathBuf) -> eyre::Result<()> {
     corro_admin::start_server(
         agent,
         AdminConfig {
-            listen_path: config.admin_path,
-            config_path,
+            listen_path: config.admin_path.clone(),
+            config_path: config_path.clone(),
         },
         tripwire,
     )?;

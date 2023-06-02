@@ -1986,7 +1986,7 @@ pub mod tests {
         ws.send(Message::binary(
             serde_json::to_vec(&Subscription::Add {
                 id: id.clone(),
-                filter: Some("tbl_name = 'testsblob'".into()),
+                where_clause: Some("tbl_name = 'testsblob'".into()),
                 from_db_version: None,
                 is_priority: true,
             })

@@ -125,7 +125,11 @@ pub async fn api_v1_subscribe_post(
     Json(sub): Json<Subscription>,
 ) -> impl IntoResponse {
     match sub {
-        Subscription::Add { id, filter, .. } => {
+        Subscription::Add {
+            id,
+            where_clause: filter,
+            ..
+        } => {
             let filter = match filter {
                 None => {
                     return (
@@ -242,7 +246,7 @@ async fn handle_socket(
                     match sub {
                         Subscription::Add {
                             id,
-                            filter,
+                            where_clause: filter,
                             from_db_version,
                             is_priority,
                         } => {
