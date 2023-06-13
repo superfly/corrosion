@@ -484,7 +484,8 @@ async fn execute_schema(agent: &Agent, statements: Vec<Statement>) -> eyre::Resu
 
         for tbl_name in partial_schema.tables.keys() {
             tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
-            let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL", [tbl_name])?;
+
+            let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL AND sql IS NOT NULL", [tbl_name])?;
             info!("updated {n} rows in __corro_schema for table {tbl_name}");
         }
 
@@ -544,7 +545,7 @@ mod tests {
     use corro_types::{
         actor::ActorId,
         config::Config,
-        schema::{apply_schema, NormalizedSchema},
+        schema::{apply_schema, NormalizedSchema, Type},
         sqlite::CrConnManager,
     };
     use tokio::sync::mpsc::{channel, error::TryRecvError};
@@ -644,6 +645,76 @@ mod tests {
 
         // no actual changes!
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_api_db_schema() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let dir = tempfile::tempdir()?;
+
+        let rw_pool = bb8::Pool::builder()
+            .max_size(1)
+            .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
+
+        {
+            let mut conn = rw_pool.get().await?;
+            migrate(&mut conn)?;
+        };
+
+        let (tx, _rx) = channel(1);
+
+        let agent = Agent(Arc::new(corro_types::agent::AgentInner {
+            actor_id: ActorId(Uuid::new_v4()),
+            ro_pool: bb8::Pool::builder()
+                .max_size(1)
+                .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite"))),
+            rw_pool,
+            config: ArcSwap::from_pointee(
+                Config::builder()
+                    .db_path(dir.path().join("corrosion.db").display().to_string())
+                    .gossip_addr("127.0.0.1:1234".parse()?)
+                    .api_addr("127.0.0.1:8080".parse()?)
+                    .build()?,
+            ),
+            gossip_addr: "127.0.0.1:0".parse().unwrap(),
+            api_addr: "127.0.0.1:0".parse().unwrap(),
+            members: Default::default(),
+            clock: Default::default(),
+            bookie: Default::default(),
+            subscribers: Default::default(),
+            tx_bcast: tx,
+            schema: Default::default(),
+        }));
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![Statement::Simple(
+                "CREATE TABLE tests (id BIGINT PRIMARY KEY, foo TEXT);".into(),
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        let schema = agent.0.schema.read();
+        let tests = schema
+            .tables
+            .get("tests")
+            .expect("no tests table in schema");
+
+        let id_col = tests.columns.get("id").unwrap();
+        assert_eq!(id_col.name, "id");
+        assert_eq!(id_col.sql_type, Type::Integer);
+        assert_eq!(id_col.nullable, true);
+        assert_eq!(id_col.primary_key, true);
+
+        let foo_col = tests.columns.get("foo").unwrap();
+        assert_eq!(foo_col.name, "foo");
+        assert_eq!(foo_col.sql_type, Type::Text);
+        assert_eq!(foo_col.nullable, true);
+        assert_eq!(foo_col.primary_key, false);
 
         Ok(())
     }
