@@ -114,6 +114,7 @@ pub fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         ext_dir.path().display()
     );
     unsafe {
+        trace!("enabled loading extension");
         conn.load_extension_enable()?;
         conn.load_extension(
             ext_dir.path().join(CRSQL_EXT_GENERIC_NAME),

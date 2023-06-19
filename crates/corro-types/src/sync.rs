@@ -9,32 +9,22 @@ use tracing::trace;
 use crate::{
     actor::ActorId,
     agent::{Booked, Bookie},
-    broadcast::Timestamp,
+    broadcast::{ChangeV1, Timestamp},
     change::Change,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, Readable, Writable)]
+#[derive(Debug, Clone, Readable, Writable)]
 pub enum SyncMessage {
     V1(SyncMessageV1),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Readable, Writable)]
+#[derive(Debug, Clone, Readable, Writable)]
 pub enum SyncMessageV1 {
     State(SyncStateV1),
-    Changeset {
-        actor_id: ActorId,
-        // internal version
-        version: i64,
-        changes: Vec<Change>,
-        ts: Timestamp,
-    },
-    Cleared {
-        actor_id: ActorId,
-        versions: RangeInclusive<i64>,
-    },
+    Changeset(ChangeV1),
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable)]
+#[derive(Debug, Default, Clone, Readable, Writable)]
 pub struct SyncStateV1 {
     pub actor_id: ActorId,
     pub heads: HashMap<ActorId, i64>,

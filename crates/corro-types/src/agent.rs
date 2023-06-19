@@ -3,7 +3,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use rangemap::RangeInclusiveMap;
+use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use tokio::{sync::mpsc::Sender, task::block_in_place};
 use tracing::warn;
 
@@ -127,9 +127,18 @@ pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> 
     Ok(())
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum KnownDbVersion {
-    Current { db_version: i64, ts: Timestamp },
+    Current {
+        db_version: i64,
+        last_seq: i64,
+        ts: Timestamp,
+    },
+    Partial {
+        seqs: RangeInclusiveSet<i64>,
+        last_seq: i64,
+        ts: Timestamp,
+    },
     Cleared,
 }
 
@@ -168,8 +177,31 @@ impl Booked {
 pub struct BookWriter<'a>(RwLockWriteGuard<'a, BookedVersions>);
 
 impl<'a> BookWriter<'a> {
-    pub fn insert(&mut self, version: i64, db_version: KnownDbVersion) {
-        self.0.insert(version..=version, db_version);
+    pub fn insert(&mut self, version: i64, mut known_version: KnownDbVersion) {
+        if let KnownDbVersion::Partial { seqs, last_seq, ts } = &mut known_version {
+            if let Some((range, value)) = self.0.get_key_value(&version) {
+                if range.start() != range.end() {
+                    panic!("unexpected range key when trying to merge partial sequence of changes");
+                }
+                if let KnownDbVersion::Partial {
+                    seqs: old_seqs,
+                    last_seq: old_last_seq,
+                    ts: old_ts,
+                } = &value
+                {
+                    if old_last_seq != last_seq {
+                        panic!("divergent last_seq when attempting to merge booked seq ranges");
+                    }
+                    if old_ts != ts {
+                        panic!("divergent timestamp when attempting to merge booked seq ranges");
+                    }
+                    seqs.extend(old_seqs.clone());
+                } else {
+                    panic!("unexpected non-partial booked value");
+                }
+            }
+        }
+        self.0.insert(version..=version, known_version);
     }
 
     pub fn contains(&self, version: i64) -> bool {

@@ -1,5 +1,6 @@
 use std::{
     cmp,
+    ops::RangeInclusive,
     time::{Duration, Instant},
 };
 
@@ -7,6 +8,7 @@ use axum::Extension;
 use bb8::RunError;
 use compact_str::{CompactString, ToCompactString};
 use corro_types::{
+    actor::ActorId,
     agent::{Agent, KnownDbVersion},
     api::{QueryResultBuilder, RqliteResponse, RqliteResult, Statement},
     broadcast::{Changeset, Timestamp},
@@ -14,7 +16,10 @@ use corro_types::{
     sqlite::SqlitePool,
 };
 use hyper::StatusCode;
-use rusqlite::{params, params_from_iter, ToSql, Transaction};
+use rusqlite::{
+    params, params_from_iter, CachedStatement, Connection, MappedRows, OptionalExtension, Row,
+    Rows, ToSql, Transaction,
+};
 use tokio::task::block_in_place;
 use tracing::{error, info, trace};
 
@@ -24,6 +29,8 @@ use corro_types::{
 };
 
 use crate::agent::process_subs;
+
+const MAX_CHANGES_PER_MESSAGE: usize = 50;
 
 // TODO: accept a few options
 // #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -45,6 +52,85 @@ pub enum ChangeError {
     TooManyRowsImpacted,
 }
 
+pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
+    Ok(Change {
+        table: row.get(0)?,
+        pk: row.get(1)?,
+        cid: row.get(2)?,
+        val: row.get(3)?,
+        col_version: row.get(4)?,
+        db_version: row.get(5)?,
+        seq: row.get(6)?,
+        site_id: row.get(7)?,
+    })
+}
+
+pub struct ChunkedChanges<'stmt> {
+    rows: Rows<'stmt>,
+    changes: Vec<Change>,
+    last_pushed_seq: i64,
+    last_start_seq: i64,
+    last_seq: i64,
+}
+
+impl<'stmt> ChunkedChanges<'stmt> {
+    pub fn new(
+        statement: &'stmt mut CachedStatement,
+        actor_id: Option<ActorId>,
+        db_version: i64,
+        last_seq: i64,
+    ) -> rusqlite::Result<Self> {
+        let site_id: Option<[u8; 16]> = actor_id.map(|actor_id| actor_id.to_bytes());
+
+        let rows = statement.query(params![site_id, db_version])?;
+
+        Ok(Self {
+            rows,
+            changes: vec![],
+            last_pushed_seq: 0,
+            last_start_seq: 0,
+            last_seq,
+        })
+    }
+}
+
+impl<'stmt> Iterator for ChunkedChanges<'stmt> {
+    type Item = Result<(Vec<Change>, RangeInclusive<i64>), rusqlite::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.last_pushed_seq >= self.last_seq {
+            return None;
+        }
+
+        loop {
+            match self.rows.next() {
+                Ok(Some(row)) => match row_to_change(row) {
+                    Ok(change) => {
+                        self.last_pushed_seq = change.seq;
+                        self.changes.push(change);
+
+                        if self.changes.len() >= MAX_CHANGES_PER_MESSAGE {
+                            let start_seq = self.last_start_seq;
+                            self.last_start_seq = self.last_pushed_seq + 1;
+                            return Some(Ok((
+                                self.changes.drain(..).collect(),
+                                start_seq..=self.last_pushed_seq,
+                            )));
+                        }
+                    }
+                    Err(e) => return Some(Err(e)),
+                },
+                Ok(None) => break,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        return Some(Ok((
+            self.changes.drain(..).collect(),
+            self.last_start_seq..=self.last_seq,
+        )));
+    }
+}
+
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     f: F,
@@ -62,106 +148,114 @@ where
     block_in_place(move || {
         let tx = conn.transaction()?;
 
-        let start_version: i64 = tx
-            .prepare_cached("SELECT crsql_dbversion();")?
-            .query_row((), |row| row.get(0))?;
-
+        // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
-        let rows_impacted: i64 = tx
-            .prepare_cached("SELECT crsql_rows_impacted()")?
-            .query_row((), |row| row.get(0))?;
+        let db_version: i64 = tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
 
-        if rows_impacted > agent.config().max_change_size {
-            return Err(ChangeError::TooManyRowsImpacted);
-        }
+        let last_seq: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
+                [db_version],
+                |row| row.get(0),
+            )
+            .optional()?;
 
         let booked = agent.bookie().for_actor(actor_id);
+        let mut book_writer = booked.write();
+
+        let last_version = book_writer.last().unwrap_or(0);
+        trace!("last_version: {last_version}");
+        let version = last_version + 1;
+        trace!("version: {version}");
+
         let elapsed = {
-            let mut book_writer = booked.write();
+            if last_seq.is_some() {
+                let last_seq: i64 = tx.query_row(
+                    "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
+                    [db_version],
+                    |row| row.get(0),
+                )?;
 
-            let last_version = book_writer.last().unwrap_or(0);
-            trace!("last_version: {last_version}");
-            let version = last_version + 1;
-            trace!("version: {version}");
-
-            let (changes, db_version) = {
-                let mut prepped = tx.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version FROM crsql_changes WHERE site_id IS NULL AND db_version > ?"#)?;
-
-                let mut end_version = start_version;
-
-                let mapped = prepped.query_map([start_version], |row| {
-                    let change = Change {
-                        table: row.get(0)?,
-                        pk: row.get(1)?,
-                        cid: row.get(2)?,
-                        val: row.get(3)?,
-                        col_version: row.get(4)?,
-                        db_version: row.get(5)?,
-                        site_id: actor_id.to_bytes(),
-                    };
-                    end_version = cmp::max(end_version, change.db_version);
-                    Ok(change)
-                })?;
-
-                let changes = mapped.collect::<Result<Vec<Change>, rusqlite::Error>>()?;
-
-                let db_version = if end_version > start_version {
-                    tx.prepare_cached(
-                        r#"
-                        INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts)
-                            VALUES (?, ?, ?, ?);
-                    "#,
-                    )?
-                    .execute(params![
-                        actor_id,
-                        version,
-                        end_version,
-                        Timestamp::from(agent.clock().new_timestamp())
-                    ])?;
-                    Some(end_version)
-                } else {
-                    None
-                };
-
-                (changes, db_version)
-            };
+                tx.prepare_cached(
+                    r#"
+                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
+                    VALUES (?, ?, ?, ?, ?);
+            "#,
+                )?
+                .execute(params![
+                    actor_id,
+                    version,
+                    db_version,
+                    last_seq,
+                    Timestamp::from(agent.clock().new_timestamp())
+                ])?;
+            }
 
             tx.commit()?;
-            let elapsed = start.elapsed();
-
-            if !changes.is_empty() {
-                let ts: Timestamp = agent.clock().new_timestamp().into();
-                book_writer.insert(
-                    version,
-                    match db_version {
-                        Some(db_version) => KnownDbVersion::Current { db_version, ts },
-                        None => KnownDbVersion::Cleared,
-                    },
-                );
-
-                if let Some(db_version) = db_version {
-                    process_subs(agent, &changes, db_version);
-                }
-
-                let tx_bcast = agent.tx_bcast().clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tx_bcast
-                        .send(BroadcastInput::AddBroadcast(Message::V1(
-                            MessageV1::Change {
-                                actor_id,
-                                version,
-                                changeset: Changeset::Full { changes, ts },
-                            },
-                        )))
-                        .await
-                    {
-                        error!("could not send change message for broadcast: {e}");
-                    }
-                });
-            }
-            elapsed
+            start.elapsed()
         };
+
+        if let Some(last_seq) = last_seq {
+            let ts: Timestamp = agent.clock().new_timestamp().into();
+            book_writer.insert(
+                version,
+                KnownDbVersion::Current {
+                    db_version,
+                    last_seq,
+                    ts,
+                },
+            );
+
+            let agent = agent.clone();
+
+            // TODO: make sure this future finishes in case the program get shuts down
+            //       probably by using `spawn_counted`
+            tokio::spawn(async move {
+                let conn = agent.read_only_pool().get().await?;
+
+                block_in_place(|| {
+                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS ? AND db_version = ?"#)?;
+                    let mut chunked =
+                        ChunkedChanges::new(&mut prepped, None, db_version, last_seq)?;
+                    while let Some(changes_seqs) = chunked.next() {
+                        match changes_seqs {
+                            Ok((changes, seqs)) => {
+                                process_subs(&agent, &changes, db_version);
+
+                                let tx_bcast = agent.tx_bcast().clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = tx_bcast
+                                        .send(BroadcastInput::AddBroadcast(Message::V1(
+                                            MessageV1::Change {
+                                                actor_id,
+                                                version,
+                                                changeset: Changeset::Full {
+                                                    changes,
+                                                    seqs,
+                                                    last_seq,
+                                                    ts,
+                                                },
+                                            },
+                                        )))
+                                        .await
+                                    {
+                                        error!("could not send change message for broadcast: {e}");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    Ok::<_, rusqlite::Error>(())
+                })?;
+
+                Ok::<_, eyre::Report>(())
+            });
+        }
 
         Ok::<_, ChangeError>((ret, elapsed))
     })

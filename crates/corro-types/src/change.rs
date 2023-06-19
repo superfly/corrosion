@@ -20,6 +20,7 @@ pub struct Change {
     pub val: SqliteValue,
     pub col_version: i64,
     pub db_version: i64,
+    pub seq: i64,
     pub site_id: [u8; 16],
 }
 

@@ -4,6 +4,7 @@ use std::{
     error::Error,
     fmt, io,
     net::SocketAddr,
+    ops::RangeInclusive,
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
@@ -21,7 +22,9 @@ use arc_swap::ArcSwap;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, AgentInner, Booked, BookedVersions, Bookie, KnownDbVersion},
-    broadcast::{BroadcastInput, BroadcastSrc, Changeset, FocaInput, Message, MessageV1},
+    broadcast::{
+        BroadcastInput, BroadcastSrc, ChangeV1, Changeset, FocaInput, Message, MessageV1, Timestamp,
+    },
     change::Change,
     config::{Config, DEFAULT_GOSSIP_PORT},
     filters::{match_expr, AggregateChange},
@@ -29,7 +32,10 @@ use corro_types::{
     pubsub::{SubscriptionEvent, SubscriptionMessage},
     schema::{apply_schema, init_schema},
     sqlite::{init_cr_conn, CrConn, CrConnManager, Migration, SqlitePool},
-    sync::{generate_sync, SyncMessage, SyncMessageDecodeError, SyncMessageV1, SyncStateV1},
+    sync::{
+        generate_sync, SyncMessage, SyncMessageDecodeError, SyncMessageEncodeError, SyncMessageV1,
+        SyncStateV1,
+    },
 };
 
 use axum::{
@@ -45,6 +51,7 @@ use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
+use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use spawn::spawn_counted;
 use tokio::{
@@ -144,9 +151,14 @@ pub async fn setup(
     let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 
     {
+        debug!("getting read-only conn for pull bookkeeping rows");
         let conn = ro_pool.get().await?;
+
+        debug!("getting bookkept rows");
+
         let mut prepped = conn.prepare_cached(
-            "SELECT actor_id, start_version, end_version, db_version, ts FROM __corro_bookkeeping",
+            "SELECT actor_id, start_version, end_version, db_version, last_seq, ts
+                FROM __corro_bookkeeping AS bk",
         )?;
         let mut rows = prepped.query([])?;
 
@@ -163,7 +175,8 @@ pub async fn setup(
                         match row.get(3)? {
                             Some(db_version) => KnownDbVersion::Current {
                                 db_version,
-                                ts: row.get(4)?,
+                                last_seq: row.get(4)?,
+                                ts: row.get(5)?,
                             },
                             None => KnownDbVersion::Cleared,
                         },
@@ -171,7 +184,45 @@ pub async fn setup(
                 }
             }
         }
+
+        let mut partials: HashMap<(ActorId, i64), (RangeInclusiveSet<i64>, i64, Timestamp)> =
+            HashMap::new();
+
+        debug!("getting seq bookkept rows");
+
+        let mut prepped = conn.prepare_cached(
+            "SELECT site_id, version, start_seq, end_seq, last_seq, ts
+                FROM __corro_seq_bookkeeping",
+        )?;
+        let mut rows = prepped.query([])?;
+
+        loop {
+            let row = rows.next()?;
+            match row {
+                None => break,
+                Some(row) => {
+                    let (range, last_seq, ts) =
+                        partials.entry((row.get(0)?, row.get(1)?)).or_default();
+
+                    range.insert(row.get(2)?..=row.get(3)?);
+                    *last_seq = row.get(4)?;
+                    *ts = row.get(5)?;
+                }
+            }
+        }
+
+        debug!("filling up partial known versions");
+
+        for ((actor_id, version), (seqs, last_seq, ts)) in partials {
+            let ranges = bk.entry(actor_id).or_default();
+            ranges.insert(
+                version..=version,
+                KnownDbVersion::Partial { seqs, last_seq, ts },
+            );
+        }
     }
+
+    debug!("done building bookkeeping");
 
     let bookie = Bookie::new(Arc::new(RwLock::new(
         bk.into_iter()
@@ -930,6 +981,7 @@ pub async fn handle_broadcast(
                     }) => {
                         increment_counter!("corro.broadcast.recv.count", "kind" => "operation");
 
+                        // TODO: check the seqs range
                         if bookie.contains(actor_id, version) {
                             trace!("already seen, stop disseminating");
                             continue;
@@ -968,7 +1020,22 @@ fn store_empty_changeset(
     actor_id: ActorId,
     version: i64,
 ) -> Result<(), rusqlite::Error> {
-    tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, rusqlite::types::Null, rusqlite::types::Null])?;
+    tx.prepare_cached(
+        "
+        INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (actor_id, start_version) DO NOTHING;
+    ",
+    )?
+    .execute(params![
+        actor_id,
+        version,
+        rusqlite::types::Null,
+        rusqlite::types::Null
+    ])?;
+
+    tx.prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?
+        .execute(params![actor_id, version,])?;
 
     tx.commit()?;
     return Ok(());
@@ -976,12 +1043,19 @@ fn store_empty_changeset(
 
 async fn process_single_version(
     agent: &Agent,
-    actor_id: ActorId,
-    version: i64,
-    changeset: Changeset,
+    change: ChangeV1,
 ) -> Result<Option<Changeset>, bb8::RunError<bb8_rusqlite::Error>> {
     let bookie = agent.bookie();
 
+    let is_complete = change.is_complete();
+
+    let ChangeV1 {
+        actor_id,
+        version,
+        changeset,
+    } = change;
+
+    // TODO: check the seqs range
     if bookie.contains(actor_id, version) {
         trace!(
             "already seen this one! from: {}, version: {version}",
@@ -1006,23 +1080,83 @@ async fn process_single_version(
             return Ok(None);
         }
 
-        let (db_version, changeset) = block_in_place(move || {
+        let (known_version, changeset, db_version) = block_in_place(move || {
             let tx = conn.transaction()?;
 
-            let (changes, ts) = match changeset {
-                Changeset::Empty => {
+            let (changes, seqs, last_seq, ts) = match changeset.into_changes() {
+                None => {
                     store_empty_changeset(tx, actor_id, version)?;
-                    return Ok((None, Changeset::Empty));
+                    return Ok((KnownDbVersion::Cleared, Changeset::Empty, None));
                 }
-                Changeset::Full { changes, .. } if changes.is_empty() => {
-                    store_empty_changeset(tx, actor_id, version)?;
-                    return Ok((None, Changeset::Empty));
-                }
-                Changeset::Full { changes, ts } => (changes, ts),
+                Some(parts) => parts,
             };
 
-            let start_version: i64 =
-                tx.query_row("SELECT crsql_dbversion()", (), |row| row.get(0))?;
+            // if not a full range!
+            if !is_complete {
+                for change in changes.iter() {
+                    debug!("buffering change! {change:?}");
+                    tx.prepare_cached(
+                        r#"
+                            INSERT INTO __corro_buffered_changes
+                                ("table", pk, cid, val, col_version, db_version, site_id, seq, version)
+                            VALUES
+                                (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,   ?)
+                            ON CONFLICT (site_id, db_version, version, seq)
+                                DO NOTHING
+                        "#,
+                    )?
+                    .execute(params![
+                        change.table.as_str(),
+                        change.pk.as_str(),
+                        change.cid.as_str(),
+                        &change.val,
+                        change.col_version,
+                        change.db_version,
+                        &change.site_id,
+                        change.seq,
+                        version,
+                    ])?;
+                }
+
+                tx.prepare_cached(
+                    "
+                    INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, ts)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT (site_id, version, start_seq)
+                            DO UPDATE SET end_seq = excluded.end_seq;
+                ",
+                )?
+                .execute(params![
+                    actor_id,
+                    version,
+                    seqs.start(),
+                    seqs.end(),
+                    ts
+                ])?;
+
+                tx.commit()?;
+
+                let mut range_seqs = RangeInclusiveSet::new();
+                range_seqs.insert(seqs.clone());
+
+                return Ok((
+                    KnownDbVersion::Partial {
+                        seqs: range_seqs,
+                        last_seq,
+                        ts,
+                    },
+                    Changeset::Full {
+                        changes,
+                        seqs,
+                        last_seq,
+                        ts,
+                    },
+                    None,
+                ));
+            }
+
+            let db_version: i64 =
+                tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
 
             let mut impactful_changeset = vec![];
 
@@ -1030,10 +1164,11 @@ async fn process_single_version(
                 debug!("inserting change! {change:?}");
                 tx.prepare_cached(
                     r#"
-            INSERT INTO crsql_changes
-                ("table", pk, cid, val, col_version, db_version, site_id)
-            VALUES
-                (?,       ?,  ?,   ?,   ?,           ?,          ?)"#,
+                        INSERT INTO crsql_changes
+                            ("table", pk, cid, val, col_version, db_version, seq, site_id)
+                        VALUES
+                            (?,       ?,  ?,   ?,   ?,           ?,          ?,    ?)
+                    "#,
                 )?
                 .execute(params![
                     change.table.as_str(),
@@ -1042,6 +1177,7 @@ async fn process_single_version(
                     &change.val,
                     change.col_version,
                     change.db_version,
+                    change.seq,
                     &change.site_id
                 ])?;
                 let rows_impacted: i64 = tx
@@ -1054,15 +1190,6 @@ async fn process_single_version(
                 }
             }
 
-            let end_version: i64 = tx
-                .prepare_cached("SELECT MAX(db_version) FROM crsql_changes;")?
-                .query_row((), |row| row.get(0))?;
-
-            let db_version = if end_version > start_version {
-                Some(end_version)
-            } else {
-                None
-            };
             debug!(
                 "inserting bookkeeping row: {}, start: {}, end: {:?}, ts: {:?}",
                 actor_id, version, db_version, ts
@@ -1070,33 +1197,31 @@ async fn process_single_version(
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, ts])?;
 
-            let new_changeset = if impactful_changeset.is_empty() {
-                Changeset::Empty
+            let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
+                (KnownDbVersion::Cleared, Changeset::Empty, None)
             } else {
-                Changeset::Full {
-                    changes: impactful_changeset,
-                    ts,
-                }
+                (
+                    KnownDbVersion::Current {
+                        db_version,
+                        last_seq,
+                        ts,
+                    },
+                    Changeset::Full {
+                        changes: impactful_changeset,
+                        seqs,
+                        last_seq,
+                        ts,
+                    },
+                    Some(db_version),
+                )
             };
 
             tx.commit()?;
 
-            Ok::<_, bb8_rusqlite::Error>((db_version, new_changeset))
+            Ok::<_, bb8_rusqlite::Error>((known_version, new_changeset, db_version))
         })?;
 
-        booked_write.insert(
-            version,
-            match (db_version, changeset.ts()) {
-                (Some(db_version), Some(ts)) => KnownDbVersion::Current { db_version, ts },
-                (Some(db_version), None) => {
-                    panic!("should not be possible: missing timestamp for still-current db_version {db_version}");
-                }
-                (None, Some(ts)) => {
-                    panic!("should not be possible: missing db_version, but we have a timestamp {ts}");
-                }
-                (None, None) => KnownDbVersion::Cleared,
-            },
-        );
+        booked_write.insert(version, known_version);
         (db_version, changeset)
     };
 
@@ -1117,7 +1242,15 @@ async fn process_msg(
             version,
             changeset,
         }) => {
-            let changeset = process_single_version(agent, actor_id, version, changeset).await?;
+            let changeset = process_single_version(
+                agent,
+                ChangeV1 {
+                    actor_id,
+                    version,
+                    changeset,
+                },
+            )
+            .await?;
 
             changeset.map(|changeset| {
                 Message::V1(MessageV1::Change {
@@ -1182,6 +1315,8 @@ pub enum SyncClientError {
     NoGoodCandidate,
     #[error("could not decode message: {0}")]
     Decoded(#[from] SyncMessageDecodeError),
+    #[error("could not encode message: {0}")]
+    Encoded(#[from] SyncMessageEncodeError),
     #[error("unexpected sync message")]
     UnexpectedSyncMessage,
 }
@@ -1307,14 +1442,17 @@ async fn handle_sync_receive(
     );
 
     let sync_msg: SyncMessage = sync.into();
-    let data = serde_json::to_vec(&sync_msg)?;
+    let mut buf = BytesMut::new();
+
+    sync_msg.encode(&mut buf)?;
+    let data = buf.split().freeze();
 
     gauge!("corro.sync.client.request.size.bytes", data.len() as f64);
 
     let req = hyper::Request::builder()
         .method(hyper::Method::POST)
         .uri(format!("http://{addr}/v1/sync"))
-        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(hyper::header::CONTENT_TYPE, "application/speedy")
         .header(hyper::header::ACCEPT, "application/octet-stream")
         .header(
             "corro-clock",
@@ -1377,23 +1515,9 @@ async fn handle_sync_receive(
         let mut buf = buf_res?;
         let msg = SyncMessage::from_buf(&mut buf)?;
         let len = match msg {
-            SyncMessage::V1(SyncMessageV1::Changeset {
-                actor_id,
-                version,
-                changes,
-                ts,
-            }) => {
-                let len = changes.len();
-                process_single_version(agent, actor_id, version, Changeset::Full { changes, ts })
-                    .await?;
-                len
-            }
-            SyncMessage::V1(SyncMessageV1::Cleared { actor_id, versions }) => {
-                let len = ((versions.end() - versions.start()) + 1) as usize;
-                for version in versions {
-                    process_single_version(agent, actor_id, version, Changeset::Empty).await?;
-                }
-
+            SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
+                let len = change.len();
+                process_single_version(agent, change).await?;
                 len
             }
             SyncMessage::V1(SyncMessageV1::State(_)) => {
@@ -1446,14 +1570,53 @@ pub fn migrate(conn: &mut CrConn) -> rusqlite::Result<()> {
 fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         r#"
-            -- internal bookeeping
+            -- internal bookkeeping
             CREATE TABLE __corro_bookkeeping (
                 actor_id TEXT NOT NULL,
                 start_version INTEGER NOT NULL,
                 end_version INTEGER,
                 db_version INTEGER,
+
+                last_seq INTEGER,
+
                 ts TEXT,
+
                 PRIMARY KEY (actor_id, start_version)
+            ) WITHOUT ROWID;
+
+            -- internal per-db-version seq bookkeeping
+            CREATE TABLE __corro_seq_bookkeeping (
+                -- remote actor / site id
+                site_id BLOB NOT NULL,
+                -- remote internal version
+                version INTEGER NOT NULL,
+                
+                -- start and end seq for this bookkept record
+                start_seq INTEGER NOT NULL,
+                end_seq INTEGER NOT NULL,
+
+                last_seq INTEGER NOT NULL,
+
+                -- timestamp, need to propagate...
+                ts TEXT NOT NULL,
+
+                PRIMARY KEY (site_id, version, start_seq)
+            ) WITHOUT ROWID;
+
+            -- buffered changes (similar schema as crsql_changes)
+            CREATE TABLE __corro_buffered_changes (
+                "table" TEXT NOT NULL,
+                pk TEXT NOT NULL,
+                cid TEXT NOT NULL,
+                val ANY, -- shouldn't matter I don't think
+                col_version INTEGER NOT NULL,
+                db_version INTEGER NOT NULL,
+                site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
+                seq INTEGER NOT NULL,
+
+                version INTEGER NOT NULL,
+
+                PRIMARY KEY (site_id, db_version, version, seq)
             ) WITHOUT ROWID;
             
             -- SWIM memberships
@@ -1557,15 +1720,17 @@ pub mod tests {
             "hello world 1"
         ],]))?;
 
-        let res = client
-            .request(
+        let res = timeout(
+            Duration::from_secs(5),
+            client.request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
                     .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
-            )
-            .await?;
+            ),
+        )
+        .await??;
 
         let body: RqliteResponse =
             serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
@@ -2035,7 +2200,7 @@ pub mod tests {
 
         let changes = conn
                     .prepare_cached(
-                        r#"SELECT "table", pk, cid, val, col_version, db_version, COALESCE(site_id, crsql_siteid()) FROM crsql_changes"#,
+                        r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes"#,
                     )?
                     .query_map([], |row| {
                         Ok(Change {
@@ -2045,7 +2210,8 @@ pub mod tests {
                             val: row.get(3)?,
                             col_version: row.get(4)?,
                             db_version: row.get(5)?,
-                            site_id: row.get(6)?,
+                            seq: row.get(6)?,
+                            site_id: row.get(7)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
