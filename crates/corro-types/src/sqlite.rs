@@ -6,7 +6,7 @@ use std::{
 use bb8::ManageConnection;
 use bb8_rusqlite::RusqliteConnectionManager;
 use once_cell::sync::Lazy;
-use rusqlite::{Connection, OpenFlags, ToSql, Transaction};
+use rusqlite::{Connection, ToSql, Transaction};
 use tempfile::TempDir;
 use tracing::{error, trace};
 

@@ -1,4 +1,4 @@
-use std::collections::btree_map::Range;
+use std::cmp;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
@@ -12,7 +12,7 @@ use axum::{
 };
 use bytes::BytesMut;
 use corro_types::agent::{Agent, KnownDbVersion};
-use corro_types::broadcast::{ChangeV1, Changeset, Timestamp};
+use corro_types::broadcast::{ChangeV1, Changeset};
 use corro_types::sync::{SyncMessage, SyncMessageV1};
 use futures::StreamExt;
 use metrics::{counter, histogram};
@@ -24,13 +24,12 @@ use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, trace, warn};
 
 use crate::agent::handle_payload;
-use crate::api::http::{row_to_change, ChunkedChanges};
+use crate::api::http::ChunkedChanges;
 
 use corro_types::{
     actor::ActorId,
     agent::{Booked, Bookie},
     broadcast::{BroadcastSrc, FocaInput, Message},
-    change::Change,
     sqlite::SqlitePool,
 };
 
@@ -170,12 +169,20 @@ fn process_range(
     };
 
     for (versions, known_version) in overlapping {
-        for version in versions {
-            block_in_place(|| {
-                process_version(&conn, actor_id, is_local, version, &known_version, &sender)?;
-                Ok::<_, eyre::Report>(())
-            })?;
-        }
+        block_in_place(|| {
+            for version in versions {
+                process_version(
+                    &conn,
+                    actor_id,
+                    is_local,
+                    version,
+                    &known_version,
+                    vec![],
+                    &sender,
+                )?;
+            }
+            Ok::<_, eyre::Report>(())
+        })?;
     }
 
     Ok(())
@@ -187,6 +194,7 @@ fn process_version(
     is_local: bool,
     version: i64,
     known_version: &KnownDbVersion,
+    mut seqs_needed: Vec<RangeInclusive<i64>>,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
     match known_version {
@@ -195,64 +203,88 @@ fn process_version(
             last_seq,
             ts,
         } => {
-            let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS ? AND db_version = ?"#)?;
-            let mut chunked = ChunkedChanges::new(
-                &mut prepped,
-                (!is_local).then_some(actor_id),
-                *db_version,
-                *last_seq,
-            )?;
-            while let Some(changes_seqs) = chunked.next() {
-                match changes_seqs {
-                    Ok((changes, seqs)) => {
-                        send_msg(
-                            SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                                actor_id,
-                                version,
-                                changeset: Changeset::Full {
-                                    changes,
-                                    seqs,
-                                    last_seq: *last_seq,
-                                    ts: *ts,
-                                },
-                            })),
-                            &sender,
-                        );
-                    }
-                    Err(e) => {
-                        error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                        break;
+            if seqs_needed.is_empty() {
+                seqs_needed = vec![(0..=*last_seq)];
+            }
+
+            for range in seqs_needed {
+                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS ? AND db_version = ? AND seq >= ?"#)?;
+                let site_id: Option<[u8; 16]> = (!is_local)
+                    .then_some(actor_id)
+                    .map(|actor_id| actor_id.to_bytes());
+
+                let rows = prepped.query(params![site_id, db_version, range.start()])?;
+
+                let mut chunked = ChunkedChanges::new(rows, *range.end())?;
+                while let Some(changes_seqs) = chunked.next() {
+                    match changes_seqs {
+                        Ok((changes, seqs)) => {
+                            send_msg(
+                                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                                    actor_id,
+                                    version,
+                                    changeset: Changeset::Full {
+                                        changes,
+                                        seqs,
+                                        last_seq: *last_seq,
+                                        ts: *ts,
+                                    },
+                                })),
+                                &sender,
+                            );
+                        }
+                        Err(e) => {
+                            error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                            break;
+                        }
                     }
                 }
             }
         }
         KnownDbVersion::Partial { seqs, last_seq, ts } => {
-            for range in seqs.iter() {
-                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM crsql_changes WHERE site_id IS ? AND version = ? AND seq >= ? AND seq <= ?"#)?;
-                let mapped = prepped.query_map(
-                    params![actor_id, version, range.start(), range.end()],
-                    row_to_change,
-                )?;
+            if seqs_needed.is_empty() {
+                seqs_needed = vec![(0..=*last_seq)];
+            }
 
-                match mapped.collect::<rusqlite::Result<Vec<Change>>>() {
-                    Ok(changes) => {
-                        send_msg(
-                            SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                                actor_id,
-                                version,
-                                changeset: Changeset::Full {
-                                    changes,
-                                    seqs: range.clone(),
-                                    last_seq: *last_seq,
-                                    ts: *ts,
-                                },
-                            })),
-                            &sender,
-                        );
-                    }
-                    Err(e) => {
-                        error!("could not get seqs in {range:?} for version {version} and actor_id: {actor_id}, error: {e}");
+            for range_needed in seqs_needed {
+                for range in seqs.iter() {
+                    // check if our partial range is contained into the needed range from the other node
+                    if range.start() > range_needed.end() {
                         continue;
+                    }
+
+                    let start_seq = cmp::max(range.start(), range_needed.start());
+                    let end_seq = cmp::min(range.end(), range_needed.end());
+
+                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM __corro_buffered_changes WHERE site_id = ? AND version = ? AND seq >= ? AND seq <= ?"#)?;
+
+                    let site_id: [u8; 16] = actor_id.to_bytes();
+
+                    let rows = prepped.query(params![site_id, version, start_seq, end_seq])?;
+
+                    let mut chunked = ChunkedChanges::new(rows, *end_seq)?;
+                    while let Some(changes_seqs) = chunked.next() {
+                        match changes_seqs {
+                            Ok((changes, seqs)) => {
+                                send_msg(
+                                    SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                                        actor_id,
+                                        version,
+                                        changeset: Changeset::Full {
+                                            changes,
+                                            seqs,
+                                            last_seq: *last_seq,
+                                            ts: *ts,
+                                        },
+                                    })),
+                                    &sender,
+                                );
+                            }
+                            Err(e) => {
+                                error!("could not process buffered crsql change (version: {version}) for broadcast: {e}");
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -307,7 +339,25 @@ async fn process_sync(
             }
         }
 
-        // 2. process newer-than-heads
+        // 2. process partial needs
+        if let Some(partial_needed) = sync_state.partial_need.get(&actor_id) {
+            for (version, seqs_needed) in partial_needed.iter() {
+                let known = { booked.read().get(version).cloned() };
+                if let Some(known) = known {
+                    process_version(
+                        &conn,
+                        actor_id,
+                        is_local,
+                        *version,
+                        &known,
+                        seqs_needed.clone(),
+                        &sender,
+                    )?;
+                }
+            }
+        }
+
+        // 3. process newer-than-heads
         let their_last_version = sync_state.heads.get(&actor_id).copied().unwrap_or(0);
         let our_last_version = booked.last().unwrap_or(0);
 

@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     ops::RangeInclusive,
     time::{Duration, Instant},
 };
@@ -8,7 +7,6 @@ use axum::Extension;
 use bb8::RunError;
 use compact_str::{CompactString, ToCompactString};
 use corro_types::{
-    actor::ActorId,
     agent::{Agent, KnownDbVersion},
     api::{QueryResultBuilder, RqliteResponse, RqliteResult, Statement},
     broadcast::{Changeset, Timestamp},
@@ -16,10 +14,7 @@ use corro_types::{
     sqlite::SqlitePool,
 };
 use hyper::StatusCode;
-use rusqlite::{
-    params, params_from_iter, CachedStatement, Connection, MappedRows, OptionalExtension, Row,
-    Rows, ToSql, Transaction,
-};
+use rusqlite::{params, params_from_iter, Row, Rows, ToSql, Transaction};
 use tokio::task::block_in_place;
 use tracing::{error, info, trace};
 
@@ -75,16 +70,7 @@ pub struct ChunkedChanges<'stmt> {
 }
 
 impl<'stmt> ChunkedChanges<'stmt> {
-    pub fn new(
-        statement: &'stmt mut CachedStatement,
-        actor_id: Option<ActorId>,
-        db_version: i64,
-        last_seq: i64,
-    ) -> rusqlite::Result<Self> {
-        let site_id: Option<[u8; 16]> = actor_id.map(|actor_id| actor_id.to_bytes());
-
-        let rows = statement.query(params![site_id, db_version])?;
-
+    pub fn new(rows: Rows<'stmt>, last_seq: i64) -> rusqlite::Result<Self> {
         Ok(Self {
             rows,
             changes: vec![],
@@ -230,9 +216,9 @@ where
                 let conn = agent.read_only_pool().get().await?;
 
                 block_in_place(|| {
-                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS ? AND db_version = ?"#)?;
-                    let mut chunked =
-                        ChunkedChanges::new(&mut prepped, None, db_version, last_seq)?;
+                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?"#)?;
+                    let rows = prepped.query([db_version])?;
+                    let mut chunked = ChunkedChanges::new(rows, last_seq)?;
                     while let Some(changes_seqs) = chunked.next() {
                         match changes_seqs {
                             Ok((changes, seqs)) => {

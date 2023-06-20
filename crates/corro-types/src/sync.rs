@@ -1,16 +1,14 @@
 use std::{collections::HashMap, io, ops::RangeInclusive};
 
 use bytes::{Buf, BufMut, BytesMut};
-use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 use tracing::trace;
 
 use crate::{
     actor::ActorId,
-    agent::{Booked, Bookie},
-    broadcast::{ChangeV1, Timestamp},
-    change::Change,
+    agent::{Booked, Bookie, KnownDbVersion},
+    broadcast::ChangeV1,
 };
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -29,6 +27,7 @@ pub struct SyncStateV1 {
     pub actor_id: ActorId,
     pub heads: HashMap<ActorId, i64>,
     pub need: HashMap<ActorId, Vec<RangeInclusive<i64>>>,
+    pub partial_need: HashMap<ActorId, HashMap<i64, Vec<RangeInclusive<i64>>>>,
 }
 
 impl SyncStateV1 {
@@ -76,6 +75,19 @@ pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
         state
             .need
             .insert(actor_id, booked.read().gaps(&(1..=last_version)).collect());
+
+        {
+            let read = booked.read();
+            for (range, known) in read.iter() {
+                if let KnownDbVersion::Partial { seqs, last_seq, .. } = known {
+                    state
+                        .partial_need
+                        .entry(actor_id)
+                        .or_default()
+                        .insert(*range.start(), seqs.gaps(&(0..=*last_seq)).collect());
+                }
+            }
+        }
 
         state.heads.insert(actor_id, last_version);
     }

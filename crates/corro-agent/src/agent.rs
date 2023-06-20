@@ -1,10 +1,8 @@
 use std::{
-    collections::{hash_set::Difference, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     convert::Infallible,
     error::Error,
-    fmt,
-    hash::BuildHasher,
-    io,
+    fmt, io,
     net::SocketAddr,
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
@@ -441,6 +439,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     tokio::spawn({
         let self_actor_id = agent.actor_id();
         let pool = agent.read_only_pool().clone();
+        let rw_pool = agent.read_write_pool().clone();
         let bookie = agent.bookie().clone();
         async move {
             loop {
@@ -476,8 +475,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         continue;
                     }
                 };
-                block_in_place(|| {
+                let to_replace = block_in_place(|| {
+                    let mut to_replace = HashSet::new();
                     for (actor_id, versions) in to_check {
+                        if versions.is_empty() {
+                            continue;
+                        }
                         let site_id = if actor_id == self_actor_id {
                             None
                         } else {
@@ -486,12 +489,16 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         match compact_booked_for_actor(&conn, site_id, &versions) {
                             Ok(diff) => {
+                                if diff.is_empty() {
+                                    continue;
+                                }
                                 let booked = bookie.for_actor(actor_id);
                                 let len = diff.len();
                                 for version in diff {
                                     booked.insert(version, KnownDbVersion::Cleared);
                                 }
                                 info!("compacted in-memory cache by clearing {len} db versions for actor {actor_id}");
+                                to_replace.insert(actor_id);
                             }
                             Err(e) => {
                                 error!("could not compute difference between known live and still alive versions for actor {actor_id}: {e}");
@@ -499,7 +506,61 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             }
                         }
                     }
+                    to_replace
                 });
+
+                for actor_id in to_replace {
+                    let mut conn = match rw_pool.get().await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            error!("could not checkout r/w pooled conn for compacting in-db actor versions: {e}");
+                            continue;
+                        }
+                    };
+
+                    let res = block_in_place(|| {
+                        let tx = conn.transaction()?;
+
+                        let deleted = tx
+                            .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ?")?
+                            .execute([actor_id])?;
+
+                        let mut inserted = 0;
+
+                        let booked = bookie.for_actor(actor_id);
+                        {
+                            let read = booked.read();
+
+                            for (range, known) in read.iter() {
+                                match known {
+                                    KnownDbVersion::Current {
+                                        db_version,
+                                        last_seq,
+                                        ts,
+                                    } => {
+                                        inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?,?,?,?,?)")?.execute(params![actor_id, range.start(), db_version, last_seq, ts])?;
+                                    }
+                                    KnownDbVersion::Cleared => {
+                                        inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?,?,?)")?.execute(params![actor_id, range.start(), range.end()])?;
+                                    }
+                                    KnownDbVersion::Partial { .. } => {
+                                        // do nothing, not stored in that table!
+                                    }
+                                }
+                            }
+                        }
+
+                        tx.commit()?;
+
+                        info!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
+
+                        Ok::<_, rusqlite::Error>(())
+                    });
+
+                    if let Err(e) = res {
+                        error!("could not compact in-db versions state for actor {actor_id}: {e}");
+                    }
+                }
             }
         }
     });
