@@ -161,15 +161,24 @@ where
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
-        let db_version: i64 = tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
+        let db_version: i64 = tx
+            .prepare_cached("SELECT crsql_nextdbversion()")?
+            .query_row((), |row| row.get(0))?;
 
-        let last_seq: Option<i64> = tx
-            .query_row(
+        let has_changes: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE site_id IS NULL AND db_version = ?);",
+        )?
+        .query_row([db_version], |row| row.get(0))?;
+
+        let last_seq: Option<i64> = if has_changes {
+            tx.prepare_cached(
                 "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
-                [db_version],
-                |row| row.get(0),
-            )
-            .optional()?;
+            )?
+            .query_row([db_version], |row| row.get(0))?
+        } else {
+            None
+        };
 
         let booked = agent.bookie().for_actor(actor_id);
         let mut book_writer = booked.write();
@@ -180,13 +189,7 @@ where
         trace!("version: {version}");
 
         let elapsed = {
-            if last_seq.is_some() {
-                let last_seq: i64 = tx.query_row(
-                    "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
-                    [db_version],
-                    |row| row.get(0),
-                )?;
-
+            if let Some(last_seq) = last_seq {
                 tx.prepare_cached(
                     r#"
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
@@ -206,7 +209,7 @@ where
             start.elapsed()
         };
 
-        trace!("committed tx, db_version: {db_version}, last seq: {last_seq:?}");
+        trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
         if let Some(last_seq) = last_seq {
             let ts: Timestamp = agent.clock().new_timestamp().into();
