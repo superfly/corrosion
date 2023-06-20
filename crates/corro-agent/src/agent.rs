@@ -1326,7 +1326,7 @@ async fn process_single_version(
                 actor_id, version, db_version, ts
             );
 
-            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, ts])?;
+            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
 
             let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
                 (KnownDbVersion::Cleared, Changeset::Empty, None)
