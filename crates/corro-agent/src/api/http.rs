@@ -71,6 +71,7 @@ pub struct ChunkedChanges<'stmt> {
     last_pushed_seq: i64,
     last_start_seq: i64,
     last_seq: i64,
+    done: bool,
 }
 
 impl<'stmt> ChunkedChanges<'stmt> {
@@ -90,6 +91,7 @@ impl<'stmt> ChunkedChanges<'stmt> {
             last_pushed_seq: 0,
             last_start_seq: 0,
             last_seq,
+            done: false,
         })
     }
 }
@@ -98,15 +100,20 @@ impl<'stmt> Iterator for ChunkedChanges<'stmt> {
     type Item = Result<(Vec<Change>, RangeInclusive<i64>), rusqlite::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.last_pushed_seq >= self.last_seq {
+        if self.done {
             return None;
         }
 
         loop {
+            trace!("chunking through the rows iterator");
             match self.rows.next() {
                 Ok(Some(row)) => match row_to_change(row) {
                     Ok(change) => {
+                        trace!("got change: {change:?}");
                         self.last_pushed_seq = change.seq;
+                        if change.seq == self.last_seq {
+                            self.done = true;
+                        }
                         self.changes.push(change);
 
                         if self.changes.len() >= MAX_CHANGES_PER_MESSAGE {
@@ -120,7 +127,10 @@ impl<'stmt> Iterator for ChunkedChanges<'stmt> {
                     }
                     Err(e) => return Some(Err(e)),
                 },
-                Ok(None) => break,
+                Ok(None) => {
+                    self.done = true;
+                    break;
+                }
                 Err(e) => return Some(Err(e)),
             }
         }
@@ -196,6 +206,8 @@ where
             start.elapsed()
         };
 
+        trace!("committed tx, db_version: {db_version}, last seq: {last_seq:?}");
+
         if let Some(last_seq) = last_seq {
             let ts: Timestamp = agent.clock().new_timestamp().into();
             book_writer.insert(
@@ -222,6 +234,8 @@ where
                         match changes_seqs {
                             Ok((changes, seqs)) => {
                                 process_subs(&agent, &changes, db_version);
+
+                                trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
                                 let tx_bcast = agent.tx_bcast().clone();
                                 tokio::spawn(async move {

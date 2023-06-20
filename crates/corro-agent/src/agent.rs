@@ -1,10 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_set::Difference, HashMap, HashSet},
     convert::Infallible,
     error::Error,
-    fmt, io,
+    fmt,
+    hash::BuildHasher,
+    io,
     net::SocketAddr,
-    ops::RangeInclusive,
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
@@ -58,7 +59,7 @@ use tokio::{
     net::{TcpListener, UdpSocket},
     sync::mpsc::{channel, Receiver, Sender},
     task::block_in_place,
-    time::timeout,
+    time::{sleep, timeout},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::{codec::LengthDelimitedCodec, io::StreamReader};
@@ -437,6 +438,70 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         }
     });
 
+    tokio::spawn({
+        let self_actor_id = agent.actor_id();
+        let pool = agent.read_only_pool().clone();
+        let bookie = agent.bookie().clone();
+        async move {
+            loop {
+                sleep(Duration::from_secs(300)).await;
+
+                let to_check: HashMap<ActorId, HashSet<i64>> = {
+                    bookie
+                        .read()
+                        .iter()
+                        .map(|(actor_id, booked)| {
+                            (
+                                *actor_id,
+                                booked
+                                    .read()
+                                    .iter()
+                                    .filter_map(|(_range, known)| {
+                                        if let KnownDbVersion::Current { db_version, .. } = known {
+                                            Some(*db_version)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect()
+                };
+
+                let conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!("could not checkout pooled conn for compacting in-memory actor versions: {e}");
+                        continue;
+                    }
+                };
+                block_in_place(|| {
+                    for (actor_id, versions) in to_check {
+                        let site_id = if actor_id == self_actor_id {
+                            None
+                        } else {
+                            Some(actor_id.to_bytes())
+                        };
+
+                        match compact_booked_for_actor(&conn, site_id, &versions) {
+                            Ok(diff) => {
+                                let booked = bookie.for_actor(actor_id);
+                                for version in diff {
+                                    booked.insert(version, KnownDbVersion::Cleared);
+                                }
+                            }
+                            Err(e) => {
+                                error!("could not compute difference between known live and still alive versions for actor {actor_id}: {e}");
+                                continue;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    });
+
     let states = match agent.read_only_pool().get().await {
         Ok(conn) => {
             match conn.prepare("SELECT foca_state FROM __corro_members") {
@@ -599,6 +664,25 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+fn compact_booked_for_actor(
+    conn: &Connection,
+    site_id: Option<[u8; 16]>,
+    versions: &HashSet<i64>,
+) -> eyre::Result<HashSet<i64>> {
+    // TODO: optimize that in a single query once cr-sqlite supports aggregation
+    conn.prepare_cached("CREATE TEMP TABLE __temp_count_lookup AS SELECT db_version, site_id FROM crsql_changes WHERE site_id IS ? AND db_version >= ? AND db_version <= ?;")?.execute(params![site_id, versions.iter().min(), versions.iter().max()])?;
+
+    let still_live: HashSet<i64> = conn
+        .prepare_cached("SELECT db_version, count(*) FROM __temp_count_lookup GROUP BY db_version")?
+        .query_map((), |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    conn.prepare_cached("DROP TABLE __temp_count_lookup;")?
+        .execute(())?;
+
+    Ok(versions.difference(&still_live).copied().collect())
 }
 
 async fn handle_gossip_to_send(socket: Arc<UdpSocket>, mut to_send_rx: Receiver<(Actor, Bytes)>) {
@@ -982,7 +1066,7 @@ pub async fn handle_broadcast(
                         increment_counter!("corro.broadcast.recv.count", "kind" => "operation");
 
                         // TODO: check the seqs range
-                        if bookie.contains(actor_id, version) {
+                        if bookie.contains(actor_id, version, changeset.seqs()) {
                             trace!("already seen, stop disseminating");
                             continue;
                         }
@@ -1055,8 +1139,7 @@ async fn process_single_version(
         changeset,
     } = change;
 
-    // TODO: check the seqs range
-    if bookie.contains(actor_id, version) {
+    if bookie.contains(actor_id, version, changeset.seqs()) {
         trace!(
             "already seen this one! from: {}, version: {version}",
             actor_id
@@ -1065,9 +1148,10 @@ async fn process_single_version(
     }
 
     trace!(
-        "received {} changes to process from: {}, version: {version}",
+        "received {} changes to process from: {}, version: {version}, seqs: {:?}",
         changeset.len(),
-        actor_id
+        actor_id,
+        changeset.seqs()
     );
 
     let mut conn = agent.read_write_pool().get().await?;
@@ -1076,7 +1160,7 @@ async fn process_single_version(
     let (db_version, changeset) = {
         let mut booked_write = booked.write();
 
-        if booked_write.contains(version) {
+        if booked_write.contains(version, changeset.seqs()) {
             return Ok(None);
         }
 
@@ -1120,8 +1204,8 @@ async fn process_single_version(
 
                 tx.prepare_cached(
                     "
-                    INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, ts)
-                        VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
+                        VALUES (?, ?, ?, ?, ?, ?)
                         ON CONFLICT (site_id, version, start_seq)
                             DO UPDATE SET end_seq = excluded.end_seq;
                 ",
@@ -1131,20 +1215,65 @@ async fn process_single_version(
                     version,
                     seqs.start(),
                     seqs.end(),
+                    last_seq,
                     ts
                 ])?;
 
-                tx.commit()?;
+                let seqs_count: i64 = tx.prepare_cached("SELECT SUM((end_seq + 1) - start_seq) FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?.query_row(params![actor_id, version], |row|row.get(0))?;
 
-                let mut range_seqs = RangeInclusiveSet::new();
-                range_seqs.insert(seqs.clone());
+                debug!("GOT {seqs_count} (last_seq: {last_seq})");
 
-                return Ok((
+                let known_version = if seqs_count - 1 == last_seq {
+                    debug!("we got em all!");
+
+                    let count = tx.prepare_cached("INSERT INTO crsql_changes SELECT \"table\", pk, cid, val, col_version, db_version, site_id FROM __corro_buffered_changes WHERE site_id = ? AND version = ? ORDER BY seq ASC")?.execute(params![actor_id.as_bytes(), version])?;
+                    debug!("inserted from buffered into crsql_changes, count: {count}");
+
+                    let count = tx.prepare_cached(
+                        "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
+                    )?
+                    .execute(params![actor_id.as_bytes(), version])?;
+                    debug!("DELETED buffered changes: {count}");
+
+                    let count = tx
+                        .prepare_cached(
+                            "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
+                        )?
+                        .execute(params![actor_id, version])?;
+                    debug!("DELETED seq bookkeeping: {count}");
+
+                    let rows_impacted: i64 = tx
+                        .prepare_cached("SELECT crsql_rows_impacted()")?
+                        .query_row((), |row| row.get(0))?;
+
+                    debug!("APPLIED, ROWS IMPACTED: {rows_impacted}");
+
+                    if rows_impacted > 0 {
+                        let db_version: i64 =
+                            tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
+                        debug!("db version: {db_version}");
+                        KnownDbVersion::Current {
+                            db_version,
+                            last_seq,
+                            ts,
+                        }
+                    } else {
+                        KnownDbVersion::Cleared
+                    }
+                } else {
+                    let mut range_seqs = RangeInclusiveSet::new();
+                    range_seqs.insert(seqs.clone());
                     KnownDbVersion::Partial {
                         seqs: range_seqs,
                         last_seq,
                         ts,
-                    },
+                    }
+                };
+
+                tx.commit()?;
+
+                return Ok((
+                    known_version,
                     Changeset::Full {
                         changes,
                         seqs,
@@ -1856,6 +1985,58 @@ pub mod tests {
         assert_eq!(svc.id, 2);
         assert_eq!(svc.text, "hello world 2");
 
+        let values: Vec<serde_json::Value> = (3..1000)
+            .map(|id| {
+                serde_json::json!([
+                    "INSERT INTO tests (id,text) VALUES (?,?)",
+                    id,
+                    format!("hello world #{id}"),
+                ])
+            })
+            .collect();
+
+        let req_body: Vec<Statement> = serde_json::from_value(json!(values))?;
+
+        let res = timeout(
+            Duration::from_secs(5),
+            client.request(
+                hyper::Request::builder()
+                    .method(hyper::Method::POST)
+                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
+                    .header(hyper::header::CONTENT_TYPE, "application/json")
+                    .body(serde_json::to_vec(&req_body)?.into())?,
+            ),
+        )
+        .await??;
+
+        let body: RqliteResponse =
+            serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+
+        let dbversion: i64 = ta1.agent.read_only_pool().get().await?.query_row(
+            "SELECT crsql_dbversion();",
+            (),
+            |row| row.get(0),
+        )?;
+        assert_eq!(dbversion, 3);
+
+        println!("body: {body:?}");
+
+        let expected_count: i64 = ta1.agent.read_only_pool().get().await?.query_row(
+            "SELECT COUNT(*) FROM tests",
+            (),
+            |row| row.get(0),
+        )?;
+
+        sleep(Duration::from_secs(2)).await;
+
+        let got_count: i64 = ta2.agent.read_only_pool().get().await?.query_row(
+            "SELECT COUNT(*) FROM tests",
+            (),
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(expected_count, got_count);
+
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
@@ -2281,6 +2462,37 @@ pub mod tests {
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_memory_versions_compaction() -> eyre::Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+
+        init_cr_conn(&mut conn)?;
+
+        conn.execute_batch(
+            "CREATE TABLE foo (a INTEGER PRIMARY KEY, b INTEGER); SELECT crsql_as_crr('foo');",
+        )?;
+
+        // db version 1
+        conn.execute("INSERT INTO foo (a) VALUES (1)", ())?;
+        // db version 2
+        conn.execute("UPDATE foo SET b = 2 WHERE a = 1;", ())?;
+
+        let db_version: i64 = conn.query_row(
+            "SELECT db_version FROM crsql_changes WHERE site_id IS NULL",
+            (),
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(db_version, 2);
+
+        let diff = compact_booked_for_actor(&conn, None, &vec![1].into_iter().collect())?;
+
+        assert!(diff.contains(&1));
+        assert!(!diff.contains(&2));
 
         Ok(())
     }

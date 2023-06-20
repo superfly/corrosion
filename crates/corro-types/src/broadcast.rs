@@ -91,6 +91,13 @@ pub enum Changeset {
 }
 
 impl Changeset {
+    pub fn seqs(&self) -> Option<&RangeInclusive<i64>> {
+        match self {
+            Changeset::Empty => None,
+            Changeset::Full { seqs, .. } => Some(seqs),
+        }
+    }
+
     pub fn is_complete(&self) -> bool {
         match self {
             Changeset::Empty => true,

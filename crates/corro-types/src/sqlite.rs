@@ -51,10 +51,12 @@ impl CrConnManager {
     where
         P: AsRef<Path>,
     {
-        Self(RusqliteConnectionManager::new_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ))
+        Self::new(path)
+        // TODO: bring this back when fixed by cr-sqlite
+        // Self(RusqliteConnectionManager::new_with_flags(
+        //     path,
+        //     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        // ))
     }
 }
 

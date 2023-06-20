@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, ops::RangeInclusive, sync::Arc};
 
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
@@ -157,8 +157,22 @@ impl Booked {
         self.0.write().insert(version..=version, db_version);
     }
 
-    pub fn contains(&self, version: i64) -> bool {
-        self.0.read().contains_key(&version)
+    pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
+        match seqs {
+            Some(check_seqs) => {
+                let read = self.0.read();
+                match read.get(&version) {
+                    Some(known) => match known {
+                        KnownDbVersion::Partial { seqs, .. } => {
+                            check_seqs.clone().all(|seq| seqs.contains(&seq))
+                        }
+                        KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
+                    },
+                    None => false,
+                }
+            }
+            None => self.0.read().contains_key(&version),
+        }
     }
 
     pub fn last(&self) -> Option<i64> {
@@ -204,8 +218,19 @@ impl<'a> BookWriter<'a> {
         self.0.insert(version..=version, known_version);
     }
 
-    pub fn contains(&self, version: i64) -> bool {
-        self.0.contains_key(&version)
+    pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
+        match seqs {
+            Some(check_seqs) => match self.0.get(&version) {
+                Some(known) => match known {
+                    KnownDbVersion::Partial { seqs, .. } => {
+                        check_seqs.clone().all(|seq| seqs.contains(&seq))
+                    }
+                    KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
+                },
+                None => false,
+            },
+            None => self.0.contains_key(&version),
+        }
     }
 
     pub fn last(&self) -> Option<i64> {
@@ -241,11 +266,16 @@ impl Bookie {
         w.entry(actor_id).or_default().clone()
     }
 
-    pub fn contains(&self, actor_id: ActorId, version: i64) -> bool {
+    pub fn contains(
+        &self,
+        actor_id: ActorId,
+        version: i64,
+        seqs: Option<&RangeInclusive<i64>>,
+    ) -> bool {
         self.0
             .read()
             .get(&actor_id)
-            .map(|booked| booked.contains(version))
+            .map(|booked| booked.contains(version, seqs))
             .unwrap_or(false)
     }
 
