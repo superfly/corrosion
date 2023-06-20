@@ -487,9 +487,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         match compact_booked_for_actor(&conn, site_id, &versions) {
                             Ok(diff) => {
                                 let booked = bookie.for_actor(actor_id);
+                                let len = diff.len();
                                 for version in diff {
                                     booked.insert(version, KnownDbVersion::Cleared);
                                 }
+                                info!("compacted in-memory cache by clearing {len} db versions for actor {actor_id}");
                             }
                             Err(e) => {
                                 error!("could not compute difference between known live and still alive versions for actor {actor_id}: {e}");
