@@ -196,30 +196,7 @@ impl Booked {
 pub struct BookWriter<'a>(RwLockWriteGuard<'a, BookedVersions>);
 
 impl<'a> BookWriter<'a> {
-    pub fn insert(&mut self, version: i64, mut known_version: KnownDbVersion) {
-        if let KnownDbVersion::Partial { seqs, last_seq, ts } = &mut known_version {
-            if let Some((range, value)) = self.0.get_key_value(&version) {
-                if range.start() != range.end() {
-                    panic!("unexpected range key when trying to merge partial sequence of changes");
-                }
-                if let KnownDbVersion::Partial {
-                    seqs: old_seqs,
-                    last_seq: old_last_seq,
-                    ts: old_ts,
-                } = &value
-                {
-                    if old_last_seq != last_seq {
-                        panic!("divergent last_seq when attempting to merge booked seq ranges, expected: {old_last_seq}, got: {last_seq}");
-                    }
-                    if old_ts != ts {
-                        panic!("divergent timestamp when attempting to merge booked seq ranges, expected: {old_ts}, got: {ts}");
-                    }
-                    seqs.extend(old_seqs.clone());
-                } else {
-                    panic!("unexpected non-partial booked value");
-                }
-            }
-        }
+    pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
         self.0.insert(version..=version, known_version);
     }
 

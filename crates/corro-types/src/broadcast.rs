@@ -98,6 +98,13 @@ impl Changeset {
         }
     }
 
+    pub fn last_seq(&self) -> Option<i64> {
+        match self {
+            Changeset::Empty => None,
+            Changeset::Full { last_seq, .. } => Some(*last_seq),
+        }
+    }
+
     pub fn is_complete(&self) -> bool {
         match self {
             Changeset::Empty => true,
@@ -109,13 +116,6 @@ impl Changeset {
         match self {
             Changeset::Empty => 0,
             Changeset::Full { changes, .. } => changes.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        match self {
-            Changeset::Empty => true,
-            Changeset::Full { changes, .. } => changes.is_empty(),
         }
     }
 
@@ -133,7 +133,7 @@ impl Changeset {
         }
     }
 
-    pub fn into_changes(self) -> Option<(Vec<Change>, RangeInclusive<i64>, i64, Timestamp)> {
+    pub fn into_parts(self) -> Option<(Vec<Change>, RangeInclusive<i64>, i64, Timestamp)> {
         match self {
             Changeset::Empty => None,
             Changeset::Full {

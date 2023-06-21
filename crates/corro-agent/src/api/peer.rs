@@ -203,45 +203,40 @@ fn process_version(
             last_seq,
             ts,
         } => {
-            if seqs_needed.is_empty() {
-                seqs_needed = vec![(0..=*last_seq)];
-            }
+            let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS ? AND db_version = ? ORDER BY seq ASC"#)?;
+            let site_id: Option<[u8; 16]> = (!is_local)
+                .then_some(actor_id)
+                .map(|actor_id| actor_id.to_bytes());
 
-            for range in seqs_needed {
-                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS ? AND db_version = ? AND seq >= ?"#)?;
-                let site_id: Option<[u8; 16]> = (!is_local)
-                    .then_some(actor_id)
-                    .map(|actor_id| actor_id.to_bytes());
+            let rows = prepped.query(params![site_id, db_version])?;
 
-                let rows = prepped.query(params![site_id, db_version, range.start()])?;
-
-                let mut chunked = ChunkedChanges::new(rows, *range.end())?;
-                while let Some(changes_seqs) = chunked.next() {
-                    match changes_seqs {
-                        Ok((changes, seqs)) => {
-                            send_msg(
-                                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                                    actor_id,
-                                    version,
-                                    changeset: Changeset::Full {
-                                        changes,
-                                        seqs,
-                                        last_seq: *last_seq,
-                                        ts: *ts,
-                                    },
-                                })),
-                                &sender,
-                            );
-                        }
-                        Err(e) => {
-                            error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                            break;
-                        }
+            let mut chunked = ChunkedChanges::new(rows, *last_seq)?;
+            while let Some(changes_seqs) = chunked.next() {
+                match changes_seqs {
+                    Ok((changes, seqs)) => {
+                        send_msg(
+                            SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                                actor_id,
+                                version,
+                                changeset: Changeset::Full {
+                                    changes,
+                                    seqs,
+                                    last_seq: *last_seq,
+                                    ts: *ts,
+                                },
+                            })),
+                            &sender,
+                        );
+                    }
+                    Err(e) => {
+                        error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                        break;
                     }
                 }
             }
         }
         KnownDbVersion::Partial { seqs, last_seq, ts } => {
+            debug!("seqs needed: {seqs_needed:?}");
             if seqs_needed.is_empty() {
                 seqs_needed = vec![(0..=*last_seq)];
             }
@@ -256,7 +251,7 @@ fn process_version(
                     let start_seq = cmp::max(range.start(), range_needed.start());
                     let end_seq = cmp::min(range.end(), range_needed.end());
 
-                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM __corro_buffered_changes WHERE site_id = ? AND version = ? AND seq >= ? AND seq <= ?"#)?;
+                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM __corro_buffered_changes WHERE site_id = ? AND version = ? AND seq >= ? AND seq <= ? ORDER BY seq ASC"#)?;
 
                     let site_id: [u8; 16] = actor_id.to_bytes();
 
