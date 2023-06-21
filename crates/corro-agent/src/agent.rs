@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
     error::Error,
     fmt, io,
@@ -438,87 +438,61 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     tokio::spawn({
         let self_actor_id = agent.actor_id();
-        let pool = agent.read_only_pool().clone();
         let rw_pool = agent.read_write_pool().clone();
         let bookie = agent.bookie().clone();
         async move {
             loop {
                 sleep(Duration::from_secs(300)).await;
 
-                let to_check: HashMap<ActorId, HashSet<i64>> = {
-                    bookie
-                        .read()
-                        .iter()
-                        .map(|(actor_id, booked)| {
-                            (
-                                *actor_id,
-                                booked
-                                    .read()
-                                    .iter()
-                                    .filter_map(|(_range, known)| {
-                                        if let KnownDbVersion::Current { db_version, .. } = known {
-                                            Some(*db_version)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect(),
-                            )
-                        })
-                        .collect()
-                };
+                let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
 
-                let conn = match pool.get().await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        error!("could not checkout pooled conn for compacting in-memory actor versions: {e}");
-                        continue;
-                    }
-                };
-                let to_replace = block_in_place(|| {
-                    let mut to_replace = HashSet::new();
-                    for (actor_id, versions) in to_check {
-                        if versions.is_empty() {
-                            continue;
-                        }
-                        let site_id = if actor_id == self_actor_id {
-                            None
-                        } else {
-                            Some(actor_id.to_bytes())
-                        };
-
-                        match compact_booked_for_actor(&conn, site_id, &versions) {
-                            Ok(diff) => {
-                                if diff.is_empty() {
-                                    continue;
-                                }
-                                let booked = bookie.for_actor(actor_id);
-                                let len = diff.len();
-                                for version in diff {
-                                    booked.insert(version, KnownDbVersion::Cleared);
-                                }
-                                info!("compacted in-memory cache by clearing {len} db versions for actor {actor_id}");
-                                to_replace.insert(actor_id);
-                            }
-                            Err(e) => {
-                                error!("could not compute difference between known live and still alive versions for actor {actor_id}: {e}");
-                                continue;
-                            }
-                        }
-                    }
-                    to_replace
-                });
-
-                for actor_id in to_replace {
+                for actor_id in to_check {
+                    // we need to acquire this first, annoyingly
                     let mut conn = match rw_pool.get().await {
                         Ok(conn) => conn,
                         Err(e) => {
-                            error!("could not checkout r/w pooled conn for compacting in-db actor versions: {e}");
+                            error!("could not checkout pooled conn for compacting in-memory actor versions: {e}");
                             continue;
                         }
                     };
 
+                    let booked = bookie.for_actor(actor_id);
+
+                    // get a write lock so nothing else may handle changes while we do this
+                    let mut bookedw = booked.write();
+
+                    let versions = bookedw.current_versions();
+
+                    if versions.is_empty() {
+                        continue;
+                    }
+
+                    let site_id = if actor_id == self_actor_id {
+                        None
+                    } else {
+                        Some(actor_id.to_bytes())
+                    };
+
                     let res = block_in_place(|| {
+                        match compact_booked_for_actor(&conn, site_id, &versions) {
+                            Ok(to_clear) => {
+                                if to_clear.is_empty() {
+                                    return Ok(());
+                                }
+                                let len = to_clear.len();
+                                for db_version in to_clear {
+                                    if let Some(version) = versions.get(&db_version) {
+                                        bookedw.insert(*version, KnownDbVersion::Cleared);
+                                    }
+                                }
+                                info!("compacted in-memory cache by clearing {len} db versions for actor {actor_id}");
+                            }
+                            Err(e) => {
+                                error!("could not compute difference between known live and still alive versions for actor {actor_id}: {e}");
+                                return Ok(());
+                            }
+                        }
+
                         let tx = conn.transaction()?;
 
                         let deleted = tx
@@ -527,25 +501,20 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         let mut inserted = 0;
 
-                        let booked = bookie.for_actor(actor_id);
-                        {
-                            let read = booked.read();
-
-                            for (range, known) in read.iter() {
-                                match known {
-                                    KnownDbVersion::Current {
-                                        db_version,
-                                        last_seq,
-                                        ts,
-                                    } => {
-                                        inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?,?,?,?,?)")?.execute(params![actor_id, range.start(), db_version, last_seq, ts])?;
-                                    }
-                                    KnownDbVersion::Cleared => {
-                                        inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?,?,?)")?.execute(params![actor_id, range.start(), range.end()])?;
-                                    }
-                                    KnownDbVersion::Partial { .. } => {
-                                        // do nothing, not stored in that table!
-                                    }
+                        for (range, known) in bookedw.inner().iter() {
+                            match known {
+                                KnownDbVersion::Current {
+                                    db_version,
+                                    last_seq,
+                                    ts,
+                                } => {
+                                    inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?,?,?,?,?)")?.execute(params![actor_id, range.start(), db_version, last_seq, ts])?;
+                                }
+                                KnownDbVersion::Cleared => {
+                                    inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?,?,?)")?.execute(params![actor_id, range.start(), range.end()])?;
+                                }
+                                KnownDbVersion::Partial { .. } => {
+                                    // do nothing, not stored in that table!
                                 }
                             }
                         }
@@ -558,7 +527,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     });
 
                     if let Err(e) = res {
-                        error!("could not compact in-db versions state for actor {actor_id}: {e}");
+                        error!("could not compact versions for actor {actor_id}: {e}");
                     }
                 }
             }
@@ -732,10 +701,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 fn compact_booked_for_actor(
     conn: &Connection,
     site_id: Option<[u8; 16]>,
-    versions: &HashSet<i64>,
+    versions: &BTreeMap<i64, i64>,
 ) -> eyre::Result<HashSet<i64>> {
     // TODO: optimize that in a single query once cr-sqlite supports aggregation
-    conn.prepare_cached("CREATE TEMP TABLE __temp_count_lookup AS SELECT db_version, site_id FROM crsql_changes WHERE site_id IS ? AND db_version >= ? AND db_version <= ?;")?.execute(params![site_id, versions.iter().min(), versions.iter().max()])?;
+    conn.prepare_cached("CREATE TEMP TABLE __temp_count_lookup AS SELECT db_version, site_id FROM crsql_changes WHERE site_id IS ? AND db_version >= ? AND db_version <= ?;")?.execute(params![site_id, versions.iter().map(|(_, db_v)| db_v).min(), versions.iter().map(|(_, db_v)| db_v).max()])?;
 
     let still_live: HashSet<i64> = conn
         .prepare_cached("SELECT db_version, count(*) FROM __temp_count_lookup GROUP BY db_version")?
@@ -745,7 +714,9 @@ fn compact_booked_for_actor(
     conn.prepare_cached("DROP TABLE __temp_count_lookup;")?
         .execute(())?;
 
-    Ok(versions.difference(&still_live).copied().collect())
+    let keys: HashSet<i64> = versions.keys().copied().collect();
+
+    Ok(keys.difference(&still_live).copied().collect())
 }
 
 async fn handle_gossip_to_send(socket: Arc<UdpSocket>, mut to_send_rx: Receiver<(Actor, Bytes)>) {
@@ -1242,6 +1213,30 @@ async fn process_single_version(
             if !is_complete {
                 for change in changes.iter() {
                     debug!("buffering change! {change:?}");
+
+                    let upserted = tx.prepare_cached(
+                        "
+                        INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT (site_id, version, start_seq)
+                                DO UPDATE SET
+                                    end_seq = excluded.end_seq
+                                WHERE excluded.end_seq > end_seq;
+                    ",
+                    )?
+                    .execute(params![
+                        actor_id,
+                        version,
+                        seqs.start(),
+                        seqs.end(),
+                        last_seq,
+                        ts
+                    ])?;
+
+                    if upserted != 1 {
+                        continue;
+                    }
+
                     tx.prepare_cached(
                         r#"
                             INSERT INTO __corro_buffered_changes
@@ -1264,23 +1259,6 @@ async fn process_single_version(
                         version,
                     ])?;
                 }
-
-                tx.prepare_cached(
-                    "
-                    INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (site_id, version, start_seq)
-                            DO UPDATE SET end_seq = excluded.end_seq;
-                ",
-                )?
-                .execute(params![
-                    actor_id,
-                    version,
-                    seqs.start(),
-                    seqs.end(),
-                    last_seq,
-                    ts
-                ])?;
 
                 let seqs_count: i64 = tx.prepare_cached("SELECT SUM((end_seq + 1) - start_seq) FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?.query_row(params![actor_id, version], |row|row.get(0))?;
 
@@ -2552,7 +2530,7 @@ pub mod tests {
 
         assert_eq!(db_version, 2);
 
-        let diff = compact_booked_for_actor(&conn, None, &vec![1].into_iter().collect())?;
+        let diff = compact_booked_for_actor(&conn, None, &vec![(1, 1)].into_iter().collect())?;
 
         assert!(diff.contains(&1));
         assert!(!diff.contains(&2));

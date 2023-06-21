@@ -1,4 +1,9 @@
-use std::{collections::HashMap, net::SocketAddr, ops::RangeInclusive, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+    ops::RangeInclusive,
+    sync::Arc,
+};
 
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
@@ -235,6 +240,23 @@ impl<'a> BookWriter<'a> {
 
     pub fn last(&self) -> Option<i64> {
         self.0.iter().map(|(k, _v)| *k.end()).max()
+    }
+
+    pub fn current_versions(&self) -> BTreeMap<i64, i64> {
+        self.0
+            .iter()
+            .filter_map(|(range, known)| {
+                if let KnownDbVersion::Current { db_version, .. } = known {
+                    Some((*db_version, *range.start()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn inner(&self) -> &RwLockWriteGuard<'a, BookedVersions> {
+        &self.0
     }
 }
 
