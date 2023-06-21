@@ -704,7 +704,7 @@ fn compact_booked_for_actor(
     versions: &BTreeMap<i64, i64>,
 ) -> eyre::Result<HashSet<i64>> {
     // TODO: optimize that in a single query once cr-sqlite supports aggregation
-    conn.prepare_cached("CREATE TEMP TABLE __temp_count_lookup AS SELECT db_version, site_id FROM crsql_changes WHERE site_id IS ? AND db_version >= ? AND db_version <= ?;")?.execute(params![site_id, versions.iter().map(|(_, db_v)| db_v).min(), versions.iter().map(|(_, db_v)| db_v).max()])?;
+    conn.prepare_cached("CREATE TEMP TABLE __temp_count_lookup AS SELECT db_version, site_id FROM crsql_changes WHERE site_id IS ? AND db_version >= ? AND db_version <= ?;")?.execute(params![site_id, versions.first_key_value().map(|(v, _db_v)| *v), versions.last_key_value().map(|(v, _db_v)| *v)])?;
 
     let still_live: HashSet<i64> = conn
         .prepare_cached("SELECT db_version, count(*) FROM __temp_count_lookup GROUP BY db_version")?
@@ -1099,7 +1099,6 @@ pub async fn handle_broadcast(
                     }) => {
                         increment_counter!("corro.broadcast.recv.count", "kind" => "operation");
 
-                        // TODO: check the seqs range
                         if bookie.contains(actor_id, version, changeset.seqs()) {
                             trace!("already seen, stop disseminating");
                             continue;

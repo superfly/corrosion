@@ -15,6 +15,7 @@ use corro_types::{
 };
 use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, Row, Rows, ToSql, Transaction};
+use spawn::spawn_counted;
 use tokio::task::block_in_place;
 use tracing::{error, info, trace};
 
@@ -210,9 +211,7 @@ where
 
             let agent = agent.clone();
 
-            // TODO: make sure this future finishes in case the program get shuts down
-            //       probably by using `spawn_counted`
-            tokio::spawn(async move {
+            spawn_counted(async move {
                 let conn = agent.read_only_pool().get().await?;
 
                 block_in_place(|| {
