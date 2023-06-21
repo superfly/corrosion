@@ -209,10 +209,10 @@ impl<'a> BookWriter<'a> {
                 } = &value
                 {
                     if old_last_seq != last_seq {
-                        panic!("divergent last_seq when attempting to merge booked seq ranges");
+                        panic!("divergent last_seq when attempting to merge booked seq ranges, expected: {old_last_seq}, got: {last_seq}");
                     }
                     if old_ts != ts {
-                        panic!("divergent timestamp when attempting to merge booked seq ranges");
+                        panic!("divergent timestamp when attempting to merge booked seq ranges, expected: {old_ts}, got: {ts}");
                     }
                     seqs.extend(old_seqs.clone());
                 } else {

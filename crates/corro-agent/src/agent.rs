@@ -1137,6 +1137,7 @@ fn store_empty_changeset(
     actor_id: ActorId,
     version: i64,
 ) -> Result<(), rusqlite::Error> {
+    // TODO: make sure this makes sense
     tx.prepare_cached(
         "
         INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts)

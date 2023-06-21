@@ -87,6 +87,7 @@ impl<'stmt> Iterator for ChunkedChanges<'stmt> {
     type Item = Result<(Vec<Change>, RangeInclusive<i64>), rusqlite::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // previously marked as done because the Rows iterator returned None
         if self.done {
             return None;
         }
@@ -98,12 +99,16 @@ impl<'stmt> Iterator for ChunkedChanges<'stmt> {
                     Ok(change) => {
                         trace!("got change: {change:?}");
                         self.last_pushed_seq = change.seq;
-                        if change.seq == self.last_seq {
-                            self.done = true;
-                        }
                         self.changes.push(change);
 
+                        if self.last_pushed_seq == self.last_seq {
+                            // this was the last seq! break early
+                            self.done = true;
+                            break;
+                        }
+
                         if self.changes.len() >= MAX_CHANGES_PER_MESSAGE {
+                            // chunking it up
                             let start_seq = self.last_start_seq;
                             self.last_start_seq = self.last_pushed_seq + 1;
                             return Some(Ok((
@@ -115,15 +120,19 @@ impl<'stmt> Iterator for ChunkedChanges<'stmt> {
                     Err(e) => return Some(Err(e)),
                 },
                 Ok(None) => {
+                    // marking as done for the next `next()` call
                     self.done = true;
+                    // break out of the loop, don't return, there might be buffered changes
                     break;
                 }
                 Err(e) => return Some(Err(e)),
             }
         }
+
+        // return buffered changes
         return Some(Ok((
-            self.changes.drain(..).collect(),
-            self.last_start_seq..=self.last_seq,
+            self.changes.clone(),                // no need to drain here like before
+            self.last_start_seq..=self.last_seq, // even if empty, this is all we have still applied
         )));
     }
 }
@@ -147,6 +156,8 @@ where
 
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
+
+        let ts = Timestamp::from(agent.clock().new_timestamp());
 
         let db_version: i64 = tx
             .prepare_cached("SELECT crsql_nextdbversion()")?
@@ -183,13 +194,7 @@ where
                     VALUES (?, ?, ?, ?, ?);
             "#,
                 )?
-                .execute(params![
-                    actor_id,
-                    version,
-                    db_version,
-                    last_seq,
-                    Timestamp::from(agent.clock().new_timestamp())
-                ])?;
+                .execute(params![actor_id, version, db_version, last_seq, ts])?;
             }
 
             tx.commit()?;
@@ -199,7 +204,6 @@ where
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
         if let Some(last_seq) = last_seq {
-            let ts: Timestamp = agent.clock().new_timestamp().into();
             book_writer.insert(
                 version,
                 KnownDbVersion::Current {

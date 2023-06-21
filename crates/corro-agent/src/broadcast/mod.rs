@@ -156,7 +156,6 @@ pub fn runtime_loop(
 
                 match branch {
                     Branch::Tripped => {
-                        // TODO: save all last member states
                         let states: Vec<_> = {
                             let members = agent.0.members.read();
                             foca.iter_members()
@@ -411,6 +410,7 @@ pub fn runtime_loop(
         }
 
         let mut tripped = false;
+        let mut ser_buf = BytesMut::new();
 
         loop {
             let branch = tokio::select! {
@@ -462,7 +462,7 @@ pub fn runtime_loop(
 
             match branch {
                 Branch::Tripped => {
-                    // TODO: leave cluster, save all last member states
+                    // nothing to here, yet!
                 }
                 Branch::Broadcast(input) => {
                     match input {
@@ -499,9 +499,7 @@ pub fn runtime_loop(
                     }
                 }
                 Branch::SendBroadcast(msg) => {
-                    // TODO: optimize allocs
-                    let mut buf = BytesMut::new();
-                    match serialize_broadcast(&msg, &mut buf) {
+                    match serialize_broadcast(&msg, &mut ser_buf) {
                         Ok(bytes) => {
                             let config = config.read();
                             if bytes.len() > EFFECTIVE_CAP {

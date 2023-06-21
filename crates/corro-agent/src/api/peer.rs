@@ -340,8 +340,8 @@ async fn process_sync(
         }
 
         // 2. process partial needs
-        if let Some(partial_needed) = sync_state.partial_need.get(&actor_id) {
-            for (version, seqs_needed) in partial_needed.iter() {
+        if let Some(partially_needed) = sync_state.partial_need.get(&actor_id) {
+            for (version, seqs_needed) in partially_needed.iter() {
                 let known = { booked.read().get(version).cloned() };
                 if let Some(known) = known {
                     process_version(
