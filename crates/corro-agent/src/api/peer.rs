@@ -351,15 +351,17 @@ async fn process_sync(
             for (version, seqs_needed) in partially_needed.iter() {
                 let known = { booked.read().get(version).cloned() };
                 if let Some(known) = known {
-                    process_version(
-                        &conn,
-                        actor_id,
-                        is_local,
-                        *version,
-                        &known,
-                        seqs_needed.clone(),
-                        &sender,
-                    )?;
+                    block_in_place(|| {
+                        process_version(
+                            &conn,
+                            actor_id,
+                            is_local,
+                            *version,
+                            &known,
+                            seqs_needed.clone(),
+                            &sender,
+                        )
+                    })?;
                 }
             }
         }

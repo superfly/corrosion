@@ -537,9 +537,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let states = match agent.read_only_pool().get().await {
         Ok(conn) => {
-            match conn.prepare("SELECT foca_state FROM __corro_members") {
-                Ok(mut prepped) => {
-                    match prepped
+            block_in_place(
+                || match conn.prepare("SELECT foca_state FROM __corro_members") {
+                    Ok(mut prepped) => {
+                        match prepped
                     .query_map([], |row| row.get::<_, String>(0))
                     .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
                 {
@@ -557,12 +558,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         vec![]
                     },
                 }
-                }
-                Err(e) => {
-                    error!("could not prepare query for foca member states: {e}");
-                    vec![]
-                }
-            }
+                    }
+                    Err(e) => {
+                        error!("could not prepare query for foca member states: {e}");
+                        vec![]
+                    }
+                },
+            )
         }
         Err(e) => {
             error!("could not acquire conn for foca member states: {e}");
@@ -898,20 +900,24 @@ async fn generate_bootstrap(
     if addrs.is_empty() {
         // fallback to in-db nodes
         let conn = pool.get().await?;
-        let mut prepped = conn.prepare("select address from __corro_members limit 5")?;
-        let node_addrs = prepped.query_map([], |row| row.get::<_, String>(0))?;
-        addrs = node_addrs
-            .flatten()
-            .flat_map(|addr| addr.parse())
-            .filter(|addr| match (our_addr, addr) {
-                (SocketAddr::V6(our_ip), SocketAddr::V6(ip)) if our_ip != *ip => true,
-                (SocketAddr::V4(our_ip), SocketAddr::V4(ip)) if our_ip != *ip => true,
-                _ => {
-                    info!("ignore node with addr: {addr}");
-                    false
-                }
-            })
-            .collect()
+        addrs = block_in_place(|| {
+            let mut prepped = conn.prepare("select address from __corro_members limit 5")?;
+            let node_addrs = prepped.query_map([], |row| row.get::<_, String>(0))?;
+            Ok::<_, rusqlite::Error>(
+                node_addrs
+                    .flatten()
+                    .flat_map(|addr| addr.parse())
+                    .filter(|addr| match (our_addr, addr) {
+                        (SocketAddr::V6(our_ip), SocketAddr::V6(ip)) if our_ip != *ip => true,
+                        (SocketAddr::V4(our_ip), SocketAddr::V4(ip)) if our_ip != *ip => true,
+                        _ => {
+                            info!("ignore node with addr: {addr}");
+                            false
+                        }
+                    })
+                    .collect(),
+            )
+        })?;
     }
 
     let mut rng = StdRng::from_entropy();

@@ -23,6 +23,7 @@ use rusqlite::params;
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{channel, Receiver, Sender},
+    task::block_in_place,
     time::{interval, MissedTickBehavior},
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
@@ -183,7 +184,7 @@ pub fn runtime_loop(
 
                         {
                             match agent.read_write_pool().get().await {
-                                Ok(mut conn) => match conn.transaction() {
+                                Ok(mut conn) => block_in_place(|| match conn.transaction() {
                                     Ok(tx) => {
                                         for (id, address, state, foca_state) in states {
                                             let db_res = tx.prepare_cached(
@@ -213,10 +214,11 @@ pub fn runtime_loop(
                                             error!("could not commit member states upsert tx: {e}");
                                         }
                                     }
+
                                     Err(e) => {
                                         error!("could not start transaction to update member events: {e}");
                                     }
-                                },
+                                }),
                                 Err(e) => {
                                     error!(
                                     "could not acquire a r/w conn to process member events: {e}"
@@ -306,42 +308,37 @@ pub fn runtime_loop(
                             }
                         };
 
-                        let tx = match conn.transaction() {
-                            Ok(tx) => tx,
-                            Err(e) => {
-                                error!("could not start transaction to update member events: {e}");
-                                continue;
-                            }
-                        };
+                        let res = block_in_place(|| {
+                            let tx = conn.transaction()?;
 
-                        for (id, address, state, foca_state) in splitted {
-                            let db_res = tx
-                                .prepare_cached(
+                            for (id, address, state, foca_state) in splitted {
+                                tx.prepare_cached(
                                     "
-                                INSERT INTO __corro_members (id, address, state, foca_state)
-                                    VALUES (?, ?, ?, ?)
-                                ON CONFLICT (id) DO UPDATE SET
-                                    address = excluded.address,
-                                    state = excluded.state,
-                                    foca_state = excluded.foca_state;
-                            ",
-                                )
-                                .and_then(|mut prepped| {
-                                    prepped.execute(params![
-                                        id,
-                                        address.to_string(),
-                                        state,
-                                        foca_state
-                                    ])
-                                });
-
-                            if let Err(e) = db_res {
-                                error!("could not upsert member state: {e}");
+                                        INSERT INTO __corro_members (id, address, state, foca_state)
+                                            VALUES (?, ?, ?, ?)
+                                        ON CONFLICT (id) DO UPDATE SET
+                                            address = excluded.address,
+                                            state = excluded.state,
+                                            foca_state = excluded.foca_state;
+                                    ",
+                                )?
+                                .execute(params![
+                                    id,
+                                    address.to_string(),
+                                    state,
+                                    foca_state
+                                ])?;
                             }
-                        }
 
-                        if let Err(e) = tx.commit() {
-                            error!("could not commit member states upsert tx: {e}");
+                            tx.commit()?;
+
+                            Ok::<_, rusqlite::Error>(())
+                        });
+
+                        if let Err(e) = res {
+                            error!(
+                                "could not insert state changes from SWIM cluster into sqlite: {e}"
+                            );
                         }
                     }
                     Branch::HandleTimer(timer) => {
