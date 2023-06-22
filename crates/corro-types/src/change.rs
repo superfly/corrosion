@@ -12,7 +12,7 @@ use speedy::{Readable, Writable};
 
 use crate::filters::parse_sqlite_quoted_str;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Readable, Writable)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
 pub struct Change {
     pub table: String,
     pub pk: String,
@@ -78,9 +78,10 @@ impl<'a> SqliteValueRef<'a> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
 #[serde(untagged)]
 pub enum SqliteValue {
+    #[default]
     Null,
     Integer(i64),
     Real(f64),

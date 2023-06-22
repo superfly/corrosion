@@ -14,7 +14,7 @@ use corro_types::{
     sqlite::SqlitePool,
 };
 use hyper::StatusCode;
-use rusqlite::{params, params_from_iter, Row, Rows, ToSql, Transaction};
+use rusqlite::{params, params_from_iter, Row, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::task::block_in_place;
 use tracing::{error, info, trace};
@@ -26,7 +26,7 @@ use corro_types::{
 
 use crate::agent::process_subs;
 
-const MAX_CHANGES_PER_MESSAGE: usize = 50;
+pub const MAX_CHANGES_PER_MESSAGE: usize = 50;
 
 // TODO: accept a few options
 // #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -61,29 +61,34 @@ pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
     })
 }
 
-pub struct ChunkedChanges<'stmt> {
-    rows: Rows<'stmt>,
+pub struct ChunkedChanges<I> {
+    iter: I,
     changes: Vec<Change>,
     last_pushed_seq: i64,
     last_start_seq: i64,
     last_seq: i64,
+    chunk_size: usize,
     done: bool,
 }
 
-impl<'stmt> ChunkedChanges<'stmt> {
-    pub fn new(rows: Rows<'stmt>, last_seq: i64) -> rusqlite::Result<Self> {
-        Ok(Self {
-            rows,
+impl<I> ChunkedChanges<I> {
+    pub fn new(iter: I, start_seq: i64, last_seq: i64, chunk_size: usize) -> Self {
+        Self {
+            iter,
             changes: vec![],
             last_pushed_seq: 0,
-            last_start_seq: 0,
+            last_start_seq: start_seq,
             last_seq,
+            chunk_size,
             done: false,
-        })
+        }
     }
 }
 
-impl<'stmt> Iterator for ChunkedChanges<'stmt> {
+impl<'stmt, I> Iterator for ChunkedChanges<I>
+where
+    I: Iterator<Item = rusqlite::Result<Change>>,
+{
     type Item = Result<(Vec<Change>, RangeInclusive<i64>), rusqlite::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -94,38 +99,35 @@ impl<'stmt> Iterator for ChunkedChanges<'stmt> {
 
         loop {
             trace!("chunking through the rows iterator");
-            match self.rows.next() {
-                Ok(Some(row)) => match row_to_change(row) {
-                    Ok(change) => {
-                        trace!("got change: {change:?}");
-                        self.last_pushed_seq = change.seq;
-                        self.changes.push(change);
+            match self.iter.next() {
+                Some(Ok(change)) => {
+                    trace!("got change: {change:?}");
+                    self.last_pushed_seq = change.seq;
+                    self.changes.push(change);
 
-                        if self.last_pushed_seq == self.last_seq {
-                            // this was the last seq! break early
-                            self.done = true;
-                            break;
-                        }
-
-                        if self.changes.len() >= MAX_CHANGES_PER_MESSAGE {
-                            // chunking it up
-                            let start_seq = self.last_start_seq;
-                            self.last_start_seq = self.last_pushed_seq + 1;
-                            return Some(Ok((
-                                self.changes.drain(..).collect(),
-                                start_seq..=self.last_pushed_seq,
-                            )));
-                        }
+                    if self.last_pushed_seq == self.last_seq {
+                        // this was the last seq! break early
+                        self.done = true;
+                        break;
                     }
-                    Err(e) => return Some(Err(e)),
-                },
-                Ok(None) => {
+
+                    if self.changes.len() >= self.chunk_size {
+                        // chunking it up
+                        let start_seq = self.last_start_seq;
+                        self.last_start_seq = self.last_pushed_seq + 1;
+                        return Some(Ok((
+                            self.changes.drain(..).collect(),
+                            start_seq..=self.last_pushed_seq,
+                        )));
+                    }
+                }
+                None => {
                     // marking as done for the next `next()` call
                     self.done = true;
                     // break out of the loop, don't return, there might be buffered changes
                     break;
                 }
-                Err(e) => return Some(Err(e)),
+                Some(Err(e)) => return Some(Err(e)),
             }
         }
 
@@ -220,8 +222,9 @@ where
 
                 block_in_place(|| {
                     let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?"#)?;
-                    let rows = prepped.query([db_version])?;
-                    let mut chunked = ChunkedChanges::new(rows, last_seq)?;
+                    let rows = prepped.query_map([db_version], row_to_change)?;
+                    let mut chunked =
+                        ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_PER_MESSAGE);
                     while let Some(changes_seqs) = chunked.next() {
                         match changes_seqs {
                             Ok((changes, seqs)) => {
@@ -817,5 +820,52 @@ mod tests {
         assert_eq!(foo_col.primary_key, false);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_change_chunker() {
+        // empty interator
+        let mut chunker = ChunkedChanges::new(vec![].into_iter(), 0, 100, 50);
+
+        assert_eq!(chunker.next(), Some(Ok((vec![], 0..=100))));
+        assert_eq!(chunker.next(), None);
+
+        let seq_0 = Change {
+            seq: 0,
+            ..Default::default()
+        };
+        let seq_1 = Change {
+            seq: 1,
+            ..Default::default()
+        };
+        let seq_2 = Change {
+            seq: 2,
+            ..Default::default()
+        };
+
+        // 2 iterations
+        let mut chunker = ChunkedChanges::new(
+            vec![Ok(seq_0.clone()), Ok(seq_1.clone()), Ok(seq_2.clone())].into_iter(),
+            0,
+            100,
+            2,
+        );
+
+        assert_eq!(
+            chunker.next(),
+            Some(Ok((vec![seq_0.clone(), seq_1.clone()], 0..=1)))
+        );
+        assert_eq!(chunker.next(), Some(Ok((vec![seq_2.clone()], 2..=100))));
+        assert_eq!(chunker.next(), None);
+
+        let mut chunker = ChunkedChanges::new(
+            vec![Ok(seq_0.clone()), Ok(seq_1.clone())].into_iter(),
+            0,
+            0,
+            1,
+        );
+
+        assert_eq!(chunker.next(), Some(Ok((vec![seq_0.clone()], 0..=0))));
+        assert_eq!(chunker.next(), None);
     }
 }

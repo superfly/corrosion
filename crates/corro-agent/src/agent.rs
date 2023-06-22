@@ -4,6 +4,7 @@ use std::{
     error::Error,
     fmt, io,
     net::SocketAddr,
+    ops::RangeInclusive,
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
@@ -1199,7 +1200,7 @@ async fn process_single_version(
 
         // check again, might've changed since we acquired the lock
         if booked_write.contains(version, changeset.seqs()) {
-            debug!("previously unknown versions are now deemed known, aborting inserts");
+            trace!("previously unknown versions are now deemed known, aborting inserts");
             return Ok(None);
         }
 
@@ -1216,10 +1217,16 @@ async fn process_single_version(
 
             // if not a full range!
             if !is_complete {
+                // debug!(actor = %agent.actor_id(), "changes len: {}", changes.len());
+                if changes.len() != 50 {
+                    debug!(actor = %agent.actor_id(), "changes len: {}", changes.len());
+                }
+                let mut inserted = 0;
                 for change in changes.iter() {
                     trace!("buffering change! {change:?}");
 
-                    tx.prepare_cached(
+                    // insert change, do nothing on conflict
+                    inserted += tx.prepare_cached(
                         r#"
                             INSERT INTO __corro_buffered_changes
                                 ("table", pk, cid, val, col_version, db_version, site_id, seq, version)
@@ -1242,54 +1249,87 @@ async fn process_single_version(
                     ])?;
                 }
 
-                // let upserted = tx.prepare_cached(
-                //     "
-                //     INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
-                //         VALUES (?, ?, ?, ?, ?, ?)
-                //         ON CONFLICT (site_id, version, start_seq)
-                //             DO UPDATE SET
-                //                 end_seq = excluded.end_seq
-                //             WHERE excluded.end_seq > end_seq;
-                // ",
-                // )?
-                // .execute(params![
-                //     actor_id,
-                //     version,
-                //     seqs.start(),
-                //     seqs.end(),
-                //     last_seq,
-                //     ts
-                // ])?;
+                if changes.len() != inserted {
+                    debug!(actor = %agent.actor_id(), "did not insert as many changes... {inserted}");
+                }
 
-                // trace!("upserted {upserted} rows into __corro_seq_bookkeeping");
+                // calculate all known sequences for the actor + version combo
+                let mut seqs_recorded: RangeInclusiveSet<i64> = tx
+                    .prepare_cached(
+                        "
+                    SELECT start_seq, end_seq
+                        FROM __corro_seq_bookkeeping
+                        WHERE site_id = ?
+                          AND version = ?
+                ",
+                    )?
+                    .query_map(params![actor_id, version], |row| {
+                        Ok(row.get(0)?..=row.get(1)?)
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
 
-                let mut seqs_recorded: RangeInclusiveSet<i64> = tx.prepare_cached("SELECT start_seq, end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?.query_map(params![actor_id, version], |row| Ok(row.get(0)?..=row.get(1)?))?.collect::<rusqlite::Result<_>>()?;
+                // immediately add this new range to the recorded seqs ranges
                 seqs_recorded.insert(seqs.clone());
 
-                let known_version = if seqs_recorded.gaps(&(0..=last_seq)).count() == 0 {
-                    info!("moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+                let full_seqs_range = 0..=last_seq;
 
-                    let count = tx.prepare_cached("INSERT INTO crsql_changes SELECT \"table\", pk, cid, val, col_version, db_version, site_id FROM __corro_buffered_changes WHERE site_id = ? AND version = ? ORDER BY seq ASC")?.execute(params![actor_id.as_bytes(), version])?;
-                    info!("inserted {count} rows from buffered into crsql_changes");
+                // figure out how many seq gaps we have between 0 and the last seq for this version
+                let gaps = seqs_recorded.gaps(&full_seqs_range);
+                let seq_gaps: Vec<RangeInclusive<i64>> = gaps.collect();
 
+                trace!(actor = %agent.actor_id(), "still missing seq {seq_gaps:?}");
+
+                // if we have no gaps, then we can apply all these changes.
+                let known_version = if seq_gaps.is_empty() {
+                    info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+
+                    let count: i64 = tx
+                        .prepare_cached(
+                            "
+                            SELECT count(*)
+                                FROM __corro_buffered_changes
+                                    WHERE site_id = ?
+                                      AND version = ?
+                                    ",
+                        )?
+                        .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
+                    debug!(actor = %agent.actor_id(), "total buffered rows: {count}");
+
+                    // insert all buffered changes into crsql_changes directly from the buffered changes table
+                    let count = tx
+                        .prepare_cached(
+                            "
+                        INSERT INTO crsql_changes
+                            SELECT \"table\", pk, cid, val, col_version, db_version, site_id
+                                FROM __corro_buffered_changes
+                                    WHERE site_id = ?
+                                      AND version = ?
+                                    ORDER BY db_version ASC, seq ASC
+                                    ",
+                        )?
+                        .execute(params![actor_id.as_bytes(), version])?;
+                    info!(actor = %agent.actor_id(), "inserted {count} rows from buffered into crsql_changes");
+
+                    // remove all buffered changes for cleanup purposes
                     let count = tx.prepare_cached(
                         "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
                     )?
                     .execute(params![actor_id.as_bytes(), version])?;
-                    info!("deleted {count} buffered changes");
+                    info!(actor = %agent.actor_id(), "deleted {count} buffered changes");
 
+                    // delete all bookkept sequences for this version
                     let count = tx
                         .prepare_cached(
                             "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
                         )?
                         .execute(params![actor_id, version])?;
-                    info!("deleted {count} sequences in bookkeeping");
+                    info!(actor = %agent.actor_id(), "deleted {count} sequences in bookkeeping");
 
                     let rows_impacted: i64 = tx
                         .prepare_cached("SELECT crsql_rows_impacted()")?
                         .query_row((), |row| row.get(0))?;
 
-                    info!("rows impacted by changes: {rows_impacted}");
+                    info!(actor = %agent.actor_id(), "rows impacted by changes: {rows_impacted}");
 
                     if rows_impacted > 0 {
                         let db_version: i64 =
@@ -1374,7 +1414,7 @@ async fn process_single_version(
                     .prepare_cached("SELECT crsql_rows_impacted()")?
                     .query_row((), |row| row.get(0))?;
 
-                debug!("inserted {rows_impacted} into crsql_changes");
+                debug!(actor = %agent.actor_id(), "inserted {rows_impacted} into crsql_changes");
                 if rows_impacted > 0 {
                     impactful_changeset.push(change);
                 }
@@ -2605,19 +2645,6 @@ pub mod tests {
             tripwire.clone(),
         )
         .await?;
-
-        sleep(Duration::from_secs(10)).await;
-
-        {
-            let conn = ta2.agent.read_only_pool().get().await?;
-
-            let count: i64 = conn
-                .prepare_cached("SELECT COUNT(*) FROM tests;")?
-                .query_row((), |row| row.get(0))?;
-
-            assert_eq!(count, 100000);
-        }
-
         let ta3 = launch_test_agent(
             |conf| {
                 conf.bootstrap(vec![ta2.agent.gossip_addr().to_string()])
@@ -2626,8 +2653,31 @@ pub mod tests {
             tripwire.clone(),
         )
         .await?;
+        let ta4 = launch_test_agent(
+            |conf| {
+                conf.bootstrap(vec![ta3.agent.gossip_addr().to_string()])
+                    .build()
+            },
+            tripwire.clone(),
+        )
+        .await?;
 
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_secs(20)).await;
+
+        {
+            let conn = ta2.agent.read_only_pool().get().await?;
+
+            let count: i64 = conn
+                .prepare_cached("SELECT COUNT(*) FROM tests;")?
+                .query_row((), |row| row.get(0))?;
+
+            assert_eq!(
+                count,
+                100000,
+                "actor {} did not reach 100K rows",
+                ta2.agent.actor_id()
+            );
+        }
 
         {
             let conn = ta3.agent.read_only_pool().get().await?;
@@ -2636,7 +2686,26 @@ pub mod tests {
                 .prepare_cached("SELECT COUNT(*) FROM tests;")?
                 .query_row((), |row| row.get(0))?;
 
-            assert_eq!(count, 100000);
+            assert_eq!(
+                count,
+                100000,
+                "actor {} did not reach 100K rows",
+                ta3.agent.actor_id()
+            );
+        }
+        {
+            let conn = ta4.agent.read_only_pool().get().await?;
+
+            let count: i64 = conn
+                .prepare_cached("SELECT COUNT(*) FROM tests;")?
+                .query_row((), |row| row.get(0))?;
+
+            assert_eq!(
+                count,
+                100000,
+                "actor {} did not reach 100K rows",
+                ta4.agent.actor_id()
+            );
         }
 
         tripwire_tx.send(()).await.ok();

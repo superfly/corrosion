@@ -24,7 +24,7 @@ use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, trace, warn};
 
 use crate::agent::handle_payload;
-use crate::api::http::ChunkedChanges;
+use crate::api::http::{row_to_change, ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
 
 use corro_types::{
     actor::ActorId,
@@ -208,12 +208,19 @@ fn process_version(
                 .then_some(actor_id)
                 .map(|actor_id| actor_id.to_bytes());
 
-            let rows = prepped.query(params![site_id, db_version])?;
+            let rows = prepped.query_map(params![site_id, db_version], row_to_change)?;
 
-            let mut chunked = ChunkedChanges::new(rows, *last_seq)?;
+            let mut chunked = ChunkedChanges::new(rows, 0, *last_seq, MAX_CHANGES_PER_MESSAGE);
             while let Some(changes_seqs) = chunked.next() {
                 match changes_seqs {
                     Ok((changes, seqs)) => {
+                        // if changes.len() < 50 {
+                        //     debug!(
+                        //         "CURRENT CHANGE SENT SMALLER 50 changes batch ({}) for seqs: {seqs:?}!",
+                        //         changes.len()
+                        //     );
+                        // }
+
                         send_msg(
                             SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                                 actor_id,
@@ -237,30 +244,35 @@ fn process_version(
         }
         KnownDbVersion::Partial { seqs, last_seq, ts } => {
             debug!("seqs needed: {seqs_needed:?}");
+            debug!("seqs we got: {seqs:?}");
             if seqs_needed.is_empty() {
                 seqs_needed = vec![(0..=*last_seq)];
             }
 
             for range_needed in seqs_needed {
-                for range in seqs.iter() {
-                    // check if our partial range is contained into the needed range from the other node
-                    if range.start() > range_needed.end() {
-                        continue;
-                    }
-
+                for range in seqs.overlapping(&range_needed) {
                     let start_seq = cmp::max(range.start(), range_needed.start());
+                    debug!("start seq: {start_seq}");
                     let end_seq = cmp::min(range.end(), range_needed.end());
+                    debug!("end seq: {end_seq}");
 
-                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM __corro_buffered_changes WHERE site_id = ? AND version = ? AND seq >= ? AND seq <= ? ORDER BY seq ASC"#)?;
+                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM __corro_buffered_changes WHERE site_id = ? AND version = ? AND seq >= ? AND seq <= ?"#)?;
 
                     let site_id: [u8; 16] = actor_id.to_bytes();
 
-                    let rows = prepped.query(params![site_id, version, start_seq, end_seq])?;
+                    let rows = prepped
+                        .query_map(params![site_id, version, start_seq, end_seq], row_to_change)?;
 
-                    let mut chunked = ChunkedChanges::new(rows, *end_seq)?;
+                    let mut chunked =
+                        ChunkedChanges::new(rows, *start_seq, *end_seq, MAX_CHANGES_PER_MESSAGE);
                     while let Some(changes_seqs) = chunked.next() {
                         match changes_seqs {
                             Ok((changes, seqs)) => {
+                                // if changes.len() < 50 {
+                                //     debug!(
+                                //         "PARTIAL SENT SMALLER THAN 50 changes batch ({}) for seqs: {seqs:?}!", changes.len()
+                                //     );
+                                // }
                                 send_msg(
                                     SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                                         actor_id,
