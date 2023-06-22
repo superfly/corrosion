@@ -4,7 +4,6 @@ use std::{
     error::Error,
     fmt, io,
     net::SocketAddr,
-    ops::RangeInclusive,
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
@@ -129,16 +128,18 @@ pub async fn setup(
 
     let rw_pool = bb8::Builder::new()
         .max_size(1)
+        .min_idle(Some(1)) // create one right away and keep it idle
         .build(CrConnManager::new(&conf.db_path))
         .await?;
 
     debug!("built RW pool");
 
     let ro_pool = bb8::Builder::new()
-        .max_size(5)
-        .min_idle(Some(1))
+        .max_size(10)
+        .min_idle(Some(5)) // keep a few idling
         .max_lifetime(Some(Duration::from_secs(30)))
-        .build_unchecked(CrConnManager::new_read_only(&conf.db_path));
+        .build(CrConnManager::new_read_only(&conf.db_path))
+        .await?;
     debug!("built RO pool");
 
     let schema = {
@@ -425,7 +426,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 match generate_bootstrap(bootstrap.as_slice(), gossip_addr, &pool).await {
                     Ok(addrs) => {
                         for addr in addrs.iter() {
-                            info!("Bootstrapping w/ {addr}");
+                            debug!("Bootstrapping w/ {addr}");
                             foca_tx.send(FocaInput::Announce((*addr).into())).await.ok();
                         }
                     }
@@ -911,7 +912,7 @@ async fn generate_bootstrap(
                         (SocketAddr::V6(our_ip), SocketAddr::V6(ip)) if our_ip != *ip => true,
                         (SocketAddr::V4(our_ip), SocketAddr::V4(ip)) if our_ip != *ip => true,
                         _ => {
-                            info!("ignore node with addr: {addr}");
+                            debug!("ignore node with addr: {addr}");
                             false
                         }
                     })
@@ -1291,13 +1292,12 @@ async fn process_single_version(
                 let full_seqs_range = 0..=last_seq;
 
                 // figure out how many seq gaps we have between 0 and the last seq for this version
-                let gaps = seqs_recorded.gaps(&full_seqs_range);
-                let seq_gaps: Vec<RangeInclusive<i64>> = gaps.collect();
+                let gaps_count = seqs_recorded.gaps(&full_seqs_range).count();
 
-                trace!(actor = %agent.actor_id(), "still missing seq {seq_gaps:?}");
+                trace!(actor = %agent.actor_id(), "still missing {gaps_count} seqs");
 
                 // if we have no gaps, then we can apply all these changes.
-                let known_version = if seq_gaps.is_empty() {
+                let known_version = if gaps_count == 0 {
                     info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
                     let count: i64 = tx

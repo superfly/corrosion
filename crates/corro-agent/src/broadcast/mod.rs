@@ -593,7 +593,7 @@ pub fn runtime_loop(
                 };
 
                 for addr in broadcast_to {
-                    // debug!(actor = %actor_id, "broadcasting {} bytes to: {addr} (count: {}, times sent: {})", pending.payload.len(), pending.count, pending.send_count());
+                    trace!(actor = %actor_id, "broadcasting {} bytes to: {addr} (count: {}, send count: {})", pending.payload.len(), pending.count, pending.send_count());
                     if pending.http {
                         single_http_broadcast(pending.payload.clone(), &client, addr, &clock);
                     } else {
