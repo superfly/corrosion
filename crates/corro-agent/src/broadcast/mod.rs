@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     iter::Peekable,
     net::SocketAddr,
     num::NonZeroU32,
@@ -592,7 +593,7 @@ pub fn runtime_loop(
                 };
 
                 for addr in broadcast_to {
-                    trace!("broadcasting to: {addr}");
+                    // debug!(actor = %actor_id, "broadcasting {} bytes to: {addr} (count: {}, times sent: {})", pending.payload.len(), pending.count, pending.send_count());
                     if pending.http {
                         single_http_broadcast(pending.payload.clone(), &client, addr, &clock);
                     } else {
@@ -639,6 +640,10 @@ struct PendingBroadcast {
 }
 
 impl PendingBroadcast {
+    pub fn send_count(&self) -> u32 {
+        self.backoff.retry_count()
+    }
+
     pub fn from_buf(
         buf: &mut BytesMut,
         mut count: usize,
@@ -654,8 +659,12 @@ impl PendingBroadcast {
             max_transmissions /= 2;
         }
 
+        max_transmissions = cmp::max(max_transmissions, 1);
+
         // do at least a few!
         // max_transmissions = cmp::max(max_transmissions, 20);
+
+        debug!("using max transmissions: {max_transmissions}");
 
         Self {
             http,

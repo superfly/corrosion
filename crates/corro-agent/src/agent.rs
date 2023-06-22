@@ -571,7 +571,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     };
 
     if !states.is_empty() {
+        // let cluster_size = states.len();
         foca_tx.send(FocaInput::ApplyMany(states)).await.ok();
+        // foca_tx
+        //     .send(FocaInput::ClusterSize(
+        //         (cluster_size as u32).try_into().unwrap(),
+        //     ))
+        //     .await
+        //     .ok();
     }
 
     let api = Router::new()
@@ -1613,11 +1620,13 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
         };
 
         info!(
-            "syncing from: {} to: {}, need len: {}",
+            "syncing {} with: {}, need len: {}",
             agent.actor_id(),
             actor_id,
             sync_state.need_len(),
         );
+
+        debug!(actor = %agent.actor_id(), "sync message: {sync_state:?}");
 
         let start = Instant::now();
         let res = handle_sync_receive(

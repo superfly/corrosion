@@ -11,6 +11,12 @@ RUN set -eux; \
     rm /tmp/mold.tar.gz; \
     mold --version;
 
+RUN set -eux; \
+    curl --fail --location "https://github.com/koute/not-perf/releases/download/0.1.1/not-perf-x86_64-unknown-linux-gnu.tgz" --output /tmp/nperf.tar.gz; \
+    tar --directory "/usr/local/bin" -xzvf "/tmp/nperf.tar.gz"; \
+    rm /tmp/nperf.tar.gz; \
+    nperf --version;
+
 WORKDIR /usr/src/app
 COPY . .
 # Will build and cache the binary and dependent crates in release mode
@@ -25,6 +31,7 @@ FROM keinos/sqlite3:3.42.0 as sqlite3
 FROM debian:bullseye-slim
 
 COPY --from=sqlite3 /usr/bin/sqlite3 /usr/bin/sqlite3
+COPY --from=builder /usr/local/bin/nperf /usr/local/bin/nperf
 
 # Run as "corrosion" user
 RUN useradd -ms /bin/bash corrosion
