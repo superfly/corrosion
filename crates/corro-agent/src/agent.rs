@@ -806,7 +806,9 @@ async fn handle_notifications(
                     // notify of new cluster size
                     let members_len = { agent.0.members.read().states.len() as u32 };
                     if let Ok(size) = members_len.try_into() {
-                        foca_tx.send(FocaInput::ClusterSize(size)).await.ok();
+                        if let Err(e) = foca_tx.send(FocaInput::ClusterSize(size)).await {
+                            error!("could not send new foca cluster size: {e}");
+                        }
                     }
 
                     member_events.send(MemberEvent::Up(actor.clone())).ok();
@@ -821,7 +823,9 @@ async fn handle_notifications(
                     // notify of new cluster size
                     let member_len = { agent.0.members.read().states.len() as u32 };
                     if let Ok(size) = member_len.try_into() {
-                        foca_tx.send(FocaInput::ClusterSize(size)).await.ok();
+                        if let Err(e) = foca_tx.send(FocaInput::ClusterSize(size)).await {
+                            error!("could not send new foca cluster size: {e}");
+                        }
                     }
                     member_events.send(MemberEvent::Down(actor.clone())).ok();
                 }

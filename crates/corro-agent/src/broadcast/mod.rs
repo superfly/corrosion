@@ -244,9 +244,12 @@ pub fn runtime_loop(
                             }
                         }
                         FocaInput::ClusterSize(size) => {
-                            let diff: i64 =
-                                (size.get() as i64 - last_cluster_size.get() as i64).abs();
-                            if diff > 5 {
+                            // let diff: i64 =
+                            //     (size.get() as i64 - last_cluster_size.get() as i64).abs();
+
+                            // debug!("received cluster size update: {size}, last size: {last_cluster_size}, diff: {diff}");
+
+                            if size != last_cluster_size {
                                 debug!("Adjusting cluster size to {size}");
                                 let new_config = make_foca_config(size);
                                 if let Err(e) = foca.set_config(new_config.clone()) {
@@ -664,7 +667,7 @@ impl PendingBroadcast {
         // do at least a few!
         // max_transmissions = cmp::max(max_transmissions, 20);
 
-        debug!("using max transmissions: {max_transmissions}");
+        // debug!("using max transmissions: {max_transmissions}");
 
         Self {
             http,
