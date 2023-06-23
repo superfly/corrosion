@@ -435,7 +435,7 @@ async fn catch_up_subscriber(
     let conn = agent.read_only_pool().get().await?;
 
     block_in_place(|| {
-        let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, site_id FROM crsql_changes WHERE db_version >= ?"#)?;
+        let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM crsql_changes WHERE db_version >= ?"#)?;
 
         let mut rows = prepped.query(params![from_db_version])?;
 
@@ -450,7 +450,8 @@ async fn catch_up_subscriber(
                 val: row.get(3)?,
                 col_version: row.get(4)?,
                 db_version: row.get(5)?,
-                site_id: row.get(6)?,
+                seq: row.get(6)?,
+                site_id: row.get(7)?,
             };
 
             if change.db_version != last_db_version {

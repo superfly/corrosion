@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     iter::Peekable,
     net::SocketAddr,
     num::NonZeroU32,
@@ -22,6 +23,7 @@ use rusqlite::params;
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{channel, Receiver, Sender},
+    task::block_in_place,
     time::{interval, MissedTickBehavior},
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
@@ -156,7 +158,6 @@ pub fn runtime_loop(
 
                 match branch {
                     Branch::Tripped => {
-                        // TODO: save all last member states
                         let states: Vec<_> = {
                             let members = agent.0.members.read();
                             foca.iter_members()
@@ -183,7 +184,7 @@ pub fn runtime_loop(
 
                         {
                             match agent.read_write_pool().get().await {
-                                Ok(mut conn) => match conn.transaction() {
+                                Ok(mut conn) => block_in_place(|| match conn.transaction() {
                                     Ok(tx) => {
                                         for (id, address, state, foca_state) in states {
                                             let db_res = tx.prepare_cached(
@@ -213,10 +214,11 @@ pub fn runtime_loop(
                                             error!("could not commit member states upsert tx: {e}");
                                         }
                                     }
+
                                     Err(e) => {
                                         error!("could not start transaction to update member events: {e}");
                                     }
-                                },
+                                }),
                                 Err(e) => {
                                     error!(
                                     "could not acquire a r/w conn to process member events: {e}"
@@ -244,9 +246,12 @@ pub fn runtime_loop(
                             }
                         }
                         FocaInput::ClusterSize(size) => {
-                            let diff: i64 =
-                                (size.get() as i64 - last_cluster_size.get() as i64).abs();
-                            if diff > 5 {
+                            // let diff: i64 =
+                            //     (size.get() as i64 - last_cluster_size.get() as i64).abs();
+
+                            // debug!("received cluster size update: {size}, last size: {last_cluster_size}, diff: {diff}");
+
+                            if size != last_cluster_size {
                                 debug!("Adjusting cluster size to {size}");
                                 let new_config = make_foca_config(size);
                                 if let Err(e) = foca.set_config(new_config.clone()) {
@@ -303,42 +308,37 @@ pub fn runtime_loop(
                             }
                         };
 
-                        let tx = match conn.transaction() {
-                            Ok(tx) => tx,
-                            Err(e) => {
-                                error!("could not start transaction to update member events: {e}");
-                                continue;
-                            }
-                        };
+                        let res = block_in_place(|| {
+                            let tx = conn.transaction()?;
 
-                        for (id, address, state, foca_state) in splitted {
-                            let db_res = tx
-                                .prepare_cached(
+                            for (id, address, state, foca_state) in splitted {
+                                tx.prepare_cached(
                                     "
-                                INSERT INTO __corro_members (id, address, state, foca_state)
-                                    VALUES (?, ?, ?, ?)
-                                ON CONFLICT (id) DO UPDATE SET
-                                    address = excluded.address,
-                                    state = excluded.state,
-                                    foca_state = excluded.foca_state;
-                            ",
-                                )
-                                .and_then(|mut prepped| {
-                                    prepped.execute(params![
-                                        id,
-                                        address.to_string(),
-                                        state,
-                                        foca_state
-                                    ])
-                                });
-
-                            if let Err(e) = db_res {
-                                error!("could not upsert member state: {e}");
+                                        INSERT INTO __corro_members (id, address, state, foca_state)
+                                            VALUES (?, ?, ?, ?)
+                                        ON CONFLICT (id) DO UPDATE SET
+                                            address = excluded.address,
+                                            state = excluded.state,
+                                            foca_state = excluded.foca_state;
+                                    ",
+                                )?
+                                .execute(params![
+                                    id,
+                                    address.to_string(),
+                                    state,
+                                    foca_state
+                                ])?;
                             }
-                        }
 
-                        if let Err(e) = tx.commit() {
-                            error!("could not commit member states upsert tx: {e}");
+                            tx.commit()?;
+
+                            Ok::<_, rusqlite::Error>(())
+                        });
+
+                        if let Err(e) = res {
+                            error!(
+                                "could not insert state changes from SWIM cluster into sqlite: {e}"
+                            );
                         }
                     }
                     Branch::HandleTimer(timer) => {
@@ -411,6 +411,7 @@ pub fn runtime_loop(
         }
 
         let mut tripped = false;
+        let mut ser_buf = BytesMut::new();
 
         loop {
             let branch = tokio::select! {
@@ -462,7 +463,7 @@ pub fn runtime_loop(
 
             match branch {
                 Branch::Tripped => {
-                    // TODO: leave cluster, save all last member states
+                    // nothing to here, yet!
                 }
                 Branch::Broadcast(input) => {
                     match input {
@@ -499,9 +500,7 @@ pub fn runtime_loop(
                     }
                 }
                 Branch::SendBroadcast(msg) => {
-                    // TODO: optimize allocs
-                    let mut buf = BytesMut::new();
-                    match serialize_broadcast(&msg, &mut buf) {
+                    match serialize_broadcast(&msg, &mut ser_buf) {
                         Ok(bytes) => {
                             let config = config.read();
                             if bytes.len() > EFFECTIVE_CAP {
@@ -594,7 +593,7 @@ pub fn runtime_loop(
                 };
 
                 for addr in broadcast_to {
-                    trace!("broadcasting to: {addr}");
+                    trace!(actor = %actor_id, "broadcasting {} bytes to: {addr} (count: {}, send count: {})", pending.payload.len(), pending.count, pending.send_count());
                     if pending.http {
                         single_http_broadcast(pending.payload.clone(), &client, addr, &clock);
                     } else {
@@ -641,6 +640,10 @@ struct PendingBroadcast {
 }
 
 impl PendingBroadcast {
+    pub fn send_count(&self) -> u32 {
+        self.backoff.retry_count()
+    }
+
     pub fn from_buf(
         buf: &mut BytesMut,
         mut count: usize,
@@ -656,8 +659,12 @@ impl PendingBroadcast {
             max_transmissions /= 2;
         }
 
+        max_transmissions = cmp::max(max_transmissions, 1);
+
         // do at least a few!
         // max_transmissions = cmp::max(max_transmissions, 20);
+
+        // debug!("using max transmissions: {max_transmissions}");
 
         Self {
             http,

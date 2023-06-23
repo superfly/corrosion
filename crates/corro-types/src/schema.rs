@@ -296,32 +296,46 @@ pub fn make_schema_inner(
 
         info!("new columns: {new_col_names:?}");
 
-        let new_cols_iter = new_table
-            .columns
-            .iter()
-            .filter(|(col_name, _)| new_col_names.contains(col_name));
-
         if changed_cols.is_empty() {
             // 2.1. no changed columns, add missing ones
 
-            tx.execute_batch(&format!("SELECT crsql_begin_alter('{name}');"))?;
+            if new_col_names.is_empty() {
+                // nothing to do
+            } else {
+                info!("Altering crsql for table {}", table.name);
+                let start = Instant::now();
+                tx.execute_batch(&format!("SELECT crsql_begin_alter('{name}');"))?;
 
-            for (col_name, col) in new_cols_iter {
-                info!("adding column '{col_name}'");
-                if col.primary_key {
-                    return Err(SchemaError::AddPrimaryKey(name.clone(), col_name.clone()));
+                let new_cols_iter = new_table
+                    .columns
+                    .iter()
+                    .filter(|(col_name, _)| new_col_names.contains(col_name));
+
+                for (col_name, col) in new_cols_iter {
+                    info!("adding column '{col_name}'");
+                    if col.primary_key {
+                        return Err(SchemaError::AddPrimaryKey(name.clone(), col_name.clone()));
+                    }
+                    if !col.nullable && col.default_value.is_none() {
+                        return Err(SchemaError::NotNullableColumnNeedsDefault {
+                            tbl_name: name.clone(),
+                            name: col_name.clone(),
+                        });
+                    }
+                    tx.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {}", col))?;
                 }
-                if !col.nullable && col.default_value.is_none() {
-                    return Err(SchemaError::NotNullableColumnNeedsDefault {
-                        tbl_name: name.clone(),
-                        name: col_name.clone(),
-                    });
-                }
-                tx.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {}", col))?;
+                tx.execute_batch(&format!("SELECT crsql_commit_alter('{name}');"))?;
+                info!(
+                    "Altering crsql for table {} took {:?}",
+                    table.name,
+                    start.elapsed()
+                );
             }
-            tx.execute_batch(&format!("SELECT crsql_commit_alter('{name}');"))?;
         } else {
             // 2.2 we do have changed columns, try to do something about that
+
+            info!("Columns have changed... replacing table {}", table.name);
+            let start = Instant::now();
 
             let primary_keys = table
                 .columns
@@ -384,6 +398,7 @@ pub fn make_schema_inner(
             ))?;
 
             tx.execute_batch(&format!("SELECT crsql_commit_alter('{name}');"))?;
+            info!("Replacing table {} took {:?}", table.name, start.elapsed());
         }
 
         let new_index_names = new_table

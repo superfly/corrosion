@@ -1,9 +1,14 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+    ops::RangeInclusive,
+    sync::Arc,
+};
 
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use rangemap::RangeInclusiveMap;
+use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use tokio::{sync::mpsc::Sender, task::block_in_place};
 use tracing::warn;
 
@@ -127,9 +132,18 @@ pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> 
     Ok(())
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum KnownDbVersion {
-    Current { db_version: i64, ts: Timestamp },
+    Current {
+        db_version: i64,
+        last_seq: i64,
+        ts: Timestamp,
+    },
+    Partial {
+        seqs: RangeInclusiveSet<i64>,
+        last_seq: i64,
+        ts: Timestamp,
+    },
     Cleared,
 }
 
@@ -148,8 +162,22 @@ impl Booked {
         self.0.write().insert(version..=version, db_version);
     }
 
-    pub fn contains(&self, version: i64) -> bool {
-        self.0.read().contains_key(&version)
+    pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
+        match seqs {
+            Some(check_seqs) => {
+                let read = self.0.read();
+                match read.get(&version) {
+                    Some(known) => match known {
+                        KnownDbVersion::Partial { seqs, .. } => {
+                            check_seqs.clone().all(|seq| seqs.contains(&seq))
+                        }
+                        KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
+                    },
+                    None => false,
+                }
+            }
+            None => self.0.read().contains_key(&version),
+        }
     }
 
     pub fn last(&self) -> Option<i64> {
@@ -168,16 +196,44 @@ impl Booked {
 pub struct BookWriter<'a>(RwLockWriteGuard<'a, BookedVersions>);
 
 impl<'a> BookWriter<'a> {
-    pub fn insert(&mut self, version: i64, db_version: KnownDbVersion) {
-        self.0.insert(version..=version, db_version);
+    pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
+        self.0.insert(version..=version, known_version);
     }
 
-    pub fn contains(&self, version: i64) -> bool {
-        self.0.contains_key(&version)
+    pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
+        match seqs {
+            Some(check_seqs) => match self.0.get(&version) {
+                Some(known) => match known {
+                    KnownDbVersion::Partial { seqs, .. } => {
+                        check_seqs.clone().all(|seq| seqs.contains(&seq))
+                    }
+                    KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
+                },
+                None => false,
+            },
+            None => self.0.contains_key(&version),
+        }
     }
 
     pub fn last(&self) -> Option<i64> {
         self.0.iter().map(|(k, _v)| *k.end()).max()
+    }
+
+    pub fn current_versions(&self) -> BTreeMap<i64, i64> {
+        self.0
+            .iter()
+            .filter_map(|(range, known)| {
+                if let KnownDbVersion::Current { db_version, .. } = known {
+                    Some((*db_version, *range.start()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn inner(&self) -> &RwLockWriteGuard<'a, BookedVersions> {
+        &self.0
     }
 }
 
@@ -209,11 +265,16 @@ impl Bookie {
         w.entry(actor_id).or_default().clone()
     }
 
-    pub fn contains(&self, actor_id: ActorId, version: i64) -> bool {
+    pub fn contains(
+        &self,
+        actor_id: ActorId,
+        version: i64,
+        seqs: Option<&RangeInclusive<i64>>,
+    ) -> bool {
         self.0
             .read()
             .get(&actor_id)
-            .map(|booked| booked.contains(version))
+            .map(|booked| booked.contains(version, seqs))
             .unwrap_or(false)
     }
 

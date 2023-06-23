@@ -1,5 +1,12 @@
 app = "corrosion2"
 
+# [env]
+# RUST_LOG="info,corro_agent=debug"
+
 [mounts]
 source = "corro_data"
 destination = "/var/lib/corrosion"
+
+[metrics]
+port = 9090
+path = "/"

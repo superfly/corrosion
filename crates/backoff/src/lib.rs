@@ -40,7 +40,10 @@ impl Backoff {
     /// provided.
     #[inline]
     pub fn jitter(mut self, jitter: f32) -> Self {
-        assert!(jitter > 0f32 && jitter < 1f32, "<exponential-backoff>: jitter must be between 0 and 1.");
+        assert!(
+            jitter > 0f32 && jitter < 1f32,
+            "<exponential-backoff>: jitter must be between 0 and 1."
+        );
         self.jitter = jitter;
         self
     }
@@ -75,6 +78,10 @@ impl Iter {
             retry_count: 0,
             last_exponent: 0,
         }
+    }
+
+    pub fn retry_count(&self) -> u32 {
+        self.retry_count
     }
 }
 
@@ -129,7 +136,9 @@ mod tests {
 
     #[test]
     fn test_backoff() {
-        let boff = Backoff::new(15).timeout_range(Duration::from_millis(10), Duration::from_secs(1)).iter();
+        let boff = Backoff::new(15)
+            .timeout_range(Duration::from_millis(10), Duration::from_secs(1))
+            .iter();
 
         let mut total = Duration::default();
         for dur in boff {

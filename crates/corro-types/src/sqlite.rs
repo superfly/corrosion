@@ -6,7 +6,7 @@ use std::{
 use bb8::ManageConnection;
 use bb8_rusqlite::RusqliteConnectionManager;
 use once_cell::sync::Lazy;
-use rusqlite::{Connection, OpenFlags, ToSql, Transaction};
+use rusqlite::{Connection, ToSql, Transaction};
 use tempfile::TempDir;
 use tracing::{error, trace};
 
@@ -51,10 +51,12 @@ impl CrConnManager {
     where
         P: AsRef<Path>,
     {
-        Self(RusqliteConnectionManager::new_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ))
+        Self::new(path)
+        // TODO: bring this back when fixed by cr-sqlite
+        // Self(RusqliteConnectionManager::new_with_flags(
+        //     path,
+        //     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        // ))
     }
 }
 
@@ -114,6 +116,7 @@ pub fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         ext_dir.path().display()
     );
     unsafe {
+        trace!("enabled loading extension");
         conn.load_extension_enable()?;
         conn.load_extension(
             ext_dir.path().join(CRSQL_EXT_GENERIC_NAME),

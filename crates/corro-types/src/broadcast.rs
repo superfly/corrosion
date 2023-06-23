@@ -1,4 +1,10 @@
-use std::{fmt, io, net::SocketAddr, num::NonZeroU32, time::Duration};
+use std::{
+    fmt, io,
+    net::SocketAddr,
+    num::NonZeroU32,
+    ops::{Deref, RangeInclusive},
+    time::Duration,
+};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use foca::{Identity, Member, Notification, Runtime, Timer};
@@ -58,23 +64,58 @@ pub enum MessageV1 {
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
+pub struct ChangeV1 {
+    pub actor_id: ActorId,
+    // internal version
+    pub version: i64,
+    pub changeset: Changeset,
+}
+
+impl Deref for ChangeV1 {
+    type Target = Changeset;
+
+    fn deref(&self) -> &Self::Target {
+        &self.changeset
+    }
+}
+
+#[derive(Debug, Clone, Readable, Writable)]
 pub enum Changeset {
     Empty,
-    Full { changes: Vec<Change>, ts: Timestamp },
+    Full {
+        changes: Vec<Change>,
+        seqs: RangeInclusive<i64>,
+        last_seq: i64,
+        ts: Timestamp,
+    },
 }
 
 impl Changeset {
+    pub fn seqs(&self) -> Option<&RangeInclusive<i64>> {
+        match self {
+            Changeset::Empty => None,
+            Changeset::Full { seqs, .. } => Some(seqs),
+        }
+    }
+
+    pub fn last_seq(&self) -> Option<i64> {
+        match self {
+            Changeset::Empty => None,
+            Changeset::Full { last_seq, .. } => Some(*last_seq),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Changeset::Empty => true,
+            Changeset::Full { seqs, last_seq, .. } => *seqs.start() == 0 && seqs.end() == last_seq,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Changeset::Empty => 0,
             Changeset::Full { changes, .. } => changes.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        match self {
-            Changeset::Empty => true,
-            Changeset::Full { changes, .. } => changes.is_empty(),
         }
     }
 
@@ -91,6 +132,18 @@ impl Changeset {
             Changeset::Full { changes, .. } => &changes,
         }
     }
+
+    pub fn into_parts(self) -> Option<(Vec<Change>, RangeInclusive<i64>, i64, Timestamp)> {
+        match self {
+            Changeset::Empty => None,
+            Changeset::Full {
+                changes,
+                seqs,
+                last_seq,
+                ts,
+            } => Some((changes, seqs, last_seq, ts)),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -99,7 +152,9 @@ pub enum TimestampParseError {
     Parse(ParseNTP64Error),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Readable, Writable, PartialEq, Eq)]
+#[derive(
+    Debug, Default, Clone, Copy, Serialize, Deserialize, Readable, Writable, PartialEq, Eq,
+)]
 #[serde(transparent)]
 pub struct Timestamp(pub u64);
 

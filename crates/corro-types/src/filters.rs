@@ -800,6 +800,7 @@ mod tests {
                 val: crate::change::SqliteValue::Integer(1),
                 col_version: 1,
                 db_version: 123,
+                seq: 0,
                 site_id: actor1.into_bytes(),
             },
             Change {
@@ -809,6 +810,7 @@ mod tests {
                 val: crate::change::SqliteValue::Text("hello".into()),
                 col_version: 1,
                 db_version: 123,
+                seq: 1,
                 site_id: actor1.into_bytes(),
             },
             Change {
@@ -818,6 +820,7 @@ mod tests {
                 val: crate::change::SqliteValue::Text(r#"{"foo": "bar"}"#.into()),
                 col_version: 1,
                 db_version: 123,
+                seq: 2,
                 site_id: actor1.into_bytes(),
             },
             Change {
@@ -827,6 +830,7 @@ mod tests {
                 val: crate::change::SqliteValue::Text("{}".into()),
                 col_version: 1,
                 db_version: 123,
+                seq: 3,
                 site_id: actor1.into_bytes(),
             },
             // update
@@ -837,6 +841,7 @@ mod tests {
                 val: crate::change::SqliteValue::Blob(br#"{"foo": "bar"}"#.to_vec()),
                 col_version: 2,
                 db_version: 123,
+                seq: 4,
                 site_id: actor2.into_bytes(),
             },
         ];
