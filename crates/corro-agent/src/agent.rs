@@ -355,7 +355,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 .layer(Extension(foca_tx.clone()))
                 .layer(Extension(agent.clone()))
                 .layer(Extension(bcast_msg_tx.clone()))
-                ,
         )
         .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http());
@@ -1235,10 +1234,6 @@ async fn process_single_version(
 
             // if not a full range!
             if !is_complete {
-                // debug!(actor = %agent.actor_id(), "changes len: {}", changes.len());
-                if changes.len() != 50 {
-                    debug!(actor = %agent.actor_id(), "changes len: {}", changes.len());
-                }
                 let mut inserted = 0;
                 for change in changes.iter() {
                     trace!("buffering change! {change:?}");
@@ -1289,6 +1284,7 @@ async fn process_single_version(
                 // immediately add this new range to the recorded seqs ranges
                 seqs_recorded.insert(seqs.clone());
 
+                // all seq for this version (from 0 to the last seq, inclusively)
                 let full_seqs_range = 0..=last_seq;
 
                 // figure out how many seq gaps we have between 0 and the last seq for this version

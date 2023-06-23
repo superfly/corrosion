@@ -1,16 +1,18 @@
 use std::net::SocketAddr;
 
+use admin::AdminConn;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use corro_client::CorrosionApiClient;
 use corro_types::{
     api::{RqliteResult, Statement},
-    config::Config,
+    config::{default_admin_path, Config},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
 
+pub mod admin;
 pub mod command;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -151,6 +153,13 @@ async fn main() -> eyre::Result<()> {
             }
         }
         Command::Reload => command::reload::run(cli.admin_path()).await?,
+        Command::Sync(SyncCommand::Generate) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::Generate,
+            ))
+            .await?;
+        }
     }
 
     Ok(())
@@ -207,8 +216,10 @@ impl Cli {
     fn admin_path(&self) -> Utf8PathBuf {
         if let Some(ref admin_path) = self.admin_path {
             admin_path.clone()
+        } else if let Ok(config) = Config::load(self.config_path.as_str()) {
+            config.admin_path
         } else {
-            self.config().admin_path
+            default_admin_path()
         }
     }
 
@@ -254,10 +265,20 @@ enum Command {
 
     /// Reload the config
     Reload,
+
+    /// Sync-related commands
+    #[command(subcommand)]
+    Sync(SyncCommand),
 }
 
 #[derive(Subcommand)]
 enum ConsulCommand {
     /// Synchronizes the local consul agent with Corrosion
     Sync,
+}
+
+#[derive(Subcommand)]
+enum SyncCommand {
+    /// Generate a sync message from the current agent
+    Generate,
 }

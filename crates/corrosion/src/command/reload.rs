@@ -1,64 +1,14 @@
 use std::path::Path;
 
-use corro_admin::{Command, LogLevel, Response};
-use futures::{SinkExt, TryStreamExt};
-use tokio::net::UnixStream;
-use tokio_serde::{formats::Json, Framed};
-use tokio_util::codec::LengthDelimitedCodec;
-use tracing::{error, event, info};
+use corro_admin::Command;
+use tracing::info;
+
+use crate::admin::AdminConn;
 
 pub async fn run<P: AsRef<Path>>(admin_path: P) -> eyre::Result<()> {
-    handle_reload(admin_path).await
-}
-
-type FramedStream = Framed<
-    tokio_util::codec::Framed<UnixStream, LengthDelimitedCodec>,
-    Response,
-    Command,
-    Json<Response, Command>,
->;
-
-async fn connect<P: AsRef<Path>>(path: P) -> eyre::Result<FramedStream> {
-    let stream = UnixStream::connect(path).await?;
-    Ok(Framed::new(
-        tokio_util::codec::Framed::new(stream, LengthDelimitedCodec::new()),
-        Json::default(),
-    ))
-}
-
-async fn handle_reload<P: AsRef<Path>>(path: P) -> eyre::Result<()> {
-    let mut stream = connect(path).await?;
-
-    stream.send(Command::Reload).await?;
-
-    loop {
-        let res = stream.try_next().await?;
-
-        match res {
-            None => {
-                error!("Failed to get response from Corrosion's admin!");
-                break;
-            }
-            Some(res) => match res {
-                Response::Log { level, msg, ts } => match level {
-                    LogLevel::Trace => event!(tracing::Level::TRACE, %ts, "{msg}"),
-                    LogLevel::Debug => event!(tracing::Level::DEBUG, %ts, "{msg}"),
-                    LogLevel::Info => event!(tracing::Level::INFO, %ts, "{msg}"),
-                    LogLevel::Warn => event!(tracing::Level::WARN, %ts, "{msg}"),
-                    LogLevel::Error => event!(tracing::Level::ERROR, %ts, "{msg}"),
-                },
-                Response::Error { msg } => {
-                    error!("{msg}");
-                    break;
-                }
-                Response::Success => {
-                    info!("Successfully reloaded Corrosion!");
-                    break;
-                }
-            },
-        }
-    }
-
+    let mut conn = AdminConn::connect(admin_path).await?;
+    conn.send_command(Command::Reload).await?;
+    info!("Successfully reloaded Corrosion!");
     Ok(())
 }
 
@@ -114,7 +64,7 @@ mod tests {
 
         tokio::fs::write(&config_path, conf_bytes).await?;
 
-        handle_reload(&ta.agent.config().admin_path).await?;
+        run(&ta.agent.config().admin_path).await?;
 
         assert!(ta
             .agent
