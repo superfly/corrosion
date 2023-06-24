@@ -6,7 +6,7 @@ use std::{
 use bb8::ManageConnection;
 use bb8_rusqlite::RusqliteConnectionManager;
 use once_cell::sync::Lazy;
-use rusqlite::{Connection, ToSql, Transaction};
+use rusqlite::{Connection, OpenFlags, ToSql, Transaction};
 use tempfile::TempDir;
 use tracing::{error, trace};
 
@@ -51,12 +51,10 @@ impl CrConnManager {
     where
         P: AsRef<Path>,
     {
-        Self::new(path)
-        // TODO: bring this back when fixed by cr-sqlite
-        // Self(RusqliteConnectionManager::new_with_flags(
-        //     path,
-        //     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        // ))
+        Self(RusqliteConnectionManager::new_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ))
     }
 }
 
