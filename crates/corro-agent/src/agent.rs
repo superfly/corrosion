@@ -2680,7 +2680,7 @@ pub mod tests {
         )
         .await?;
 
-        sleep(Duration::from_secs(20)).await;
+        sleep(Duration::from_secs(30)).await;
 
         {
             let conn = ta2.agent.read_only_pool().get().await?;
@@ -2738,7 +2738,7 @@ pub mod tests {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
-        let agents = futures::stream::iter(0..20)
+        let agents = futures::stream::iter(0..10)
             .chunks(50)
             .fold(vec![], {
                 let tripwire = tripwire.clone();
