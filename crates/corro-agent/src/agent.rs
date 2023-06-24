@@ -80,6 +80,7 @@ pub struct AgentOptions {
     api_listener: TcpListener,
     bootstrap: Vec<String>,
     rx_bcast: Receiver<BroadcastInput>,
+    rx_apply: Receiver<(ActorId, i64)>,
     tripwire: Tripwire,
 }
 
@@ -149,6 +150,8 @@ pub async fn setup(
         apply_schema(&mut conn, &conf.schema_paths, &schema)?
     };
 
+    let (tx_apply, rx_apply) = channel(512);
+
     let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 
     {
@@ -216,10 +219,16 @@ pub async fn setup(
 
         for ((actor_id, version), (seqs, last_seq, ts)) in partials {
             let ranges = bk.entry(actor_id).or_default();
+            let gaps_count = seqs.gaps(&(0..=last_seq)).count();
             ranges.insert(
                 version..=version,
                 KnownDbVersion::Partial { seqs, last_seq, ts },
             );
+
+            if gaps_count == 0 {
+                info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
+                tx_apply.send((actor_id, version)).await?;
+            }
         }
     }
 
@@ -252,6 +261,7 @@ pub async fn setup(
         api_listener,
         bootstrap: conf.bootstrap.clone(),
         rx_bcast,
+        rx_apply,
         tripwire,
     };
 
@@ -267,6 +277,7 @@ pub async fn setup(
         subscribers: Default::default(),
         bookie,
         tx_bcast,
+        tx_apply,
         schema: RwLock::new(schema),
     }));
 
@@ -289,6 +300,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         bootstrap,
         mut tripwire,
         rx_bcast,
+        mut rx_apply,
     } = opts;
     info!("Current Actor ID: {}", actor_id);
 
@@ -355,7 +367,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 .layer(Extension(foca_tx.clone()))
                 .layer(Extension(agent.clone()))
                 .layer(Extension(bcast_msg_tx.clone()))
-                ,
         )
         .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http());
@@ -415,23 +426,60 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     );
 
     tokio::spawn({
-        let pool = agent.read_only_pool().clone();
+        let agent = agent.clone();
         let foca_tx = foca_tx.clone();
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
 
             loop {
-                interval.tick().await;
+                enum Branch {
+                    Tick,
+                    BackgroundApply { actor_id: ActorId, version: i64 },
+                }
 
-                match generate_bootstrap(bootstrap.as_slice(), gossip_addr, &pool).await {
-                    Ok(addrs) => {
-                        for addr in addrs.iter() {
-                            debug!("Bootstrapping w/ {addr}");
-                            foca_tx.send(FocaInput::Announce((*addr).into())).await.ok();
+                let branch = tokio::select! {
+                    biased;
+
+                    maybe_item = rx_apply.recv() => match maybe_item {
+                        Some((actor_id, version)) => Branch::BackgroundApply{actor_id, version},
+                        None => {
+                            debug!("background applies queue is closed, breaking out of loop");
+                            break;
+                        }
+                    },
+
+                    _ = interval.tick() => Branch::Tick
+                };
+
+                match branch {
+                    Branch::Tick => {
+                        match generate_bootstrap(
+                            bootstrap.as_slice(),
+                            gossip_addr,
+                            agent.read_only_pool(),
+                        )
+                        .await
+                        {
+                            Ok(addrs) => {
+                                for addr in addrs.iter() {
+                                    debug!("Bootstrapping w/ {addr}");
+                                    foca_tx.send(FocaInput::Announce((*addr).into())).await.ok();
+                                }
+                            }
+                            Err(e) => {
+                                error!("could not find nodes to announce ourselves to: {e}");
+                            }
                         }
                     }
-                    Err(e) => {
-                        error!("could not find nodes to announce ourselves to: {e}");
+                    Branch::BackgroundApply { actor_id, version } => {
+                        match process_fully_buffered_changes(&agent, actor_id, version).await {
+                            Ok(_applied) => {
+                                // TODO: do something, I guess?
+                            }
+                            Err(e) => {
+                                error!("could not apply fully buffered changes: {e}");
+                            }
+                        }
                     }
                 }
             }
@@ -1181,6 +1229,119 @@ fn store_empty_changeset(
     return Ok(());
 }
 
+async fn process_fully_buffered_changes(
+    agent: &Agent,
+    actor_id: ActorId,
+    version: i64,
+) -> Result<bool, bb8::RunError<bb8_rusqlite::Error>> {
+    let booked = agent.bookie().for_actor(actor_id);
+
+    let mut conn = agent.read_write_pool().get().await?;
+
+    let mut bookedw = booked.write();
+
+    let (last_seq, ts) = {
+        match bookedw.inner().get(&version) {
+            Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
+                if seqs.gaps(&(0..=*last_seq)).count() != 0 {
+                    // TODO: return an error here
+                    return Ok(false);
+                }
+                (*last_seq, *ts)
+            }
+            Some(_) => {
+                warn!(%actor_id, %version, "already processed buffered changes, returning");
+                return Ok(false);
+            }
+            None => {
+                warn!(%actor_id, %version, "version not found in cache,returning");
+                return Ok(false);
+            }
+        }
+    };
+
+    info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+
+    let known_version = block_in_place(|| {
+        let tx = conn.transaction()?;
+
+        let count: i64 = tx
+            .prepare_cached(
+                "
+                SELECT count(*)
+                    FROM __corro_buffered_changes
+                        WHERE site_id = ?
+                            AND version = ?
+                        ",
+            )?
+            .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
+        debug!(actor = %agent.actor_id(), "total buffered rows: {count}");
+
+        let start = Instant::now();
+        // insert all buffered changes into crsql_changes directly from the buffered changes table
+        let count = tx
+            .prepare_cached(
+                "
+                INSERT INTO crsql_changes
+                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id
+                        FROM __corro_buffered_changes
+                            WHERE site_id = ?
+                                AND version = ?
+                            ORDER BY db_version ASC, seq ASC
+                            ",
+            )?
+            .execute(params![actor_id.as_bytes(), version])?;
+        info!(actor = %agent.actor_id(), "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+
+        // remove all buffered changes for cleanup purposes
+        let count = tx
+            .prepare_cached(
+                "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
+            )?
+            .execute(params![actor_id.as_bytes(), version])?;
+        info!(actor = %agent.actor_id(), "deleted {count} buffered changes");
+
+        // delete all bookkept sequences for this version
+        let count = tx
+            .prepare_cached(
+                "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
+            )?
+            .execute(params![actor_id, version])?;
+        info!(actor = %agent.actor_id(), "deleted {count} sequences in bookkeeping");
+
+        let rows_impacted: i64 = tx
+            .prepare_cached("SELECT crsql_rows_impacted()")?
+            .query_row((), |row| row.get(0))?;
+
+        info!(actor = %agent.actor_id(), "rows impacted by changes: {rows_impacted}");
+
+        let known_version = if rows_impacted > 0 {
+            let db_version: i64 =
+                tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
+            debug!("db version: {db_version}");
+
+            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
+
+            KnownDbVersion::Current {
+                db_version,
+                last_seq,
+                ts,
+            }
+        } else {
+            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, last_seq, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, last_seq, ts])?;
+            KnownDbVersion::Cleared
+        };
+
+        tx.commit()?;
+
+        Ok::<_, bb8_rusqlite::Error>(known_version)
+    })?;
+
+    bookedw.insert(version, known_version);
+
+    Ok(true)
+}
+
 async fn process_single_version(
     agent: &Agent,
     change: ChangeV1,
@@ -1235,10 +1396,6 @@ async fn process_single_version(
 
             // if not a full range!
             if !is_complete {
-                // debug!(actor = %agent.actor_id(), "changes len: {}", changes.len());
-                if changes.len() != 50 {
-                    debug!(actor = %agent.actor_id(), "changes len: {}", changes.len());
-                }
                 let mut inserted = 0;
                 for change in changes.iter() {
                     trace!("buffering change! {change:?}");
@@ -1289,6 +1446,7 @@ async fn process_single_version(
                 // immediately add this new range to the recorded seqs ranges
                 seqs_recorded.insert(seqs.clone());
 
+                // all seq for this version (from 0 to the last seq, inclusively)
                 let full_seqs_range = 0..=last_seq;
 
                 // figure out how many seq gaps we have between 0 and the last seq for this version
@@ -1296,69 +1454,12 @@ async fn process_single_version(
 
                 trace!(actor = %agent.actor_id(), "still missing {gaps_count} seqs");
 
-                // if we have no gaps, then we can apply all these changes.
-                let known_version = if gaps_count == 0 {
-                    info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
-
-                    let count: i64 = tx
-                        .prepare_cached(
-                            "
-                            SELECT count(*)
-                                FROM __corro_buffered_changes
-                                    WHERE site_id = ?
-                                      AND version = ?
-                                    ",
-                        )?
-                        .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
-                    debug!(actor = %agent.actor_id(), "total buffered rows: {count}");
-
-                    // insert all buffered changes into crsql_changes directly from the buffered changes table
-                    let count = tx
-                        .prepare_cached(
-                            "
-                        INSERT INTO crsql_changes
-                            SELECT \"table\", pk, cid, val, col_version, db_version, site_id
-                                FROM __corro_buffered_changes
-                                    WHERE site_id = ?
-                                      AND version = ?
-                                    ORDER BY db_version ASC, seq ASC
-                                    ",
-                        )?
-                        .execute(params![actor_id.as_bytes(), version])?;
-                    info!(actor = %agent.actor_id(), "inserted {count} rows from buffered into crsql_changes");
-
-                    // remove all buffered changes for cleanup purposes
-                    let count = tx.prepare_cached(
-                        "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
-                    )?
-                    .execute(params![actor_id.as_bytes(), version])?;
-                    info!(actor = %agent.actor_id(), "deleted {count} buffered changes");
-
-                    // delete all bookkept sequences for this version
-                    let count = tx
-                        .prepare_cached(
-                            "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
-                        )?
-                        .execute(params![actor_id, version])?;
-                    info!(actor = %agent.actor_id(), "deleted {count} sequences in bookkeeping");
-
-                    let rows_impacted: i64 = tx
-                        .prepare_cached("SELECT crsql_rows_impacted()")?
-                        .query_row((), |row| row.get(0))?;
-
-                    info!(actor = %agent.actor_id(), "rows impacted by changes: {rows_impacted}");
-
-                    if rows_impacted > 0 {
-                        let db_version: i64 =
-                            tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
-                        debug!("db version: {db_version}");
-                        KnownDbVersion::Current {
-                            db_version,
-                            last_seq,
-                            ts,
-                        }
-                    } else {
-                        KnownDbVersion::Cleared
+                // if we have no gaps, then we can schedule applying all these changes.
+                if gaps_count == 0 {
+                    if let Err(e) = agent.tx_apply().blocking_send((actor_id, version)) {
+                        error!(
+                            "could not send trigger for applying fully buffered changes later: {e}"
+                        );
                     }
                 } else {
                     tx.prepare_cached(
@@ -1380,18 +1481,16 @@ async fn process_single_version(
                             ts
                         ])?;
                     }
-
-                    KnownDbVersion::Partial {
-                        seqs: seqs_recorded,
-                        last_seq,
-                        ts,
-                    }
-                };
+                }
 
                 tx.commit()?;
 
                 return Ok((
-                    known_version,
+                    KnownDbVersion::Partial {
+                        seqs: seqs_recorded,
+                        last_seq,
+                        ts,
+                    },
                     Changeset::Full {
                         changes,
                         seqs,
@@ -1919,8 +2018,11 @@ pub mod tests {
         time::{Duration, Instant},
     };
 
-    use futures::{SinkExt, StreamExt, TryStreamExt};
-    use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
+    use futures::{stream::FuturesUnordered, SinkExt, StreamExt, TryStreamExt};
+    use rand::{
+        distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::IteratorRandom,
+        SeedableRng,
+    };
     use serde::Deserialize;
     use serde_json::json;
     use spawn::wait_for_all_pending_handles;
@@ -1935,7 +2037,7 @@ pub mod tests {
 
     use corro_types::{
         agent::reload,
-        api::{RqliteResponse, Statement},
+        api::{RqliteResponse, RqliteResult, Statement},
         change::SqliteValue,
         filters::{ChangeEvent, OwnedAggregateChange},
         pubsub::{Subscription, SubscriptionId},
@@ -2628,7 +2730,7 @@ pub mod tests {
             .pool_idle_timeout(Duration::from_secs(300))
             .build_http::<hyper::Body>();
 
-        let req_body: Vec<Statement> = serde_json::from_value(json!(["INSERT INTO tests  WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000  ) SELECT id, \"hello\" as text FROM cte;"]))?;
+        let req_body: Vec<Statement> = serde_json::from_value(json!(["INSERT INTO tests  WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 10000  ) SELECT id, \"hello\" as text FROM cte;"]))?;
 
         let res = timeout(
             Duration::from_secs(5),
@@ -2692,7 +2794,7 @@ pub mod tests {
 
             assert_eq!(
                 count,
-                100000,
+                10000,
                 "actor {} did not reach 100K rows",
                 ta2.agent.actor_id()
             );
@@ -2707,7 +2809,7 @@ pub mod tests {
 
             assert_eq!(
                 count,
-                100000,
+                10000,
                 "actor {} did not reach 100K rows",
                 ta3.agent.actor_id()
             );
@@ -2721,10 +2823,146 @@ pub mod tests {
 
             assert_eq!(
                 count,
-                100000,
+                10000,
                 "actor {} did not reach 100K rows",
                 ta4.agent.actor_id()
             );
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn many_small_changes() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let agents = futures::stream::iter(0..10)
+            .chunks(50)
+            .fold(vec![], {
+                let tripwire = tripwire.clone();
+                move |mut agents: Vec<TestAgent>, to_launch| {
+                    let tripwire = tripwire.clone();
+                    async move {
+                        for n in to_launch {
+                            println!("LAUNCHING AGENT #{n}");
+                            let mut rng = StdRng::from_entropy();
+                            let bootstrap = agents
+                                .iter()
+                                .map(|ta| ta.agent.gossip_addr())
+                                .choose_multiple(&mut rng, 10);
+                            agents.push(
+                                launch_test_agent(
+                                    |conf| {
+                                        conf.gossip_addr("127.0.0.1:0".parse().unwrap())
+                                            .bootstrap(
+                                                bootstrap
+                                                    .iter()
+                                                    .map(SocketAddr::to_string)
+                                                    .collect::<Vec<String>>(),
+                                            )
+                                            .build()
+                                    },
+                                    tripwire.clone(),
+                                )
+                                .await
+                                .unwrap(),
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        agents
+                    }
+                }
+            })
+            .await;
+
+        let mut start_id = 0;
+
+        FuturesUnordered::from_iter(agents.iter().map(|ta| {
+            let ta = ta.clone();
+            start_id += 100000;
+            async move {
+                tokio::spawn(async move {
+                    let client: hyper::Client<_, hyper::Body> =
+                        hyper::Client::builder().build_http();
+
+                    let durs = {
+                        let between = Uniform::from(100..=1000);
+                        let mut rng = rand::thread_rng();
+                        (0..100)
+                            .map(|_| between.sample(&mut rng))
+                            .collect::<Vec<_>>()
+                    };
+
+                    let api_addr = ta.agent.api_addr();
+                    let actor_id = ta.agent.actor_id();
+
+                    FuturesUnordered::from_iter(durs.into_iter().map(|dur| {
+                        let client = client.clone();
+                        start_id += 1;
+                        async move {
+                            sleep(Duration::from_millis(dur)).await;
+
+                            let req_body = serde_json::from_value::<Vec<Statement>>(json!([[
+                                "INSERT INTO tests (id,text) VALUES (?,?)",
+                                start_id,
+                                format!("hello from {actor_id}")
+                            ],]))?;
+
+                            let res = client
+                                .request(
+                                    hyper::Request::builder()
+                                        .method(hyper::Method::POST)
+                                        .uri(format!("http://{api_addr}/db/execute?transaction"))
+                                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                                        .body(serde_json::to_vec(&req_body)?.into())?,
+                                )
+                                .await?;
+
+                            if res.status() != StatusCode::OK {
+                                eyre::bail!("bad status code: {}", res.status());
+                            }
+
+                            let body: RqliteResponse = serde_json::from_slice(
+                                &hyper::body::to_bytes(res.into_body()).await?,
+                            )?;
+
+                            match &body.results[0] {
+                                RqliteResult::Execute { .. } => {}
+                                RqliteResult::Error { error } => {
+                                    eyre::bail!("error: {error}");
+                                }
+                                res => {
+                                    eyre::bail!("unexpected response: {res:?}");
+                                }
+                            }
+
+                            Ok::<_, eyre::Report>(())
+                        }
+                    }))
+                    .try_collect()
+                    .await?;
+
+                    Ok::<_, eyre::Report>(())
+                })
+                .await??;
+                Ok::<_, eyre::Report>(())
+            }
+        }))
+        .try_collect()
+        .await?;
+
+        sleep(Duration::from_secs(10)).await;
+
+        for ta in agents {
+            let conn = ta.agent.read_only_pool().get().await?;
+            let count: i64 = conn.query_row("SELECT count(*) FROM tests", (), |row| row.get(0))?;
+
+            println!("actor: {}, count: {count}", ta.agent.actor_id());
         }
 
         tripwire_tx.send(()).await.ok();

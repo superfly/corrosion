@@ -5,6 +5,7 @@ use corro_types::{
     agent::{reload, Agent},
     config::Config,
     sqlite::SqlitePoolError,
+    sync::generate_sync,
 };
 use futures::{SinkExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,12 @@ pub fn start_server(
 pub enum Command {
     Reload,
     Backup { path: String },
+    Sync(SyncCommand),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SyncCommand {
+    Generate,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -117,6 +124,7 @@ pub enum Response {
         msg: String,
     },
     Success,
+    Json(serde_json::Value),
 }
 
 type FramedStream = Framed<
@@ -161,6 +169,13 @@ async fn handle_conn(
                         send_error(&mut stream, e).await;
                     }
                 },
+                Command::Sync(SyncCommand::Generate) => {
+                    let sync_state = generate_sync(agent.bookie(), agent.actor_id());
+                    match serde_json::to_value(&sync_state) {
+                        Ok(json) => send(&mut stream, Response::Json(json)).await,
+                        Err(e) => send_error(&mut stream, e).await,
+                    }
+                }
             },
             Ok(None) => {
                 debug!("done with admin conn");

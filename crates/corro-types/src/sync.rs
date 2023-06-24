@@ -1,6 +1,7 @@
 use std::{collections::HashMap, io, ops::RangeInclusive};
 
 use bytes::{Buf, BufMut, BytesMut};
+use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 use tracing::trace;
@@ -22,7 +23,7 @@ pub enum SyncMessageV1 {
     Changeset(ChangeV1),
 }
 
-#[derive(Debug, Default, Clone, Readable, Writable)]
+#[derive(Debug, Default, Clone, Readable, Writable, Serialize, Deserialize)]
 pub struct SyncStateV1 {
     pub actor_id: ActorId,
     pub heads: HashMap<ActorId, i64>,
@@ -90,6 +91,11 @@ pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             let read = booked.read();
             for (range, known) in read.iter() {
                 if let KnownDbVersion::Partial { seqs, last_seq, .. } = known {
+                    if seqs.gaps(&(0..=*last_seq)).count() == 0 {
+                        // soon to be processed, but we got it all
+                        continue;
+                    }
+
                     state
                         .partial_need
                         .entry(actor_id)

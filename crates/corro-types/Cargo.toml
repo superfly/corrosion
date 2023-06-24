@@ -17,6 +17,7 @@ crc32fast = { workspace = true }
 enquote = { workspace = true }
 fallible-iterator = { workspace = true }
 foca = { workspace = true } 
+futures = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }

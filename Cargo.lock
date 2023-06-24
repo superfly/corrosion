@@ -673,6 +673,7 @@ dependencies = [
  "enquote",
  "fallible-iterator",
  "foca",
+ "futures",
  "hex",
  "indexmap",
  "itertools",
