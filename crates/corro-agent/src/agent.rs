@@ -1915,8 +1915,11 @@ pub mod tests {
         time::{Duration, Instant},
     };
 
-    use futures::{SinkExt, StreamExt, TryStreamExt};
-    use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
+    use futures::{stream::FuturesUnordered, SinkExt, StreamExt, TryStreamExt};
+    use rand::{
+        distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::IteratorRandom,
+        SeedableRng,
+    };
     use serde::Deserialize;
     use serde_json::json;
     use spawn::wait_for_all_pending_handles;
@@ -1931,7 +1934,7 @@ pub mod tests {
 
     use corro_types::{
         agent::reload,
-        api::{RqliteResponse, Statement},
+        api::{RqliteResponse, RqliteResult, Statement},
         change::SqliteValue,
         filters::{ChangeEvent, OwnedAggregateChange},
         pubsub::{Subscription, SubscriptionId},
@@ -2721,6 +2724,142 @@ pub mod tests {
                 "actor {} did not reach 100K rows",
                 ta4.agent.actor_id()
             );
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn many_small_changes() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let agents = futures::stream::iter(0..20)
+            .chunks(50)
+            .fold(vec![], {
+                let tripwire = tripwire.clone();
+                move |mut agents: Vec<TestAgent>, to_launch| {
+                    let tripwire = tripwire.clone();
+                    async move {
+                        for n in to_launch {
+                            println!("LAUNCHING AGENT #{n}");
+                            let mut rng = StdRng::from_entropy();
+                            let bootstrap = agents
+                                .iter()
+                                .map(|ta| ta.agent.gossip_addr())
+                                .choose_multiple(&mut rng, 10);
+                            agents.push(
+                                launch_test_agent(
+                                    |conf| {
+                                        conf.gossip_addr("127.0.0.1:0".parse().unwrap())
+                                            .bootstrap(
+                                                bootstrap
+                                                    .iter()
+                                                    .map(SocketAddr::to_string)
+                                                    .collect::<Vec<String>>(),
+                                            )
+                                            .build()
+                                    },
+                                    tripwire.clone(),
+                                )
+                                .await
+                                .unwrap(),
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        agents
+                    }
+                }
+            })
+            .await;
+
+        let mut start_id = 0;
+
+        FuturesUnordered::from_iter(agents.iter().map(|ta| {
+            let ta = ta.clone();
+            start_id += 100000;
+            async move {
+                tokio::spawn(async move {
+                    let client: hyper::Client<_, hyper::Body> =
+                        hyper::Client::builder().build_http();
+
+                    let durs = {
+                        let between = Uniform::from(100..=1000);
+                        let mut rng = rand::thread_rng();
+                        (0..100)
+                            .map(|_| between.sample(&mut rng))
+                            .collect::<Vec<_>>()
+                    };
+
+                    let api_addr = ta.agent.api_addr();
+                    let actor_id = ta.agent.actor_id();
+
+                    FuturesUnordered::from_iter(durs.into_iter().map(|dur| {
+                        let client = client.clone();
+                        start_id += 1;
+                        async move {
+                            sleep(Duration::from_millis(dur)).await;
+
+                            let req_body = serde_json::from_value::<Vec<Statement>>(json!([[
+                                "INSERT INTO tests (id,text) VALUES (?,?)",
+                                start_id,
+                                format!("hello from {actor_id}")
+                            ],]))?;
+
+                            let res = client
+                                .request(
+                                    hyper::Request::builder()
+                                        .method(hyper::Method::POST)
+                                        .uri(format!("http://{api_addr}/db/execute?transaction"))
+                                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                                        .body(serde_json::to_vec(&req_body)?.into())?,
+                                )
+                                .await?;
+
+                            if res.status() != StatusCode::OK {
+                                eyre::bail!("bad status code: {}", res.status());
+                            }
+
+                            let body: RqliteResponse = serde_json::from_slice(
+                                &hyper::body::to_bytes(res.into_body()).await?,
+                            )?;
+
+                            match &body.results[0] {
+                                RqliteResult::Execute { .. } => {}
+                                RqliteResult::Error { error } => {
+                                    eyre::bail!("error: {error}");
+                                }
+                                res => {
+                                    eyre::bail!("unexpected response: {res:?}");
+                                }
+                            }
+
+                            Ok::<_, eyre::Report>(())
+                        }
+                    }))
+                    .try_collect()
+                    .await?;
+
+                    Ok::<_, eyre::Report>(())
+                })
+                .await??;
+                Ok::<_, eyre::Report>(())
+            }
+        }))
+        .try_collect()
+        .await?;
+
+        sleep(Duration::from_secs(10)).await;
+
+        for ta in agents {
+            let conn = ta.agent.read_only_pool().get().await?;
+            let count: i64 = conn.query_row("SELECT count(*) FROM tests", (), |row| row.get(0))?;
+
+            println!("actor: {}, count: {count}", ta.agent.actor_id());
         }
 
         tripwire_tx.send(()).await.ok();

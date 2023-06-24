@@ -84,6 +84,13 @@ impl ManageConnection for CrConnManager {
 
 pub struct CrConn(pub Connection);
 
+impl CrConn {
+    pub fn transaction(&mut self) -> rusqlite::Result<Transaction> {
+        self.0
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+    }
+}
+
 impl Deref for CrConn {
     type Target = Connection;
 
@@ -179,4 +186,84 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
         tx.commit()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::{stream::FuturesUnordered, TryStreamExt};
+    use tokio::task::block_in_place;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes() -> Result<(), Box<dyn std::error::Error>> {
+        let tmpdir = tempfile::TempDir::new()?;
+
+        let pool = bb8::Builder::new()
+            .max_size(1)
+            .min_idle(Some(1)) // create one right away and keep it idle
+            .build(CrConnManager::new(tmpdir.path().join("test.db")))
+            .await?;
+
+        {
+            let conn = pool.get().await?;
+
+            conn.execute_batch(
+                "
+                CREATE TABLE foo (a INTEGER PRIMARY KEY, b INTEGER);
+                SELECT crsql_as_crr('foo');
+            ",
+            )?;
+        }
+
+        let total: i64 = 1000;
+        let per_worker: i64 = 5;
+
+        let futs = FuturesUnordered::from_iter((0..total).map(|_| {
+            let pool = pool.clone();
+            async move {
+                tokio::spawn(async move {
+                    FuturesUnordered::from_iter((0..per_worker).map(|_| {
+                        let pool = pool.clone();
+                        async move {
+                            let conn = pool.get().await?;
+                            block_in_place(|| {
+                                conn.prepare_cached(
+                                    "INSERT INTO foo (a, b) VALUES (random(), random())",
+                                )?
+                                .execute(())?;
+                                Ok::<_, TestError>(())
+                            })?;
+                            Ok::<_, TestError>(())
+                        }
+                    }))
+                    .try_collect()
+                    .await?;
+                    Ok::<_, TestError>(())
+                })
+                .await??;
+                Ok::<_, TestError>(())
+            }
+        }));
+
+        futs.try_collect().await?;
+
+        let conn = pool.get().await?;
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM foo;", (), |row| row.get(0))?;
+
+        assert_eq!(count, total * per_worker);
+
+        Ok(())
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum TestError {
+        #[error(transparent)]
+        Rusqlite(#[from] rusqlite::Error),
+        #[error(transparent)]
+        Bb8Rusqlite(#[from] bb8::RunError<bb8_rusqlite::Error>),
+        #[error(transparent)]
+        Join(#[from] tokio::task::JoinError),
+    }
 }
