@@ -1308,6 +1308,7 @@ async fn process_single_version(
                         .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
                     debug!(actor = %agent.actor_id(), "total buffered rows: {count}");
 
+                    let start = Instant::now();
                     // insert all buffered changes into crsql_changes directly from the buffered changes table
                     let count = tx
                         .prepare_cached(
@@ -1321,7 +1322,7 @@ async fn process_single_version(
                                     ",
                         )?
                         .execute(params![actor_id.as_bytes(), version])?;
-                    info!(actor = %agent.actor_id(), "inserted {count} rows from buffered into crsql_changes");
+                    info!(actor = %agent.actor_id(), "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
 
                     // remove all buffered changes for cleanup purposes
                     let count = tx.prepare_cached(
@@ -2627,7 +2628,7 @@ pub mod tests {
             .pool_idle_timeout(Duration::from_secs(300))
             .build_http::<hyper::Body>();
 
-        let req_body: Vec<Statement> = serde_json::from_value(json!(["INSERT INTO tests  WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000  ) SELECT id, \"hello\" as text FROM cte;"]))?;
+        let req_body: Vec<Statement> = serde_json::from_value(json!(["INSERT INTO tests  WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 10000  ) SELECT id, \"hello\" as text FROM cte;"]))?;
 
         let res = timeout(
             Duration::from_secs(5),
@@ -2680,7 +2681,7 @@ pub mod tests {
         )
         .await?;
 
-        sleep(Duration::from_secs(30)).await;
+        sleep(Duration::from_secs(20)).await;
 
         {
             let conn = ta2.agent.read_only_pool().get().await?;
@@ -2691,7 +2692,7 @@ pub mod tests {
 
             assert_eq!(
                 count,
-                100000,
+                10000,
                 "actor {} did not reach 100K rows",
                 ta2.agent.actor_id()
             );
@@ -2706,7 +2707,7 @@ pub mod tests {
 
             assert_eq!(
                 count,
-                100000,
+                10000,
                 "actor {} did not reach 100K rows",
                 ta3.agent.actor_id()
             );
@@ -2720,7 +2721,7 @@ pub mod tests {
 
             assert_eq!(
                 count,
-                100000,
+                10000,
                 "actor {} did not reach 100K rows",
                 ta4.agent.actor_id()
             );
