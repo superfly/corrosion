@@ -1319,12 +1319,16 @@ async fn process_fully_buffered_changes(
             let db_version: i64 =
                 tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
             debug!("db version: {db_version}");
+
+            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
+
             KnownDbVersion::Current {
                 db_version,
                 last_seq,
                 ts,
             }
         } else {
+            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, last_seq, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, last_seq, ts])?;
             KnownDbVersion::Cleared
         };
 
