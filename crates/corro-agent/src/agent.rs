@@ -80,6 +80,7 @@ pub struct AgentOptions {
     api_listener: TcpListener,
     bootstrap: Vec<String>,
     rx_bcast: Receiver<BroadcastInput>,
+    rx_apply: Receiver<(ActorId, i64)>,
     tripwire: Tripwire,
 }
 
@@ -149,6 +150,8 @@ pub async fn setup(
         apply_schema(&mut conn, &conf.schema_paths, &schema)?
     };
 
+    let (tx_apply, rx_apply) = channel(512);
+
     let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 
     {
@@ -216,10 +219,16 @@ pub async fn setup(
 
         for ((actor_id, version), (seqs, last_seq, ts)) in partials {
             let ranges = bk.entry(actor_id).or_default();
+            let gaps_count = seqs.gaps(&(0..=last_seq)).count();
             ranges.insert(
                 version..=version,
                 KnownDbVersion::Partial { seqs, last_seq, ts },
             );
+
+            if gaps_count == 0 {
+                info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
+                tx_apply.send((actor_id, version)).await?;
+            }
         }
     }
 
@@ -252,6 +261,7 @@ pub async fn setup(
         api_listener,
         bootstrap: conf.bootstrap.clone(),
         rx_bcast,
+        rx_apply,
         tripwire,
     };
 
@@ -267,6 +277,7 @@ pub async fn setup(
         subscribers: Default::default(),
         bookie,
         tx_bcast,
+        tx_apply,
         schema: RwLock::new(schema),
     }));
 
@@ -289,6 +300,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         bootstrap,
         mut tripwire,
         rx_bcast,
+        mut rx_apply,
     } = opts;
     info!("Current Actor ID: {}", actor_id);
 
@@ -414,23 +426,60 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     );
 
     tokio::spawn({
-        let pool = agent.read_only_pool().clone();
+        let agent = agent.clone();
         let foca_tx = foca_tx.clone();
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
 
             loop {
-                interval.tick().await;
+                enum Branch {
+                    Tick,
+                    BackgroundApply { actor_id: ActorId, version: i64 },
+                }
 
-                match generate_bootstrap(bootstrap.as_slice(), gossip_addr, &pool).await {
-                    Ok(addrs) => {
-                        for addr in addrs.iter() {
-                            debug!("Bootstrapping w/ {addr}");
-                            foca_tx.send(FocaInput::Announce((*addr).into())).await.ok();
+                let branch = tokio::select! {
+                    biased;
+
+                    maybe_item = rx_apply.recv() => match maybe_item {
+                        Some((actor_id, version)) => Branch::BackgroundApply{actor_id, version},
+                        None => {
+                            debug!("background applies queue is closed, breaking out of loop");
+                            break;
+                        }
+                    },
+
+                    _ = interval.tick() => Branch::Tick
+                };
+
+                match branch {
+                    Branch::Tick => {
+                        match generate_bootstrap(
+                            bootstrap.as_slice(),
+                            gossip_addr,
+                            agent.read_only_pool(),
+                        )
+                        .await
+                        {
+                            Ok(addrs) => {
+                                for addr in addrs.iter() {
+                                    debug!("Bootstrapping w/ {addr}");
+                                    foca_tx.send(FocaInput::Announce((*addr).into())).await.ok();
+                                }
+                            }
+                            Err(e) => {
+                                error!("could not find nodes to announce ourselves to: {e}");
+                            }
                         }
                     }
-                    Err(e) => {
-                        error!("could not find nodes to announce ourselves to: {e}");
+                    Branch::BackgroundApply { actor_id, version } => {
+                        match process_fully_buffered_changes(&agent, actor_id, version).await {
+                            Ok(_applied) => {
+                                // TODO: do something, I guess?
+                            }
+                            Err(e) => {
+                                error!("could not apply fully buffered changes: {e}");
+                            }
+                        }
                     }
                 }
             }
@@ -1180,6 +1229,115 @@ fn store_empty_changeset(
     return Ok(());
 }
 
+async fn process_fully_buffered_changes(
+    agent: &Agent,
+    actor_id: ActorId,
+    version: i64,
+) -> Result<bool, bb8::RunError<bb8_rusqlite::Error>> {
+    let booked = agent.bookie().for_actor(actor_id);
+
+    let mut conn = agent.read_write_pool().get().await?;
+
+    let mut bookedw = booked.write();
+
+    let (last_seq, ts) = {
+        match bookedw.inner().get(&version) {
+            Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
+                if seqs.gaps(&(0..=*last_seq)).count() != 0 {
+                    // TODO: return an error here
+                    return Ok(false);
+                }
+                (*last_seq, *ts)
+            }
+            Some(_) => {
+                warn!(%actor_id, %version, "already processed buffered changes, returning");
+                return Ok(false);
+            }
+            None => {
+                warn!(%actor_id, %version, "version not found in cache,returning");
+                return Ok(false);
+            }
+        }
+    };
+
+    info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+
+    let known_version = block_in_place(|| {
+        let tx = conn.transaction()?;
+
+        let count: i64 = tx
+            .prepare_cached(
+                "
+                SELECT count(*)
+                    FROM __corro_buffered_changes
+                        WHERE site_id = ?
+                            AND version = ?
+                        ",
+            )?
+            .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
+        debug!(actor = %agent.actor_id(), "total buffered rows: {count}");
+
+        let start = Instant::now();
+        // insert all buffered changes into crsql_changes directly from the buffered changes table
+        let count = tx
+            .prepare_cached(
+                "
+                INSERT INTO crsql_changes
+                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id
+                        FROM __corro_buffered_changes
+                            WHERE site_id = ?
+                                AND version = ?
+                            ORDER BY db_version ASC, seq ASC
+                            ",
+            )?
+            .execute(params![actor_id.as_bytes(), version])?;
+        info!(actor = %agent.actor_id(), "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+
+        // remove all buffered changes for cleanup purposes
+        let count = tx
+            .prepare_cached(
+                "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
+            )?
+            .execute(params![actor_id.as_bytes(), version])?;
+        info!(actor = %agent.actor_id(), "deleted {count} buffered changes");
+
+        // delete all bookkept sequences for this version
+        let count = tx
+            .prepare_cached(
+                "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
+            )?
+            .execute(params![actor_id, version])?;
+        info!(actor = %agent.actor_id(), "deleted {count} sequences in bookkeeping");
+
+        let rows_impacted: i64 = tx
+            .prepare_cached("SELECT crsql_rows_impacted()")?
+            .query_row((), |row| row.get(0))?;
+
+        info!(actor = %agent.actor_id(), "rows impacted by changes: {rows_impacted}");
+
+        let known_version = if rows_impacted > 0 {
+            let db_version: i64 =
+                tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
+            debug!("db version: {db_version}");
+            KnownDbVersion::Current {
+                db_version,
+                last_seq,
+                ts,
+            }
+        } else {
+            KnownDbVersion::Cleared
+        };
+
+        tx.commit()?;
+
+        Ok::<_, bb8_rusqlite::Error>(known_version)
+    })?;
+
+    bookedw.insert(version, known_version);
+
+    Ok(true)
+}
+
 async fn process_single_version(
     agent: &Agent,
     change: ChangeV1,
@@ -1292,70 +1450,12 @@ async fn process_single_version(
 
                 trace!(actor = %agent.actor_id(), "still missing {gaps_count} seqs");
 
-                // if we have no gaps, then we can apply all these changes.
-                let known_version = if gaps_count == 0 {
-                    info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
-
-                    let count: i64 = tx
-                        .prepare_cached(
-                            "
-                            SELECT count(*)
-                                FROM __corro_buffered_changes
-                                    WHERE site_id = ?
-                                      AND version = ?
-                                    ",
-                        )?
-                        .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
-                    debug!(actor = %agent.actor_id(), "total buffered rows: {count}");
-
-                    let start = Instant::now();
-                    // insert all buffered changes into crsql_changes directly from the buffered changes table
-                    let count = tx
-                        .prepare_cached(
-                            "
-                        INSERT INTO crsql_changes
-                            SELECT \"table\", pk, cid, val, col_version, db_version, site_id
-                                FROM __corro_buffered_changes
-                                    WHERE site_id = ?
-                                      AND version = ?
-                                    ORDER BY db_version ASC, seq ASC
-                                    ",
-                        )?
-                        .execute(params![actor_id.as_bytes(), version])?;
-                    info!(actor = %agent.actor_id(), "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
-
-                    // remove all buffered changes for cleanup purposes
-                    let count = tx.prepare_cached(
-                        "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
-                    )?
-                    .execute(params![actor_id.as_bytes(), version])?;
-                    info!(actor = %agent.actor_id(), "deleted {count} buffered changes");
-
-                    // delete all bookkept sequences for this version
-                    let count = tx
-                        .prepare_cached(
-                            "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
-                        )?
-                        .execute(params![actor_id, version])?;
-                    info!(actor = %agent.actor_id(), "deleted {count} sequences in bookkeeping");
-
-                    let rows_impacted: i64 = tx
-                        .prepare_cached("SELECT crsql_rows_impacted()")?
-                        .query_row((), |row| row.get(0))?;
-
-                    info!(actor = %agent.actor_id(), "rows impacted by changes: {rows_impacted}");
-
-                    if rows_impacted > 0 {
-                        let db_version: i64 =
-                            tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
-                        debug!("db version: {db_version}");
-                        KnownDbVersion::Current {
-                            db_version,
-                            last_seq,
-                            ts,
-                        }
-                    } else {
-                        KnownDbVersion::Cleared
+                // if we have no gaps, then we can schedule applying all these changes.
+                if gaps_count == 0 {
+                    if let Err(e) = agent.tx_apply().blocking_send((actor_id, version)) {
+                        error!(
+                            "could not send trigger for applying fully buffered changes later: {e}"
+                        );
                     }
                 } else {
                     tx.prepare_cached(
@@ -1377,18 +1477,16 @@ async fn process_single_version(
                             ts
                         ])?;
                     }
-
-                    KnownDbVersion::Partial {
-                        seqs: seqs_recorded,
-                        last_seq,
-                        ts,
-                    }
-                };
+                }
 
                 tx.commit()?;
 
                 return Ok((
-                    known_version,
+                    KnownDbVersion::Partial {
+                        seqs: seqs_recorded,
+                        last_seq,
+                        ts,
+                    },
                     Changeset::Full {
                         changes,
                         seqs,

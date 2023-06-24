@@ -679,7 +679,8 @@ mod tests {
             apply_schema(&mut conn, &[&schema_path], &NormalizedSchema::default())?;
         }
 
-        let (tx, mut rx) = channel(1);
+        let (tx_bcast, mut rx_bcast) = channel(1);
+        let (tx_apply, _rx_apply) = channel(1);
 
         let agent = Agent(Arc::new(corro_types::agent::AgentInner {
             actor_id: ActorId(Uuid::new_v4()),
@@ -701,7 +702,8 @@ mod tests {
             clock: Default::default(),
             bookie: Default::default(),
             subscribers: Default::default(),
-            tx_bcast: tx,
+            tx_bcast,
+            tx_apply,
             schema: Default::default(),
         }));
 
@@ -721,7 +723,10 @@ mod tests {
 
         assert!(body.0.results.len() == 1);
 
-        let msg = rx.recv().await.expect("not msg received on bcast channel");
+        let msg = rx_bcast
+            .recv()
+            .await
+            .expect("not msg received on bcast channel");
 
         assert!(matches!(
             msg,
@@ -749,7 +754,7 @@ mod tests {
         assert!(body.0.results.len() == 1);
 
         // no actual changes!
-        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(rx_bcast.try_recv(), Err(TryRecvError::Empty)));
 
         Ok(())
     }
@@ -768,7 +773,8 @@ mod tests {
             migrate(&mut conn)?;
         };
 
-        let (tx, _rx) = channel(1);
+        let (tx_bcast, _rx_bcast) = channel(1);
+        let (tx_apply, _rx_apply) = channel(1);
 
         let agent = Agent(Arc::new(corro_types::agent::AgentInner {
             actor_id: ActorId(Uuid::new_v4()),
@@ -789,7 +795,8 @@ mod tests {
             clock: Default::default(),
             bookie: Default::default(),
             subscribers: Default::default(),
-            tx_bcast: tx,
+            tx_bcast,
+            tx_apply,
             schema: Default::default(),
         }));
 

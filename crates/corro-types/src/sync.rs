@@ -91,6 +91,11 @@ pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             let read = booked.read();
             for (range, known) in read.iter() {
                 if let KnownDbVersion::Partial { seqs, last_seq, .. } = known {
+                    if seqs.gaps(&(0..=*last_seq)).count() == 0 {
+                        // soon to be processed, but we got it all
+                        continue;
+                    }
+
                     state
                         .partial_need
                         .entry(actor_id)

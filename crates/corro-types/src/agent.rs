@@ -38,6 +38,8 @@ pub struct AgentInner {
     pub bookie: Bookie,
     pub subscribers: Subscribers,
     pub tx_bcast: Sender<BroadcastInput>,
+    pub tx_apply: Sender<(ActorId, i64)>,
+
     pub schema: RwLock<NormalizedSchema>,
 }
 
@@ -71,6 +73,10 @@ impl Agent {
 
     pub fn tx_bcast(&self) -> &Sender<BroadcastInput> {
         &self.0.tx_bcast
+    }
+
+    pub fn tx_apply(&self) -> &Sender<(ActorId, i64)> {
+        &self.0.tx_apply
     }
 
     pub fn bookie(&self) -> &Bookie {
