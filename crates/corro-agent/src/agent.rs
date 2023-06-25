@@ -486,6 +486,22 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         }
     });
 
+    let mut last_compact_cleared = HashMap::new();
+
+    {
+        for (actor_id, booked) in agent.bookie().read().iter() {
+            let mut cleared = 0;
+            for (range, known) in booked.read().iter() {
+                if let KnownDbVersion::Cleared = known {
+                    cleared += (range.end() - range.start()) + 1;
+                }
+            }
+            last_compact_cleared.insert(*actor_id, cleared);
+        }
+    }
+
+    const COMPACT_CLEARED_THRESHOLD: i64 = 100;
+
     tokio::spawn({
         let self_actor_id = agent.actor_id();
         let rw_pool = agent.read_write_pool().clone();
@@ -508,6 +524,27 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                     let booked = bookie.for_actor(actor_id);
 
+                    let current_cleared: i64 = {
+                        booked
+                            .read()
+                            .iter()
+                            .filter_map(|(range, known)| match known {
+                                KnownDbVersion::Cleared => Some((range.end() - range.start()) + 1),
+                                _ => None,
+                            })
+                            .sum::<i64>()
+                    };
+
+                    if current_cleared
+                        - last_compact_cleared
+                            .get(&actor_id)
+                            .copied()
+                            .unwrap_or_default()
+                        < COMPACT_CLEARED_THRESHOLD
+                    {
+                        continue;
+                    }
+
                     // get a write lock so nothing else may handle changes while we do this
                     let mut bookedw = booked.write();
 
@@ -524,24 +561,18 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     };
 
                     let res = block_in_place(|| {
-                        match compact_booked_for_actor(&conn, site_id, &versions) {
+                        let to_clear = match compact_booked_for_actor(&conn, site_id, &versions) {
                             Ok(to_clear) => {
                                 if to_clear.is_empty() {
-                                    return Ok(());
+                                    return Ok(None);
                                 }
-                                let len = to_clear.len();
-                                for db_version in to_clear {
-                                    if let Some(version) = versions.get(&db_version) {
-                                        bookedw.insert(*version, KnownDbVersion::Cleared);
-                                    }
-                                }
-                                info!("compacted in-memory cache by clearing {len} db versions for actor {actor_id}");
+                                to_clear
                             }
                             Err(e) => {
                                 error!("could not compute difference between known live and still alive versions for actor {actor_id}: {e}");
-                                return Ok(());
+                                return Err(e);
                             }
-                        }
+                        };
 
                         let tx = conn.transaction()?;
 
@@ -573,11 +604,27 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         info!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
-                        Ok::<_, rusqlite::Error>(())
+                        Ok::<_, eyre::Report>(Some(to_clear))
                     });
 
-                    if let Err(e) = res {
-                        error!("could not compact versions for actor {actor_id}: {e}");
+                    match res {
+                        Ok(Some(to_clear)) => {
+                            let cleared_len = to_clear.len();
+                            let cleared = last_compact_cleared.entry(actor_id).or_default();
+                            for db_version in to_clear {
+                                if let Some(version) = versions.get(&db_version) {
+                                    bookedw.insert(*version, KnownDbVersion::Cleared);
+                                    *cleared += 1;
+                                }
+                            }
+                            info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}");
+                        }
+                        Ok(None) => {
+                            // nothing to clear
+                        }
+                        Err(e) => {
+                            error!("could not compact versions for actor {actor_id}: {e}");
+                        }
                     }
                 }
             }
