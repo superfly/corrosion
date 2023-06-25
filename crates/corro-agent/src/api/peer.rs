@@ -1,21 +1,17 @@
 use std::cmp;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::{
-    extract::{ConnectInfo, RawBody},
-    Extension,
-};
-use bytes::BytesMut;
+use axum::{extract::RawBody, Extension};
+use bytes::{Buf, BytesMut};
 use corro_types::agent::{Agent, KnownDbVersion};
-use corro_types::broadcast::{ChangeV1, Changeset};
+use corro_types::broadcast::{ChangeV1, Changeset, Message};
 use corro_types::sync::{SyncMessage, SyncMessageV1};
 use futures::StreamExt;
-use metrics::{counter, histogram};
+use metrics::{counter, histogram, increment_counter};
 use rusqlite::{params, Connection};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::block_in_place;
@@ -23,23 +19,20 @@ use tokio::time::timeout;
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, trace, warn};
 
-use crate::agent::handle_payload;
+use crate::agent::{handle_broadcast, PayloadKind};
 use crate::api::http::{row_to_change, ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
 
 use corro_types::{
     actor::ActorId,
     agent::{Booked, Bookie},
-    broadcast::{BroadcastSrc, FocaInput, Message},
     sqlite::SqlitePool,
 };
 
 #[allow(clippy::too_many_arguments)]
 pub async fn peer_api_v1_broadcast(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Extension(agent): Extension<Agent>,
-    Extension(gossip_msg_tx): Extension<Sender<Message>>,
-    Extension(foca_tx): Extension<Sender<FocaInput>>,
+    Extension(bcast_msg_tx): Extension<Sender<Message>>,
     RawBody(mut body): RawBody,
 ) -> impl IntoResponse {
     match headers.get("corro-clock") {
@@ -61,34 +54,43 @@ pub async fn peer_api_v1_broadcast(
     let mut codec = LengthDelimitedCodec::builder()
         .length_field_type::<u32>()
         .new_codec();
+
     let mut buf = BytesMut::new();
 
     let mut kind = None;
 
     loop {
         match body.next().await {
-            Some(Ok(bytes)) => {
-                kind = Some(
-                    match handle_payload(
-                        kind,
-                        BroadcastSrc::Http(addr),
-                        &mut buf,
-                        &mut codec,
-                        bytes,
-                        &foca_tx,
-                        agent.actor_id(),
-                        agent.bookie(),
-                        &gossip_msg_tx,
-                    )
-                    .await
-                    {
-                        Ok(kind) => kind,
-                        Err(e) => {
-                            error!("error handling payload: {e}");
-                            return StatusCode::UNPROCESSABLE_ENTITY;
+            Some(Ok(mut bytes)) => {
+                match kind.get_or_insert_with(|| {
+                    PayloadKind::from_repr(bytes.get_u8()).map(|kind| {
+                        increment_counter!("corro.payload.recv.count", "kind" => kind.to_string());
+                        kind
+                    })
+                }) {
+                    None => {
+                        return StatusCode::UNPROCESSABLE_ENTITY;
+                    }
+                    // I'm not sure this can ever happen, I doubt it...
+                    Some(PayloadKind::Swim) => {
+                        return StatusCode::BAD_REQUEST;
+                    }
+                    Some(PayloadKind::Broadcast | PayloadKind::PriorityBroadcast) => {
+                        buf.extend_from_slice(&bytes);
+
+                        if let Err(e) = handle_broadcast(
+                            &mut codec,
+                            &mut buf,
+                            agent.actor_id(),
+                            agent.bookie(),
+                            &bcast_msg_tx,
+                        )
+                        .await
+                        {
+                            error!("could not handle broadcast from HTTP: {e}");
                         }
-                    },
-                )
+                    }
+                }
             }
             Some(Err(e)) => {
                 error!("error reading bytes from gossip body: {e}");

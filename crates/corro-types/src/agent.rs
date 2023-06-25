@@ -273,13 +273,13 @@ impl Bookie {
 
     pub fn contains(
         &self,
-        actor_id: ActorId,
+        actor_id: &ActorId,
         version: i64,
         seqs: Option<&RangeInclusive<i64>>,
     ) -> bool {
         self.0
             .read()
-            .get(&actor_id)
+            .get(actor_id)
             .map(|booked| booked.contains(version, seqs))
             .unwrap_or(false)
     }

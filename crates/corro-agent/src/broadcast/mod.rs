@@ -158,6 +158,8 @@ pub fn runtime_loop(
 
                 match branch {
                     Branch::Tripped => {
+                        // collect all current states
+
                         let states: Vec<_> = {
                             let members = agent.0.members.read();
                             foca.iter_members()
@@ -181,6 +183,14 @@ pub fn runtime_loop(
                                 })
                                 .collect()
                         };
+
+                        // leave the cluster gracefully
+
+                        if let Err(e) = foca.leave_cluster(&mut runtime) {
+                            error!("could not leave cluster: {e}");
+                        }
+
+                        // write the states to the DB for a faster rejoin
 
                         {
                             match agent.read_write_pool().get().await {
@@ -227,9 +237,6 @@ pub fn runtime_loop(
                             }
                         }
 
-                        if let Err(e) = foca.leave_cluster(&mut runtime) {
-                            error!("could not leave cluster: {e}");
-                        }
                         break;
                     }
                     Branch::Foca(input) => match input {

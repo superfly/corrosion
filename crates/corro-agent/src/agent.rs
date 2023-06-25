@@ -22,7 +22,8 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, AgentInner, Booked, BookedVersions, Bookie, KnownDbVersion},
     broadcast::{
-        BroadcastInput, BroadcastSrc, ChangeV1, Changeset, FocaInput, Message, MessageV1, Timestamp,
+        BroadcastInput, BroadcastSrc, ChangeV1, Changeset, FocaInput, Message, MessageDecodeError,
+        MessageV1, Timestamp,
     },
     change::Change,
     config::{Config, DEFAULT_GOSSIP_PORT},
@@ -53,6 +54,7 @@ use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use spawn::spawn_counted;
+use strum::FromRepr;
 use tokio::{
     net::{TcpListener, UdpSocket},
     sync::mpsc::{channel, Receiver, Sender},
@@ -335,6 +337,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         tripwire.clone(),
     );
 
+    let (decode_tx, mut decode_rx) = channel(10240);
+
     let peer_api = Router::new()
         .route(
             "/v1/sync",
@@ -367,46 +371,69 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 .layer(Extension(foca_tx.clone()))
                 .layer(Extension(agent.clone()))
                 .layer(Extension(bcast_msg_tx.clone()))
+                .layer(Extension(decode_tx.clone()))
         )
         .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http());
 
+    // async message decoder task
+    tokio::spawn({
+        let bookie = agent.bookie().clone();
+        let self_actor_id = agent.actor_id();
+        async move {
+            let mut codec = LengthDelimitedCodec::builder()
+                .length_field_type::<u32>()
+                .new_codec();
+
+            while let Some(mut buf) = decode_rx.recv().await {
+                if let Err(e) =
+                    handle_broadcast(&mut codec, &mut buf, self_actor_id, &bookie, &bcast_msg_tx)
+                        .await
+                {
+                    error!("could not handle broadcast: {e}");
+                }
+            }
+
+            info!("Broadcast decode loop is done!");
+        }
+    });
+
     tokio::spawn({
         let foca_tx = foca_tx.clone();
         let socket = udp_gossip.clone();
-        let bookie = agent.bookie().clone();
         async move {
             let mut recv_buf = vec![0u8; FRAGMENTS_AT];
+
+            let mut databuf = BytesMut::new();
 
             loop {
                 match socket.recv_from(&mut recv_buf).await {
                     Ok((len, from_addr)) => {
                         trace!("udp received len: {len} from {from_addr}");
-                        let recv = recv_buf[..len].to_vec().into();
-                        let foca_tx = foca_tx.clone();
-                        let bookie = bookie.clone();
-                        let bcast_msg_tx = bcast_msg_tx.clone();
-                        tokio::spawn(async move {
-                            let mut codec = LengthDelimitedCodec::builder()
-                                .length_field_type::<u32>()
-                                .new_codec();
-                            let mut databuf = BytesMut::new();
-                            if let Err(e) = handle_payload(
-                                None,
-                                BroadcastSrc::Udp(from_addr),
-                                &mut databuf,
-                                &mut codec,
-                                recv,
-                                &foca_tx,
-                                actor_id,
-                                &bookie,
-                                &bcast_msg_tx,
-                            )
-                            .await
-                            {
-                                error!("could not handle UDP payload from '{from_addr}': {e}");
+                        let mut recv = &recv_buf[..len];
+
+                        let payload_byte = recv.get_u8();
+                        match PayloadKind::from_repr(payload_byte) {
+                            None => {
+                                warn!("received unknown payload kind (byte: {payload_byte})");
+                                continue;
                             }
-                        });
+                            Some(PayloadKind::Swim) => {
+                                if let Err(e) = foca_tx.try_send(FocaInput::Data(
+                                    Bytes::copy_from_slice(recv),
+                                    BroadcastSrc::Udp(from_addr),
+                                )) {
+                                    error!("could not send SWIM message to foca from UDP: {e}");
+                                }
+                            }
+                            Some(PayloadKind::Broadcast | PayloadKind::PriorityBroadcast) => {
+                                databuf.extend_from_slice(recv);
+
+                                if let Err(e) = decode_tx.try_send(databuf.split()) {
+                                    error!("could not send UDP broadcast message to decoder: {e}");
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         error!("error receiving on gossip udp socket: {e}");
@@ -804,6 +831,42 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     Ok(())
 }
 
+pub async fn handle_broadcast(
+    codec: &mut LengthDelimitedCodec,
+    buf: &mut BytesMut,
+    self_actor_id: ActorId,
+    bookie: &Bookie,
+    bcast_msg_tx: &Sender<Message>,
+) -> Result<(), MessageDecodeError> {
+    while let Some(msg) = Message::decode(codec, buf)? {
+        trace!("broadcast: {msg:?}");
+
+        match &msg {
+            Message::V1(MessageV1::Change {
+                actor_id,
+                version,
+                changeset,
+            }) => {
+                increment_counter!("corro.broadcast.recv.count", "kind" => "change");
+
+                if bookie.contains(actor_id, *version, changeset.seqs()) {
+                    trace!("already seen, stop disseminating");
+                    continue;
+                }
+
+                if *actor_id == self_actor_id {
+                    continue;
+                }
+            }
+        }
+
+        if let Err(e) = bcast_msg_tx.send(msg).await {
+            error!("could not send change message through broadcast channel: {e}");
+        }
+    }
+    Ok(())
+}
+
 fn compact_booked_for_actor(
     conn: &Connection,
     site_id: Option<[u8; 16]>,
@@ -1117,13 +1180,12 @@ async fn resolve_bootstrap(
     Ok(addrs)
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, FromRepr)]
+#[repr(u8)]
 pub enum PayloadKind {
-    Swim,
+    Swim = 0,
     Broadcast,
     PriorityBroadcast,
-
-    Unknown(u8),
 }
 
 impl fmt::Display for PayloadKind {
@@ -1132,118 +1194,8 @@ impl fmt::Display for PayloadKind {
             PayloadKind::Swim => write!(f, "swim"),
             PayloadKind::Broadcast => write!(f, "broadcast"),
             PayloadKind::PriorityBroadcast => write!(f, "priority-broadcast"),
-            PayloadKind::Unknown(b) => write!(f, "unknown({b})"),
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_payload(
-    mut kind: Option<PayloadKind>,
-    from: BroadcastSrc,
-    buf: &mut BytesMut,
-    codec: &mut LengthDelimitedCodec,
-    mut payload: Bytes,
-    foca_tx: &Sender<FocaInput>,
-    actor_id: ActorId,
-    bookie: &Bookie,
-    bcast_tx: &Sender<Message>,
-) -> eyre::Result<PayloadKind> {
-    let kind = kind.take().unwrap_or_else(|| {
-        let kind = match payload.get_u8() {
-            0 => PayloadKind::Swim,
-            1 => PayloadKind::Broadcast,
-            2 => PayloadKind::PriorityBroadcast,
-            n => PayloadKind::Unknown(n),
-        };
-        increment_counter!("corro.payload.recv.count", "kind" => kind.to_string());
-        kind
-    });
-
-    trace!("got payload kind: {kind:?}");
-
-    match kind {
-        // SWIM
-        PayloadKind::Swim => {
-            trace!("received SWIM gossip");
-            // And simply forward it to foca
-            _ = foca_tx.send(FocaInput::Data(payload, from)).await;
-        }
-        // broadcast!
-        PayloadKind::Broadcast | PayloadKind::PriorityBroadcast => {
-            trace!("received broadcast gossip");
-            // put it back in there...
-            buf.put_slice(payload.as_ref());
-            handle_broadcast(
-                buf, codec, actor_id, bookie,
-                // if kind == PayloadKind::PriorityBroadcast {
-                //     bcast_priority_tx
-                // } else {
-                bcast_tx, // },
-            )
-            .await?;
-        }
-        // unknown
-        PayloadKind::Unknown(n) => {
-            return Err(eyre::eyre!("unknown payload kind: {n}"));
-        }
-    }
-    Ok(kind)
-}
-
-pub async fn handle_broadcast(
-    buf: &mut BytesMut,
-    codec: &mut LengthDelimitedCodec,
-    self_actor_id: ActorId,
-    bookie: &Bookie,
-    bcast_tx: &Sender<Message>,
-) -> eyre::Result<()> {
-    histogram!("corro.broadcast.recv.bytes", buf.len() as f64);
-    loop {
-        // decode a length-delimited "frame"
-        match Message::decode(codec, buf) {
-            Ok(Some(msg)) => {
-                trace!("broadcast: {msg:?}");
-
-                match msg {
-                    Message::V1(MessageV1::Change {
-                        actor_id,
-                        version,
-                        changeset,
-                    }) => {
-                        increment_counter!("corro.broadcast.recv.count", "kind" => "operation");
-
-                        if bookie.contains(actor_id, version, changeset.seqs()) {
-                            trace!("already seen, stop disseminating");
-                            continue;
-                        }
-
-                        if actor_id != self_actor_id {
-                            bcast_tx
-                                .send(Message::V1(MessageV1::Change {
-                                    actor_id,
-                                    version,
-                                    changeset,
-                                }))
-                                .await
-                                .ok();
-                        }
-                    }
-                }
-            }
-            Ok(None) => {
-                break;
-            }
-            Err(e) => {
-                error!(
-                    "error decoding bytes from gossip body: {e} (len: {})",
-                    buf.len()
-                );
-                break;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn store_empty_changeset(
@@ -1403,7 +1355,7 @@ async fn process_single_version(
         changeset,
     } = change;
 
-    if bookie.contains(actor_id, version, changeset.seqs()) {
+    if bookie.contains(&actor_id, version, changeset.seqs()) {
         trace!(
             "already seen this one! from: {}, version: {version}",
             actor_id
@@ -2266,7 +2218,7 @@ pub mod tests {
 
         let req_body: Vec<Statement> = serde_json::from_value(json!(values))?;
 
-        let res = timeout(
+        timeout(
             Duration::from_secs(5),
             client.request(
                 hyper::Request::builder()
@@ -2278,17 +2230,12 @@ pub mod tests {
         )
         .await??;
 
-        let body: RqliteResponse =
-            serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
-
         let dbversion: i64 = ta1.agent.read_only_pool().get().await?.query_row(
             "SELECT crsql_dbversion();",
             (),
             |row| row.get(0),
         )?;
         assert_eq!(dbversion, 3);
-
-        println!("body: {body:?}");
 
         let expected_count: i64 = ta1.agent.read_only_pool().get().await?.query_row(
             "SELECT COUNT(*) FROM tests",

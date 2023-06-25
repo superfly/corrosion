@@ -217,6 +217,8 @@ pub enum MessageDecodeError {
     Corrupted(u32, u32),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error("insufficient length received to decode message: {0}")]
+    InsufficientLength(usize),
 }
 
 impl Message {
@@ -241,6 +243,10 @@ impl Message {
     pub fn from_buf(buf: &mut BytesMut) -> Result<Message, MessageDecodeError> {
         let len = buf.len();
         trace!("successfully decoded a frame, len: {len}");
+
+        if len < 4 {
+            return Err(MessageDecodeError::InsufficientLength(len));
+        }
 
         let mut crc_bytes = buf.split_off(len - 4);
 
