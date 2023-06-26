@@ -1,8 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
-    error::Error,
-    fmt, io,
+    fmt,
     net::SocketAddr,
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
@@ -21,8 +20,7 @@ use arc_swap::ArcSwap;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
-        Agent, AgentConfig, Booked, BookedVersions, Bookie, ChangeError, KnownDbVersion, PoolError,
-        SplitPool,
+        Agent, AgentConfig, Booked, BookedVersions, Bookie, ChangeError, KnownDbVersion, SplitPool,
     },
     broadcast::{
         BroadcastInput, BroadcastSrc, ChangeV1, Changeset, FocaInput, Message, MessageDecodeError,
@@ -34,11 +32,8 @@ use corro_types::{
     members::{MemberEvent, Members},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
     schema::{apply_schema, init_schema},
-    sqlite::{init_cr_conn, CrConn, CrConnManager, Migration, SqlitePool},
-    sync::{
-        generate_sync, SyncMessage, SyncMessageDecodeError, SyncMessageEncodeError, SyncMessageV1,
-        SyncStateV1,
-    },
+    sqlite::{init_cr_conn, CrConn, CrConnManager, Migration},
+    sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
 };
 
 use axum::{
@@ -49,7 +44,7 @@ use axum::{
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use foca::{Member, Notification};
-use futures::{FutureExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
@@ -65,7 +60,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tokio_util::{codec::LengthDelimitedCodec, io::StreamReader};
+use tokio_util::codec::LengthDelimitedCodec;
 use tower::{buffer::BufferLayer, limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
@@ -306,7 +301,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         bootstrap,
         mut tripwire,
         rx_bcast,
-        mut rx_apply,
+        rx_apply,
     } = opts;
     info!("Current Actor ID: {}", actor_id);
 

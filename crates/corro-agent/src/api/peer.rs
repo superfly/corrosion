@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::ops::RangeInclusive;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{cmp, io};
 
-use axum::body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{extract::RawBody, Extension};
@@ -14,9 +13,9 @@ use corro_types::broadcast::{ChangeV1, Changeset, Message};
 use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1,
 };
-use futures::stream::{FusedStream, FuturesOrdered, FuturesUnordered};
+use futures::stream::{FusedStream, FuturesOrdered};
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
-use metrics::{counter, histogram, increment_counter};
+use metrics::{counter, increment_counter};
 use rusqlite::{params, Connection};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::block_in_place;
@@ -31,7 +30,6 @@ use crate::api::http::{row_to_change, ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
 use corro_types::{
     actor::ActorId,
     agent::{Booked, Bookie},
-    sqlite::SqlitePool,
 };
 
 #[allow(clippy::too_many_arguments)]

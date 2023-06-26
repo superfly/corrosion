@@ -20,12 +20,12 @@ use metrics::{gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
-use strum::{EnumDiscriminants, EnumString};
+use strum::EnumDiscriminants;
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{channel, Receiver, Sender},
     task::block_in_place,
-    time::{interval, timeout, MissedTickBehavior},
+    time::{interval, MissedTickBehavior},
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
 use tracing::{debug, error, log::info, trace, warn};

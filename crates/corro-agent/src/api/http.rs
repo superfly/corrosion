@@ -4,14 +4,12 @@ use std::{
 };
 
 use axum::Extension;
-use bb8::RunError;
 use compact_str::{CompactString, ToCompactString};
 use corro_types::{
-    agent::{Agent, ChangeError, KnownDbVersion, PoolError, SplitPool},
+    agent::{Agent, ChangeError, KnownDbVersion, SplitPool},
     api::{QueryResultBuilder, RqliteResponse, RqliteResult, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     schema::{make_schema_inner, parse_sql},
-    sqlite::SqlitePool,
 };
 use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, Row, ToSql, Transaction};
@@ -623,8 +621,6 @@ pub async fn api_v1_db_schema(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use arc_swap::ArcSwap;
     use corro_types::{
         actor::ActorId,
