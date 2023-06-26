@@ -201,7 +201,7 @@ pub enum BackupError {
 }
 
 async fn handle_backup(agent: &Agent, path: String) -> Result<(), BackupError> {
-    let conn = agent.read_only_pool().get().await?;
+    let conn = agent.pool().read().await?;
     block_in_place(|| conn.execute("VACUUM INTO ?;", [&path]))?;
     Ok(())
 }

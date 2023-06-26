@@ -1,25 +1,31 @@
-use std::cmp;
 use std::collections::HashMap;
+use std::error::Error;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
+use std::{cmp, io};
 
+use axum::body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{extract::RawBody, Extension};
 use bytes::{Buf, BytesMut};
-use corro_types::agent::{Agent, KnownDbVersion};
+use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
 use corro_types::broadcast::{ChangeV1, Changeset, Message};
-use corro_types::sync::{SyncMessage, SyncMessageV1};
-use futures::StreamExt;
+use corro_types::sync::{
+    generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1,
+};
+use futures::stream::{FusedStream, FuturesOrdered, FuturesUnordered};
+use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use metrics::{counter, histogram, increment_counter};
 use rusqlite::{params, Connection};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::block_in_place;
 use tokio::time::timeout;
 use tokio_util::codec::LengthDelimitedCodec;
+use tokio_util::io::StreamReader;
 use tracing::{debug, error, trace, warn};
 
-use crate::agent::{handle_broadcast, PayloadKind};
+use crate::agent::{handle_broadcast, process_single_version, PayloadKind, SyncRecvError};
 use crate::api::http::{row_to_change, ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
 
 use corro_types::{
@@ -108,6 +114,14 @@ pub async fn peer_api_v1_broadcast(
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
     #[error(transparent)]
+    Send(#[from] SyncSendError),
+    #[error(transparent)]
+    Recv(#[from] SyncRecvError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncSendError {
+    #[error(transparent)]
     Rusqlite(#[from] rusqlite::Error),
 
     #[error("expected a column, there were none")]
@@ -130,26 +144,17 @@ pub enum SyncError {
 
     #[error("wrong ip byte len: {0}")]
     WrongIpByteLength(usize),
+
+    #[error("could not encode message: {0}")]
+    Encode(#[from] SyncMessageEncodeError),
+
+    #[error("sync send channel is closed")]
+    ChannelClosed,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("unknown accept header value '{0}'")]
 pub struct UnknownAcceptHeaderValue(String);
-
-fn send_msg(msg: SyncMessage, sender: &Sender<SyncMessage>) {
-    trace!("sending sync msg: {msg:?}");
-
-    // async send the data... not ideal but it'll have to do
-    // TODO: figure out a better way to backpressure here, maybe drop this range?
-    tokio::spawn({
-        let sender = sender.clone();
-        async move {
-            if let Err(e) = sender.send(msg).await {
-                error!("could not send sync message: {e}");
-            }
-        }
-    });
-}
 
 fn process_range(
     booked: &Booked,
@@ -216,15 +221,8 @@ fn process_version(
             while let Some(changes_seqs) = chunked.next() {
                 match changes_seqs {
                     Ok((changes, seqs)) => {
-                        // if changes.len() < 50 {
-                        //     debug!(
-                        //         "CURRENT CHANGE SENT SMALLER 50 changes batch ({}) for seqs: {seqs:?}!",
-                        //         changes.len()
-                        //     );
-                        // }
-
-                        send_msg(
-                            SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                        if let Err(_) = sender.blocking_send(SyncMessage::V1(
+                            SyncMessageV1::Changeset(ChangeV1 {
                                 actor_id,
                                 version,
                                 changeset: Changeset::Full {
@@ -233,9 +231,10 @@ fn process_version(
                                     last_seq: *last_seq,
                                     ts: *ts,
                                 },
-                            })),
-                            &sender,
-                        );
+                            }),
+                        )) {
+                            eyre::bail!("sync message sender channel is closed");
+                        }
                     }
                     Err(e) => {
                         error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
@@ -270,13 +269,8 @@ fn process_version(
                     while let Some(changes_seqs) = chunked.next() {
                         match changes_seqs {
                             Ok((changes, seqs)) => {
-                                // if changes.len() < 50 {
-                                //     debug!(
-                                //         "PARTIAL SENT SMALLER THAN 50 changes batch ({}) for seqs: {seqs:?}!", changes.len()
-                                //     );
-                                // }
-                                send_msg(
-                                    SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                                if let Err(_e) = sender.blocking_send(SyncMessage::V1(
+                                    SyncMessageV1::Changeset(ChangeV1 {
                                         actor_id,
                                         version,
                                         changeset: Changeset::Full {
@@ -285,9 +279,10 @@ fn process_version(
                                             last_seq: *last_seq,
                                             ts: *ts,
                                         },
-                                    })),
-                                    &sender,
-                                );
+                                    }),
+                                )) {
+                                    eyre::bail!("sync message sender channel is closed");
+                                }
                             }
                             Err(e) => {
                                 error!("could not process buffered crsql change (version: {version}) for broadcast: {e}");
@@ -299,14 +294,15 @@ fn process_version(
             }
         }
         KnownDbVersion::Cleared => {
-            send_msg(
-                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+            if let Err(_e) =
+                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     version,
                     changeset: Changeset::Empty,
-                })),
-                sender,
-            );
+                })))
+            {
+                eyre::bail!("sync message sender channel is closed");
+            }
         }
     }
 
@@ -317,17 +313,12 @@ fn process_version(
 
 async fn process_sync(
     local_actor_id: ActorId,
-    pool: &SqlitePool,
-    bookie: &Bookie,
-    sync: SyncMessage,
+    pool: SplitPool,
+    bookie: Bookie,
+    sync_state: SyncStateV1,
     sender: Sender<SyncMessage>,
 ) -> eyre::Result<()> {
-    let sync_state = match sync.state() {
-        Some(state) => state,
-        None => eyre::bail!("unexpected sync message: {sync:?}"),
-    };
-
-    let conn = pool.get().await?;
+    let conn = pool.read().await?;
 
     let bookie: HashMap<ActorId, Booked> =
         { bookie.read().iter().map(|(k, v)| (*k, v.clone())).collect() };
@@ -415,14 +406,41 @@ pub async fn peer_api_v1_sync_post(
         }
     }
 
-    let (mut sender, body) = hyper::body::Body::channel();
+    let (sender, body) = hyper::body::Body::channel();
+
+    let sync_state = generate_sync(agent.bookie(), agent.actor_id());
+
+    tokio::spawn(async move {
+        if let Err(e) = bidirectional_sync(&agent, sync_state, req_body, sender).await {
+            error!("error bidirectionally syncing: {e}");
+        }
+    });
+
+    hyper::Response::builder().body(body).unwrap()
+}
+
+// #[derive(Debug, Copy, Clone, Default)]
+// pub struct SyncSummary {
+//     send_count: usize,
+//     recv_count: usize,
+// }
+
+pub async fn bidirectional_sync(
+    agent: &Agent,
+    sync_state: SyncStateV1,
+    body_in: hyper::Body,
+    mut body_out: hyper::body::Sender,
+) -> Result<usize, SyncError> {
     let (tx, mut rx) = channel::<SyncMessage>(256);
 
     tokio::spawn(async move {
+        let mut codec = LengthDelimitedCodec::builder()
+            .length_field_type::<u32>()
+            .new_codec();
         let mut buf = BytesMut::new();
 
         while let Some(msg) = rx.recv().await {
-            if let Err(e) = msg.encode(&mut buf) {
+            if let Err(e) = msg.encode_w_codec(&mut codec, &mut buf) {
                 error!("could not encode message, skipping: {e}");
                 continue;
             }
@@ -431,7 +449,7 @@ pub async fn peer_api_v1_sync_post(
 
             match timeout(
                 Duration::from_secs(5),
-                sender.send_data(buf.split().freeze()),
+                body_out.send_data(buf.split().freeze()),
             )
             .await
             {
@@ -451,51 +469,105 @@ pub async fn peer_api_v1_sync_post(
         }
     });
 
-    tokio::spawn(async move {
-        let bytes = hyper::body::to_bytes(req_body).await?;
+    // send our sync state
 
-        let mut buf = BytesMut::with_capacity(bytes.len());
-        buf.extend_from_slice(&bytes);
+    tx.send(SyncMessage::V1(SyncMessageV1::State(sync_state)))
+        .await
+        .map_err(|_| SyncSendError::ChannelClosed)?;
 
-        let mut codec = LengthDelimitedCodec::builder()
-            .length_field_type::<u32>()
-            .new_codec();
-        let sync = SyncMessage::decode(&mut codec, &mut buf)?;
+    let body = StreamReader::new(body_in.map_err(|e| {
+        if let Some(io_error) = e
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+        {
+            return io::Error::from(io_error.kind());
+        }
+        io::Error::new(io::ErrorKind::Other, e)
+    }));
 
-        let sync = match sync {
-            Some(msg) => msg,
-            None => {
-                error!("no sync message to decode");
-                return Ok(());
+    let mut framed = LengthDelimitedCodec::builder()
+        .length_field_type::<u32>()
+        .new_read(body)
+        .inspect_ok(|b| counter!("corro.sync.chunk.recv.bytes", b.len() as u64));
+
+    if let Some(buf_res) = framed.next().await {
+        let mut buf = buf_res.map_err(SyncRecvError::from)?;
+        let msg = SyncMessage::from_buf(&mut buf).map_err(SyncRecvError::from)?;
+        if let SyncMessage::V1(SyncMessageV1::State(sync)) = msg {
+            tokio::spawn(
+                process_sync(
+                    agent.actor_id(),
+                    agent.pool().clone(),
+                    agent.bookie().clone(),
+                    sync,
+                    tx,
+                )
+                .inspect_err(|e| error!("could not process sync request: {e}")),
+            );
+        } else {
+            return Err(SyncRecvError::UnexpectedSyncMessage.into());
+        }
+    }
+
+    let mut count = 0;
+
+    let mut futs = FuturesOrdered::new();
+
+    loop {
+        enum Branch {
+            Framed(BytesMut),
+            Done(Option<SyncRecvError>),
+        }
+
+        let branch = tokio::select! {
+            biased;
+
+            maybe_buf_res = framed.next() => match maybe_buf_res {
+                None => Branch::Done(None),
+                Some(Ok(buf_res)) => Branch::Framed(buf_res),
+                Some(Err(e)) => Branch::Done(Some(SyncRecvError::from(e)))
+            },
+
+            maybe_res = futs.next(), if !futs.is_terminated() => match maybe_res {
+                Some(Err(e)) => return Err(SyncRecvError::from(e).into()),
+                _ => continue,
             }
         };
 
-        let now = Instant::now();
-        match process_sync(
-            agent.actor_id(),
-            agent.read_only_pool(),
-            agent.bookie(),
-            sync,
-            tx,
-        )
-        .await
-        {
-            Ok(_) => {
-                histogram!(
-                    "corro.sync.server.process.time.seconds",
-                    now.elapsed().as_secs_f64()
-                );
-            }
-            Err(e) => {
-                error!("could not process sync request: {e}");
+        let recv_error = match branch {
+            Branch::Framed(mut buf) => match SyncMessage::from_buf(&mut buf) {
+                Ok(msg) => {
+                    let len = match msg {
+                        SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
+                            let len = change.len();
+                            futs.push_back(async { process_single_version(agent, change).await });
+                            len
+                        }
+                        SyncMessage::V1(SyncMessageV1::State(_)) => {
+                            warn!("received sync state message more than once, ignoring");
+                            continue;
+                        }
+                    };
+                    count += len;
+                    continue;
+                }
+                Err(e) => Some(SyncRecvError::from(e)),
+            },
+            Branch::Done(e) => e,
+        };
+
+        while let Some(res) = futs.next().await {
+            if let Err(e) = res {
+                return Err(SyncRecvError::from(e).into());
             }
         }
 
-        Ok::<_, eyre::Report>(())
-    });
+        if let Some(e) = recv_error {
+            return Err(e.into());
+        }
 
-    hyper::Response::builder()
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .unwrap()
+        break;
+    }
+
+    Ok(count)
 }

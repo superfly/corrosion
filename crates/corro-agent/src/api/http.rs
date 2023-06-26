@@ -7,9 +7,9 @@ use axum::Extension;
 use bb8::RunError;
 use compact_str::{CompactString, ToCompactString};
 use corro_types::{
-    agent::{Agent, KnownDbVersion},
+    agent::{Agent, ChangeError, KnownDbVersion, PoolError, SplitPool},
     api::{QueryResultBuilder, RqliteResponse, RqliteResult, Statement},
-    broadcast::{Changeset, Timestamp},
+    broadcast::{ChangeV1, Changeset, Timestamp},
     schema::{make_schema_inner, parse_sql},
     sqlite::SqlitePool,
 };
@@ -37,16 +37,6 @@ pub const MAX_CHANGES_PER_MESSAGE: usize = 50;
 //     transaction: Option<bool>,
 //     q: Option<String>,
 // }
-
-#[derive(Debug, thiserror::Error)]
-pub enum ChangeError {
-    #[error("could not acquire pooled connection: {0}")]
-    ConnAcquisition(#[from] RunError<bb8_rusqlite::Error>),
-    #[error("rusqlite: {0}")]
-    Rusqlite(#[from] rusqlite::Error),
-    #[error("too many rows impacted")]
-    TooManyRowsImpacted,
-}
 
 pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
     Ok(Change {
@@ -147,7 +137,7 @@ where
     F: Fn(&Transaction) -> Result<T, ChangeError>,
 {
     trace!("getting conn...");
-    let mut conn = agent.read_write_pool().get().await?;
+    let mut conn = agent.pool().write_priority().await?;
     trace!("got conn");
 
     let actor_id = agent.actor_id();
@@ -220,7 +210,7 @@ where
             let agent = agent.clone();
 
             spawn_counted(async move {
-                let conn = agent.read_only_pool().get().await?;
+                let conn = agent.pool().read().await?;
 
                 block_in_place(|| {
                     let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?"#)?;
@@ -238,7 +228,7 @@ where
                                 tokio::spawn(async move {
                                     if let Err(e) = tx_bcast
                                         .send(BroadcastInput::AddBroadcast(Message::V1(
-                                            MessageV1::Change {
+                                            MessageV1::Change(ChangeV1 {
                                                 actor_id,
                                                 version,
                                                 changeset: Changeset::Full {
@@ -247,7 +237,7 @@ where
                                                     last_seq,
                                                     ts,
                                                 },
-                                            },
+                                            }),
                                         )))
                                         .await
                                     {
@@ -343,17 +333,6 @@ pub async fn api_v1_db_execute(
     let (results, elapsed) = match res {
         Ok(res) => res,
         Err(e) => match e {
-            ChangeError::TooManyRowsImpacted => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(RqliteResponse {
-                        results: vec![RqliteResult::Error {
-                            error: format!("too many changed columns, please restrict the number of statements per request to {}", agent.config().max_change_size),
-                        }],
-                        time: None,
-                    }),
-                );
-            }
             e => {
                 error!("could not execute statement(s): {e}");
                 return (
@@ -387,11 +366,11 @@ pub enum QueryError {
 }
 
 async fn query_statements(
-    pool: &SqlitePool,
+    pool: &SplitPool,
     statements: &[Statement],
     associative: bool,
 ) -> Result<Vec<RqliteResult>, QueryError> {
-    let conn = pool.get().await?;
+    let conn = pool.read().await?;
 
     let mut results = vec![];
 
@@ -536,7 +515,7 @@ pub async fn api_v1_db_query(
     }
 
     let start = Instant::now();
-    match query_statements(agent.read_only_pool(), &statements, false).await {
+    match query_statements(agent.pool(), &statements, false).await {
         Ok(results) => {
             let elapsed = start.elapsed();
             (
@@ -571,10 +550,10 @@ async fn execute_schema(agent: &Agent, statements: Vec<Statement>) -> eyre::Resu
 
     let partial_schema = parse_sql(&new_sql)?;
 
-    let mut conn = agent.read_write_pool().get().await?;
+    let mut conn = agent.pool().write_priority().await?;
 
     // hold onto this lock so nothing else makes changes
-    let mut schema_write = agent.0.schema.write();
+    let mut schema_write = agent.schema().write();
 
     let mut new_schema = schema_write.clone();
 
@@ -654,6 +633,7 @@ mod tests {
         sqlite::CrConnManager,
     };
     use tokio::sync::mpsc::{channel, error::TryRecvError};
+    use tripwire::Tripwire;
     use uuid::Uuid;
 
     use super::*;
@@ -663,6 +643,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn rqlite_db_execute() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
+
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
         let dir = tempfile::tempdir()?;
         let schema_path = dir.path().join("schema");
         tokio::fs::create_dir_all(&schema_path).await?;
@@ -682,7 +665,7 @@ mod tests {
         let (tx_bcast, mut rx_bcast) = channel(1);
         let (tx_apply, _rx_apply) = channel(1);
 
-        let agent = Agent(Arc::new(corro_types::agent::AgentInner {
+        let agent = Agent::new(corro_types::agent::AgentConfig {
             actor_id: ActorId(Uuid::new_v4()),
             ro_pool: bb8::Pool::builder()
                 .max_size(1)
@@ -705,7 +688,8 @@ mod tests {
             tx_bcast,
             tx_apply,
             schema: Default::default(),
-        }));
+            tripwire,
+        });
 
         let (status_code, body) = api_v1_db_execute(
             Extension(agent.clone()),
@@ -730,7 +714,10 @@ mod tests {
 
         assert!(matches!(
             msg,
-            BroadcastInput::AddBroadcast(Message::V1(MessageV1::Change { version: 1, .. }))
+            BroadcastInput::AddBroadcast(Message::V1(MessageV1::Change(ChangeV1 {
+                version: 1,
+                ..
+            })))
         ));
 
         assert_eq!(agent.bookie().last(&agent.actor_id()), Some(1));
@@ -762,6 +749,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_schema() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
         let dir = tempfile::tempdir()?;
 
         let rw_pool = bb8::Pool::builder()
@@ -776,7 +765,7 @@ mod tests {
         let (tx_bcast, _rx_bcast) = channel(1);
         let (tx_apply, _rx_apply) = channel(1);
 
-        let agent = Agent(Arc::new(corro_types::agent::AgentInner {
+        let agent = Agent::new(corro_types::agent::AgentConfig {
             actor_id: ActorId(Uuid::new_v4()),
             ro_pool: bb8::Pool::builder()
                 .max_size(1)
@@ -798,7 +787,8 @@ mod tests {
             tx_bcast,
             tx_apply,
             schema: Default::default(),
-        }));
+            tripwire,
+        });
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
@@ -810,7 +800,7 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
 
-        let schema = agent.0.schema.read();
+        let schema = agent.schema().read();
         let tests = schema
             .tables
             .get("tests")

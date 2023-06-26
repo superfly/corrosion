@@ -1,16 +1,26 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
-    ops::RangeInclusive,
+    ops::{Deref, DerefMut, RangeInclusive},
     sync::Arc,
 };
 
 use arc_swap::ArcSwap;
+use bb8::PooledConnection;
 use camino::Utf8PathBuf;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use tokio::{sync::mpsc::Sender, task::block_in_place};
-use tracing::warn;
+use spawn::spawn_counted;
+use tokio::{
+    sync::{
+        mpsc::{channel, Sender},
+        oneshot,
+    },
+    task::block_in_place,
+};
+use tokio_util::sync::{CancellationToken, DropGuard};
+use tracing::{error, warn};
+use tripwire::Tripwire;
 
 use crate::{
     actor::ActorId,
@@ -18,15 +28,15 @@ use crate::{
     config::Config,
     pubsub::Subscribers,
     schema::{apply_schema, NormalizedSchema, SchemaError},
-    sqlite::SqlitePool,
+    sqlite::{CrConnManager, SqlitePool},
 };
 
 use super::members::Members;
 
 #[derive(Clone)]
-pub struct Agent(pub Arc<AgentInner>);
+pub struct Agent(Arc<AgentInner>);
 
-pub struct AgentInner {
+pub struct AgentConfig {
     pub actor_id: ActorId,
     pub ro_pool: SqlitePool,
     pub rw_pool: SqlitePool,
@@ -41,16 +51,45 @@ pub struct AgentInner {
     pub tx_apply: Sender<(ActorId, i64)>,
 
     pub schema: RwLock<NormalizedSchema>,
+    pub tripwire: Tripwire,
+}
+
+pub struct AgentInner {
+    actor_id: ActorId,
+    pool: SplitPool,
+    config: ArcSwap<Config>,
+    gossip_addr: SocketAddr,
+    api_addr: SocketAddr,
+    members: RwLock<Members>,
+    clock: Arc<uhlc::HLC>,
+    bookie: Bookie,
+    subscribers: Subscribers,
+    tx_bcast: Sender<BroadcastInput>,
+    tx_apply: Sender<(ActorId, i64)>,
+    schema: RwLock<NormalizedSchema>,
 }
 
 impl Agent {
-    /// Return a borrowed [SqlitePool]
-    pub fn read_only_pool(&self) -> &SqlitePool {
-        &self.0.ro_pool
+    pub fn new(config: AgentConfig) -> Self {
+        Self(Arc::new(AgentInner {
+            actor_id: config.actor_id,
+            pool: SplitPool::new(config.ro_pool, config.rw_pool, config.tripwire),
+            config: config.config,
+            gossip_addr: config.gossip_addr,
+            api_addr: config.api_addr,
+            members: config.members,
+            clock: config.clock,
+            bookie: config.bookie,
+            subscribers: config.subscribers,
+            tx_bcast: config.tx_bcast,
+            tx_apply: config.tx_apply,
+            schema: config.schema,
+        }))
     }
 
-    pub fn read_write_pool(&self) -> &SqlitePool {
-        &self.0.rw_pool
+    /// Return a borrowed [SqlitePool]
+    pub fn pool(&self) -> &SplitPool {
+        &self.0.pool
     }
 
     pub fn actor_id(&self) -> ActorId {
@@ -83,6 +122,14 @@ impl Agent {
         &self.0.bookie
     }
 
+    pub fn members(&self) -> &RwLock<Members> {
+        &self.0.members
+    }
+
+    pub fn schema(&self) -> &RwLock<NormalizedSchema> {
+        &self.0.schema
+    }
+
     pub fn db_path(&self) -> Utf8PathBuf {
         self.0.config.load().db_path.clone()
     }
@@ -96,12 +143,148 @@ impl Agent {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SplitPool(Arc<SplitPoolInner>);
+
+#[derive(Debug)]
+struct SplitPoolInner {
+    read: SqlitePool,
+    write: SqlitePool,
+
+    priority_tx: Sender<oneshot::Sender<DropGuard>>,
+    normal_tx: Sender<oneshot::Sender<DropGuard>>,
+    low_tx: Sender<oneshot::Sender<DropGuard>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PoolError {
+    #[error(transparent)]
+    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    #[error("queue is closed")]
+    QueueClosed,
+    #[error("callback is closed")]
+    CallbackClosed,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ChangeError {
+    #[error("could not acquire pooled connection: {0}")]
+    Pool(#[from] PoolError),
+    #[error("rusqlite: {0}")]
+    Rusqlite(#[from] rusqlite::Error),
+}
+
+impl SplitPool {
+    pub fn new(read: SqlitePool, write: SqlitePool, mut tripwire: Tripwire) -> Self {
+        let (priority_tx, mut priority_rx) = channel(256);
+        let (normal_tx, mut normal_rx) = channel(512);
+        let (low_tx, mut low_rx) = channel(1024);
+
+        spawn_counted(async move {
+            loop {
+                let tx: oneshot::Sender<DropGuard> = tokio::select! {
+                    biased;
+
+                    _ = &mut tripwire => {
+                        break
+                    }
+
+                    Some(tx) = priority_rx.recv() => tx,
+                    Some(tx) = normal_rx.recv() => tx,
+                    Some(tx) = low_rx.recv() => tx,
+                };
+
+                wait_conn_drop(tx).await
+            }
+
+            // keep processing priority messages
+            // NOTE: not using recv because it'll wait indefinitely, this only waits until all
+            //       current conn requests are done
+            while let Ok(tx) = priority_rx.try_recv() {
+                wait_conn_drop(tx).await
+            }
+        });
+
+        Self(Arc::new(SplitPoolInner {
+            read,
+            write,
+            priority_tx,
+            normal_tx,
+            low_tx,
+        }))
+    }
+
+    // get a read-only connection
+    pub async fn read(
+        &self,
+    ) -> Result<PooledConnection<CrConnManager>, bb8::RunError<bb8_rusqlite::Error>> {
+        self.0.read.get().await
+    }
+
+    // get a high priority write connection (e.g. client input)
+    pub async fn write_priority(&self) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.priority_tx).await
+    }
+
+    // get a normal priority write connection (e.g. sync process)
+    pub async fn write_normal(&self) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.normal_tx).await
+    }
+
+    // get a low priority write connection (e.g. background tasks)
+    pub async fn write_low(&self) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.low_tx).await
+    }
+
+    async fn write_inner(
+        &self,
+        chan: &Sender<oneshot::Sender<DropGuard>>,
+    ) -> Result<WriteConn, PoolError> {
+        let (tx, rx) = oneshot::channel();
+        chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
+        let _drop_guard = rx.await.map_err(|_| PoolError::CallbackClosed)?;
+        let conn = self.0.write.get().await?;
+        Ok(WriteConn { conn, _drop_guard })
+    }
+}
+
+async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>) {
+    let cancel = CancellationToken::new();
+    let drop_guard = cancel.clone().drop_guard();
+
+    if let Err(_e) = tx.send(drop_guard) {
+        error!("could not send back drop guard for pooled conn, oneshot channel likely closed");
+        return;
+    }
+
+    cancel.cancelled().await
+}
+
+pub struct WriteConn<'a> {
+    conn: PooledConnection<'a, CrConnManager>,
+    _drop_guard: DropGuard,
+}
+
+impl<'a> Deref for WriteConn<'a> {
+    type Target = PooledConnection<'a, CrConnManager>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl<'a> DerefMut for WriteConn<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReloadError {
     #[error(transparent)]
     Schema(#[from] SchemaError),
     #[error(transparent)]
-    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    Pool(#[from] PoolError),
 }
 
 pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> {
@@ -126,7 +309,7 @@ pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> 
         warn!("reloaded ineffectual change: log_format");
     }
 
-    let mut conn = agent.read_write_pool().get().await?;
+    let mut conn = agent.pool().write_normal().await?;
     let mut schema_write = agent.0.schema.write();
 
     let new_schema =

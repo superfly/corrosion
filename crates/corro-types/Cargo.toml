@@ -30,6 +30,7 @@ rangemap = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+spawn = { path = "../spawn" }
 speedy = { workspace = true }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }
@@ -39,5 +40,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tripwire = { path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }

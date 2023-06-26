@@ -8,7 +8,6 @@ use std::{
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use foca::{Identity, Member, Notification, Runtime, Timer};
-
 use metrics::increment_counter;
 use rusqlite::{
     types::{FromSql, FromSqlError},
@@ -55,12 +54,7 @@ pub enum Message {
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum MessageV1 {
-    Change {
-        actor_id: ActorId,
-        // internal version
-        version: i64,
-        changeset: Changeset,
-    },
+    Change(ChangeV1),
 }
 
 #[derive(Debug, Clone, Readable, Writable)]

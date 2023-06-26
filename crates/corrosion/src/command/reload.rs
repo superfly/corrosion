@@ -73,7 +73,7 @@ mod tests {
             .iter()
             .any(|p| *p == new_path));
 
-        assert!(ta.agent.0.schema.read().tables.contains_key("blah"));
+        assert!(ta.agent.schema().read().tables.contains_key("blah"));
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
