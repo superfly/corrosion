@@ -475,22 +475,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         }
     });
 
-    let mut last_compact_cleared = HashMap::new();
-
-    {
-        for (actor_id, booked) in agent.bookie().read().iter() {
-            let mut cleared = 0;
-            for (range, known) in booked.read().iter() {
-                if let KnownDbVersion::Cleared = known {
-                    cleared += (range.end() - range.start()) + 1;
-                }
-            }
-            last_compact_cleared.insert(*actor_id, cleared);
-        }
-    }
-
-    info!("last_compact_cleared map: {last_compact_cleared:?}");
-
     const COMPACT_CLEARED_THRESHOLD: i64 = 100;
 
     tokio::spawn({
@@ -498,6 +482,22 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         let pool = agent.pool().clone();
         let bookie = agent.bookie().clone();
         async move {
+            let mut last_compact_cleared = HashMap::new();
+
+            {
+                for (actor_id, booked) in bookie.read().iter() {
+                    let mut cleared = 0;
+                    for (range, known) in booked.read().iter() {
+                        if let KnownDbVersion::Cleared = known {
+                            cleared += (range.end() - range.start()) + 1;
+                        }
+                    }
+                    last_compact_cleared.insert(*actor_id, cleared);
+                }
+            }
+
+            info!("last_compact_cleared map: {last_compact_cleared:?}");
+
             loop {
                 sleep(Duration::from_secs(300)).await;
 
@@ -526,13 +526,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             .sum::<i64>()
                     };
 
-                    if current_cleared
-                        - last_compact_cleared
-                            .get(&actor_id)
-                            .copied()
-                            .unwrap_or_default()
-                        < COMPACT_CLEARED_THRESHOLD
-                    {
+                    let last_cleared = last_compact_cleared
+                        .get(&actor_id)
+                        .copied()
+                        .unwrap_or_default();
+
+                    info!("comparing {actor_id} clears! {current_cleared} (current) - {last_cleared} (last) < {COMPACT_CLEARED_THRESHOLD} (threshold)");
+
+                    if current_cleared - last_cleared < COMPACT_CLEARED_THRESHOLD {
                         continue;
                     }
 
