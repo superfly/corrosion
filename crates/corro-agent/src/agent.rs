@@ -475,29 +475,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         }
     });
 
-    const COMPACT_CLEARED_THRESHOLD: i64 = 100;
-
     tokio::spawn({
         let self_actor_id = agent.actor_id();
         let pool = agent.pool().clone();
         let bookie = agent.bookie().clone();
         async move {
-            let mut last_compact_cleared = HashMap::new();
-
-            {
-                for (actor_id, booked) in bookie.read().iter() {
-                    let mut cleared = 0;
-                    for (range, known) in booked.read().iter() {
-                        if let KnownDbVersion::Cleared = known {
-                            cleared += (range.end() - range.start()) + 1;
-                        }
-                    }
-                    last_compact_cleared.insert(*actor_id, cleared);
-                }
-            }
-
-            info!("last_compact_cleared map: {last_compact_cleared:?}");
-
             loop {
                 sleep(Duration::from_secs(300)).await;
 
@@ -515,36 +497,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                     let booked = bookie.for_actor(actor_id);
 
-                    let current_cleared: i64 = {
-                        booked
-                            .read()
-                            .iter()
-                            .filter_map(|(range, known)| match known {
-                                KnownDbVersion::Cleared => Some((range.end() - range.start()) + 1),
-                                _ => None,
-                            })
-                            .sum::<i64>()
-                    };
-
-                    let last_cleared = last_compact_cleared
-                        .get(&actor_id)
-                        .copied()
-                        .unwrap_or_default();
-
-                    info!("comparing {actor_id} clears! {current_cleared} (current) - {last_cleared} (last) < {COMPACT_CLEARED_THRESHOLD} (threshold)");
-
-                    if current_cleared - last_cleared < COMPACT_CLEARED_THRESHOLD {
-                        continue;
-                    }
-
                     // get a write lock so nothing else may handle changes while we do this
                     let mut bookedw = booked.write();
 
                     let versions = bookedw.current_versions();
-
-                    if versions.is_empty() {
-                        continue;
-                    }
 
                     let site_id = if actor_id == self_actor_id {
                         None
@@ -602,11 +558,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     match res {
                         Ok(Some(to_clear)) => {
                             let cleared_len = to_clear.len();
-                            let cleared = last_compact_cleared.entry(actor_id).or_default();
                             for db_version in to_clear {
                                 if let Some(version) = versions.get(&db_version) {
                                     bookedw.insert(*version, KnownDbVersion::Cleared);
-                                    *cleared += 1;
                                 }
                             }
                             info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}");
@@ -838,15 +792,8 @@ fn compact_booked_for_actor(
     versions: &BTreeMap<i64, i64>,
 ) -> eyre::Result<HashSet<i64>> {
     // TODO: optimize that in a single query once cr-sqlite supports aggregation
-    conn.prepare_cached("CREATE TEMP TABLE __temp_count_lookup AS SELECT db_version, site_id FROM crsql_changes WHERE site_id IS ? AND db_version >= ? AND db_version <= ?;")?.execute(params![site_id, versions.first_key_value().map(|(v, _db_v)| *v), versions.last_key_value().map(|(v, _db_v)| *v)])?;
 
-    let still_live: HashSet<i64> = conn
-        .prepare_cached("SELECT db_version, count(*) FROM __temp_count_lookup GROUP BY db_version")?
-        .query_map((), |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-
-    conn.prepare_cached("DROP TABLE __temp_count_lookup;")?
-        .execute(())?;
+    let still_live: HashSet<i64> = conn.prepare_cached("SELECT DISTINCT(db_version) FROM crsql_changes WHERE site_id IS ? AND db_version >= ? AND db_version <= ?;")?.query_map(params![site_id, versions.first_key_value().map(|(db_v, _v)| *db_v), versions.last_key_value().map(|(db_v, _v)| *db_v)], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
 
     let keys: HashSet<i64> = versions.keys().copied().collect();
 
