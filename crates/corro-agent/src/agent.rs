@@ -2463,7 +2463,7 @@ pub mod tests {
 
         let changes = conn
                     .prepare_cached(
-                        r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes"#,
+                        r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes ORDER BY db_version, seq ASC"#,
                     )?
                     .query_map([], |row| {
                         Ok(Change {

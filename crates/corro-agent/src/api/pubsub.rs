@@ -435,7 +435,7 @@ async fn catch_up_subscriber(
     let conn = agent.pool().read().await?;
 
     block_in_place(|| {
-        let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM crsql_changes WHERE db_version >= ?"#)?;
+        let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM crsql_changes WHERE db_version >= ? ORDER BY db_version, seq ASC"#)?;
 
         let mut rows = prepped.query(params![from_db_version])?;
 
