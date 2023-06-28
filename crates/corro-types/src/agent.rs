@@ -12,6 +12,7 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use spawn::spawn_counted;
 use tokio::{
+    runtime::Handle,
     sync::{
         mpsc::{channel, Sender},
         oneshot,
@@ -221,6 +222,13 @@ impl SplitPool {
         self.0.read.get().await
     }
 
+    pub fn read_blocking(
+        &self,
+    ) -> Result<PooledConnection<CrConnManager>, bb8::RunError<bb8_rusqlite::Error>> {
+        let pool = self.0.read.clone();
+        Handle::current().block_on(async move { pool.get_owned().await })
+    }
+
     // get a high priority write connection (e.g. client input)
     pub async fn write_priority(&self) -> Result<WriteConn, PoolError> {
         self.write_inner(&self.0.priority_tx).await
@@ -236,6 +244,11 @@ impl SplitPool {
         self.write_inner(&self.0.low_tx).await
     }
 
+    pub fn write_low_blocking(&self) -> Result<WriteConn<'static>, PoolError> {
+        let this = self.clone();
+        Handle::current().block_on(async move { this.write_inner_owned(&this.0.low_tx).await })
+    }
+
     async fn write_inner(
         &self,
         chan: &Sender<oneshot::Sender<DropGuard>>,
@@ -244,6 +257,17 @@ impl SplitPool {
         chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
         let _drop_guard = rx.await.map_err(|_| PoolError::CallbackClosed)?;
         let conn = self.0.write.get().await?;
+        Ok(WriteConn { conn, _drop_guard })
+    }
+
+    async fn write_inner_owned(
+        &self,
+        chan: &Sender<oneshot::Sender<DropGuard>>,
+    ) -> Result<WriteConn<'static>, PoolError> {
+        let (tx, rx) = oneshot::channel();
+        chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
+        let _drop_guard = rx.await.map_err(|_| PoolError::CallbackClosed)?;
+        let conn = self.0.write.get_owned().await?;
         Ok(WriteConn { conn, _drop_guard })
     }
 }

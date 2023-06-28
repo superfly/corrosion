@@ -486,15 +486,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
 
                 for actor_id in to_check {
-                    // we need to acquire this first, annoyingly
-                    let mut conn = match pool.write_low().await {
-                        Ok(conn) => conn,
-                        Err(e) => {
-                            error!("could not checkout pooled conn for compacting in-memory actor versions: {e}");
-                            continue;
-                        }
-                    };
-
                     let booked = bookie.for_actor(actor_id);
 
                     // get a write lock so nothing else may handle changes while we do this
@@ -509,19 +500,23 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     };
 
                     let res = block_in_place(|| {
-                        let to_clear = match compact_booked_for_actor(&conn, site_id, &versions) {
-                            Ok(to_clear) => {
-                                if to_clear.is_empty() {
-                                    return Ok(None);
+                        let to_clear = {
+                            let conn = pool.read_blocking()?;
+                            match compact_booked_for_actor(&conn, site_id, &versions) {
+                                Ok(to_clear) => {
+                                    if to_clear.is_empty() {
+                                        return Ok(None);
+                                    }
+                                    to_clear
                                 }
-                                to_clear
-                            }
-                            Err(e) => {
-                                error!("could not compute difference between known live and still alive versions for actor {actor_id}: {e}");
-                                return Err(e);
+                                Err(e) => {
+                                    error!("could not compute difference between known live and still alive versions for actor {actor_id}: {e}");
+                                    return Err(e);
+                                }
                             }
                         };
 
+                        let mut conn = pool.write_low_blocking()?;
                         let tx = conn.transaction()?;
 
                         let deleted = tx
