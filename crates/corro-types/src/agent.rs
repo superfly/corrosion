@@ -329,7 +329,7 @@ pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> 
     if old_conf.bootstrap != new_conf.bootstrap {
         warn!("reloaded ineffectual change: bootstrap");
     }
-    if old_conf.log_format != new_conf.log_format {
+    if old_conf.log != new_conf.log {
         warn!("reloaded ineffectual change: log_format");
     }
 

@@ -124,21 +124,21 @@ pub fn runtime_loop(
             loop {
                 let branch = tokio::select! {
                     biased;
-                    input = rx_foca.recv() => match input {
-                        Some(input) => {
-                            Branch::Foca(input)
-                        },
-                        None => {
-                            warn!("no more foca inputs");
-                            break;
-                        }
-                    },
                     timer = timer_rx.recv() => match timer {
                         Some(timer) => {
                             Branch::HandleTimer(timer)
                         },
                         None => {
                             warn!("no more foca timers, breaking");
+                            break;
+                        }
+                    },
+                    input = rx_foca.recv() => match input {
+                        Some(input) => {
+                            Branch::Foca(input)
+                        },
+                        None => {
+                            warn!("no more foca inputs");
                             break;
                         }
                     },

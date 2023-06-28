@@ -9,5 +9,9 @@ metrics_addr = "0.0.0.0:9090"
 
 bootstrap = ["corrosion2.internal:8787"]
 
-# log_format = "json"
 schema_paths = ["/app/schemas"]
+
+[log]
+colors = false
+
+# log_format = "json"

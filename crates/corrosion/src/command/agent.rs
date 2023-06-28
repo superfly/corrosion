@@ -34,9 +34,10 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
 
     let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
 
-    match config.log_format {
+    match config.log.format {
         LogFormat::Plaintext => {
-            sub.with(tracing_subscriber::fmt::Layer::new()).init();
+            sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
+                .init();
         }
         LogFormat::Json => {
             sub.with(tracing_subscriber::fmt::Layer::new().json())
