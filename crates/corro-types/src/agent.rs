@@ -225,8 +225,7 @@ impl SplitPool {
     pub fn read_blocking(
         &self,
     ) -> Result<PooledConnection<CrConnManager>, bb8::RunError<bb8_rusqlite::Error>> {
-        let pool = self.0.read.clone();
-        Handle::current().block_on(async move { pool.get_owned().await })
+        Handle::current().block_on(self.0.read.get_owned())
     }
 
     // get a high priority write connection (e.g. client input)
@@ -245,8 +244,7 @@ impl SplitPool {
     }
 
     pub fn write_low_blocking(&self) -> Result<WriteConn<'static>, PoolError> {
-        let this = self.clone();
-        Handle::current().block_on(async move { this.write_inner_owned(&this.0.low_tx).await })
+        Handle::current().block_on(self.write_inner_owned(&self.0.low_tx))
     }
 
     async fn write_inner(
@@ -397,8 +395,8 @@ impl Booked {
         self.0.read().iter().map(|(k, _v)| *k.end()).max()
     }
 
-    pub fn read(&self) -> RwLockReadGuard<BookedVersions> {
-        self.0.read()
+    pub fn read(&self) -> BookReader {
+        BookReader(self.0.read())
     }
 
     pub fn write(&self) -> BookWriter {
@@ -406,11 +404,42 @@ impl Booked {
     }
 }
 
+pub struct BookReader<'a>(RwLockReadGuard<'a, BookedVersions>);
+
+impl<'a> BookReader<'a> {
+    pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
+        match seqs {
+            Some(check_seqs) => match self.0.get(&version) {
+                Some(known) => match known {
+                    KnownDbVersion::Partial { seqs, .. } => {
+                        check_seqs.clone().all(|seq| seqs.contains(&seq))
+                    }
+                    KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
+                },
+                None => false,
+            },
+            None => self.0.contains_key(&version),
+        }
+    }
+}
+
+impl<'a> Deref for BookReader<'a> {
+    type Target = RwLockReadGuard<'a, BookedVersions>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub struct BookWriter<'a>(RwLockWriteGuard<'a, BookedVersions>);
 
 impl<'a> BookWriter<'a> {
     pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
-        self.0.insert(version..=version, known_version);
+        self.insert_many(version..=version, known_version);
+    }
+
+    pub fn insert_many(&mut self, versions: RangeInclusive<i64>, known_version: KnownDbVersion) {
+        self.0.insert(versions, known_version);
     }
 
     pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
@@ -426,6 +455,14 @@ impl<'a> BookWriter<'a> {
             },
             None => self.0.contains_key(&version),
         }
+    }
+
+    pub fn contains_all(
+        &self,
+        mut versions: RangeInclusive<i64>,
+        seqs: Option<&RangeInclusive<i64>>,
+    ) -> bool {
+        versions.all(|version| self.contains(version, seqs))
     }
 
     pub fn last(&self) -> Option<i64> {
@@ -481,13 +518,16 @@ impl Bookie {
     pub fn contains(
         &self,
         actor_id: &ActorId,
-        version: i64,
+        mut versions: RangeInclusive<i64>,
         seqs: Option<&RangeInclusive<i64>>,
     ) -> bool {
         self.0
             .read()
             .get(actor_id)
-            .map(|booked| booked.contains(version, seqs))
+            .map(|booked| {
+                let read = booked.read();
+                versions.all(|v| read.contains(v, seqs))
+            })
             .unwrap_or(false)
     }
 

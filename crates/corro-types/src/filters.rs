@@ -864,7 +864,7 @@ mod tests {
 
     #[test]
     fn unquoting() {
-        let pk = "'hell|hell'|1.2345|NULL|'world'|X'010203'|123456";
+        let pk = "'hell|hell'|1.2345|NULL|'world'|X'010203'|123456|'some''string'";
 
         assert_eq!(
             dbg!(split_pk(pk)),
@@ -875,6 +875,7 @@ mod tests {
                 SqliteValue::Text("world".into()),
                 SqliteValue::Blob(vec![1, 2, 3]),
                 SqliteValue::Integer(123456),
+                SqliteValue::Text("some'string".into()),
             ],
         );
 

@@ -82,13 +82,14 @@ pub fn runtime_loop(
     let mut runtime: DispatchRuntime<Actor> =
         DispatchRuntime::new(to_send_tx, to_schedule_tx, notifications_tx);
 
-    let (timer_tx, mut timer_rx) = channel(1);
+    let (timer_tx, mut timer_rx) = channel(10);
     tokio::spawn(async move {
         while let Some((duration, timer)) = to_schedule_rx.recv().await {
             let timer_tx = timer_tx.clone();
+            let seq = Instant::now();
             tokio::spawn(async move {
                 tokio::time::sleep(duration).await;
-                timer_tx.send(timer).await.ok();
+                timer_tx.send((timer, seq)).await.ok();
             });
         }
     });
@@ -112,7 +113,7 @@ pub fn runtime_loop(
             #[strum_discriminants(derive(strum::IntoStaticStr))]
             enum Branch {
                 Foca(FocaInput),
-                HandleTimer(Timer<Actor>),
+                HandleTimer(Timer<Actor>, Instant),
                 MemberEvents(Vec<Result<MemberEvent, BroadcastStreamRecvError>>),
                 Metrics,
                 Tripped,
@@ -125,8 +126,8 @@ pub fn runtime_loop(
                 let branch = tokio::select! {
                     biased;
                     timer = timer_rx.recv() => match timer {
-                        Some(timer) => {
-                            Branch::HandleTimer(timer)
+                        Some((timer, seq)) => {
+                            Branch::HandleTimer(timer, seq)
                         },
                         None => {
                             warn!("no more foca timers, breaking");
@@ -359,9 +360,21 @@ pub fn runtime_loop(
                             }
                         });
                     }
-                    Branch::HandleTimer(timer) => {
-                        if let Err(e) = foca.handle_timer(timer, &mut runtime) {
-                            error!("foca: error handling timer: {e}");
+                    Branch::HandleTimer(timer, seq) => {
+                        let mut v = vec![(timer, seq)];
+
+                        // drain the channel, in case there's a race among timers
+                        while let Ok((timer, seq)) = timer_rx.try_recv() {
+                            v.push((timer, seq));
+                        }
+
+                        // sort by instant these were scheduled
+                        v.sort_by(|a, b| a.1.cmp(&b.1));
+
+                        for (timer, _) in v {
+                            if let Err(e) = foca.handle_timer(timer, &mut runtime) {
+                                error!("foca: error handling timer: {e}");
+                            }
                         }
                     }
                     Branch::Metrics => {

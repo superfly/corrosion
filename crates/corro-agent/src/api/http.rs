@@ -228,8 +228,8 @@ where
                                         .send(BroadcastInput::AddBroadcast(Message::V1(
                                             MessageV1::Change(ChangeV1 {
                                                 actor_id,
-                                                version,
                                                 changeset: Changeset::Full {
+                                                    version,
                                                     changes,
                                                     seqs,
                                                     last_seq,
@@ -711,7 +711,7 @@ mod tests {
         assert!(matches!(
             msg,
             BroadcastInput::AddBroadcast(Message::V1(MessageV1::Change(ChangeV1 {
-                version: 1,
+                changeset: Changeset::Full { version: 1, .. },
                 ..
             })))
         ));

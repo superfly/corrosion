@@ -1,6 +1,7 @@
 app = "corrosion2"
 
-# [env]
+[env]
+RUST_BACKTRACE="1"
 # RUST_LOG="info,foca=debug"
 
 [mounts]

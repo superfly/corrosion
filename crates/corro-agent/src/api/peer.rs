@@ -13,7 +13,7 @@ use corro_types::broadcast::{ChangeV1, Changeset, Message};
 use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1,
 };
-use futures::stream::{FusedStream, FuturesOrdered};
+use futures::stream::{FusedStream, FuturesUnordered};
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use metrics::{counter, increment_counter};
 use rusqlite::{params, Connection};
@@ -175,6 +175,14 @@ fn process_range(
 
     for (versions, known_version) in overlapping {
         block_in_place(|| {
+            if let KnownDbVersion::Cleared = &known_version {
+                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty { versions },
+                })))?;
+                return Ok(());
+            }
+
             for version in versions {
                 process_version(
                     &conn,
@@ -222,8 +230,8 @@ fn process_version(
                         if let Err(_) = sender.blocking_send(SyncMessage::V1(
                             SyncMessageV1::Changeset(ChangeV1 {
                                 actor_id,
-                                version,
                                 changeset: Changeset::Full {
+                                    version,
                                     changes,
                                     seqs,
                                     last_seq: *last_seq,
@@ -270,8 +278,8 @@ fn process_version(
                                 if let Err(_e) = sender.blocking_send(SyncMessage::V1(
                                     SyncMessageV1::Changeset(ChangeV1 {
                                         actor_id,
-                                        version,
                                         changeset: Changeset::Full {
+                                            version,
                                             changes,
                                             seqs,
                                             last_seq: *last_seq,
@@ -291,16 +299,8 @@ fn process_version(
                 }
             }
         }
-        KnownDbVersion::Cleared => {
-            if let Err(_e) =
-                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
-                    version,
-                    changeset: Changeset::Empty,
-                })))
-            {
-                eyre::bail!("sync message sender channel is closed");
-            }
+        _ => {
+            warn!("not supposed to happen");
         }
     }
 
@@ -423,6 +423,8 @@ pub async fn peer_api_v1_sync_post(
 //     recv_count: usize,
 // }
 
+const MAX_BUFFERED_FUTS: usize = 100;
+
 pub async fn bidirectional_sync(
     agent: &Agent,
     sync_state: SyncStateV1,
@@ -509,7 +511,7 @@ pub async fn bidirectional_sync(
 
     let mut count = 0;
 
-    let mut futs = FuturesOrdered::new();
+    let mut futs = FuturesUnordered::new();
 
     loop {
         enum Branch {
@@ -538,7 +540,7 @@ pub async fn bidirectional_sync(
                     let len = match msg {
                         SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
                             let len = change.len();
-                            futs.push_back(async { process_single_version(agent, change).await });
+                            futs.push(async { process_single_version(agent, change).await });
                             len
                         }
                         SyncMessage::V1(SyncMessageV1::State(_)) => {
@@ -547,6 +549,15 @@ pub async fn bidirectional_sync(
                         }
                     };
                     count += len;
+
+                    if futs.len() >= MAX_BUFFERED_FUTS {
+                        // drain futures a bit...
+                        while let Some(res) = futs.next().await {
+                            if let Err(e) = res {
+                                return Err(SyncRecvError::from(e).into());
+                            }
+                        }
+                    }
                     continue;
                 }
                 Err(e) => Some(SyncRecvError::from(e)),

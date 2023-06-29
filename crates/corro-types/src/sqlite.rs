@@ -1,14 +1,14 @@
 use std::{
     ops::{Deref, DerefMut},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use bb8::ManageConnection;
-use bb8_rusqlite::RusqliteConnectionManager;
 use once_cell::sync::Lazy;
 use rusqlite::{Connection, OpenFlags, ToSql, Transaction};
 use tempfile::TempDir;
-use tracing::{error, trace};
+use tracing::{error, info, trace};
 
 pub type SqlitePool = bb8::Pool<CrConnManager>;
 pub type SqlitePoolError = bb8::RunError<bb8_rusqlite::Error>;
@@ -37,24 +37,49 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
     dir
 });
 
-pub struct CrConnManager(RusqliteConnectionManager);
+#[derive(Debug)]
+struct ConnectionOptions {
+    mode: OpenMode,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+enum OpenMode {
+    Plain,
+    WithFlags { flags: rusqlite::OpenFlags },
+}
+
+pub struct CrConnManager(Arc<ConnectionOptions>);
 
 impl CrConnManager {
     pub fn new<P>(path: P) -> Self
     where
         P: AsRef<Path>,
     {
-        Self(RusqliteConnectionManager::new(path))
+        Self(Arc::new(ConnectionOptions {
+            mode: OpenMode::Plain,
+            path: path.as_ref().into(),
+        }))
     }
 
     pub fn new_read_only<P>(path: P) -> Self
     where
         P: AsRef<Path>,
     {
-        Self(RusqliteConnectionManager::new_with_flags(
+        Self::new_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ))
+        )
+    }
+
+    pub fn new_with_flags<P>(path: P, flags: OpenFlags) -> Self
+    where
+        P: AsRef<Path>,
+    {
+        Self(Arc::new(ConnectionOptions {
+            mode: OpenMode::WithFlags { flags },
+            path: path.as_ref().into(),
+        }))
     }
 }
 
@@ -66,20 +91,62 @@ impl ManageConnection for CrConnManager {
 
     /// Attempts to create a new connection.
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        let mut conn = self.0.connect().await?;
+        let options = self.0.clone();
+
+        // Technically, we don't need to use spawn_blocking() here, but doing so
+        // means we won't inadvertantly block this task for any length of time,
+        // since rusqlite is inherently synchronous.
+        let mut conn = tokio::task::spawn_blocking(move || {
+            println!(
+                "({:?} {:?}) sqlite connect",
+                std::thread::current().id(),
+                std::thread::current().name()
+            );
+            match &options.mode {
+                OpenMode::Plain => rusqlite::Connection::open(&options.path),
+                OpenMode::WithFlags { flags } => {
+                    rusqlite::Connection::open_with_flags(&options.path, *flags)
+                }
+            }
+        })
+        .await??;
+
         init_cr_conn(&mut conn)?;
         Ok(CrConn(conn))
     }
-    /// Determines if the connection is still connected to the database.
-    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        self.0.is_valid(conn).await
+
+    async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        // println!(
+        //     "({:?} {:?}) id_valid called",
+        //     std::thread::current().id(),
+        //     std::thread::current().name()
+        // );
+        // // Matching bb8-postgres, we'll try to run a trivial query here. Using
+        // // block_in_place() gives better behaviour if the SQLite call blocks for
+        // // some reason, but means that we depend on the tokio multi-threaded
+        // // runtime being active. (We can't use spawn_blocking() here because
+        // // Connection isn't Sync.)
+        // tokio::task::block_in_place(|| {
+        //     println!(
+        //         "({:?} {:?}) id_valid inside block_in_place",
+        //         std::thread::current().id(),
+        //         std::thread::current().name()
+        //     );
+        //     conn.execute("SELECT 1", [])
+        // })?;
+        Ok(())
     }
-    /// Synchronously determine if the connection is no longer usable, if possible.
-    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
-        self.0.has_broken(conn)
+
+    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
+        // There's no real concept of a "broken" connection in SQLite: if the
+        // handle is still open, then we're good. (And we know the handle is
+        // still open, because Connection::close() consumes the Connection, in
+        // which case we're definitely not here.)
+        false
     }
 }
 
+#[derive(Debug)]
 pub struct CrConn(pub Connection);
 
 impl CrConn {

@@ -3,6 +3,7 @@ use std::{
     convert::Infallible,
     fmt,
     net::SocketAddr,
+    ops::RangeInclusive,
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
@@ -481,7 +482,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         let bookie = agent.bookie().clone();
         async move {
             loop {
-                sleep(Duration::from_secs(300)).await;
+                // FIXME: don't do this so often, only set it low for debugging purposes!
+                sleep(Duration::from_secs(30)).await;
+
+                info!("checking for compressable state");
 
                 let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
 
@@ -501,7 +505,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                     let res = block_in_place(|| {
                         let to_clear = {
+                            info!("getting read conn");
                             let conn = pool.read_blocking()?;
+                            info!("got read conn");
                             match compact_booked_for_actor(&conn, site_id, &versions) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
@@ -516,7 +522,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             }
                         };
 
+                        info!("getting write conn");
                         let mut conn = pool.write_low_blocking()?;
+                        info!("got write conn");
                         let tx = conn.transaction()?;
 
                         let deleted = tx
@@ -758,12 +766,11 @@ pub async fn handle_broadcast(
         match &msg {
             Message::V1(MessageV1::Change(ChangeV1 {
                 actor_id,
-                version,
                 changeset,
             })) => {
                 increment_counter!("corro.broadcast.recv.count", "kind" => "change");
 
-                if bookie.contains(actor_id, *version, changeset.seqs()) {
+                if bookie.contains(actor_id, changeset.versions(), changeset.seqs()) {
                     trace!("already seen, stop disseminating");
                     continue;
                 }
@@ -1108,28 +1115,33 @@ impl fmt::Display for PayloadKind {
 fn store_empty_changeset(
     tx: Transaction,
     actor_id: ActorId,
-    version: i64,
+    versions: RangeInclusive<i64>,
 ) -> Result<(), rusqlite::Error> {
     // TODO: make sure this makes sense
     tx.prepare_cached(
         "
-        INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, ts)
-            VALUES (?, ?, ?, ?)
+        INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, ts)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT (actor_id, start_version) DO NOTHING;
     ",
     )?
     .execute(params![
         actor_id,
-        version,
+        versions.start(),
+        versions.end(),
         rusqlite::types::Null,
         rusqlite::types::Null
     ])?;
 
-    tx.prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?
-        .execute(params![actor_id, version,])?;
+    for version in versions {
+        tx.prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?
+            .execute(params![actor_id, version,])?;
 
-    tx.prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?
+        tx.prepare_cached(
+            "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
+        )?
         .execute(params![actor_id, version,])?;
+    }
 
     tx.commit()?;
     return Ok(());
@@ -1258,21 +1270,21 @@ pub async fn process_single_version(
 
     let ChangeV1 {
         actor_id,
-        version,
         changeset,
     } = change;
 
-    if bookie.contains(&actor_id, version, changeset.seqs()) {
+    if bookie.contains(&actor_id, changeset.versions(), changeset.seqs()) {
         trace!(
-            "already seen this one! from: {}, version: {version}",
-            actor_id
+            "already seen these versions from: {actor_id}, version: {:?}",
+            changeset.versions()
         );
         return Ok(None);
     }
 
     trace!(
-        "received {} changes to process from: {actor_id}, version: {version}, seqs: {:?} (last_seq: {:?})",
+        "received {} changes to process from: {actor_id}, versions: {:?}, seqs: {:?} (last_seq: {:?})",
         changeset.len(),
+        changeset.versions(),
         changeset.seqs(),
         changeset.last_seq()
     );
@@ -1284,7 +1296,7 @@ pub async fn process_single_version(
         let mut booked_write = booked.write();
 
         // check again, might've changed since we acquired the lock
-        if booked_write.contains(version, changeset.seqs()) {
+        if booked_write.contains_all(changeset.versions(), changeset.seqs()) {
             trace!("previously unknown versions are now deemed known, aborting inserts");
             return Ok(None);
         }
@@ -1292,10 +1304,11 @@ pub async fn process_single_version(
         let (known_version, changeset, db_version) = block_in_place(move || {
             let tx = conn.transaction()?;
 
-            let (changes, seqs, last_seq, ts) = match changeset.into_parts() {
+            let versions = changeset.versions();
+            let (version, changes, seqs, last_seq, ts) = match changeset.into_parts() {
                 None => {
-                    store_empty_changeset(tx, actor_id, version)?;
-                    return Ok((KnownDbVersion::Cleared, Changeset::Empty, None));
+                    store_empty_changeset(tx, actor_id, versions.clone())?;
+                    return Ok((KnownDbVersion::Cleared, Changeset::Empty { versions }, None));
                 }
                 Some(parts) => parts,
             };
@@ -1398,6 +1411,7 @@ pub async fn process_single_version(
                         ts,
                     },
                     Changeset::Full {
+                        version,
                         changes,
                         seqs,
                         last_seq,
@@ -1450,7 +1464,7 @@ pub async fn process_single_version(
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
 
             let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
-                (KnownDbVersion::Cleared, Changeset::Empty, None)
+                (KnownDbVersion::Cleared, Changeset::Empty { versions }, None)
             } else {
                 (
                     KnownDbVersion::Current {
@@ -1459,6 +1473,7 @@ pub async fn process_single_version(
                         ts,
                     },
                     Changeset::Full {
+                        version,
                         changes: impactful_changeset,
                         seqs,
                         last_seq,
@@ -1473,7 +1488,7 @@ pub async fn process_single_version(
             Ok::<_, rusqlite::Error>((known_version, new_changeset, db_version))
         })?;
 
-        booked_write.insert(version, known_version);
+        booked_write.insert_many(changeset.versions(), known_version);
         (db_version, changeset)
     };
 
@@ -1487,13 +1502,12 @@ pub async fn process_single_version(
 async fn process_msg(agent: &Agent, msg: Message) -> Result<Option<Message>, ChangeError> {
     Ok(match msg {
         Message::V1(MessageV1::Change(change)) => {
-            let (actor_id, version) = (change.actor_id, change.version);
+            let actor_id = change.actor_id;
             let changeset = process_single_version(agent, change).await?;
 
             changeset.map(|changeset| {
                 Message::V1(MessageV1::Change(ChangeV1 {
                     actor_id,
-                    version,
                     changeset,
                 }))
             })
@@ -1892,7 +1906,7 @@ pub mod tests {
     use super::*;
 
     use corro_types::{
-        agent::reload,
+        agent::{reload, PoolError},
         api::{RqliteResponse, RqliteResult, Statement},
         change::SqliteValue,
         filters::{ChangeEvent, OwnedAggregateChange},
@@ -2825,4 +2839,136 @@ pub mod tests {
 
         Ok(())
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tokio_repro() {
+        // let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
+        // let dir = tempfile::tempdir().unwrap();
+        // let db_path = dir.path().join("test.db");
+        // let pool = bb8::Pool::builder()
+        //     .max_size(1)
+        //     .min_idle(Some(1))
+        //     .build(CrConnManager::new(&db_path))
+        //     .await
+        //     .expect("could not build write pool");
+        // let read_pool = bb8::Pool::builder().build_unchecked(CrConnManager::new(&db_path));
+
+        // let spool = SplitPool::new(read_pool, pool, tripwire);
+
+        // tokio::spawn({
+        //     let spool = spool.clone();
+        //     async move {
+        //         println!("acquiring first write conn");
+        //         let conn = spool
+        //             .write_normal()
+        //             .await
+        //             .expect("could not get normal priority write conn");
+        //         println!("acquired first write conn");
+        //         tokio::time::sleep(Duration::from_secs(5)).await;
+        //         println!("done with first conn");
+        //     }
+        // });
+
+        // // let (chan_tx, mut chan_rx) = tokio::sync::mpsc::channel(1024);
+
+        // tokio::spawn(async move {
+        //     tokio::time::sleep(Duration::from_secs(1)).await;
+        //     for _ in 0..100 {
+        //         tokio::task::block_in_place(|| {
+        //             {
+        //                 let _read = spool.read_blocking()?;
+        //                 println!("GOT READ");
+        //             }
+
+        //             let _write = spool.write_low_blocking()?;
+        //             println!("GOT WRITE!");
+
+        //             Ok::<_, PoolError>(())
+        //         })?;
+        //     }
+
+        //     Ok::<_, PoolError>(())
+        // })
+        // .await
+        // .expect("spawn problem")
+        // .unwrap();
+
+        // tokio::spawn(async move {
+        //     loop {
+        //         tokio::spawn(async move {
+        //             block_in_place(|| {
+        //                 if let Err(e) = tokio::runtime::Handle::current().block_on(async move {
+        //                     tokio::task::spawn_blocking(|| {
+        //                         std::thread::sleep(Duration::from_millis(1));
+        //                     })
+        //                     .await
+        //                 }) {
+        //                     error!("inner spawn failed: {e}");
+        //                 }
+        //             });
+        //         });
+        //         tokio::time::sleep(Duration::from_millis(2)).await;
+        //     }
+        // });
+
+        tokio::spawn(async move {
+            loop {
+                tokio::spawn(async move {
+                    block_in_place(|| {
+                        if let Err(e) = tokio::runtime::Handle::current().block_on(async move {
+                            tokio::task::spawn_blocking(|| {
+                                std::thread::sleep(Duration::from_millis(1));
+                            })
+                            .await
+                        }) {
+                            error!("inner spawn failed: {e}");
+                        }
+                        block_in_place(|| {
+                            std::thread::sleep(Duration::from_millis(1));
+                        })
+                    });
+                });
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                tokio::spawn(async move {
+                    block_in_place(|| {
+                        if let Err(e) = tokio::runtime::Handle::current().block_on(async move {
+                            tokio::task::spawn_blocking(|| {
+                                std::thread::sleep(Duration::from_millis(1));
+                            })
+                            .await
+                        }) {
+                            error!("inner spawn failed: {e}");
+                        }
+                        block_in_place(|| {
+                            std::thread::sleep(Duration::from_millis(1));
+                        })
+                    });
+                });
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        for _ in 0..1000 {
+            block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    tokio::task::spawn_blocking(|| {
+                        std::thread::sleep(Duration::from_millis(1));
+                    })
+                    .await
+                    .expect("inner spawn failed");
+                    block_in_place(|| {
+                        std::thread::sleep(Duration::from_millis(1));
+                    })
+                })
+            });
+        }
+    }
+
+    // async fn get_conn(chan: &tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<tokio_util::sync::DropGuard>>)
 }
