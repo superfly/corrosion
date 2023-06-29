@@ -8,7 +8,7 @@ use bb8::ManageConnection;
 use once_cell::sync::Lazy;
 use rusqlite::{Connection, OpenFlags, ToSql, Transaction};
 use tempfile::TempDir;
-use tracing::{error, info, trace};
+use tracing::{error, trace};
 
 pub type SqlitePool = bb8::Pool<CrConnManager>;
 pub type SqlitePoolError = bb8::RunError<bb8_rusqlite::Error>;
@@ -96,17 +96,10 @@ impl ManageConnection for CrConnManager {
         // Technically, we don't need to use spawn_blocking() here, but doing so
         // means we won't inadvertantly block this task for any length of time,
         // since rusqlite is inherently synchronous.
-        let mut conn = tokio::task::spawn_blocking(move || {
-            println!(
-                "({:?} {:?}) sqlite connect",
-                std::thread::current().id(),
-                std::thread::current().name()
-            );
-            match &options.mode {
-                OpenMode::Plain => rusqlite::Connection::open(&options.path),
-                OpenMode::WithFlags { flags } => {
-                    rusqlite::Connection::open_with_flags(&options.path, *flags)
-                }
+        let mut conn = tokio::task::spawn_blocking(move || match &options.mode {
+            OpenMode::Plain => rusqlite::Connection::open(&options.path),
+            OpenMode::WithFlags { flags } => {
+                rusqlite::Connection::open_with_flags(&options.path, *flags)
             }
         })
         .await??;

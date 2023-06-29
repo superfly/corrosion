@@ -505,9 +505,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                     let res = block_in_place(|| {
                         let to_clear = {
-                            info!("getting read conn");
                             let conn = pool.read_blocking()?;
-                            info!("got read conn");
                             match compact_booked_for_actor(&conn, site_id, &versions) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
@@ -522,9 +520,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             }
                         };
 
-                        info!("getting write conn");
                         let mut conn = pool.write_low_blocking()?;
-                        info!("got write conn");
                         let tx = conn.transaction()?;
 
                         let deleted = tx
@@ -1906,7 +1902,7 @@ pub mod tests {
     use super::*;
 
     use corro_types::{
-        agent::{reload, PoolError},
+        agent::reload,
         api::{RqliteResponse, RqliteResult, Statement},
         change::SqliteValue,
         filters::{ChangeEvent, OwnedAggregateChange},
