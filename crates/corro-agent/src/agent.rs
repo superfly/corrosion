@@ -482,7 +482,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         let bookie = agent.bookie().clone();
         async move {
             loop {
-                // FIXME: don't do this so often, only set it low for debugging purposes!
                 sleep(Duration::from_secs(300)).await;
 
                 let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
