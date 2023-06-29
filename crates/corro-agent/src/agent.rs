@@ -483,9 +483,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         async move {
             loop {
                 // FIXME: don't do this so often, only set it low for debugging purposes!
-                sleep(Duration::from_secs(30)).await;
-
-                info!("checking for compressable state");
+                sleep(Duration::from_secs(300)).await;
 
                 let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
 
