@@ -141,16 +141,26 @@ impl SyncMessage {
         Self::read_from_buffer(slice.as_ref())
     }
 
-    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), SyncMessageEncodeError> {
+    pub fn encode_w_codec(
+        &self,
+        codec: &mut LengthDelimitedCodec,
+        buf: &mut BytesMut,
+    ) -> Result<(), SyncMessageEncodeError> {
         self.write_to_stream(buf.writer())?;
         let mut bytes = buf.split();
         let hash = crc32fast::hash(&bytes);
         bytes.put_u32(hash);
 
+        codec.encode(bytes.split().freeze(), buf)?;
+
+        Ok(())
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), SyncMessageEncodeError> {
         let mut codec = LengthDelimitedCodec::builder()
             .length_field_type::<u32>()
             .new_codec();
-        codec.encode(bytes.split().freeze(), buf)?;
+        self.encode_w_codec(&mut codec, buf)?;
 
         Ok(())
     }

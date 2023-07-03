@@ -8,7 +8,6 @@ use std::{
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use foca::{Identity, Member, Notification, Runtime, Timer};
-
 use metrics::increment_counter;
 use rusqlite::{
     types::{FromSql, FromSqlError},
@@ -55,19 +54,14 @@ pub enum Message {
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum MessageV1 {
-    Change {
-        actor_id: ActorId,
-        // internal version
-        version: i64,
-        changeset: Changeset,
-    },
+    Change(ChangeV1),
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
     // internal version
-    pub version: i64,
+    // pub version: i64,
     pub changeset: Changeset,
 }
 
@@ -81,8 +75,11 @@ impl Deref for ChangeV1 {
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum Changeset {
-    Empty,
+    Empty {
+        versions: RangeInclusive<i64>,
+    },
     Full {
+        version: i64,
         changes: Vec<Change>,
         seqs: RangeInclusive<i64>,
         last_seq: i64,
@@ -91,57 +88,65 @@ pub enum Changeset {
 }
 
 impl Changeset {
+    pub fn versions(&self) -> RangeInclusive<i64> {
+        match self {
+            Changeset::Empty { versions } => versions.clone(),
+            Changeset::Full { version, .. } => *version..=*version,
+        }
+    }
+
     pub fn seqs(&self) -> Option<&RangeInclusive<i64>> {
         match self {
-            Changeset::Empty => None,
+            Changeset::Empty { .. } => None,
             Changeset::Full { seqs, .. } => Some(seqs),
         }
     }
 
     pub fn last_seq(&self) -> Option<i64> {
         match self {
-            Changeset::Empty => None,
+            Changeset::Empty { .. } => None,
             Changeset::Full { last_seq, .. } => Some(*last_seq),
         }
     }
 
     pub fn is_complete(&self) -> bool {
         match self {
-            Changeset::Empty => true,
+            Changeset::Empty { .. } => true,
             Changeset::Full { seqs, last_seq, .. } => *seqs.start() == 0 && seqs.end() == last_seq,
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
-            Changeset::Empty => 0,
+            Changeset::Empty { .. } => 0,
             Changeset::Full { changes, .. } => changes.len(),
         }
     }
 
     pub fn ts(&self) -> Option<Timestamp> {
         match self {
-            Changeset::Empty => None,
+            Changeset::Empty { .. } => None,
             Changeset::Full { ts, .. } => Some(*ts),
         }
     }
 
     pub fn changes(&self) -> &[Change] {
         match self {
-            Changeset::Empty => &[],
+            Changeset::Empty { .. } => &[],
             Changeset::Full { changes, .. } => &changes,
         }
     }
 
-    pub fn into_parts(self) -> Option<(Vec<Change>, RangeInclusive<i64>, i64, Timestamp)> {
+    pub fn into_parts(self) -> Option<(i64, Vec<Change>, RangeInclusive<i64>, i64, Timestamp)> {
         match self {
-            Changeset::Empty => None,
+            Changeset::Empty { .. } => None,
             Changeset::Full {
+                version,
                 changes,
                 seqs,
                 last_seq,
                 ts,
-            } => Some((changes, seqs, last_seq, ts)),
+            } => Some((version, changes, seqs, last_seq, ts)),
         }
     }
 }
@@ -217,6 +222,8 @@ pub enum MessageDecodeError {
     Corrupted(u32, u32),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error("insufficient length received to decode message: {0}")]
+    InsufficientLength(usize),
 }
 
 impl Message {
@@ -241,6 +248,10 @@ impl Message {
     pub fn from_buf(buf: &mut BytesMut) -> Result<Message, MessageDecodeError> {
         let len = buf.len();
         trace!("successfully decoded a frame, len: {len}");
+
+        if len < 4 {
+            return Err(MessageDecodeError::InsufficientLength(len));
+        }
 
         let mut crc_bytes = buf.split_off(len - 4);
 

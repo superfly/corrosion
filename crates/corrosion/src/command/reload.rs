@@ -1,14 +1,13 @@
-use std::path::Path;
+use std::{net::SocketAddr, path::Path};
 
-use corro_admin::Command;
+use corro_client::CorrosionApiClient;
 use tracing::info;
 
-use crate::admin::AdminConn;
+pub async fn run<P: AsRef<Path>>(api_addr: SocketAddr, schema_paths: &[P]) -> eyre::Result<()> {
+    let client = CorrosionApiClient::new(api_addr);
 
-pub async fn run<P: AsRef<Path>>(admin_path: P) -> eyre::Result<()> {
-    let mut conn = AdminConn::connect(admin_path).await?;
-    conn.send_command(Command::Reload).await?;
-    info!("Successfully reloaded Corrosion!");
+    client.schema_from_paths(schema_paths).await?;
+    info!("Successfully reloaded Corrosion's schema from paths!");
     Ok(())
 }
 
@@ -16,8 +15,6 @@ pub async fn run<P: AsRef<Path>>(admin_path: P) -> eyre::Result<()> {
 mod tests {
     use super::*;
 
-    use camino::Utf8PathBuf;
-    use corro_admin::AdminConfig;
     use corro_tests::launch_test_agent;
     use spawn::wait_for_all_pending_handles;
     use tripwire::Tripwire;
@@ -28,24 +25,10 @@ mod tests {
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
         let ta = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
-        let config_path: Utf8PathBuf = ta
-            .tmpdir
-            .path()
-            .join("config.toml")
-            .display()
-            .to_string()
-            .into();
-
-        let agent = ta.agent.clone();
-        let listen_path = agent.config().admin_path.clone();
-        corro_admin::start_server(
-            agent,
-            AdminConfig {
-                listen_path,
-                config_path: config_path.clone(),
-            },
-            tripwire,
-        )?;
+        let client = corro_client::CorrosionApiClient::new(ta.agent.api_addr());
+        client
+            .schema_from_paths(&ta.agent.config().schema_paths)
+            .await?;
 
         let mut conf = ta.agent.config().as_ref().clone();
         let new_path = ta.tmpdir.path().join("schema2");
@@ -60,20 +43,11 @@ mod tests {
         conf.schema_paths
             .push(new_path.display().to_string().into());
 
-        let conf_bytes = toml::to_vec(&conf)?;
+        println!("conf: {conf:?}");
 
-        tokio::fs::write(&config_path, conf_bytes).await?;
+        run(ta.agent.api_addr(), &conf.schema_paths).await?;
 
-        run(&ta.agent.config().admin_path).await?;
-
-        assert!(ta
-            .agent
-            .config()
-            .schema_paths
-            .iter()
-            .any(|p| *p == new_path));
-
-        assert!(ta.agent.0.schema.read().tables.contains_key("blah"));
+        assert!(ta.agent.schema().read().tables.contains_key("blah"));
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;

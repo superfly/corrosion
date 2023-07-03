@@ -1,12 +1,7 @@
 use std::{fmt::Display, time::Duration};
 
 use camino::Utf8PathBuf;
-use corro_types::{
-    agent::{reload, Agent},
-    config::Config,
-    sqlite::SqlitePoolError,
-    sync::generate_sync,
-};
+use corro_types::{agent::Agent, sqlite::SqlitePoolError, sync::generate_sync};
 use futures::{SinkExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
@@ -81,7 +76,6 @@ pub fn start_server(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
-    Reload,
     Backup { path: String },
     Sync(SyncCommand),
 }
@@ -136,7 +130,7 @@ type FramedStream = Framed<
 
 async fn handle_conn(
     agent: Agent,
-    config: AdminConfig,
+    _config: AdminConfig,
     stream: UnixStream,
 ) -> Result<(), AdminError> {
     // wrap in stream in line delimited json decoder
@@ -148,27 +142,17 @@ async fn handle_conn(
     loop {
         match stream.try_next().await {
             Ok(Some(cmd)) => match cmd {
-                Command::Reload => match Config::load(config.config_path.as_str()) {
-                    Ok(conf) => {
-                        info_log(&mut stream, "Reloading...").await;
-                        if let Err(e) = reload(&agent, conf).await {
-                            send_error(&mut stream, e).await;
-                            continue;
+                Command::Backup { path } => {
+                    info_log(&mut stream, "Starting backup procedure...").await;
+                    match handle_backup(&agent, path).await {
+                        Ok(_) => {
+                            send_success(&mut stream).await;
                         }
-                        send(&mut stream, Response::Success).await;
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                        }
                     }
-                    Err(e) => {
-                        send_error(&mut stream, e).await;
-                    }
-                },
-                Command::Backup { path } => match handle_backup(&agent, path).await {
-                    Ok(_) => {
-                        send_success(&mut stream).await;
-                    }
-                    Err(e) => {
-                        send_error(&mut stream, e).await;
-                    }
-                },
+                }
                 Command::Sync(SyncCommand::Generate) => {
                     let sync_state = generate_sync(agent.bookie(), agent.actor_id());
                     match serde_json::to_value(&sync_state) {
@@ -201,7 +185,7 @@ pub enum BackupError {
 }
 
 async fn handle_backup(agent: &Agent, path: String) -> Result<(), BackupError> {
-    let conn = agent.read_only_pool().get().await?;
+    let conn = agent.pool().read().await?;
     block_in_place(|| conn.execute("VACUUM INTO ?;", [&path]))?;
     Ok(())
 }

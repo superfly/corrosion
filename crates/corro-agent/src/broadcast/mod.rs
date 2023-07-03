@@ -20,10 +20,11 @@ use metrics::{gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
+use strum::EnumDiscriminants;
 use tokio::{
     net::UdpSocket,
-    sync::mpsc::{channel, Receiver, Sender},
-    task::block_in_place,
+    sync::mpsc::{self, channel, Receiver, Sender},
+    task::{block_in_place, LocalSet},
     time::{interval, MissedTickBehavior},
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
@@ -48,6 +49,55 @@ pub const EFFECTIVE_HTTP_BROADCAST_SIZE: usize = HTTP_BROADCAST_SIZE - 1;
 const BIG_PAYLOAD_THRESHOLD: usize = 32 * 1024;
 
 pub type ClientPool = hyper::Client<HttpConnector, hyper::Body>;
+
+#[derive(Clone)]
+struct TimerSpawner {
+    send: mpsc::UnboundedSender<(Duration, Timer<Actor>)>,
+}
+
+impl TimerSpawner {
+    pub fn new(timer_tx: mpsc::Sender<(Timer<Actor>, Instant)>) -> Self {
+        let (send, mut recv) = mpsc::unbounded_channel();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        std::thread::spawn({
+            let timer_tx = timer_tx.clone();
+            move || {
+                let local = LocalSet::new();
+
+                local.spawn_local(async move {
+                    while let Some((duration, timer)) = recv.recv().await {
+                        let seq = Instant::now() + duration;
+
+                        let timer_tx = timer_tx.clone();
+                        tokio::task::spawn_local(async move {
+                            tokio::time::sleep(duration).await;
+                            timer_tx.send((timer, seq)).await.ok();
+                        });
+                    }
+                    // If the while loop returns, then all the LocalSpawner
+                    // objects have been dropped.
+                });
+
+                // This will return once all senders are dropped and all
+                // spawned tasks have returned.
+                rt.block_on(local);
+            }
+        });
+
+        Self { send }
+    }
+
+    pub fn spawn(&self, task: (Duration, Timer<Actor>)) {
+        self.send
+            .send(task)
+            .expect("Thread with LocalSet has shut down.");
+    }
+}
 
 pub fn runtime_loop(
     actor: Actor,
@@ -81,17 +131,17 @@ pub fn runtime_loop(
     let mut runtime: DispatchRuntime<Actor> =
         DispatchRuntime::new(to_send_tx, to_schedule_tx, notifications_tx);
 
-    let (timer_tx, mut timer_rx) = channel(1);
+    let (timer_tx, mut timer_rx) = channel(10);
+    let timer_spawner = TimerSpawner::new(timer_tx);
+
     tokio::spawn(async move {
         while let Some((duration, timer)) = to_schedule_rx.recv().await {
-            let timer_tx = timer_tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
-                timer_tx.send(timer).await.ok();
-            });
+            timer_spawner.spawn((duration, timer));
         }
     });
 
+    // foca SWIM operations loop.
+    // NOTE: every turn of that loop should be fast or else we risk being suspected of being down
     tokio::spawn({
         let config = config.clone();
         let agent = agent.clone();
@@ -105,9 +155,11 @@ pub fn runtime_loop(
                     .chunks_timeout(100, Duration::from_secs(30));
             tokio::pin!(member_events_chunks);
 
+            #[derive(EnumDiscriminants)]
+            #[strum_discriminants(derive(strum::IntoStaticStr))]
             enum Branch {
                 Foca(FocaInput),
-                HandleTimer(Timer<Actor>),
+                HandleTimer(Timer<Actor>, Instant),
                 MemberEvents(Vec<Result<MemberEvent, BroadcastStreamRecvError>>),
                 Metrics,
                 Tripped,
@@ -119,21 +171,21 @@ pub fn runtime_loop(
             loop {
                 let branch = tokio::select! {
                     biased;
+                    timer = timer_rx.recv() => match timer {
+                        Some((timer, seq)) => {
+                            Branch::HandleTimer(timer, seq)
+                        },
+                        None => {
+                            warn!("no more foca timers, breaking");
+                            break;
+                        }
+                    },
                     input = rx_foca.recv() => match input {
                         Some(input) => {
                             Branch::Foca(input)
                         },
                         None => {
                             warn!("no more foca inputs");
-                            break;
-                        }
-                    },
-                    timer = timer_rx.recv() => match timer {
-                        Some(timer) => {
-                            Branch::HandleTimer(timer)
-                        },
-                        None => {
-                            warn!("no more foca timers, breaking");
                             break;
                         }
                     },
@@ -156,10 +208,15 @@ pub fn runtime_loop(
                     },
                 };
 
+                let start = Instant::now();
+                let discriminant = BranchDiscriminants::from(&branch);
+
                 match branch {
                     Branch::Tripped => {
+                        // collect all current states
+
                         let states: Vec<_> = {
-                            let members = agent.0.members.read();
+                            let members = agent.members().read();
                             foca.iter_members()
                                 .filter_map(|member| {
                                     members.get(&member.id().id()).and_then(|state| {
@@ -182,8 +239,16 @@ pub fn runtime_loop(
                                 .collect()
                         };
 
+                        // leave the cluster gracefully
+
+                        if let Err(e) = foca.leave_cluster(&mut runtime) {
+                            error!("could not leave cluster: {e}");
+                        }
+
+                        // write the states to the DB for a faster rejoin
+
                         {
-                            match agent.read_write_pool().get().await {
+                            match agent.pool().write_priority().await {
                                 Ok(mut conn) => block_in_place(|| match conn.transaction() {
                                     Ok(tx) => {
                                         for (id, address, state, foca_state) in states {
@@ -227,9 +292,6 @@ pub fn runtime_loop(
                             }
                         }
 
-                        if let Err(e) = foca.leave_cluster(&mut runtime) {
-                            error!("could not leave cluster: {e}");
-                        }
                         break;
                     }
                     Branch::Foca(input) => match input {
@@ -298,52 +360,67 @@ pub fn runtime_loop(
                             })
                             .collect();
 
-                        let mut conn = match agent.read_write_pool().get().await {
-                            Ok(conn) => conn,
-                            Err(e) => {
+                        let pool = agent.pool().clone();
+                        tokio::spawn(async move {
+                            let mut conn = match pool.write_low().await {
+                                Ok(conn) => conn,
+                                Err(e) => {
+                                    error!(
+                                        "could not acquire a r/w conn to process member events: {e}"
+                                    );
+                                    return;
+                                }
+                            };
+
+                            let res = block_in_place(|| {
+                                let tx = conn.transaction()?;
+
+                                for (id, address, state, foca_state) in splitted {
+                                    tx.prepare_cached(
+                                        "
+                                            INSERT INTO __corro_members (id, address, state, foca_state)
+                                                VALUES (?, ?, ?, ?)
+                                            ON CONFLICT (id) DO UPDATE SET
+                                                address = excluded.address,
+                                                state = excluded.state,
+                                                foca_state = excluded.foca_state;
+                                        ",
+                                    )?
+                                    .execute(params![
+                                        id,
+                                        address.to_string(),
+                                        state,
+                                        foca_state
+                                    ])?;
+                                }
+
+                                tx.commit()?;
+
+                                Ok::<_, rusqlite::Error>(())
+                            });
+
+                            if let Err(e) = res {
                                 error!(
-                                    "could not acquire a r/w conn to process member events: {e}"
+                                    "could not insert state changes from SWIM cluster into sqlite: {e}"
                                 );
-                                continue;
                             }
-                        };
-
-                        let res = block_in_place(|| {
-                            let tx = conn.transaction()?;
-
-                            for (id, address, state, foca_state) in splitted {
-                                tx.prepare_cached(
-                                    "
-                                        INSERT INTO __corro_members (id, address, state, foca_state)
-                                            VALUES (?, ?, ?, ?)
-                                        ON CONFLICT (id) DO UPDATE SET
-                                            address = excluded.address,
-                                            state = excluded.state,
-                                            foca_state = excluded.foca_state;
-                                    ",
-                                )?
-                                .execute(params![
-                                    id,
-                                    address.to_string(),
-                                    state,
-                                    foca_state
-                                ])?;
-                            }
-
-                            tx.commit()?;
-
-                            Ok::<_, rusqlite::Error>(())
                         });
-
-                        if let Err(e) = res {
-                            error!(
-                                "could not insert state changes from SWIM cluster into sqlite: {e}"
-                            );
-                        }
                     }
-                    Branch::HandleTimer(timer) => {
-                        if let Err(e) = foca.handle_timer(timer, &mut runtime) {
-                            error!("foca: error handling timer: {e}");
+                    Branch::HandleTimer(timer, seq) => {
+                        let mut v = vec![(timer, seq)];
+
+                        // drain the channel, in case there's a race among timers
+                        while let Ok((timer, seq)) = timer_rx.try_recv() {
+                            v.push((timer, seq));
+                        }
+
+                        // sort by instant these were scheduled
+                        v.sort_by(|a, b| a.1.cmp(&b.1));
+
+                        for (timer, _) in v {
+                            if let Err(e) = foca.handle_timer(timer, &mut runtime) {
+                                error!("foca: error handling timer: {e}");
+                            }
                         }
                     }
                     Branch::Metrics => {
@@ -367,6 +444,12 @@ pub fn runtime_loop(
                         }
                         gauge!("corro.gossip.cluster_size", last_cluster_size.get() as f64);
                     }
+                }
+
+                let elapsed = start.elapsed();
+                if elapsed > Duration::from_secs(1) {
+                    let to_s: &'static str = discriminant.into();
+                    warn!("took {elapsed:?} to execute branch: {to_s}");
                 }
             }
 
@@ -581,8 +664,7 @@ pub fn runtime_loop(
                 trace!("{} to broadcast: {pending:?}", actor_id);
                 let broadcast_to = {
                     agent
-                        .0
-                        .members
+                        .members()
                         .read()
                         .states
                         .iter()

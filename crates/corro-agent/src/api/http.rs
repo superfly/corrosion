@@ -4,14 +4,12 @@ use std::{
 };
 
 use axum::Extension;
-use bb8::RunError;
 use compact_str::{CompactString, ToCompactString};
 use corro_types::{
-    agent::{Agent, KnownDbVersion},
+    agent::{Agent, ChangeError, KnownDbVersion, SplitPool},
     api::{QueryResultBuilder, RqliteResponse, RqliteResult, Statement},
-    broadcast::{Changeset, Timestamp},
+    broadcast::{ChangeV1, Changeset, Timestamp},
     schema::{make_schema_inner, parse_sql},
-    sqlite::SqlitePool,
 };
 use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, Row, ToSql, Transaction};
@@ -37,16 +35,6 @@ pub const MAX_CHANGES_PER_MESSAGE: usize = 50;
 //     transaction: Option<bool>,
 //     q: Option<String>,
 // }
-
-#[derive(Debug, thiserror::Error)]
-pub enum ChangeError {
-    #[error("could not acquire pooled connection: {0}")]
-    ConnAcquisition(#[from] RunError<bb8_rusqlite::Error>),
-    #[error("rusqlite: {0}")]
-    Rusqlite(#[from] rusqlite::Error),
-    #[error("too many rows impacted")]
-    TooManyRowsImpacted,
-}
 
 pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
     Ok(Change {
@@ -147,7 +135,7 @@ where
     F: Fn(&Transaction) -> Result<T, ChangeError>,
 {
     trace!("getting conn...");
-    let mut conn = agent.read_write_pool().get().await?;
+    let mut conn = agent.pool().write_priority().await?;
     trace!("got conn");
 
     let actor_id = agent.actor_id();
@@ -220,10 +208,10 @@ where
             let agent = agent.clone();
 
             spawn_counted(async move {
-                let conn = agent.read_only_pool().get().await?;
+                let conn = agent.pool().read().await?;
 
                 block_in_place(|| {
-                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?"#)?;
+                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#)?;
                     let rows = prepped.query_map([db_version], row_to_change)?;
                     let mut chunked =
                         ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_PER_MESSAGE);
@@ -238,16 +226,16 @@ where
                                 tokio::spawn(async move {
                                     if let Err(e) = tx_bcast
                                         .send(BroadcastInput::AddBroadcast(Message::V1(
-                                            MessageV1::Change {
+                                            MessageV1::Change(ChangeV1 {
                                                 actor_id,
-                                                version,
                                                 changeset: Changeset::Full {
+                                                    version,
                                                     changes,
                                                     seqs,
                                                     last_seq,
                                                     ts,
                                                 },
-                                            },
+                                            }),
                                         )))
                                         .await
                                     {
@@ -343,17 +331,6 @@ pub async fn api_v1_db_execute(
     let (results, elapsed) = match res {
         Ok(res) => res,
         Err(e) => match e {
-            ChangeError::TooManyRowsImpacted => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(RqliteResponse {
-                        results: vec![RqliteResult::Error {
-                            error: format!("too many changed columns, please restrict the number of statements per request to {}", agent.config().max_change_size),
-                        }],
-                        time: None,
-                    }),
-                );
-            }
             e => {
                 error!("could not execute statement(s): {e}");
                 return (
@@ -387,11 +364,11 @@ pub enum QueryError {
 }
 
 async fn query_statements(
-    pool: &SqlitePool,
+    pool: &SplitPool,
     statements: &[Statement],
     associative: bool,
 ) -> Result<Vec<RqliteResult>, QueryError> {
-    let conn = pool.get().await?;
+    let conn = pool.read().await?;
 
     let mut results = vec![];
 
@@ -536,7 +513,7 @@ pub async fn api_v1_db_query(
     }
 
     let start = Instant::now();
-    match query_statements(agent.read_only_pool(), &statements, false).await {
+    match query_statements(agent.pool(), &statements, false).await {
         Ok(results) => {
             let elapsed = start.elapsed();
             (
@@ -559,28 +536,25 @@ pub async fn api_v1_db_query(
     }
 }
 
-async fn execute_schema(agent: &Agent, statements: Vec<Statement>) -> eyre::Result<()> {
-    let new_sql: String = statements
-        .into_iter()
-        .map(|stmt| match stmt {
-            Statement::Simple(s) => Ok(s),
-            _ => eyre::bail!("only simple statements are supported"),
-        })
-        .collect::<Result<Vec<_>, eyre::Report>>()?
-        .join(";");
+async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
+    let new_sql: String = statements.join(";");
 
     let partial_schema = parse_sql(&new_sql)?;
 
-    let mut conn = agent.read_write_pool().get().await?;
+    let mut conn = agent.pool().write_priority().await?;
 
     // hold onto this lock so nothing else makes changes
-    let mut schema_write = agent.0.schema.write();
+    let mut schema_write = agent.schema().write();
 
-    let mut new_schema = schema_write.clone();
-
-    for (name, def) in partial_schema.tables.iter() {
-        new_schema.tables.insert(name.clone(), def.clone());
-    }
+    // clone the previous schema and apply
+    let new_schema = {
+        let mut schema = schema_write.clone();
+        for (name, def) in partial_schema.tables.iter() {
+            // overwrite table because users are expected to return a full table def
+            schema.tables.insert(name.clone(), def.clone());
+        }
+        schema
+    };
 
     block_in_place(|| {
         let tx = conn.transaction()?;
@@ -606,7 +580,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<Statement>) -> eyre::Resu
 
 pub async fn api_v1_db_schema(
     Extension(agent): Extension<Agent>,
-    axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
+    axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
 ) -> (StatusCode, axum::Json<RqliteResponse>) {
     if statements.is_empty() {
         return (
@@ -619,6 +593,8 @@ pub async fn api_v1_db_schema(
             }),
         );
     }
+
+    let start = Instant::now();
 
     if let Err(e) = execute_schema(&agent, statements).await {
         error!("could not merge schemas: {e}");
@@ -637,23 +613,17 @@ pub async fn api_v1_db_schema(
         StatusCode::OK,
         axum::Json(RqliteResponse {
             results: vec![],
-            time: None,
+            time: Some(start.elapsed().as_secs_f64()),
         }),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use arc_swap::ArcSwap;
-    use corro_types::{
-        actor::ActorId,
-        config::Config,
-        schema::{apply_schema, NormalizedSchema, Type},
-        sqlite::CrConnManager,
-    };
+    use corro_types::{actor::ActorId, config::Config, schema::Type, sqlite::CrConnManager};
     use tokio::sync::mpsc::{channel, error::TryRecvError};
+    use tripwire::Tripwire;
     use uuid::Uuid;
 
     use super::*;
@@ -663,11 +633,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn rqlite_db_execute() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
-        let dir = tempfile::tempdir()?;
-        let schema_path = dir.path().join("schema");
-        tokio::fs::create_dir_all(&schema_path).await?;
 
-        tokio::fs::write(schema_path.join("test.sql"), corro_tests::TEST_SCHEMA).await?;
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
+        let dir = tempfile::tempdir()?;
 
         let rw_pool = bb8::Pool::builder()
             .max_size(1)
@@ -676,13 +645,12 @@ mod tests {
         {
             let mut conn = rw_pool.get().await?;
             migrate(&mut conn)?;
-            apply_schema(&mut conn, &[&schema_path], &NormalizedSchema::default())?;
         }
 
         let (tx_bcast, mut rx_bcast) = channel(1);
         let (tx_apply, _rx_apply) = channel(1);
 
-        let agent = Agent(Arc::new(corro_types::agent::AgentInner {
+        let agent = Agent::new(corro_types::agent::AgentConfig {
             actor_id: ActorId(Uuid::new_v4()),
             ro_pool: bb8::Pool::builder()
                 .max_size(1)
@@ -691,7 +659,6 @@ mod tests {
             config: ArcSwap::from_pointee(
                 Config::builder()
                     .db_path(dir.path().join("corrosion.db").display().to_string())
-                    .add_schema_path(schema_path.display().to_string())
                     .gossip_addr("127.0.0.1:1234".parse()?)
                     .api_addr("127.0.0.1:8080".parse()?)
                     .build()?,
@@ -705,7 +672,16 @@ mod tests {
             tx_bcast,
             tx_apply,
             schema: Default::default(),
-        }));
+            tripwire,
+        });
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
 
         let (status_code, body) = api_v1_db_execute(
             Extension(agent.clone()),
@@ -730,7 +706,10 @@ mod tests {
 
         assert!(matches!(
             msg,
-            BroadcastInput::AddBroadcast(Message::V1(MessageV1::Change { version: 1, .. }))
+            BroadcastInput::AddBroadcast(Message::V1(MessageV1::Change(ChangeV1 {
+                changeset: Changeset::Full { version: 1, .. },
+                ..
+            })))
         ));
 
         assert_eq!(agent.bookie().last(&agent.actor_id()), Some(1));
@@ -762,6 +741,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_schema() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
         let dir = tempfile::tempdir()?;
 
         let rw_pool = bb8::Pool::builder()
@@ -776,7 +757,7 @@ mod tests {
         let (tx_bcast, _rx_bcast) = channel(1);
         let (tx_apply, _rx_apply) = channel(1);
 
-        let agent = Agent(Arc::new(corro_types::agent::AgentInner {
+        let agent = Agent::new(corro_types::agent::AgentConfig {
             actor_id: ActorId(Uuid::new_v4()),
             ro_pool: bb8::Pool::builder()
                 .max_size(1)
@@ -798,23 +779,73 @@ mod tests {
             tx_bcast,
             tx_apply,
             schema: Default::default(),
-        }));
+            tripwire,
+        });
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
-            axum::Json(vec![Statement::Simple(
+            axum::Json(vec![
                 "CREATE TABLE tests (id BIGINT PRIMARY KEY, foo TEXT);".into(),
-            )]),
+            ]),
         )
         .await;
 
         assert_eq!(status_code, StatusCode::OK);
 
-        let schema = agent.0.schema.read();
+        // scope the schema reader in here
+        {
+            let schema = agent.schema().read();
+            let tests = schema
+                .tables
+                .get("tests")
+                .expect("no tests table in schema");
+
+            let id_col = tests.columns.get("id").unwrap();
+            assert_eq!(id_col.name, "id");
+            assert_eq!(id_col.sql_type, Type::Integer);
+            assert_eq!(id_col.nullable, true);
+            assert_eq!(id_col.primary_key, true);
+
+            let foo_col = tests.columns.get("foo").unwrap();
+            assert_eq!(foo_col.name, "foo");
+            assert_eq!(foo_col.sql_type, Type::Text);
+            assert_eq!(foo_col.nullable, true);
+            assert_eq!(foo_col.primary_key, false);
+        }
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![
+                "CREATE TABLE tests2 (id BIGINT PRIMARY KEY, foo TEXT);".into(),
+                "CREATE TABLE tests (id BIGINT PRIMARY KEY, foo TEXT);".into(),
+            ]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        let schema = agent.schema().read();
         let tests = schema
             .tables
             .get("tests")
             .expect("no tests table in schema");
+
+        let id_col = tests.columns.get("id").unwrap();
+        assert_eq!(id_col.name, "id");
+        assert_eq!(id_col.sql_type, Type::Integer);
+        assert_eq!(id_col.nullable, true);
+        assert_eq!(id_col.primary_key, true);
+
+        let foo_col = tests.columns.get("foo").unwrap();
+        assert_eq!(foo_col.name, "foo");
+        assert_eq!(foo_col.sql_type, Type::Text);
+        assert_eq!(foo_col.nullable, true);
+        assert_eq!(foo_col.primary_key, false);
+
+        let tests = schema
+            .tables
+            .get("tests2")
+            .expect("no tests2 table in schema");
 
         let id_col = tests.columns.get("id").unwrap();
         assert_eq!(id_col.name, "id");

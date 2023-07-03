@@ -16,14 +16,15 @@ pub struct Config {
     pub metrics_addr: Option<SocketAddr>,
     #[serde(default)]
     pub bootstrap: Vec<String>,
-    #[serde(default)]
-    pub log_format: LogFormat,
+
     #[serde(default)]
     pub schema_paths: Vec<Utf8PathBuf>,
 
     #[serde(default = "default_max_change_size")]
     pub max_change_size: i64,
 
+    #[serde(default)]
+    pub log: LogConfig,
     #[serde(default)]
     pub consul: Option<ConsulConfig>,
 }
@@ -34,6 +35,14 @@ pub fn default_admin_path() -> Utf8PathBuf {
 
 pub fn default_max_change_size() -> i64 {
     MAX_CHANGE_SIZE
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogConfig {
+    #[serde(default)]
+    pub format: LogFormat,
+    #[serde(default)]
+    pub colors: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,7 +75,7 @@ pub struct ConfigBuilder {
     admin_path: Option<Utf8PathBuf>,
     metrics_addr: Option<SocketAddr>,
     bootstrap: Option<Vec<String>>,
-    log_format: Option<LogFormat>,
+    log: Option<LogConfig>,
     schema_paths: Vec<Utf8PathBuf>,
     max_change_size: Option<i64>,
     consul: Option<ConsulConfig>,
@@ -98,8 +107,8 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn log_format(mut self, log_format: LogFormat) -> Self {
-        self.log_format = Some(log_format);
+    pub fn log(mut self, log: LogConfig) -> Self {
+        self.log = Some(log);
         self
     }
 
@@ -134,7 +143,7 @@ impl ConfigBuilder {
             admin_path: self.admin_path.unwrap_or_else(default_admin_path),
             metrics_addr: self.metrics_addr,
             bootstrap: self.bootstrap.unwrap_or_default(),
-            log_format: self.log_format.unwrap_or_default(),
+            log: self.log.unwrap_or_default(),
             schema_paths: self.schema_paths,
             max_change_size: self.max_change_size.unwrap_or(MAX_CHANGE_SIZE),
 
@@ -156,18 +165,13 @@ fn default_db_path() -> Utf8PathBuf {
 }
 
 /// Log format (JSON only)
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 #[allow(missing_docs)]
 pub enum LogFormat {
+    #[default]
     Plaintext,
     Json,
-}
-
-impl Default for LogFormat {
-    fn default() -> Self {
-        LogFormat::Plaintext
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -53,10 +53,17 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 
     let actor_id = ActorId(Uuid::new_v4());
 
-    start(actor_id, conf, tripwire)
-        .await
-        .map(|agent| TestAgent {
-            agent,
-            tmpdir: Arc::new(tmpdir),
-        })
+    let schema_paths = conf.schema_paths.clone();
+
+    let agent = start(actor_id, conf, tripwire).await?;
+
+    {
+        let client = corro_client::CorrosionApiClient::new(agent.api_addr());
+        client.schema_from_paths(&schema_paths).await?;
+    }
+
+    Ok(TestAgent {
+        agent,
+        tmpdir: Arc::new(tmpdir),
+    })
 }

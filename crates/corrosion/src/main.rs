@@ -152,7 +152,9 @@ async fn main() -> eyre::Result<()> {
                 }
             }
         }
-        Command::Reload => command::reload::run(cli.admin_path()).await?,
+        Command::Reload => {
+            command::reload::run(cli.config().api_addr, &cli.config().schema_paths).await?
+        }
         Command::Sync(SyncCommand::Generate) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Sync(

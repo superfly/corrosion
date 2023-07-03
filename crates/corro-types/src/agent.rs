@@ -1,32 +1,45 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
-    ops::RangeInclusive,
+    ops::{Deref, DerefMut, RangeInclusive},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
+use bb8::PooledConnection;
 use camino::Utf8PathBuf;
+use metrics::{gauge, histogram, increment_counter};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use tokio::{sync::mpsc::Sender, task::block_in_place};
-use tracing::warn;
+use rusqlite::InterruptHandle;
+use spawn::spawn_counted;
+use tokio::{
+    runtime::Handle,
+    sync::{
+        mpsc::{channel, Sender},
+        oneshot,
+    },
+};
+use tokio_util::sync::{CancellationToken, DropGuard};
+use tracing::{error, trace, warn};
+use tripwire::Tripwire;
 
 use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, Timestamp},
     config::Config,
     pubsub::Subscribers,
-    schema::{apply_schema, NormalizedSchema, SchemaError},
-    sqlite::SqlitePool,
+    schema::NormalizedSchema,
+    sqlite::{CrConnManager, SqlitePool},
 };
 
 use super::members::Members;
 
 #[derive(Clone)]
-pub struct Agent(pub Arc<AgentInner>);
+pub struct Agent(Arc<AgentInner>);
 
-pub struct AgentInner {
+pub struct AgentConfig {
     pub actor_id: ActorId,
     pub ro_pool: SqlitePool,
     pub rw_pool: SqlitePool,
@@ -41,16 +54,45 @@ pub struct AgentInner {
     pub tx_apply: Sender<(ActorId, i64)>,
 
     pub schema: RwLock<NormalizedSchema>,
+    pub tripwire: Tripwire,
+}
+
+pub struct AgentInner {
+    actor_id: ActorId,
+    pool: SplitPool,
+    config: ArcSwap<Config>,
+    gossip_addr: SocketAddr,
+    api_addr: SocketAddr,
+    members: RwLock<Members>,
+    clock: Arc<uhlc::HLC>,
+    bookie: Bookie,
+    subscribers: Subscribers,
+    tx_bcast: Sender<BroadcastInput>,
+    tx_apply: Sender<(ActorId, i64)>,
+    schema: RwLock<NormalizedSchema>,
 }
 
 impl Agent {
-    /// Return a borrowed [SqlitePool]
-    pub fn read_only_pool(&self) -> &SqlitePool {
-        &self.0.ro_pool
+    pub fn new(config: AgentConfig) -> Self {
+        Self(Arc::new(AgentInner {
+            actor_id: config.actor_id,
+            pool: SplitPool::new(config.ro_pool, config.rw_pool, config.tripwire),
+            config: config.config,
+            gossip_addr: config.gossip_addr,
+            api_addr: config.api_addr,
+            members: config.members,
+            clock: config.clock,
+            bookie: config.bookie,
+            subscribers: config.subscribers,
+            tx_bcast: config.tx_bcast,
+            tx_apply: config.tx_apply,
+            schema: config.schema,
+        }))
     }
 
-    pub fn read_write_pool(&self) -> &SqlitePool {
-        &self.0.rw_pool
+    /// Return a borrowed [SqlitePool]
+    pub fn pool(&self) -> &SplitPool {
+        &self.0.pool
     }
 
     pub fn actor_id(&self) -> ActorId {
@@ -83,6 +125,14 @@ impl Agent {
         &self.0.bookie
     }
 
+    pub fn members(&self) -> &RwLock<Members> {
+        &self.0.members
+    }
+
+    pub fn schema(&self) -> &RwLock<NormalizedSchema> {
+        &self.0.schema
+    }
+
     pub fn db_path(&self) -> Utf8PathBuf {
         self.0.config.load().db_path.clone()
     }
@@ -96,46 +146,233 @@ impl Agent {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ReloadError {
-    #[error(transparent)]
-    Schema(#[from] SchemaError),
-    #[error(transparent)]
-    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+#[derive(Debug, Clone)]
+pub struct SplitPool(Arc<SplitPoolInner>);
+
+#[derive(Debug)]
+struct SplitPoolInner {
+    read: SqlitePool,
+    write: SqlitePool,
+
+    priority_tx: Sender<oneshot::Sender<CancellationToken>>,
+    normal_tx: Sender<oneshot::Sender<CancellationToken>>,
+    low_tx: Sender<oneshot::Sender<CancellationToken>>,
 }
 
-pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> {
-    let old_conf = agent.config();
+#[derive(Debug, thiserror::Error)]
+pub enum PoolError {
+    #[error(transparent)]
+    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    #[error("queue is closed")]
+    QueueClosed,
+    #[error("callback is closed")]
+    CallbackClosed,
+}
 
-    if old_conf.db_path != new_conf.db_path {
-        warn!("reloaded ineffectual change: db_path");
-    }
-    if old_conf.gossip_addr != new_conf.gossip_addr {
-        warn!("reloaded ineffectual change: gossip_addr");
-    }
-    if old_conf.api_addr != new_conf.api_addr {
-        warn!("reloaded ineffectual change: api_addr");
-    }
-    if old_conf.metrics_addr != new_conf.metrics_addr {
-        warn!("reloaded ineffectual change: metrics_addr");
-    }
-    if old_conf.bootstrap != new_conf.bootstrap {
-        warn!("reloaded ineffectual change: bootstrap");
-    }
-    if old_conf.log_format != new_conf.log_format {
-        warn!("reloaded ineffectual change: log_format");
+#[derive(Debug, thiserror::Error)]
+pub enum ChangeError {
+    #[error("could not acquire pooled connection: {0}")]
+    Pool(#[from] PoolError),
+    #[error("rusqlite: {0}")]
+    Rusqlite(#[from] rusqlite::Error),
+}
+
+impl SplitPool {
+    pub fn new(read: SqlitePool, write: SqlitePool, mut tripwire: Tripwire) -> Self {
+        let (priority_tx, mut priority_rx) = channel(256);
+        let (normal_tx, mut normal_rx) = channel(512);
+        let (low_tx, mut low_rx) = channel(1024);
+
+        spawn_counted(async move {
+            loop {
+                let tx: oneshot::Sender<CancellationToken> = tokio::select! {
+                    biased;
+
+                    _ = &mut tripwire => {
+                        break
+                    }
+
+                    Some(tx) = priority_rx.recv() => tx,
+                    Some(tx) = normal_rx.recv() => tx,
+                    Some(tx) = low_rx.recv() => tx,
+                };
+
+                wait_conn_drop(tx).await
+            }
+
+            // keep processing priority messages
+            // NOTE: using `recv` would wait indefinitely, this loop only waits until all
+            //       current conn requests are done
+            while let Ok(tx) = priority_rx.try_recv() {
+                wait_conn_drop(tx).await
+            }
+        });
+
+        Self(Arc::new(SplitPoolInner {
+            read,
+            write,
+            priority_tx,
+            normal_tx,
+            low_tx,
+        }))
     }
 
-    let mut conn = agent.read_write_pool().get().await?;
-    let mut schema_write = agent.0.schema.write();
+    pub fn emit_metrics(&self) {
+        let read_state = self.0.read.state();
+        gauge!(
+            "corro.sqlite.pool.read.connections",
+            read_state.connections as f64
+        );
+        gauge!(
+            "corro.sqlite.pool.read.connections.idle",
+            read_state.idle_connections as f64
+        );
 
-    let new_schema =
-        block_in_place(|| apply_schema(&mut conn, &new_conf.schema_paths, &schema_write))?;
+        let write_state = self.0.write.state();
+        gauge!(
+            "corro.sqlite.pool.write.connections",
+            write_state.connections as f64
+        );
+        gauge!(
+            "corro.sqlite.pool.write.connections.idle",
+            write_state.idle_connections as f64
+        );
+    }
 
-    agent.set_config(new_conf);
-    *schema_write = new_schema;
+    // get a read-only connection
+    pub async fn read(
+        &self,
+    ) -> Result<PooledConnection<CrConnManager>, bb8::RunError<bb8_rusqlite::Error>> {
+        self.0.read.get().await
+    }
 
-    Ok(())
+    pub fn read_blocking(
+        &self,
+    ) -> Result<PooledConnection<CrConnManager>, bb8::RunError<bb8_rusqlite::Error>> {
+        Handle::current().block_on(self.0.read.get_owned())
+    }
+
+    // get a high priority write connection (e.g. client input)
+    pub async fn write_priority(&self) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.priority_tx, "priority").await
+    }
+
+    // get a normal priority write connection (e.g. sync process)
+    pub async fn write_normal(&self) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.normal_tx, "normal").await
+    }
+
+    // get a low priority write connection (e.g. background tasks)
+    pub async fn write_low(&self) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.low_tx, "low").await
+    }
+
+    pub fn blocking_write_low(&self) -> Result<WriteConn<'static>, PoolError> {
+        Handle::current().block_on(self.write_inner_owned(&self.0.low_tx, "priority"))
+    }
+
+    async fn write_inner(
+        &self,
+        chan: &Sender<oneshot::Sender<CancellationToken>>,
+        queue: &'static str,
+    ) -> Result<WriteConn, PoolError> {
+        let (tx, rx) = oneshot::channel();
+        chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
+        let start = Instant::now();
+        let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
+        histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
+        let conn = self.0.write.get().await?;
+
+        tokio::spawn(timeout_wait(
+            token.clone(),
+            conn.get_interrupt_handle(),
+            Duration::from_secs(30),
+            queue,
+        ));
+
+        Ok(WriteConn {
+            conn,
+            _drop_guard: token.drop_guard(),
+        })
+    }
+
+    async fn write_inner_owned(
+        &self,
+        chan: &Sender<oneshot::Sender<CancellationToken>>,
+        queue: &'static str,
+    ) -> Result<WriteConn<'static>, PoolError> {
+        let (tx, rx) = oneshot::channel();
+        chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
+        let start = Instant::now();
+        let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
+        histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
+        let conn = self.0.write.get_owned().await?;
+
+        tokio::spawn(timeout_wait(
+            token.clone(),
+            conn.get_interrupt_handle(),
+            Duration::from_secs(30),
+            queue,
+        ));
+
+        Ok(WriteConn {
+            conn,
+            _drop_guard: token.drop_guard(),
+        })
+    }
+}
+
+async fn timeout_wait(
+    token: CancellationToken,
+    handle: InterruptHandle,
+    timeout: Duration,
+    queue: &'static str,
+) {
+    let start = Instant::now();
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            trace!("conn dropped before timeout");
+            histogram!("corro.sqlite.pool.execution.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
+            return;
+        },
+        _ = tokio::time::sleep(timeout) => {
+            warn!("conn execution timed out, interrupting!");
+        }
+    }
+    handle.interrupt();
+    increment_counter!("corro.sqlite.pool.execution.timeout");
+    // FIXME: do we need to cancel the token?
+}
+
+async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
+    let cancel = CancellationToken::new();
+
+    if let Err(_e) = tx.send(cancel.clone()) {
+        error!("could not send back drop guard for pooled conn, oneshot channel likely closed");
+        return;
+    }
+
+    cancel.cancelled().await
+}
+
+pub struct WriteConn<'a> {
+    conn: PooledConnection<'a, CrConnManager>,
+    _drop_guard: DropGuard,
+}
+
+impl<'a> Deref for WriteConn<'a> {
+    type Target = PooledConnection<'a, CrConnManager>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl<'a> DerefMut for WriteConn<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -190,8 +427,8 @@ impl Booked {
         self.0.read().iter().map(|(k, _v)| *k.end()).max()
     }
 
-    pub fn read(&self) -> RwLockReadGuard<BookedVersions> {
-        self.0.read()
+    pub fn read(&self) -> BookReader {
+        BookReader(self.0.read())
     }
 
     pub fn write(&self) -> BookWriter {
@@ -199,11 +436,42 @@ impl Booked {
     }
 }
 
+pub struct BookReader<'a>(RwLockReadGuard<'a, BookedVersions>);
+
+impl<'a> BookReader<'a> {
+    pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
+        match seqs {
+            Some(check_seqs) => match self.0.get(&version) {
+                Some(known) => match known {
+                    KnownDbVersion::Partial { seqs, .. } => {
+                        check_seqs.clone().all(|seq| seqs.contains(&seq))
+                    }
+                    KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
+                },
+                None => false,
+            },
+            None => self.0.contains_key(&version),
+        }
+    }
+}
+
+impl<'a> Deref for BookReader<'a> {
+    type Target = RwLockReadGuard<'a, BookedVersions>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub struct BookWriter<'a>(RwLockWriteGuard<'a, BookedVersions>);
 
 impl<'a> BookWriter<'a> {
     pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
-        self.0.insert(version..=version, known_version);
+        self.insert_many(version..=version, known_version);
+    }
+
+    pub fn insert_many(&mut self, versions: RangeInclusive<i64>, known_version: KnownDbVersion) {
+        self.0.insert(versions, known_version);
     }
 
     pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
@@ -219,6 +487,14 @@ impl<'a> BookWriter<'a> {
             },
             None => self.0.contains_key(&version),
         }
+    }
+
+    pub fn contains_all(
+        &self,
+        mut versions: RangeInclusive<i64>,
+        seqs: Option<&RangeInclusive<i64>>,
+    ) -> bool {
+        versions.all(|version| self.contains(version, seqs))
     }
 
     pub fn last(&self) -> Option<i64> {
@@ -273,14 +549,17 @@ impl Bookie {
 
     pub fn contains(
         &self,
-        actor_id: ActorId,
-        version: i64,
+        actor_id: &ActorId,
+        mut versions: RangeInclusive<i64>,
         seqs: Option<&RangeInclusive<i64>>,
     ) -> bool {
         self.0
             .read()
-            .get(&actor_id)
-            .map(|booked| booked.contains(version, seqs))
+            .get(actor_id)
+            .map(|booked| {
+                let read = booked.read();
+                versions.all(|v| read.contains(v, seqs))
+            })
             .unwrap_or(false)
     }
 

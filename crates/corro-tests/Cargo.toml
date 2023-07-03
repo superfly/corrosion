@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 corro-agent = { path = "../corro-agent" }
+corro-client = { path = "../corro-client" }
 corro-types = { path = "../corro-types" }
 eyre = { workspace = true }
 tempfile = { workspace = true }

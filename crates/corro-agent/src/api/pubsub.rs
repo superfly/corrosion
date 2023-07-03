@@ -432,10 +432,10 @@ async fn catch_up_subscriber(
         tx,
     } = catch_up;
 
-    let conn = agent.read_only_pool().get().await?;
+    let conn = agent.pool().read().await?;
 
     block_in_place(|| {
-        let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM crsql_changes WHERE db_version >= ?"#)?;
+        let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM crsql_changes WHERE db_version >= ? ORDER BY db_version, seq ASC"#)?;
 
         let mut rows = prepped.query(params![from_db_version])?;
 
@@ -455,7 +455,7 @@ async fn catch_up_subscriber(
             };
 
             if change.db_version != last_db_version {
-                let schema = agent.0.schema.read();
+                let schema = agent.schema().read();
                 if !changeset.is_empty() {
                     let aggs = AggregateChange::from_changes(
                         changeset.drain(..),
@@ -481,7 +481,7 @@ async fn catch_up_subscriber(
         }
 
         if !changeset.is_empty() {
-            let schema = agent.0.schema.read();
+            let schema = agent.schema().read();
             let aggs = AggregateChange::from_changes(changeset.drain(..), &schema, last_db_version);
             for agg in aggs {
                 let matches = filter
