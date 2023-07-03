@@ -1907,8 +1907,6 @@ pub mod tests {
         change::SqliteValue,
         filters::{ChangeEvent, OwnedAggregateChange},
         pubsub::{Subscription, SubscriptionId},
-        schema::apply_schema,
-        sqlite::CrConnManager,
     };
 
     use corro_tests::*;
@@ -2330,94 +2328,6 @@ pub mod tests {
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn schema_application() -> eyre::Result<()> {
-        _ = tracing_subscriber::fmt::try_init();
-        let dir = tempfile::tempdir()?;
-        let schema_path = dir.path().join("schema");
-        tokio::fs::create_dir_all(&schema_path).await?;
-
-        tokio::fs::write(schema_path.join("test.sql"), corro_tests::TEST_SCHEMA).await?;
-
-        let pool = bb8::Pool::builder()
-            .max_size(1)
-            .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
-
-        let schema = {
-            let mut conn = pool.get().await?;
-            migrate(&mut conn)?;
-            let schema = init_schema(&conn)?;
-            apply_schema(&mut conn, &[&schema_path], &schema)?
-        };
-
-        println!("initial schema: {schema:#?}");
-
-        println!("SECOND ATTEMPT ------");
-
-        tokio::fs::remove_file(schema_path.join("test.sql")).await?;
-
-        tokio::fs::write(
-            schema_path.join("consul.sql"),
-            r#"
-
-        CREATE TABLE IF NOT EXISTS tests (
-            id INTEGER NOT NULL PRIMARY KEY,
-            text TEXT NOT NULL DEFAULT "",
-            meta JSON NOT NULL DEFAULT '{}',
-
-            app_id INTEGER AS (CAST(JSON_EXTRACT(meta, '$.app_id') AS INTEGER)),
-            instance_id TEXT AS (
-                COALESCE(
-                    JSON_EXTRACT(meta, '$.machine_id'),
-                    SUBSTR(JSON_EXTRACT(meta, '$.alloc_id'), 1, 8),
-                    CASE
-                        WHEN INSTR(id, '_nomad-task-') = 1 THEN SUBSTR(id, 13, 8)
-                        ELSE NULL
-                    END
-                )
-            )
-        ) WITHOUT ROWID;
-
-
-        CREATE TABLE IF NOT EXISTS tests2 (
-            id INTEGER NOT NULL PRIMARY KEY,
-            text TEXT NOT NULL DEFAULT ""
-        ) WITHOUT ROWID;
-
-        CREATE TABLE IF NOT EXISTS testsblob (
-            id BLOB NOT NULL PRIMARY KEY,
-            text TEXT NOT NULL DEFAULT ""
-        ) WITHOUT ROWID;
-        
-        
-        CREATE TABLE IF NOT EXISTS consul_checks (
-            node TEXT NOT NULL DEFAULT "",
-            id TEXT NOT NULL DEFAULT "",
-            service_id TEXT NOT NULL DEFAULT "",
-            service_name TEXT NOT NULL DEFAULT "",
-            name TEXT NOT NULL DEFAULT "",
-            status TEXT,
-            output TEXT NOT NULL DEFAULT "",
-            updated_at BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (node, id)
-        ) WITHOUT ROWID;
-        
-        CREATE INDEX consul_checks_node_id_updated_at ON consul_checks (node, id, updated_at);
-
-        "#,
-        )
-        .await?;
-
-        let _new_schema = {
-            let mut conn = pool.get().await?;
-            apply_schema(&mut conn, &[schema_path], &schema)?
-        };
-
-        // println!("new schema: {new_schema:#?}");
 
         Ok(())
     }

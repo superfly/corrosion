@@ -536,15 +536,8 @@ pub async fn api_v1_db_query(
     }
 }
 
-async fn execute_schema(agent: &Agent, statements: Vec<Statement>) -> eyre::Result<()> {
-    let new_sql: String = statements
-        .into_iter()
-        .map(|stmt| match stmt {
-            Statement::Simple(s) => Ok(s),
-            _ => eyre::bail!("only simple statements are supported"),
-        })
-        .collect::<Result<Vec<_>, eyre::Report>>()?
-        .join(";");
+async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
+    let new_sql: String = statements.join(";");
 
     let partial_schema = parse_sql(&new_sql)?;
 
@@ -587,7 +580,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<Statement>) -> eyre::Resu
 
 pub async fn api_v1_db_schema(
     Extension(agent): Extension<Agent>,
-    axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
+    axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
 ) -> (StatusCode, axum::Json<RqliteResponse>) {
     if statements.is_empty() {
         return (
@@ -628,12 +621,7 @@ pub async fn api_v1_db_schema(
 #[cfg(test)]
 mod tests {
     use arc_swap::ArcSwap;
-    use corro_types::{
-        actor::ActorId,
-        config::Config,
-        schema::{apply_schema, NormalizedSchema, Type},
-        sqlite::CrConnManager,
-    };
+    use corro_types::{actor::ActorId, config::Config, schema::Type, sqlite::CrConnManager};
     use tokio::sync::mpsc::{channel, error::TryRecvError};
     use tripwire::Tripwire;
     use uuid::Uuid;
@@ -649,10 +637,6 @@ mod tests {
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
 
         let dir = tempfile::tempdir()?;
-        let schema_path = dir.path().join("schema");
-        tokio::fs::create_dir_all(&schema_path).await?;
-
-        tokio::fs::write(schema_path.join("test.sql"), corro_tests::TEST_SCHEMA).await?;
 
         let rw_pool = bb8::Pool::builder()
             .max_size(1)
@@ -661,7 +645,6 @@ mod tests {
         {
             let mut conn = rw_pool.get().await?;
             migrate(&mut conn)?;
-            apply_schema(&mut conn, &[&schema_path], &NormalizedSchema::default())?;
         }
 
         let (tx_bcast, mut rx_bcast) = channel(1);
@@ -676,7 +659,6 @@ mod tests {
             config: ArcSwap::from_pointee(
                 Config::builder()
                     .db_path(dir.path().join("corrosion.db").display().to_string())
-                    .add_schema_path(schema_path.display().to_string())
                     .gossip_addr("127.0.0.1:1234".parse()?)
                     .api_addr("127.0.0.1:8080".parse()?)
                     .build()?,
@@ -692,6 +674,14 @@ mod tests {
             schema: Default::default(),
             tripwire,
         });
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
 
         let (status_code, body) = api_v1_db_execute(
             Extension(agent.clone()),
@@ -794,9 +784,41 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
-            axum::Json(vec![Statement::Simple(
+            axum::Json(vec![
                 "CREATE TABLE tests (id BIGINT PRIMARY KEY, foo TEXT);".into(),
-            )]),
+            ]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        // scope the schema reader in here
+        {
+            let schema = agent.schema().read();
+            let tests = schema
+                .tables
+                .get("tests")
+                .expect("no tests table in schema");
+
+            let id_col = tests.columns.get("id").unwrap();
+            assert_eq!(id_col.name, "id");
+            assert_eq!(id_col.sql_type, Type::Integer);
+            assert_eq!(id_col.nullable, true);
+            assert_eq!(id_col.primary_key, true);
+
+            let foo_col = tests.columns.get("foo").unwrap();
+            assert_eq!(foo_col.name, "foo");
+            assert_eq!(foo_col.sql_type, Type::Text);
+            assert_eq!(foo_col.nullable, true);
+            assert_eq!(foo_col.primary_key, false);
+        }
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![
+                "CREATE TABLE tests2 (id BIGINT PRIMARY KEY, foo TEXT);".into(),
+                "CREATE TABLE tests (id BIGINT PRIMARY KEY, foo TEXT);".into(),
+            ]),
         )
         .await;
 
@@ -807,6 +829,23 @@ mod tests {
             .tables
             .get("tests")
             .expect("no tests table in schema");
+
+        let id_col = tests.columns.get("id").unwrap();
+        assert_eq!(id_col.name, "id");
+        assert_eq!(id_col.sql_type, Type::Integer);
+        assert_eq!(id_col.nullable, true);
+        assert_eq!(id_col.primary_key, true);
+
+        let foo_col = tests.columns.get("foo").unwrap();
+        assert_eq!(foo_col.name, "foo");
+        assert_eq!(foo_col.sql_type, Type::Text);
+        assert_eq!(foo_col.nullable, true);
+        assert_eq!(foo_col.primary_key, false);
+
+        let tests = schema
+            .tables
+            .get("tests2")
+            .expect("no tests2 table in schema");
 
         let id_col = tests.columns.get("id").unwrap();
         assert_eq!(id_col.name, "id");
