@@ -133,14 +133,11 @@ pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
     let mut dump = String::new();
 
     let tables: HashMap<String, String> = conn
-            .prepare(
-                r#"SELECT name, sql FROM sqlite_schema
-    WHERE type = "table" AND name != "sqlite_sequence" AND name NOT LIKE '__corro_%' AND name NOT LIKE '%crsql%' ORDER BY tbl_name"#,
-            )?
-            .query_map((), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+        .prepare(r#"SELECT name, sql FROM __corro_schema WHERE type = "table" ORDER BY tbl_name"#)?
+        .query_map((), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
 
     for sql in tables.values() {
         dump.push_str(sql.as_str());
@@ -148,14 +145,11 @@ pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
     }
 
     let indexes: HashMap<String, String> = conn
-            .prepare(
-                r#"SELECT name, sql FROM sqlite_schema
-    WHERE type = "index" AND name NOT LIKE 'sqlite_autoindex_%' AND name NOT LIKE '__corro_%' AND name NOT LIKE '%crsql%' ORDER BY tbl_name"#,
-            )?
-            .query_map((), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+        .prepare(r#"SELECT name, sql FROM __corro_schema WHERE type = "index" ORDER BY tbl_name"#)?
+        .query_map((), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
 
     for sql in indexes.values() {
         dump.push_str(sql.as_str());
@@ -504,23 +498,23 @@ pub fn make_schema<P: AsRef<Path>>(
         }
     }
 
-    let extra_schema = tx
-        .prepare_cached(
-            "SELECT sql FROM __corro_schema ORDER BY
-                CASE 
-                    WHEN type = 'table' THEN 1 
-                    ELSE 2
-                END
-            ",
-        )?
-        .query(())?
-        .and_then(|row| row.get(0))
-        .collect::<rusqlite::Result<Vec<String>>>()?;
+    // let extra_schema = tx
+    //     .prepare_cached(
+    //         "SELECT sql FROM __corro_schema ORDER BY
+    //             CASE 
+    //                 WHEN type = 'table' THEN 1 
+    //                 ELSE 2
+    //             END
+    //         ",
+    //     )?
+    //     .query(())?
+    //     .and_then(|row| row.get(0))
+    //     .collect::<rusqlite::Result<Vec<String>>>()?;
 
-    for extra in extra_schema {
-        new_sql.push_str(&extra);
-        new_sql.push(';');
-    }
+    // for extra in extra_schema {
+    //     new_sql.push_str(&extra);
+    //     new_sql.push(';');
+    // }
 
     let new_schema = parse_sql(&new_sql)?;
 

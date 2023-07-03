@@ -32,7 +32,7 @@ use corro_types::{
     filters::{match_expr, AggregateChange},
     members::{MemberEvent, Members},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
-    schema::{apply_schema, init_schema},
+    schema::init_schema,
     sqlite::{init_cr_conn, CrConn, CrConnManager, Migration},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
 };
@@ -147,8 +147,7 @@ pub async fn setup(
     let schema = {
         let mut conn = rw_pool.get().await?;
         migrate(&mut conn)?;
-        let schema = init_schema(&conn)?;
-        apply_schema(&mut conn, &conf.schema_paths, &schema)?
+        init_schema(&conn)?
     };
 
     let (tx_apply, rx_apply) = channel(512);
@@ -219,6 +218,7 @@ pub async fn setup(
         debug!("filling up partial known versions");
 
         for ((actor_id, version), (seqs, last_seq, ts)) in partials {
+            info!("looking at partials for {actor_id} v{version}, seq: {seqs:?}, last_seq: {last_seq}");
             let ranges = bk.entry(actor_id).or_default();
             let gaps_count = seqs.gaps(&(0..=last_seq)).count();
             ranges.insert(
@@ -517,7 +517,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             }
                         };
 
-                        let mut conn = pool.write_low_blocking()?;
+                        let mut conn = pool.blocking_write_low()?;
                         let tx = conn.transaction()?;
 
                         let deleted = tx
@@ -696,7 +696,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             .inspect(|_| info!("corrosion agent sync loop is done")),
     );
 
-    // let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
+    let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
 
     tokio::spawn(handle_gossip_to_send(udp_gossip.clone(), to_send_rx));
@@ -732,10 +732,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             _ = db_cleanup_interval.tick() => {
                 tokio::spawn(handle_db_cleanup(agent.pool().clone()).preemptible(tripwire.clone()));
             },
-            // _ = metrics_interval.tick() => {
-            //     let agent = agent.clone();
-            //     tokio::spawn(tokio::runtime::Handle::current().spawn_blocking(move ||collect_metrics(agent)));
-            // },
+            _ = metrics_interval.tick() => {
+                let agent = agent.clone();
+                tokio::spawn(async move { block_in_place(move || collect_metrics(agent)) });
+            },
             _ = &mut tripwire => {
                 debug!("tripped corrosion");
                 break;
@@ -744,6 +744,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+fn collect_metrics(agent: Agent) {
+    agent.pool().emit_metrics();
 }
 
 pub async fn handle_broadcast(
@@ -1840,7 +1844,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 foca_state JSON
             ) WITHOUT ROWID;
 
-            -- tracked corrosion schema, useful for non-file schema changes
+            -- tracked corrosion schema
             CREATE TABLE __corro_schema (
                 tbl_name TEXT NOT NULL,
                 type TEXT NOT NULL,
@@ -1904,6 +1908,7 @@ pub mod tests {
         change::SqliteValue,
         filters::{ChangeEvent, OwnedAggregateChange},
         pubsub::{Subscription, SubscriptionId},
+        schema::apply_schema,
         sqlite::CrConnManager,
     };
 
@@ -2832,136 +2837,4 @@ pub mod tests {
 
         Ok(())
     }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn tokio_repro() {
-        // let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
-
-        // let dir = tempfile::tempdir().unwrap();
-        // let db_path = dir.path().join("test.db");
-        // let pool = bb8::Pool::builder()
-        //     .max_size(1)
-        //     .min_idle(Some(1))
-        //     .build(CrConnManager::new(&db_path))
-        //     .await
-        //     .expect("could not build write pool");
-        // let read_pool = bb8::Pool::builder().build_unchecked(CrConnManager::new(&db_path));
-
-        // let spool = SplitPool::new(read_pool, pool, tripwire);
-
-        // tokio::spawn({
-        //     let spool = spool.clone();
-        //     async move {
-        //         println!("acquiring first write conn");
-        //         let conn = spool
-        //             .write_normal()
-        //             .await
-        //             .expect("could not get normal priority write conn");
-        //         println!("acquired first write conn");
-        //         tokio::time::sleep(Duration::from_secs(5)).await;
-        //         println!("done with first conn");
-        //     }
-        // });
-
-        // // let (chan_tx, mut chan_rx) = tokio::sync::mpsc::channel(1024);
-
-        // tokio::spawn(async move {
-        //     tokio::time::sleep(Duration::from_secs(1)).await;
-        //     for _ in 0..100 {
-        //         tokio::task::block_in_place(|| {
-        //             {
-        //                 let _read = spool.read_blocking()?;
-        //                 println!("GOT READ");
-        //             }
-
-        //             let _write = spool.write_low_blocking()?;
-        //             println!("GOT WRITE!");
-
-        //             Ok::<_, PoolError>(())
-        //         })?;
-        //     }
-
-        //     Ok::<_, PoolError>(())
-        // })
-        // .await
-        // .expect("spawn problem")
-        // .unwrap();
-
-        // tokio::spawn(async move {
-        //     loop {
-        //         tokio::spawn(async move {
-        //             block_in_place(|| {
-        //                 if let Err(e) = tokio::runtime::Handle::current().block_on(async move {
-        //                     tokio::task::spawn_blocking(|| {
-        //                         std::thread::sleep(Duration::from_millis(1));
-        //                     })
-        //                     .await
-        //                 }) {
-        //                     error!("inner spawn failed: {e}");
-        //                 }
-        //             });
-        //         });
-        //         tokio::time::sleep(Duration::from_millis(2)).await;
-        //     }
-        // });
-
-        tokio::spawn(async move {
-            loop {
-                tokio::spawn(async move {
-                    block_in_place(|| {
-                        if let Err(e) = tokio::runtime::Handle::current().block_on(async move {
-                            tokio::task::spawn_blocking(|| {
-                                std::thread::sleep(Duration::from_millis(1));
-                            })
-                            .await
-                        }) {
-                            error!("inner spawn failed: {e}");
-                        }
-                        block_in_place(|| {
-                            std::thread::sleep(Duration::from_millis(1));
-                        })
-                    });
-                });
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        });
-
-        tokio::spawn(async move {
-            loop {
-                tokio::spawn(async move {
-                    block_in_place(|| {
-                        if let Err(e) = tokio::runtime::Handle::current().block_on(async move {
-                            tokio::task::spawn_blocking(|| {
-                                std::thread::sleep(Duration::from_millis(1));
-                            })
-                            .await
-                        }) {
-                            error!("inner spawn failed: {e}");
-                        }
-                        block_in_place(|| {
-                            std::thread::sleep(Duration::from_millis(1));
-                        })
-                    });
-                });
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        });
-
-        for _ in 0..1000 {
-            block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    tokio::task::spawn_blocking(|| {
-                        std::thread::sleep(Duration::from_millis(1));
-                    })
-                    .await
-                    .expect("inner spawn failed");
-                    block_in_place(|| {
-                        std::thread::sleep(Duration::from_millis(1));
-                    })
-                })
-            });
-        }
-    }
-
-    // async fn get_conn(chan: &tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<tokio_util::sync::DropGuard>>)
 }

@@ -16,14 +16,15 @@ pub struct Config {
     pub metrics_addr: Option<SocketAddr>,
     #[serde(default)]
     pub bootstrap: Vec<String>,
-    #[serde(default)]
-    pub log: LogConfig,
+
     #[serde(default)]
     pub schema_paths: Vec<Utf8PathBuf>,
 
     #[serde(default = "default_max_change_size")]
     pub max_change_size: i64,
 
+    #[serde(default)]
+    pub log: LogConfig,
     #[serde(default)]
     pub consul: Option<ConsulConfig>,
 }

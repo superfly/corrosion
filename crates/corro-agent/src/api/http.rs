@@ -553,11 +553,15 @@ async fn execute_schema(agent: &Agent, statements: Vec<Statement>) -> eyre::Resu
     // hold onto this lock so nothing else makes changes
     let mut schema_write = agent.schema().write();
 
-    let mut new_schema = schema_write.clone();
-
-    for (name, def) in partial_schema.tables.iter() {
-        new_schema.tables.insert(name.clone(), def.clone());
-    }
+    // clone the previous schema and apply
+    let new_schema = {
+        let mut schema = schema_write.clone();
+        for (name, def) in partial_schema.tables.iter() {
+            // overwrite table because users are expected to return a full table def
+            schema.tables.insert(name.clone(), def.clone());
+        }
+        schema
+    };
 
     block_in_place(|| {
         let tx = conn.transaction()?;
@@ -597,6 +601,8 @@ pub async fn api_v1_db_schema(
         );
     }
 
+    let start = Instant::now();
+
     if let Err(e) = execute_schema(&agent, statements).await {
         error!("could not merge schemas: {e}");
         return (
@@ -614,7 +620,7 @@ pub async fn api_v1_db_schema(
         StatusCode::OK,
         axum::Json(RqliteResponse {
             results: vec![],
-            time: None,
+            time: Some(start.elapsed().as_secs_f64()),
         }),
     )
 }

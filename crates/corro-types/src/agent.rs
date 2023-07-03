@@ -3,13 +3,16 @@ use std::{
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
 use bb8::PooledConnection;
 use camino::Utf8PathBuf;
+use metrics::{gauge, histogram, increment_counter};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
+use rusqlite::InterruptHandle;
 use spawn::spawn_counted;
 use tokio::{
     runtime::Handle,
@@ -20,7 +23,7 @@ use tokio::{
     task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{error, warn};
+use tracing::{error, trace, warn};
 use tripwire::Tripwire;
 
 use crate::{
@@ -152,9 +155,9 @@ struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
 
-    priority_tx: Sender<oneshot::Sender<DropGuard>>,
-    normal_tx: Sender<oneshot::Sender<DropGuard>>,
-    low_tx: Sender<oneshot::Sender<DropGuard>>,
+    priority_tx: Sender<oneshot::Sender<CancellationToken>>,
+    normal_tx: Sender<oneshot::Sender<CancellationToken>>,
+    low_tx: Sender<oneshot::Sender<CancellationToken>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -183,7 +186,7 @@ impl SplitPool {
 
         spawn_counted(async move {
             loop {
-                let tx: oneshot::Sender<DropGuard> = tokio::select! {
+                let tx: oneshot::Sender<CancellationToken> = tokio::select! {
                     biased;
 
                     _ = &mut tripwire => {
@@ -199,7 +202,7 @@ impl SplitPool {
             }
 
             // keep processing priority messages
-            // NOTE: not using recv because it'll wait indefinitely, this only waits until all
+            // NOTE: using `recv` would wait indefinitely, this loop only waits until all
             //       current conn requests are done
             while let Ok(tx) = priority_rx.try_recv() {
                 wait_conn_drop(tx).await
@@ -213,6 +216,28 @@ impl SplitPool {
             normal_tx,
             low_tx,
         }))
+    }
+
+    pub fn emit_metrics(&self) {
+        let read_state = self.0.read.state();
+        gauge!(
+            "corro.sqlite.pool.read.connections",
+            read_state.connections as f64
+        );
+        gauge!(
+            "corro.sqlite.pool.read.connections.idle",
+            read_state.idle_connections as f64
+        );
+
+        let write_state = self.0.write.state();
+        gauge!(
+            "corro.sqlite.pool.write.connections",
+            write_state.connections as f64
+        );
+        gauge!(
+            "corro.sqlite.pool.write.connections.idle",
+            write_state.idle_connections as f64
+        );
     }
 
     // get a read-only connection
@@ -230,51 +255,101 @@ impl SplitPool {
 
     // get a high priority write connection (e.g. client input)
     pub async fn write_priority(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.priority_tx).await
+        self.write_inner(&self.0.priority_tx, "priority").await
     }
 
     // get a normal priority write connection (e.g. sync process)
     pub async fn write_normal(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.normal_tx).await
+        self.write_inner(&self.0.normal_tx, "normal").await
     }
 
     // get a low priority write connection (e.g. background tasks)
     pub async fn write_low(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.low_tx).await
+        self.write_inner(&self.0.low_tx, "low").await
     }
 
-    pub fn write_low_blocking(&self) -> Result<WriteConn<'static>, PoolError> {
-        Handle::current().block_on(self.write_inner_owned(&self.0.low_tx))
+    pub fn blocking_write_low(&self) -> Result<WriteConn<'static>, PoolError> {
+        Handle::current().block_on(self.write_inner_owned(&self.0.low_tx, "priority"))
     }
 
     async fn write_inner(
         &self,
-        chan: &Sender<oneshot::Sender<DropGuard>>,
+        chan: &Sender<oneshot::Sender<CancellationToken>>,
+        queue: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
         chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
-        let _drop_guard = rx.await.map_err(|_| PoolError::CallbackClosed)?;
+        let start = Instant::now();
+        let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
+        histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
         let conn = self.0.write.get().await?;
-        Ok(WriteConn { conn, _drop_guard })
+
+        tokio::spawn(timeout_wait(
+            token.clone(),
+            conn.get_interrupt_handle(),
+            Duration::from_secs(30),
+            queue,
+        ));
+
+        Ok(WriteConn {
+            conn,
+            _drop_guard: token.drop_guard(),
+        })
     }
 
     async fn write_inner_owned(
         &self,
-        chan: &Sender<oneshot::Sender<DropGuard>>,
+        chan: &Sender<oneshot::Sender<CancellationToken>>,
+        queue: &'static str,
     ) -> Result<WriteConn<'static>, PoolError> {
         let (tx, rx) = oneshot::channel();
         chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
-        let _drop_guard = rx.await.map_err(|_| PoolError::CallbackClosed)?;
+        let start = Instant::now();
+        let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
+        histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
         let conn = self.0.write.get_owned().await?;
-        Ok(WriteConn { conn, _drop_guard })
+
+        tokio::spawn(timeout_wait(
+            token.clone(),
+            conn.get_interrupt_handle(),
+            Duration::from_secs(30),
+            queue,
+        ));
+
+        Ok(WriteConn {
+            conn,
+            _drop_guard: token.drop_guard(),
+        })
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>) {
-    let cancel = CancellationToken::new();
-    let drop_guard = cancel.clone().drop_guard();
+async fn timeout_wait(
+    token: CancellationToken,
+    handle: InterruptHandle,
+    timeout: Duration,
+    queue: &'static str,
+) {
+    let start = Instant::now();
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            trace!("conn dropped before timeout");
+            histogram!("corro.sqlite.pool.execution.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
+            return;
+        },
+        _ = tokio::time::sleep(timeout) => {
+            warn!("conn execution timed out, interrupting!");
+        }
+    }
+    handle.interrupt();
+    increment_counter!("corro.sqlite.pool.execution.timeout");
+    // FIXME: do we need to cancel the token?
+}
 
-    if let Err(_e) = tx.send(drop_guard) {
+async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
+    let cancel = CancellationToken::new();
+
+    if let Err(_e) = tx.send(cancel.clone()) {
         error!("could not send back drop guard for pooled conn, oneshot channel likely closed");
         return;
     }

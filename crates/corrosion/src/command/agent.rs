@@ -121,6 +121,22 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
         tripwire,
     )?;
 
+    if !config.schema_paths.is_empty() {
+        let client = corro_client::CorrosionApiClient::new(config.api_addr);
+
+        match client
+            .schema_from_paths(config.schema_paths.as_slice())
+            .await
+        {
+            Ok(res) => {
+                info!("Applied schema in {:?}s", res.time);
+            }
+            Err(e) => {
+                error!("could not apply schema: {e}");
+            }
+        }
+    }
+
     tripwire_worker.await;
 
     wait_for_all_pending_handles().await;

@@ -13,7 +13,6 @@ use corro_types::broadcast::{ChangeV1, Changeset, Message};
 use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1,
 };
-use futures::stream::{FusedStream, FuturesUnordered};
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use metrics::{counter, increment_counter};
 use rusqlite::{params, Connection};
@@ -423,8 +422,6 @@ pub async fn peer_api_v1_sync_post(
 //     recv_count: usize,
 // }
 
-const MAX_BUFFERED_FUTS: usize = 100;
-
 pub async fn bidirectional_sync(
     agent: &Agent,
     sync_state: SyncStateV1,
@@ -465,7 +462,7 @@ pub async fn bidirectional_sync(
                 Ok(_) => {}
             }
 
-            counter!("corro.sync.server.chunk.sent.bytes", buf_len as u64);
+            counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
         }
     });
 
@@ -511,71 +508,27 @@ pub async fn bidirectional_sync(
 
     let mut count = 0;
 
-    let mut futs = FuturesUnordered::new();
-
-    loop {
-        enum Branch {
-            Framed(BytesMut),
-            Done(Option<SyncRecvError>),
-        }
-
-        let branch = tokio::select! {
-            biased;
-
-            maybe_buf_res = framed.next() => match maybe_buf_res {
-                None => Branch::Done(None),
-                Some(Ok(buf_res)) => Branch::Framed(buf_res),
-                Some(Err(e)) => Branch::Done(Some(SyncRecvError::from(e)))
-            },
-
-            maybe_res = futs.next(), if !futs.is_terminated() => match maybe_res {
-                Some(Err(e)) => return Err(SyncRecvError::from(e).into()),
-                _ => continue,
-            }
-        };
-
-        let recv_error = match branch {
-            Branch::Framed(mut buf) => match SyncMessage::from_buf(&mut buf) {
-                Ok(msg) => {
-                    let len = match msg {
-                        SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
-                            let len = change.len();
-                            futs.push(async { process_single_version(agent, change).await });
-                            len
-                        }
-                        SyncMessage::V1(SyncMessageV1::State(_)) => {
-                            warn!("received sync state message more than once, ignoring");
-                            continue;
-                        }
-                    };
-                    count += len;
-
-                    if futs.len() >= MAX_BUFFERED_FUTS {
-                        // drain futures a bit...
-                        while let Some(res) = futs.next().await {
-                            if let Err(e) = res {
-                                return Err(SyncRecvError::from(e).into());
-                            }
-                        }
+    while let Some(buf_res) = framed.next().await {
+        let mut buf = buf_res.map_err(SyncRecvError::from)?;
+        match SyncMessage::from_buf(&mut buf) {
+            Ok(msg) => {
+                let len = match msg {
+                    SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
+                        let len = change.len();
+                        process_single_version(agent, change)
+                            .await
+                            .map_err(SyncRecvError::from)?;
+                        len
                     }
-                    continue;
-                }
-                Err(e) => Some(SyncRecvError::from(e)),
-            },
-            Branch::Done(e) => e,
-        };
-
-        while let Some(res) = futs.next().await {
-            if let Err(e) = res {
-                return Err(SyncRecvError::from(e).into());
+                    SyncMessage::V1(SyncMessageV1::State(_)) => {
+                        warn!("received sync state message more than once, ignoring");
+                        continue;
+                    }
+                };
+                count += len;
             }
+            Err(e) => return Err(SyncRecvError::from(e).into()),
         }
-
-        if let Some(e) = recv_error {
-            return Err(e.into());
-        }
-
-        break;
     }
 
     Ok(count)

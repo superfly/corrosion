@@ -23,8 +23,8 @@ use rusqlite::params;
 use strum::EnumDiscriminants;
 use tokio::{
     net::UdpSocket,
-    sync::mpsc::{channel, Receiver, Sender},
-    task::block_in_place,
+    sync::mpsc::{self, channel, Receiver, Sender},
+    task::{block_in_place, LocalSet},
     time::{interval, MissedTickBehavior},
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
@@ -49,6 +49,55 @@ pub const EFFECTIVE_HTTP_BROADCAST_SIZE: usize = HTTP_BROADCAST_SIZE - 1;
 const BIG_PAYLOAD_THRESHOLD: usize = 32 * 1024;
 
 pub type ClientPool = hyper::Client<HttpConnector, hyper::Body>;
+
+#[derive(Clone)]
+struct TimerSpawner {
+    send: mpsc::UnboundedSender<(Duration, Timer<Actor>)>,
+}
+
+impl TimerSpawner {
+    pub fn new(timer_tx: mpsc::Sender<(Timer<Actor>, Instant)>) -> Self {
+        let (send, mut recv) = mpsc::unbounded_channel();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        std::thread::spawn({
+            let timer_tx = timer_tx.clone();
+            move || {
+                let local = LocalSet::new();
+
+                local.spawn_local(async move {
+                    while let Some((duration, timer)) = recv.recv().await {
+                        let seq = Instant::now() + duration;
+
+                        let timer_tx = timer_tx.clone();
+                        tokio::task::spawn_local(async move {
+                            tokio::time::sleep(duration).await;
+                            timer_tx.send((timer, seq)).await.ok();
+                        });
+                    }
+                    // If the while loop returns, then all the LocalSpawner
+                    // objects have been dropped.
+                });
+
+                // This will return once all senders are dropped and all
+                // spawned tasks have returned.
+                rt.block_on(local);
+            }
+        });
+
+        Self { send }
+    }
+
+    pub fn spawn(&self, task: (Duration, Timer<Actor>)) {
+        self.send
+            .send(task)
+            .expect("Thread with LocalSet has shut down.");
+    }
+}
 
 pub fn runtime_loop(
     actor: Actor,
@@ -83,14 +132,11 @@ pub fn runtime_loop(
         DispatchRuntime::new(to_send_tx, to_schedule_tx, notifications_tx);
 
     let (timer_tx, mut timer_rx) = channel(10);
+    let timer_spawner = TimerSpawner::new(timer_tx);
+
     tokio::spawn(async move {
         while let Some((duration, timer)) = to_schedule_rx.recv().await {
-            let timer_tx = timer_tx.clone();
-            let seq = Instant::now();
-            tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
-                timer_tx.send((timer, seq)).await.ok();
-            });
+            timer_spawner.spawn((duration, timer));
         }
     });
 
