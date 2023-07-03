@@ -1903,7 +1903,6 @@ pub mod tests {
     use super::*;
 
     use corro_types::{
-        agent::reload,
         api::{RqliteResponse, RqliteResult, Statement},
         change::SqliteValue,
         filters::{ChangeEvent, OwnedAggregateChange},
@@ -2232,12 +2231,33 @@ pub mod tests {
                             )
                             .await?;
 
-                        Ok::<_, eyre::Report>(res)
+                        if res.status() != StatusCode::OK {
+                            eyre::bail!("unexpected status code: {}", res.status());
+                        }
+
+                        let body: RqliteResponse =
+                            serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+
+                        for (i, statement) in statements.iter().enumerate() {
+                            if !matches!(
+                                body.results[i],
+                                RqliteResult::Execute {
+                                    rows_affected: 1,
+                                    ..
+                                }
+                            ) {
+                                eyre::bail!(
+                                    "unexpected rqlite result for statement {i}: {statement:?}"
+                                );
+                            }
+                        }
+
+                        Ok::<_, eyre::Report>(())
                     })
                 }
             })
             .try_buffer_unordered(10)
-            .try_collect::<Vec<hyper::Response<hyper::Body>>>()
+            .try_collect::<Vec<()>>()
             .await?;
             Ok::<_, eyre::Report>(())
         });
@@ -2487,64 +2507,6 @@ pub mod tests {
                     .collect::<rusqlite::Result<Vec<_>>>()?;
 
         println!("changes: {changes:#?}");
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn reloading() -> eyre::Result<()> {
-        _ = tracing_subscriber::fmt::try_init();
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-        let ta = launch_test_agent(
-            |conf| conf.api_addr("127.0.0.1:0".parse().unwrap()).build(),
-            tripwire.clone(),
-        )
-        .await?;
-
-        let dir = tempfile::tempdir()?;
-        tokio::fs::write(
-            dir.path().join("test2.sql"),
-            br#"CREATE TABLE IF NOT EXISTS consul_checks (
-            node TEXT NOT NULL DEFAULT "",
-            id TEXT NOT NULL DEFAULT "",
-            service_id TEXT NOT NULL DEFAULT "",
-            service_name TEXT NOT NULL DEFAULT "",
-            name TEXT NOT NULL DEFAULT "",
-            status TEXT,
-            output TEXT NOT NULL DEFAULT "",
-            updated_at BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (node, id)
-        ) WITHOUT ROWID;
-        
-        CREATE INDEX consul_checks_node_id_updated_at ON consul_checks (node, id, updated_at);"#,
-        )
-        .await?;
-
-        let mut conf: Config = ta.agent.config().as_ref().clone();
-        conf.schema_paths
-            .push(dir.path().display().to_string().into());
-
-        assert!(ta
-            .agent
-            .schema()
-            .read()
-            .tables
-            .get("consul_checks")
-            .is_none());
-
-        reload(&ta.agent, conf).await?;
-
-        assert!(ta
-            .agent
-            .schema()
-            .read()
-            .tables
-            .get("consul_checks")
-            .is_some());
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;

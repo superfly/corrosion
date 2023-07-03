@@ -8,10 +8,7 @@ use corro_types::{
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use spawn::wait_for_all_pending_handles;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    signal::unix::SignalKind,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -19,9 +16,6 @@ use uuid::Uuid;
 use crate::VERSION;
 
 pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> {
-    // do this first!
-    let mut hangup = tokio::signal::unix::signal(SignalKind::hangup())?;
-
     let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
     println!("tracing-filter directives: {directives}");
     let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
@@ -83,35 +77,6 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
         .await
         .expect("could not start agent");
 
-    tokio::spawn({
-        let agent = agent.clone();
-        let config_path = config_path.clone();
-        let mut tripwire = tripwire.clone();
-        async move {
-            loop {
-                tokio::select! {
-                    _ = hangup.recv() => {},
-                    _ = &mut tripwire => {
-                        break;
-                    }
-                }
-                info!("Reloading config from '{}'", config_path);
-
-                let new_conf = match Config::load(config_path.as_str()) {
-                    Ok(conf) => conf,
-                    Err(e) => {
-                        error!("could not load new config: {e}");
-                        continue;
-                    }
-                };
-
-                if let Err(e) = corro_types::agent::reload(&agent, new_conf).await {
-                    error!("could not reload config: {e}");
-                }
-            }
-        }
-    });
-
     corro_admin::start_server(
         agent,
         AdminConfig {
@@ -123,7 +88,6 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
 
     if !config.schema_paths.is_empty() {
         let client = corro_client::CorrosionApiClient::new(config.api_addr);
-
         match client
             .schema_from_paths(config.schema_paths.as_slice())
             .await

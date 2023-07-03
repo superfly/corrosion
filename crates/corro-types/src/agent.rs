@@ -20,7 +20,6 @@ use tokio::{
         mpsc::{channel, Sender},
         oneshot,
     },
-    task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{error, trace, warn};
@@ -31,7 +30,7 @@ use crate::{
     broadcast::{BroadcastInput, Timestamp},
     config::Config,
     pubsub::Subscribers,
-    schema::{apply_schema, NormalizedSchema, SchemaError},
+    schema::NormalizedSchema,
     sqlite::{CrConnManager, SqlitePool},
 };
 
@@ -374,48 +373,6 @@ impl<'a> DerefMut for WriteConn<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ReloadError {
-    #[error(transparent)]
-    Schema(#[from] SchemaError),
-    #[error(transparent)]
-    Pool(#[from] PoolError),
-}
-
-pub async fn reload(agent: &Agent, new_conf: Config) -> Result<(), ReloadError> {
-    let old_conf = agent.config();
-
-    if old_conf.db_path != new_conf.db_path {
-        warn!("reloaded ineffectual change: db_path");
-    }
-    if old_conf.gossip_addr != new_conf.gossip_addr {
-        warn!("reloaded ineffectual change: gossip_addr");
-    }
-    if old_conf.api_addr != new_conf.api_addr {
-        warn!("reloaded ineffectual change: api_addr");
-    }
-    if old_conf.metrics_addr != new_conf.metrics_addr {
-        warn!("reloaded ineffectual change: metrics_addr");
-    }
-    if old_conf.bootstrap != new_conf.bootstrap {
-        warn!("reloaded ineffectual change: bootstrap");
-    }
-    if old_conf.log != new_conf.log {
-        warn!("reloaded ineffectual change: log_format");
-    }
-
-    let mut conn = agent.pool().write_normal().await?;
-    let mut schema_write = agent.0.schema.write();
-
-    let new_schema =
-        block_in_place(|| apply_schema(&mut conn, &new_conf.schema_paths, &schema_write))?;
-
-    agent.set_config(new_conf);
-    *schema_write = new_schema;
-
-    Ok(())
 }
 
 #[derive(Clone, Eq, PartialEq)]

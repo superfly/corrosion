@@ -649,6 +649,7 @@ name = "corro-tests"
 version = "0.1.0"
 dependencies = [
  "corro-agent",
+ "corro-client",
  "corro-types",
  "eyre",
  "tempfile",
