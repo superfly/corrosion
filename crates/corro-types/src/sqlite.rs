@@ -108,13 +108,14 @@ impl ManageConnection for CrConnManager {
         Ok(CrConn(conn))
     }
 
-    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+    #[inline]
+    async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Self::Error> {
         // Matching bb8-postgres, we'll try to run a trivial query here. Using
         // block_in_place() gives better behaviour if the SQLite call blocks for
         // some reason, but means that we depend on the tokio multi-threaded
         // runtime being active. (We can't use spawn_blocking() here because
         // Connection isn't Sync.)
-        tokio::task::block_in_place(|| conn.execute("SELECT 1", []))?;
+        // tokio::task::block_in_place(|| conn.execute_batch("SELECT 1"))?;
         Ok(())
     }
 
