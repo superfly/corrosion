@@ -11,7 +11,6 @@ use axum::{
 };
 use corro_types::{
     agent::Agent,
-    broadcast::Timestamp,
     change::Change,
     filters::{match_expr, parse_expr, AggregateChange},
     pubsub::{
@@ -31,8 +30,6 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{debug, error, info, trace, warn};
 use tripwire::Tripwire;
 
-use crate::api::http::make_broadcastable_changes;
-
 #[derive(Debug, thiserror::Error)]
 pub enum SubscribeError {
     #[error(transparent)]
@@ -48,7 +45,6 @@ fn add_subscriber(
     sub: Subscriber,
     id: SubscriptionId,
     filter: Option<SubscriptionFilter>,
-    is_priority: bool,
 ) {
     trace!("add subscription");
     let conn_subs = {
@@ -66,56 +62,9 @@ fn add_subscriber(
     increment_counter!("corro.subscriptions.update.count", "id" => id.to_string());
     let updated_at = agent.clock().new_timestamp();
 
-    let filter_input = filter.as_ref().map(|filter| filter.input().to_owned());
-
     {
         let mut sub = conn_subs.write();
-        sub.insert(
-            id.clone(),
-            SubscriptionInfo {
-                filter,
-                is_priority,
-                updated_at,
-            },
-        );
-    }
-
-    if is_priority {
-        if let Some(filter) = filter_input.clone() {
-            let agent = agent.clone();
-            let id = id.clone();
-
-            tokio::spawn(async move {
-                let actor_id = agent.actor_id();
-                let res = make_broadcastable_changes(&agent, |tx| {
-                    tx.prepare_cached(
-                        "
-                    INSERT INTO __corro_subs (actor_id, id, filter, active, ts)
-                        VALUES (?,?,?,?,?)
-                        ON CONFLICT (actor_id, id) DO UPDATE SET
-                            filter = excluded.filter,
-                            active = excluded.active,
-                            ts = excluded.ts
-                        WHERE excluded.filter != filter
-                           OR excluded.active != active;",
-                    )?
-                    .execute(params![
-                        actor_id,
-                        id.as_str(),
-                        filter,
-                        true,
-                        Timestamp::from(updated_at)
-                    ])?;
-
-                    Ok(())
-                })
-                .await;
-
-                if let Err(e) = res {
-                    error!("could not insert subscription in sql: {e}");
-                }
-            });
-        }
+        sub.insert(id.clone(), SubscriptionInfo { filter, updated_at });
     }
 }
 
@@ -157,7 +106,6 @@ pub async fn api_v1_subscribe_post(
                 },
                 id,
                 Some(filter),
-                true,
             );
             (StatusCode::OK, Json(json!({"ok": true})))
         }
@@ -248,18 +196,7 @@ async fn handle_socket(
                             id,
                             where_clause: filter,
                             from_db_version,
-                            is_priority,
                         } => {
-                            if filter.is_none() && is_priority {
-                                _ = tx.send(SubscriptionMessage::Event {
-                                    id,
-                                    event: SubscriptionEvent::Error {
-                                        error: "can't broadcast interest for 'everything' filter"
-                                            .into(),
-                                    },
-                                });
-                                continue;
-                            }
                             let filter = match filter
                                 .map(|f| {
                                     parse_expr(f.as_str())
@@ -306,7 +243,6 @@ async fn handle_socket(
                                             id,
                                             filter,
                                             from_db_version,
-                                            is_priority,
                                             tx,
                                         },
                                         &agent,
@@ -327,25 +263,14 @@ async fn handle_socket(
                                     },
                                     id,
                                     filter,
-                                    is_priority,
                                 );
                             }
                         }
                         Subscription::Remove { id } => {
                             let map = agent.subscribers().read();
-                            let should_update = if let Some(subs) = map.get(&sub_id) {
+                            if let Some(subs) = map.get(&sub_id) {
                                 let mut subs = subs.write();
-                                if let Some(info) = subs.remove(&id) {
-                                    info.is_priority
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
-                            if should_update {
-                                // TODO: deactivate subscriber (aka soft-delete)
-                                // update_actor_subscriptions(&subscribers, &update_tx);
+                                _ = subs.remove(&id);
                             }
                         }
                     }
@@ -383,38 +308,15 @@ async fn handle_socket(
 
     debug!("subscriber with sub id: {sub_id} is done");
 
-    let to_delete = {
+    {
         let mut subscribers = agent.subscribers().write();
-        subscribers.remove(&sub_id).clone()
-    };
-
-    if let Some(subs) = to_delete {
-        let now = Timestamp::from(agent.clock().new_timestamp());
-        let res = make_broadcastable_changes(&agent, |tx| {
-            if let Some((subs, _)) = subs.read().as_local() {
-                for (id, info) in subs.iter() {
-                    if info.is_priority {
-                        tx.prepare_cached(
-                        "UPDATE __corro_subs SET active = ?, ts = ? WHERE actor_id = ? AND id = ?",
-                    )?
-                    .execute(params![false, now, agent.actor_id(), id.as_str()])?;
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await;
-
-        if let Err(e) = res {
-            error!("could not clean up subs: {e}");
-        }
+        subscribers.remove(&sub_id);
     }
 }
 
 struct CatchUp {
     id: SubscriptionId,
     filter: Option<SubscriptionFilter>,
-    is_priority: bool,
     from_db_version: i64,
     tx: UnboundedSender<SubscriptionMessage>,
 }
@@ -427,7 +329,6 @@ async fn catch_up_subscriber(
     let CatchUp {
         id,
         filter,
-        is_priority,
         from_db_version,
         tx,
     } = catch_up;
@@ -509,7 +410,6 @@ async fn catch_up_subscriber(
         },
         id,
         filter,
-        is_priority,
     );
 
     Ok(())

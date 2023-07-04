@@ -1855,22 +1855,6 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
             
                 PRIMARY KEY (tbl_name, type, name)
             ) WITHOUT ROWID;
-
-            -- all subscriptions ever
-            CREATE TABLE __corro_subs (
-                actor_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-            
-                filter TEXT NOT NULL DEFAULT "",
-                active INTEGER NOT NULL DEFAULT 1,
-
-                ts TEXT,
-            
-                PRIMARY KEY (actor_id, id)
-            ) WITHOUT ROWID;
-
-            -- that's how we'll propagate subscription changes
-            SELECT crsql_as_crr('__corro_subs');
         "#,
     )?;
 
@@ -2353,7 +2337,6 @@ pub mod tests {
                 id: id.clone(),
                 where_clause: Some("tbl_name = 'testsblob'".into()),
                 from_db_version: None,
-                is_priority: true,
             })
             .unwrap(),
         ))

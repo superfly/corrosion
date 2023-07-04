@@ -126,6 +126,7 @@ pub enum SupportedExpr {
     BinaryAnd(Box<SupportedExpr>, Box<SupportedExpr>),
     BinaryOr(Box<SupportedExpr>, Box<SupportedExpr>),
     Parenthesized(Vec<SupportedExpr>),
+    ParenthesizedAnd(Vec<SupportedExpr>),
     InList {
         list: Vec<SupportedExpr>,
         not: bool,
@@ -662,6 +663,7 @@ pub fn match_expr(expr: &SupportedExpr, agg: &AggregateChange) -> bool {
         }
         SupportedExpr::BinaryOr(a, b) => match_expr(a.as_ref(), agg) || match_expr(b.as_ref(), agg),
         SupportedExpr::Parenthesized(exprs) => exprs.iter().any(|expr| match_expr(expr, agg)),
+        SupportedExpr::ParenthesizedAnd(exprs) => exprs.iter().all(|expr| match_expr(expr, agg)),
         SupportedExpr::InList { list, not } => {
             let any_matched = list.iter().any(|expr| match_expr(expr, agg));
             (!*not && any_matched) || (*not && !any_matched)

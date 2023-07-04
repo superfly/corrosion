@@ -190,7 +190,6 @@ impl CorrosionApiClient {
             id: SubscriptionId(id.into()),
             where_clause,
             from_db_version: None,
-            is_priority: false,
         })
         .await?;
         sub.flush().await?;
