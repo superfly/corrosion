@@ -1329,7 +1329,7 @@ pub async fn process_single_version(
                     )?
                     .execute(params![
                         change.table.as_str(),
-                        change.pk.as_str(),
+                        change.pk,
                         change.cid.as_str(),
                         &change.val,
                         change.col_version,
@@ -1435,7 +1435,7 @@ pub async fn process_single_version(
                 )?
                 .execute(params![
                     change.table.as_str(),
-                    change.pk.as_str(),
+                    change.pk,
                     change.cid.as_str(),
                     &change.val,
                     change.col_version,
@@ -1821,7 +1821,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
             -- buffered changes (similar schema as crsql_changes)
             CREATE TABLE __corro_buffered_changes (
                 "table" TEXT NOT NULL,
-                pk TEXT NOT NULL,
+                pk BLOB NOT NULL,
                 cid TEXT NOT NULL,
                 val ANY, -- shouldn't matter I don't think
                 col_version INTEGER NOT NULL,
