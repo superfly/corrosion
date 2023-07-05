@@ -9,10 +9,11 @@ use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion, SplitPool},
     api::{QueryResultBuilder, RqliteResponse, RqliteResult, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
+    change::row_to_change,
     schema::{make_schema_inner, parse_sql},
 };
 use hyper::StatusCode;
-use rusqlite::{params, params_from_iter, Row, ToSql, Transaction};
+use rusqlite::{params, params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::task::block_in_place;
 use tracing::{error, info, trace};
@@ -35,19 +36,6 @@ pub const MAX_CHANGES_PER_MESSAGE: usize = 50;
 //     transaction: Option<bool>,
 //     q: Option<String>,
 // }
-
-pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
-    Ok(Change {
-        table: row.get(0)?,
-        pk: row.get(1)?,
-        cid: row.get(2)?,
-        val: row.get(3)?,
-        col_version: row.get(4)?,
-        db_version: row.get(5)?,
-        seq: row.get(6)?,
-        site_id: row.get(7)?,
-    })
-}
 
 pub struct ChunkedChanges<I> {
     iter: I,

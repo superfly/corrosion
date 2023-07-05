@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     actor::ActorId,
-    change::{Change, SqliteValue},
+    change::{Change, SqliteValue, SqliteValueRef},
     schema::{NormalizedSchema, Type},
 };
 
@@ -456,7 +456,7 @@ pub struct AggregateChange<'a> {
     #[serde(rename = "type")]
     pub evt_type: ChangeEvent,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub data: HashMap<&'a str, SqliteValue>,
+    pub data: HashMap<&'a str, SqliteValueRef<'a>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -471,36 +471,8 @@ pub struct OwnedAggregateChange {
     pub data: HashMap<String, SqliteValue>,
 }
 
-type PrimaryKey<'a> = HashMap<&'a str, SqliteValue>;
+type PrimaryKey<'a> = HashMap<&'a str, SqliteValueRef<'a>>;
 type OwnedPrimaryKey = HashMap<String, SqliteValue>;
-
-fn split_pk(pk: &str) -> Vec<SqliteValue> {
-    let mut iter = pk.split('|').peekable();
-
-    let mut keys = vec![];
-
-    let mut last_key = String::new();
-    while let Some(s) = iter.next() {
-        if last_key.is_empty() {
-            last_key.push_str(s);
-        } else {
-            last_key.push('|');
-            last_key.push_str(s);
-        }
-        if let Some(key) = parse_sqlite_quoted_str(last_key.as_str()) {
-            keys.push(key);
-            last_key.clear();
-        }
-    }
-    if !last_key.is_empty() {
-        if let Some(key) = parse_sqlite_quoted_str(last_key.as_str()) {
-            keys.push(key)
-        } else {
-            error!("unparsable str for sql value: {last_key}");
-        }
-    }
-    keys
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum UnpackError {
@@ -532,9 +504,8 @@ impl ColumnType {
     }
 }
 
-pub fn unpack_columns(data: &[u8]) -> Result<Vec<SqliteValue>, UnpackError> {
+pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError> {
     let mut ret = vec![];
-    let mut buf = data;
     let num_columns = buf.get_u8();
 
     for _i in 0..num_columns {
@@ -554,23 +525,22 @@ pub fn unpack_columns(data: &[u8]) -> Result<Vec<SqliteValue>, UnpackError> {
                 if buf.remaining() < len {
                     return Err(UnpackError::Abort);
                 }
-                let bytes = buf.copy_to_bytes(len);
-                ret.push(SqliteValue::Blob(bytes.to_vec()));
+                ret.push(SqliteValueRef::Blob(&buf[0..len]));
             }
             Some(ColumnType::Float) => {
                 if buf.remaining() < 8 {
                     return Err(UnpackError::Abort);
                 }
-                ret.push(SqliteValue::Real(buf.get_f64()));
+                ret.push(SqliteValueRef::Real(buf.get_f64()));
             }
             Some(ColumnType::Integer) => {
                 if buf.remaining() < intlen {
                     return Err(UnpackError::Abort);
                 }
-                ret.push(SqliteValue::Integer(buf.get_int(intlen)));
+                ret.push(SqliteValueRef::Integer(buf.get_int(intlen)));
             }
             Some(ColumnType::Null) => {
-                ret.push(SqliteValue::Null);
+                ret.push(SqliteValueRef::Null);
             }
             Some(ColumnType::Text) => {
                 if buf.remaining() < intlen {
@@ -580,9 +550,9 @@ pub fn unpack_columns(data: &[u8]) -> Result<Vec<SqliteValue>, UnpackError> {
                 if buf.remaining() < len {
                     return Err(UnpackError::Abort);
                 }
-                let bytes = buf.copy_to_bytes(len);
-                ret.push(SqliteValue::Text(unsafe {
-                    String::from_utf8_unchecked(bytes.to_vec())
+                // let bytes = buf.copy_to_bytes(len);
+                ret.push(SqliteValueRef::Text(unsafe {
+                    std::str::from_utf8_unchecked(&buf[0..len])
                 }))
             }
             None => return Err(UnpackError::Misuse),
@@ -602,7 +572,7 @@ impl<'a> AggregateChange<'a> {
             pk: self
                 .pk
                 .iter()
-                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .map(|(k, v)| ((*k).to_owned(), v.to_owned()))
                 .collect(),
             data: self
                 .data
@@ -625,7 +595,7 @@ impl<'a> AggregateChange<'a> {
             .filter_map(|((table, pk, actor_id), group)| {
                 schema.tables.get(table).and_then(|schema_table| {
                     let pk: PrimaryKey = {
-                        let pk = unpack_columns(pk).ok()?;
+                        let pk = unpack_columns(pk).unwrap();
                         schema_table
                             .pk
                             .iter()
@@ -657,20 +627,7 @@ impl<'a> AggregateChange<'a> {
                         evt_type: change_event,
                         data: match change_event {
                             ChangeEvent::Insert | ChangeEvent::Update => group
-                                .map(|change| {
-                                    (
-                                        change.cid.as_str(),
-                                        match &change.val {
-                                            v @ SqliteValue::Text(ref input) => {
-                                                match parse_sqlite_quoted_str(input) {
-                                                    Some(v) => v,
-                                                    None => v.clone(),
-                                                }
-                                            }
-                                            v => v.clone(),
-                                        },
-                                    )
-                                })
+                                .map(|change| (change.cid.as_str(), change.val.as_ref()))
                                 .collect(),
                             ChangeEvent::Delete => HashMap::new(),
                         },
@@ -847,7 +804,11 @@ pub fn parse_sqlite_quoted_str(input: &str) -> Option<SqliteValue> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{change::Change, schema::parse_sql};
+    use crate::{
+        change::row_to_change,
+        schema::parse_sql,
+        sqlite::{init_cr_conn, CrConn},
+    };
 
     use super::*;
 
@@ -855,87 +816,59 @@ mod tests {
     fn kitchen_sink() {
         _ = tracing_subscriber::fmt::try_init();
 
-        let schema = parse_sql(
-            "
-            CREATE TABLE test (
-                id BIGINT NOT NULL,
-                b TEXT NOT NULL,
-                foo JSON NOT NULL DEFAULT '{}',
-                bar JSONB NOT NULL DEFAULT '{}',
+        let sql = "
+        CREATE TABLE tests (
+            id BIGINT NOT NULL,
+            b TEXT NOT NULL,
+            foo JSON NOT NULL DEFAULT '{}',
+            bar JSONB NOT NULL DEFAULT '{}',
 
-                PRIMARY KEY (id, b)
-            ) WITHOUT ROWID;
-        ",
-        )
-        .unwrap();
+            PRIMARY KEY (id, b)
+        ) WITHOUT ROWID;
+    ";
+
+        let schema = parse_sql(sql).unwrap();
 
         let jsonb = hex::encode(br#"{"foo": "bar"}"#);
 
         let expr = parse_expr(
-            format!(r#"(evt_type = 'insert' AND test.id = 1 AND test.foo = '{{"foo": "bar"}}') OR (evt_type = 'update' AND test.bar = x'{jsonb}')"#)
+            format!(r#"(evt_type = 'insert' AND tests.id = 1 AND tests.foo = '{{"foo": "bar"}}') OR (evt_type = 'update' AND tests.bar = x'{jsonb}')"#)
                 .as_str(),
         )
         .unwrap();
 
-        println!("expr: {expr:#?}");
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_cr_conn(&mut conn).unwrap();
+        let conn1 = CrConn(conn);
 
-        let actor1 = Uuid::new_v4();
-        let actor2 = Uuid::new_v4();
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_cr_conn(&mut conn).unwrap();
+        let conn2 = CrConn(conn);
 
-        let changes = vec![
-            // insert
-            Change {
-                table: "test".into(),
-                pk: "'1'|'hello'".into(),
-                cid: "id".into(),
-                val: crate::change::SqliteValue::Integer(1),
-                col_version: 1,
-                db_version: 123,
-                seq: 0,
-                site_id: actor1.into_bytes(),
-            },
-            Change {
-                table: "test".into(),
-                pk: "'1'|'hello'".into(),
-                cid: "b".into(),
-                val: crate::change::SqliteValue::Text("hello".into()),
-                col_version: 1,
-                db_version: 123,
-                seq: 1,
-                site_id: actor1.into_bytes(),
-            },
-            Change {
-                table: "test".into(),
-                pk: "'1'|'hello'".into(),
-                cid: "foo".into(),
-                val: crate::change::SqliteValue::Text(r#"{"foo": "bar"}"#.into()),
-                col_version: 1,
-                db_version: 123,
-                seq: 2,
-                site_id: actor1.into_bytes(),
-            },
-            Change {
-                table: "test".into(),
-                pk: "'1'|'hello'".into(),
-                cid: "bar".into(),
-                val: crate::change::SqliteValue::Text("{}".into()),
-                col_version: 1,
-                db_version: 123,
-                seq: 3,
-                site_id: actor1.into_bytes(),
-            },
-            // update
-            Change {
-                table: "test".into(),
-                pk: "'2'|'hello'".into(),
-                cid: "bar".into(),
-                val: crate::change::SqliteValue::Blob(br#"{"foo": "bar"}"#.to_vec()),
-                col_version: 2,
-                db_version: 123,
-                seq: 4,
-                site_id: actor2.into_bytes(),
-            },
-        ];
+        conn1.execute_batch(sql).unwrap();
+        conn1
+            .execute_batch("SELECT crsql_as_crr('tests');")
+            .unwrap();
+
+        conn2.execute_batch(sql).unwrap();
+        conn2
+            .execute_batch("SELECT crsql_as_crr('tests');")
+            .unwrap();
+
+        conn1
+            .prepare(r#"INSERT INTO tests (id, b, foo) VALUES (1, 'hello', '{"foo": "bar"}');"#)
+            .unwrap()
+            .execute([])
+            .unwrap();
+
+        let mut prepped = conn1.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
+        let rows = prepped.query_map([1], row_to_change).unwrap();
+
+        let mut changes = vec![];
+
+        for row in rows {
+            changes.push(row.unwrap());
+        }
 
         let aggs = AggregateChange::from_changes(changes.iter(), &schema, 1);
         println!("aggs: {aggs:#?}");
@@ -951,43 +884,5 @@ mod tests {
                 serde_json::to_string_pretty(&agg.to_owned()).unwrap()
             );
         }
-    }
-
-    #[test]
-    fn unquoting() {
-        let pk = "'hell|hell'|1.2345|NULL|'world'|X'010203'|123456|'some''string'";
-
-        assert_eq!(
-            dbg!(split_pk(pk)),
-            vec![
-                SqliteValue::Text("hell|hell".to_owned()),
-                SqliteValue::Real(1.2345),
-                SqliteValue::Null,
-                SqliteValue::Text("world".into()),
-                SqliteValue::Blob(vec![1, 2, 3]),
-                SqliteValue::Integer(123456),
-                SqliteValue::Text("some'string".into()),
-            ],
-        );
-
-        let tests = vec!["'mystring'", "123456", "1.23456", "X'010203'", "NULL"];
-
-        let parsed = tests
-            .into_iter()
-            .filter_map(|s| parse_sqlite_quoted_str(s))
-            .collect::<Vec<_>>();
-
-        println!("parsed: {parsed:?}");
-
-        assert_eq!(
-            parsed,
-            vec![
-                SqliteValue::Text("mystring".into()),
-                SqliteValue::Integer(123456),
-                SqliteValue::Real(1.23456),
-                SqliteValue::Blob(vec![1, 2, 3]),
-                SqliteValue::Null
-            ]
-        );
     }
 }

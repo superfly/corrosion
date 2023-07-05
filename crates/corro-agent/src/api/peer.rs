@@ -10,6 +10,7 @@ use axum::{extract::RawBody, Extension};
 use bytes::{Buf, BytesMut};
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
 use corro_types::broadcast::{ChangeV1, Changeset, Message};
+use corro_types::change::row_to_change;
 use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1,
 };
@@ -24,7 +25,7 @@ use tokio_util::io::StreamReader;
 use tracing::{debug, error, trace, warn};
 
 use crate::agent::{handle_broadcast, process_single_version, PayloadKind, SyncRecvError};
-use crate::api::http::{row_to_change, ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
+use crate::api::http::{ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
 
 use corro_types::{
     actor::ActorId,

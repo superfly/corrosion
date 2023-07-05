@@ -5,7 +5,7 @@ use std::{
 
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
-    ToSql,
+    Row, ToSql,
 };
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
@@ -22,6 +22,19 @@ pub struct Change {
     pub db_version: i64,
     pub seq: i64,
     pub site_id: [u8; 16],
+}
+
+pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
+    Ok(Change {
+        table: row.get(0)?,
+        pk: row.get(1)?,
+        cid: row.get(2)?,
+        val: row.get(3)?,
+        col_version: row.get(4)?,
+        db_version: row.get(5)?,
+        seq: row.get(6)?,
+        site_id: row.get(7)?,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
