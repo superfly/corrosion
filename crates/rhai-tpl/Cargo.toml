@@ -1,0 +1,15 @@
+[package]
+name = "rhai-tpl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rhai = { version = "1.15.1" }
+logos = { version = "0.13.0" }
+enquote = { workspace = true }
+thiserror = { workspace = true }
+hostname = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

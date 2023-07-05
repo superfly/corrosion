@@ -162,6 +162,7 @@ async fn main() -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Template(_) => todo!(),
     }
 
     Ok(())
@@ -271,6 +272,9 @@ enum Command {
     /// Sync-related commands
     #[command(subcommand)]
     Sync(SyncCommand),
+
+    #[command(subcommand)]
+    Template(TemplateCommand),
 }
 
 #[derive(Subcommand)]
@@ -284,3 +288,6 @@ enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
 }
+
+#[derive(Subcommand)]
+enum TemplateCommand {}
