@@ -1,5 +1,6 @@
 use std::{cmp::Ordering, collections::HashMap, ops::Deref};
 
+use bytes::Buf;
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use itertools::Itertools;
@@ -501,6 +502,96 @@ fn split_pk(pk: &str) -> Vec<SqliteValue> {
     keys
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum UnpackError {
+    #[error("abort")]
+    Abort,
+    #[error("misuse")]
+    Misuse,
+}
+
+#[derive(PartialEq, Debug)]
+pub enum ColumnType {
+    Integer = 1,
+    Float = 2,
+    Text = 3,
+    Blob = 4,
+    Null = 5,
+}
+
+impl ColumnType {
+    fn from_u8(u: u8) -> Option<Self> {
+        Some(match u {
+            1 => Self::Integer,
+            2 => Self::Float,
+            3 => Self::Text,
+            4 => Self::Blob,
+            5 => Self::Null,
+            _ => return None,
+        })
+    }
+}
+
+pub fn unpack_columns(data: &[u8]) -> Result<Vec<SqliteValue>, UnpackError> {
+    let mut ret = vec![];
+    let mut buf = data;
+    let num_columns = buf.get_u8();
+
+    for _i in 0..num_columns {
+        if !buf.has_remaining() {
+            return Err(UnpackError::Abort);
+        }
+        let column_type_and_maybe_intlen = buf.get_u8();
+        let column_type = ColumnType::from_u8(column_type_and_maybe_intlen & 0x07);
+        let intlen = (column_type_and_maybe_intlen >> 3 & 0xFF) as usize;
+
+        match column_type {
+            Some(ColumnType::Blob) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                let len = buf.get_int(intlen) as usize;
+                if buf.remaining() < len {
+                    return Err(UnpackError::Abort);
+                }
+                let bytes = buf.copy_to_bytes(len);
+                ret.push(SqliteValue::Blob(bytes.to_vec()));
+            }
+            Some(ColumnType::Float) => {
+                if buf.remaining() < 8 {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValue::Real(buf.get_f64()));
+            }
+            Some(ColumnType::Integer) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValue::Integer(buf.get_int(intlen)));
+            }
+            Some(ColumnType::Null) => {
+                ret.push(SqliteValue::Null);
+            }
+            Some(ColumnType::Text) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                let len = buf.get_int(intlen) as usize;
+                if buf.remaining() < len {
+                    return Err(UnpackError::Abort);
+                }
+                let bytes = buf.copy_to_bytes(len);
+                ret.push(SqliteValue::Text(unsafe {
+                    String::from_utf8_unchecked(bytes.to_vec())
+                }))
+            }
+            None => return Err(UnpackError::Misuse),
+        }
+    }
+
+    Ok(ret)
+}
+
 impl<'a> AggregateChange<'a> {
     pub fn to_owned(&self) -> OwnedAggregateChange {
         OwnedAggregateChange {
@@ -526,15 +617,15 @@ impl<'a> AggregateChange<'a> {
         schema: &'a NormalizedSchema,
         version: i64,
     ) -> Vec<Self> {
-        let grouped =
-            changes.group_by(|change| (change.table.as_str(), change.pk.as_str(), change.site_id));
+        let grouped = changes
+            .group_by(|change| (change.table.as_str(), change.pk.as_slice(), change.site_id));
 
         grouped
             .into_iter()
             .filter_map(|((table, pk, actor_id), group)| {
                 schema.tables.get(table).and_then(|schema_table| {
                     let pk: PrimaryKey = {
-                        let pk = split_pk(pk);
+                        let pk = unpack_columns(pk).ok()?;
                         schema_table
                             .pk
                             .iter()

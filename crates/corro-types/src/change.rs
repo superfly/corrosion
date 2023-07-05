@@ -15,7 +15,7 @@ use crate::filters::parse_sqlite_quoted_str;
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
 pub struct Change {
     pub table: String,
-    pub pk: String,
+    pub pk: Vec<u8>,
     pub cid: String,
     pub val: SqliteValue,
     pub col_version: i64,
