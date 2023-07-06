@@ -766,44 +766,6 @@ fn match_lit_value<T: PartialEq + PartialOrd + ?Sized>(
     }
 }
 
-pub fn parse_sqlite_quoted_str(input: &str) -> Option<SqliteValue> {
-    use nom::{
-        bytes::complete::{escaped_transform, tag, take_while},
-        character::complete::none_of,
-        combinator::{map_parser, map_res, recognize},
-        multi::{many0, separated_list0},
-        sequence::delimited,
-        AsChar, IResult,
-    };
-
-    fn parse_quoted_blob(input: &str) -> IResult<&str, Vec<u8>> {
-        let decoder = map_res(take_while(AsChar::is_hex_digit), hex::decode);
-        delimited(tag("X'"), decoder, tag("'"))(input)
-    }
-
-    fn parse_quoted_text(input: &str) -> IResult<&str, String> {
-        let seq = recognize(separated_list0(tag("''"), many0(none_of("'"))));
-        let unquote = escaped_transform(none_of("'"), '\'', tag("'"));
-        let res = delimited(tag("'"), map_parser(seq, unquote), tag("'"))(input)?;
-
-        Ok(res)
-    }
-
-    Some(if let Ok(i) = input.parse::<i64>() {
-        SqliteValue::Integer(i)
-    } else if let Ok(f) = input.parse::<f64>() {
-        SqliteValue::Real(f)
-    } else if input == "NULL" {
-        SqliteValue::Null
-    } else if let Ok((_, v)) = parse_quoted_blob(input) {
-        SqliteValue::Blob(v)
-    } else {
-        return parse_quoted_text(input)
-            .map(|(_, s)| SqliteValue::Text(s))
-            .ok();
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{

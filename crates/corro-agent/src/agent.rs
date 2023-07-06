@@ -2369,7 +2369,7 @@ pub mod tests {
                     version: 1,
                     evt_type: ChangeEvent::Insert,
                     table: "testsblob".into(),
-                    pk: vec![(String::from("id"), SqliteValue::Blob(vec![1, 2, 3]))]
+                    pk: vec![(String::from("id"), SqliteValue::Blob(vec![1, 2, 3].into()))]
                         .into_iter()
                         .collect(),
                     data: vec![(String::from("text"), SqliteValue::Text("hello".into()))]

@@ -252,28 +252,28 @@ pub fn upsert_service_statements(
     updated_at: i64,
 ) -> eyre::Result<()> {
     // run this by corrosion so it's part of the same transaction
-    statements.push(Statement::WithParams(vec![
-        "INSERT INTO __corro_consul_services ( id, hash )
-            VALUES (?, ?)
-            ON CONFLICT (id) DO UPDATE SET
-                hash = excluded.hash;"
-            .into(),
+    statements.push(Statement::WithParams("INSERT INTO __corro_consul_services ( id, hash )
+    VALUES (?, ?)
+    ON CONFLICT (id) DO UPDATE SET
+        hash = excluded.hash;"
+    .into(),vec![
+        
         svc.id.clone().into(),
         hash.to_be_bytes().to_vec().into(),
     ]));
 
     // upsert!
-    statements.push(Statement::WithParams(vec![
-        "INSERT INTO consul_services ( node, id, name, tags, meta, port, address, updated_at )
-        VALUES (?,?,?,?,?,?,?,?)
-        ON CONFLICT(node, id) DO UPDATE SET
-            name = excluded.name,
-            tags = excluded.tags,
-            meta = excluded.meta,
-            port = excluded.port,
-            address = excluded.address,
-            updated_at = excluded.updated_at;"
-            .into(),
+    statements.push(Statement::WithParams("INSERT INTO consul_services ( node, id, name, tags, meta, port, address, updated_at )
+    VALUES (?,?,?,?,?,?,?,?)
+    ON CONFLICT(node, id) DO UPDATE SET
+        name = excluded.name,
+        tags = excluded.tags,
+        meta = excluded.meta,
+        port = excluded.port,
+        address = excluded.address,
+        updated_at = excluded.updated_at;"
+        .into(),vec![
+        
         node.into(),
         svc.id.into(),
         svc.name.into(),
@@ -295,28 +295,28 @@ pub fn upsert_check_statements(
     updated_at: i64,
 ) -> eyre::Result<()> {
     // run this by corrosion so it's part of the same transaction
-    statements.push(Statement::WithParams(vec![
-        "INSERT INTO __corro_consul_checks ( id, hash )
-            VALUES (?, ?)
-            ON CONFLICT (id) DO UPDATE SET
-                hash = excluded.hash;"
-            .into(),
+    statements.push(Statement::WithParams("INSERT INTO __corro_consul_checks ( id, hash )
+    VALUES (?, ?)
+    ON CONFLICT (id) DO UPDATE SET
+        hash = excluded.hash;"
+    .into(),vec![
+        
         check.id.clone().into(),
         hash.to_be_bytes().to_vec().into(),
     ]));
 
     // upsert!
-    statements.push(Statement::WithParams(vec![
-        "INSERT INTO consul_checks ( node, id, service_id, service_name, name, status, output, updated_at )
-        VALUES (?,?,?,?,?,?,?,?)
-        ON CONFLICT(node, id) DO UPDATE SET
-            service_id = excluded.service_id,
-            service_name = excluded.service_name,
-            name = excluded.name,
-            status = excluded.status,
-            output = excluded.output,
-            updated_at = excluded.updated_at;"
-            .into(),
+    statements.push(Statement::WithParams("INSERT INTO consul_checks ( node, id, service_id, service_name, name, status, output, updated_at )
+    VALUES (?,?,?,?,?,?,?,?)
+    ON CONFLICT(node, id) DO UPDATE SET
+        service_id = excluded.service_id,
+        service_name = excluded.service_name,
+        name = excluded.name,
+        status = excluded.status,
+        output = excluded.output,
+        updated_at = excluded.updated_at;"
+        .into(),vec![
+        
         node.into(),
         check.id.into(),
         check.service_id.into(),
@@ -379,12 +379,12 @@ pub async fn update_consul_services(
     }
 
     for id in to_delete.iter() {
-        statements.push(Statement::WithParams(vec![
-            "DELETE FROM __corro_consul_services WHERE id = ?;".into(),
+        statements.push(Statement::WithParams("DELETE FROM __corro_consul_services WHERE id = ?;".into(),vec![
+            
             (*id).clone().into(),
         ]));
-        statements.push(Statement::WithParams(vec![
-            "DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),
+        statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),vec![
+            
             node.into(),
             (*id).clone().into(),
         ]));
@@ -458,12 +458,12 @@ pub async fn update_consul_checks(
     }
 
     for id in to_delete.iter() {
-        statements.push(Statement::WithParams(vec![
-            "DELETE FROM __corro_consul_checks WHERE id = ?;".into(),
+        statements.push(Statement::WithParams("DELETE FROM __corro_consul_checks WHERE id = ?;".into(),vec![
+            
             (*id).clone().into(),
         ]));
-        statements.push(Statement::WithParams(vec![
-            "DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),
+        statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),vec![
+            
             node.into(),
             (*id).clone().into(),
         ]));

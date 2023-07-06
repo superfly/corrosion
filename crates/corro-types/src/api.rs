@@ -10,7 +10,7 @@ use crate::change::SqliteValue;
 pub enum Statement {
     Simple(String),
     WithNamedParams(String, HashMap<String, SqliteValue>),
-    WithParams(Vec<SqliteValue>),
+    WithParams(String, Vec<SqliteValue>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -43,3 +43,4 @@ tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }
+smallvec = { workspace = true }

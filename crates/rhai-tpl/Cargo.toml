@@ -10,6 +10,7 @@ enquote = { workspace = true }
 thiserror = { workspace = true }
 hostname = { workspace = true }
 tracing = { workspace = true }
+corro-client = { path = "../corro-client" }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

@@ -374,7 +374,7 @@ impl Matcher {
         let mut prepped = conn.prepare_cached(sql)?;
 
         for (i, (_, pk)) in agg.pk.iter().enumerate() {
-            prepped.raw_bind_parameter(i + 1, pk)?;
+            prepped.raw_bind_parameter(i + 1, pk.to_owned())?;
         }
 
         Ok(Some(prepped))
@@ -443,7 +443,12 @@ fn expr_from_pk(table: &str, pk: &str) -> Option<Expr> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{actor::ActorId, change::SqliteValue, filters::ChangeEvent, schema::parse_sql};
+    use crate::{
+        actor::ActorId,
+        change::{SqliteValue, SqliteValueRef},
+        filters::ChangeEvent,
+        schema::parse_sql,
+    };
 
     use super::*;
 
@@ -552,13 +557,13 @@ mod tests {
                     version: 1,
                     table: "consul_services",
                     pk: vec![
-                        ("node", SqliteValue::from("test-hostname")),
-                        ("id", SqliteValue::from("service-1")),
+                        ("node", SqliteValueRef::Text("test-hostname")),
+                        ("id", SqliteValueRef::Text("service-1")),
                     ]
                     .into_iter()
                     .collect(),
                     evt_type: ChangeEvent::Insert,
-                    data: vec![("name", SqliteValue::from("app-prometheus"))]
+                    data: vec![("name", SqliteValueRef::Text("app-prometheus"))]
                         .into_iter()
                         .collect(),
                 },
@@ -581,7 +586,9 @@ mod tests {
                     actor_id: ActorId::default(),
                     version: 2,
                     table: "machines",
-                    pk: vec![("id", SqliteValue::from("m-1"))].into_iter().collect(),
+                    pk: vec![("id", SqliteValueRef::Text("m-1"))]
+                        .into_iter()
+                        .collect(),
                     evt_type: ChangeEvent::Insert,
                     data: Default::default(),
                 },
@@ -604,7 +611,9 @@ mod tests {
                     actor_id: ActorId::default(),
                     version: 3,
                     table: "machines",
-                    pk: vec![("id", SqliteValue::from("m-2"))].into_iter().collect(),
+                    pk: vec![("id", SqliteValueRef::Text("m-2"))]
+                        .into_iter()
+                        .collect(),
                     evt_type: ChangeEvent::Insert,
                     data: Default::default(),
                 },
