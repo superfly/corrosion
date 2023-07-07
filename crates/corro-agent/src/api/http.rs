@@ -147,14 +147,16 @@ where
         )?
         .query_row([db_version], |row| row.get(0))?;
 
-        let last_seq: Option<i64> = if has_changes {
-            tx.prepare_cached(
+        if !has_changes {
+            tx.commit()?;
+            return Ok((ret, start.elapsed()));
+        }
+
+        let last_seq: i64 = tx
+            .prepare_cached(
                 "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
             )?
-            .query_row([db_version], |row| row.get(0))?
-        } else {
-            None
-        };
+            .query_row([db_version], |row| row.get(0))?;
 
         let booked = agent.bookie().for_actor(actor_id);
         // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
@@ -167,15 +169,13 @@ where
         trace!("version: {version}");
 
         let elapsed = {
-            if let Some(last_seq) = last_seq {
-                tx.prepare_cached(
-                    r#"
+            tx.prepare_cached(
+                r#"
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
                     VALUES (?, ?, ?, ?, ?);
             "#,
-                )?
-                .execute(params![actor_id, version, db_version, last_seq, ts])?;
-            }
+            )?
+            .execute(params![actor_id, version, db_version, last_seq, ts])?;
 
             tx.commit()?;
             start.elapsed()
@@ -183,66 +183,63 @@ where
 
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        if let Some(last_seq) = last_seq {
-            book_writer.insert(
-                version,
-                KnownDbVersion::Current {
-                    db_version,
-                    last_seq,
-                    ts,
-                },
-            );
+        book_writer.insert(
+            version,
+            KnownDbVersion::Current {
+                db_version,
+                last_seq,
+                ts,
+            },
+        );
 
-            let agent = agent.clone();
+        let agent = agent.clone();
 
-            spawn_counted(async move {
-                let conn = agent.pool().read().await?;
+        spawn_counted(async move {
+            let conn = agent.pool().read().await?;
 
-                block_in_place(|| {
-                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#)?;
-                    let rows = prepped.query_map([db_version], row_to_change)?;
-                    let mut chunked =
-                        ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_PER_MESSAGE);
-                    while let Some(changes_seqs) = chunked.next() {
-                        match changes_seqs {
-                            Ok((changes, seqs)) => {
-                                process_subs(&agent, &changes, db_version);
+            block_in_place(|| {
+                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#)?;
+                let rows = prepped.query_map([db_version], row_to_change)?;
+                let mut chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_PER_MESSAGE);
+                while let Some(changes_seqs) = chunked.next() {
+                    match changes_seqs {
+                        Ok((changes, seqs)) => {
+                            process_subs(&agent, &changes, db_version);
 
-                                trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
+                            trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
-                                let tx_bcast = agent.tx_bcast().clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = tx_bcast
-                                        .send(BroadcastInput::AddBroadcast(Message::V1(
-                                            MessageV1::Change(ChangeV1 {
-                                                actor_id,
-                                                changeset: Changeset::Full {
-                                                    version,
-                                                    changes,
-                                                    seqs,
-                                                    last_seq,
-                                                    ts,
-                                                },
-                                            }),
-                                        )))
-                                        .await
-                                    {
-                                        error!("could not send change message for broadcast: {e}");
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                                break;
-                            }
+                            let tx_bcast = agent.tx_bcast().clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tx_bcast
+                                    .send(BroadcastInput::AddBroadcast(Message::V1(
+                                        MessageV1::Change(ChangeV1 {
+                                            actor_id,
+                                            changeset: Changeset::Full {
+                                                version,
+                                                changes,
+                                                seqs,
+                                                last_seq,
+                                                ts,
+                                            },
+                                        }),
+                                    )))
+                                    .await
+                                {
+                                    error!("could not send change message for broadcast: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                            break;
                         }
                     }
-                    Ok::<_, rusqlite::Error>(())
-                })?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })?;
 
-                Ok::<_, eyre::Report>(())
-            });
-        }
+            Ok::<_, eyre::Report>(())
+        });
 
         Ok::<_, ChangeError>((ret, elapsed))
     })

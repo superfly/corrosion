@@ -1423,6 +1423,8 @@ pub async fn process_single_version(
 
             let mut impactful_changeset = vec![];
 
+            let mut last_rows_impacted = 0;
+
             for change in changes {
                 trace!("inserting change! {change:?}");
                 tx.prepare_cached(
@@ -1447,18 +1449,21 @@ pub async fn process_single_version(
                     .prepare_cached("SELECT crsql_rows_impacted()")?
                     .query_row((), |row| row.get(0))?;
 
-                debug!(actor = %agent.actor_id(), "inserted {rows_impacted} into crsql_changes");
-                if rows_impacted > 0 {
+                if rows_impacted > last_rows_impacted {
+                    debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
                     impactful_changeset.push(change);
                 }
+                last_rows_impacted = rows_impacted;
             }
 
             debug!(
-                "inserting bookkeeping row: {}, start: {}, end: {:?}, ts: {:?}",
+                "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?}",
                 actor_id, version, db_version, ts
             );
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
+
+            debug!("inserted bookkeeping row");
 
             let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
                 (KnownDbVersion::Cleared, Changeset::Empty { versions }, None)
@@ -1482,16 +1487,21 @@ pub async fn process_single_version(
 
             tx.commit()?;
 
+            debug!("committed transaction");
+
             Ok::<_, rusqlite::Error>((known_version, new_changeset, db_version))
         })?;
 
         booked_write.insert_many(changeset.versions(), known_version);
+        debug!("inserted into in-memory bookkeeping");
+
         (db_version, changeset)
     };
 
     if let Some(db_version) = db_version {
         process_subs(agent, changeset.changes(), db_version);
     }
+    debug!("processed subscriptions, if any!");
 
     Ok(Some(changeset))
 }
