@@ -2367,14 +2367,28 @@ dependencies = [
 name = "rhai-tpl"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "compact_str 0.7.0",
  "corro-client",
+ "corro-tests",
+ "corro-types",
  "enquote",
+ "futures",
+ "hex",
  "hostname",
+ "hyper",
+ "indexmap",
  "logos",
  "rhai",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "tripwire",
 ]
 
 [[package]]

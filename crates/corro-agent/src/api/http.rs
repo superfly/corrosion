@@ -8,7 +8,7 @@ use bytes::{BufMut, BytesMut};
 use compact_str::{CompactString, ToCompactString};
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
-    api::{RqliteResponse, RqliteResult, Statement},
+    api::{QueryResult, RqliteResponse, RqliteResult, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{row_to_change, SqliteValue},
     schema::{make_schema_inner, parse_sql},
@@ -348,13 +348,6 @@ pub enum QueryError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum QueryResult {
-    Row(Vec<SqliteValue>),
-    Error(CompactString),
-}
-
 pub async fn api_v1_db_query(
     Extension(agent): Extension<Agent>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
@@ -436,6 +429,18 @@ pub async fn api_v1_db_query(
 
         block_in_place(|| {
             let col_count = prepped.column_count();
+
+            if let Err(e) = data_tx.blocking_send(QueryResult::Columns(
+                prepped
+                    .columns()
+                    .into_iter()
+                    .map(|col| col.name().to_compact_string())
+                    .collect(),
+            )) {
+                error!("could not send back columns: {e}");
+                return;
+            }
+
             let mut rows = match prepped.query(()) {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -594,8 +599,10 @@ pub async fn api_v1_db_schema(
 #[cfg(test)]
 mod tests {
     use arc_swap::ArcSwap;
-    use corro_types::{actor::ActorId, config::Config, schema::Type, sqlite::CrConnManager};
+    use corro_types::{actor::ActorId, config::Config, schema::SqliteType, sqlite::CrConnManager};
+    use futures::StreamExt;
     use tokio::sync::mpsc::{channel, error::TryRecvError};
+    use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
     use uuid::Uuid;
 
@@ -604,7 +611,7 @@ mod tests {
     use crate::agent::migrate;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn rqlite_db_execute() -> eyre::Result<()> {
+    async fn test_api_db_execute() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
 
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
@@ -710,6 +717,129 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_api_db_query() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
+        let dir = tempfile::tempdir()?;
+
+        let rw_pool = bb8::Pool::builder()
+            .max_size(1)
+            .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
+
+        {
+            let mut conn = rw_pool.get().await?;
+            migrate(&mut conn)?;
+        }
+
+        let (tx_bcast, _rx_bcast) = channel(1);
+        let (tx_apply, _rx_apply) = channel(1);
+
+        let agent = Agent::new(corro_types::agent::AgentConfig {
+            actor_id: ActorId(Uuid::new_v4()),
+            ro_pool: bb8::Pool::builder()
+                .max_size(1)
+                .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite"))),
+            rw_pool,
+            config: ArcSwap::from_pointee(
+                Config::builder()
+                    .db_path(dir.path().join("corrosion.db").display().to_string())
+                    .gossip_addr("127.0.0.1:1234".parse()?)
+                    .api_addr("127.0.0.1:8080".parse()?)
+                    .build()?,
+            ),
+            gossip_addr: "127.0.0.1:0".parse().unwrap(),
+            api_addr: "127.0.0.1:0".parse().unwrap(),
+            members: Default::default(),
+            clock: Default::default(),
+            bookie: Default::default(),
+            subscribers: Default::default(),
+            tx_bcast,
+            tx_apply,
+            schema: Default::default(),
+            tripwire,
+        });
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        let (status_code, body) = api_v1_db_execute(
+            Extension(agent.clone()),
+            axum::Json(vec![
+                Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id".into(), "service-name".into()],
+                ),
+                Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-2".into(), "service-name-2".into()],
+                ),
+            ]),
+        )
+        .await;
+
+        // println!("{body:?}");
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        assert!(body.0.results.len() == 2);
+
+        let res = api_v1_db_query(
+            Extension(agent.clone()),
+            axum::Json(Statement::Simple("select * from tests".into())),
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut body = res.into_body();
+
+        let mut lines = LinesCodec::new();
+
+        let mut buf = BytesMut::new();
+
+        buf.extend_from_slice(&body.next().await.unwrap()?);
+
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        let cols: QueryResult = serde_json::from_str(&s).unwrap();
+
+        assert_eq!(cols, QueryResult::Columns(vec!["id".into(), "text".into()]));
+
+        buf.extend_from_slice(&body.next().await.unwrap()?);
+
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        let row: QueryResult = serde_json::from_str(&s).unwrap();
+
+        assert_eq!(
+            row,
+            QueryResult::Row(vec!["service-id".into(), "service-name".into()])
+        );
+
+        buf.extend_from_slice(&body.next().await.unwrap()?);
+
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        let row: QueryResult = serde_json::from_str(&s).unwrap();
+
+        assert_eq!(
+            row,
+            QueryResult::Row(vec!["service-id-2".into(), "service-name-2".into()])
+        );
+
+        assert!(body.next().await.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_schema() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
@@ -773,13 +903,13 @@ mod tests {
 
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
-            assert_eq!(id_col.sql_type, Type::Integer);
+            assert_eq!(id_col.sql_type, SqliteType::Integer);
             assert_eq!(id_col.nullable, true);
             assert_eq!(id_col.primary_key, true);
 
             let foo_col = tests.columns.get("foo").unwrap();
             assert_eq!(foo_col.name, "foo");
-            assert_eq!(foo_col.sql_type, Type::Text);
+            assert_eq!(foo_col.sql_type, SqliteType::Text);
             assert_eq!(foo_col.nullable, true);
             assert_eq!(foo_col.primary_key, false);
         }
@@ -803,13 +933,13 @@ mod tests {
 
         let id_col = tests.columns.get("id").unwrap();
         assert_eq!(id_col.name, "id");
-        assert_eq!(id_col.sql_type, Type::Integer);
+        assert_eq!(id_col.sql_type, SqliteType::Integer);
         assert_eq!(id_col.nullable, true);
         assert_eq!(id_col.primary_key, true);
 
         let foo_col = tests.columns.get("foo").unwrap();
         assert_eq!(foo_col.name, "foo");
-        assert_eq!(foo_col.sql_type, Type::Text);
+        assert_eq!(foo_col.sql_type, SqliteType::Text);
         assert_eq!(foo_col.nullable, true);
         assert_eq!(foo_col.primary_key, false);
 
@@ -820,13 +950,13 @@ mod tests {
 
         let id_col = tests.columns.get("id").unwrap();
         assert_eq!(id_col.name, "id");
-        assert_eq!(id_col.sql_type, Type::Integer);
+        assert_eq!(id_col.sql_type, SqliteType::Integer);
         assert_eq!(id_col.nullable, true);
         assert_eq!(id_col.primary_key, true);
 
         let foo_col = tests.columns.get("foo").unwrap();
         assert_eq!(foo_col.name, "foo");
-        assert_eq!(foo_col.sql_type, Type::Text);
+        assert_eq!(foo_col.sql_type, SqliteType::Text);
         assert_eq!(foo_col.nullable, true);
         assert_eq!(foo_col.primary_key, false);
 

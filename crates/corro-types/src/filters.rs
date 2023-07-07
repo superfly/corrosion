@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     actor::ActorId,
     change::{Change, SqliteValue, SqliteValueRef},
-    schema::{NormalizedSchema, Type},
+    schema::{NormalizedSchema, SqliteType},
 };
 
 const CORRO_EVENT: &str = "evt_type";
@@ -25,7 +25,7 @@ const CORRO_ACTOR: &str = "actor_id";
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: String,
-    pub sql_type: Type,
+    pub sql_type: SqliteType,
     pub primary_key: bool,
     pub nullable: bool,
 }

@@ -7,6 +7,7 @@ use std::{
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
 use rusqlite::{Connection, Transaction};
+use serde::{Deserialize, Serialize};
 use sqlite3_parser::ast::{
     Cmd, ColumnConstraint, ColumnDefinition, CreateTableBody, Expr, Name, NamedTableConstraint,
     QualifiedName, SortedColumn, Stmt, TableConstraint, TableOptions, ToTokens,
@@ -16,7 +17,7 @@ use tracing::{debug, info};
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct NormalizedColumn {
     pub name: String,
-    pub sql_type: Type,
+    pub sql_type: SqliteType,
     pub nullable: bool,
     pub default_value: Option<String>,
     pub generated: Option<String>,
@@ -43,8 +44,9 @@ impl fmt::Display for NormalizedColumn {
 
 /// SQLite data types.
 /// See [Fundamental Datatypes](https://sqlite.org/c3ref/c_blob.html).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Type {
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqliteType {
     /// NULL
     Null,
     /// 64-bit signed integer
@@ -668,7 +670,7 @@ fn prepare_table(
                             .as_deref()
                         {
                             // 1. If the declared type contains the string "INT" then it is assigned INTEGER affinity.
-                            Some(s) if s.contains("INT") => Type::Integer,
+                            Some(s) if s.contains("INT") => SqliteType::Integer,
                             // 2. If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
                             Some(s)
                                 if s.contains("CHAR")
@@ -676,12 +678,12 @@ fn prepare_table(
                                     || s.contains("TEXT")
                                     || s == "JSON" =>
                             {
-                                Type::Text
+                                SqliteType::Text
                             }
 
                             // 3. If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
-                            Some(s) if s.contains("BLOB") || s == "JSONB" => Type::Blob,
-                            None => Type::Blob,
+                            Some(s) if s.contains("BLOB") || s == "JSONB" => SqliteType::Blob,
+                            None => SqliteType::Blob,
 
                             // 4. If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
                             Some(s)
@@ -690,11 +692,11 @@ fn prepare_table(
                                     || s.contains("DOUB")
                                     || s == "ANY" =>
                             {
-                                Type::Real
+                                SqliteType::Real
                             }
 
                             // 5. Otherwise, the affinity is NUMERIC.
-                            Some(_s) => Type::Real,
+                            Some(_s) => SqliteType::Real,
                         },
                         primary_key,
                         nullable,

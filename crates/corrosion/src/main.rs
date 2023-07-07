@@ -1,16 +1,18 @@
 use std::net::SocketAddr;
 
 use admin::AdminConn;
+use bytes::BytesMut;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use corro_client::CorrosionApiClient;
 use corro_types::{
-    api::{RqliteResult, Statement},
+    api::{QueryResult, RqliteResult, Statement},
     config::{default_admin_path, Config},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
+use tokio_util::codec::{Decoder, LinesCodec};
 
 pub mod admin;
 pub mod command;
@@ -44,53 +46,38 @@ async fn main() -> eyre::Result<()> {
             columns: show_columns,
             timer,
         } => {
-            let res = cli
+            let mut body = cli
                 .api_client()
-                .query(&[Statement::Simple(query.clone())])
+                .query(&Statement::Simple(query.clone()))
                 .await?;
 
-            for res in res.results {
+            let mut lines = LinesCodec::new();
+
+            let mut buf = BytesMut::new();
+
+            loop {
+                buf.extend_from_slice(&body.next().await.unwrap()?);
+                let s = lines.decode(&mut buf).unwrap().unwrap();
+                let res: QueryResult = serde_json::from_str(&s)?;
+
                 match res {
-                    RqliteResult::QueryAssociative { rows, time, .. } => {
-                        for row in rows {
-                            println!(
-                                "{}",
-                                row.values()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("|")
-                            );
-                        }
-                        if let Some(elapsed) = timer.then_some(time).flatten() {
-                            println!("Run Time: real {elapsed}");
-                        }
-                    }
-                    RqliteResult::Query {
-                        values,
-                        time,
-                        columns,
-                        ..
-                    } => {
+                    QueryResult::Columns(cols) => {
                         if *show_columns {
-                            println!("{}", columns.join("|"));
-                        }
-                        for row in values {
-                            println!(
-                                "{}",
-                                row.iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("|")
-                            );
-                        }
-                        if let Some(elapsed) = timer.then_some(time).flatten() {
-                            println!("Run Time: real {elapsed}");
+                            println!("{}", cols.join("|"));
                         }
                     }
-                    RqliteResult::Error { error } => {
-                        eprintln!("Error: {error}");
+                    QueryResult::Row(row) => {
+                        println!(
+                            "{}",
+                            row.iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        );
                     }
-                    _ => {}
+                    QueryResult::Error(e) => {
+                        eyre::bail!("{e}");
+                    }
                 }
             }
         }
