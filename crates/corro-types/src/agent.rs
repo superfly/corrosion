@@ -29,12 +29,14 @@ use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, Timestamp},
     config::Config,
-    pubsub::Subscribers,
+    pubsub::{MatcherSub, Subscribers},
     schema::NormalizedSchema,
     sqlite::{CrConnManager, SqlitePool},
 };
 
 use super::members::Members;
+
+pub type Matchers = HashMap<uuid::Uuid, MatcherSub>;
 
 #[derive(Clone)]
 pub struct Agent(Arc<AgentInner>);
@@ -67,6 +69,7 @@ pub struct AgentInner {
     clock: Arc<uhlc::HLC>,
     bookie: Bookie,
     subscribers: Subscribers,
+    matchers: RwLock<Matchers>,
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
     schema: RwLock<NormalizedSchema>,
@@ -84,6 +87,7 @@ impl Agent {
             clock: config.clock,
             bookie: config.bookie,
             subscribers: config.subscribers,
+            matchers: RwLock::new(HashMap::new()),
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             schema: config.schema,
@@ -131,6 +135,10 @@ impl Agent {
 
     pub fn schema(&self) -> &RwLock<NormalizedSchema> {
         &self.0.schema
+    }
+
+    pub fn matchers(&self) -> &RwLock<Matchers> {
+        &self.0.matchers
     }
 
     pub fn db_path(&self) -> Utf8PathBuf {

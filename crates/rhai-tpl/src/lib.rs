@@ -3,13 +3,13 @@ use std::sync::{Arc, RwLock};
 
 use bytes::BytesMut;
 use compact_str::CompactString;
+use corro_types::api::QueryResult;
 use corro_types::api::Statement;
 use corro_types::change::SqliteValue;
-use corro_types::{api::QueryResult, schema::SqliteType};
 use futures::StreamExt;
 use indexmap::IndexMap;
 use logos::Logos;
-use rhai::{EvalAltResult, Map, Shared};
+use rhai::{EvalAltResult, Map};
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
 use tokio_util::codec::{Decoder, LinesCodec};
@@ -606,7 +606,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_basic() {
         _ = tracing_subscriber::fmt::try_init();
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let (tripwire, _, _) = Tripwire::new_simple();
 
         let tmpdir = tempfile::tempdir().unwrap();
         let filepath = tmpdir.path().join("output");
@@ -665,7 +665,7 @@ tail",
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_sql() {
         _ = tracing_subscriber::fmt::try_init();
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let (tripwire, _, _) = Tripwire::new_simple();
 
         let ta = launch_test_agent(|conf| conf.build(), tripwire.clone())
             .await

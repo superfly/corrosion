@@ -34,7 +34,7 @@ impl CorrosionApiClient {
     pub async fn query(&self, statement: &Statement) -> Result<hyper::Body, Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/db/query", self.api_addr))
+            .uri(format!("http://{}/v1/queries", self.api_addr))
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statement)?))?;
@@ -51,7 +51,7 @@ impl CorrosionApiClient {
     pub async fn execute(&self, statements: &[Statement]) -> Result<RqliteResponse, Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/db/execute?transaction", self.api_addr))
+            .uri(format!("http://{}/v1/transactions", self.api_addr))
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statements)?))?;

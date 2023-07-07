@@ -20,11 +20,12 @@ use sqlite3_parser::{
     ast::{As, Cmd, Expr, Id, Name, OneSelect, Operator, SelectTable, Stmt},
     lexer::sql::Parser,
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing::trace;
 use uhlc::Timestamp;
 
 use crate::{
+    change::SqliteValue,
     filters::{parse_expr, AggregateChange, OwnedAggregateChange, SupportedExpr},
     schema::{NormalizedSchema, NormalizedTable},
 };
@@ -242,9 +243,14 @@ impl FromStr for SubscriptionFilter {
     }
 }
 
-#[derive(Debug)]
+pub struct MatcherSub {
+    pub matcher: Matcher,
+    pub tx: mpsc::Sender<Vec<SqliteValue>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Matcher {
-    pub statements: HashMap<String, String>,
+    pub statements: Arc<HashMap<String, String>>,
 }
 
 impl Matcher {
@@ -356,7 +362,13 @@ impl Matcher {
             statements.insert(tbl_name, Cmd::Stmt(stmt).to_string());
         }
 
-        Ok(Self { statements })
+        Ok(Self {
+            statements: Arc::new(statements),
+        })
+    }
+
+    pub fn has_match(&self, agg: &AggregateChange) -> bool {
+        self.statements.contains_key(agg.table)
     }
 
     pub fn changed_stmt<'a>(

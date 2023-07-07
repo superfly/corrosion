@@ -1,9 +1,18 @@
 use std::{
+    convert::Infallible,
     ops::RangeInclusive,
     time::{Duration, Instant},
 };
 
-use axum::Extension;
+use async_trait::async_trait;
+use axum::{
+    extract::FromRequestParts,
+    response::{
+        sse::{Event, KeepAlive},
+        IntoResponse, Sse,
+    },
+    Extension, TypedHeader,
+};
 use bytes::{BufMut, BytesMut};
 use compact_str::{CompactString, ToCompactString};
 use corro_types::{
@@ -11,14 +20,23 @@ use corro_types::{
     api::{QueryResult, RqliteResponse, RqliteResult, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{row_to_change, SqliteValue},
+    pubsub::{Matcher, MatcherSub},
     schema::{make_schema_inner, parse_sql},
 };
-use hyper::StatusCode;
+use futures::StreamExt;
+use hyper::{
+    header::AsHeaderName,
+    http::{request::Parts, HeaderName, HeaderValue},
+    StatusCode,
+};
 use rusqlite::{params, params_from_iter, ToSql, Transaction};
 use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
 use tokio::{
-    sync::{mpsc::channel, oneshot},
+    sync::{
+        mpsc::{self, channel},
+        oneshot,
+    },
     task::block_in_place,
 };
 use tracing::{error, info, trace};
@@ -268,7 +286,7 @@ fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usi
     }
 }
 
-pub async fn api_v1_db_execute(
+pub async fn api_v1_transactions(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Extension(agent): Extension<Agent>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
@@ -348,10 +366,38 @@ pub enum QueryError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
-pub async fn api_v1_db_query(
-    Extension(agent): Extension<Agent>,
-    axum::extract::Json(stmt): axum::extract::Json<Statement>,
-) -> hyper::Response<hyper::Body> {
+pub struct AcceptHeader(Option<HeaderValue>);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for AcceptHeader
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(parts.headers.get("accept").cloned()))
+    }
+}
+
+enum QueriesResponse<S> {
+    Rows(hyper::Response<hyper::Body>),
+    Watch(S),
+}
+
+impl<S> IntoResponse for QueriesResponse<S>
+where
+    S: IntoResponse,
+{
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            QueriesResponse::Rows(a) => a.into_response(),
+            QueriesResponse::Watch(b) => b.into_response(),
+        }
+    }
+}
+
+async fn build_query_rows_response(agent: &Agent, stmt: Statement) -> hyper::Response<hyper::Body> {
     let (mut tx, body) = hyper::Body::channel();
 
     let (res_tx, res_rx) = oneshot::channel();
@@ -514,6 +560,72 @@ pub async fn api_v1_db_query(
         .expect("could not build body")
 }
 
+pub async fn api_v1_queries(
+    Extension(agent): Extension<Agent>,
+    AcceptHeader(accept): AcceptHeader,
+    axum::extract::Json(stmt): axum::extract::Json<Statement>,
+) -> impl IntoResponse {
+    let wants_event_stream = match accept {
+        Some(header) => header == "text/event-stream",
+        _ => false,
+    };
+
+    if !wants_event_stream {
+        return QueriesResponse::Rows(build_query_rows_response(&agent, stmt).await);
+    }
+
+    let stmt = match stmt {
+        Statement::Simple(s) => s,
+        _ => {
+            return QueriesResponse::Rows(
+                hyper::Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(
+                        serde_json::to_vec(&QueryResult::Error(
+                            "only simple statements (no params) are accepted for streaming".into(),
+                        ))
+                        .expect("could not serialize queries stream error")
+                        .into(),
+                    )
+                    .expect("could not build error response"),
+            )
+        }
+    };
+
+    let matcher = match Matcher::new(&agent.schema().read(), &stmt) {
+        Ok(m) => m,
+        Err(e) => {
+            return QueriesResponse::Rows(
+                hyper::Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(
+                        serde_json::to_vec(&QueryResult::Error(e.to_compact_string()))
+                            .expect("could not serialize queries stream error")
+                            .into(),
+                    )
+                    .expect("could not build error response"),
+            )
+        }
+    };
+
+    let (tx, rx) = mpsc::channel(128);
+
+    let id = uuid::Uuid::new_v4();
+    {
+        agent
+            .matchers()
+            .write()
+            .insert(id, MatcherSub { matcher, tx });
+    }
+
+    QueriesResponse::Watch(
+        Sse::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx)
+                .map(|row| Event::default().json_data(QueryResult::Row(row))),
+        ), // .keep_alive(KeepAlive::default()),
+    )
+}
+
 async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
     let new_sql: String = statements.join(";");
 
@@ -599,8 +711,10 @@ pub async fn api_v1_db_schema(
 #[cfg(test)]
 mod tests {
     use arc_swap::ArcSwap;
+    use bytes::Bytes;
     use corro_types::{actor::ActorId, config::Config, schema::SqliteType, sqlite::CrConnManager};
-    use futures::StreamExt;
+    use futures::Stream;
+    use http_body::{combinators::UnsyncBoxBody, Body};
     use tokio::sync::mpsc::{channel, error::TryRecvError};
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
@@ -609,6 +723,19 @@ mod tests {
     use super::*;
 
     use crate::agent::migrate;
+
+    struct UnsyncBodyStream(std::pin::Pin<Box<UnsyncBoxBody<Bytes, axum::Error>>>);
+
+    impl Stream for UnsyncBodyStream {
+        type Item = Result<Bytes, axum::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.0.as_mut().poll_data(cx)
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_execute() -> eyre::Result<()> {
@@ -663,7 +790,7 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
 
-        let (status_code, body) = api_v1_db_execute(
+        let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
             axum::Json(vec![Statement::WithParams(
                 "insert into tests (id, text) values (?,?)".into(),
@@ -695,7 +822,7 @@ mod tests {
 
         println!("second req...");
 
-        let (status_code, body) = api_v1_db_execute(
+        let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
             axum::Json(vec![Statement::WithParams(
                 "update tests SET text = ? where id = ?".into(),
@@ -769,7 +896,7 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
 
-        let (status_code, body) = api_v1_db_execute(
+        let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
             axum::Json(vec![
                 Statement::WithParams(
@@ -790,11 +917,13 @@ mod tests {
 
         assert!(body.0.results.len() == 2);
 
-        let res = api_v1_db_query(
+        let res = api_v1_queries(
             Extension(agent.clone()),
+            AcceptHeader(None),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
-        .await;
+        .await
+        .into_response();
 
         assert_eq!(res.status(), StatusCode::OK);
 
@@ -804,7 +933,7 @@ mod tests {
 
         let mut buf = BytesMut::new();
 
-        buf.extend_from_slice(&body.next().await.unwrap()?);
+        buf.extend_from_slice(&body.data().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -812,7 +941,7 @@ mod tests {
 
         assert_eq!(cols, QueryResult::Columns(vec!["id".into(), "text".into()]));
 
-        buf.extend_from_slice(&body.next().await.unwrap()?);
+        buf.extend_from_slice(&body.data().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -823,7 +952,7 @@ mod tests {
             QueryResult::Row(vec!["service-id".into(), "service-name".into()])
         );
 
-        buf.extend_from_slice(&body.next().await.unwrap()?);
+        buf.extend_from_slice(&body.data().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -834,7 +963,66 @@ mod tests {
             QueryResult::Row(vec!["service-id-2".into(), "service-name-2".into()])
         );
 
-        assert!(body.next().await.is_none());
+        assert!(body.data().await.is_none());
+
+        let res = api_v1_queries(
+            Extension(agent.clone()),
+            AcceptHeader(Some(HeaderValue::from_static("text/event-stream"))),
+            axum::Json(Statement::Simple("select * from tests".into())),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            HeaderValue::from_static("text/event-stream")
+        );
+
+        let mut body = res.into_body();
+
+        let mut lines = LinesCodec::new();
+
+        let mut buf = BytesMut::new();
+
+        let (status_code, _) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::Json(vec![Statement::WithParams(
+                "insert into tests (id, text) values (?,?)".into(),
+                vec!["service-id-3".into(), "service-name-3".into()],
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "data:{\"row\":[\"service-id-3\",\"service-name-3\"]}");
+
+        let (status_code, _) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::Json(vec![Statement::WithParams(
+                "insert into tests (id, text) values (?,?)".into(),
+                vec!["service-id-4".into(), "service-name-4".into()],
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        let s = loop {
+            match lines.decode(&mut buf).unwrap() {
+                Some(s) if !s.is_empty() => break s,
+                _ => {
+                    buf.extend_from_slice(&body.data().await.unwrap()?);
+                }
+            }
+        };
+
+        assert_eq!(s, "data:{\"row\":[\"service-id-4\",\"service-name-4\"]}");
 
         Ok(())
     }

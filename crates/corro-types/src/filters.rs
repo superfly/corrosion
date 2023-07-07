@@ -1,6 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap, ops::Deref};
 
 use bytes::Buf;
+use compact_str::{CompactString, ToCompactString};
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use itertools::Itertools;
@@ -464,12 +465,33 @@ pub struct AggregateChange<'a> {
 pub struct OwnedAggregateChange {
     pub actor_id: ActorId,
     pub version: i64,
-    pub table: String,
+    pub table: CompactString,
     pub pk: OwnedPrimaryKey,
     #[serde(rename = "type")]
     pub evt_type: ChangeEvent,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub data: HashMap<String, SqliteValue>,
+}
+
+impl OwnedAggregateChange {
+    pub fn as_ref(&self) -> AggregateChange {
+        AggregateChange {
+            actor_id: self.actor_id,
+            version: self.version,
+            table: &self.table,
+            pk: self
+                .pk
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_ref()))
+                .collect(),
+            evt_type: self.evt_type,
+            data: self
+                .data
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_ref()))
+                .collect(),
+        }
+    }
 }
 
 type PrimaryKey<'a> = HashMap<&'a str, SqliteValueRef<'a>>;
@@ -569,7 +591,7 @@ impl<'a> AggregateChange<'a> {
             actor_id: self.actor_id,
             version: self.version,
             evt_type: self.evt_type,
-            table: self.table.to_owned(),
+            table: self.table.to_compact_string(),
             pk: self
                 .pk
                 .iter()

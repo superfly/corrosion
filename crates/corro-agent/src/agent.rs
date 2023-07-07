@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     api::{
-        http::{api_v1_db_execute, api_v1_db_query, api_v1_db_schema},
+        http::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
         peer::{bidirectional_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncError},
         pubsub::api_v1_subscribe_ws,
     },
@@ -27,11 +27,11 @@ use corro_types::{
         BroadcastInput, BroadcastSrc, ChangeV1, Changeset, FocaInput, Message, MessageDecodeError,
         MessageV1, Timestamp,
     },
-    change::Change,
+    change::{Change, SqliteValue},
     config::{Config, DEFAULT_GOSSIP_PORT},
     filters::{match_expr, AggregateChange},
     members::{MemberEvent, Members},
-    pubsub::{SubscriptionEvent, SubscriptionMessage},
+    pubsub::{MatcherError, SubscriptionEvent, SubscriptionMessage},
     schema::init_schema,
     sqlite::{init_cr_conn, CrConn, CrConnManager, Migration},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
@@ -623,8 +623,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let api = Router::new()
         .route(
-            "/db/execute",
-            post(api_v1_db_execute).route_layer(
+            "/v1/transactions",
+            post(api_v1_transactions).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -637,8 +637,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             ),
         )
         .route(
-            "/db/query",
-            post(api_v1_db_query).route_layer(
+            "/v1/queries",
+            post(api_v1_queries).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -1518,25 +1518,79 @@ pub fn process_subs(agent: &Agent, changeset: &[Change], db_version: i64) {
     let aggs = AggregateChange::from_changes(changeset.iter(), &schema, db_version);
     trace!("agg changes: {aggs:?}");
     for agg in aggs {
-        let subscribers = agent.subscribers().read();
-        trace!("subs: {subscribers:?}");
-        for (sub, subscriptions) in subscribers.iter() {
-            trace!("looking at sub {sub}");
-            let subs = subscriptions.read();
-            if let Some((subs, sender)) = subs.as_local() {
-                for (id, info) in subs.iter() {
-                    if let Some(filter) = info.filter.as_ref() {
-                        if match_expr(filter, &agg) {
-                            trace!("matched subscriber: {id} w/ info: {info:?}!");
-                            if let Err(e) = sender.send(SubscriptionMessage::Event {
-                                id: id.clone(),
-                                event: SubscriptionEvent::Change(agg.to_owned()),
-                            }) {
-                                error!("could not send sub message: {e}")
+        {
+            let subscribers = agent.subscribers().read();
+            trace!("subs: {subscribers:?}");
+            for (sub, subscriptions) in subscribers.iter() {
+                trace!("looking at sub {sub}");
+                let subs = subscriptions.read();
+                if let Some((subs, sender)) = subs.as_local() {
+                    for (id, info) in subs.iter() {
+                        if let Some(filter) = info.filter.as_ref() {
+                            if match_expr(filter, &agg) {
+                                trace!("matched subscriber: {id} w/ info: {info:?}!");
+                                if let Err(e) = sender.send(SubscriptionMessage::Event {
+                                    id: id.clone(),
+                                    event: SubscriptionEvent::Change(agg.to_owned()),
+                                }) {
+                                    error!("could not send sub message: {e}")
+                                }
                             }
                         }
                     }
                 }
+            }
+        }
+        let matchers = agent.matchers().read();
+        for (_id, matcher_sub) in matchers.iter() {
+            if matcher_sub.matcher.has_match(&agg) {
+                // TODO: optimize this process here, could lead to a lot of tasks
+                let pool = agent.pool().clone();
+                let matcher = matcher_sub.matcher.clone();
+                let tx = matcher_sub.tx.clone();
+                let agg = agg.to_owned();
+                tokio::spawn(async move {
+                    let conn = match pool.read().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("could not get read pool connection for matcher query: {e}");
+                            return;
+                        }
+                    };
+                    let res = block_in_place(|| {
+                        match matcher.changed_stmt(&conn, &agg.as_ref())? {
+                            Some(mut prepped) => {
+                                let col_count = prepped.column_count();
+
+                                let mut rows = prepped.raw_query();
+                                while let Ok(Some(row)) = rows.next() {
+                                    match (0..col_count)
+                                        .map(|i| row.get::<_, SqliteValue>(i))
+                                        .collect::<rusqlite::Result<Vec<_>>>()
+                                    {
+                                        Ok(row) => {
+                                            if let Err(e) = tx.blocking_send(row) {
+                                                error!("could not send back row to matcher sub sender: {e}");
+                                                return Ok(());
+                                            }
+                                            println!("SENT ROW!");
+                                        }
+                                        Err(e) => {
+                                            error!("could not deserialize row's cells: {e}");
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                            }
+                            None => return Ok(()),
+                        }
+
+                        Ok::<_, MatcherError>(())
+                    });
+                    if let Err(e) = res {
+                        error!("could not handle changed stmt: {e}");
+                    }
+                });
             }
         }
     }
@@ -1925,7 +1979,7 @@ pub mod tests {
             client.request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
+                    .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
             ),
@@ -1996,7 +2050,7 @@ pub mod tests {
             .request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
+                    .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
             )
@@ -2074,7 +2128,7 @@ pub mod tests {
             client.request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
+                    .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
             ),
@@ -2207,7 +2261,7 @@ pub mod tests {
                             .request(
                                 hyper::Request::builder()
                                     .method(hyper::Method::POST)
-                                    .uri(format!("http://{chosen}/db/execute?transaction"))
+                                    .uri(format!("http://{chosen}/v1/transactions"))
                                     .header(hyper::header::CONTENT_TYPE, "application/json")
                                     .body(serde_json::to_vec(&statements)?.into())?,
                             )
@@ -2457,7 +2511,7 @@ pub mod tests {
             client.request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
+                    .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
             ),
@@ -2638,7 +2692,7 @@ pub mod tests {
                                 .request(
                                     hyper::Request::builder()
                                         .method(hyper::Method::POST)
-                                        .uri(format!("http://{api_addr}/db/execute?transaction"))
+                                        .uri(format!("http://{api_addr}/v1/transactions"))
                                         .header(hyper::header::CONTENT_TYPE, "application/json")
                                         .body(serde_json::to_vec(&req_body)?.into())?,
                                 )

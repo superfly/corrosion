@@ -54,3 +54,5 @@ uuid = { workspace = true }
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }
 corro-tests = { path = "../corro-tests" }
+http-body = { workspace = true }
+eventsource-stream = { workspace = true }
