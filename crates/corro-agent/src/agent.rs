@@ -465,7 +465,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     Ok(addrs) => {
                         for addr in addrs.iter() {
                             debug!("Bootstrapping w/ {addr}");
-                            foca_tx.send(FocaInput::Announce((*addr).into())).await.ok();
+                            if let Err(e) = foca_tx.send(FocaInput::Announce((*addr).into())).await
+                            {
+                                error!("could not send foca Announce message: {e}");
+                            } else {
+                                debug!("successfully sent announce message");
+                            }
                         }
                     }
                     Err(e) => {

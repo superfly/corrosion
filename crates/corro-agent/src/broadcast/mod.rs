@@ -691,6 +691,7 @@ pub fn runtime_loop(
                 }
             }
         }
+        info!("broadcasts are done");
     });
 }
 
