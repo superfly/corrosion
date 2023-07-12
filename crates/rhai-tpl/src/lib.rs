@@ -12,6 +12,8 @@ use futures::StreamExt;
 use indexmap::IndexMap;
 use logos::Logos;
 use parking_lot::RwLock;
+use rhai::NativeCallContext;
+use rhai::Scope;
 use rhai::{EvalAltResult, Map};
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
@@ -267,9 +269,64 @@ impl QueryHandle {
     }
 }
 
-pub struct SubsequentQueryResponse {
-    id: Uuid,
-    client: CorrosionApiClient,
+#[derive(Clone)]
+pub struct TemplateWriter(Arc<RwLock<Box<dyn Write + Send + Sync + 'static>>>);
+
+impl TemplateWriter {
+    fn write_str(&mut self, data: &str) -> Result<(), Box<EvalAltResult>> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        Ok(self
+            .0
+            .write()
+            .write_all(data.as_bytes())
+            .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?)
+    }
+
+    fn write_char(&mut self, data: char) -> Result<(), Box<EvalAltResult>> {
+        let mut b = [0; 2];
+        let len = data.encode_utf8(&mut b).len();
+        Ok(self
+            .0
+            .write()
+            .write_all(&b[0..len])
+            .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?)
+    }
+
+    fn write_query_to_json(&mut self, res: QueryResponse) -> Result<(), Box<EvalAltResult>> {
+        let mut json_output = JsonOutput::default();
+
+        let mut w = self.0.write();
+
+        json_output.write_rows(&mut *w, res.into_iter())
+    }
+
+    fn write_query_to_json_w_options(
+        &mut self,
+        res: QueryResponse,
+        options: Map,
+    ) -> Result<(), Box<EvalAltResult>> {
+        let mut json_output = {
+            let pretty = options
+                .get("pretty")
+                .and_then(|d| d.as_bool().ok())
+                .unwrap_or(false);
+            let row_values_as_array = options
+                .get("row_values_as_array")
+                .and_then(|d| d.as_bool().ok())
+                .unwrap_or(false);
+
+            JsonOutput {
+                pretty,
+                row_values_as_array,
+            }
+        };
+
+        let mut w = self.0.write();
+
+        json_output.write_rows(&mut *w, res.into_iter())
+    }
 }
 
 pub struct Engine {
@@ -277,36 +334,14 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new<W: Write + Send + Sync + 'static>(
-        writer: Arc<RwLock<W>>,
-        client: corro_client::CorrosionApiClient,
-    ) -> Self {
+    pub fn new(client: corro_client::CorrosionApiClient) -> Self {
         let mut engine = rhai::Engine::new();
 
-        engine.register_fn("__write", {
-            let writer = writer.clone();
-            move |data: &str| -> Result<(), Box<EvalAltResult>> {
-                if data.is_empty() {
-                    return Ok(());
-                }
-                Ok(writer
-                    .write()
-                    .write_all(data.as_bytes())
-                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?)
-            }
-        });
-
-        engine.register_fn("__write", {
-            let writer = writer.clone();
-            move |data: char| -> Result<(), Box<EvalAltResult>> {
-                let mut b = [0; 2];
-                let len = data.encode_utf8(&mut b).len();
-                Ok(writer
-                    .write()
-                    .write_all(&b[0..len])
-                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?)
-            }
-        });
+        engine.register_type::<TemplateWriter>();
+        engine.register_fn("write", TemplateWriter::write_str);
+        engine.register_fn("write", TemplateWriter::write_char);
+        engine.register_fn("write_json", TemplateWriter::write_query_to_json);
+        engine.register_fn("write_json", TemplateWriter::write_query_to_json_w_options);
 
         engine.register_type_with_name::<QueryResponse>("QueryResponse");
         engine.register_iterator_result::<QueryResponse, Row>();
@@ -368,22 +403,6 @@ impl Engine {
             }
         });
 
-        let json_writer = JsonWriter::new(writer.clone());
-
-        engine.register_fn("write_json", {
-            let json_writer = json_writer.clone();
-            move |res: QueryResponse| -> Result<(), Box<EvalAltResult>> {
-                json_writer.write_json(res)
-            }
-        });
-
-        engine.register_fn("write_json", {
-            let json_writer = json_writer.clone();
-            move |res: QueryResponse, options: Map| -> Result<(), Box<EvalAltResult>> {
-                json_writer.write_json_w_options(res, options)
-            }
-        });
-
         engine.register_fn("hostname", || -> Result<String, Box<EvalAltResult>> {
             Ok(hostname::get()
                 .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?
@@ -427,7 +446,7 @@ impl Engine {
                 }
                 Tag::Output => {
                     trace!("OUTPUT: {content:?}");
-                    program.push_str("__write(`${");
+                    program.push_str("__tpl_writer.write(`${");
                     program.push_str(content);
                     program.push_str("}`);\n");
                 }
@@ -456,78 +475,16 @@ fn rhai_enquote(program: &mut String, text: &str, strip_newline: bool) {
     if !text.is_empty() {
         trace!("enquoting: {text:?}");
         if text == "\n" {
-            program.push_str("__write('\\n');\n");
+            program.push_str("__tpl_writer.write('\\n');\n");
         } else {
             if !strip_newline && text.starts_with('\n') {
-                program.push_str("__write('\\n');\n");
+                program.push_str("__tpl_writer.write('\\n');\n");
             }
 
-            program.push_str(r#"__write("#);
+            program.push_str(r#"__tpl_writer.write("#);
             program.push_str(&enquote::enquote('`', text));
             program.push_str(");\n");
         }
-    }
-}
-
-struct JsonWriter<W: Write> {
-    writer: Arc<RwLock<W>>,
-}
-
-impl<W> Clone for JsonWriter<W>
-where
-    W: Write,
-{
-    fn clone(&self) -> Self {
-        Self {
-            writer: self.writer.clone(),
-        }
-    }
-}
-
-impl<W> JsonWriter<W>
-where
-    W: Write,
-{
-    fn new(writer: Arc<RwLock<W>>) -> Self {
-        Self { writer }
-    }
-
-    fn write_json_w_options(
-        &self,
-        res: QueryResponse,
-        options: Map,
-    ) -> Result<(), Box<EvalAltResult>> {
-        let mut json_output = {
-            let pretty = options
-                .get("pretty")
-                .and_then(|d| d.as_bool().ok())
-                .unwrap_or(false);
-            let row_values_as_array = options
-                .get("row_values_as_array")
-                .and_then(|d| d.as_bool().ok())
-                .unwrap_or(false);
-
-            JsonOutput {
-                pretty,
-                row_values_as_array,
-            }
-        };
-
-        let mut w = self.writer.write();
-
-        json_output.write_rows(&mut *w, res.into_iter())?;
-
-        println!("wrote JSON!");
-
-        Ok(())
-    }
-
-    fn write_json(&self, res: QueryResponse) -> Result<(), Box<EvalAltResult>> {
-        let mut json_output = JsonOutput::default();
-
-        let mut w = self.writer.write();
-
-        json_output.write_rows(&mut *w, res.into_iter())
     }
 }
 
@@ -609,8 +566,12 @@ pub struct Template<'a> {
 }
 
 impl<'a> Template<'a> {
-    pub fn render(&self) -> Result<(), Box<rhai::EvalAltResult>> {
-        self.engine.engine.eval_ast(&self.ast)
+    pub fn render(&self, w: TemplateWriter) -> Result<(), Box<rhai::EvalAltResult>> {
+        let mut scope = Scope::new();
+        scope.push("__tpl_writer", w);
+        self.engine
+            .engine
+            .eval_ast_with_scope(&mut scope, &self.ast)
     }
 }
 
@@ -654,7 +615,7 @@ mod tests {
 
         let client = corro_client::CorrosionApiClient::new(ta.agent.api_addr());
 
-        let engine = Engine::new(Arc::new(RwLock::new(f)), client);
+        let engine = Engine::new(client);
 
         let input = r#"<%
 let a = [42, 123, 999, 0, true, "hello", "world!", 987.6543];
@@ -669,7 +630,8 @@ Item #<%= count + 1 %> = <%= item %>
 tail"#;
 
         let tpl = engine.compile(input).unwrap();
-        tpl.render().unwrap();
+        tpl.render(TemplateWriter(Arc::new(RwLock::new(Box::new(f)))))
+            .unwrap();
 
         let output = std::fs::read_to_string(filepath).unwrap();
 
@@ -746,7 +708,7 @@ tail",
                     .open(&filepath)
                     .unwrap();
 
-                let engine = Engine::new(Arc::new(RwLock::new(f)), client);
+                let engine = Engine::new(client);
 
                 // loop {
                 let cmd = cmd_rx.recv().await.unwrap();
@@ -757,7 +719,8 @@ tail",
 <%= write_json(sql("select * from tests"), #{pretty: true}) %>"#;
 
                     let tpl = engine.compile(input).unwrap();
-                    tpl.render().unwrap();
+                    tpl.render(TemplateWriter(Arc::new(RwLock::new(Box::new(f)))))
+                        .unwrap();
                 });
                 reply_tx.send(Reply::Rendered).await.unwrap();
                 // }
