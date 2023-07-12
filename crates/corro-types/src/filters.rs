@@ -4,6 +4,7 @@ use bytes::Buf;
 use compact_str::{CompactString, ToCompactString};
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
+use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlite3_parser::{
@@ -494,8 +495,8 @@ impl OwnedAggregateChange {
     }
 }
 
-type PrimaryKey<'a> = HashMap<&'a str, SqliteValueRef<'a>>;
-type OwnedPrimaryKey = HashMap<String, SqliteValue>;
+type PrimaryKey<'a> = IndexMap<&'a str, SqliteValueRef<'a>>;
+type OwnedPrimaryKey = IndexMap<String, SqliteValue>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UnpackError {

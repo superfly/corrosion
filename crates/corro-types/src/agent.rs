@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -12,7 +13,7 @@ use camino::Utf8PathBuf;
 use metrics::{gauge, histogram, increment_counter};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::InterruptHandle;
+use rusqlite::{Connection, InterruptHandle};
 use spawn::spawn_counted;
 use tokio::{
     runtime::Handle,
@@ -22,21 +23,21 @@ use tokio::{
     },
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{error, trace, warn};
+use tracing::{error, info, trace, warn};
 use tripwire::Tripwire;
 
 use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, Timestamp},
     config::Config,
-    pubsub::{MatcherSub, Subscribers},
+    pubsub::{Matcher, Subscribers},
     schema::NormalizedSchema,
     sqlite::{CrConnManager, SqlitePool},
 };
 
 use super::members::Members;
 
-pub type Matchers = HashMap<uuid::Uuid, MatcherSub>;
+pub type Matchers = HashMap<uuid::Uuid, Matcher>;
 
 #[derive(Clone)]
 pub struct Agent(Arc<AgentInner>);
@@ -79,7 +80,12 @@ impl Agent {
     pub fn new(config: AgentConfig) -> Self {
         Self(Arc::new(AgentInner {
             actor_id: config.actor_id,
-            pool: SplitPool::new(config.ro_pool, config.rw_pool, config.tripwire),
+            pool: SplitPool::new(
+                config.ro_pool,
+                config.rw_pool,
+                &config.config.load().db_path,
+                config.tripwire,
+            ),
             config: config.config,
             gossip_addr: config.gossip_addr,
             api_addr: config.api_addr,
@@ -161,6 +167,7 @@ pub struct SplitPool(Arc<SplitPoolInner>);
 struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
+    path: PathBuf,
 
     priority_tx: Sender<oneshot::Sender<CancellationToken>>,
     normal_tx: Sender<oneshot::Sender<CancellationToken>>,
@@ -186,7 +193,12 @@ pub enum ChangeError {
 }
 
 impl SplitPool {
-    pub fn new(read: SqlitePool, write: SqlitePool, mut tripwire: Tripwire) -> Self {
+    pub fn new<P: AsRef<Path>>(
+        read: SqlitePool,
+        write: SqlitePool,
+        path: P,
+        mut tripwire: Tripwire,
+    ) -> Self {
         let (priority_tx, mut priority_rx) = channel(256);
         let (normal_tx, mut normal_rx) = channel(512);
         let (low_tx, mut low_rx) = channel(1024);
@@ -208,6 +220,8 @@ impl SplitPool {
                 wait_conn_drop(tx).await
             }
 
+            info!("write loop done, draining...");
+
             // keep processing priority messages
             // NOTE: using `recv` would wait indefinitely, this loop only waits until all
             //       current conn requests are done
@@ -219,6 +233,7 @@ impl SplitPool {
         Self(Arc::new(SplitPoolInner {
             read,
             write,
+            path: path.as_ref().to_owned(),
             priority_tx,
             normal_tx,
             low_tx,
@@ -258,6 +273,21 @@ impl SplitPool {
         &self,
     ) -> Result<PooledConnection<CrConnManager>, bb8::RunError<bb8_rusqlite::Error>> {
         Handle::current().block_on(self.0.read.get_owned())
+    }
+
+    pub async fn dedicated_write(&self) -> Result<Connection, rusqlite::Error> {
+        tokio::task::block_in_place(|| {
+            let conn = rusqlite::Connection::open(&self.0.path)?;
+
+            conn.execute_batch(
+                r#"
+                    PRAGMA journal_mode = WAL;
+                    PRAGMA synchronous = NORMAL;
+                "#,
+            )?;
+
+            Ok(conn)
+        })
     }
 
     // get a high priority write connection (e.g. client input)

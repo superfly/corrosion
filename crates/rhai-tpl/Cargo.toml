@@ -23,6 +23,8 @@ futures = { workspace = true }
 tripwire = { path = "../tripwire" }
 hex = { workspace = true }
 indexmap = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

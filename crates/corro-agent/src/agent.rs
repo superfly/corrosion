@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     api::{
-        http::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
+        http::{api_v1_db_schema, api_v1_queries, api_v1_query_by_id, api_v1_transactions},
         peer::{bidirectional_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncError},
         pubsub::api_v1_subscribe_ws,
     },
@@ -27,11 +27,11 @@ use corro_types::{
         BroadcastInput, BroadcastSrc, ChangeV1, Changeset, FocaInput, Message, MessageDecodeError,
         MessageV1, Timestamp,
     },
-    change::{Change, SqliteValue},
+    change::Change,
     config::{Config, DEFAULT_GOSSIP_PORT},
     filters::{match_expr, AggregateChange},
     members::{MemberEvent, Members},
-    pubsub::{MatcherError, SubscriptionEvent, SubscriptionMessage},
+    pubsub::{SubscriptionEvent, SubscriptionMessage},
     schema::init_schema,
     sqlite::{init_cr_conn, CrConn, CrConnManager, Migration},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
@@ -639,6 +639,20 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         .route(
             "/v1/queries",
             post(api_v1_queries).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(128)),
+            ),
+        )
+        .route(
+            "/v1/queries/:id",
+            get(api_v1_query_by_id).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -1541,57 +1555,20 @@ pub fn process_subs(agent: &Agent, changeset: &[Change], db_version: i64) {
                 }
             }
         }
-        let matchers = agent.matchers().read();
-        for (_id, matcher_sub) in matchers.iter() {
-            if matcher_sub.matcher.has_match(&agg) {
-                // TODO: optimize this process here, could lead to a lot of tasks
-                let pool = agent.pool().clone();
-                let matcher = matcher_sub.matcher.clone();
-                let tx = matcher_sub.tx.clone();
-                let agg = agg.to_owned();
-                tokio::spawn(async move {
-                    let conn = match pool.read().await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!("could not get read pool connection for matcher query: {e}");
-                            return;
-                        }
-                    };
-                    let res = block_in_place(|| {
-                        match matcher.changed_stmt(&conn, &agg.as_ref())? {
-                            Some(mut prepped) => {
-                                let col_count = prepped.column_count();
 
-                                let mut rows = prepped.raw_query();
-                                while let Ok(Some(row)) = rows.next() {
-                                    match (0..col_count)
-                                        .map(|i| row.get::<_, SqliteValue>(i))
-                                        .collect::<rusqlite::Result<Vec<_>>>()
-                                    {
-                                        Ok(row) => {
-                                            if let Err(e) = tx.blocking_send(row) {
-                                                error!("could not send back row to matcher sub sender: {e}");
-                                                return Ok(());
-                                            }
-                                            println!("SENT ROW!");
-                                        }
-                                        Err(e) => {
-                                            error!("could not deserialize row's cells: {e}");
-                                            return Ok(());
-                                        }
-                                    }
-                                }
-                            }
-                            None => return Ok(()),
-                        }
+        let mut matchers_to_delete = vec![];
 
-                        Ok::<_, MatcherError>(())
-                    });
-                    if let Err(e) = res {
-                        error!("could not handle changed stmt: {e}");
-                    }
-                });
+        {
+            let matchers = agent.matchers().read();
+            for (id, matcher) in matchers.iter() {
+                if let Err(e) = matcher.process_change(&agg) {
+                    error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
+                    matchers_to_delete.push(*id);
+                }
             }
+        }
+        for id in matchers_to_delete {
+            agent.matchers().write().remove(&id);
         }
     }
 }

@@ -4,18 +4,19 @@ use async_stream::try_stream;
 use bb8_rusqlite::RusqliteConnectionManager;
 use compact_str::CompactString;
 use corro_types::{
-    api::{RqliteResponse, Statement},
+    api::{Query, RqliteResponse, Statement},
     pubsub::{Subscription, SubscriptionId, SubscriptionMessage},
 };
 use futures::{
     stream::{SplitSink, SplitStream},
     Sink, SinkExt, Stream, StreamExt,
 };
-use hyper::{client::HttpConnector, Body, StatusCode};
+use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use pin_project_lite::pin_project;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{tungstenite as ws, MaybeTlsStream, WebSocketStream};
 use tracing::warn;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct CorrosionApiClient {
@@ -31,13 +32,35 @@ impl CorrosionApiClient {
         }
     }
 
-    pub async fn query(&self, statement: &Statement) -> Result<hyper::Body, Error> {
+    pub async fn query(&self, statement: &Query) -> Result<(Option<Uuid>, hyper::Body), Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(format!("http://{}/v1/queries", self.api_addr))
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statement)?))?;
+
+        let res = self.api_client.request(req).await?;
+
+        if !res.status().is_success() {
+            return Err(Error::UnexpectedStatusCode(res.status()));
+        }
+
+        // TODO: make that header name a const in corro-types
+        let id = res
+            .headers()
+            .get(HeaderName::from_static("corro-query-id"))
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()));
+
+        Ok((id, res.into_body()))
+    }
+
+    pub async fn watched_query(&self, id: Uuid) -> Result<hyper::Body, Error> {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(format!("http://{}/v1/queries/{}", self.api_addr, id))
+            .header(hyper::header::ACCEPT, "application/json")
+            .body(hyper::Body::empty())?;
 
         let res = self.api_client.request(req).await?;
 

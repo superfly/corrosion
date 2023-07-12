@@ -21,5 +21,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [features]

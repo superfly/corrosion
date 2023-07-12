@@ -7,8 +7,9 @@ use std::{
     sync::Arc,
 };
 
-use compact_str::CompactString;
+use compact_str::{CompactString, ToCompactString};
 use fallible_iterator::FallibleIterator;
+use indexmap::IndexMap;
 use parking_lot::RwLock;
 use rusqlite::Connection;
 use serde::{
@@ -17,14 +18,23 @@ use serde::{
 };
 use speedy::{Context, Readable, Writable};
 use sqlite3_parser::{
-    ast::{As, Cmd, Expr, Id, Name, OneSelect, Operator, SelectTable, Stmt},
+    ast::{
+        As, Cmd, Expr, Id, JoinConstraint, Name, OneSelect, Operator, ResultColumn, Select,
+        SelectTable, Stmt,
+    },
     lexer::sql::Parser,
 };
-use tokio::sync::mpsc::{self, UnboundedSender};
-use tracing::trace;
+use tokio::{
+    sync::mpsc::{self, error::SendError, UnboundedSender},
+    task::block_in_place,
+};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, trace, warn};
 use uhlc::Timestamp;
+use uuid::Uuid;
 
 use crate::{
+    api::RowResult,
     change::SqliteValue,
     filters::{parse_expr, AggregateChange, OwnedAggregateChange, SupportedExpr},
     schema::{NormalizedSchema, NormalizedTable},
@@ -243,107 +253,142 @@ impl FromStr for SubscriptionFilter {
     }
 }
 
-pub struct MatcherSub {
-    pub matcher: Matcher,
-    pub tx: mpsc::Sender<Vec<SqliteValue>>,
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeType {
+    Upsert,
+    Delete,
+}
+
+pub enum MatcherRequest {
+    ProcessChange(MatcherStmt, Vec<SqliteValue>),
+    QueryTemp(mpsc::Sender<RowResult>),
 }
 
 #[derive(Debug, Clone)]
-pub struct Matcher {
-    pub statements: Arc<HashMap<String, String>>,
+pub struct Matcher(pub Arc<InnerMatcher>);
+
+#[derive(Debug, Clone)]
+pub struct MatcherStmt {
+    new_query: String,
+    temp_query: String,
+}
+
+#[derive(Debug)]
+pub struct InnerMatcher {
+    pub id: Uuid,
+    pub query: Stmt,
+    pub statements: HashMap<String, MatcherStmt>,
+    pub pks: IndexMap<String, Vec<String>>,
+    pub parsed: ParsedSelect,
+    pub temp_table: String,
+    pub tx: mpsc::Sender<RowResult>,
+    pub query_tx: mpsc::Sender<MatcherRequest>,
+    pub col_names: Vec<CompactString>,
 }
 
 impl Matcher {
-    pub fn new(schema: &NormalizedSchema, sql: &str) -> Result<Self, MatcherError> {
+    pub fn new(
+        id: Uuid,
+        schema: &NormalizedSchema,
+        mut conn: Connection,
+        tx: mpsc::Sender<RowResult>,
+        sql: &str,
+        cancel: CancellationToken,
+    ) -> Result<Self, MatcherError> {
+        let col_names: Vec<CompactString> = {
+            conn.prepare(sql)?
+                .column_names()
+                .into_iter()
+                .map(|s| s.to_compact_string())
+                .collect()
+        };
+
         let mut parser = Parser::new(sql.as_bytes());
 
-        let mut aliases = HashMap::new();
-        let mut tables = HashSet::new();
-
-        let stmt = match parser.next()?.ok_or(MatcherError::StatementRequired)? {
+        let (stmt, parsed) = match parser.next()?.ok_or(MatcherError::StatementRequired)? {
             Cmd::Stmt(stmt) => {
-                match stmt {
-                    Stmt::Select(ref select) => match select.body.select {
-                        OneSelect::Select { ref from, .. } => match from {
-                            Some(from) => {
-                                match &from.select {
-                                    Some(table) => match table.as_ref() {
-                                        SelectTable::Table(name, alias, _) => {
-                                            if schema.tables.contains_key(name.name.0.as_str()) {
-                                                if let Some(As::As(alias) | As::Elided(alias)) =
-                                                    alias
-                                                {
-                                                    aliases.insert(
-                                                        name.name.0.clone(),
-                                                        alias.0.clone(),
-                                                    );
-                                                } else if let Some(ref alias) = name.alias {
-                                                    aliases.insert(
-                                                        name.name.0.clone(),
-                                                        alias.0.clone(),
-                                                    );
-                                                }
-                                                tables.insert(name.name.0.clone());
-                                            }
-                                        }
-                                        _ => {}
-                                    },
-                                    _ => {}
-                                }
-                                if let Some(ref joins) = from.joins {
-                                    for join in joins.iter() {
-                                        // let mut tbl_name = None;
-                                        match &join.table {
-                                            SelectTable::Table(name, alias, _) => {
-                                                if let Some(As::As(alias) | As::Elided(alias)) =
-                                                    alias
-                                                {
-                                                    aliases.insert(
-                                                        name.name.0.clone(),
-                                                        alias.0.clone(),
-                                                    );
-                                                } else if let Some(ref alias) = name.alias {
-                                                    aliases.insert(
-                                                        name.name.0.clone(),
-                                                        alias.0.clone(),
-                                                    );
-                                                }
-                                                tables.insert(name.name.0.clone());
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
-                        },
-                        _ => {}
-                    },
+                let parsed = match stmt {
+                    Stmt::Select(ref select) => extract_select_columns(select, schema)?,
                     _ => return Err(MatcherError::UnsupportedStatement),
-                }
+                };
 
-                stmt
+                (stmt, parsed)
             }
             _ => return Err(MatcherError::StatementRequired),
         };
 
-        if tables.is_empty() {
+        // println!("{stmt:#?}");
+        // println!("parsed: {parsed:#?}");
+
+        if parsed.table_columns.is_empty() {
             return Err(MatcherError::TableRequired);
         }
 
         let mut statements = HashMap::new();
 
-        for tbl_name in tables {
-            let mut stmt = stmt.clone();
+        let mut pks = IndexMap::default();
 
+        let mut stmt = stmt.clone();
+        match &mut stmt {
+            Stmt::Select(select) => match &mut select.body.select {
+                OneSelect::Select { columns, .. } => {
+                    let mut new_cols = parsed
+                        .table_columns
+                        .iter()
+                        .filter_map(|(tbl_name, _cols)| {
+                            schema.tables.get(tbl_name).map(|table| {
+                                let tbl_name = parsed
+                                    .aliases
+                                    .iter()
+                                    .find_map(|(alias, actual)| {
+                                        (actual == tbl_name).then_some(alias)
+                                    })
+                                    .unwrap_or(tbl_name);
+                                table
+                                    .pk
+                                    .iter()
+                                    .map(|pk| {
+                                        let alias = format!("__corro_pk_{tbl_name}_{pk}");
+                                        let entry: &mut Vec<String> =
+                                            pks.entry(table.name.clone()).or_default();
+                                        entry.push(alias.clone());
+
+                                        ResultColumn::Expr(
+                                            Expr::Qualified(
+                                                Name(tbl_name.clone()),
+                                                Name(pk.clone()),
+                                            ),
+                                            Some(As::As(Name(alias))),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .flatten()
+                        .collect::<Vec<_>>();
+
+                    new_cols.append(&mut parsed.columns.clone());
+                    *columns = new_cols;
+                }
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+
+        let temp_table = format!("query_{}", id.as_simple());
+
+        for (tbl_name, _cols) in parsed.table_columns.iter() {
             let expr = table_to_expr(
-                &aliases,
+                &parsed.aliases,
                 schema
                     .tables
-                    .get(&tbl_name)
+                    .get(tbl_name)
                     .expect("this should not happen, missing table in schema"),
                 &tbl_name,
             )?;
+
+            let mut stmt = stmt.clone();
 
             match &mut stmt {
                 Stmt::Select(select) => match &mut select.body.select {
@@ -359,38 +404,699 @@ impl Matcher {
                 _ => {}
             }
 
-            statements.insert(tbl_name, Cmd::Stmt(stmt).to_string());
+            let mut new_query = Cmd::Stmt(stmt).to_string();
+            new_query.pop();
+
+            let mut tmp_cols = pks.values().cloned().flatten().collect::<Vec<String>>();
+            for i in 0..(parsed.columns.len()) {
+                tmp_cols.push(format!("col_{i}"));
+            }
+
+            statements.insert(
+                tbl_name.clone(),
+                MatcherStmt {
+                    new_query,
+                    temp_query: format!(
+                        "SELECT {} FROM {} WHERE {}",
+                        tmp_cols.join(","),
+                        temp_table,
+                        pks.get(tbl_name)
+                            .cloned()
+                            .ok_or(MatcherError::MissingPrimaryKeys)?
+                            .iter()
+                            .map(|k| format!("{k} IS ?"))
+                            .collect::<Vec<_>>()
+                            .join(" AND ")
+                    ),
+                },
+            );
         }
 
-        Ok(Self {
-            statements: Arc::new(statements),
-        })
+        let (query_tx, mut query_rx) = mpsc::channel(512);
+
+        let matcher = Self(Arc::new(InnerMatcher {
+            id,
+            query: stmt,
+            statements: statements,
+            pks,
+            parsed,
+            temp_table,
+            tx,
+            query_tx,
+            col_names: col_names.clone(),
+        }));
+
+        tokio::spawn({
+            let matcher = matcher.clone();
+            async move {
+                if let Err(e) = matcher.0.tx.send(RowResult::Columns(col_names)).await {
+                    error!("could not send back columns, probably means no receivers! {e}");
+                    return;
+                }
+
+                let mut tmp_cols = matcher
+                    .0
+                    .pks
+                    .values()
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<String>>();
+
+                let mut query_cols = vec![];
+                for i in 0..(matcher.0.parsed.columns.len()) {
+                    let col_name = format!("col_{i}");
+                    tmp_cols.push(col_name.clone());
+                    query_cols.push(col_name);
+                }
+
+                let res = block_in_place(|| {
+                    let tx = conn.transaction()?;
+
+                    let create_temp_table = format!(
+                        "CREATE TEMP TABLE {} (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {});
+                        CREATE UNIQUE INDEX {}_pk ON {} ({});",
+                        matcher.0.temp_table,
+                        tmp_cols.join(","),
+                        matcher.0.temp_table,
+                        matcher.0.temp_table,
+                        matcher
+                            .0
+                            .pks
+                            .values()
+                            .flatten()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
+
+                    println!("create temp table: {create_temp_table}");
+
+                    tx.execute_batch(&create_temp_table)?;
+
+                    let mut stmt_str = Cmd::Stmt(matcher.0.query.clone()).to_string();
+                    stmt_str.pop();
+
+                    let insert_into = format!(
+                        "INSERT INTO {} ({}) {} RETURNING __corro_rowid,{}",
+                        matcher.0.temp_table,
+                        tmp_cols.join(","),
+                        stmt_str,
+                        query_cols.join(","),
+                    );
+
+                    {
+                        let mut prepped = tx.prepare(&insert_into)?;
+
+                        let mut rows = prepped.query(())?;
+
+                        loop {
+                            match rows.next() {
+                                Ok(Some(row)) => {
+                                    let rowid: i64 = row.get(0)?;
+                                    let cells = (1..=query_cols.len())
+                                        .map(|i| row.get::<_, SqliteValue>(i))
+                                        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                                    if let Err(e) = matcher.0.tx.blocking_send(RowResult::Row {
+                                        change_type: ChangeType::Upsert,
+                                        rowid,
+                                        cells,
+                                    }) {
+                                        error!("could not send back row: {e}");
+                                        return Err(MatcherError::ChangeReceiverClosed);
+                                    }
+                                }
+                                Ok(None) => {
+                                    // done!
+                                    break;
+                                }
+                                Err(e) => {
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+                    }
+
+                    tx.commit()?;
+
+                    Ok::<_, MatcherError>(())
+                });
+
+                if let Err(e) = res {
+                    _ = matcher
+                        .0
+                        .tx
+                        .send(RowResult::Error(e.to_compact_string()))
+                        .await;
+                    return;
+                }
+
+                if let Err(e) = matcher.0.tx.send(RowResult::EndOfQuery).await {
+                    error!("could not send back end-of-query message: {e}");
+                    return;
+                }
+
+                loop {
+                    let req = tokio::select! {
+                        Some(req) = query_rx.recv() => req,
+                        _ = cancel.cancelled() => return,
+                        else => return,
+                    };
+
+                    match req {
+                        MatcherRequest::ProcessChange(stmt, pks) => {
+                            if let Err(e) =
+                                block_in_place(|| matcher.handle_change(&mut conn, stmt, pks))
+                            {
+                                error!("could not handle change: {e}");
+                                if matches!(e, MatcherError::ChangeReceiverClosed) {
+                                    // break here...
+                                    break;
+                                }
+                            }
+                        }
+                        MatcherRequest::QueryTemp(tx) => {
+                            #[derive(Debug, thiserror::Error)]
+                            enum QueryTempError {
+                                #[error(transparent)]
+                                Sqlite(#[from] rusqlite::Error),
+                                #[error(transparent)]
+                                Send(#[from] SendError<RowResult>),
+                            }
+
+                            let res = block_in_place(|| {
+                                let mut query_cols = vec![];
+                                for i in 0..(matcher.0.parsed.columns.len()) {
+                                    query_cols.push(format!("col_{i}"));
+                                }
+                                let mut prepped = conn.prepare_cached(&format!(
+                                    "SELECT __corro_rowid,{} FROM {}",
+                                    query_cols.join(","),
+                                    matcher.temp_table()
+                                ))?;
+                                let col_count = prepped.column_count();
+
+                                tx.blocking_send(RowResult::Columns(matcher.0.col_names.clone()))?;
+
+                                let mut rows = prepped.query(())?;
+
+                                loop {
+                                    let row = match rows.next()? {
+                                        Some(row) => row,
+                                        None => break,
+                                    };
+                                    let rowid = row.get(0)?;
+
+                                    let cells = (1..col_count)
+                                        .map(|i| row.get::<_, SqliteValue>(i))
+                                        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                                    tx.blocking_send(RowResult::Row {
+                                        rowid,
+                                        change_type: ChangeType::Upsert,
+                                        cells,
+                                    })?;
+                                }
+
+                                Ok::<(), QueryTempError>(())
+                            });
+
+                            if let Err(QueryTempError::Sqlite(e)) = res {
+                                _ = tx.send(RowResult::Error(e.to_compact_string())).await;
+                                continue;
+                            }
+
+                            _ = tx.send(RowResult::EndOfQuery).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(matcher)
     }
 
     pub fn has_match(&self, agg: &AggregateChange) -> bool {
-        self.statements.contains_key(agg.table)
+        self.0.statements.contains_key(agg.table)
     }
 
-    pub fn changed_stmt<'a>(
-        &self,
-        conn: &'a Connection,
-        agg: &AggregateChange,
-    ) -> Result<Option<rusqlite::CachedStatement<'a>>, MatcherError> {
-        let sql = if let Some(sql) = self.statements.get(agg.table) {
-            sql
+    pub fn process_change<'a>(&self, agg: &AggregateChange<'a>) -> Result<(), MatcherError> {
+        let stmt = if let Some(stmt) = self.0.statements.get(agg.table) {
+            stmt
         } else {
             trace!("irrelevant table!");
-            return Ok(None);
+            return Ok(());
         };
 
-        let mut prepped = conn.prepare_cached(sql)?;
+        self.0
+            .query_tx
+            .try_send(MatcherRequest::ProcessChange(
+                stmt.clone(),
+                agg.pk.values().map(|v| v.to_owned()).collect(),
+            ))
+            .map_err(|_| MatcherError::ChangeQueueClosedOrFull)?;
 
-        for (i, (_, pk)) in agg.pk.iter().enumerate() {
-            prepped.raw_bind_parameter(i + 1, pk.to_owned())?;
+        Ok(())
+    }
+
+    pub fn temp_table(&self) -> &str {
+        &self.0.temp_table
+    }
+
+    pub fn handle_change(
+        &self,
+        conn: &mut Connection,
+        stmt: MatcherStmt,
+        pks: Vec<SqliteValue>,
+    ) -> Result<(), MatcherError> {
+        let mut actual_cols = vec![];
+        let mut tmp_cols = self
+            .0
+            .pks
+            .values()
+            .cloned()
+            .flatten()
+            .collect::<Vec<String>>();
+        for i in 0..(self.0.parsed.columns.len()) {
+            let col_name = format!("col_{i}");
+            tmp_cols.push(col_name.clone());
+            actual_cols.push(col_name);
         }
 
-        Ok(Some(prepped))
+        let tx = conn.transaction()?;
+
+        let sql = format!(
+            "INSERT INTO {} ({})
+                            SELECT * FROM (
+                                {}
+                                EXCEPT
+                                {}
+                            ) WHERE 1
+                        ON CONFLICT({})
+                            DO UPDATE SET
+                                {}
+                        RETURNING __corro_rowid,{}",
+            // insert into
+            self.0.temp_table,
+            tmp_cols.join(","),
+            stmt.new_query,
+            stmt.temp_query,
+            self.0
+                .pks
+                .values()
+                .cloned()
+                .flatten()
+                .collect::<Vec<String>>()
+                .join(","),
+            (0..(self.0.parsed.columns.len()))
+                .map(|i| format!("col_{i} = excluded.col_{i}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            actual_cols.join(",")
+        );
+
+        // println!("sql: {sql}");
+
+        let mut insert_prepped = tx.prepare_cached(&sql)?;
+
+        let mut i = 1;
+
+        // do this 2 times
+        for _ in 0..2 {
+            for pk in pks.iter() {
+                insert_prepped.raw_bind_parameter(i, pk.to_owned())?;
+                i += 1;
+            }
+        }
+
+        let sql = format!(
+            "
+        DELETE FROM {} WHERE ({}) in (SELECT {} FROM (
+            {}
+            EXCEPT
+            {}
+        )) RETURNING __corro_rowid,{}",
+            // delete from
+            self.0.temp_table,
+            self.0
+                .pks
+                .values()
+                .cloned()
+                .flatten()
+                .collect::<Vec<String>>()
+                .join(","),
+            self.0
+                .pks
+                .values()
+                .cloned()
+                .flatten()
+                .collect::<Vec<String>>()
+                .join(","),
+            stmt.temp_query,
+            stmt.new_query,
+            actual_cols.join(",")
+        );
+
+        let mut delete_prepped = tx.prepare_cached(&sql)?;
+
+        let mut i = 1;
+
+        // do this 2 times
+        for _ in 0..2 {
+            for pk in pks.iter() {
+                delete_prepped.raw_bind_parameter(i, pk.to_owned())?;
+                i += 1;
+            }
+        }
+
+        for (change_type, mut prepped) in [
+            (ChangeType::Upsert, insert_prepped),
+            (ChangeType::Delete, delete_prepped),
+        ] {
+            let col_count = prepped.column_count();
+
+            let mut rows = prepped.raw_query();
+
+            while let Ok(Some(row)) = rows.next() {
+                let rowid: i64 = row.get(0)?;
+
+                match (1..col_count)
+                    .map(|i| row.get::<_, SqliteValue>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                {
+                    Ok(cells) => {
+                        if let Err(e) = self.0.tx.blocking_send(RowResult::Row {
+                            rowid,
+                            change_type,
+                            cells,
+                        }) {
+                            error!("could not send back row to matcher sub sender: {e}");
+                            return Err(MatcherError::ChangeReceiverClosed);
+                        }
+                    }
+                    Err(e) => {
+                        error!("could not deserialize row's cells: {e}");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
+}
+
+#[derive(Debug, Default)]
+pub struct ParsedSelect {
+    table_columns: IndexMap<String, HashSet<String>>,
+    aliases: HashMap<String, String>,
+    pub columns: Vec<ResultColumn>,
+    children: Vec<Box<ParsedSelect>>,
+}
+
+fn extract_select_columns(
+    select: &Select,
+    schema: &NormalizedSchema,
+) -> Result<ParsedSelect, MatcherError> {
+    let mut parsed = ParsedSelect::default();
+
+    match select.body.select {
+        OneSelect::Select {
+            ref from,
+            ref columns,
+            ref where_clause,
+            ..
+        } => {
+            let from_table = match from {
+                Some(from) => {
+                    let from_table = match &from.select {
+                        Some(table) => match table.as_ref() {
+                            SelectTable::Table(name, alias, _) => {
+                                if schema.tables.contains_key(name.name.0.as_str()) {
+                                    if let Some(As::As(alias) | As::Elided(alias)) = alias {
+                                        parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    } else if let Some(ref alias) = name.alias {
+                                        parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    }
+                                    parsed.table_columns.entry(name.name.0.clone()).or_default();
+                                    Some(&name.name)
+                                } else {
+                                    return Err(MatcherError::TableNotFound(name.name.0.clone()));
+                                }
+                            }
+                            // TODO: add support for:
+                            // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
+                            // Select(Select, Option<As>),
+                            // Sub(FromClause, Option<As>),
+                            t => {
+                                warn!("ignoring {t:?}");
+                                None
+                            }
+                        },
+                        _ => {
+                            // according to the sqlite3-parser docs, this can't really happen
+                            // ignore!
+                            unreachable!()
+                        }
+                    };
+                    if let Some(ref joins) = from.joins {
+                        for join in joins.iter() {
+                            // let mut tbl_name = None;
+                            let tbl_name = match &join.table {
+                                SelectTable::Table(name, alias, _) => {
+                                    if let Some(As::As(alias) | As::Elided(alias)) = alias {
+                                        parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    } else if let Some(ref alias) = name.alias {
+                                        parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    }
+                                    parsed.table_columns.entry(name.name.0.clone()).or_default();
+                                    &name.name
+                                }
+                                // TODO: add support for:
+                                // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
+                                // Select(Select, Option<As>),
+                                // Sub(FromClause, Option<As>),
+                                t => {
+                                    warn!("ignoring JOIN's non-SelectTable::Table:  {t:?}");
+                                    continue;
+                                }
+                            };
+                            // ON or USING
+                            if let Some(constraint) = &join.constraint {
+                                match constraint {
+                                    JoinConstraint::On(expr) => {
+                                        extract_expr_columns(expr, schema, &mut parsed)?;
+                                    }
+                                    JoinConstraint::Using(names) => {
+                                        let entry = parsed
+                                            .table_columns
+                                            .entry(tbl_name.0.clone())
+                                            .or_default();
+                                        for name in names.iter() {
+                                            entry.insert(name.0.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(expr) = where_clause {
+                        extract_expr_columns(expr, schema, &mut parsed)?;
+                    }
+                    from_table
+                }
+                _ => None,
+            };
+
+            extract_columns(columns.as_slice(), from_table, schema, &mut parsed)?;
+        }
+        _ => {}
+    }
+
+    Ok(parsed)
+}
+
+fn extract_expr_columns(
+    expr: &Expr,
+    schema: &NormalizedSchema,
+    parsed: &mut ParsedSelect,
+) -> Result<(), MatcherError> {
+    match expr {
+        // simplest case
+        Expr::Qualified(tblname, colname) => {
+            let resolved_name = parsed.aliases.get(&tblname.0).unwrap_or(&tblname.0);
+            parsed
+                .table_columns
+                .entry(resolved_name.clone())
+                .or_default()
+                .insert(colname.0.clone());
+        }
+        // simplest case but also mentioning the schema
+        Expr::DoublyQualified(schema_name, tblname, colname) if schema_name.0 == "main" => {
+            let resolved_name = parsed.aliases.get(&tblname.0).unwrap_or(&tblname.0);
+            parsed
+                .table_columns
+                .entry(resolved_name.clone())
+                .or_default()
+                .insert(colname.0.clone());
+        }
+
+        Expr::Name(_) => {
+            // figure out which table this is for...
+            todo!()
+        }
+
+        Expr::Between { lhs, .. } => extract_expr_columns(lhs, schema, parsed)?,
+        Expr::Binary(lhs, _, rhs) => {
+            extract_expr_columns(lhs, schema, parsed)?;
+            extract_expr_columns(rhs, schema, parsed)?;
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(expr) = base {
+                extract_expr_columns(expr, schema, parsed)?;
+            }
+            for (when_expr, _then_expr) in when_then_pairs.iter() {
+                // NOTE: should we also parse the then expr?
+                extract_expr_columns(when_expr, schema, parsed)?;
+            }
+            if let Some(expr) = else_expr {
+                extract_expr_columns(expr, schema, parsed)?;
+            }
+        }
+        Expr::Cast { expr, .. } => extract_expr_columns(expr, schema, parsed)?,
+        Expr::Collate(expr, _) => extract_expr_columns(expr, schema, parsed)?,
+        Expr::Exists(select) => {
+            parsed
+                .children
+                .push(Box::new(extract_select_columns(select, schema)?));
+        }
+        Expr::FunctionCall { args, .. } => {
+            if let Some(args) = args {
+                for expr in args.iter() {
+                    extract_expr_columns(expr, schema, parsed)?;
+                }
+            }
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            extract_expr_columns(lhs, schema, parsed)?;
+            if let Some(rhs) = rhs {
+                for expr in rhs.iter() {
+                    extract_expr_columns(expr, schema, parsed)?;
+                }
+            }
+        }
+        Expr::InSelect { lhs, rhs, .. } => {
+            extract_expr_columns(lhs, schema, parsed)?;
+            parsed
+                .children
+                .push(Box::new(extract_select_columns(rhs, schema)?));
+        }
+        expr @ Expr::InTable { .. } => {
+            return Err(MatcherError::UnsupportedExpr { expr: expr.clone() })
+        }
+        Expr::IsNull(expr) => {
+            extract_expr_columns(expr, schema, parsed)?;
+        }
+        Expr::Like { lhs, rhs, .. } => {
+            extract_expr_columns(lhs, schema, parsed)?;
+            extract_expr_columns(rhs, schema, parsed)?;
+        }
+
+        Expr::NotNull(expr) => {
+            extract_expr_columns(expr, schema, parsed)?;
+        }
+        Expr::Parenthesized(parens) => {
+            for expr in parens.iter() {
+                extract_expr_columns(expr, schema, parsed)?;
+            }
+        }
+        Expr::Subquery(select) => {
+            parsed
+                .children
+                .push(Box::new(extract_select_columns(select, schema)?));
+        }
+        Expr::Unary(_, expr) => {
+            extract_expr_columns(expr, schema, parsed)?;
+        }
+
+        // no column names in there...
+        // Expr::FunctionCallStar { name, filter_over } => todo!(),
+        // Expr::Id(_) => todo!(),
+        // Expr::Literal(_) => todo!(),
+        // Expr::Raise(_, _) => todo!(),
+        // Expr::Variable(_) => todo!(),
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn extract_columns(
+    columns: &[ResultColumn],
+    from: Option<&Name>,
+    schema: &NormalizedSchema,
+    parsed: &mut ParsedSelect,
+) -> Result<(), MatcherError> {
+    let mut i = 0;
+    for col in columns.iter() {
+        match col {
+            ResultColumn::Expr(expr, _) => {
+                extract_expr_columns(expr, schema, parsed)?;
+                parsed.columns.push(ResultColumn::Expr(
+                    expr.clone(),
+                    Some(As::As(Name(format!("col_{i}")))),
+                ));
+                i += 1;
+            }
+            ResultColumn::Star => {
+                if let Some(tbl_name) = from {
+                    if let Some(table) = schema.tables.get(&tbl_name.0) {
+                        let entry = parsed.table_columns.entry(table.name.clone()).or_default();
+                        for col in table.columns.keys() {
+                            entry.insert(col.clone());
+                            parsed.columns.push(ResultColumn::Expr(
+                                Expr::Name(Name(col.clone())),
+                                Some(As::As(Name(format!("col_{i}")))),
+                            ));
+                            i += 1;
+                        }
+                    } else {
+                        return Err(MatcherError::TableStarNotFound {
+                            tbl_name: tbl_name.0.clone(),
+                        });
+                    }
+                } else {
+                    unreachable!()
+                }
+            }
+            ResultColumn::TableStar(tbl_name) => {
+                let name = parsed
+                    .aliases
+                    .get(tbl_name.0.as_str())
+                    .unwrap_or(&tbl_name.0);
+                if let Some(table) = schema.tables.get(name) {
+                    let entry = parsed.table_columns.entry(table.name.clone()).or_default();
+                    for col in table.columns.keys() {
+                        entry.insert(col.clone());
+                        parsed.columns.push(ResultColumn::Expr(
+                            Expr::Qualified(tbl_name.clone(), Name(col.clone())),
+                            Some(As::As(Name(format!("col_{i}")))),
+                        ));
+                        i += 1;
+                    }
+                } else {
+                    return Err(MatcherError::TableStarNotFound {
+                        tbl_name: name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn table_to_expr(
@@ -399,7 +1105,8 @@ fn table_to_expr(
     table: &str,
 ) -> Result<Expr, MatcherError> {
     let tbl_name = aliases
-        .get(table)
+        .iter()
+        .find_map(|(alias, actual)| (actual == table).then_some(alias))
         .cloned()
         .unwrap_or_else(|| table.to_owned());
 
@@ -443,6 +1150,18 @@ pub enum MatcherError {
     NoPrimaryKey(String),
     #[error("aggregate missing primary key {0}.{1}")]
     AggPrimaryKeyMissing(String, String),
+    #[error("JOIN .. ON expression is not supported for join on table '{table}': {expr:?}")]
+    JoinOnExprUnsupported { table: String, expr: Expr },
+    #[error("expression is not supported: {expr:?}")]
+    UnsupportedExpr { expr: Expr },
+    #[error("could not find table for {tbl_name}.* in corrosion's schema")]
+    TableStarNotFound { tbl_name: String },
+    #[error("missing primary keys, this shouldn't happen")]
+    MissingPrimaryKeys,
+    #[error("change queue has been closed or is full")]
+    ChangeQueueClosedOrFull,
+    #[error("change receiver is closed")]
+    ChangeReceiverClosed,
 }
 
 fn expr_from_pk(table: &str, pk: &str) -> Option<Expr> {
@@ -464,15 +1183,24 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_diff() {
-        let sql = "SELECT json_object('labels',json_object(
-            '__metrics_path', JSON_EXTRACT(meta, '$.path'),
-            'app_name', app_name,
-            'vm_account_id', cs.organization_id,
-            'instance', instance_id
-          ), 'targets', json_array(address||':'||port)
-          ) FROM consul_services AS cs LEFT JOIN machines m ON m.id = cs.instance_id LEFT JOIN machine_versions mv ON m.id = mv.machine_id AND m.machine_version_id = mv.id LEFT JOIN machine_version_statuses mvs ON m.id = mvs.machine_id AND m.machine_version_id = mvs.id WHERE cs.node = 'test-hostname' AND (mvs.status IS NULL OR mvs.status = 'started') AND cs.name == 'app-prometheus'";
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_diff() {
+        let sql = "SELECT json_object(
+            'targets', json_array(cs.address||':'||cs.port),
+            'labels',  json_object(
+              '__metrics_path__', JSON_EXTRACT(cs.meta, '$.path'),
+              'app',            cs.app_name,
+              'vm_account_id',  cs.organization_id,
+              'instance',       cs.instance_id
+            )
+          )
+          FROM consul_services cs
+            LEFT JOIN machines m                   ON m.id = cs.instance_id
+            LEFT JOIN machine_versions mv          ON m.id = mv.machine_id  AND m.machine_version_id = mv.id
+            LEFT JOIN machine_version_statuses mvs ON m.id = mvs.machine_id AND m.machine_version_id = mvs.id
+          WHERE cs.node = 'test-hostname'
+            AND (mvs.status IS NULL OR mvs.status = 'started')
+            AND cs.name == 'app-prometheus'";
 
         let schema_sql = "
           CREATE TABLE consul_services (
@@ -534,7 +1262,10 @@ mod tests {
 
         let schema = parse_sql(schema_sql).unwrap();
 
-        let mut conn = rusqlite::Connection::open_in_memory().expect("could not open conn");
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("test.db");
+
+        let mut conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
         conn.execute_batch(schema_sql)
             .expect("could not exec schema");
 
@@ -542,29 +1273,56 @@ mod tests {
         {
             let tx = conn.transaction().unwrap();
             tx.execute_batch(r#"
-                INSERT INTO consul_services (node, id, name, address, port, meta) VALUES ('test-hostname', 'service-1', 'app-prometheus', '127.0.0.1', 1, '{"path": "/1", "machine_id": "m-1"}');
-                INSERT INTO consul_services (node, id, name, address, port, meta) VALUES ('test-hostname', 'service-2', 'not-app-prometheus', '127.0.0.1', 1, '{"path": "/1", "machine_id": "m-2"}');
+                        INSERT INTO consul_services (node, id, name, address, port, meta) VALUES ('test-hostname', 'service-1', 'app-prometheus', '127.0.0.1', 1, '{"path": "/1", "machine_id": "m-1"}');
+        
+                        INSERT INTO machines (id, machine_version_id) VALUES ('m-1', 'mv-1');
+        
+                        INSERT INTO machine_versions (machine_id, id) VALUES ('m-1', 'mv-1');
+        
+                        INSERT INTO machine_version_statuses (machine_id, id, status) VALUES ('m-1', 'mv-1', 'started');
 
-                INSERT INTO machines (id, machine_version_id) VALUES ('m-1', 'mv-1');
+                        INSERT INTO consul_services (node, id, name, address, port, meta) VALUES ('test-hostname', 'service-2', 'not-app-prometheus', '127.0.0.1', 1, '{"path": "/1", "machine_id": "m-2"}');
+
                 INSERT INTO machines (id, machine_version_id) VALUES ('m-2', 'mv-2');
 
-                INSERT INTO machine_versions (machine_id, id) VALUES ('m-1', 'mv-1');
                 INSERT INTO machine_versions (machine_id, id) VALUES ('m-2', 'mv-2');
 
-                INSERT INTO machine_version_statuses (machine_id, id, status) VALUES ('m-1', 'mv-1', 'started');
                 INSERT INTO machine_version_statuses (machine_id, id, status) VALUES ('m-2', 'mv-2', 'started');
-            "#).unwrap();
+                    "#).unwrap();
             tx.commit().unwrap();
         }
 
-        let matcher = Matcher::new(&schema, sql).unwrap();
+        let cancel = CancellationToken::new();
+        let id = Uuid::new_v4();
 
-        println!("matcher:\n {matcher:#?}");
+        {
+            let (tx, mut rx) = mpsc::channel(1);
+            let matcher = Matcher::new(
+                id,
+                &schema,
+                rusqlite::Connection::open(&db_path).expect("could not open conn"),
+                tx,
+                sql,
+                cancel,
+            )
+            .unwrap();
 
-        let mut prepped = matcher
-            .changed_stmt(
-                &conn,
-                &AggregateChange {
+            assert!(matches!(rx.recv().await.unwrap(), RowResult::Columns(_)));
+
+            let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
+
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                RowResult::Row {
+                    rowid: 1,
+                    change_type: ChangeType::Upsert,
+                    cells
+                }
+            );
+            assert!(matches!(rx.recv().await.unwrap(), RowResult::EndOfQuery));
+
+            matcher
+                .process_change(&AggregateChange {
                     actor_id: ActorId::default(),
                     version: 1,
                     table: "consul_services",
@@ -578,63 +1336,88 @@ mod tests {
                     data: vec![("name", SqliteValueRef::Text("app-prometheus"))]
                         .into_iter()
                         .collect(),
-                },
-            )
-            .unwrap()
-            .unwrap();
+                })
+                .unwrap();
 
-        let mut rows = prepped.raw_query();
+            // insert the second row
+            {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(r#"
+                INSERT INTO consul_services (node, id, name, address, port, meta) VALUES ('test-hostname', 'service-3', 'app-prometheus', '127.0.0.1', 1, '{"path": "/1", "machine_id": "m-3"}');
 
-        assert_eq!(rows.next().unwrap().unwrap().get::<_, SqliteValue>(0).unwrap(), SqliteValue::Text(
-            "{\"labels\":{\"__metrics_path\":\"/1\",\"app_name\":null,\"vm_account_id\":null,\"instance\":\"m-1\"},\"targets\":[\"127.0.0.1:1\"]}".into(),
-        ));
+                INSERT INTO machines (id, machine_version_id) VALUES ('m-3', 'mv-3');
 
-        assert!(rows.next().unwrap().is_none());
+                INSERT INTO machine_versions (machine_id, id) VALUES ('m-3', 'mv-3');
 
-        let mut prepped = matcher
-            .changed_stmt(
-                &conn,
-                &AggregateChange {
+                INSERT INTO machine_version_statuses (machine_id, id, status) VALUES ('m-3', 'mv-3', 'started');
+            "#).unwrap();
+                tx.commit().unwrap();
+            }
+
+            matcher
+                .process_change(&AggregateChange {
                     actor_id: ActorId::default(),
                     version: 2,
-                    table: "machines",
-                    pk: vec![("id", SqliteValueRef::Text("m-1"))]
+                    table: "consul_services",
+                    pk: vec![
+                        ("node", SqliteValueRef::Text("test-hostname")),
+                        ("id", SqliteValueRef::Text("service-3")),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    evt_type: ChangeEvent::Insert,
+                    data: vec![("name", SqliteValueRef::Text("app-prometheus"))]
                         .into_iter()
                         .collect(),
-                    evt_type: ChangeEvent::Insert,
-                    data: Default::default(),
-                },
-            )
-            .unwrap()
-            .unwrap();
+                })
+                .unwrap();
 
-        let mut rows = prepped.raw_query();
+            let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
-        assert_eq!(rows.next().unwrap().unwrap().get::<_, SqliteValue>(0).unwrap(), SqliteValue::Text(
-                "{\"labels\":{\"__metrics_path\":\"/1\",\"app_name\":null,\"vm_account_id\":null,\"instance\":\"m-1\"},\"targets\":[\"127.0.0.1:1\"]}".into(),
-            ));
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                RowResult::Row {
+                    rowid: 2,
+                    change_type: ChangeType::Upsert,
+                    cells
+                }
+            );
 
-        assert!(rows.next().unwrap().is_none());
+            // delete the first row
+            {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(r#"
+                        DELETE FROM consul_services where node = 'test-hostname' AND id = 'service-1';
+                    "#).unwrap();
+                tx.commit().unwrap();
+            }
 
-        let mut prepped = matcher
-            .changed_stmt(
-                &conn,
-                &AggregateChange {
+            matcher
+                .process_change(&AggregateChange {
                     actor_id: ActorId::default(),
                     version: 3,
-                    table: "machines",
-                    pk: vec![("id", SqliteValueRef::Text("m-2"))]
-                        .into_iter()
-                        .collect(),
-                    evt_type: ChangeEvent::Insert,
+                    table: "consul_services",
+                    pk: vec![
+                        ("node", SqliteValueRef::Text("test-hostname")),
+                        ("id", SqliteValueRef::Text("service-1")),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    evt_type: ChangeEvent::Delete,
                     data: Default::default(),
-                },
-            )
-            .unwrap()
-            .unwrap();
+                })
+                .unwrap();
 
-        let mut rows = prepped.raw_query();
+            let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
-        assert!(rows.next().unwrap().is_none());
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                RowResult::Row {
+                    rowid: 1,
+                    change_type: ChangeType::Delete,
+                    cells
+                }
+            );
+        }
     }
 }

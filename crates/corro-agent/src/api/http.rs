@@ -1,36 +1,26 @@
 use std::{
-    convert::Infallible,
     ops::RangeInclusive,
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
-use axum::{
-    extract::FromRequestParts,
-    response::{
-        sse::{Event, KeepAlive},
-        IntoResponse, Sse,
-    },
-    Extension, TypedHeader,
-};
+use axum::{response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
-use compact_str::{CompactString, ToCompactString};
+use compact_str::{format_compact, CompactString, ToCompactString};
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
-    api::{QueryResult, RqliteResponse, RqliteResult, Statement},
+    api::{Query, RowResult, RqliteResponse, RqliteResult, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{row_to_change, SqliteValue},
-    pubsub::{Matcher, MatcherSub},
+    pubsub::{ChangeType, Matcher, MatcherRequest},
     schema::{make_schema_inner, parse_sql},
 };
-use futures::StreamExt;
+use futures::future::poll_fn;
 use hyper::{
-    header::AsHeaderName,
-    http::{request::Parts, HeaderName, HeaderValue},
-    StatusCode,
+    header::CONTENT_TYPE,
+    http::{HeaderName, HeaderValue},
+    HeaderMap, StatusCode,
 };
 use rusqlite::{params, params_from_iter, ToSql, Transaction};
-use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
 use tokio::{
     sync::{
@@ -38,13 +28,16 @@ use tokio::{
         oneshot,
     },
     task::block_in_place,
+    time::interval,
 };
-use tracing::{error, info, trace};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, trace};
 
 use corro_types::{
     broadcast::{BroadcastInput, Message, MessageV1},
     change::Change,
 };
+use uuid::Uuid;
 
 use crate::agent::process_subs;
 
@@ -366,54 +359,171 @@ pub enum QueryError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
-pub struct AcceptHeader(Option<HeaderValue>);
-
-#[async_trait]
-impl<S> FromRequestParts<S> for AcceptHeader
-where
-    S: Send + Sync,
-{
-    type Rejection = Infallible;
-
-    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self(parts.headers.get("accept").cloned()))
-    }
+#[derive(Debug, Default)]
+pub struct RowOptions {
+    col_names: Option<Vec<CompactString>>,
+    rowid_first_cell: bool,
 }
 
-enum QueriesResponse<S> {
-    Rows(hyper::Response<hyper::Body>),
-    Watch(S),
-}
-
-impl<S> IntoResponse for QueriesResponse<S>
-where
-    S: IntoResponse,
-{
-    fn into_response(self) -> axum::response::Response {
-        match self {
-            QueriesResponse::Rows(a) => a.into_response(),
-            QueriesResponse::Watch(b) => b.into_response(),
-        }
-    }
-}
-
-async fn build_query_rows_response(agent: &Agent, stmt: Statement) -> hyper::Response<hyper::Body> {
-    let (mut tx, body) = hyper::Body::channel();
-
+async fn build_query_rows_response(
+    agent: &Agent,
+    data_tx: mpsc::Sender<RowResult>,
+    stmt: Statement,
+) -> Option<(StatusCode, RqliteResult)> {
     let (res_tx, res_rx) = oneshot::channel();
 
-    // TODO: timeout on data send instead of infinitely accumulating.
+    let pool = agent.pool().clone();
+
+    tokio::spawn(async move {
+        let conn = match pool.read().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                _ = res_tx.send(Some((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    RqliteResult::Error {
+                        error: e.to_string(),
+                    },
+                )));
+                return;
+            }
+        };
+
+        let prepped_res = block_in_place(|| match stmt {
+            Statement::Simple(q) => conn.prepare(q.as_str()),
+            Statement::WithParams(q, _) => conn.prepare(q.as_str()),
+            Statement::WithNamedParams(q, _) => conn.prepare(q.as_str()),
+        });
+
+        let mut prepped = match prepped_res {
+            Ok(prepped) => prepped,
+            Err(e) => {
+                _ = res_tx.send(Some((
+                    StatusCode::BAD_REQUEST,
+                    RqliteResult::Error {
+                        error: e.to_string(),
+                    },
+                )));
+                return;
+            }
+        };
+
+        block_in_place(|| {
+            let col_count = prepped.column_count();
+
+            if let Err(e) = data_tx.blocking_send(RowResult::Columns(
+                prepped
+                    .columns()
+                    .into_iter()
+                    .map(|col| col.name().to_compact_string())
+                    .collect(),
+            )) {
+                error!("could not send back columns: {e}");
+                return;
+            }
+
+            let mut rows = match prepped.query(()) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    _ = res_tx.send(Some((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        RqliteResult::Error {
+                            error: e.to_string(),
+                        },
+                    )));
+                    return;
+                }
+            };
+
+            if let Err(_e) = res_tx.send(None) {
+                error!("could not send back response through oneshot channel, aborting");
+                return;
+            }
+
+            let mut rowid = 1;
+
+            loop {
+                match rows.next() {
+                    Ok(Some(row)) => {
+                        match (0..col_count)
+                            .map(|i| row.get::<_, SqliteValue>(i))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                        {
+                            Ok(cells) => {
+                                if let Err(e) = data_tx.blocking_send(RowResult::Row {
+                                    change_type: ChangeType::Upsert,
+                                    rowid,
+                                    cells,
+                                }) {
+                                    error!("could not send back row: {e}");
+                                    return;
+                                }
+                                rowid += 1;
+                            }
+                            Err(e) => {
+                                _ = data_tx.blocking_send(RowResult::Error(e.to_compact_string()));
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // done!
+                        break;
+                    }
+                    Err(e) => {
+                        _ = data_tx.blocking_send(RowResult::Error(e.to_compact_string()));
+                        return;
+                    }
+                }
+            }
+        });
+    });
+
+    match res_rx.await {
+        Ok(res) => res,
+        Err(e) => Some((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            RqliteResult::Error {
+                error: e.to_string(),
+            },
+        )),
+    }
+}
+
+pub async fn api_v1_query_by_id(
+    Extension(agent): Extension<Agent>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> impl IntoResponse {
+    let matcher = match { agent.matchers().read().get(&id).cloned() } {
+        Some(matcher) => matcher,
+        None => {
+            return hyper::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(
+                    serde_json::to_vec(&RowResult::Error(format_compact!(
+                        "could not find watcher with id {id}"
+                    )))
+                    .expect("could not serialize queries stream error")
+                    .into(),
+                )
+                .expect("could not build error response")
+        }
+    };
+
+    let (mut tx, body) = hyper::Body::channel();
+
+    // TODO: timeout on data send instead of infinitely waiting for channel space.
     let (data_tx, mut data_rx) = channel(512);
 
     tokio::spawn(async move {
         let mut buf = BytesMut::new();
+
         while let Some(query_res) = data_rx.recv().await {
             {
                 let mut writer = (&mut buf).writer();
                 if let Err(e) = serde_json::to_writer(&mut writer, &query_res) {
                     _ = tx
                         .send_data(
-                            serde_json::to_vec(&serde_json::json!(QueryResult::Error(
+                            serde_json::to_vec(&serde_json::json!(RowResult::Error(
                                 e.to_compact_string()
                             )))
                             .expect("could not serialize error json")
@@ -431,199 +541,186 @@ async fn build_query_rows_response(agent: &Agent, stmt: Statement) -> hyper::Res
                 return;
             }
         }
+
+        debug!("watcher query body channel done");
     });
 
-    let pool = agent.pool().clone();
-    tokio::spawn(async move {
-        let conn = match pool.read().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                _ = res_tx.send((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    hyper::Body::from(
-                        serde_json::to_vec(&RqliteResult::Error {
-                            error: e.to_string(),
-                        })
-                        .expect("could not serialize error response"),
-                    ),
-                ));
-                return;
-            }
-        };
-
-        let prepped_res = block_in_place(|| match stmt {
-            Statement::Simple(q) => conn.prepare(q.as_str()),
-            Statement::WithParams(q, _) => conn.prepare(q.as_str()),
-            Statement::WithNamedParams(q, _) => conn.prepare(q.as_str()),
-        });
-
-        let mut prepped = match prepped_res {
-            Ok(prepped) => prepped,
-            Err(e) => {
-                _ = res_tx.send((
-                    StatusCode::BAD_REQUEST,
-                    hyper::Body::from(
-                        serde_json::to_vec(&RqliteResult::Error {
-                            error: e.to_string(),
-                        })
-                        .expect("could not serialize error response"),
-                    ),
-                ));
-                return;
-            }
-        };
-
-        block_in_place(|| {
-            let col_count = prepped.column_count();
-
-            if let Err(e) = data_tx.blocking_send(QueryResult::Columns(
-                prepped
-                    .columns()
-                    .into_iter()
-                    .map(|col| col.name().to_compact_string())
-                    .collect(),
-            )) {
-                error!("could not send back columns: {e}");
-                return;
-            }
-
-            let mut rows = match prepped.query(()) {
-                Ok(rows) => rows,
-                Err(e) => {
-                    _ = res_tx.send((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        hyper::Body::from(
-                            serde_json::to_vec(&RqliteResult::Error {
-                                error: e.to_string(),
-                            })
-                            .expect("could not serialize error response"),
-                        ),
-                    ));
-                    return;
-                }
-            };
-
-            if let Err(_e) = res_tx.send((StatusCode::OK, body)) {
-                error!("could not send back response through oneshot channel, aborting");
-                return;
-            }
-
-            loop {
-                match rows.next() {
-                    Ok(Some(row)) => {
-                        match (0..col_count)
-                            .map(|i| row.get::<_, SqliteValue>(i))
-                            .collect::<rusqlite::Result<Vec<_>>>()
-                        {
-                            Ok(row) => {
-                                if let Err(e) = data_tx.blocking_send(QueryResult::Row(row)) {
-                                    error!("could not send back row: {e}");
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                _ = data_tx
-                                    .blocking_send(QueryResult::Error(e.to_compact_string()));
-                                return;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // done!
-                        break;
-                    }
-                    Err(e) => {
-                        _ = data_tx.blocking_send(QueryResult::Error(e.to_compact_string()));
-                        return;
-                    }
-                }
-            }
-        });
-    });
-
-    let (status, body) = match res_rx.await {
-        Ok(res) => res,
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            hyper::Body::from(
-                serde_json::to_vec(&RqliteResult::Error {
-                    error: e.to_string(),
-                })
-                .expect("could not serialize error response"),
-            ),
-        ),
-    };
+    if let Err(e) = matcher
+        .0
+        .query_tx
+        .send(MatcherRequest::QueryTemp(data_tx))
+        .await
+    {
+        return hyper::Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(
+                serde_json::to_vec(&RowResult::Error(
+                    "could not send query request to watcher, probably gone".into(),
+                ))
+                .expect("could not serialize queries stream error")
+                .into(),
+            )
+            .expect("could not build query response body");
+    }
 
     hyper::Response::builder()
-        .status(status)
+        .status(StatusCode::OK)
         .body(body)
-        .expect("could not build body")
+        .expect("could not build query response body")
 }
 
 pub async fn api_v1_queries(
     Extension(agent): Extension<Agent>,
-    AcceptHeader(accept): AcceptHeader,
-    axum::extract::Json(stmt): axum::extract::Json<Statement>,
+    axum::extract::Json(query): axum::extract::Json<Query>,
 ) -> impl IntoResponse {
-    let wants_event_stream = match accept {
-        Some(header) => header == "text/event-stream",
-        _ => false,
-    };
+    let (mut tx, body) = hyper::Body::channel();
 
-    if !wants_event_stream {
-        return QueriesResponse::Rows(build_query_rows_response(&agent, stmt).await);
-    }
+    let matcher_id = Uuid::new_v4();
+    let cancel = CancellationToken::new();
+
+    // TODO: timeout on data send instead of infinitely waiting for channel space.
+    let (data_tx, mut data_rx) = channel(512);
+
+    tokio::spawn({
+        let cancel = cancel.clone();
+        let agent = agent.clone();
+        async move {
+            let _drop_guard = cancel.drop_guard();
+
+            let mut buf = BytesMut::new();
+
+            let mut check_ready = interval(Duration::from_secs(1));
+            loop {
+                // either we get data we need to transmit
+                // or we check every 1s if the client is still ready to receive data
+                let query_res = tokio::select! {
+                    Some(query_res) = data_rx.recv() => query_res,
+                    _ = check_ready.tick() => {
+                        if let Err(_) = poll_fn(|cx| tx.poll_ready(cx)).await {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                {
+                    let mut writer = (&mut buf).writer();
+                    if let Err(e) = serde_json::to_writer(&mut writer, &query_res) {
+                        _ = tx
+                            .send_data(
+                                serde_json::to_vec(&serde_json::json!(RowResult::Error(
+                                    e.to_compact_string()
+                                )))
+                                .expect("could not serialize error json")
+                                .into(),
+                            )
+                            .await;
+                        return;
+                    }
+                }
+
+                buf.extend_from_slice(b"\n");
+
+                if let Err(e) = tx.send_data(buf.split().freeze()).await {
+                    error!("could not send data through body's channel: {e}");
+                    return;
+                }
+            }
+            debug!("query body channel done");
+            // try to remove if it exists.
+            agent.matchers().write().remove(&matcher_id);
+        }
+    });
+
+    let stmt = match query {
+        Query::Simple(statement)
+        | Query::Options {
+            statement,
+            watch: false,
+        } => match build_query_rows_response(&agent, data_tx, statement).await {
+            Some((status, res)) => {
+                return hyper::Response::builder()
+                    .status(status)
+                    .body(
+                        serde_json::to_vec(&res)
+                            .expect("could not serialize query error response")
+                            .into(),
+                    )
+                    .expect("could not build query response body");
+            }
+            None => {
+                return hyper::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(body)
+                    .expect("could not build query response body");
+            }
+        },
+        Query::Options {
+            statement,
+            watch: true,
+        } => statement,
+    };
 
     let stmt = match stmt {
         Statement::Simple(s) => s,
         _ => {
-            return QueriesResponse::Rows(
-                hyper::Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(
-                        serde_json::to_vec(&QueryResult::Error(
-                            "only simple statements (no params) are accepted for streaming".into(),
-                        ))
+            return hyper::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(
+                    serde_json::to_vec(&RowResult::Error(
+                        "only simple statements (no params) are accepted for watches".into(),
+                    ))
+                    .expect("could not serialize queries stream error")
+                    .into(),
+                )
+                .expect("could not build error response")
+        }
+    };
+
+    let conn = match agent.pool().dedicated_write().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            return hyper::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(
+                    serde_json::to_vec(&RowResult::Error(e.to_compact_string()))
                         .expect("could not serialize queries stream error")
                         .into(),
-                    )
-                    .expect("could not build error response"),
-            )
+                )
+                .expect("could not build error response")
         }
     };
 
-    let matcher = match Matcher::new(&agent.schema().read(), &stmt) {
+    let matcher = match Matcher::new(
+        matcher_id,
+        &agent.schema().read(),
+        conn,
+        data_tx.clone(),
+        &stmt,
+        cancel,
+    ) {
         Ok(m) => m,
         Err(e) => {
-            return QueriesResponse::Rows(
-                hyper::Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(
-                        serde_json::to_vec(&QueryResult::Error(e.to_compact_string()))
-                            .expect("could not serialize queries stream error")
-                            .into(),
-                    )
-                    .expect("could not build error response"),
-            )
+            return hyper::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(
+                    serde_json::to_vec(&RowResult::Error(e.to_compact_string()))
+                        .expect("could not serialize queries stream error")
+                        .into(),
+                )
+                .expect("could not build error response")
         }
     };
 
-    let (tx, rx) = mpsc::channel(128);
-
-    let id = uuid::Uuid::new_v4();
     {
-        agent
-            .matchers()
-            .write()
-            .insert(id, MatcherSub { matcher, tx });
+        agent.matchers().write().insert(matcher_id, matcher.clone());
     }
 
-    QueriesResponse::Watch(
-        Sse::new(
-            tokio_stream::wrappers::ReceiverStream::new(rx)
-                .map(|row| Event::default().json_data(QueryResult::Row(row))),
-        ), // .keep_alive(KeepAlive::default()),
-    )
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header("corro-query-id", matcher_id.to_string())
+        .body(body)
+        .expect("could not generate ok http response for query request")
 }
 
 async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
@@ -919,8 +1016,9 @@ mod tests {
 
         let res = api_v1_queries(
             Extension(agent.clone()),
-            AcceptHeader(None),
-            axum::Json(Statement::Simple("select * from tests".into())),
+            axum::Json(Query::Simple(Statement::Simple(
+                "select * from tests".into(),
+            ))),
         )
         .await
         .into_response();
@@ -937,47 +1035,53 @@ mod tests {
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
-        let cols: QueryResult = serde_json::from_str(&s).unwrap();
+        let cols: RowResult = serde_json::from_str(&s).unwrap();
 
-        assert_eq!(cols, QueryResult::Columns(vec!["id".into(), "text".into()]));
+        assert_eq!(cols, RowResult::Columns(vec!["id".into(), "text".into()]));
 
         buf.extend_from_slice(&body.data().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
-        let row: QueryResult = serde_json::from_str(&s).unwrap();
+        let row: RowResult = serde_json::from_str(&s).unwrap();
 
         assert_eq!(
             row,
-            QueryResult::Row(vec!["service-id".into(), "service-name".into()])
+            RowResult::Row {
+                rowid: 1,
+                change_type: ChangeType::Upsert,
+                cells: vec!["service-id".into(), "service-name".into()]
+            }
         );
 
         buf.extend_from_slice(&body.data().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
-        let row: QueryResult = serde_json::from_str(&s).unwrap();
+        let row: RowResult = serde_json::from_str(&s).unwrap();
 
         assert_eq!(
             row,
-            QueryResult::Row(vec!["service-id-2".into(), "service-name-2".into()])
+            RowResult::Row {
+                rowid: 2,
+                change_type: ChangeType::Upsert,
+                cells: vec!["service-id-2".into(), "service-name-2".into()]
+            }
         );
 
         assert!(body.data().await.is_none());
 
         let res = api_v1_queries(
             Extension(agent.clone()),
-            AcceptHeader(Some(HeaderValue::from_static("text/event-stream"))),
-            axum::Json(Statement::Simple("select * from tests".into())),
+            axum::Json(Query::Options {
+                statement: Statement::Simple("select * from tests".into()),
+                watch: true,
+            }),
         )
         .await
         .into_response();
 
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(
-            res.headers().get("content-type").unwrap(),
-            HeaderValue::from_static("text/event-stream")
-        );
 
         let mut body = res.into_body();
 
@@ -1000,7 +1104,7 @@ mod tests {
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
-        assert_eq!(s, "data:{\"row\":[\"service-id-3\",\"service-name-3\"]}");
+        assert_eq!(s, "{\"row\":[\"service-id-3\",\"service-name-3\"]}");
 
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
@@ -1022,7 +1126,7 @@ mod tests {
             }
         };
 
-        assert_eq!(s, "data:{\"row\":[\"service-id-4\",\"service-name-4\"]}");
+        assert_eq!(s, "{\"row\":[\"service-id-4\",\"service-name-4\"]}");
 
         Ok(())
     }

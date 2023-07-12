@@ -6,7 +6,7 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use corro_client::CorrosionApiClient;
 use corro_types::{
-    api::{QueryResult, RqliteResult, Statement},
+    api::{Query, RowResult, RqliteResult, Statement},
     config::{default_admin_path, Config},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
 };
@@ -44,11 +44,11 @@ async fn main() -> eyre::Result<()> {
         Command::Query {
             query,
             columns: show_columns,
-            timer,
+            ..
         } => {
-            let mut body = cli
+            let (_, mut body) = cli
                 .api_client()
-                .query(&Statement::Simple(query.clone()))
+                .query(&Query::Simple(Statement::Simple(query.clone())))
                 .await?;
 
             let mut lines = LinesCodec::new();
@@ -58,24 +58,28 @@ async fn main() -> eyre::Result<()> {
             loop {
                 buf.extend_from_slice(&body.next().await.unwrap()?);
                 let s = lines.decode(&mut buf).unwrap().unwrap();
-                let res: QueryResult = serde_json::from_str(&s)?;
+                let res: RowResult = serde_json::from_str(&s)?;
 
                 match res {
-                    QueryResult::Columns(cols) => {
+                    RowResult::Columns(cols) => {
                         if *show_columns {
                             println!("{}", cols.join("|"));
                         }
                     }
-                    QueryResult::Row(row) => {
+                    RowResult::Row { cells, .. } => {
                         println!(
                             "{}",
-                            row.iter()
+                            cells
+                                .iter()
                                 .map(|v| v.to_string())
                                 .collect::<Vec<_>>()
                                 .join("|")
                         );
                     }
-                    QueryResult::Error(e) => {
+                    RowResult::EndOfQuery => {
+                        break;
+                    }
+                    RowResult::Error(e) => {
                         eyre::bail!("{e}");
                     }
                 }

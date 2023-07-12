@@ -675,6 +675,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2418,6 +2419,7 @@ dependencies = [
  "hyper",
  "indexmap",
  "logos",
+ "parking_lot",
  "rhai",
  "serde",
  "serde_json",
@@ -2428,6 +2430,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tripwire",
+ "uuid",
 ]
 
 [[package]]

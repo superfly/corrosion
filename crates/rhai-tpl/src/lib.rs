@@ -1,19 +1,25 @@
+use std::collections::HashMap;
 use std::io::Write;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bytes::BytesMut;
 use compact_str::CompactString;
-use corro_types::api::QueryResult;
+use corro_client::CorrosionApiClient;
+use corro_types::api::RowResult;
 use corro_types::api::Statement;
 use corro_types::change::SqliteValue;
 use futures::StreamExt;
 use indexmap::IndexMap;
 use logos::Logos;
+use parking_lot::RwLock;
 use rhai::{EvalAltResult, Map};
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
+use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio_util::codec::{Decoder, LinesCodec};
 use tracing::trace;
+use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Clone, Copy, Default, thiserror::Error)]
 #[error("parse error")]
@@ -43,7 +49,7 @@ enum Closing {
 
 #[derive(Clone)]
 struct QueryResponse {
-    body: Arc<RwLock<hyper::Body>>,
+    query: Arc<RwLock<QueryHandle>>,
 }
 
 impl IntoIterator for QueryResponse {
@@ -53,7 +59,8 @@ impl IntoIterator for QueryResponse {
 
     fn into_iter(self) -> Self::IntoIter {
         QueryResponseIter {
-            body: self.body,
+            query: self.query.clone(),
+            body: None,
             codec: LinesCodec::new(),
             buf: BytesMut::new(),
             handle: tokio::runtime::Handle::current(),
@@ -64,7 +71,8 @@ impl IntoIterator for QueryResponse {
 }
 
 struct QueryResponseIter {
-    body: Arc<RwLock<hyper::Body>>,
+    query: Arc<RwLock<QueryHandle>>,
+    body: Option<hyper::Body>,
     buf: BytesMut,
     codec: LinesCodec,
     handle: tokio::runtime::Handle,
@@ -74,6 +82,7 @@ struct QueryResponseIter {
 
 #[derive(Clone)]
 struct Row {
+    id: i64,
     columns: Arc<Vec<CompactString>>,
     cells: Vec<SqliteValue>,
 }
@@ -155,21 +164,27 @@ impl Cell {
     }
 }
 
-impl Iterator for QueryResponseIter {
-    type Item = Result<Row, Box<EvalAltResult>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        loop {
-            let bytes_res = match self.body.write() {
-                Ok(mut body) => self.handle.block_on(body.next()),
+impl QueryResponseIter {
+    pub async fn recv(&mut self) -> Option<Result<Row, Box<EvalAltResult>>> {
+        let body = match self.body.as_mut() {
+            Some(body) => body,
+            None => match self.query.write().body().await {
+                Ok(body) => {
+                    self.body = Some(body);
+                    self.body.as_mut().unwrap()
+                }
                 Err(e) => {
                     self.done = true;
                     return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
                 }
-            };
+            },
+        };
+
+        if self.done {
+            return None;
+        }
+        loop {
+            let bytes_res = body.next().await;
             match bytes_res {
                 Some(Ok(b)) => self.buf.extend_from_slice(&b),
                 Some(Err(e)) => {
@@ -184,10 +199,11 @@ impl Iterator for QueryResponseIter {
             match self.codec.decode(&mut self.buf) {
                 Ok(Some(line)) => match serde_json::from_str(&line) {
                     Ok(res) => match res {
-                        QueryResult::Columns(cols) => self.columns = Some(Arc::new(cols)),
-                        QueryResult::Row(cells) => match self.columns.as_ref() {
+                        RowResult::Columns(cols) => self.columns = Some(Arc::new(cols)),
+                        RowResult::Row { rowid, cells, .. } => match self.columns.as_ref() {
                             Some(columns) => {
                                 return Some(Ok(Row {
+                                    id: rowid,
                                     columns: columns.clone(),
                                     cells,
                                 }))
@@ -199,7 +215,10 @@ impl Iterator for QueryResponseIter {
                                 ))));
                             }
                         },
-                        QueryResult::Error(e) => {
+                        RowResult::EndOfQuery => {
+                            return None;
+                        }
+                        RowResult::Error(e) => {
                             self.done = true;
                             return Some(Err(Box::new(EvalAltResult::from(e))));
                         }
@@ -221,6 +240,38 @@ impl Iterator for QueryResponseIter {
     }
 }
 
+impl Iterator for QueryResponseIter {
+    type Item = Result<Row, Box<EvalAltResult>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        self.handle.clone().block_on(self.recv())
+    }
+}
+
+pub struct QueryHandle {
+    query_id: Uuid,
+    body: Option<hyper::Body>,
+    client: CorrosionApiClient,
+}
+
+impl QueryHandle {
+    async fn body(&mut self) -> Result<hyper::Body, corro_client::Error> {
+        if let Some(body) = self.body.take() {
+            return Ok(body);
+        }
+
+        self.client.watched_query(self.query_id).await
+    }
+}
+
+pub struct SubsequentQueryResponse {
+    id: Uuid,
+    client: CorrosionApiClient,
+}
+
 pub struct Engine {
     engine: rhai::Engine,
 }
@@ -240,7 +291,6 @@ impl Engine {
                 }
                 Ok(writer
                     .write()
-                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?
                     .write_all(data.as_bytes())
                     .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?)
             }
@@ -253,7 +303,6 @@ impl Engine {
                 let len = data.encode_utf8(&mut b).len();
                 Ok(writer
                     .write()
-                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?
                     .write_all(&b[0..len])
                     .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?)
             }
@@ -273,18 +322,51 @@ impl Engine {
         engine.register_fn("to_json", SqliteValueWrap::to_json);
         engine.register_fn("to_string", SqliteValueWrap::to_json);
 
-        engine.register_fn(
-            "sql",
+        let query_cache: Arc<RwLock<HashMap<String, Arc<RwLock<QueryHandle>>>>> =
+            Default::default();
+
+        engine.register_fn("sql", {
+            // let query_cache = query_cache.clone();
             move |query: &str| -> Result<QueryResponse, Box<EvalAltResult>> {
-                let body = tokio::runtime::Handle::current()
-                    .block_on(client.query(&Statement::Simple(query.into())))
+                if let Some(handle) = { query_cache.read().get(query).cloned() } {
+                    println!("query already existed...");
+                    return Ok(QueryResponse { query: handle });
+                }
+
+                let mut w = query_cache.write();
+                // double check, for a race (unlikely here, but it is a good idea still)
+                if let Some(handle) = { w.get(query).cloned() } {
+                    println!("query already existed...");
+                    return Ok(QueryResponse { query: handle });
+                }
+
+                println!("making a brand new query!");
+
+                let (query_id, body) = tokio::runtime::Handle::current()
+                    .block_on(client.query(&corro_types::api::Query::Options {
+                        statement: Statement::Simple(query.into()),
+                        watch: true,
+                    }))
                     .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
 
-                Ok(QueryResponse {
-                    body: Arc::new(RwLock::new(body)),
-                })
-            },
-        );
+                let query_id = match query_id {
+                    Some(query_id) => query_id,
+                    None => {
+                        return Err(Box::new(EvalAltResult::from("malformed corrosion response: expected a query id in a response header")));
+                    }
+                };
+
+                let handle = Arc::new(RwLock::new(QueryHandle {
+                    query_id,
+                    body: Some(body),
+                    client: client.clone(),
+                }));
+
+                w.insert(query.to_string(), handle.clone());
+
+                Ok(QueryResponse { query: handle })
+            }
+        });
 
         let json_writer = JsonWriter::new(writer.clone());
 
@@ -301,55 +383,6 @@ impl Engine {
                 json_writer.write_json_w_options(res, options)
             }
         });
-
-        engine.register_fn(
-            "write_json",
-            move |res: QueryResponse, options: Option<Map>| -> Result<(), Box<EvalAltResult>> {
-                let options = match options {
-                    None => {
-                        println!("no options provided, using default");
-                        JsonOutput::default()
-                    }
-                    Some(map) => {
-                        let pretty = map
-                            .get("pretty")
-                            .and_then(|d| d.as_bool().ok())
-                            .unwrap_or(false);
-                        let as_array = map
-                            .get("as_array")
-                            .and_then(|d| d.as_bool().ok())
-                            .unwrap_or(false);
-
-                        JsonOutput {
-                            pretty,
-                            row_values_as_array: as_array,
-                        }
-                    }
-                };
-
-                let mut w = writer
-                    .write()
-                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
-
-                let rows = res.into_iter();
-
-                if options.pretty {
-                    let ser = serde_json::Serializer::pretty(&mut *w);
-                    if options.row_values_as_array {
-                        write_json_rows_as_array(ser, rows)
-                    } else {
-                        write_json_rows_as_object(ser, rows)
-                    }
-                } else {
-                    let ser = serde_json::Serializer::new(&mut *w);
-                    if options.row_values_as_array {
-                        write_json_rows_as_array(ser, rows)
-                    } else {
-                        write_json_rows_as_object(ser, rows)
-                    }
-                }
-            },
-        );
 
         engine.register_fn("hostname", || -> Result<String, Box<EvalAltResult>> {
             Ok(hostname::get()
@@ -480,21 +513,19 @@ where
             }
         };
 
-        let mut w = self
-            .writer
-            .write()
-            .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+        let mut w = self.writer.write();
 
-        json_output.write_rows(&mut *w, res.into_iter())
+        json_output.write_rows(&mut *w, res.into_iter())?;
+
+        println!("wrote JSON!");
+
+        Ok(())
     }
 
     fn write_json(&self, res: QueryResponse) -> Result<(), Box<EvalAltResult>> {
         let mut json_output = JsonOutput::default();
 
-        let mut w = self
-            .writer
-            .write()
-            .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+        let mut w = self.writer.write();
 
         json_output.write_rows(&mut *w, res.into_iter())
     }
@@ -606,7 +637,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_basic() {
         _ = tracing_subscriber::fmt::try_init();
-        let (tripwire, _, _) = Tripwire::new_simple();
+        let (tripwire, _trip_worker, _trip_sender) = Tripwire::new_simple();
 
         let tmpdir = tempfile::tempdir().unwrap();
         let filepath = tmpdir.path().join("output");
@@ -665,7 +696,7 @@ tail",
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_sql() {
         _ = tracing_subscriber::fmt::try_init();
-        let (tripwire, _, _) = Tripwire::new_simple();
+        let (tripwire, _trip_worker, _trip_sender) = Tripwire::new_simple();
 
         let ta = launch_test_agent(|conf| conf.build(), tripwire.clone())
             .await
@@ -722,7 +753,8 @@ tail",
                 assert!(matches!(Command::Render, cmd));
 
                 block_in_place(|| {
-                    let input = r#"<%= write_json(sql("select * from tests"), #{pretty: true}) %>"#;
+                    let input = r#"<%= write_json(sql("select * from tests"), #{pretty: true}) %>
+<%= write_json(sql("select * from tests"), #{pretty: true}) %>"#;
 
                     let tpl = engine.compile(input).unwrap();
                     tpl.render().unwrap();
