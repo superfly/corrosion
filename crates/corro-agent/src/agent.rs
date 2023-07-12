@@ -925,6 +925,7 @@ async fn handle_notifications(
 }
 
 async fn handle_db_cleanup(pool: SplitPool) -> eyre::Result<()> {
+    debug!("handling db_cleanup (WAL truncation)");
     let conn = pool.write_low().await?;
     block_in_place(move || {
         let start = Instant::now();
@@ -943,6 +944,7 @@ async fn handle_db_cleanup(pool: SplitPool) -> eyre::Result<()> {
         }
         Ok::<_, eyre::Report>(())
     })?;
+    debug!("done handling db_cleanup");
     Ok(())
 }
 
