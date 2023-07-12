@@ -494,10 +494,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 for actor_id in to_check {
                     let booked = bookie.for_actor(actor_id);
 
-                    // get a write lock so nothing else may handle changes while we do this
-                    let mut bookedw = booked.write();
-
-                    let versions = bookedw.current_versions();
+                    let versions = {
+                        let read = booked.read();
+                        read.current_versions()
+                    };
 
                     let site_id = if actor_id == self_actor_id {
                         None
@@ -531,7 +531,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         let mut inserted = 0;
 
-                        for (range, known) in bookedw.inner().iter() {
+                        for (range, known) in booked.read().iter() {
                             match known {
                                 KnownDbVersion::Current {
                                     db_version,
@@ -555,6 +555,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         Ok::<_, eyre::Report>(Some(to_clear))
                     });
+
+                    let mut bookedw = booked.write();
 
                     match res {
                         Ok(Some(to_clear)) => {
