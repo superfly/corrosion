@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Seek;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -12,13 +13,10 @@ use futures::StreamExt;
 use indexmap::IndexMap;
 use logos::Logos;
 use parking_lot::RwLock;
-use rhai::NativeCallContext;
 use rhai::Scope;
 use rhai::{EvalAltResult, Map};
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
-use tokio::sync::mpsc;
-use tokio::sync::Notify;
 use tokio_util::codec::{Decoder, LinesCodec};
 use tracing::trace;
 use uuid::Uuid;
@@ -269,10 +267,17 @@ impl QueryHandle {
     }
 }
 
+pub trait WriteSeek: Write + Seek + Send + Sync + 'static {}
+impl<T> WriteSeek for T where T: Write + Seek + Send + Sync + 'static {}
+
 #[derive(Clone)]
-pub struct TemplateWriter(Arc<RwLock<Box<dyn Write + Send + Sync + 'static>>>);
+pub struct TemplateWriter(Arc<RwLock<Box<dyn WriteSeek>>>);
 
 impl TemplateWriter {
+    pub fn new<W: WriteSeek>(w: W) -> Self {
+        Self(Arc::new(RwLock::new(Box::new(w))))
+    }
+
     fn write_str(&mut self, data: &str) -> Result<(), Box<EvalAltResult>> {
         if data.is_empty() {
             return Ok(());
@@ -630,8 +635,7 @@ Item #<%= count + 1 %> = <%= item %>
 tail"#;
 
         let tpl = engine.compile(input).unwrap();
-        tpl.render(TemplateWriter(Arc::new(RwLock::new(Box::new(f)))))
-            .unwrap();
+        tpl.render(TemplateWriter::new(f)).unwrap();
 
         let output = std::fs::read_to_string(filepath).unwrap();
 
@@ -719,8 +723,7 @@ tail",
 <%= write_json(sql("select * from tests"), #{pretty: true}) %>"#;
 
                     let tpl = engine.compile(input).unwrap();
-                    tpl.render(TemplateWriter(Arc::new(RwLock::new(Box::new(f)))))
-                        .unwrap();
+                    tpl.render(TemplateWriter::new(f)).unwrap();
                 });
                 reply_tx.send(Reply::Rendered).await.unwrap();
                 // }

@@ -5,7 +5,7 @@ use std::{
 
 use axum::{response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
-use compact_str::{format_compact, CompactString, ToCompactString};
+use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
     api::{Query, RowResult, RqliteResponse, RqliteResult, Statement},
@@ -15,11 +15,7 @@ use corro_types::{
     schema::{make_schema_inner, parse_sql},
 };
 use futures::future::poll_fn;
-use hyper::{
-    header::CONTENT_TYPE,
-    http::{HeaderName, HeaderValue},
-    HeaderMap, StatusCode,
-};
+use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
@@ -359,12 +355,6 @@ pub enum QueryError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
-#[derive(Debug, Default)]
-pub struct RowOptions {
-    col_names: Option<Vec<CompactString>>,
-    rowid_first_cell: bool,
-}
-
 async fn build_query_rows_response(
     agent: &Agent,
     data_tx: mpsc::Sender<RowResult>,
@@ -545,7 +535,7 @@ pub async fn api_v1_query_by_id(
         debug!("watcher query body channel done");
     });
 
-    if let Err(e) = matcher
+    if let Err(_e) = matcher
         .0
         .query_tx
         .send(MatcherRequest::QueryTemp(data_tx))
