@@ -213,7 +213,7 @@ pub fn runtime_loop(
 
                 match branch {
                     Branch::Tripped => {
-                        debug!("handling Branch::Tripped");
+                        trace!("handling Branch::Tripped");
                         // collect all current states
 
                         let states: Vec<_> = {
@@ -297,21 +297,21 @@ pub fn runtime_loop(
                     }
                     Branch::Foca(input) => match input {
                         FocaInput::Announce(actor) => {
-                            debug!("handling FocaInput::Announce");
+                            trace!("handling FocaInput::Announce");
                             trace!("announcing actor: {actor:?}");
                             if let Err(e) = foca.announce(actor, &mut runtime) {
                                 error!("foca announce error: {e}");
                             }
                         }
                         FocaInput::Data(data, from) => {
-                            debug!("handling FocaInput::Data");
+                            trace!("handling FocaInput::Data");
                             histogram!("corro.gossip.recv.bytes", data.len() as f64);
                             if let Err(e) = foca.handle_data(&data, &mut runtime) {
                                 error!("error handling foca data from {from:?}: {e}");
                             }
                         }
                         FocaInput::ClusterSize(size) => {
-                            debug!("handling FocaInput::ClusterSize");
+                            trace!("handling FocaInput::ClusterSize");
                             // let diff: i64 =
                             //     (size.get() as i64 - last_cluster_size.get() as i64).abs();
 
@@ -330,14 +330,14 @@ pub fn runtime_loop(
                             }
                         }
                         FocaInput::ApplyMany(updates) => {
-                            debug!("handling FocaInput::ApplyMany");
+                            trace!("handling FocaInput::ApplyMany");
                             if let Err(e) = foca.apply_many(updates.into_iter(), &mut runtime) {
                                 error!("foca apply_many error: {e}");
                             }
                         }
                     },
                     Branch::MemberEvents(evts) => {
-                        debug!("handling Branch::MemberEvents");
+                        trace!("handling Branch::MemberEvents");
                         let splitted: Vec<_> = evts
                             .iter()
                             .flatten()
@@ -413,7 +413,7 @@ pub fn runtime_loop(
                         });
                     }
                     Branch::HandleTimer(timer, seq) => {
-                        debug!("handling Branch::HandleTimer");
+                        trace!("handling Branch::HandleTimer");
                         let mut v = vec![(timer, seq)];
 
                         // drain the channel, in case there's a race among timers
@@ -431,7 +431,7 @@ pub fn runtime_loop(
                         }
                     }
                     Branch::Metrics => {
-                        debug!("handling Branch::Metrics");
+                        trace!("handling Branch::Metrics");
                         {
                             gauge!("corro.gossip.members", foca.num_members() as f64);
                             gauge!(
@@ -557,7 +557,7 @@ pub fn runtime_loop(
                     // nothing to here, yet!
                 }
                 Branch::Broadcast(input) => {
-                    debug!("handling Branch::Broadcast");
+                    trace!("handling Branch::Broadcast");
                     match input {
                         BroadcastInput::Rebroadcast(msg) => {
                             let bcast_tx = bcast_tx.clone();
@@ -592,7 +592,7 @@ pub fn runtime_loop(
                     }
                 }
                 Branch::SendBroadcast(msg) => {
-                    debug!("handling Branch::SendBroadcast");
+                    trace!("handling Branch::SendBroadcast");
                     match serialize_broadcast(&msg, &mut ser_buf) {
                         Ok(bytes) => {
                             let config = config.read();
@@ -637,7 +637,7 @@ pub fn runtime_loop(
                     }
                 }
                 Branch::BroadcastDeadline => {
-                    debug!("handling Branch::BroadcastDeadline");
+                    trace!("handling Branch::BroadcastDeadline");
                     let config = config.read();
                     if bcast_buf.len() > 1 {
                         to_broadcast = Some(PendingBroadcast::from_buf(
@@ -650,7 +650,7 @@ pub fn runtime_loop(
                     }
                 }
                 Branch::HttpBroadcastDeadline => {
-                    debug!("handling Branch::HttpBroadcastDeadline");
+                    trace!("handling Branch::HttpBroadcastDeadline");
                     let config = config.read();
                     if http_bcast_buf.len() > 1 {
                         to_broadcast = Some(PendingBroadcast::from_buf(
@@ -663,11 +663,11 @@ pub fn runtime_loop(
                     }
                 }
                 Branch::WokePendingBroadcast(pending) => {
-                    debug!("handling Branch::WokePendingBroadcast");
+                    trace!("handling Branch::WokePendingBroadcast");
                     to_broadcast = Some(pending)
                 }
                 Branch::Metrics => {
-                    debug!("handling Branch::Metrics");
+                    trace!("handling Branch::Metrics");
                     gauge!(
                         "corro.gossip.broadcast.channel.capacity",
                         bcast_tx.capacity() as f64

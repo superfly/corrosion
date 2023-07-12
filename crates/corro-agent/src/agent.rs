@@ -511,7 +511,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             match compact_booked_for_actor(&conn, site_id, &versions) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
-                                        return Ok(None);
+                                        return Ok(());
                                     }
                                     to_clear
                                 }
@@ -553,27 +553,20 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         info!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
-                        Ok::<_, eyre::Report>(Some(to_clear))
+                        let mut bookedw = booked.write();
+                        let cleared_len = to_clear.len();
+                        for db_version in to_clear {
+                            if let Some(version) = versions.get(&db_version) {
+                                bookedw.insert(*version, KnownDbVersion::Cleared);
+                            }
+                        }
+                        info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}");
+
+                        Ok::<_, eyre::Report>(())
                     });
 
-                    let mut bookedw = booked.write();
-
-                    match res {
-                        Ok(Some(to_clear)) => {
-                            let cleared_len = to_clear.len();
-                            for db_version in to_clear {
-                                if let Some(version) = versions.get(&db_version) {
-                                    bookedw.insert(*version, KnownDbVersion::Cleared);
-                                }
-                            }
-                            info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}");
-                        }
-                        Ok(None) => {
-                            // nothing to clear
-                        }
-                        Err(e) => {
-                            error!("could not compact versions for actor {actor_id}: {e}");
-                        }
+                    if let Err(e) = res {
+                        error!("could not compact versions for actor {actor_id}: {e}");
                     }
                 }
             }
