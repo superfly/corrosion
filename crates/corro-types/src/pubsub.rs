@@ -25,7 +25,7 @@ use sqlite3_parser::{
     lexer::sql::Parser,
 };
 use tokio::{
-    sync::mpsc::{self, error::SendError, UnboundedSender},
+    sync::mpsc::{self, UnboundedSender},
     task::block_in_place,
 };
 use tokio_util::sync::CancellationToken;
@@ -262,7 +262,6 @@ pub enum ChangeType {
 
 pub enum MatcherRequest {
     ProcessChange(MatcherStmt, Vec<SqliteValue>),
-    QueryTemp(mpsc::Sender<RowResult>),
 }
 
 #[derive(Debug, Clone)]
@@ -281,7 +280,8 @@ pub struct InnerMatcher {
     pub statements: HashMap<String, MatcherStmt>,
     pub pks: IndexMap<String, Vec<String>>,
     pub parsed: ParsedSelect,
-    pub temp_table: String,
+    pub query_table: String,
+    pub qualified_table_name: String,
     pub tx: mpsc::Sender<RowResult>,
     pub query_tx: mpsc::Sender<MatcherRequest>,
     pub col_names: Vec<CompactString>,
@@ -376,7 +376,7 @@ impl Matcher {
             _ => unreachable!(),
         }
 
-        let temp_table = format!("query_{}", id.as_simple());
+        let query_table = format!("query_{}", id.as_simple());
 
         for (tbl_name, _cols) in parsed.table_columns.iter() {
             let expr = table_to_expr(
@@ -419,7 +419,7 @@ impl Matcher {
                     temp_query: format!(
                         "SELECT {} FROM {} WHERE {}",
                         tmp_cols.join(","),
-                        temp_table,
+                        query_table,
                         pks.get(tbl_name)
                             .cloned()
                             .ok_or(MatcherError::MissingPrimaryKeys)?
@@ -440,11 +440,43 @@ impl Matcher {
             statements: statements,
             pks,
             parsed,
-            temp_table,
+            qualified_table_name: format!("watches.{query_table}"),
+            query_table,
             tx,
             query_tx,
             col_names: col_names.clone(),
         }));
+
+        let mut tmp_cols = matcher
+            .0
+            .pks
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<String>>();
+
+        for i in 0..(matcher.0.parsed.columns.len()) {
+            tmp_cols.push(format!("col_{i}"));
+        }
+
+        let create_temp_table = format!(
+            "CREATE TABLE {} (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {});
+            CREATE UNIQUE INDEX watches.index_{}_pk ON {} ({});",
+            matcher.0.qualified_table_name,
+            tmp_cols.join(","),
+            matcher.0.id.as_simple(),
+            matcher.0.query_table,
+            matcher
+                .0
+                .pks
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+
+        conn.execute_batch(&create_temp_table)?;
 
         tokio::spawn({
             let matcher = matcher.clone();
@@ -454,51 +486,20 @@ impl Matcher {
                     return;
                 }
 
-                let mut tmp_cols = matcher
-                    .0
-                    .pks
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect::<Vec<String>>();
-
                 let mut query_cols = vec![];
                 for i in 0..(matcher.0.parsed.columns.len()) {
-                    let col_name = format!("col_{i}");
-                    tmp_cols.push(col_name.clone());
-                    query_cols.push(col_name);
+                    query_cols.push(format!("col_{i}"));
                 }
 
                 let res = block_in_place(|| {
                     let tx = conn.transaction()?;
-
-                    let create_temp_table = format!(
-                        "CREATE TEMP TABLE {} (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {});
-                        CREATE UNIQUE INDEX {}_pk ON {} ({});",
-                        matcher.0.temp_table,
-                        tmp_cols.join(","),
-                        matcher.0.temp_table,
-                        matcher.0.temp_table,
-                        matcher
-                            .0
-                            .pks
-                            .values()
-                            .flatten()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    );
-
-                    println!("create temp table: {create_temp_table}");
-
-                    tx.execute_batch(&create_temp_table)?;
 
                     let mut stmt_str = Cmd::Stmt(matcher.0.query.clone()).to_string();
                     stmt_str.pop();
 
                     let insert_into = format!(
                         "INSERT INTO {} ({}) {} RETURNING __corro_rowid,{}",
-                        matcher.0.temp_table,
+                        matcher.0.qualified_table_name,
                         tmp_cols.join(","),
                         stmt_str,
                         query_cols.join(","),
@@ -575,59 +576,6 @@ impl Matcher {
                                 }
                             }
                         }
-                        MatcherRequest::QueryTemp(tx) => {
-                            #[derive(Debug, thiserror::Error)]
-                            enum QueryTempError {
-                                #[error(transparent)]
-                                Sqlite(#[from] rusqlite::Error),
-                                #[error(transparent)]
-                                Send(#[from] SendError<RowResult>),
-                            }
-
-                            let res = block_in_place(|| {
-                                let mut query_cols = vec![];
-                                for i in 0..(matcher.0.parsed.columns.len()) {
-                                    query_cols.push(format!("col_{i}"));
-                                }
-                                let mut prepped = conn.prepare_cached(&format!(
-                                    "SELECT __corro_rowid,{} FROM {}",
-                                    query_cols.join(","),
-                                    matcher.temp_table()
-                                ))?;
-                                let col_count = prepped.column_count();
-
-                                tx.blocking_send(RowResult::Columns(matcher.0.col_names.clone()))?;
-
-                                let mut rows = prepped.query(())?;
-
-                                loop {
-                                    let row = match rows.next()? {
-                                        Some(row) => row,
-                                        None => break,
-                                    };
-                                    let rowid = row.get(0)?;
-
-                                    let cells = (1..col_count)
-                                        .map(|i| row.get::<_, SqliteValue>(i))
-                                        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-                                    tx.blocking_send(RowResult::Row {
-                                        rowid,
-                                        change_type: ChangeType::Upsert,
-                                        cells,
-                                    })?;
-                                }
-
-                                Ok::<(), QueryTempError>(())
-                            });
-
-                            if let Err(QueryTempError::Sqlite(e)) = res {
-                                _ = tx.send(RowResult::Error(e.to_compact_string())).await;
-                                continue;
-                            }
-
-                            _ = tx.send(RowResult::EndOfQuery).await;
-                        }
                     }
                 }
             }
@@ -659,8 +607,8 @@ impl Matcher {
         Ok(())
     }
 
-    pub fn temp_table(&self) -> &str {
-        &self.0.temp_table
+    pub fn table_name(&self) -> &str {
+        &self.0.qualified_table_name
     }
 
     pub fn handle_change(
@@ -697,7 +645,7 @@ impl Matcher {
                                 {}
                         RETURNING __corro_rowid,{}",
             // insert into
-            self.0.temp_table,
+            self.0.qualified_table_name,
             tmp_cols.join(","),
             stmt.new_query,
             stmt.temp_query,
@@ -737,7 +685,7 @@ impl Matcher {
             {}
         )) RETURNING __corro_rowid,{}",
             // delete from
-            self.0.temp_table,
+            self.0.qualified_table_name,
             self.0
                 .pks
                 .values()
@@ -801,6 +749,8 @@ impl Matcher {
                 }
             }
         }
+
+        tx.commit()?;
 
         Ok(())
     }
@@ -1179,6 +1129,7 @@ mod tests {
         change::{SqliteValue, SqliteValueRef},
         filters::ChangeEvent,
         schema::parse_sql,
+        sqlite::setup_conn,
     };
 
     use super::*;
@@ -1266,6 +1217,22 @@ mod tests {
         let db_path = tmpdir.path().join("test.db");
 
         let mut conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
+
+        setup_conn(
+            &mut conn,
+            &[(
+                tmpdir
+                    .path()
+                    .join("watches.db")
+                    .display()
+                    .to_string()
+                    .into(),
+                "watches".into(),
+            )]
+            .into(),
+        )
+        .unwrap();
+
         conn.execute_batch(schema_sql)
             .expect("could not exec schema");
 
@@ -1295,17 +1262,26 @@ mod tests {
         let cancel = CancellationToken::new();
         let id = Uuid::new_v4();
 
+        let mut matcher_conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
+
+        setup_conn(
+            &mut matcher_conn,
+            &[(
+                tmpdir
+                    .path()
+                    .join("watches.db")
+                    .display()
+                    .to_string()
+                    .into(),
+                "watches".into(),
+            )]
+            .into(),
+        )
+        .unwrap();
+
         {
             let (tx, mut rx) = mpsc::channel(1);
-            let matcher = Matcher::new(
-                id,
-                &schema,
-                rusqlite::Connection::open(&db_path).expect("could not open conn"),
-                tx,
-                sql,
-                cancel,
-            )
-            .unwrap();
+            let matcher = Matcher::new(id, &schema, matcher_conn, tx, sql, cancel).unwrap();
 
             assert!(matches!(rx.recv().await.unwrap(), RowResult::Columns(_)));
 

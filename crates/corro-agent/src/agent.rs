@@ -10,7 +10,10 @@ use std::{
 
 use crate::{
     api::{
-        http::{api_v1_db_schema, api_v1_queries, api_v1_query_by_id, api_v1_transactions},
+        http::{
+            api_v1_db_schema, api_v1_queries, api_v1_transactions, api_v1_watch_by_id,
+            api_v1_watches,
+        },
         peer::{bidirectional_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncError},
         pubsub::api_v1_subscribe_ws,
     },
@@ -33,7 +36,7 @@ use corro_types::{
     members::{MemberEvent, Members},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
     schema::init_schema,
-    sqlite::{init_cr_conn, CrConn, CrConnManager, Migration},
+    sqlite::{init_cr_conn, CrConn, Migration, SqlitePoolError},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
 };
 
@@ -128,24 +131,10 @@ pub async fn setup(
 
     info!("Actor ID: {}", actor_id);
 
-    let rw_pool = bb8::Builder::new()
-        .max_size(1)
-        .min_idle(Some(1)) // create one right away and keep it idle
-        .build(CrConnManager::new(&conf.db_path))
-        .await?;
-
-    debug!("built RW pool");
-
-    let ro_pool = bb8::Builder::new()
-        .max_size(10)
-        .min_idle(Some(5)) // keep a few idling
-        .max_lifetime(Some(Duration::from_secs(30)))
-        .build(CrConnManager::new_read_only(&conf.db_path))
-        .await?;
-    debug!("built RO pool");
+    let pool = SplitPool::create(&conf.db_path, tripwire.clone()).await?;
 
     let schema = {
-        let mut conn = rw_pool.get().await?;
+        let mut conn = pool.write_priority().await?;
         migrate(&mut conn)?;
         init_schema(&conn)?
     };
@@ -156,7 +145,7 @@ pub async fn setup(
 
     {
         debug!("getting read-only conn for pull bookkeeping rows");
-        let conn = ro_pool.get().await?;
+        let conn = pool.read().await?;
 
         debug!("getting bookkept rows");
 
@@ -268,8 +257,7 @@ pub async fn setup(
 
     let agent = Agent::new(AgentConfig {
         actor_id,
-        ro_pool,
-        rw_pool,
+        pool,
         config: ArcSwap::from_pointee(conf),
         gossip_addr,
         api_addr,
@@ -651,8 +639,22 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             ),
         )
         .route(
-            "/v1/queries/:id",
-            get(api_v1_query_by_id).route_layer(
+            "/v1/watches",
+            post(api_v1_watches).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(128)),
+            ),
+        )
+        .route(
+            "/v1/watches/:id",
+            get(api_v1_watch_by_id).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -1586,7 +1588,7 @@ pub enum SyncClientError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    Pool(#[from] SqlitePoolError),
     #[error("no good candidates found")]
     NoGoodCandidate,
     #[error("could not decode message: {0}")]

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use corro_types::sqlite::SqlitePool;
+use corro_types::sqlite::SqlitePoolError;
 use futures::stream;
 use futures::Stream;
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -156,7 +157,7 @@ fn encode_row_data(
 #[derive(Debug, thiserror::Error)]
 enum PgApiError {
     #[error(transparent)]
-    PoolCheckout(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    PoolCheckout(#[from] SqlitePoolError),
     #[error(transparent)]
     Rusqlite(#[from] rusqlite::Error),
     #[error("parameter type unsupported: {0}")]

@@ -8,11 +8,12 @@ use bytes::{BufMut, BytesMut};
 use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
-    api::{Query, RowResult, RqliteResponse, RqliteResult, Statement},
+    api::{RowResult, RqliteResponse, RqliteResult, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{row_to_change, SqliteValue},
-    pubsub::{ChangeType, Matcher, MatcherRequest},
+    pubsub::{ChangeType, Matcher},
     schema::{make_schema_inner, parse_sql},
+    sqlite::SqlitePoolError,
 };
 use futures::future::poll_fn;
 use hyper::StatusCode;
@@ -27,7 +28,7 @@ use tokio::{
     time::interval,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use corro_types::{
     broadcast::{BroadcastInput, Message, MessageV1},
@@ -350,7 +351,7 @@ pub async fn api_v1_transactions(
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
     #[error("pool connection acquisition error")]
-    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    Pool(#[from] SqlitePoolError),
     #[error("sqlite error: {0}")]
     Rusqlite(#[from] rusqlite::Error),
 }
@@ -479,7 +480,7 @@ async fn build_query_rows_response(
     }
 }
 
-pub async fn api_v1_query_by_id(
+pub async fn api_v1_watch_by_id(
     Extension(agent): Extension<Agent>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> impl IntoResponse {
@@ -535,23 +536,73 @@ pub async fn api_v1_query_by_id(
         debug!("watcher query body channel done");
     });
 
-    if let Err(_e) = matcher
-        .0
-        .query_tx
-        .send(MatcherRequest::QueryTemp(data_tx))
-        .await
-    {
-        return hyper::Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(
-                serde_json::to_vec(&RowResult::Error(
-                    "could not send query request to watcher, probably gone".into(),
-                ))
-                .expect("could not serialize queries stream error")
-                .into(),
-            )
-            .expect("could not build query response body");
-    }
+    let pool = agent.pool().dedicated_pool().clone();
+    tokio::spawn(async move {
+        if let Err(_e) = data_tx
+            .send(RowResult::Columns(matcher.0.col_names.clone()))
+            .await
+        {
+            warn!("could not send back column names, client is probably gone. returning.");
+            return;
+        }
+
+        let conn = match pool.get().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                _ = data_tx.send(RowResult::Error(e.to_compact_string())).await;
+                return;
+            }
+        };
+
+        #[derive(Debug, thiserror::Error)]
+        enum QueryTempError {
+            #[error(transparent)]
+            Sqlite(#[from] rusqlite::Error),
+            #[error(transparent)]
+            Send(#[from] mpsc::error::SendError<RowResult>),
+        }
+
+        let res = block_in_place(|| {
+            let mut query_cols = vec![];
+            for i in 0..(matcher.0.parsed.columns.len()) {
+                query_cols.push(format!("col_{i}"));
+            }
+            let mut prepped = conn.prepare_cached(&format!(
+                "SELECT __corro_rowid,{} FROM {}",
+                query_cols.join(","),
+                matcher.table_name()
+            ))?;
+            let col_count = prepped.column_count();
+
+            data_tx.blocking_send(RowResult::Columns(matcher.0.col_names.clone()))?;
+
+            let mut rows = prepped.query(())?;
+
+            loop {
+                let row = match rows.next()? {
+                    Some(row) => row,
+                    None => break,
+                };
+                let rowid = row.get(0)?;
+
+                let cells = (1..col_count)
+                    .map(|i| row.get::<_, SqliteValue>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                data_tx.blocking_send(RowResult::Row {
+                    rowid,
+                    change_type: ChangeType::Upsert,
+                    cells,
+                })?;
+            }
+
+            Ok::<_, QueryTempError>(())
+        });
+
+        if let Err(QueryTempError::Sqlite(e)) = res {
+            _ = data_tx.send(RowResult::Error(e.to_compact_string())).await;
+        }
+    });
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -559,9 +610,9 @@ pub async fn api_v1_query_by_id(
         .expect("could not build query response body")
 }
 
-pub async fn api_v1_queries(
+pub async fn api_v1_watches(
     Extension(agent): Extension<Agent>,
-    axum::extract::Json(query): axum::extract::Json<Query>,
+    axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
     let (mut tx, body) = hyper::Body::channel();
 
@@ -622,35 +673,6 @@ pub async fn api_v1_queries(
         }
     });
 
-    let stmt = match query {
-        Query::Simple(statement)
-        | Query::Options {
-            statement,
-            watch: false,
-        } => match build_query_rows_response(&agent, data_tx, statement).await {
-            Some((status, res)) => {
-                return hyper::Response::builder()
-                    .status(status)
-                    .body(
-                        serde_json::to_vec(&res)
-                            .expect("could not serialize query error response")
-                            .into(),
-                    )
-                    .expect("could not build query response body");
-            }
-            None => {
-                return hyper::Response::builder()
-                    .status(StatusCode::OK)
-                    .body(body)
-                    .expect("could not build query response body");
-            }
-        },
-        Query::Options {
-            statement,
-            watch: true,
-        } => statement,
-    };
-
     let stmt = match stmt {
         Statement::Simple(s) => s,
         _ => {
@@ -667,7 +689,7 @@ pub async fn api_v1_queries(
         }
     };
 
-    let conn = match agent.pool().dedicated_write().await {
+    let conn = match agent.pool().dedicated().await {
         Ok(conn) => conn,
         Err(e) => {
             return hyper::Response::builder()
@@ -681,14 +703,16 @@ pub async fn api_v1_queries(
         }
     };
 
-    let matcher = match Matcher::new(
-        matcher_id,
-        &agent.schema().read(),
-        conn,
-        data_tx.clone(),
-        &stmt,
-        cancel,
-    ) {
+    let matcher = match block_in_place(|| {
+        Matcher::new(
+            matcher_id,
+            &agent.schema().read(),
+            conn,
+            data_tx.clone(),
+            &stmt,
+            cancel,
+        )
+    }) {
         Ok(m) => m,
         Err(e) => {
             return hyper::Response::builder()
@@ -711,6 +735,65 @@ pub async fn api_v1_queries(
         .header("corro-query-id", matcher_id.to_string())
         .body(body)
         .expect("could not generate ok http response for query request")
+}
+
+pub async fn api_v1_queries(
+    Extension(agent): Extension<Agent>,
+    axum::extract::Json(stmt): axum::extract::Json<Statement>,
+) -> impl IntoResponse {
+    let (mut tx, body) = hyper::Body::channel();
+
+    // TODO: timeout on data send instead of infinitely waiting for channel space.
+    let (data_tx, mut data_rx) = channel(512);
+
+    tokio::spawn(async move {
+        let mut buf = BytesMut::new();
+
+        while let Some(row_res) = data_rx.recv().await {
+            {
+                let mut writer = (&mut buf).writer();
+                if let Err(e) = serde_json::to_writer(&mut writer, &row_res) {
+                    _ = tx
+                        .send_data(
+                            serde_json::to_vec(&serde_json::json!(RowResult::Error(
+                                e.to_compact_string()
+                            )))
+                            .expect("could not serialize error json")
+                            .into(),
+                        )
+                        .await;
+                    return;
+                }
+            }
+
+            buf.extend_from_slice(b"\n");
+
+            if let Err(e) = tx.send_data(buf.split().freeze()).await {
+                error!("could not send data through body's channel: {e}");
+                return;
+            }
+        }
+        debug!("query body channel done");
+    });
+
+    match build_query_rows_response(&agent, data_tx, stmt).await {
+        Some((status, res)) => {
+            return hyper::Response::builder()
+                .status(status)
+                .body(
+                    serde_json::to_vec(&res)
+                        .expect("could not serialize query error response")
+                        .into(),
+                )
+                .expect("could not build query response body");
+        }
+        None => {
+            return hyper::Response::builder()
+                .status(StatusCode::OK)
+                .body(body)
+                .expect("could not build query response body");
+        }
+    }
 }
 
 async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
@@ -799,7 +882,7 @@ pub async fn api_v1_db_schema(
 mod tests {
     use arc_swap::ArcSwap;
     use bytes::Bytes;
-    use corro_types::{actor::ActorId, config::Config, schema::SqliteType, sqlite::CrConnManager};
+    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, schema::SqliteType};
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
     use tokio::sync::mpsc::{channel, error::TryRecvError};
@@ -832,12 +915,10 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let rw_pool = bb8::Pool::builder()
-            .max_size(1)
-            .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
+        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
 
         {
-            let mut conn = rw_pool.get().await?;
+            let mut conn = pool.write_priority().await?;
             migrate(&mut conn)?;
         }
 
@@ -846,10 +927,7 @@ mod tests {
 
         let agent = Agent::new(corro_types::agent::AgentConfig {
             actor_id: ActorId(Uuid::new_v4()),
-            ro_pool: bb8::Pool::builder()
-                .max_size(1)
-                .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite"))),
-            rw_pool,
+            pool,
             config: ArcSwap::from_pointee(
                 Config::builder()
                     .db_path(dir.path().join("corrosion.db").display().to_string())
@@ -938,12 +1016,10 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let rw_pool = bb8::Pool::builder()
-            .max_size(1)
-            .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
+        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
 
         {
-            let mut conn = rw_pool.get().await?;
+            let mut conn = pool.write_priority().await?;
             migrate(&mut conn)?;
         }
 
@@ -952,10 +1028,7 @@ mod tests {
 
         let agent = Agent::new(corro_types::agent::AgentConfig {
             actor_id: ActorId(Uuid::new_v4()),
-            ro_pool: bb8::Pool::builder()
-                .max_size(1)
-                .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite"))),
-            rw_pool,
+            pool,
             config: ArcSwap::from_pointee(
                 Config::builder()
                     .db_path(dir.path().join("corrosion.db").display().to_string())
@@ -1006,9 +1079,7 @@ mod tests {
 
         let res = api_v1_queries(
             Extension(agent.clone()),
-            axum::Json(Query::Simple(Statement::Simple(
-                "select * from tests".into(),
-            ))),
+            axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await
         .into_response();
@@ -1061,12 +1132,9 @@ mod tests {
 
         assert!(body.data().await.is_none());
 
-        let res = api_v1_queries(
+        let res = api_v1_watches(
             Extension(agent.clone()),
-            axum::Json(Query::Options {
-                statement: Statement::Simple("select * from tests".into()),
-                watch: true,
-            }),
+            axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await
         .into_response();
@@ -1091,10 +1159,29 @@ mod tests {
         assert_eq!(status_code, StatusCode::OK);
 
         buf.extend_from_slice(&body.data().await.unwrap()?);
-
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
-        assert_eq!(s, "{\"row\":[\"service-id-3\",\"service-name-3\"]}");
+        assert_eq!(s, "{\"columns\":[\"id\",\"text\"]}");
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "{\"row\":{\"rowid\":1,\"change_type\":\"upsert\",\"cells\":[\"service-id\",\"service-name\"]}}");
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "{\"row\":{\"rowid\":2,\"change_type\":\"upsert\",\"cells\":[\"service-id-2\",\"service-name-2\"]}}");
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "\"end_of_query\"");
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "{\"row\":{\"rowid\":3,\"change_type\":\"upsert\",\"cells\":[\"service-id-3\",\"service-name-3\"]}}");
 
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
@@ -1107,16 +1194,10 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
 
-        let s = loop {
-            match lines.decode(&mut buf).unwrap() {
-                Some(s) if !s.is_empty() => break s,
-                _ => {
-                    buf.extend_from_slice(&body.data().await.unwrap()?);
-                }
-            }
-        };
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
 
-        assert_eq!(s, "{\"row\":[\"service-id-4\",\"service-name-4\"]}");
+        assert_eq!(s, "{\"row\":{\"rowid\":4,\"change_type\":\"upsert\",\"cells\":[\"service-id-4\",\"service-name-4\"]}}");
 
         Ok(())
     }
@@ -1128,24 +1209,19 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let rw_pool = bb8::Pool::builder()
-            .max_size(1)
-            .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
+        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
 
         {
-            let mut conn = rw_pool.get().await?;
+            let mut conn = pool.write_priority().await?;
             migrate(&mut conn)?;
-        };
+        }
 
         let (tx_bcast, _rx_bcast) = channel(1);
         let (tx_apply, _rx_apply) = channel(1);
 
         let agent = Agent::new(corro_types::agent::AgentConfig {
             actor_id: ActorId(Uuid::new_v4()),
-            ro_pool: bb8::Pool::builder()
-                .max_size(1)
-                .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite"))),
-            rw_pool,
+            pool,
             config: ArcSwap::from_pointee(
                 Config::builder()
                     .db_path(dir.path().join("corrosion.db").display().to_string())

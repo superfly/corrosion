@@ -8,7 +8,6 @@ edition = "2021"
 [dependencies]
 async-stream = { workspace = true }
 bb8 = { workspace = true }
-bb8-rusqlite = { workspace = true }
 camino = { workspace = true }
 compact_str = { workspace = true }
 corro-types = { path = "../corro-types" }

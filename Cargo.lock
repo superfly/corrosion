@@ -301,18 +301,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bb8-rusqlite"
-version = "0.1.0"
-source = "git+https://github.com/jeromegn/bb8-rusqlite?rev=7dec4e0#7dec4e0fea659967e6f90a2c4b871fcb43b9f724"
-dependencies = [
- "async-trait",
- "bb8",
- "rusqlite",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "bcder"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -609,7 +597,6 @@ dependencies = [
  "axum",
  "backoff",
  "bb8",
- "bb8-rusqlite",
  "bincode",
  "bytes",
  "camino",
@@ -662,7 +649,6 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "bb8",
- "bb8-rusqlite",
  "camino",
  "compact_str 0.7.0",
  "corro-types",
@@ -700,7 +686,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bb8",
- "bb8-rusqlite",
  "bytes",
  "camino",
  "compact_str 0.7.0",
@@ -748,7 +733,6 @@ dependencies = [
  "axum",
  "backoff",
  "bb8",
- "bb8-rusqlite",
  "bincode",
  "bytes",
  "camino",
@@ -776,11 +760,13 @@ dependencies = [
  "quoted-string",
  "rand",
  "rangemap",
+ "rhai-tpl",
  "rusqlite",
  "rustls",
  "seahash",
  "serde",
  "serde_json",
+ "shellwords",
  "spawn",
  "speedy",
  "sqlite3-parser",
@@ -2735,6 +2721,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "900fba806f70c630b0a382d0d825e17a0f19fcd059a2ade1ff237bcddf446b31"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "shellwords"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89e515aa4699a88148ed5ef96413ceef0048ce95b43fbc955a33bde0a70fcae6"
+dependencies = [
+ "lazy_static",
+ "regex",
 ]
 
 [[package]]

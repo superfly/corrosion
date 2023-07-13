@@ -13,13 +13,6 @@ pub enum Statement {
     WithParams(String, Vec<SqliteValue>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Query {
-    Simple(Statement),
-    Options { statement: Statement, watch: bool },
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RqliteResponse {
     pub results: Vec<RqliteResult>,

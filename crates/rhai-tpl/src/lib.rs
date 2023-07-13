@@ -13,12 +13,17 @@ use futures::StreamExt;
 use indexmap::IndexMap;
 use logos::Logos;
 use parking_lot::RwLock;
+use rhai::Dynamic;
 use rhai::Scope;
 use rhai::{EvalAltResult, Map};
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
+use tokio::sync::{mpsc, RwLock as TokioRwLock};
 use tokio_util::codec::{Decoder, LinesCodec};
+use tracing::debug;
+use tracing::error;
 use tracing::trace;
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Clone, Copy, Default, thiserror::Error)]
@@ -49,7 +54,45 @@ enum Closing {
 
 #[derive(Clone)]
 struct QueryResponse {
-    query: Arc<RwLock<QueryHandle>>,
+    query: Arc<TokioRwLock<QueryHandle>>,
+}
+
+impl QueryResponse {
+    fn to_json(&mut self) -> SqlToJson {
+        SqlToJson {
+            json_output: JsonOutput::default(),
+            res: self.clone(),
+        }
+    }
+
+    fn to_json_w_options(&mut self, options: Map) -> SqlToJson {
+        let json_output = {
+            let pretty = options
+                .get("pretty")
+                .and_then(|d| d.as_bool().ok())
+                .unwrap_or(false);
+            let row_values_as_array = options
+                .get("row_values_as_array")
+                .and_then(|d| d.as_bool().ok())
+                .unwrap_or(false);
+
+            JsonOutput {
+                pretty,
+                row_values_as_array,
+            }
+        };
+
+        SqlToJson {
+            json_output,
+            res: self.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SqlToJson {
+    json_output: JsonOutput,
+    res: QueryResponse,
 }
 
 impl IntoIterator for QueryResponse {
@@ -61,6 +104,7 @@ impl IntoIterator for QueryResponse {
         QueryResponseIter {
             query: self.query.clone(),
             body: None,
+            original: false,
             codec: LinesCodec::new(),
             buf: BytesMut::new(),
             handle: tokio::runtime::Handle::current(),
@@ -70,18 +114,9 @@ impl IntoIterator for QueryResponse {
     }
 }
 
-struct QueryResponseIter {
-    query: Arc<RwLock<QueryHandle>>,
-    body: Option<hyper::Body>,
-    buf: BytesMut,
-    codec: LinesCodec,
-    handle: tokio::runtime::Handle,
-    done: bool,
-    columns: Option<Arc<Vec<CompactString>>>,
-}
-
 #[derive(Clone)]
 struct Row {
+    #[allow(dead_code)]
     id: i64,
     columns: Arc<Vec<CompactString>>,
     cells: Vec<SqliteValue>,
@@ -164,13 +199,25 @@ impl Cell {
     }
 }
 
+struct QueryResponseIter {
+    query: Arc<TokioRwLock<QueryHandle>>,
+    body: Option<hyper::Body>,
+    original: bool,
+    buf: BytesMut,
+    codec: LinesCodec,
+    handle: tokio::runtime::Handle,
+    done: bool,
+    columns: Option<Arc<Vec<CompactString>>>,
+}
+
 impl QueryResponseIter {
     pub async fn recv(&mut self) -> Option<Result<Row, Box<EvalAltResult>>> {
         let body = match self.body.as_mut() {
             Some(body) => body,
-            None => match self.query.write().body().await {
-                Ok(body) => {
+            None => match self.query.write().await.body().await {
+                Ok((body, original)) => {
                     self.body = Some(body);
+                    self.original = original;
                     self.body.as_mut().unwrap()
                 }
                 Err(e) => {
@@ -206,7 +253,7 @@ impl QueryResponseIter {
                                     id: rowid,
                                     columns: columns.clone(),
                                     cells,
-                                }))
+                                }));
                             }
                             None => {
                                 self.done = true;
@@ -252,30 +299,43 @@ impl Iterator for QueryResponseIter {
 }
 
 pub struct QueryHandle {
-    query_id: Uuid,
+    id: Uuid,
     body: Option<hyper::Body>,
     client: CorrosionApiClient,
 }
 
 impl QueryHandle {
-    async fn body(&mut self) -> Result<hyper::Body, corro_client::Error> {
+    async fn body(&mut self) -> Result<(hyper::Body, bool), corro_client::Error> {
         if let Some(body) = self.body.take() {
-            return Ok(body);
+            return Ok((body, true));
         }
 
-        self.client.watched_query(self.query_id).await
+        Ok((self.client.watched_query(self.id).await?, false))
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TemplateCommand {
+    Render,
 }
 
 pub trait WriteSeek: Write + Seek + Send + Sync + 'static {}
 impl<T> WriteSeek for T where T: Write + Seek + Send + Sync + 'static {}
 
 #[derive(Clone)]
-pub struct TemplateWriter(Arc<RwLock<Box<dyn WriteSeek>>>);
+pub struct TemplateWriter(Arc<TemplateWriterInner>);
+
+pub struct TemplateWriterInner {
+    w: RwLock<Box<dyn WriteSeek>>,
+    tx: mpsc::Sender<TemplateCommand>,
+}
 
 impl TemplateWriter {
-    pub fn new<W: WriteSeek>(w: W) -> Self {
-        Self(Arc::new(RwLock::new(Box::new(w))))
+    pub fn new<W: WriteSeek>(w: W, tx: mpsc::Sender<TemplateCommand>) -> Self {
+        Self(Arc::new(TemplateWriterInner {
+            w: RwLock::new(Box::new(w)),
+            tx,
+        }))
     }
 
     fn write_str(&mut self, data: &str) -> Result<(), Box<EvalAltResult>> {
@@ -284,6 +344,7 @@ impl TemplateWriter {
         }
         Ok(self
             .0
+            .w
             .write()
             .write_all(data.as_bytes())
             .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?)
@@ -294,43 +355,56 @@ impl TemplateWriter {
         let len = data.encode_utf8(&mut b).len();
         Ok(self
             .0
+            .w
             .write()
             .write_all(&b[0..len])
             .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?)
     }
 
-    fn write_query_to_json(&mut self, res: QueryResponse) -> Result<(), Box<EvalAltResult>> {
-        let mut json_output = JsonOutput::default();
-
-        let mut w = self.0.write();
-
-        json_output.write_rows(&mut *w, res.into_iter())
+    fn write_dynamic(&mut self, d: Dynamic) -> Result<(), Box<EvalAltResult>> {
+        Ok(self
+            .0
+            .w
+            .write()
+            .write_all(d.to_string().as_bytes())
+            .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?)
     }
 
-    fn write_query_to_json_w_options(
-        &mut self,
-        res: QueryResponse,
-        options: Map,
-    ) -> Result<(), Box<EvalAltResult>> {
-        let mut json_output = {
-            let pretty = options
-                .get("pretty")
-                .and_then(|d| d.as_bool().ok())
-                .unwrap_or(false);
-            let row_values_as_array = options
-                .get("row_values_as_array")
-                .and_then(|d| d.as_bool().ok())
-                .unwrap_or(false);
+    fn write_sql_to_json(&mut self, mut json: SqlToJson) -> Result<(), Box<EvalAltResult>> {
+        let mut rows = json.res.into_iter();
+        {
+            let mut w = self.0.w.write();
+            json.json_output.write_rows(&mut *w, &mut rows)?;
+        }
 
-            JsonOutput {
-                pretty,
-                row_values_as_array,
-            }
-        };
+        if rows.original {
+            println!("original query, spawning task to listen");
+            let tx = self.0.tx.clone();
+            tokio::spawn(async move {
+                match rows.recv().await {
+                    Some(Ok(row)) => {
+                        println!("got an updated row! {:?}", row.cells);
+                        if let Err(_e) = tx.send(TemplateCommand::Render).await {
+                            error!(
+                                "could not send back re-render command, channel must be closed!"
+                            );
+                        }
+                        return;
+                    }
+                    Some(Err(e)) => {
+                        // TODO: need to re-render possibly...
+                        warn!("error from upstream, returning... {e}");
+                        return;
+                    }
+                    None => {
+                        debug!("I guess we're done");
+                        return;
+                    }
+                }
+            });
+        }
 
-        let mut w = self.0.write();
-
-        json_output.write_rows(&mut *w, res.into_iter())
+        Ok(())
     }
 }
 
@@ -345,11 +419,13 @@ impl Engine {
         engine.register_type::<TemplateWriter>();
         engine.register_fn("write", TemplateWriter::write_str);
         engine.register_fn("write", TemplateWriter::write_char);
-        engine.register_fn("write_json", TemplateWriter::write_query_to_json);
-        engine.register_fn("write_json", TemplateWriter::write_query_to_json_w_options);
+        engine.register_fn("write", TemplateWriter::write_sql_to_json);
+        engine.register_fn("write", TemplateWriter::write_dynamic);
 
         engine.register_type_with_name::<QueryResponse>("QueryResponse");
         engine.register_iterator_result::<QueryResponse, Row>();
+        engine.register_fn("to_json", QueryResponse::to_json);
+        engine.register_fn("to_json", QueryResponse::to_json_w_options);
 
         engine.register_type_with_name::<Row>("Row");
         engine.register_iterator::<Row>();
@@ -362,12 +438,13 @@ impl Engine {
         engine.register_fn("to_json", SqliteValueWrap::to_json);
         engine.register_fn("to_string", SqliteValueWrap::to_json);
 
-        let query_cache: Arc<RwLock<HashMap<String, Arc<RwLock<QueryHandle>>>>> =
+        let query_cache: Arc<RwLock<HashMap<String, Arc<TokioRwLock<QueryHandle>>>>> =
             Default::default();
 
         engine.register_fn("sql", {
             // let query_cache = query_cache.clone();
             move |query: &str| -> Result<QueryResponse, Box<EvalAltResult>> {
+                println!("hello sql");
                 if let Some(handle) = { query_cache.read().get(query).cloned() } {
                     println!("query already existed...");
                     return Ok(QueryResponse { query: handle });
@@ -383,21 +460,13 @@ impl Engine {
                 println!("making a brand new query!");
 
                 let (query_id, body) = tokio::runtime::Handle::current()
-                    .block_on(client.query(&corro_types::api::Query::Options {
-                        statement: Statement::Simple(query.into()),
-                        watch: true,
-                    }))
+                    .block_on(client.watch(&Statement::Simple(query.into())))
                     .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
 
-                let query_id = match query_id {
-                    Some(query_id) => query_id,
-                    None => {
-                        return Err(Box::new(EvalAltResult::from("malformed corrosion response: expected a query id in a response header")));
-                    }
-                };
+                println!("got res w/ id: {query_id}");
 
-                let handle = Arc::new(RwLock::new(QueryHandle {
-                    query_id,
+                let handle = Arc::new(TokioRwLock::new(QueryHandle {
+                    id: query_id,
                     body: Some(body),
                     client: client.clone(),
                 }));
@@ -451,9 +520,9 @@ impl Engine {
                 }
                 Tag::Output => {
                     trace!("OUTPUT: {content:?}");
-                    program.push_str("__tpl_writer.write(`${");
+                    program.push_str("__tpl_writer.write(");
                     program.push_str(content);
-                    program.push_str("}`);\n");
+                    program.push_str(");\n");
                 }
             }
 
@@ -503,7 +572,7 @@ impl JsonOutput {
     fn write_rows<W: Write>(
         &mut self,
         w: &mut W,
-        rows: QueryResponseIter,
+        rows: &mut QueryResponseIter,
     ) -> Result<(), Box<EvalAltResult>> {
         if self.pretty {
             let ser = serde_json::Serializer::pretty(w);
@@ -525,7 +594,7 @@ impl JsonOutput {
 
 fn write_json_rows_as_object<W: Write, F: Formatter>(
     mut ser: serde_json::Serializer<W, F>,
-    mut rows: QueryResponseIter,
+    rows: &mut QueryResponseIter,
 ) -> Result<(), Box<EvalAltResult>> {
     let mut seq = ser
         .serialize_seq(None)
@@ -550,7 +619,7 @@ fn write_json_rows_as_object<W: Write, F: Formatter>(
 
 fn write_json_rows_as_array<W: Write, F: Formatter>(
     mut ser: serde_json::Serializer<W, F>,
-    mut rows: QueryResponseIter,
+    rows: &mut QueryResponseIter,
 ) -> Result<(), Box<EvalAltResult>> {
     let mut seq = ser
         .serialize_seq(None)
@@ -634,8 +703,10 @@ Item #<%= count + 1 %> = <%= item %>
 
 tail"#;
 
+        let (tx, _rx) = mpsc::channel(1);
+
         let tpl = engine.compile(input).unwrap();
-        tpl.render(TemplateWriter::new(f)).unwrap();
+        tpl.render(TemplateWriter::new(f, tx)).unwrap();
 
         let output = std::fs::read_to_string(filepath).unwrap();
 
@@ -692,49 +763,84 @@ tail",
         let tmpdir = tempfile::tempdir().unwrap();
         let filepath = tmpdir.path().join("output");
 
-        enum Command {
-            Render,
+        // enum Command {
+        //     Render,
+        // }
+
+        // enum Reply {
+        //     Rendered,
+        // }
+
+        // let (cmd_tx, mut cmd_rx) = mpsc::channel(10);
+        // let (reply_tx, mut reply_rx) = mpsc::channel(10);
+
+        // tokio::spawn({
+        //     let filepath = filepath.clone();
+        //     async move {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&filepath)
+            .unwrap();
+
+        let engine = Engine::new(client.clone());
+
+        // loop {
+        // let cmd = cmd_rx.recv().await.unwrap();
+        // assert!(matches!(cmd, Command::Render));
+
+        let (tx, mut rx) = mpsc::channel(1);
+
+        {
+            block_in_place(|| {
+                let input = r#"<%= sql("select * from tests").to_json(#{pretty: true}) %>
+<%= sql("select * from tests").to_json() %>"#;
+
+                let tpl = engine.compile(input).unwrap();
+                tpl.render(TemplateWriter::new(f, tx)).unwrap();
+            });
+            // reply_tx.send(Reply::Rendered).await.unwrap();
+            // }
+            // }
+            // });
+
+            // cmd_tx.send(Command::Render).await.unwrap();
+            // let replied = reply_rx.recv().await.unwrap();
+            // assert!(matches!(replied, Reply::Rendered));
+
+            let output = std::fs::read_to_string(&filepath).unwrap();
+
+            println!("output: {output}");
+
+            client
+                .execute(&vec![Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-3".into(), "service-name-3".into()],
+                )])
+                .await
+                .unwrap();
+
+            assert_eq!(rx.recv().await.unwrap(), TemplateCommand::Render);
+            assert!(rx.recv().await.is_none());
         }
 
-        enum Reply {
-            Rendered,
-        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&filepath)
+            .unwrap();
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(10);
-        let (reply_tx, mut reply_rx) = mpsc::channel(10);
+        let (tx, _rx) = mpsc::channel(1);
 
-        tokio::spawn({
-            let filepath = filepath.clone();
-            async move {
-                let f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .open(&filepath)
-                    .unwrap();
+        block_in_place(|| {
+            let input = r#"<%= sql("select * from tests").to_json(#{pretty: true}) %>
+<%= sql("select * from tests").to_json() %>"#;
 
-                let engine = Engine::new(client);
-
-                // loop {
-                let cmd = cmd_rx.recv().await.unwrap();
-                assert!(matches!(Command::Render, cmd));
-
-                block_in_place(|| {
-                    let input = r#"<%= write_json(sql("select * from tests"), #{pretty: true}) %>
-<%= write_json(sql("select * from tests"), #{pretty: true}) %>"#;
-
-                    let tpl = engine.compile(input).unwrap();
-                    tpl.render(TemplateWriter::new(f)).unwrap();
-                });
-                reply_tx.send(Reply::Rendered).await.unwrap();
-                // }
-            }
+            let tpl = engine.compile(input).unwrap();
+            tpl.render(TemplateWriter::new(f, tx)).unwrap();
         });
 
-        cmd_tx.send(Command::Render).await.unwrap();
-        let replied = reply_rx.recv().await.unwrap();
-        assert!(matches!(Reply::Rendered, replied));
-
-        let output = std::fs::read_to_string(filepath).unwrap();
+        let output = std::fs::read_to_string(&filepath).unwrap();
 
         println!("output: {output}");
     }

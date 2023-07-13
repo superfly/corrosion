@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -15,6 +16,7 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{Connection, InterruptHandle};
 use spawn::spawn_counted;
+use tempfile::TempDir;
 use tokio::{
     runtime::Handle,
     sync::{
@@ -23,7 +25,7 @@ use tokio::{
     },
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use tripwire::Tripwire;
 
 use crate::{
@@ -32,7 +34,7 @@ use crate::{
     config::Config,
     pubsub::{Matcher, Subscribers},
     schema::NormalizedSchema,
-    sqlite::{CrConnManager, SqlitePool},
+    sqlite::{CrConnManager, RusqliteConnManager, SqlitePool, SqlitePoolError},
 };
 
 use super::members::Members;
@@ -44,8 +46,7 @@ pub struct Agent(Arc<AgentInner>);
 
 pub struct AgentConfig {
     pub actor_id: ActorId,
-    pub ro_pool: SqlitePool,
-    pub rw_pool: SqlitePool,
+    pub pool: SplitPool,
     pub config: ArcSwap<Config>,
     pub gossip_addr: SocketAddr,
     pub api_addr: SocketAddr,
@@ -80,12 +81,7 @@ impl Agent {
     pub fn new(config: AgentConfig) -> Self {
         Self(Arc::new(AgentInner {
             actor_id: config.actor_id,
-            pool: SplitPool::new(
-                config.ro_pool,
-                config.rw_pool,
-                &config.config.load().db_path,
-                config.tripwire,
-            ),
+            pool: config.pool,
             config: config.config,
             gossip_addr: config.gossip_addr,
             api_addr: config.api_addr,
@@ -167,7 +163,12 @@ pub struct SplitPool(Arc<SplitPoolInner>);
 struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
-    path: PathBuf,
+
+    dedicated_pool: bb8::Pool<RusqliteConnManager>,
+
+    // need to keep this for the life of the pool!
+    #[allow(dead_code)]
+    tmp_db_dir: TempDir,
 
     priority_tx: Sender<oneshot::Sender<CancellationToken>>,
     normal_tx: Sender<oneshot::Sender<CancellationToken>>,
@@ -177,7 +178,7 @@ struct SplitPoolInner {
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
     #[error(transparent)]
-    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    Pool(#[from] SqlitePoolError),
     #[error("queue is closed")]
     QueueClosed,
     #[error("callback is closed")]
@@ -192,11 +193,62 @@ pub enum ChangeError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SplitPoolCreateError {
+    #[error(transparent)]
+    Pool(#[from] crate::sqlite::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
 impl SplitPool {
-    pub fn new<P: AsRef<Path>>(
+    pub async fn create<P: AsRef<Path>>(
+        path: P,
+        tripwire: Tripwire,
+    ) -> Result<Self, SplitPoolCreateError> {
+        let rw_pool = bb8::Builder::new()
+            .max_size(1)
+            .min_idle(Some(1)) // create one right away and keep it idle
+            .build(CrConnManager::new(path.as_ref()))
+            .await?;
+
+        debug!("built RW pool");
+
+        let ro_pool = bb8::Builder::new()
+            .max_size(10)
+            .min_idle(Some(5)) // keep a few idling
+            .max_lifetime(Some(Duration::from_secs(30)))
+            .build(CrConnManager::new_read_only(path.as_ref()))
+            .await?;
+        debug!("built RO pool");
+
+        let tmp_db_dir = match path.as_ref().parent() {
+            Some(parent) => tempfile::tempdir_in(parent)?,
+            None => tempfile::tempdir()?,
+        };
+
+        let dedicated_pool = bb8::Pool::builder()
+            .max_size(100)
+            .build(RusqliteConnManager::new(path.as_ref()).attach(
+                tmp_db_dir.path().join("watches.db").display().to_string(),
+                "watches",
+            ))
+            .await?;
+
+        Ok(Self::new(
+            ro_pool,
+            rw_pool,
+            dedicated_pool,
+            tmp_db_dir,
+            tripwire,
+        ))
+    }
+
+    pub fn new(
         read: SqlitePool,
         write: SqlitePool,
-        path: P,
+        dedicated_pool: bb8::Pool<RusqliteConnManager>,
+        tmp_db_dir: TempDir,
         mut tripwire: Tripwire,
     ) -> Self {
         let (priority_tx, mut priority_rx) = channel(256);
@@ -233,7 +285,8 @@ impl SplitPool {
         Self(Arc::new(SplitPoolInner {
             read,
             write,
-            path: path.as_ref().to_owned(),
+            dedicated_pool,
+            tmp_db_dir,
             priority_tx,
             normal_tx,
             low_tx,
@@ -263,31 +316,20 @@ impl SplitPool {
     }
 
     // get a read-only connection
-    pub async fn read(
-        &self,
-    ) -> Result<PooledConnection<CrConnManager>, bb8::RunError<bb8_rusqlite::Error>> {
+    pub async fn read(&self) -> Result<PooledConnection<CrConnManager>, SqlitePoolError> {
         self.0.read.get().await
     }
 
-    pub fn read_blocking(
-        &self,
-    ) -> Result<PooledConnection<CrConnManager>, bb8::RunError<bb8_rusqlite::Error>> {
+    pub fn read_blocking(&self) -> Result<PooledConnection<CrConnManager>, SqlitePoolError> {
         Handle::current().block_on(self.0.read.get_owned())
     }
 
-    pub async fn dedicated_write(&self) -> Result<Connection, rusqlite::Error> {
-        tokio::task::block_in_place(|| {
-            let conn = rusqlite::Connection::open(&self.0.path)?;
+    pub async fn dedicated(&self) -> Result<Connection, crate::sqlite::Error> {
+        self.0.dedicated_pool.dedicated_connection().await
+    }
 
-            conn.execute_batch(
-                r#"
-                    PRAGMA journal_mode = WAL;
-                    PRAGMA synchronous = NORMAL;
-                "#,
-            )?;
-
-            Ok(conn)
-        })
+    pub fn dedicated_pool(&self) -> &bb8::Pool<RusqliteConnManager> {
+        &self.0.dedicated_pool
     }
 
     // get a high priority write connection (e.g. client input)

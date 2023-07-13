@@ -6,7 +6,7 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use corro_client::CorrosionApiClient;
 use corro_types::{
-    api::{Query, RowResult, RqliteResult, Statement},
+    api::{RowResult, RqliteResult, Statement},
     config::{default_admin_path, Config},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
 };
@@ -46,9 +46,9 @@ async fn main() -> eyre::Result<()> {
             columns: show_columns,
             ..
         } => {
-            let (_, mut body) = cli
+            let mut body = cli
                 .api_client()
-                .query(&Query::Simple(Statement::Simple(query.clone())))
+                .query(&Statement::Simple(query.clone()))
                 .await?;
 
             let mut lines = LinesCodec::new();
@@ -153,7 +153,9 @@ async fn main() -> eyre::Result<()> {
             ))
             .await?;
         }
-        Command::Template(_) => todo!(),
+        Command::Template { template } => {
+            command::tpl::run(cli.api_addr(), template).await?;
+        }
     }
 
     Ok(())
@@ -264,8 +266,9 @@ enum Command {
     #[command(subcommand)]
     Sync(SyncCommand),
 
-    #[command(subcommand)]
-    Template(TemplateCommand),
+    Template {
+        template: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -279,6 +282,3 @@ enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
 }
-
-#[derive(Subcommand)]
-enum TemplateCommand {}

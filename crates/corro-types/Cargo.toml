@@ -7,7 +7,6 @@ edition = "2021"
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bb8 = { workspace = true }
-bb8-rusqlite = { workspace = true }
 bytes = { workspace = true }
 camino = { workspace = true }
 compact_str = { workspace = true }

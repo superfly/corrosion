@@ -1,11 +1,11 @@
 use std::{net::SocketAddr, ops::Deref, path::Path, pin::Pin, time::Duration};
 
 use async_stream::try_stream;
-use bb8_rusqlite::RusqliteConnectionManager;
 use compact_str::CompactString;
 use corro_types::{
-    api::{Query, RqliteResponse, Statement},
+    api::{RqliteResponse, Statement},
     pubsub::{Subscription, SubscriptionId, SubscriptionMessage},
+    sqlite::RusqliteConnManager,
 };
 use futures::{
     stream::{SplitSink, SplitStream},
@@ -32,10 +32,27 @@ impl CorrosionApiClient {
         }
     }
 
-    pub async fn query(&self, statement: &Query) -> Result<(Option<Uuid>, hyper::Body), Error> {
+    pub async fn query(&self, statement: &Statement) -> Result<hyper::Body, Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(format!("http://{}/v1/queries", self.api_addr))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::ACCEPT, "application/json")
+            .body(Body::from(serde_json::to_vec(statement)?))?;
+
+        let res = self.api_client.request(req).await?;
+
+        if !res.status().is_success() {
+            return Err(Error::UnexpectedStatusCode(res.status()));
+        }
+
+        Ok(res.into_body())
+    }
+
+    pub async fn watch(&self, statement: &Statement) -> Result<(Uuid, hyper::Body), Error> {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{}/v1/watches", self.api_addr))
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statement)?))?;
@@ -50,7 +67,8 @@ impl CorrosionApiClient {
         let id = res
             .headers()
             .get(HeaderName::from_static("corro-query-id"))
-            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()));
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
+            .ok_or(Error::ExpectedQueryId)?;
 
         Ok((id, res.into_body()))
     }
@@ -58,7 +76,7 @@ impl CorrosionApiClient {
     pub async fn watched_query(&self, id: Uuid) -> Result<hyper::Body, Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::GET)
-            .uri(format!("http://{}/v1/queries/{}", self.api_addr, id))
+            .uri(format!("http://{}/v1/watches/{}", self.api_addr, id))
             .header(hyper::header::ACCEPT, "application/json")
             .body(hyper::Body::empty())?;
 
@@ -335,7 +353,7 @@ pub enum SubSendError {
 #[derive(Clone)]
 pub struct CorrosionClient {
     api_client: CorrosionApiClient,
-    pool: bb8::Pool<bb8_rusqlite::RusqliteConnectionManager>,
+    pool: bb8::Pool<RusqliteConnManager>,
 }
 
 impl CorrosionClient {
@@ -345,11 +363,11 @@ impl CorrosionClient {
             pool: bb8::Pool::builder()
                 .max_size(5)
                 .max_lifetime(Some(Duration::from_secs(30)))
-                .build_unchecked(RusqliteConnectionManager::new(&db_path)),
+                .build_unchecked(RusqliteConnManager::new(&db_path)),
         }
     }
 
-    pub fn pool(&self) -> &bb8::Pool<RusqliteConnectionManager> {
+    pub fn pool(&self) -> &bb8::Pool<RusqliteConnManager> {
         &self.pool
     }
 }
@@ -377,4 +395,7 @@ pub enum Error {
 
     #[error("received unexpected response code: {0}")]
     UnexpectedStatusCode(StatusCode),
+
+    #[error("could not retrieve watch id from headers")]
+    ExpectedQueryId,
 }
