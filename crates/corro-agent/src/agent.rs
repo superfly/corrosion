@@ -2656,8 +2656,7 @@ pub mod tests {
 
                             let req_body = serde_json::from_value::<Vec<Statement>>(json!([[
                                 "INSERT INTO tests (id,text) VALUES (?,?)",
-                                start_id,
-                                format!("hello from {actor_id}")
+                                [start_id, format!("hello from {actor_id}")]
                             ],]))?;
 
                             let res = client
