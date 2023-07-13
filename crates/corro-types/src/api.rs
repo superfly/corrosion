@@ -9,8 +9,8 @@ use crate::{change::SqliteValue, pubsub::ChangeType};
 #[serde(untagged)]
 pub enum Statement {
     Simple(String),
-    WithNamedParams(String, HashMap<String, SqliteValue>),
     WithParams(String, Vec<SqliteValue>),
+    WithNamedParams(String, HashMap<String, SqliteValue>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

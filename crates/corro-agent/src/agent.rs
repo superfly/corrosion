@@ -1949,8 +1949,7 @@ pub mod tests {
 
         let req_body: Vec<Statement> = serde_json::from_value(json!([[
             "INSERT INTO tests (id,text) VALUES (?,?)",
-            1,
-            "hello world 1"
+            [1, "hello world 1"]
         ],]))?;
 
         let res = timeout(
@@ -2021,8 +2020,7 @@ pub mod tests {
 
         let req_body: Vec<Statement> = serde_json::from_value(json!([[
             "INSERT INTO tests (id,text) VALUES (?,?)",
-            2,
-            "hello world 2"
+            [2, "hello world 2"]
         ]]))?;
 
         let res = client
@@ -2094,8 +2092,7 @@ pub mod tests {
             .map(|id| {
                 serde_json::json!([
                     "INSERT INTO tests (id,text) VALUES (?,?)",
-                    id,
-                    format!("hello world #{id}"),
+                    [id, format!("hello world #{id}")],
                 ])
             })
             .collect();
@@ -2203,23 +2200,19 @@ pub mod tests {
             serde_json::from_value::<Vec<Statement>>(json!([
                 [
                     "INSERT INTO tests (id,text) VALUES (?,?)",
-                    n,
-                    format!("hello world {n}")
+                    [n, format!("hello world {n}")]
                 ],
                 [
                     "INSERT INTO tests2 (id,text) VALUES (?,?)",
-                    n,
-                    format!("hello world {n}")
+                    [n, format!("hello world {n}")]
                 ],
                 [
                     "INSERT INTO tests (id,text) VALUES (?,?)",
-                    n + 10000,
-                    format!("hello world {n}")
+                    [n + 10000, format!("hello world {n}")]
                 ],
                 [
                     "INSERT INTO tests2 (id,text) VALUES (?,?)",
-                    n + 10000,
-                    format!("hello world {n}")
+                    [n + 10000, format!("hello world {n}")]
                 ]
             ]))
             .unwrap()
