@@ -6,7 +6,7 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use corro_client::CorrosionApiClient;
 use corro_types::{
-    api::{RowResult, RqliteResult, Statement},
+    api::{QueryEvent, RqliteResult, Statement},
     config::{default_admin_path, Config},
     pubsub::{SubscriptionEvent, SubscriptionMessage},
 };
@@ -58,15 +58,15 @@ async fn main() -> eyre::Result<()> {
             loop {
                 buf.extend_from_slice(&body.next().await.unwrap()?);
                 let s = lines.decode(&mut buf).unwrap().unwrap();
-                let res: RowResult = serde_json::from_str(&s)?;
+                let res: QueryEvent = serde_json::from_str(&s)?;
 
                 match res {
-                    RowResult::Columns(cols) => {
+                    QueryEvent::Columns(cols) => {
                         if *show_columns {
                             println!("{}", cols.join("|"));
                         }
                     }
-                    RowResult::Row { cells, .. } => {
+                    QueryEvent::Row { cells, .. } => {
                         println!(
                             "{}",
                             cells
@@ -76,10 +76,10 @@ async fn main() -> eyre::Result<()> {
                                 .join("|")
                         );
                     }
-                    RowResult::EndOfQuery => {
+                    QueryEvent::EndOfQuery => {
                         break;
                     }
-                    RowResult::Error(e) => {
+                    QueryEvent::Error(e) => {
                         eyre::bail!("{e}");
                     }
                 }

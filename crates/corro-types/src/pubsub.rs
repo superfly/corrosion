@@ -37,7 +37,7 @@ use uhlc::Timestamp;
 use uuid::Uuid;
 
 use crate::{
-    api::RowResult,
+    api::QueryEvent,
     change::SqliteValue,
     filters::{parse_expr, AggregateChange, OwnedAggregateChange, SupportedExpr},
     schema::{NormalizedSchema, NormalizedTable},
@@ -286,7 +286,7 @@ pub struct InnerMatcher {
     pub parsed: ParsedSelect,
     pub query_table: String,
     pub qualified_table_name: String,
-    pub change_tx: broadcast::Sender<RowResult>,
+    pub change_tx: broadcast::Sender<QueryEvent>,
     pub cmd_tx: mpsc::Sender<MatcherCmd>,
     pub col_names: Vec<CompactString>,
     pub cancel: CancellationToken,
@@ -297,8 +297,8 @@ impl Matcher {
         id: Uuid,
         schema: &NormalizedSchema,
         mut conn: Connection,
-        init_tx: mpsc::Sender<RowResult>,
-        change_tx: broadcast::Sender<RowResult>,
+        init_tx: mpsc::Sender<QueryEvent>,
+        change_tx: broadcast::Sender<QueryEvent>,
         sql: &str,
         cancel: CancellationToken,
     ) -> Result<Self, MatcherError> {
@@ -489,7 +489,7 @@ impl Matcher {
             let matcher = matcher.clone();
             async move {
                 let _drop_guard = cancel.clone().drop_guard();
-                if let Err(e) = init_tx.send(RowResult::Columns(col_names)).await {
+                if let Err(e) = init_tx.send(QueryEvent::Columns(col_names)).await {
                     error!("could not send back columns, probably means no receivers! {e}");
                     return;
                 }
@@ -526,7 +526,7 @@ impl Matcher {
                                         .map(|i| row.get::<_, SqliteValue>(i))
                                         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                                    if let Err(e) = init_tx.blocking_send(RowResult::Row {
+                                    if let Err(e) = init_tx.blocking_send(QueryEvent::Row {
                                         change_type: ChangeType::Upsert,
                                         rowid,
                                         cells,
@@ -552,11 +552,11 @@ impl Matcher {
                 });
 
                 if let Err(e) = res {
-                    _ = init_tx.send(RowResult::Error(e.to_compact_string())).await;
+                    _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
                     return;
                 }
 
-                if let Err(e) = init_tx.send(RowResult::EndOfQuery).await {
+                if let Err(e) = init_tx.send(QueryEvent::EndOfQuery).await {
                     error!("could not send back end-of-query message: {e}");
                     return;
                 }
@@ -772,7 +772,7 @@ impl Matcher {
                     .collect::<rusqlite::Result<Vec<_>>>()
                 {
                     Ok(cells) => {
-                        if let Err(e) = self.0.change_tx.send(RowResult::Row {
+                        if let Err(e) = self.0.change_tx.send(QueryEvent::Row {
                             rowid,
                             change_type,
                             cells,
@@ -794,7 +794,7 @@ impl Matcher {
         Ok(())
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<RowResult> {
+    pub fn subscribe(&self) -> broadcast::Receiver<QueryEvent> {
         self.0.change_tx.subscribe()
     }
 
@@ -1393,19 +1393,19 @@ mod tests {
             let matcher =
                 Matcher::new(id, &schema, matcher_conn, tx, change_tx, sql, cancel).unwrap();
 
-            assert!(matches!(rx.recv().await.unwrap(), RowResult::Columns(_)));
+            assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Columns(_)));
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
             assert_eq!(
                 rx.recv().await.unwrap(),
-                RowResult::Row {
+                QueryEvent::Row {
                     rowid: 1,
                     change_type: ChangeType::Upsert,
                     cells
                 }
             );
-            assert!(matches!(rx.recv().await.unwrap(), RowResult::EndOfQuery));
+            assert!(matches!(rx.recv().await.unwrap(), QueryEvent::EndOfQuery));
 
             matcher
                 .process_change(&AggregateChange {
@@ -1462,7 +1462,7 @@ mod tests {
 
             assert_eq!(
                 change_rx.recv().await.unwrap(),
-                RowResult::Row {
+                QueryEvent::Row {
                     rowid: 2,
                     change_type: ChangeType::Upsert,
                     cells
@@ -1498,7 +1498,7 @@ mod tests {
 
             assert_eq!(
                 change_rx.recv().await.unwrap(),
-                RowResult::Row {
+                QueryEvent::Row {
                     rowid: 1,
                     change_type: ChangeType::Delete,
                     cells

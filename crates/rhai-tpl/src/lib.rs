@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use compact_str::CompactString;
 use corro_client::CorrosionApiClient;
-use corro_types::api::RowResult;
+use corro_types::api::QueryEvent;
 use corro_types::api::Statement;
 use corro_types::change::SqliteValue;
 use futures::StreamExt;
@@ -246,8 +246,8 @@ impl QueryResponseIter {
             match self.codec.decode(&mut self.buf) {
                 Ok(Some(line)) => match serde_json::from_str(&line) {
                     Ok(res) => match res {
-                        RowResult::Columns(cols) => self.columns = Some(Arc::new(cols)),
-                        RowResult::Row { rowid, cells, .. } => match self.columns.as_ref() {
+                        QueryEvent::Columns(cols) => self.columns = Some(Arc::new(cols)),
+                        QueryEvent::Row { rowid, cells, .. } => match self.columns.as_ref() {
                             Some(columns) => {
                                 return Some(Ok(Row {
                                     id: rowid,
@@ -262,10 +262,10 @@ impl QueryResponseIter {
                                 ))));
                             }
                         },
-                        RowResult::EndOfQuery => {
+                        QueryEvent::EndOfQuery => {
                             return None;
                         }
-                        RowResult::Error(e) => {
+                        QueryEvent::Error(e) => {
                             self.done = true;
                             return Some(Err(Box::new(EvalAltResult::from(e))));
                         }

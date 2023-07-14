@@ -43,8 +43,8 @@ pub enum RqliteResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum RowResult {
+#[serde(rename_all = "snake_case", tag = "event", content = "data")]
+pub enum QueryEvent {
     Columns(Vec<CompactString>),
     Row {
         rowid: i64,
