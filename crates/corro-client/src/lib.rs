@@ -111,7 +111,7 @@ impl CorrosionApiClient {
     pub async fn schema(&self, statements: &[Statement]) -> Result<RqliteResponse, Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/db/schema", self.api_addr))
+            .uri(format!("http://{}/v1/migrations", self.api_addr))
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statements)?))?;

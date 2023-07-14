@@ -1,5 +1,7 @@
 use std::{
+    collections::HashMap,
     ops::RangeInclusive,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -11,7 +13,7 @@ use corro_types::{
     api::{RowResult, RqliteResponse, RqliteResult, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{row_to_change, SqliteValue},
-    pubsub::{ChangeType, Matcher},
+    pubsub::{ChangeType, Matcher, MatcherCmd},
     schema::{make_schema_inner, parse_sql},
     sqlite::SqlitePoolError,
 };
@@ -23,7 +25,7 @@ use tokio::{
     sync::{
         broadcast,
         mpsc::{self, channel},
-        oneshot,
+        oneshot, RwLock as TokioRwLock,
     },
     task::block_in_place,
     time::interval,
@@ -485,6 +487,10 @@ pub async fn api_v1_watch_by_id(
     Extension(agent): Extension<Agent>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> impl IntoResponse {
+    watch_by_id(agent, id).await
+}
+
+async fn watch_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
     let matcher = match { agent.matchers().read().get(&id).cloned() } {
         Some(matcher) => matcher,
         None => {
@@ -514,6 +520,7 @@ pub async fn api_v1_watch_by_id(
         tx,
         init_rx,
         change_rx,
+        matcher.cmd_tx().clone(),
         cancel,
     ));
 
@@ -589,6 +596,7 @@ pub async fn api_v1_watch_by_id(
 
     hyper::Response::builder()
         .status(StatusCode::OK)
+        .header("corro-query-id", id.to_string())
         .body(body)
         .expect("could not build query response body")
 }
@@ -599,6 +607,7 @@ async fn process_watch_channel(
     mut tx: hyper::body::Sender,
     mut init_rx: mpsc::Receiver<RowResult>,
     mut change_rx: broadcast::Receiver<RowResult>,
+    cmd_tx: mpsc::Sender<MatcherCmd>,
     cancel: CancellationToken,
 ) {
     let mut buf = BytesMut::new();
@@ -669,31 +678,18 @@ async fn process_watch_channel(
     if cancelled {
         // try to remove if it exists.
         agent.matchers().write().remove(&matcher_id);
+    } else {
+        _ = cmd_tx.send(MatcherCmd::Unsubscribe).await;
     }
 }
 
+pub type MatcherCache = Arc<TokioRwLock<HashMap<String, Uuid>>>;
+
 pub async fn api_v1_watches(
     Extension(agent): Extension<Agent>,
+    Extension(watch_cache): Extension<MatcherCache>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
-    let (tx, body) = hyper::Body::channel();
-
-    let matcher_id = Uuid::new_v4();
-    let cancel = CancellationToken::new();
-
-    // TODO: timeout on data send instead of infinitely waiting for channel space.
-    let (data_tx, data_rx) = channel(512);
-    let (change_tx, change_rx) = broadcast::channel(128);
-
-    tokio::spawn(process_watch_channel(
-        agent.clone(),
-        matcher_id,
-        tx,
-        data_rx,
-        change_rx,
-        cancel.clone(),
-    ));
-
     let stmt = match stmt {
         Statement::Simple(s) => s,
         _ => {
@@ -706,9 +702,26 @@ pub async fn api_v1_watches(
                     .expect("could not serialize queries stream error")
                     .into(),
                 )
-                .expect("could not build error response")
+                .expect("could not build error response");
         }
     };
+
+    if let Some(matcher_id) = { watch_cache.read().await.get(&stmt).cloned() } {
+        let contains = { agent.matchers().read().contains_key(&matcher_id) };
+        if contains {
+            info!("reusing matcher id {matcher_id}");
+            return watch_by_id(agent, matcher_id).await;
+        }
+    }
+
+    let (tx, body) = hyper::Body::channel();
+
+    // TODO: timeout on data send instead of infinitely waiting for channel space.
+    let (data_tx, data_rx) = channel(512);
+    let (change_tx, change_rx) = broadcast::channel(128);
+
+    let matcher_id = Uuid::new_v4();
+    let cancel = CancellationToken::new();
 
     let conn = match agent.pool().dedicated().await {
         Ok(conn) => conn,
@@ -732,7 +745,7 @@ pub async fn api_v1_watches(
             data_tx.clone(),
             change_tx,
             &stmt,
-            cancel,
+            cancel.clone(),
         )
     }) {
         Ok(m) => m,
@@ -751,6 +764,16 @@ pub async fn api_v1_watches(
     {
         agent.matchers().write().insert(matcher_id, matcher.clone());
     }
+
+    tokio::spawn(process_watch_channel(
+        agent.clone(),
+        matcher_id,
+        tx,
+        data_rx,
+        change_rx,
+        matcher.cmd_tx().clone(),
+        cancel.clone(),
+    ));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -1156,6 +1179,7 @@ mod tests {
 
         let res = api_v1_watches(
             Extension(agent.clone()),
+            Extension(Default::default()),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await

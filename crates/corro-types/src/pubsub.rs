@@ -32,7 +32,7 @@ use tokio::{
     task::block_in_place,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, trace, warn};
+use tracing::{error, info, trace, warn};
 use uhlc::Timestamp;
 use uuid::Uuid;
 
@@ -263,8 +263,9 @@ pub enum ChangeType {
     Delete,
 }
 
-pub enum MatcherRequest {
+pub enum MatcherCmd {
     ProcessChange(MatcherStmt, Vec<SqliteValue>),
+    Unsubscribe,
 }
 
 #[derive(Debug, Clone)]
@@ -286,7 +287,7 @@ pub struct InnerMatcher {
     pub query_table: String,
     pub qualified_table_name: String,
     pub change_tx: broadcast::Sender<RowResult>,
-    pub query_tx: mpsc::Sender<MatcherRequest>,
+    pub cmd_tx: mpsc::Sender<MatcherCmd>,
     pub col_names: Vec<CompactString>,
     pub cancel: CancellationToken,
 }
@@ -437,7 +438,7 @@ impl Matcher {
             );
         }
 
-        let (query_tx, mut query_rx) = mpsc::channel(512);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(512);
 
         let matcher = Self(Arc::new(InnerMatcher {
             id,
@@ -448,7 +449,7 @@ impl Matcher {
             qualified_table_name: format!("watches.{query_table}"),
             query_table,
             change_tx,
-            query_tx,
+            cmd_tx,
             col_names: col_names.clone(),
             cancel: cancel.clone(),
         }));
@@ -562,21 +563,30 @@ impl Matcher {
 
                 loop {
                     let req = tokio::select! {
-                        Some(req) = query_rx.recv() => req,
+                        Some(req) = cmd_rx.recv() => req,
                         _ = cancel.cancelled() => return,
                         else => return,
                     };
 
                     match req {
-                        MatcherRequest::ProcessChange(stmt, pks) => {
+                        MatcherCmd::ProcessChange(stmt, pks) => {
                             if let Err(e) =
                                 block_in_place(|| matcher.handle_change(&mut conn, stmt, pks))
                             {
-                                error!("could not handle change: {e}");
                                 if matches!(e, MatcherError::ChangeReceiverClosed) {
                                     // break here...
                                     break;
                                 }
+                                error!("could not handle change: {e}");
+                            }
+                        }
+                        MatcherCmd::Unsubscribe => {
+                            if matcher.0.change_tx.receiver_count() == 0 {
+                                info!(
+                                    "matcher {} has no more subscribers, we're done!",
+                                    matcher.0.id
+                                );
+                                break;
                             }
                         }
                     }
@@ -585,6 +595,10 @@ impl Matcher {
         });
 
         Ok(matcher)
+    }
+
+    pub fn cmd_tx(&self) -> &mpsc::Sender<MatcherCmd> {
+        &self.0.cmd_tx
     }
 
     pub fn has_match(&self, agg: &AggregateChange) -> bool {
@@ -600,8 +614,8 @@ impl Matcher {
         };
 
         self.0
-            .query_tx
-            .try_send(MatcherRequest::ProcessChange(
+            .cmd_tx
+            .try_send(MatcherCmd::ProcessChange(
                 stmt.clone(),
                 agg.pk.values().map(|v| v.to_owned()).collect(),
             ))

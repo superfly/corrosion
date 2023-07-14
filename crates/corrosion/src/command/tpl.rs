@@ -15,7 +15,7 @@ use tokio::{
     sync::mpsc::{self, channel, Receiver, Sender},
     task::block_in_place,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -55,14 +55,15 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
 
         filepaths.push((src.clone(), notify_tx));
 
-        match tokio::fs::metadata(&src).await {
+        let mut mtime = match tokio::fs::metadata(&src).await {
             Ok(meta) => {
                 if meta.is_dir() {
                     eyre::bail!("source path should be a file, not a directory");
                 }
+                meta.modified()?
             }
             Err(e) => return Err(e.into()),
-        }
+        };
 
         let dst: Utf8PathBuf = splitted
             .next()
@@ -89,6 +90,9 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
 
             let mut tpl = engine.compile(&input)?;
             let tmp_filepath = dir.path().join(Uuid::new_v4().as_simple().to_string());
+
+            let mut tpl_writer = None;
+
             'outer: loop {
                 let f = tokio::fs::OpenOptions::new()
                     .create(true)
@@ -97,13 +101,18 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
                     .open(&tmp_filepath)
                     .await?;
                 let (tx, mut rx) = mpsc::channel(1);
-                let w = TemplateWriter::new(f.into_std().await, tx);
 
-                let res = block_in_place(|| tpl.render(w));
+                let new_tpl_writer = TemplateWriter::new(f.into_std().await, tx);
+                let old_tpl_writer = tpl_writer.replace(new_tpl_writer.clone());
+
+                let res = block_in_place(|| tpl.render(new_tpl_writer));
+
+                if let Some(tpl_writer) = old_tpl_writer {
+                    tpl_writer.cancel();
+                }
 
                 if let Err(e) = res {
-                    // TODO: tracing crate? I think so!
-                    eprintln!("[ERROR] could not render template '{src}': {e}");
+                    error!("could not render template '{src}': {e}");
                     break;
                 }
 
@@ -138,15 +147,27 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
 
                     match branch {
                         Branch::Recompile => {
-                            debug!("checking if we need to recompile the template at {src}");
-                            let input = tokio::fs::read_to_string(&src).await?;
-                            let new_checksum = crc32fast::hash(input.as_bytes());
-                            if checksum != new_checksum {
-                                info!("file at {src} changed, recompiling and rendering anew");
-                                tpl = engine.compile(&input)?;
-                                checksum = new_checksum;
-                                // break from inner loop
-                                break;
+                            trace!("checking if we need to recompile the template at {src}");
+                            let meta = tokio::fs::metadata(&src).await?;
+                            let new_mtime = meta.modified()?;
+                            trace!("new mtime: {new_mtime:?}");
+
+                            if mtime != new_mtime {
+                                mtime = new_mtime;
+                                debug!("mtime changed, checksumming...");
+                                let input = tokio::fs::read_to_string(&src).await?;
+                                let new_checksum = crc32fast::hash(input.as_bytes());
+                                if checksum != new_checksum {
+                                    info!("file at {src} changed, recompiling and rendering anew");
+                                    tpl = engine.compile(&input)?;
+                                    checksum = new_checksum;
+                                    // break from inner loop
+                                    break;
+                                } else {
+                                    debug!("checksum did not change");
+                                }
+                            } else {
+                                trace!("mtime did not change");
                             }
                         }
                         Branch::Render => {
@@ -247,7 +268,7 @@ async fn async_watch(paths: Vec<(Utf8PathBuf, Sender<()>)>) -> notify::Result<()
                     _ = debouncer.watcher().unwatch(path.as_std_path());
                 }
             }
-            Err(e) => println!("watch error: {:?}", e),
+            Err(e) => error!("watch error: {:?}", e),
         }
     }
 

@@ -12,7 +12,7 @@ use crate::{
     api::{
         http::{
             api_v1_db_schema, api_v1_queries, api_v1_transactions, api_v1_watch_by_id,
-            api_v1_watches,
+            api_v1_watches, MatcherCache,
         },
         peer::{bidirectional_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncError},
         pubsub::api_v1_subscribe_ws,
@@ -667,7 +667,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             ),
         )
         .route(
-            "/db/schema",
+            "/v1/migrations",
             post(api_v1_db_schema).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
@@ -685,6 +685,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
                 .layer(Extension(agent.clone()))
+                .layer(Extension(MatcherCache::default()))
                 .layer(Extension(tripwire.clone())),
         )
         .layer(DefaultBodyLimit::disable())

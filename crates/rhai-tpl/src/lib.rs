@@ -20,6 +20,8 @@ use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
 use tokio::sync::{mpsc, RwLock as TokioRwLock};
 use tokio_util::codec::{Decoder, LinesCodec};
+use tokio_util::sync::CancellationToken;
+use tokio_util::sync::DropGuard;
 use tracing::debug;
 use tracing::error;
 use tracing::trace;
@@ -328,14 +330,21 @@ pub struct TemplateWriter(Arc<TemplateWriterInner>);
 pub struct TemplateWriterInner {
     w: RwLock<Box<dyn WriteSeek>>,
     tx: mpsc::Sender<TemplateCommand>,
+    cancel: CancellationToken,
 }
 
 impl TemplateWriter {
     pub fn new<W: WriteSeek>(w: W, tx: mpsc::Sender<TemplateCommand>) -> Self {
+        let cancel = CancellationToken::new();
         Self(Arc::new(TemplateWriterInner {
             w: RwLock::new(Box::new(w)),
             tx,
+            cancel,
         }))
+    }
+
+    pub fn cancel(&self) {
+        self.0.cancel.cancel();
     }
 
     fn write_str(&mut self, data: &str) -> Result<(), Box<EvalAltResult>> {
@@ -379,8 +388,18 @@ impl TemplateWriter {
 
         let tx = self.0.tx.clone();
 
+        let cancel = self.0.cancel.clone();
+
         tokio::spawn(async move {
-            match rows.recv().await {
+            let row_recv = tokio::select! {
+                row_recv = rows.recv() => row_recv,
+                _ = cancel.cancelled() => {
+                    debug!("template cancellation trigger, returning from tokio task");
+                    return
+                },
+            };
+
+            match row_recv {
                 Some(Ok(row)) => {
                     trace!("got an updated row! {:?}", row.cells);
                     if let Err(_e) = tx.send(TemplateCommand::Render).await {
