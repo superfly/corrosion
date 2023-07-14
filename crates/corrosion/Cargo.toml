@@ -61,6 +61,9 @@ uuid = { workspace = true }
 tikv-jemallocator = "0.5"
 rhai-tpl = { path = "../rhai-tpl" }
 shellwords = { version = "1" }
+notify = { version = "6.0.1", default-features = false, features = ["macos_kqueue"] }
+notify-debouncer-mini = { version = "0.3.0", default-features = false }
+itertools = { workspace = true }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }

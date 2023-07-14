@@ -1,27 +1,59 @@
-use std::net::SocketAddr;
+use std::{
+    collections::{HashMap, HashSet},
+    env::current_dir,
+    net::SocketAddr,
+    time::Duration,
+};
 
 use camino::Utf8PathBuf;
 use corro_client::CorrosionApiClient;
 use futures::{stream::FuturesUnordered, StreamExt};
+use notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use rhai_tpl::{TemplateCommand, TemplateWriter};
-use tokio::{sync::mpsc, task::block_in_place};
+use tokio::{
+    sync::mpsc::{self, channel, Receiver, Sender},
+    task::block_in_place,
+};
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<()> {
-    _ = tracing_subscriber::fmt::fmt().try_init();
+    let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    println!("tracing-filter directives: {directives}");
+    let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
+    if let Some(diags) = diags {
+        eprintln!("While parsing env filters: {diags}, using default");
+    }
+    tracing_subscriber::registry::Registry::default()
+        .with(filter.layer())
+        .with(tracing_subscriber::fmt::Layer::new())
+        .init();
+
     let client = CorrosionApiClient::new(api_addr);
     let engine = rhai_tpl::Engine::new(client.clone());
 
-    println!("template run");
+    let mut filepaths = vec![];
+
+    let cwd = current_dir()?;
 
     let mut futs = FuturesUnordered::new();
 
     for tpl in template {
         let mut splitted = tpl.splitn(3, ':');
-        let src: Utf8PathBuf = splitted
+        let mut src: Utf8PathBuf = splitted
             .next()
             .ok_or_else(|| eyre::eyre!("missing source template"))?
             .into();
+
+        if src.is_relative() {
+            src = cwd.join(&src).canonicalize()?.try_into()?;
+        }
+
+        let (notify_tx, mut notify_rx) = channel(1);
+
+        filepaths.push((src.clone(), notify_tx));
 
         match tokio::fs::metadata(&src).await {
             Ok(meta) => {
@@ -44,17 +76,20 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
         // rejoin
         let cmd = splitted.next().map(|s| shellwords::split(s)).transpose()?;
 
-        println!("src: {src}, dst: {dst}, cmd: {cmd:?}");
+        debug!("src: {src}, dst: {dst}, cmd: {cmd:?}");
 
         let input = tokio::fs::read_to_string(&src).await?;
 
         let dir = tempfile::tempdir()?;
 
-        let tpl = engine.compile(&input)?;
+        let engine = engine.clone();
 
         futs.push(async move {
+            let mut checksum = crc32fast::hash(input.as_bytes());
+
+            let mut tpl = engine.compile(&input)?;
             let tmp_filepath = dir.path().join(Uuid::new_v4().as_simple().to_string());
-            loop {
+            'outer: loop {
                 let f = tokio::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -86,23 +121,134 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
                     }
                 }
 
-                match rx.recv().await {
-                    None => {
-                        println!("template renderer is done");
-                        break;
+                loop {
+                    enum Branch {
+                        Recompile,
+                        Render,
                     }
-                    Some(TemplateCommand::Render) => {
-                        println!("re-rendering {src}");
+
+                    let branch = tokio::select! {
+                        Some(_) = notify_rx.recv() => Branch::Recompile,
+                        Some(TemplateCommand::Render) = rx.recv() => Branch::Render,
+                        else => {
+                            warn!("template renderer is done");
+                            break 'outer;
+                        }
+                    };
+
+                    match branch {
+                        Branch::Recompile => {
+                            debug!("checking if we need to recompile the template at {src}");
+                            let input = tokio::fs::read_to_string(&src).await?;
+                            let new_checksum = crc32fast::hash(input.as_bytes());
+                            if checksum != new_checksum {
+                                info!("file at {src} changed, recompiling and rendering anew");
+                                tpl = engine.compile(&input)?;
+                                checksum = new_checksum;
+                                // break from inner loop
+                                break;
+                            }
+                        }
+                        Branch::Render => {
+                            debug!("re-rendering {src}");
+                            break;
+                        }
                     }
                 }
             }
 
-            Ok::<_, eyre::Report>(())
+            Ok::<_, eyre::Report>(src)
         });
     }
 
+    tokio::spawn(async_watch(filepaths));
+
     while let Some(res) = futs.next().await {
+        match res {
+            Ok(_) => {
+                info!("")
+            }
+            Err(_) => todo!(),
+        }
         println!("got a res: {res:?}");
+    }
+
+    Ok(())
+}
+
+fn async_watcher() -> notify::Result<(Debouncer<RecommendedWatcher>, Receiver<DebounceEventResult>)>
+{
+    let (tx, rx) = channel(1);
+
+    // Automatically select the best implementation for your platform.
+    // You can also access each implementation directly e.g. INotifyWatcher.
+    let debouncer = new_debouncer(
+        Duration::from_secs(1),
+        None,
+        move |res: DebounceEventResult| {
+            if let Err(e) = tx.blocking_send(res) {
+                error!("could not send file change notifications! {e}");
+            }
+        },
+    )?;
+
+    Ok((debouncer, rx))
+}
+
+async fn async_watch(paths: Vec<(Utf8PathBuf, Sender<()>)>) -> notify::Result<()> {
+    let (mut debouncer, mut rx) = async_watcher()?;
+
+    let mut map: HashMap<Utf8PathBuf, Vec<Sender<()>>> = HashMap::new();
+
+    for (path, sender) in paths {
+        match map.entry(path) {
+            std::collections::hash_map::Entry::Occupied(mut senders) => {
+                senders.get_mut().push(sender)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                debouncer
+                    .watcher()
+                    .watch(entry.key().as_std_path(), RecursiveMode::NonRecursive)?;
+                entry.insert(vec![sender]);
+            }
+        }
+    }
+
+    while let Some(res) = rx.recv().await {
+        match res {
+            Ok(events) => {
+                let changed_set = events.into_iter().fold(HashSet::new(), |mut set, event| {
+                    set.insert(Utf8PathBuf::from(event.path.display().to_string()));
+                    set
+                });
+
+                let mut paths_to_delete = vec![];
+
+                for path in changed_set {
+                    if let Some(senders) = map.get_mut(&path) {
+                        let mut to_delete = vec![];
+                        for (i, sender) in senders.iter().enumerate() {
+                            if let Err(_e) = sender.send(()).await {
+                                warn!("could not send template change notification for {path}");
+                                to_delete.push(i);
+                            }
+                        }
+                        for i in to_delete {
+                            senders.remove(i);
+                        }
+                        if senders.is_empty() {
+                            paths_to_delete.push(path);
+                        }
+                    }
+                }
+
+                for path in paths_to_delete {
+                    map.remove(&path);
+                    _ = debouncer.watcher().unwatch(path.as_std_path());
+                }
+            }
+            Err(e) => println!("watch error: {:?}", e),
+        }
     }
 
     Ok(())

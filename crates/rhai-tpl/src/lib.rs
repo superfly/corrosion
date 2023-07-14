@@ -377,13 +377,12 @@ impl TemplateWriter {
             json.json_output.write_rows(&mut *w, &mut rows)?;
         }
 
-        println!("original query, spawning task to listen");
         let tx = self.0.tx.clone();
 
         tokio::spawn(async move {
             match rows.recv().await {
                 Some(Ok(row)) => {
-                    println!("got an updated row! {:?}", row.cells);
+                    trace!("got an updated row! {:?}", row.cells);
                     if let Err(_e) = tx.send(TemplateCommand::Render).await {
                         error!("could not send back re-render command, channel must be closed!");
                     }
@@ -395,7 +394,7 @@ impl TemplateWriter {
                     return;
                 }
                 None => {
-                    debug!("I guess we're done");
+                    debug!("sql stream is done");
                     return;
                 }
             }
@@ -405,8 +404,9 @@ impl TemplateWriter {
     }
 }
 
+#[derive(Clone)]
 pub struct Engine {
-    engine: rhai::Engine,
+    engine: Arc<rhai::Engine>,
 }
 
 impl Engine {
@@ -441,26 +441,25 @@ impl Engine {
         engine.register_fn("sql", {
             // let query_cache = query_cache.clone();
             move |query: &str| -> Result<QueryResponse, Box<EvalAltResult>> {
-                println!("hello sql");
                 if let Some(handle) = { query_cache.read().get(query).cloned() } {
-                    println!("query already existed...");
+                    debug!("query already existed...");
                     return Ok(QueryResponse { query: handle });
                 }
 
                 let mut w = query_cache.write();
                 // double check, for a race (unlikely here, but it is a good idea still)
                 if let Some(handle) = { w.get(query).cloned() } {
-                    println!("query already existed...");
+                    debug!("query already existed...");
                     return Ok(QueryResponse { query: handle });
                 }
 
-                println!("making a brand new query!");
+                debug!("making a brand new query!");
 
                 let (query_id, body) = tokio::runtime::Handle::current()
                     .block_on(client.watch(&Statement::Simple(query.into())))
                     .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
 
-                println!("got res w/ id: {query_id}");
+                debug!("got res w/ id: {query_id}");
 
                 let handle = Arc::new(TokioRwLock::new(QueryHandle {
                     id: query_id,
@@ -481,7 +480,9 @@ impl Engine {
                 .to_string())
         });
 
-        Self { engine }
+        Self {
+            engine: Arc::new(engine),
+        }
     }
 
     pub fn compile(&self, input: &str) -> Result<Template, CompileError> {
