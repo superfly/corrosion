@@ -591,6 +591,14 @@ impl Matcher {
                         }
                     }
                 }
+                if let Err(e) =
+                    conn.execute_batch(&format!("DROP TABLE {}", matcher.0.qualified_table_name))
+                {
+                    warn!(
+                        "could not clean up temporary table {} => {e}",
+                        matcher.0.qualified_table_name
+                    );
+                }
             }
         });
 
