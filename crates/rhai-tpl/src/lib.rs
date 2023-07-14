@@ -401,7 +401,7 @@ impl TemplateWriter {
                 Some(Ok(row)) => {
                     trace!("got an updated row! {:?}", row.cells);
                     if let Err(_e) = tx.send(TemplateCommand::Render).await {
-                        error!("could not send back re-render command, channel must be closed!");
+                        debug!("could not send back re-render command, channel must be closed!");
                     }
                     return;
                 }

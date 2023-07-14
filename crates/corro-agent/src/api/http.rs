@@ -720,6 +720,8 @@ pub async fn api_v1_watches(
         if contains {
             info!("reusing matcher id {matcher_id}");
             return watch_by_id(agent, matcher_id).await;
+        } else {
+            watch_cache.write().await.remove(&stmt);
         }
     }
 

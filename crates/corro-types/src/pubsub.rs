@@ -614,6 +614,20 @@ impl Matcher {
     }
 
     pub fn process_change<'a>(&self, agg: &AggregateChange<'a>) -> Result<(), MatcherError> {
+        // println!("{:?}", self.0.parsed);
+
+        if let Some(cols) = self.0.parsed.table_columns.get(agg.table) {
+            if !agg.pk.keys().any(|col| cols.contains(*col)) {
+                if !agg.data.keys().any(|col| cols.contains(*col)) {
+                    trace!("irrelevant columns!");
+                    return Ok(());
+                }
+            }
+        } else {
+            trace!("irrelevant table!");
+            return Ok(());
+        }
+
         let stmt = if let Some(stmt) = self.0.statements.get(agg.table) {
             stmt
         } else {
@@ -912,6 +926,7 @@ fn extract_expr_columns(
         // simplest case
         Expr::Qualified(tblname, colname) => {
             let resolved_name = parsed.aliases.get(&tblname.0).unwrap_or(&tblname.0);
+            // println!("adding column: {resolved_name} => {colname:?}");
             parsed
                 .table_columns
                 .entry(resolved_name.clone())
@@ -921,6 +936,7 @@ fn extract_expr_columns(
         // simplest case but also mentioning the schema
         Expr::DoublyQualified(schema_name, tblname, colname) if schema_name.0 == "main" => {
             let resolved_name = parsed.aliases.get(&tblname.0).unwrap_or(&tblname.0);
+            // println!("adding column: {resolved_name} => {colname:?}");
             parsed
                 .table_columns
                 .entry(resolved_name.clone())
@@ -928,9 +944,59 @@ fn extract_expr_columns(
                 .insert(colname.0.clone());
         }
 
-        Expr::Name(_) => {
-            // figure out which table this is for...
-            todo!()
+        Expr::Name(colname) => {
+            let mut found = None;
+            for tbl in parsed.table_columns.keys() {
+                if let Some(tbl) = schema.tables.get(tbl) {
+                    if tbl.columns.contains_key(&colname.0) {
+                        if found.is_some() {
+                            return Err(MatcherError::QualificationRequired {
+                                col_name: colname.0.clone(),
+                            });
+                        }
+                        found = Some(tbl.name.as_str());
+                    }
+                }
+            }
+
+            if let Some(found) = found {
+                parsed
+                    .table_columns
+                    .entry(found.to_owned())
+                    .or_default()
+                    .insert(colname.0.clone());
+            } else {
+                return Err(MatcherError::TableForColumnNotFound {
+                    col_name: colname.0.clone(),
+                });
+            }
+        }
+        Expr::Id(colname) => {
+            let mut found = None;
+            for tbl in parsed.table_columns.keys() {
+                if let Some(tbl) = schema.tables.get(tbl) {
+                    if tbl.columns.contains_key(&colname.0) {
+                        if found.is_some() {
+                            return Err(MatcherError::QualificationRequired {
+                                col_name: colname.0.clone(),
+                            });
+                        }
+                        found = Some(tbl.name.as_str());
+                    }
+                }
+            }
+
+            if let Some(found) = found {
+                parsed
+                    .table_columns
+                    .entry(found.to_owned())
+                    .or_default()
+                    .insert(colname.0.clone());
+            } else {
+                return Err(MatcherError::TableForColumnNotFound {
+                    col_name: colname.0.clone(),
+                });
+            }
         }
 
         Expr::Between { lhs, .. } => extract_expr_columns(lhs, schema, parsed)?,
@@ -1032,6 +1098,7 @@ fn extract_columns(
     for col in columns.iter() {
         match col {
             ResultColumn::Expr(expr, _) => {
+                // println!("extracting col: {expr:?} (as: {maybe_as:?})");
                 extract_expr_columns(expr, schema, parsed)?;
                 parsed.columns.push(ResultColumn::Expr(
                     expr.clone(),
@@ -1143,6 +1210,10 @@ pub enum MatcherError {
     UnsupportedExpr { expr: Expr },
     #[error("could not find table for {tbl_name}.* in corrosion's schema")]
     TableStarNotFound { tbl_name: String },
+    #[error("<tbl>.{col_name} qualification required for ambiguous column name")]
+    QualificationRequired { col_name: String },
+    #[error("could not find table for column {col_name}")]
+    TableForColumnNotFound { col_name: String },
     #[error("missing primary keys, this shouldn't happen")]
     MissingPrimaryKeys,
     #[error("change queue has been closed or is full")]
