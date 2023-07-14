@@ -453,7 +453,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     Ok(addrs) => {
                         for addr in addrs.iter() {
                             debug!("Bootstrapping w/ {addr}");
-                            foca_tx.send(FocaInput::Announce((*addr).into())).await.ok();
+                            if let Err(e) = foca_tx.send(FocaInput::Announce((*addr).into())).await
+                            {
+                                error!("could not send foca Announce message: {e}");
+                            } else {
+                                debug!("successfully sent announce message");
+                            }
                         }
                     }
                     Err(e) => {
@@ -477,10 +482,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 for actor_id in to_check {
                     let booked = bookie.for_actor(actor_id);
 
-                    // get a write lock so nothing else may handle changes while we do this
-                    let mut bookedw = booked.write();
-
-                    let versions = bookedw.current_versions();
+                    let versions = {
+                        let read = booked.read();
+                        read.current_versions()
+                    };
 
                     let site_id = if actor_id == self_actor_id {
                         None
@@ -494,7 +499,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             match compact_booked_for_actor(&conn, site_id, &versions) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
-                                        return Ok(None);
+                                        return Ok(());
                                     }
                                     to_clear
                                 }
@@ -514,7 +519,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         let mut inserted = 0;
 
-                        for (range, known) in bookedw.inner().iter() {
+                        for (range, known) in booked.read().iter() {
                             match known {
                                 KnownDbVersion::Current {
                                     db_version,
@@ -536,25 +541,20 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         info!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
-                        Ok::<_, eyre::Report>(Some(to_clear))
+                        let mut bookedw = booked.write();
+                        let cleared_len = to_clear.len();
+                        for db_version in to_clear {
+                            if let Some(version) = versions.get(&db_version) {
+                                bookedw.insert(*version, KnownDbVersion::Cleared);
+                            }
+                        }
+                        info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}");
+
+                        Ok::<_, eyre::Report>(())
                     });
 
-                    match res {
-                        Ok(Some(to_clear)) => {
-                            let cleared_len = to_clear.len();
-                            for db_version in to_clear {
-                                if let Some(version) = versions.get(&db_version) {
-                                    bookedw.insert(*version, KnownDbVersion::Cleared);
-                                }
-                            }
-                            info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}");
-                        }
-                        Ok(None) => {
-                            // nothing to clear
-                        }
-                        Err(e) => {
-                            error!("could not compact versions for actor {actor_id}: {e}");
-                        }
+                    if let Err(e) = res {
+                        error!("could not compact versions for actor {actor_id}: {e}");
                     }
                 }
             }
@@ -937,6 +937,7 @@ async fn handle_notifications(
 }
 
 async fn handle_db_cleanup(pool: SplitPool) -> eyre::Result<()> {
+    debug!("handling db_cleanup (WAL truncation)");
     let conn = pool.write_low().await?;
     block_in_place(move || {
         let start = Instant::now();
@@ -955,6 +956,7 @@ async fn handle_db_cleanup(pool: SplitPool) -> eyre::Result<()> {
         }
         Ok::<_, eyre::Report>(())
     })?;
+    debug!("done handling db_cleanup");
     Ok(())
 }
 
@@ -1440,6 +1442,8 @@ pub async fn process_single_version(
 
             let mut impactful_changeset = vec![];
 
+            let mut last_rows_impacted = 0;
+
             for change in changes {
                 trace!("inserting change! {change:?}");
                 tx.prepare_cached(
@@ -1464,18 +1468,21 @@ pub async fn process_single_version(
                     .prepare_cached("SELECT crsql_rows_impacted()")?
                     .query_row((), |row| row.get(0))?;
 
-                debug!(actor = %agent.actor_id(), "inserted {rows_impacted} into crsql_changes");
-                if rows_impacted > 0 {
+                if rows_impacted > last_rows_impacted {
+                    debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
                     impactful_changeset.push(change);
                 }
+                last_rows_impacted = rows_impacted;
             }
 
             debug!(
-                "inserting bookkeeping row: {}, start: {}, end: {:?}, ts: {:?}",
+                "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?}",
                 actor_id, version, db_version, ts
             );
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
+
+            debug!("inserted bookkeeping row");
 
             let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
                 (KnownDbVersion::Cleared, Changeset::Empty { versions }, None)
@@ -1499,16 +1506,21 @@ pub async fn process_single_version(
 
             tx.commit()?;
 
+            debug!("committed transaction");
+
             Ok::<_, rusqlite::Error>((known_version, new_changeset, db_version))
         })?;
 
         booked_write.insert_many(changeset.versions(), known_version);
+        debug!("inserted into in-memory bookkeeping");
+
         (db_version, changeset)
     };
 
     if let Some(db_version) = db_version {
         process_subs(agent, changeset.changes(), db_version);
     }
+    debug!("processed subscriptions, if any!");
 
     Ok(Some(changeset))
 }

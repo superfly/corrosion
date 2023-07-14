@@ -533,6 +533,19 @@ impl<'a> BookReader<'a> {
             None => self.0.contains_key(&version),
         }
     }
+
+    pub fn current_versions(&self) -> BTreeMap<i64, i64> {
+        self.0
+            .iter()
+            .filter_map(|(range, known)| {
+                if let KnownDbVersion::Current { db_version, .. } = known {
+                    Some((*db_version, *range.start()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 impl<'a> Deref for BookReader<'a> {
