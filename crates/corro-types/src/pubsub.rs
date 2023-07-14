@@ -784,6 +784,10 @@ impl Matcher {
         self.0.change_tx.subscribe()
     }
 
+    pub fn receiver_count(&self) -> usize {
+        self.0.change_tx.receiver_count()
+    }
+
     pub fn cancel(&self) -> CancellationToken {
         self.0.cancel.clone()
     }

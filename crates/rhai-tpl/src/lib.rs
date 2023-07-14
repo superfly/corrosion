@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::Seek;
 use std::io::Write;
 use std::sync::Arc;
@@ -21,7 +20,6 @@ use serde_json::ser::Formatter;
 use tokio::sync::{mpsc, RwLock as TokioRwLock};
 use tokio_util::codec::{Decoder, LinesCodec};
 use tokio_util::sync::CancellationToken;
-use tokio_util::sync::DropGuard;
 use tracing::debug;
 use tracing::error;
 use tracing::trace;
@@ -454,26 +452,9 @@ impl Engine {
         engine.register_fn("to_json", SqliteValueWrap::to_json);
         engine.register_fn("to_string", SqliteValueWrap::to_json);
 
-        let query_cache: Arc<RwLock<HashMap<String, Arc<TokioRwLock<QueryHandle>>>>> =
-            Default::default();
-
         engine.register_fn("sql", {
             // let query_cache = query_cache.clone();
             move |query: &str| -> Result<QueryResponse, Box<EvalAltResult>> {
-                if let Some(handle) = { query_cache.read().get(query).cloned() } {
-                    debug!("query already existed...");
-                    return Ok(QueryResponse { query: handle });
-                }
-
-                let mut w = query_cache.write();
-                // double check, for a race (unlikely here, but it is a good idea still)
-                if let Some(handle) = { w.get(query).cloned() } {
-                    debug!("query already existed...");
-                    return Ok(QueryResponse { query: handle });
-                }
-
-                debug!("making a brand new query!");
-
                 let (query_id, body) = tokio::runtime::Handle::current()
                     .block_on(client.watch(&Statement::Simple(query.into())))
                     .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
@@ -485,8 +466,6 @@ impl Engine {
                     body: Some(body),
                     client: client.clone(),
                 }));
-
-                w.insert(query.to_string(), handle.clone());
 
                 Ok(QueryResponse { query: handle })
             }

@@ -672,11 +672,23 @@ async fn process_watch_channel(
     }
     debug!("query body channel done");
 
+    drop(change_rx);
+
     if cancelled {
         // try to remove if it exists.
+        info!("matcher {matcher_id} was cancelled, removing");
         agent.matchers().write().remove(&matcher_id);
     } else {
         _ = cmd_tx.send(MatcherCmd::Unsubscribe).await;
+        let mut matchers = agent.matchers().write();
+        let no_mo_receivers = matchers
+            .get(&matcher_id)
+            .map(|m| m.receiver_count() == 0)
+            .unwrap_or(false);
+        if no_mo_receivers {
+            info!("no more receivers for matcher {matcher_id}, removing");
+            matchers.remove(&matcher_id);
+        }
     }
 }
 
@@ -760,6 +772,7 @@ pub async fn api_v1_watches(
 
     {
         agent.matchers().write().insert(matcher_id, matcher.clone());
+        watch_cache.write().await.insert(stmt, matcher_id);
     }
 
     tokio::spawn(process_watch_channel(
