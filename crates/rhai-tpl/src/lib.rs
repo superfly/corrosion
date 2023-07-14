@@ -377,32 +377,29 @@ impl TemplateWriter {
             json.json_output.write_rows(&mut *w, &mut rows)?;
         }
 
-        if rows.original {
-            println!("original query, spawning task to listen");
-            let tx = self.0.tx.clone();
-            tokio::spawn(async move {
-                match rows.recv().await {
-                    Some(Ok(row)) => {
-                        println!("got an updated row! {:?}", row.cells);
-                        if let Err(_e) = tx.send(TemplateCommand::Render).await {
-                            error!(
-                                "could not send back re-render command, channel must be closed!"
-                            );
-                        }
-                        return;
+        println!("original query, spawning task to listen");
+        let tx = self.0.tx.clone();
+
+        tokio::spawn(async move {
+            match rows.recv().await {
+                Some(Ok(row)) => {
+                    println!("got an updated row! {:?}", row.cells);
+                    if let Err(_e) = tx.send(TemplateCommand::Render).await {
+                        error!("could not send back re-render command, channel must be closed!");
                     }
-                    Some(Err(e)) => {
-                        // TODO: need to re-render possibly...
-                        warn!("error from upstream, returning... {e}");
-                        return;
-                    }
-                    None => {
-                        debug!("I guess we're done");
-                        return;
-                    }
+                    return;
                 }
-            });
-        }
+                Some(Err(e)) => {
+                    // TODO: need to re-render possibly...
+                    warn!("error from upstream, returning... {e}");
+                    return;
+                }
+                None => {
+                    debug!("I guess we're done");
+                    return;
+                }
+            }
+        });
 
         Ok(())
     }
@@ -820,6 +817,8 @@ tail",
                 .await
                 .unwrap();
 
+            // we have 2 queries here...
+            assert_eq!(rx.recv().await.unwrap(), TemplateCommand::Render);
             assert_eq!(rx.recv().await.unwrap(), TemplateCommand::Render);
             assert!(rx.recv().await.is_none());
         }

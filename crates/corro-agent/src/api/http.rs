@@ -21,6 +21,7 @@ use rusqlite::{params, params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
     sync::{
+        broadcast,
         mpsc::{self, channel},
         oneshot,
     },
@@ -500,45 +501,25 @@ pub async fn api_v1_watch_by_id(
         }
     };
 
-    let (mut tx, body) = hyper::Body::channel();
+    let (tx, body) = hyper::Body::channel();
 
     // TODO: timeout on data send instead of infinitely waiting for channel space.
-    let (data_tx, mut data_rx) = channel(512);
+    let (init_tx, init_rx) = channel(512);
+    let change_rx = matcher.subscribe();
+    let cancel = matcher.cancel();
 
-    tokio::spawn(async move {
-        let mut buf = BytesMut::new();
-
-        while let Some(query_res) = data_rx.recv().await {
-            {
-                let mut writer = (&mut buf).writer();
-                if let Err(e) = serde_json::to_writer(&mut writer, &query_res) {
-                    _ = tx
-                        .send_data(
-                            serde_json::to_vec(&serde_json::json!(RowResult::Error(
-                                e.to_compact_string()
-                            )))
-                            .expect("could not serialize error json")
-                            .into(),
-                        )
-                        .await;
-                    return;
-                }
-            }
-
-            buf.extend_from_slice(b"\n");
-
-            if let Err(e) = tx.send_data(buf.split().freeze()).await {
-                error!("could not send data through body's channel: {e}");
-                return;
-            }
-        }
-
-        debug!("watcher query body channel done");
-    });
+    tokio::spawn(process_watch_channel(
+        agent.clone(),
+        id,
+        tx,
+        init_rx,
+        change_rx,
+        cancel,
+    ));
 
     let pool = agent.pool().dedicated_pool().clone();
     tokio::spawn(async move {
-        if let Err(_e) = data_tx
+        if let Err(_e) = init_tx
             .send(RowResult::Columns(matcher.0.col_names.clone()))
             .await
         {
@@ -549,7 +530,7 @@ pub async fn api_v1_watch_by_id(
         let conn = match pool.get().await {
             Ok(conn) => conn,
             Err(e) => {
-                _ = data_tx.send(RowResult::Error(e.to_compact_string())).await;
+                _ = init_tx.send(RowResult::Error(e.to_compact_string())).await;
                 return;
             }
         };
@@ -574,7 +555,7 @@ pub async fn api_v1_watch_by_id(
             ))?;
             let col_count = prepped.column_count();
 
-            data_tx.blocking_send(RowResult::Columns(matcher.0.col_names.clone()))?;
+            init_tx.blocking_send(RowResult::Columns(matcher.0.col_names.clone()))?;
 
             let mut rows = prepped.query(())?;
 
@@ -589,7 +570,7 @@ pub async fn api_v1_watch_by_id(
                     .map(|i| row.get::<_, SqliteValue>(i))
                     .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                data_tx.blocking_send(RowResult::Row {
+                init_tx.blocking_send(RowResult::Row {
                     rowid,
                     change_type: ChangeType::Upsert,
                     cells,
@@ -600,8 +581,10 @@ pub async fn api_v1_watch_by_id(
         });
 
         if let Err(QueryTempError::Sqlite(e)) = res {
-            _ = data_tx.send(RowResult::Error(e.to_compact_string())).await;
+            _ = init_tx.send(RowResult::Error(e.to_compact_string())).await;
         }
+
+        _ = init_tx.send(RowResult::EndOfQuery).await;
     });
 
     hyper::Response::builder()
@@ -610,68 +593,106 @@ pub async fn api_v1_watch_by_id(
         .expect("could not build query response body")
 }
 
+async fn process_watch_channel(
+    agent: Agent,
+    matcher_id: Uuid,
+    mut tx: hyper::body::Sender,
+    mut init_rx: mpsc::Receiver<RowResult>,
+    mut change_rx: broadcast::Receiver<RowResult>,
+    cancel: CancellationToken,
+) {
+    let mut buf = BytesMut::new();
+
+    let mut init_done = false;
+    let mut check_ready = interval(Duration::from_secs(1));
+    let mut cancelled = false;
+    loop {
+        // either we get data we need to transmit
+        // or we check every 1s if the client is still ready to receive data
+        let row_res = tokio::select! {
+            _ = cancel.cancelled() => {
+                debug!("canceled!");
+                cancelled = true;
+                break;
+            },
+            maybe_row_res = init_rx.recv(), if !init_done => match maybe_row_res {
+                Some(row_res) => row_res,
+                None => {
+                    init_done = true;
+                    continue;
+                }
+            },
+            res = change_rx.recv(), if init_done => match res {
+                Ok(row_res) => row_res,
+                Err(e) => {
+                    warn!("could not receive change: {e}");
+                    break;
+                }
+            },
+            _ = check_ready.tick() => {
+                if let Err(_) = poll_fn(|cx| tx.poll_ready(cx)).await {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        if matches!(row_res, RowResult::EndOfQuery) {
+            init_done = true;
+        }
+
+        {
+            let mut writer = (&mut buf).writer();
+            if let Err(e) = serde_json::to_writer(&mut writer, &row_res) {
+                _ = tx
+                    .send_data(
+                        serde_json::to_vec(&serde_json::json!(RowResult::Error(
+                            e.to_compact_string()
+                        )))
+                        .expect("could not serialize error json")
+                        .into(),
+                    )
+                    .await;
+                return;
+            }
+        }
+
+        buf.extend_from_slice(b"\n");
+
+        if let Err(e) = tx.send_data(buf.split().freeze()).await {
+            error!("could not send data through body's channel: {e}");
+            return;
+        }
+    }
+    debug!("query body channel done");
+
+    if cancelled {
+        // try to remove if it exists.
+        agent.matchers().write().remove(&matcher_id);
+    }
+}
+
 pub async fn api_v1_watches(
     Extension(agent): Extension<Agent>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
-    let (mut tx, body) = hyper::Body::channel();
+    let (tx, body) = hyper::Body::channel();
 
     let matcher_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
 
     // TODO: timeout on data send instead of infinitely waiting for channel space.
-    let (data_tx, mut data_rx) = channel(512);
+    let (data_tx, data_rx) = channel(512);
+    let (change_tx, change_rx) = broadcast::channel(128);
 
-    tokio::spawn({
-        let cancel = cancel.clone();
-        let agent = agent.clone();
-        async move {
-            let _drop_guard = cancel.drop_guard();
-
-            let mut buf = BytesMut::new();
-
-            let mut check_ready = interval(Duration::from_secs(1));
-            loop {
-                // either we get data we need to transmit
-                // or we check every 1s if the client is still ready to receive data
-                let query_res = tokio::select! {
-                    Some(query_res) = data_rx.recv() => query_res,
-                    _ = check_ready.tick() => {
-                        if let Err(_) = poll_fn(|cx| tx.poll_ready(cx)).await {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-
-                {
-                    let mut writer = (&mut buf).writer();
-                    if let Err(e) = serde_json::to_writer(&mut writer, &query_res) {
-                        _ = tx
-                            .send_data(
-                                serde_json::to_vec(&serde_json::json!(RowResult::Error(
-                                    e.to_compact_string()
-                                )))
-                                .expect("could not serialize error json")
-                                .into(),
-                            )
-                            .await;
-                        return;
-                    }
-                }
-
-                buf.extend_from_slice(b"\n");
-
-                if let Err(e) = tx.send_data(buf.split().freeze()).await {
-                    error!("could not send data through body's channel: {e}");
-                    return;
-                }
-            }
-            debug!("query body channel done");
-            // try to remove if it exists.
-            agent.matchers().write().remove(&matcher_id);
-        }
-    });
+    tokio::spawn(process_watch_channel(
+        agent.clone(),
+        matcher_id,
+        tx,
+        data_rx,
+        change_rx,
+        cancel.clone(),
+    ));
 
     let stmt = match stmt {
         Statement::Simple(s) => s,
@@ -709,6 +730,7 @@ pub async fn api_v1_watches(
             &agent.schema().read(),
             conn,
             data_tx.clone(),
+            change_tx,
             &stmt,
             cancel,
         )

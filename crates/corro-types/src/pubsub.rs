@@ -25,7 +25,10 @@ use sqlite3_parser::{
     lexer::sql::Parser,
 };
 use tokio::{
-    sync::mpsc::{self, UnboundedSender},
+    sync::{
+        broadcast,
+        mpsc::{self, UnboundedSender},
+    },
     task::block_in_place,
 };
 use tokio_util::sync::CancellationToken;
@@ -282,9 +285,10 @@ pub struct InnerMatcher {
     pub parsed: ParsedSelect,
     pub query_table: String,
     pub qualified_table_name: String,
-    pub tx: mpsc::Sender<RowResult>,
+    pub change_tx: broadcast::Sender<RowResult>,
     pub query_tx: mpsc::Sender<MatcherRequest>,
     pub col_names: Vec<CompactString>,
+    pub cancel: CancellationToken,
 }
 
 impl Matcher {
@@ -292,7 +296,8 @@ impl Matcher {
         id: Uuid,
         schema: &NormalizedSchema,
         mut conn: Connection,
-        tx: mpsc::Sender<RowResult>,
+        init_tx: mpsc::Sender<RowResult>,
+        change_tx: broadcast::Sender<RowResult>,
         sql: &str,
         cancel: CancellationToken,
     ) -> Result<Self, MatcherError> {
@@ -442,9 +447,10 @@ impl Matcher {
             parsed,
             qualified_table_name: format!("watches.{query_table}"),
             query_table,
-            tx,
+            change_tx,
             query_tx,
             col_names: col_names.clone(),
+            cancel: cancel.clone(),
         }));
 
         let mut tmp_cols = matcher
@@ -481,7 +487,8 @@ impl Matcher {
         tokio::spawn({
             let matcher = matcher.clone();
             async move {
-                if let Err(e) = matcher.0.tx.send(RowResult::Columns(col_names)).await {
+                let _drop_guard = cancel.clone().drop_guard();
+                if let Err(e) = init_tx.send(RowResult::Columns(col_names)).await {
                     error!("could not send back columns, probably means no receivers! {e}");
                     return;
                 }
@@ -518,7 +525,7 @@ impl Matcher {
                                         .map(|i| row.get::<_, SqliteValue>(i))
                                         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                                    if let Err(e) = matcher.0.tx.blocking_send(RowResult::Row {
+                                    if let Err(e) = init_tx.blocking_send(RowResult::Row {
                                         change_type: ChangeType::Upsert,
                                         rowid,
                                         cells,
@@ -544,15 +551,11 @@ impl Matcher {
                 });
 
                 if let Err(e) = res {
-                    _ = matcher
-                        .0
-                        .tx
-                        .send(RowResult::Error(e.to_compact_string()))
-                        .await;
+                    _ = init_tx.send(RowResult::Error(e.to_compact_string())).await;
                     return;
                 }
 
-                if let Err(e) = matcher.0.tx.send(RowResult::EndOfQuery).await {
+                if let Err(e) = init_tx.send(RowResult::EndOfQuery).await {
                     error!("could not send back end-of-query message: {e}");
                     return;
                 }
@@ -733,7 +736,7 @@ impl Matcher {
                     .collect::<rusqlite::Result<Vec<_>>>()
                 {
                     Ok(cells) => {
-                        if let Err(e) = self.0.tx.blocking_send(RowResult::Row {
+                        if let Err(e) = self.0.change_tx.send(RowResult::Row {
                             rowid,
                             change_type,
                             cells,
@@ -753,6 +756,14 @@ impl Matcher {
         tx.commit()?;
 
         Ok(())
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<RowResult> {
+        self.0.change_tx.subscribe()
+    }
+
+    pub fn cancel(&self) -> CancellationToken {
+        self.0.cancel.clone()
     }
 }
 
@@ -1281,7 +1292,9 @@ mod tests {
 
         {
             let (tx, mut rx) = mpsc::channel(1);
-            let matcher = Matcher::new(id, &schema, matcher_conn, tx, sql, cancel).unwrap();
+            let (change_tx, mut change_rx) = broadcast::channel(1);
+            let matcher =
+                Matcher::new(id, &schema, matcher_conn, tx, change_tx, sql, cancel).unwrap();
 
             assert!(matches!(rx.recv().await.unwrap(), RowResult::Columns(_)));
 
@@ -1351,7 +1364,7 @@ mod tests {
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
             assert_eq!(
-                rx.recv().await.unwrap(),
+                change_rx.recv().await.unwrap(),
                 RowResult::Row {
                     rowid: 2,
                     change_type: ChangeType::Upsert,
@@ -1387,7 +1400,7 @@ mod tests {
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
             assert_eq!(
-                rx.recv().await.unwrap(),
+                change_rx.recv().await.unwrap(),
                 RowResult::Row {
                     rowid: 1,
                     change_type: ChangeType::Delete,
