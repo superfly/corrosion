@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env::current_dir,
     net::SocketAddr,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use camino::Utf8PathBuf;
@@ -105,7 +105,14 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
                 let new_tpl_writer = TemplateWriter::new(f.into_std().await, tx);
                 let old_tpl_writer = tpl_writer.replace(new_tpl_writer.clone());
 
-                let res = block_in_place(|| tpl.render(new_tpl_writer));
+                debug!("rendering template...");
+
+                let res = block_in_place(|| {
+                    let start = Instant::now();
+                    let res = tpl.render(new_tpl_writer);
+                    debug!("rendered template in {:?}", start.elapsed());
+                    res
+                });
 
                 if let Some(tpl_writer) = old_tpl_writer {
                     tpl_writer.cancel();
@@ -116,7 +123,11 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
                     break;
                 }
 
+                debug!("rendered template");
+
                 tokio::fs::rename(&tmp_filepath, &dst).await?;
+
+                debug!("wrote file");
 
                 if let Some(ref args) = cmd {
                     let mut iter = args.iter();

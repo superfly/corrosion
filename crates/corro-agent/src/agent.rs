@@ -1543,49 +1543,51 @@ async fn process_msg(agent: &Agent, msg: Message) -> Result<Option<Message>, Cha
 
 pub fn process_subs(agent: &Agent, changeset: &[Change], db_version: i64) {
     trace!("process subs...");
-    let schema = agent.schema().read();
-    let aggs = AggregateChange::from_changes(changeset.iter(), &schema, db_version);
-    trace!("agg changes: {aggs:?}");
-    for agg in aggs {
-        {
-            let subscribers = agent.subscribers().read();
-            trace!("subs: {subscribers:?}");
-            for (sub, subscriptions) in subscribers.iter() {
-                trace!("looking at sub {sub}");
-                let subs = subscriptions.read();
-                if let Some((subs, sender)) = subs.as_local() {
-                    for (id, info) in subs.iter() {
-                        if let Some(filter) = info.filter.as_ref() {
-                            if match_expr(filter, &agg) {
-                                trace!("matched subscriber: {id} w/ info: {info:?}!");
-                                if let Err(e) = sender.send(SubscriptionMessage::Event {
-                                    id: id.clone(),
-                                    event: SubscriptionEvent::Change(agg.to_owned()),
-                                }) {
-                                    error!("could not send sub message: {e}")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // let schema = agent.schema().read();
+    // let aggs = AggregateChange::from_changes(changeset.iter(), &schema, db_version);
+    // trace!("agg changes: {aggs:?}");
+    // for agg in aggs.iter() {
+    //     {
+    //         let subscribers = agent.subscribers().read();
+    //         trace!("subs: {subscribers:?}");
+    //         for (sub, subscriptions) in subscribers.iter() {
+    //             trace!("looking at sub {sub}");
+    //             let subs = subscriptions.read();
+    //             if let Some((subs, sender)) = subs.as_local() {
+    //                 for (id, info) in subs.iter() {
+    //                     if let Some(filter) = info.filter.as_ref() {
+    //                         if match_expr(filter, &agg) {
+    //                             trace!("matched subscriber: {id} w/ info: {info:?}!");
+    //                             if let Err(e) = sender.send(SubscriptionMessage::Event {
+    //                                 id: id.clone(),
+    //                                 event: SubscriptionEvent::Change(agg.to_owned()),
+    //                             }) {
+    //                                 error!("could not send sub message: {e}")
+    //                             }
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
 
-        let mut matchers_to_delete = vec![];
+    // block_in_place(|| {
+    let mut matchers_to_delete = vec![];
 
-        {
-            let matchers = agent.matchers().read();
-            for (id, matcher) in matchers.iter() {
-                if let Err(e) = matcher.process_change(&agg) {
-                    error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
-                    matchers_to_delete.push(*id);
-                }
+    {
+        let matchers = agent.matchers().read();
+        for (id, matcher) in matchers.iter() {
+            if let Err(e) = matcher.process_change(changeset) {
+                error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
+                matchers_to_delete.push(*id);
             }
-        }
-        for id in matchers_to_delete {
-            agent.matchers().write().remove(&id);
         }
     }
+    for id in matchers_to_delete {
+        agent.matchers().write().remove(&id);
+    }
+    // });
 }
 
 #[derive(Debug, thiserror::Error)]

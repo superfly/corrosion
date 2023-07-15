@@ -715,7 +715,9 @@ pub async fn api_v1_watches(
         }
     };
 
-    if let Some(matcher_id) = { watch_cache.read().await.get(&stmt).cloned() } {
+    let matcher_id = { watch_cache.read().await.get(&stmt).cloned() };
+
+    if let Some(matcher_id) = matcher_id {
         let contains = { agent.matchers().read().contains_key(&matcher_id) };
         if contains {
             info!("reusing matcher id {matcher_id}");
@@ -729,7 +731,7 @@ pub async fn api_v1_watches(
 
     // TODO: timeout on data send instead of infinitely waiting for channel space.
     let (data_tx, data_rx) = channel(512);
-    let (change_tx, change_rx) = broadcast::channel(128);
+    let (change_tx, change_rx) = broadcast::channel(10240);
 
     let matcher_id = Uuid::new_v4();
     let cancel = CancellationToken::new();

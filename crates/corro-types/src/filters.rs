@@ -550,6 +550,7 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError
                     return Err(UnpackError::Abort);
                 }
                 ret.push(SqliteValueRef::Blob(&buf[0..len]));
+                buf.advance(len);
             }
             Some(ColumnType::Float) => {
                 if buf.remaining() < 8 {
@@ -574,10 +575,10 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError
                 if buf.remaining() < len {
                     return Err(UnpackError::Abort);
                 }
-                // let bytes = buf.copy_to_bytes(len);
                 ret.push(SqliteValueRef::Text(unsafe {
                     std::str::from_utf8_unchecked(&buf[0..len])
-                }))
+                }));
+                buf.advance(len);
             }
             None => return Err(UnpackError::Misuse),
         }
@@ -872,4 +873,7 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_packing() {}
 }

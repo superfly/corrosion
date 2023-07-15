@@ -1,3 +1,4 @@
+use std::io::BufWriter;
 use std::io::Seek;
 use std::io::Write;
 use std::sync::Arc;
@@ -335,7 +336,7 @@ impl TemplateWriter {
     pub fn new<W: WriteSeek>(w: W, tx: mpsc::Sender<TemplateCommand>) -> Self {
         let cancel = CancellationToken::new();
         Self(Arc::new(TemplateWriterInner {
-            w: RwLock::new(Box::new(w)),
+            w: RwLock::new(Box::new(BufWriter::new(w))),
             tx,
             cancel,
         }))
@@ -378,6 +379,7 @@ impl TemplateWriter {
     }
 
     fn write_sql_to_json(&mut self, mut json: SqlToJson) -> Result<(), Box<EvalAltResult>> {
+        debug!("write_sql_to_json");
         let mut rows = json.res.into_iter();
         {
             let mut w = self.0.w.write();
@@ -455,6 +457,7 @@ impl Engine {
         engine.register_fn("sql", {
             // let query_cache = query_cache.clone();
             move |query: &str| -> Result<QueryResponse, Box<EvalAltResult>> {
+                debug!("sql function call {query}");
                 let (query_id, body) = tokio::runtime::Handle::current()
                     .block_on(client.watch(&Statement::Simple(query.into())))
                     .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
@@ -638,10 +641,17 @@ pub struct Template<'a> {
 impl<'a> Template<'a> {
     pub fn render(&self, w: TemplateWriter) -> Result<(), Box<rhai::EvalAltResult>> {
         let mut scope = Scope::new();
-        scope.push("__tpl_writer", w);
+        scope.push("__tpl_writer", w.clone());
         self.engine
             .engine
-            .eval_ast_with_scope(&mut scope, &self.ast)
+            .eval_ast_with_scope(&mut scope, &self.ast)?;
+
+        w.0.w
+            .write()
+            .flush()
+            .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+
+        Ok(())
     }
 }
 

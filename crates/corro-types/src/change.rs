@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, ToSmallVec};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 
+use crate::filters::ColumnType;
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
 pub struct Change {
     pub table: String,
@@ -100,6 +102,16 @@ pub enum SqliteValue {
 }
 
 impl SqliteValue {
+    pub fn column_type(&self) -> ColumnType {
+        match self {
+            SqliteValue::Null => ColumnType::Null,
+            SqliteValue::Integer(_) => ColumnType::Integer,
+            SqliteValue::Real(_) => ColumnType::Float,
+            SqliteValue::Text(_) => ColumnType::Text,
+            SqliteValue::Blob(_) => ColumnType::Blob,
+        }
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         if let Self::Text(ref s) = self {
             Some(s)
