@@ -3,6 +3,7 @@ use std::io::BufWriter;
 use std::io::Seek;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use compact_str::CompactString;
@@ -21,6 +22,7 @@ use rhai::{EvalAltResult, Map};
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
 use tokio::sync::{mpsc, RwLock as TokioRwLock};
+use tokio::time::sleep;
 use tokio_util::codec::{Decoder, LinesCodec};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -409,6 +411,24 @@ impl TemplateWriter {
             match row_recv {
                 Some(Ok(row)) => {
                     trace!("got an updated row! {:?}", row.cells);
+
+                    const DEBOUNCE_DEADLINE: Duration = Duration::from_millis(100);
+
+                    let deadline = sleep(DEBOUNCE_DEADLINE);
+                    tokio::pin!(deadline);
+                    loop {
+                        tokio::select! {
+                            None = rows.recv() => {
+                                debug!("end of iterator");
+                                break;
+                            },
+                            _ = &mut deadline => {
+                                debug!("deadline reached");
+                                break;
+                            }
+                        }
+                    }
+
                     if let Err(_e) = tx.send(TemplateCommand::Render).await {
                         debug!("could not send back re-render command, channel must be closed!");
                     }

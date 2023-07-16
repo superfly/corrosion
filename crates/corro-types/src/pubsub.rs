@@ -907,6 +907,7 @@ fn extract_expr_columns(
                 });
             }
         }
+
         Expr::Id(colname) => {
             let check_col_name = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
 
