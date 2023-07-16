@@ -14,10 +14,11 @@ use corro_types::{
     api::{QueryEvent, RqliteResponse, RqliteResult, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{row_to_change, SqliteValue},
-    pubsub::{ChangeType, Matcher, MatcherCmd},
+    pubsub::{normalize_sql, ChangeType, Matcher, MatcherCmd},
     schema::{make_schema_inner, parse_sql},
     sqlite::SqlitePoolError,
 };
+use fallible_iterator::FallibleIterator;
 use futures::future::poll_fn;
 use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, Connection, ToSql, Transaction};
@@ -801,7 +802,10 @@ async fn expand_sql(
 ) -> Result<String, (StatusCode, CompactString)> {
     match agent.pool().read().await {
         Ok(conn) => match expanded_statement(&conn, stmt) {
-            Ok(Some(stmt)) => Ok(stmt),
+            Ok(Some(stmt)) => match normalize_sql(&stmt) {
+                Ok(stmt) => Ok(stmt),
+                Err(e) => Err((StatusCode::BAD_REQUEST, e.to_compact_string())),
+            },
             Ok(None) => Err((
                 StatusCode::BAD_REQUEST,
                 "could not expand statement's sql w/ params".into(),
