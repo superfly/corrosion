@@ -518,6 +518,8 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
 
+        println!("schema done");
+
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
             axum::Json(vec![
@@ -532,6 +534,8 @@ mod tests {
             ]),
         )
         .await;
+
+        println!("tx 1 done");
 
         // println!("{body:?}");
 
@@ -549,12 +553,6 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
 
-        let mut body = res.into_body();
-
-        let mut lines = LinesCodec::new();
-
-        let mut buf = BytesMut::new();
-
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
             axum::Json(vec![Statement::WithParams(
@@ -566,30 +564,46 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
-        let s = lines.decode(&mut buf).unwrap().unwrap();
+        let mut rows = RowsIter {
+            body: res.into_body(),
+            codec: LinesCodec::new(),
+            buf: BytesMut::new(),
+            done: false,
+        };
 
-        assert_eq!(s, "{\"event\":\"columns\",\"data\":[\"id\",\"text\"]}");
+        assert_eq!(
+            rows.recv().await.unwrap().unwrap(),
+            QueryEvent::Columns(vec!["id".into(), "text".into()])
+        );
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
-        let s = lines.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            rows.recv().await.unwrap().unwrap(),
+            QueryEvent::Row {
+                rowid: 1,
+                change_type: ChangeType::Upsert,
+                cells: vec!["service-id".into(), "service-name".into()]
+            }
+        );
 
-        assert_eq!(s, "{\"event\":\"row\",\"data\":{\"rowid\":1,\"change_type\":\"upsert\",\"cells\":[\"service-id\",\"service-name\"]}}");
+        assert_eq!(
+            rows.recv().await.unwrap().unwrap(),
+            QueryEvent::Row {
+                rowid: 2,
+                change_type: ChangeType::Upsert,
+                cells: vec!["service-id-2".into(), "service-name-2".into()]
+            }
+        );
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
-        let s = lines.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(rows.recv().await.unwrap().unwrap(), QueryEvent::EndOfQuery,);
 
-        assert_eq!(s, "{\"event\":\"row\",\"data\":{\"rowid\":2,\"change_type\":\"upsert\",\"cells\":[\"service-id-2\",\"service-name-2\"]}}");
-
-        buf.extend_from_slice(&body.data().await.unwrap()?);
-        let s = lines.decode(&mut buf).unwrap().unwrap();
-
-        assert_eq!(s, "{\"event\":\"end_of_query\"}");
-
-        buf.extend_from_slice(&body.data().await.unwrap()?);
-        let s = lines.decode(&mut buf).unwrap().unwrap();
-
-        assert_eq!(s, "{\"event\":\"row\",\"data\":{\"rowid\":3,\"change_type\":\"upsert\",\"cells\":[\"service-id-3\",\"service-name-3\"]}}");
+        assert_eq!(
+            rows.recv().await.unwrap().unwrap(),
+            QueryEvent::Row {
+                rowid: 3,
+                change_type: ChangeType::Upsert,
+                cells: vec!["service-id-3".into(), "service-name-3".into()]
+            }
+        );
 
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
@@ -602,11 +616,65 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
-        let s = lines.decode(&mut buf).unwrap().unwrap();
-
-        assert_eq!(s, "{\"event\":\"row\",\"data\":{\"rowid\":4,\"change_type\":\"upsert\",\"cells\":[\"service-id-4\",\"service-name-4\"]}}");
+        assert_eq!(
+            rows.recv().await.unwrap().unwrap(),
+            QueryEvent::Row {
+                rowid: 4,
+                change_type: ChangeType::Upsert,
+                cells: vec!["service-id-4".into(), "service-name-4".into()]
+            }
+        );
 
         Ok(())
+    }
+
+    struct RowsIter {
+        body: axum::body::BoxBody,
+        codec: LinesCodec,
+        buf: BytesMut,
+        done: bool,
+    }
+
+    impl RowsIter {
+        async fn recv(&mut self) -> Option<eyre::Result<QueryEvent>> {
+            if self.done {
+                return None;
+            }
+            loop {
+                loop {
+                    match self.codec.decode(&mut self.buf) {
+                        Ok(Some(line)) => match serde_json::from_str(&line) {
+                            Ok(res) => return Some(Ok(res)),
+                            Err(e) => {
+                                self.done = true;
+                                return Some(Err(e.into()));
+                            }
+                        },
+                        Ok(None) => {
+                            break;
+                        }
+                        Err(e) => {
+                            self.done = true;
+                            return Some(Err(e.into()));
+                        }
+                    }
+                }
+                let bytes_res = self.body.data().await;
+                match bytes_res {
+                    Some(Ok(b)) => {
+                        // debug!("read {} bytes", b.len());
+                        self.buf.extend_from_slice(&b)
+                    }
+                    Some(Err(e)) => {
+                        self.done = true;
+                        return Some(Err(e.into()));
+                    }
+                    None => {
+                        self.done = true;
+                        return None;
+                    }
+                }
+            }
+        }
     }
 }

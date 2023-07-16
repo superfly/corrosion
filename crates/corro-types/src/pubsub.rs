@@ -912,6 +912,10 @@ fn extract_expr_columns(
             }
         }
         Expr::Id(colname) => {
+            if colname.0.starts_with('"') {
+                return Ok(());
+            }
+
             let mut found = None;
             for tbl in parsed.table_columns.keys() {
                 if let Some(tbl) = schema.tables.get(tbl) {
@@ -1169,6 +1173,68 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_matcher() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        let schema_sql = "CREATE TABLE sw (pk TEXT primary key, sandwich TEXT);";
+        let schema = parse_sql(schema_sql).unwrap();
+
+        let sql = "SELECT sandwich FROM sw WHERE pk=\"mad\"";
+
+        let cancel = CancellationToken::new();
+        let id = Uuid::new_v4();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("test.db");
+
+        let mut conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
+
+        init_cr_conn(&mut conn).unwrap();
+
+        setup_conn(
+            &mut conn,
+            &[(
+                tmpdir
+                    .path()
+                    .join("watches.db")
+                    .display()
+                    .to_string()
+                    .into(),
+                "watches".into(),
+            )]
+            .into(),
+        )
+        .unwrap();
+
+        {
+            let tx = conn.transaction().unwrap();
+            make_schema_inner(&tx, &NormalizedSchema::default(), &schema).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut matcher_conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
+
+        setup_conn(
+            &mut matcher_conn,
+            &[(
+                tmpdir
+                    .path()
+                    .join("watches.db")
+                    .display()
+                    .to_string()
+                    .into(),
+                "watches".into(),
+            )]
+            .into(),
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let (change_tx, mut change_rx) = broadcast::channel(1);
+        let matcher = Matcher::new(id, &schema, matcher_conn, tx, change_tx, sql, cancel).unwrap();
+
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_diff() {
