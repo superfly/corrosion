@@ -1177,19 +1177,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_matcher() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         let schema_sql = "CREATE TABLE sw (pk TEXT primary key, sandwich TEXT);";
-        let schema = parse_sql(schema_sql).unwrap();
+        let schema = parse_sql(schema_sql)?;
 
         let sql = "SELECT sandwich FROM sw WHERE pk=\"mad\"";
 
         let cancel = CancellationToken::new();
         let id = Uuid::new_v4();
 
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir()?;
         let db_path = tmpdir.path().join("test.db");
 
         let mut conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
 
-        init_cr_conn(&mut conn).unwrap();
+        init_cr_conn(&mut conn)?;
 
         setup_conn(
             &mut conn,
@@ -1203,13 +1203,12 @@ mod tests {
                 "watches".into(),
             )]
             .into(),
-        )
-        .unwrap();
+        )?;
 
         {
-            let tx = conn.transaction().unwrap();
-            make_schema_inner(&tx, &NormalizedSchema::default(), &schema).unwrap();
-            tx.commit().unwrap();
+            let tx = conn.transaction()?;
+            make_schema_inner(&tx, &NormalizedSchema::default(), &schema)?;
+            tx.commit()?;
         }
 
         let mut matcher_conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
@@ -1226,12 +1225,11 @@ mod tests {
                 "watches".into(),
             )]
             .into(),
-        )
-        .unwrap();
+        )?;
 
-        let (tx, mut rx) = mpsc::channel(1);
-        let (change_tx, mut change_rx) = broadcast::channel(1);
-        let matcher = Matcher::new(id, &schema, matcher_conn, tx, change_tx, sql, cancel).unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (change_tx, _change_rx) = broadcast::channel(1);
+        let _matcher = Matcher::new(id, &schema, matcher_conn, tx, change_tx, sql, cancel)?;
 
         Ok(())
     }
