@@ -1,23 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
-    net::SocketAddr,
-    ops::Deref,
-    str::FromStr,
     sync::Arc,
 };
 
+use bytes::Buf;
 use compact_str::{CompactString, ToCompactString};
 use fallible_iterator::FallibleIterator;
 use indexmap::IndexMap;
 use itertools::Itertools;
-use parking_lot::RwLock;
 use rusqlite::{params_from_iter, Connection};
-use serde::{
-    de::{self, Visitor},
-    Deserialize, Serialize,
-};
-use speedy::{Context, Readable, Writable};
+use serde::{Deserialize, Serialize};
 use sqlite3_parser::{
     ast::{
         As, Cmd, Expr, JoinConstraint, Name, OneSelect, Operator, QualifiedName, ResultColumn,
@@ -26,239 +18,18 @@ use sqlite3_parser::{
     lexer::sql::Parser,
 };
 use tokio::{
-    sync::{
-        broadcast,
-        mpsc::{self, UnboundedSender},
-    },
+    sync::{broadcast, mpsc},
     task::block_in_place,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use uhlc::Timestamp;
 use uuid::Uuid;
 
 use crate::{
     api::QueryEvent,
-    change::{Change, SqliteValue},
-    filters::{
-        parse_expr, unpack_columns, AggregateChange, OwnedAggregateChange, SupportedExpr,
-        UnpackError,
-    },
+    change::{Change, SqliteValue, SqliteValueRef},
     schema::{NormalizedSchema, NormalizedTable},
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub enum SubscriberId {
-    Local { addr: SocketAddr },
-    Global,
-}
-
-impl fmt::Display for SubscriberId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SubscriberId::Local { addr } => addr.fmt(f),
-            SubscriberId::Global => f.write_str("global"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SubscriptionId(pub CompactString);
-
-impl SubscriptionId {
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
-impl fmt::Display for SubscriptionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl<'a, C: Context> Readable<'a, C> for SubscriptionId {
-    fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, <C as Context>::Error> {
-        let s = <&str as Readable<'a, C>>::read_from(reader)?;
-        Ok(Self(s.into()))
-    }
-}
-
-impl<'a, C: Context> Writable<C> for SubscriptionId {
-    fn write_to<T: ?Sized + speedy::Writer<C>>(
-        &self,
-        writer: &mut T,
-    ) -> Result<(), <C as Context>::Error> {
-        self.0.as_bytes().write_to(writer)
-    }
-}
-
-#[derive(Debug)]
-pub enum Subscriber {
-    Local {
-        subscriptions: HashMap<SubscriptionId, SubscriptionInfo>,
-        sender: UnboundedSender<SubscriptionMessage>,
-    },
-    Global {
-        subscriptions: HashMap<SubscriptionId, SubscriptionInfo>,
-    },
-}
-
-impl Subscriber {
-    pub fn insert(&mut self, id: SubscriptionId, info: SubscriptionInfo) {
-        match self {
-            Subscriber::Local { subscriptions, .. } => subscriptions,
-            Subscriber::Global { subscriptions } => subscriptions,
-        }
-        .insert(id, info);
-    }
-
-    pub fn remove(&mut self, id: &SubscriptionId) -> Option<SubscriptionInfo> {
-        match self {
-            Subscriber::Local { subscriptions, .. } => subscriptions,
-            Subscriber::Global { subscriptions } => subscriptions,
-        }
-        .remove(id)
-    }
-
-    pub fn as_local(
-        &self,
-    ) -> Option<(
-        &HashMap<SubscriptionId, SubscriptionInfo>,
-        &UnboundedSender<SubscriptionMessage>,
-    )> {
-        match self {
-            Subscriber::Local {
-                subscriptions,
-                sender,
-            } => Some((subscriptions, sender)),
-            Subscriber::Global { .. } => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct SubscriptionInfo {
-    pub filter: Option<SubscriptionFilter>,
-    pub updated_at: Timestamp,
-}
-
-pub type Subscriptions = Arc<RwLock<Subscriber>>;
-pub type Subscribers = Arc<RwLock<HashMap<SubscriberId, Subscriptions>>>;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum SubscriptionMessage {
-    Event {
-        id: SubscriptionId,
-        event: SubscriptionEvent,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(untagged)]
-pub enum SubscriptionEvent {
-    Change(OwnedAggregateChange),
-    Error { error: String },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Subscription {
-    Add {
-        id: SubscriptionId,
-        where_clause: Option<String>,
-        #[serde(default)]
-        from_db_version: Option<i64>,
-    },
-    Remove {
-        id: SubscriptionId,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct SubscriptionFilter(Arc<String>, Arc<SupportedExpr>);
-
-impl Deref for SubscriptionFilter {
-    type Target = SupportedExpr;
-
-    fn deref(&self) -> &Self::Target {
-        &self.1
-    }
-}
-
-impl SubscriptionFilter {
-    pub fn new(input: String, expr: SupportedExpr) -> Self {
-        Self(Arc::new(input), Arc::new(expr))
-    }
-
-    pub fn input(&self) -> &str {
-        &self.0
-    }
-    pub fn expr(&self) -> &SupportedExpr {
-        &self.1
-    }
-}
-
-impl PartialEq for SubscriptionFilter {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for SubscriptionFilter {}
-
-impl Serialize for SubscriptionFilter {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for SubscriptionFilter {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_string(SubscriptionFilterVisitor)
-    }
-}
-
-struct SubscriptionFilterVisitor;
-
-impl<'de> Visitor<'de> for SubscriptionFilterVisitor {
-    type Value = SubscriptionFilter;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        write!(formatter, "a string")
-    }
-
-    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.visit_string(s.to_owned())
-    }
-
-    fn visit_string<E>(self, s: String) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        s.parse().map_err(de::Error::custom)
-    }
-}
-
-impl FromStr for SubscriptionFilter {
-    type Err = crate::filters::ParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let expr = parse_expr(s)?;
-        Ok(SubscriptionFilter::new(s.to_owned(), expr))
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum NormalizeStatementError {
@@ -290,6 +61,95 @@ pub fn normalize_sql(sql: &str) -> Result<String, NormalizeStatementError> {
     }
 
     Ok(Cmd::Stmt(stmt).to_string())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UnpackError {
+    #[error("abort")]
+    Abort,
+    #[error("misuse")]
+    Misuse,
+}
+
+#[derive(PartialEq, Debug)]
+pub enum ColumnType {
+    Integer = 1,
+    Float = 2,
+    Text = 3,
+    Blob = 4,
+    Null = 5,
+}
+
+impl ColumnType {
+    fn from_u8(u: u8) -> Option<Self> {
+        Some(match u {
+            1 => Self::Integer,
+            2 => Self::Float,
+            3 => Self::Text,
+            4 => Self::Blob,
+            5 => Self::Null,
+            _ => return None,
+        })
+    }
+}
+
+pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError> {
+    let mut ret = vec![];
+    let num_columns = buf.get_u8();
+
+    for _i in 0..num_columns {
+        if !buf.has_remaining() {
+            return Err(UnpackError::Abort);
+        }
+        let column_type_and_maybe_intlen = buf.get_u8();
+        let column_type = ColumnType::from_u8(column_type_and_maybe_intlen & 0x07);
+        let intlen = (column_type_and_maybe_intlen >> 3 & 0xFF) as usize;
+
+        match column_type {
+            Some(ColumnType::Blob) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                let len = buf.get_int(intlen) as usize;
+                if buf.remaining() < len {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef::Blob(&buf[0..len]));
+                buf.advance(len);
+            }
+            Some(ColumnType::Float) => {
+                if buf.remaining() < 8 {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef::Real(buf.get_f64()));
+            }
+            Some(ColumnType::Integer) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef::Integer(buf.get_int(intlen)));
+            }
+            Some(ColumnType::Null) => {
+                ret.push(SqliteValueRef::Null);
+            }
+            Some(ColumnType::Text) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                let len = buf.get_int(intlen) as usize;
+                if buf.remaining() < len {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef::Text(unsafe {
+                    std::str::from_utf8_unchecked(&buf[0..len])
+                }));
+                buf.advance(len);
+            }
+            None => return Err(UnpackError::Misuse),
+        }
+    }
+
+    Ok(ret)
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq)]

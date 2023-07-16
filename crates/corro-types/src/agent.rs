@@ -32,7 +32,7 @@ use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, Timestamp},
     config::Config,
-    pubsub::{Matcher, Subscribers},
+    pubsub::Matcher,
     schema::NormalizedSchema,
     sqlite::{CrConnManager, RusqliteConnManager, SqlitePool, SqlitePoolError},
 };
@@ -53,7 +53,6 @@ pub struct AgentConfig {
     pub members: RwLock<Members>,
     pub clock: Arc<uhlc::HLC>,
     pub bookie: Bookie,
-    pub subscribers: Subscribers,
     pub tx_bcast: Sender<BroadcastInput>,
     pub tx_apply: Sender<(ActorId, i64)>,
 
@@ -70,7 +69,6 @@ pub struct AgentInner {
     members: RwLock<Members>,
     clock: Arc<uhlc::HLC>,
     bookie: Bookie,
-    subscribers: Subscribers,
     matchers: RwLock<Matchers>,
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
@@ -88,7 +86,6 @@ impl Agent {
             members: config.members,
             clock: config.clock,
             bookie: config.bookie,
-            subscribers: config.subscribers,
             matchers: RwLock::new(HashMap::new()),
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
@@ -114,9 +111,6 @@ impl Agent {
     }
     pub fn api_addr(&self) -> SocketAddr {
         self.0.api_addr
-    }
-    pub fn subscribers(&self) -> &Subscribers {
-        &self.0.subscribers
     }
 
     pub fn tx_bcast(&self) -> &Sender<BroadcastInput> {

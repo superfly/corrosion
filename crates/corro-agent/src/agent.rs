@@ -10,12 +10,9 @@ use std::{
 
 use crate::{
     api::{
-        http::{
-            api_v1_db_schema, api_v1_queries, api_v1_transactions, api_v1_watch_by_id,
-            api_v1_watches, MatcherCache,
-        },
+        http::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
         peer::{bidirectional_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncError},
-        pubsub::api_v1_subscribe_ws,
+        pubsub::{api_v1_watch_by_id, api_v1_watches, MatcherCache},
     },
     broadcast::{runtime_loop, ClientPool, FRAGMENTS_AT},
 };
@@ -32,9 +29,7 @@ use corro_types::{
     },
     change::Change,
     config::{Config, DEFAULT_GOSSIP_PORT},
-    filters::{match_expr, AggregateChange},
     members::{MemberEvent, Members},
-    pubsub::{SubscriptionEvent, SubscriptionMessage},
     schema::init_schema,
     sqlite::{init_cr_conn, CrConn, Migration, SqlitePoolError},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
@@ -263,7 +258,6 @@ pub async fn setup(
         api_addr,
         members: RwLock::new(Members::default()),
         clock: clock.clone(),
-        subscribers: Default::default(),
         bookie,
         tx_bcast,
         tx_apply,
@@ -680,7 +674,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     .layer(ConcurrencyLimitLayer::new(4)),
             ),
         )
-        .route("/v1/subscribe", get(api_v1_subscribe_ws))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
@@ -1517,8 +1510,8 @@ pub async fn process_single_version(
         (db_version, changeset)
     };
 
-    if let Some(db_version) = db_version {
-        process_subs(agent, changeset.changes(), db_version);
+    if db_version.is_some() {
+        process_subs(agent, changeset.changes());
     }
     debug!("processed subscriptions, if any!");
 
@@ -1541,38 +1534,9 @@ async fn process_msg(agent: &Agent, msg: Message) -> Result<Option<Message>, Cha
     })
 }
 
-pub fn process_subs(agent: &Agent, changeset: &[Change], db_version: i64) {
+pub fn process_subs(agent: &Agent, changeset: &[Change]) {
     trace!("process subs...");
-    // let schema = agent.schema().read();
-    // let aggs = AggregateChange::from_changes(changeset.iter(), &schema, db_version);
-    // trace!("agg changes: {aggs:?}");
-    // for agg in aggs.iter() {
-    //     {
-    //         let subscribers = agent.subscribers().read();
-    //         trace!("subs: {subscribers:?}");
-    //         for (sub, subscriptions) in subscribers.iter() {
-    //             trace!("looking at sub {sub}");
-    //             let subs = subscriptions.read();
-    //             if let Some((subs, sender)) = subs.as_local() {
-    //                 for (id, info) in subs.iter() {
-    //                     if let Some(filter) = info.filter.as_ref() {
-    //                         if match_expr(filter, &agg) {
-    //                             trace!("matched subscriber: {id} w/ info: {info:?}!");
-    //                             if let Err(e) = sender.send(SubscriptionMessage::Event {
-    //                                 id: id.clone(),
-    //                                 event: SubscriptionEvent::Change(agg.to_owned()),
-    //                             }) {
-    //                                 error!("could not send sub message: {e}")
-    //                             }
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
 
-    // block_in_place(|| {
     let mut matchers_to_delete = vec![];
 
     {
@@ -1587,7 +1551,6 @@ pub fn process_subs(agent: &Agent, changeset: &[Change], db_version: i64) {
     for id in matchers_to_delete {
         agent.matchers().write().remove(&id);
     }
-    // });
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1917,7 +1880,7 @@ pub mod tests {
         time::{Duration, Instant},
     };
 
-    use futures::{stream::FuturesUnordered, SinkExt, StreamExt, TryStreamExt};
+    use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
     use rand::{
         distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::IteratorRandom,
         SeedableRng,
@@ -1926,20 +1889,12 @@ pub mod tests {
     use serde_json::json;
     use spawn::wait_for_all_pending_handles;
     use tokio::time::{sleep, MissedTickBehavior};
-    use tokio_tungstenite::tungstenite::Message;
     use tracing::{info, info_span};
     use tripwire::Tripwire;
 
-    use crate::api::http::make_broadcastable_changes;
-
     use super::*;
 
-    use corro_types::{
-        api::{RqliteResponse, RqliteResult, Statement},
-        change::SqliteValue,
-        filters::{ChangeEvent, OwnedAggregateChange},
-        pubsub::{Subscription, SubscriptionId},
-    };
+    use corro_types::api::{RqliteResponse, RqliteResult, Statement};
 
     use corro_tests::*;
 
@@ -2349,98 +2304,6 @@ pub mod tests {
             }
         }
         println!("fully disseminated in {}s", start.elapsed().as_secs_f32());
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn basic_pubsub() -> eyre::Result<()> {
-        _ = tracing_subscriber::fmt::try_init();
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-        let ta = launch_test_agent(
-            |conf| conf.api_addr("127.0.0.1:0".parse().unwrap()).build(),
-            tripwire.clone(),
-        )
-        .await?;
-
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{}/v1/subscribe", ta.agent.api_addr()))
-                .await?;
-
-        let id = SubscriptionId("blah".into());
-
-        ws.send(Message::binary(
-            serde_json::to_vec(&Subscription::Add {
-                id: id.clone(),
-                where_clause: Some("tbl_name = 'testsblob'".into()),
-                from_db_version: None,
-            })
-            .unwrap(),
-        ))
-        .await?;
-
-        println!("sent message!");
-
-        make_broadcastable_changes(&ta.agent, |tx| {
-            tx.execute(
-                "INSERT INTO testsblob (id,text) VALUES (?,?)",
-                params![&[1u8, 2u8, 3u8], "hello"],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-        let msg = ws.next().await.unwrap().unwrap();
-
-        let parsed: SubscriptionMessage = serde_json::from_slice(&msg.into_data()).unwrap();
-
-        println!("{parsed:#?}");
-
-        assert_eq!(
-            parsed,
-            SubscriptionMessage::Event {
-                id,
-                event: SubscriptionEvent::Change(OwnedAggregateChange {
-                    actor_id: ta.agent.actor_id(),
-                    version: 1,
-                    evt_type: ChangeEvent::Insert,
-                    table: "testsblob".into(),
-                    pk: vec![(String::from("id"), SqliteValue::Blob(vec![1, 2, 3].into()))]
-                        .into_iter()
-                        .collect(),
-                    data: vec![(String::from("text"), SqliteValue::Text("hello".into()))]
-                        .into_iter()
-                        .collect(),
-                })
-            }
-        );
-
-        let conn = ta.agent.pool().read().await?;
-
-        let changes = conn
-                    .prepare_cached(
-                        r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes ORDER BY db_version, seq ASC"#,
-                    )?
-                    .query_map([], |row| {
-                        Ok(Change {
-                            table: row.get(0)?,
-                            pk: row.get(1)?,
-                            cid: row.get(2)?,
-                            val: row.get(3)?,
-                            col_version: row.get(4)?,
-                            db_version: row.get(5)?,
-                            seq: row.get(6)?,
-                            site_id: row.get(7)?,
-                        })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        println!("changes: {changes:#?}");
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;

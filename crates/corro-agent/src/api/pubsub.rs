@@ -1,416 +1,612 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
-use axum::{
-    extract::{
-        ws::{self, WebSocket},
-        ConnectInfo, WebSocketUpgrade,
-    },
-    http::StatusCode,
-    response::IntoResponse,
-    Extension, Json,
-};
+use axum::{http::StatusCode, response::IntoResponse, Extension};
+use bytes::{BufMut, BytesMut};
+use compact_str::{format_compact, CompactString, ToCompactString};
 use corro_types::{
     agent::Agent,
-    change::Change,
-    filters::{match_expr, parse_expr, AggregateChange},
-    pubsub::{
-        Subscriber, SubscriberId, Subscription, SubscriptionEvent, SubscriptionFilter,
-        SubscriptionId, SubscriptionInfo, SubscriptionMessage,
-    },
+    api::{QueryEvent, Statement},
+    change::SqliteValue,
+    pubsub::{normalize_sql, ChangeType, Matcher, MatcherCmd},
 };
-use metrics::increment_counter;
-use parking_lot::RwLock;
-use rusqlite::params;
-use serde_json::json;
+use futures::future::poll_fn;
+use rusqlite::Connection;
 use tokio::{
-    sync::mpsc::{unbounded_channel, UnboundedSender},
+    sync::{broadcast, mpsc, RwLock as TokioRwLock},
     task::block_in_place,
+    time::interval,
 };
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tracing::{debug, error, info, trace, warn};
-use tripwire::Tripwire;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
-#[derive(Debug, thiserror::Error)]
-pub enum SubscribeError {
-    #[error(transparent)]
-    Serde(#[from] serde_json::Error),
-    #[error(transparent)]
-    Broadcast(#[from] BroadcastStreamRecvError),
+pub async fn api_v1_watch_by_id(
+    Extension(agent): Extension<Agent>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> impl IntoResponse {
+    watch_by_id(agent, id).await
 }
 
-#[allow(clippy::too_many_arguments)]
-fn add_subscriber(
-    agent: &Agent,
-    conn_id: SubscriberId,
-    sub: Subscriber,
-    id: SubscriptionId,
-    filter: Option<SubscriptionFilter>,
-) {
-    trace!("add subscription");
-    let conn_subs = {
-        let map = agent.subscribers().read();
-        if let Some(subs) = map.get(&conn_id) {
-            subs.clone()
-        } else {
-            drop(map);
-            let mut map = agent.subscribers().write();
-            map.entry(conn_id)
-                .or_insert_with(|| Arc::new(RwLock::new(sub)))
-                .clone()
+async fn watch_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
+    let matcher = match { agent.matchers().read().get(&id).cloned() } {
+        Some(matcher) => matcher,
+        None => {
+            return hyper::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(
+                    serde_json::to_vec(&QueryEvent::Error(format_compact!(
+                        "could not find watcher with id {id}"
+                    )))
+                    .expect("could not serialize queries stream error")
+                    .into(),
+                )
+                .expect("could not build error response")
         }
     };
-    increment_counter!("corro.subscriptions.update.count", "id" => id.to_string());
-    let updated_at = agent.clock().new_timestamp();
 
-    {
-        let mut sub = conn_subs.write();
-        sub.insert(id.clone(), SubscriptionInfo { filter, updated_at });
-    }
-}
+    let (tx, body) = hyper::Body::channel();
 
-#[allow(clippy::too_many_arguments)]
-pub async fn api_v1_subscribe_post(
-    Extension(agent): Extension<Agent>,
-    Json(sub): Json<Subscription>,
-) -> impl IntoResponse {
-    match sub {
-        Subscription::Add {
-            id,
-            where_clause: filter,
-            ..
-        } => {
-            let filter = match filter {
-                None => {
-                    return (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        Json(json!({"error": "filter is required for global subscription"})),
-                    )
-                }
-                Some(f) => {
-                    match parse_expr(f.as_str()).map(|expr| SubscriptionFilter::new(f, expr)) {
-                        Ok(filter) => filter,
-                        Err(e) => {
-                            return (
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                Json(json!({"error": e.to_string()})),
-                            )
-                        }
-                    }
-                }
-            };
-            add_subscriber(
-                &agent,
-                SubscriberId::Global,
-                Subscriber::Global {
-                    subscriptions: HashMap::new(),
-                },
-                id,
-                Some(filter),
-            );
-            (StatusCode::OK, Json(json!({"ok": true})))
+    // TODO: timeout on data send instead of infinitely waiting for channel space.
+    let (init_tx, init_rx) = mpsc::channel(512);
+    let change_rx = matcher.subscribe();
+    let cancel = matcher.cancel();
+
+    tokio::spawn(process_watch_channel(
+        agent.clone(),
+        id,
+        tx,
+        init_rx,
+        change_rx,
+        matcher.cmd_tx().clone(),
+        cancel,
+    ));
+
+    let pool = agent.pool().dedicated_pool().clone();
+    tokio::spawn(async move {
+        if let Err(_e) = init_tx
+            .send(QueryEvent::Columns(matcher.0.col_names.clone()))
+            .await
+        {
+            warn!("could not send back column names, client is probably gone. returning.");
+            return;
         }
-        Subscription::Remove { id } => {
-            agent
-                .subscribers()
-                .read()
-                .get(&SubscriberId::Global)
-                .map(|subs| subs.write().remove(&id));
-            (StatusCode::OK, Json(json!({"ok": true})))
-        }
-    }
-}
 
-#[allow(clippy::too_many_arguments)]
-pub async fn api_v1_subscribe_ws(
-    ws: WebSocketUpgrade,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Extension(agent): Extension<Agent>,
-    Extension(tripwire): Extension<Tripwire>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, addr, agent, tripwire))
-}
-
-/// Actual websocket statemachine (one will be spawned per connection)
-async fn handle_socket(
-    mut socket: WebSocket,
-    addr: SocketAddr,
-    agent: Agent,
-    mut tripwire: Tripwire,
-) {
-    trace!("subscribe post!");
-
-    let sub_id = SubscriberId::Local { addr };
-
-    let (tx, mut rx) = unbounded_channel();
-
-    enum Event {
-        Recv(Option<Result<ws::Message, axum::Error>>),
-        Send(Option<SubscriptionMessage>),
-        Tripwire,
-    }
-
-    loop {
-        let evt = tokio::select! {
-            biased;
-            send = rx.recv() => Event::Send(send),
-            recv = socket.recv() => Event::Recv(recv),
-            _ = &mut tripwire => Event::Tripwire,
+        let conn = match pool.get().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
+                return;
+            }
         };
 
-        match evt {
-            Event::Recv(recv) => match recv {
-                None => {
-                    info!("{sub_id} disconnected");
-                    break;
-                }
-                Some(Err(e)) => {
-                    error!("got a ws error: {e}");
-                }
-                Some(Ok(message)) => {
-                    let sub: Subscription = match message {
-                        ws::Message::Text(s) => match serde_json::from_str(s.as_str()) {
-                            Ok(sub) => sub,
-                            Err(e) => {
-                                warn!("could not parse sub message from client: {e}");
-                                continue;
-                            }
-                        },
-                        ws::Message::Binary(v) => match serde_json::from_slice(v.as_slice()) {
-                            Ok(sub) => sub,
-                            Err(e) => {
-                                warn!("could not parse sub message from client: {e}");
-                                continue;
-                            }
-                        },
-                        ws::Message::Close(_) => {
-                            info!("client {sub_id} gracefully closing connection");
-                            break;
-                        }
-                        ws::Message::Ping(_) | ws::Message::Pong(_) => {
-                            trace!("ping or pong, nothing to do");
-                            continue;
-                        }
-                    };
-                    match sub {
-                        Subscription::Add {
-                            id,
-                            where_clause: filter,
-                            from_db_version,
-                        } => {
-                            let filter = match filter
-                                .map(|f| {
-                                    parse_expr(f.as_str())
-                                        .map(|expr| SubscriptionFilter::new(f, expr))
-                                })
-                                .transpose()
-                            {
-                                Ok(res) => res,
-                                Err(e) => {
-                                    error!("error parsing expr: {e}");
-                                    let msg = SubscriptionMessage::Event {
-                                        id: id.clone(),
-                                        event: SubscriptionEvent::Error {
-                                            error: e.to_string(),
-                                        },
-                                    };
-                                    match serde_json::to_vec(&msg) {
-                                        Ok(msg_bytes) => {
-                                            if let Err(e) =
-                                                socket.send(ws::Message::Binary(msg_bytes)).await
-                                            {
-                                                warn!("could not send op sub msg bytes: {e}");
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                "could not serialize op sub message: {e} ({msg:?})"
-                                            );
-                                            break;
-                                        }
-                                    }
-                                    continue;
-                                }
-                            };
-                            trace!("parsed subscription filter: {filter:?}");
+        #[derive(Debug, thiserror::Error)]
+        enum QueryTempError {
+            #[error(transparent)]
+            Sqlite(#[from] rusqlite::Error),
+            #[error(transparent)]
+            Send(#[from] mpsc::error::SendError<QueryEvent>),
+        }
 
-                            if let Some(from_db_version) = from_db_version {
-                                let tx = tx.clone();
-                                let agent = agent.clone();
-
-                                tokio::spawn(async move {
-                                    if let Err(e) = catch_up_subscriber(
-                                        CatchUp {
-                                            id,
-                                            filter,
-                                            from_db_version,
-                                            tx,
-                                        },
-                                        &agent,
-                                        sub_id,
-                                    )
-                                    .await
-                                    {
-                                        error!("could not catch up subscriber: {e}");
-                                    }
-                                });
-                            } else {
-                                add_subscriber(
-                                    &agent,
-                                    sub_id,
-                                    Subscriber::Local {
-                                        subscriptions: HashMap::new(),
-                                        sender: tx.clone(),
-                                    },
-                                    id,
-                                    filter,
-                                );
-                            }
-                        }
-                        Subscription::Remove { id } => {
-                            let map = agent.subscribers().read();
-                            if let Some(subs) = map.get(&sub_id) {
-                                let mut subs = subs.write();
-                                _ = subs.remove(&id);
-                            }
-                        }
-                    }
-                }
-            },
-            Event::Send(send) => match send {
-                Some(msg) => match serde_json::to_vec(&msg) {
-                    Ok(msg_bytes) => {
-                        if let Err(e) = socket.send(ws::Message::Binary(msg_bytes)).await {
-                            error!("could not send sub message: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        error!("could not serialize op sub message: {e} ({msg:?})");
-                    }
-                },
-                None => {
-                    break;
-                }
-            },
-            Event::Tripwire => {
-                if let Err(e) = socket
-                    .send(ws::Message::Close(Some(ws::CloseFrame {
-                        code: ws::close_code::AWAY,
-                        reason: "".into(),
-                    })))
-                    .await
-                {
-                    error!("could not send 'going away' close message: {e}");
-                }
-                break;
+        let res = block_in_place(|| {
+            let mut query_cols = vec![];
+            for i in 0..(matcher.0.parsed.columns.len()) {
+                query_cols.push(format!("col_{i}"));
             }
+            let mut prepped = conn.prepare_cached(&format!(
+                "SELECT __corro_rowid,{} FROM {}",
+                query_cols.join(","),
+                matcher.table_name()
+            ))?;
+            let col_count = prepped.column_count();
+
+            init_tx.blocking_send(QueryEvent::Columns(matcher.0.col_names.clone()))?;
+
+            let mut rows = prepped.query(())?;
+
+            loop {
+                let row = match rows.next()? {
+                    Some(row) => row,
+                    None => break,
+                };
+                let rowid = row.get(0)?;
+
+                let cells = (1..col_count)
+                    .map(|i| row.get::<_, SqliteValue>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                init_tx.blocking_send(QueryEvent::Row {
+                    rowid,
+                    change_type: ChangeType::Upsert,
+                    cells,
+                })?;
+            }
+
+            Ok::<_, QueryTempError>(())
+        });
+
+        if let Err(QueryTempError::Sqlite(e)) = res {
+            _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
+        }
+
+        _ = init_tx.send(QueryEvent::EndOfQuery).await;
+    });
+
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header("corro-query-id", id.to_string())
+        .body(body)
+        .expect("could not build query response body")
+}
+
+async fn process_watch_channel(
+    agent: Agent,
+    matcher_id: Uuid,
+    mut tx: hyper::body::Sender,
+    mut init_rx: mpsc::Receiver<QueryEvent>,
+    mut change_rx: broadcast::Receiver<QueryEvent>,
+    cmd_tx: mpsc::Sender<MatcherCmd>,
+    cancel: CancellationToken,
+) {
+    let mut buf = BytesMut::new();
+
+    let mut init_done = false;
+    let mut check_ready = interval(Duration::from_secs(1));
+    let mut cancelled = false;
+    loop {
+        // either we get data we need to transmit
+        // or we check every 1s if the client is still ready to receive data
+        let query_evt = tokio::select! {
+            _ = cancel.cancelled() => {
+                debug!("canceled!");
+                cancelled = true;
+                break;
+            },
+            maybe_query_evt = init_rx.recv(), if !init_done => match maybe_query_evt {
+                Some(query_evt) => query_evt,
+                None => {
+                    init_done = true;
+                    continue;
+                }
+            },
+            res = change_rx.recv(), if init_done => match res {
+                Ok(query_evt) => query_evt,
+                Err(e) => {
+                    warn!("could not receive change: {e}");
+                    break;
+                }
+            },
+            _ = check_ready.tick() => {
+                if let Err(_) = poll_fn(|cx| tx.poll_ready(cx)).await {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        {
+            let mut writer = (&mut buf).writer();
+
+            let mut query_evt = query_evt;
+
+            loop {
+                if matches!(query_evt, QueryEvent::EndOfQuery) {
+                    init_done = true;
+                }
+
+                let mut recv = if init_done {
+                    TryReceiver::Broadcast(&mut change_rx)
+                } else {
+                    TryReceiver::Mpsc(&mut init_rx)
+                };
+
+                if let Err(e) = serde_json::to_writer(&mut writer, &query_evt) {
+                    _ = tx
+                        .send_data(
+                            serde_json::to_vec(&serde_json::json!(QueryEvent::Error(
+                                e.to_compact_string()
+                            )))
+                            .expect("could not serialize error json")
+                            .into(),
+                        )
+                        .await;
+                    return;
+                }
+                // NOTE: I think that's infaillible...
+                writer
+                    .write(b"\n")
+                    .expect("could not write new line to BytesMut Writer");
+
+                // accumulate up to ~64KB
+                // TODO: predict if we can fit one more in 64KB or not based on previous writes
+                if writer.get_ref().len() >= 64 * 1024 {
+                    break;
+                }
+
+                match recv.try_recv() {
+                    Ok(new) => query_evt = new,
+                    Err(e) => match e {
+                        TryRecvError::Empty => break,
+                        TryRecvError::Closed => break,
+
+                        TryRecvError::Lagged(lagged) => {
+                            error!("change recv lagged by {lagged}, stopping watch processing");
+                            return;
+                        }
+                    },
+                }
+            }
+        }
+
+        if let Err(e) = tx.send_data(buf.split().freeze()).await {
+            error!("could not send data through body's channel: {e}");
+            return;
+        }
+    }
+    debug!("query body channel done");
+
+    drop(change_rx);
+
+    if cancelled {
+        // try to remove if it exists.
+        info!("matcher {matcher_id} was cancelled, removing");
+        agent.matchers().write().remove(&matcher_id);
+    } else {
+        _ = cmd_tx.send(MatcherCmd::Unsubscribe).await;
+        let mut matchers = agent.matchers().write();
+        let no_mo_receivers = matchers
+            .get(&matcher_id)
+            .map(|m| m.receiver_count() == 0)
+            .unwrap_or(false);
+        if no_mo_receivers {
+            info!("no more receivers for matcher {matcher_id}, removing");
+            matchers.remove(&matcher_id);
+        }
+    }
+}
+
+enum TryReceiver<'a, T> {
+    Mpsc(&'a mut mpsc::Receiver<T>),
+    Broadcast(&'a mut broadcast::Receiver<T>),
+}
+
+impl<'a, T> TryReceiver<'a, T>
+where
+    T: Clone,
+{
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        Ok(match self {
+            TryReceiver::Mpsc(r) => r.try_recv()?,
+            TryReceiver::Broadcast(b) => b.try_recv()?,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum TryRecvError {
+    #[error("empty")]
+    Empty,
+    #[error("closed")]
+    Closed,
+    #[error("lagged by {0}")]
+    Lagged(u64),
+}
+
+impl From<broadcast::error::TryRecvError> for TryRecvError {
+    fn from(value: broadcast::error::TryRecvError) -> Self {
+        match value {
+            broadcast::error::TryRecvError::Empty => TryRecvError::Empty,
+            broadcast::error::TryRecvError::Closed => TryRecvError::Closed,
+            broadcast::error::TryRecvError::Lagged(lagged) => TryRecvError::Lagged(lagged),
+        }
+    }
+}
+
+impl From<mpsc::error::TryRecvError> for TryRecvError {
+    fn from(value: mpsc::error::TryRecvError) -> Self {
+        match value {
+            mpsc::error::TryRecvError::Empty => TryRecvError::Empty,
+            mpsc::error::TryRecvError::Disconnected => TryRecvError::Closed,
+        }
+    }
+}
+
+fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<Option<String>> {
+    Ok(match stmt {
+        Statement::Simple(q) => conn.prepare(q)?.expanded_sql(),
+        Statement::WithParams(q, params) => {
+            let mut prepped = conn.prepare(q)?;
+            for (i, param) in params.iter().enumerate() {
+                prepped.raw_bind_parameter(i + 1, param)?;
+            }
+            prepped.expanded_sql()
+        }
+        Statement::WithNamedParams(q, params) => {
+            let mut prepped = conn.prepare(q)?;
+            for (k, v) in params.iter() {
+                let idx = match prepped.parameter_index(k)? {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                prepped.raw_bind_parameter(idx, v)?;
+            }
+            prepped.expanded_sql()
+        }
+    })
+}
+
+async fn expand_sql(
+    agent: &Agent,
+    stmt: &Statement,
+) -> Result<String, (StatusCode, CompactString)> {
+    match agent.pool().read().await {
+        Ok(conn) => match expanded_statement(&conn, stmt) {
+            Ok(Some(stmt)) => match normalize_sql(&stmt) {
+                Ok(stmt) => Ok(stmt),
+                Err(e) => Err((StatusCode::BAD_REQUEST, e.to_compact_string())),
+            },
+            Ok(None) => Err((
+                StatusCode::BAD_REQUEST,
+                "could not expand statement's sql w/ params".into(),
+            )),
+            Err(e) => Err((StatusCode::BAD_REQUEST, e.to_compact_string())),
+        },
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_compact_string())),
+    }
+}
+
+pub type MatcherCache = Arc<TokioRwLock<HashMap<String, Uuid>>>;
+
+pub async fn api_v1_watches(
+    Extension(agent): Extension<Agent>,
+    Extension(watch_cache): Extension<MatcherCache>,
+    axum::extract::Json(stmt): axum::extract::Json<Statement>,
+) -> impl IntoResponse {
+    let stmt = match expand_sql(&agent, &stmt).await {
+        Ok(stmt) => stmt,
+        Err((status, e)) => {
+            return hyper::Response::builder()
+                .status(status)
+                .body(
+                    serde_json::to_vec(&QueryEvent::Error(e))
+                        .expect("could not serialize queries stream error")
+                        .into(),
+                )
+                .expect("could not build error response");
+        }
+    };
+
+    let matcher_id = { watch_cache.read().await.get(&stmt).cloned() };
+
+    if let Some(matcher_id) = matcher_id {
+        let contains = { agent.matchers().read().contains_key(&matcher_id) };
+        if contains {
+            info!("reusing matcher id {matcher_id}");
+            return watch_by_id(agent, matcher_id).await;
+        } else {
+            watch_cache.write().await.remove(&stmt);
         }
     }
 
-    debug!("subscriber with sub id: {sub_id} is done");
+    let conn = match agent.pool().dedicated().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            return hyper::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(
+                    serde_json::to_vec(&QueryEvent::Error(e.to_compact_string()))
+                        .expect("could not serialize queries stream error")
+                        .into(),
+                )
+                .expect("could not build error response")
+        }
+    };
+
+    let (tx, body) = hyper::Body::channel();
+
+    // TODO: timeout on data send instead of infinitely waiting for channel space.
+    let (data_tx, data_rx) = mpsc::channel(512);
+    let (change_tx, change_rx) = broadcast::channel(10240);
+
+    let matcher_id = Uuid::new_v4();
+    let cancel = CancellationToken::new();
+
+    let matcher = match block_in_place(|| {
+        Matcher::new(
+            matcher_id,
+            &agent.schema().read(),
+            conn,
+            data_tx.clone(),
+            change_tx,
+            &stmt,
+            cancel.clone(),
+        )
+    }) {
+        Ok(m) => m,
+        Err(e) => {
+            return hyper::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(
+                    serde_json::to_vec(&QueryEvent::Error(e.to_compact_string()))
+                        .expect("could not serialize queries stream error")
+                        .into(),
+                )
+                .expect("could not build error response")
+        }
+    };
 
     {
-        let mut subscribers = agent.subscribers().write();
-        subscribers.remove(&sub_id);
+        agent.matchers().write().insert(matcher_id, matcher.clone());
+        watch_cache.write().await.insert(stmt, matcher_id);
     }
-}
 
-struct CatchUp {
-    id: SubscriptionId,
-    filter: Option<SubscriptionFilter>,
-    from_db_version: i64,
-    tx: UnboundedSender<SubscriptionMessage>,
-}
-
-async fn catch_up_subscriber(
-    catch_up: CatchUp,
-    agent: &Agent,
-    sub_id: SubscriberId,
-) -> eyre::Result<()> {
-    let CatchUp {
-        id,
-        filter,
-        from_db_version,
+    tokio::spawn(process_watch_channel(
+        agent.clone(),
+        matcher_id,
         tx,
-    } = catch_up;
+        data_rx,
+        change_rx,
+        matcher.cmd_tx().clone(),
+        cancel.clone(),
+    ));
 
-    let conn = agent.pool().read().await?;
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header("corro-query-id", matcher_id.to_string())
+        .body(body)
+        .expect("could not generate ok http response for query request")
+}
 
-    block_in_place(|| {
-        let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM crsql_changes WHERE db_version >= ? ORDER BY db_version, seq ASC"#)?;
+#[cfg(test)]
+mod tests {
+    use arc_swap::ArcSwap;
+    use corro_types::{actor::ActorId, agent::SplitPool, config::Config};
+    use http_body::Body;
+    use tokio_util::codec::{Decoder, LinesCodec};
+    use tripwire::Tripwire;
 
-        let mut rows = prepped.query(params![from_db_version])?;
+    use crate::{
+        agent::migrate,
+        api::http::{api_v1_db_schema, api_v1_transactions},
+    };
 
-        let mut changeset = vec![];
-        let mut last_db_version = from_db_version;
+    use super::*;
 
-        while let Some(row) = rows.next()? {
-            let change = Change {
-                table: row.get(0)?,
-                pk: row.get(1)?,
-                cid: row.get(2)?,
-                val: row.get(3)?,
-                col_version: row.get(4)?,
-                db_version: row.get(5)?,
-                seq: row.get(6)?,
-                site_id: row.get(7)?,
-            };
+    #[tokio::test]
+    async fn test_api_v1_watches() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
 
-            if change.db_version != last_db_version {
-                let schema = agent.schema().read();
-                if !changeset.is_empty() {
-                    let aggs = AggregateChange::from_changes(
-                        changeset.drain(..),
-                        &schema,
-                        last_db_version,
-                    );
-                    for agg in aggs {
-                        let matches = filter
-                            .as_ref()
-                            .map(|filter| match_expr(filter.expr(), &agg))
-                            .unwrap_or(true);
-                        if matches {
-                            _ = tx.send(SubscriptionMessage::Event {
-                                id: id.clone(),
-                                event: SubscriptionEvent::Change(agg.to_owned()),
-                            });
-                        }
-                    }
-                }
-            }
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
 
-            last_db_version = change.db_version;
+        let dir = tempfile::tempdir()?;
+
+        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
+
+        {
+            let mut conn = pool.write_priority().await?;
+            migrate(&mut conn)?;
         }
 
-        if !changeset.is_empty() {
-            let schema = agent.schema().read();
-            let aggs = AggregateChange::from_changes(changeset.drain(..), &schema, last_db_version);
-            for agg in aggs {
-                let matches = filter
-                    .as_ref()
-                    .map(|filter| match_expr(filter.expr(), &agg))
-                    .unwrap_or(true);
-                if matches {
-                    _ = tx.send(SubscriptionMessage::Event {
-                        id: id.clone(),
-                        event: SubscriptionEvent::Change(agg.to_owned()),
-                    });
-                }
-            }
-        }
+        let (tx_bcast, _rx_bcast) = mpsc::channel(1);
+        let (tx_apply, _rx_apply) = mpsc::channel(1);
 
-        Ok::<_, rusqlite::Error>(())
-    })?;
+        let agent = Agent::new(corro_types::agent::AgentConfig {
+            actor_id: ActorId(Uuid::new_v4()),
+            pool,
+            config: ArcSwap::from_pointee(
+                Config::builder()
+                    .db_path(dir.path().join("corrosion.db").display().to_string())
+                    .gossip_addr("127.0.0.1:1234".parse()?)
+                    .api_addr("127.0.0.1:8080".parse()?)
+                    .build()?,
+            ),
+            gossip_addr: "127.0.0.1:0".parse().unwrap(),
+            api_addr: "127.0.0.1:0".parse().unwrap(),
+            members: Default::default(),
+            clock: Default::default(),
+            bookie: Default::default(),
+            tx_bcast,
+            tx_apply,
+            schema: Default::default(),
+            tripwire,
+        });
 
-    add_subscriber(
-        agent,
-        sub_id,
-        Subscriber::Local {
-            subscriptions: HashMap::new(),
-            sender: tx,
-        },
-        id,
-        filter,
-    );
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+        )
+        .await;
 
-    Ok(())
+        assert_eq!(status_code, StatusCode::OK);
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::Json(vec![
+                Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id".into(), "service-name".into()],
+                ),
+                Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-2".into(), "service-name-2".into()],
+                ),
+            ]),
+        )
+        .await;
+
+        // println!("{body:?}");
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        assert!(body.0.results.len() == 2);
+
+        let res = api_v1_watches(
+            Extension(agent.clone()),
+            Extension(Default::default()),
+            axum::Json(Statement::Simple("select * from tests".into())),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut body = res.into_body();
+
+        let mut lines = LinesCodec::new();
+
+        let mut buf = BytesMut::new();
+
+        let (status_code, _) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::Json(vec![Statement::WithParams(
+                "insert into tests (id, text) values (?,?)".into(),
+                vec!["service-id-3".into(), "service-name-3".into()],
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "{\"event\":\"columns\",\"data\":[\"id\",\"text\"]}");
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "{\"event\":\"row\",\"data\":{\"rowid\":1,\"change_type\":\"upsert\",\"cells\":[\"service-id\",\"service-name\"]}}");
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "{\"event\":\"row\",\"data\":{\"rowid\":2,\"change_type\":\"upsert\",\"cells\":[\"service-id-2\",\"service-name-2\"]}}");
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "{\"event\":\"end_of_query\"}");
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "{\"event\":\"row\",\"data\":{\"rowid\":3,\"change_type\":\"upsert\",\"cells\":[\"service-id-3\",\"service-name-3\"]}}");
+
+        let (status_code, _) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::Json(vec![Statement::WithParams(
+                "insert into tests (id, text) values (?,?)".into(),
+                vec!["service-id-4".into(), "service-name-4".into()],
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        assert_eq!(s, "{\"event\":\"row\",\"data\":{\"rowid\":4,\"change_type\":\"upsert\",\"cells\":[\"service-id-4\",\"service-name-4\"]}}");
+
+        Ok(())
+    }
 }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, ToSmallVec};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 
-use crate::filters::ColumnType;
+use crate::pubsub::ColumnType;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
 pub struct Change {

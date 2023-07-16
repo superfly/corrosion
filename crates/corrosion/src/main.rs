@@ -8,7 +8,6 @@ use corro_client::CorrosionApiClient;
 use corro_types::{
     api::{QueryEvent, RqliteResult, Statement},
     config::{default_admin_path, Config},
-    pubsub::{SubscriptionEvent, SubscriptionMessage},
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
@@ -106,40 +105,6 @@ async fn main() -> eyre::Result<()> {
                         eprintln!("Error: {error}");
                     }
                     _ => {}
-                }
-            }
-        }
-        Command::Sub { where_clause } => {
-            let id = "testing-testing";
-            let mut conn = cli.api_client().subscribe(id, where_clause.clone()).await?;
-
-            while let Some(event) = conn.next().await {
-                match event {
-                    Ok(event) => match event {
-                        SubscriptionMessage::Event { id, event } => match event {
-                            SubscriptionEvent::Change(change) => {
-                                print!(
-                                    "({id}) [{} on '{}'] {{ ",
-                                    change.evt_type.as_str(),
-                                    change.table,
-                                );
-                                for (k, v) in change.pk {
-                                    print!("{k}: {v}");
-                                }
-                                print!(" }} => {{ ");
-                                for (k, v) in change.data {
-                                    print!("{k}: {v}");
-                                }
-                                println!(" }}");
-                            }
-                            SubscriptionEvent::Error { error } => {
-                                eprintln!("Error: {error}");
-                            }
-                        },
-                    },
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                    }
                 }
             }
         }
@@ -253,10 +218,6 @@ enum Command {
         query: String,
         #[arg(long, default_value = "false")]
         timer: bool,
-    },
-
-    Sub {
-        where_clause: Option<String>,
     },
 
     /// Reload the config

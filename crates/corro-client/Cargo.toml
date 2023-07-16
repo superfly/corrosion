@@ -18,7 +18,6 @@ rusqlite = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
