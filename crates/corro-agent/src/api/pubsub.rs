@@ -471,7 +471,7 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_v1_watches() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
 
