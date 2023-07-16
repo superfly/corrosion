@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::BufWriter;
 use std::io::Seek;
 use std::io::Write;
@@ -5,6 +6,7 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use compact_str::CompactString;
+use compact_str::ToCompactString;
 use corro_client::CorrosionApiClient;
 use corro_types::api::QueryEvent;
 use corro_types::api::Statement;
@@ -232,9 +234,54 @@ impl QueryResponseIter {
             return None;
         }
         loop {
+            loop {
+                match self.codec.decode(&mut self.buf) {
+                    Ok(Some(line)) => match serde_json::from_str(&line) {
+                        Ok(res) => match res {
+                            QueryEvent::Columns(cols) => self.columns = Some(Arc::new(cols)),
+                            QueryEvent::Row { rowid, cells, .. } => match self.columns.as_ref() {
+                                Some(columns) => {
+                                    return Some(Ok(Row {
+                                        id: rowid,
+                                        columns: columns.clone(),
+                                        cells,
+                                    }));
+                                }
+                                None => {
+                                    self.done = true;
+                                    return Some(Err(Box::new(EvalAltResult::from(
+                                        "did not receive columns data",
+                                    ))));
+                                }
+                            },
+                            QueryEvent::EndOfQuery => {
+                                return None;
+                            }
+                            QueryEvent::Error(e) => {
+                                self.done = true;
+                                return Some(Err(Box::new(EvalAltResult::from(e))));
+                            }
+                        },
+                        Err(e) => {
+                            self.done = true;
+                            return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
+                        }
+                    },
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(e) => {
+                        self.done = true;
+                        return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
+                    }
+                }
+            }
             let bytes_res = body.next().await;
             match bytes_res {
-                Some(Ok(b)) => self.buf.extend_from_slice(&b),
+                Some(Ok(b)) => {
+                    // debug!("read {} bytes", b.len());
+                    self.buf.extend_from_slice(&b)
+                }
                 Some(Err(e)) => {
                     self.done = true;
                     return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
@@ -242,46 +289,6 @@ impl QueryResponseIter {
                 None => {
                     self.done = true;
                     return None;
-                }
-            }
-            match self.codec.decode(&mut self.buf) {
-                Ok(Some(line)) => match serde_json::from_str(&line) {
-                    Ok(res) => match res {
-                        QueryEvent::Columns(cols) => self.columns = Some(Arc::new(cols)),
-                        QueryEvent::Row { rowid, cells, .. } => match self.columns.as_ref() {
-                            Some(columns) => {
-                                return Some(Ok(Row {
-                                    id: rowid,
-                                    columns: columns.clone(),
-                                    cells,
-                                }));
-                            }
-                            None => {
-                                self.done = true;
-                                return Some(Err(Box::new(EvalAltResult::from(
-                                    "did not receive columns data",
-                                ))));
-                            }
-                        },
-                        QueryEvent::EndOfQuery => {
-                            return None;
-                        }
-                        QueryEvent::Error(e) => {
-                            self.done = true;
-                            return Some(Err(Box::new(EvalAltResult::from(e))));
-                        }
-                    },
-                    Err(e) => {
-                        self.done = true;
-                        return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
-                    }
-                },
-                Ok(None) => {
-                    continue;
-                }
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
                 }
             }
         }
@@ -454,25 +461,84 @@ impl Engine {
         engine.register_fn("to_json", SqliteValueWrap::to_json);
         engine.register_fn("to_string", SqliteValueWrap::to_json);
 
+        fn sql(
+            client: &CorrosionApiClient,
+            stmt: Statement,
+        ) -> Result<QueryResponse, Box<EvalAltResult>> {
+            debug!("sql function call {stmt:?}");
+            let (query_id, body) = tokio::runtime::Handle::current()
+                .block_on(client.watch(&stmt))
+                .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+
+            debug!("got res w/ id: {query_id}");
+
+            let handle = Arc::new(TokioRwLock::new(QueryHandle {
+                id: query_id,
+                body: Some(body),
+                client: client.clone(),
+            }));
+
+            Ok(QueryResponse { query: handle })
+        }
+
         engine.register_fn("sql", {
-            // let query_cache = query_cache.clone();
+            let client = client.clone();
             move |query: &str| -> Result<QueryResponse, Box<EvalAltResult>> {
-                debug!("sql function call {query}");
-                let (query_id, body) = tokio::runtime::Handle::current()
-                    .block_on(client.watch(&Statement::Simple(query.into())))
-                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
-
-                debug!("got res w/ id: {query_id}");
-
-                let handle = Arc::new(TokioRwLock::new(QueryHandle {
-                    id: query_id,
-                    body: Some(body),
-                    client: client.clone(),
-                }));
-
-                Ok(QueryResponse { query: handle })
+                sql(&client, Statement::Simple(query.into()))
             }
         });
+
+        fn dyn_to_sql(v: Dynamic) -> Result<SqliteValue, Box<EvalAltResult>> {
+            Ok(match v.type_name() {
+                "()" => SqliteValue::Null,
+                "i64" => SqliteValue::Integer(
+                    v.as_int()
+                        .map_err(|_e| Box::new(EvalAltResult::from("could not cast to i64")))?,
+                ),
+                "f64" => SqliteValue::Real(
+                    v.as_float()
+                        .map_err(|_e| Box::new(EvalAltResult::from("could not cast to f64")))?,
+                ),
+                "bool" => {
+                    if v.as_bool()
+                        .map_err(|_e| Box::new(EvalAltResult::from("could not cast to bool")))?
+                    {
+                        SqliteValue::Integer(1)
+                    } else {
+                        SqliteValue::Integer(0)
+                    }
+                }
+                "blob" => SqliteValue::Blob(
+                    v.into_blob()
+                        .map_err(|_e| Box::new(EvalAltResult::from("could not cast to blob")))?
+                        .into(),
+                ),
+                // convert everything else into a string, including a string
+                _ => SqliteValue::Text(v.to_compact_string()),
+            })
+        }
+
+        engine.register_fn("sql", {
+            let client = client.clone();
+            move |query: &str, params: Vec<Dynamic>| -> Result<QueryResponse, Box<EvalAltResult>> {
+                let params = params
+                    .into_iter()
+                    .map(|v| dyn_to_sql(v))
+                    .collect::<Result<Vec<_>, _>>()?;
+                sql(&client, Statement::WithParams(query.into(), params))
+            }
+        });
+
+        engine.register_fn(
+            "sql",
+            move |query: &str, params: Map| -> Result<QueryResponse, Box<EvalAltResult>> {
+                let params = params
+                    .into_iter()
+                    .map(|(k, v)| Ok::<_, Box<EvalAltResult>>((k.to_string(), dyn_to_sql(v)?)))
+                    .collect::<Result<HashMap<_, _>, _>>()?;
+                sql(&client, Statement::WithNamedParams(query.into(), params))
+            },
+        );
 
         engine.register_fn("hostname", || -> Result<String, Box<EvalAltResult>> {
             Ok(hostname::get()

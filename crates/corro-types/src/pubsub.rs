@@ -571,6 +571,8 @@ impl Matcher {
                     return;
                 }
 
+                drop(init_tx);
+
                 loop {
                     let req = tokio::select! {
                         Some(req) = cmd_rx.recv() => req,

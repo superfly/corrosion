@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::Write,
     ops::RangeInclusive,
     sync::Arc,
     time::{Duration, Instant},
@@ -7,7 +8,7 @@ use std::{
 
 use axum::{response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
-use compact_str::{format_compact, ToCompactString};
+use compact_str::{format_compact, CompactString, ToCompactString};
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
     api::{QueryEvent, RqliteResponse, RqliteResult, Statement},
@@ -19,7 +20,7 @@ use corro_types::{
 };
 use futures::future::poll_fn;
 use hyper::StatusCode;
-use rusqlite::{params, params_from_iter, ToSql, Transaction};
+use rusqlite::{params, params_from_iter, Connection, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
     sync::{
@@ -274,6 +275,30 @@ fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usi
                 .as_slice(),
         ),
     }
+}
+
+fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<Option<String>> {
+    Ok(match stmt {
+        Statement::Simple(q) => conn.prepare(q)?.expanded_sql(),
+        Statement::WithParams(q, params) => {
+            let mut prepped = conn.prepare(q)?;
+            for (i, param) in params.iter().enumerate() {
+                prepped.raw_bind_parameter(i + 1, param)?;
+            }
+            prepped.expanded_sql()
+        }
+        Statement::WithNamedParams(q, params) => {
+            let mut prepped = conn.prepare(q)?;
+            for (k, v) in params.iter() {
+                let idx = match prepped.parameter_index(k)? {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                prepped.raw_bind_parameter(idx, v)?;
+            }
+            prepped.expanded_sql()
+        }
+    })
 }
 
 pub async fn api_v1_transactions(
@@ -615,21 +640,21 @@ async fn process_watch_channel(
     loop {
         // either we get data we need to transmit
         // or we check every 1s if the client is still ready to receive data
-        let row_res = tokio::select! {
+        let query_evt = tokio::select! {
             _ = cancel.cancelled() => {
                 debug!("canceled!");
                 cancelled = true;
                 break;
             },
-            maybe_row_res = init_rx.recv(), if !init_done => match maybe_row_res {
-                Some(row_res) => row_res,
+            maybe_query_evt = init_rx.recv(), if !init_done => match maybe_query_evt {
+                Some(query_evt) => query_evt,
                 None => {
                     init_done = true;
                     continue;
                 }
             },
             res = change_rx.recv(), if init_done => match res {
-                Ok(row_res) => row_res,
+                Ok(query_evt) => query_evt,
                 Err(e) => {
                     warn!("could not receive change: {e}");
                     break;
@@ -643,27 +668,59 @@ async fn process_watch_channel(
             }
         };
 
-        if matches!(row_res, QueryEvent::EndOfQuery) {
-            init_done = true;
-        }
-
         {
             let mut writer = (&mut buf).writer();
-            if let Err(e) = serde_json::to_writer(&mut writer, &row_res) {
-                _ = tx
-                    .send_data(
-                        serde_json::to_vec(&serde_json::json!(QueryEvent::Error(
-                            e.to_compact_string()
-                        )))
-                        .expect("could not serialize error json")
-                        .into(),
-                    )
-                    .await;
-                return;
+
+            let mut query_evt = query_evt;
+
+            loop {
+                if matches!(query_evt, QueryEvent::EndOfQuery) {
+                    init_done = true;
+                }
+
+                let mut recv = if init_done {
+                    TryReceiver::Broadcast(&mut change_rx)
+                } else {
+                    TryReceiver::Mpsc(&mut init_rx)
+                };
+
+                if let Err(e) = serde_json::to_writer(&mut writer, &query_evt) {
+                    _ = tx
+                        .send_data(
+                            serde_json::to_vec(&serde_json::json!(QueryEvent::Error(
+                                e.to_compact_string()
+                            )))
+                            .expect("could not serialize error json")
+                            .into(),
+                        )
+                        .await;
+                    return;
+                }
+                // NOTE: I think that's infaillible...
+                writer
+                    .write(b"\n")
+                    .expect("could not write new line to BytesMut Writer");
+
+                // accumulate up to ~64KB
+                // TODO: predict if we can fit one more in 64KB or not based on previous writes
+                if writer.get_ref().len() >= 64 * 1024 {
+                    break;
+                }
+
+                match recv.try_recv() {
+                    Ok(new) => query_evt = new,
+                    Err(e) => match e {
+                        TryRecvError::Empty => break,
+                        TryRecvError::Closed => break,
+
+                        TryRecvError::Lagged(lagged) => {
+                            error!("change recv lagged by {lagged}, stopping watch processing");
+                            return;
+                        }
+                    },
+                }
             }
         }
-
-        buf.extend_from_slice(b"\n");
 
         if let Err(e) = tx.send_data(buf.split().freeze()).await {
             error!("could not send data through body's channel: {e}");
@@ -692,6 +749,69 @@ async fn process_watch_channel(
     }
 }
 
+enum TryReceiver<'a, T> {
+    Mpsc(&'a mut mpsc::Receiver<T>),
+    Broadcast(&'a mut broadcast::Receiver<T>),
+}
+
+impl<'a, T> TryReceiver<'a, T>
+where
+    T: Clone,
+{
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        Ok(match self {
+            TryReceiver::Mpsc(r) => r.try_recv()?,
+            TryReceiver::Broadcast(b) => b.try_recv()?,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum TryRecvError {
+    #[error("empty")]
+    Empty,
+    #[error("closed")]
+    Closed,
+    #[error("lagged by {0}")]
+    Lagged(u64),
+}
+
+impl From<broadcast::error::TryRecvError> for TryRecvError {
+    fn from(value: broadcast::error::TryRecvError) -> Self {
+        match value {
+            broadcast::error::TryRecvError::Empty => TryRecvError::Empty,
+            broadcast::error::TryRecvError::Closed => TryRecvError::Closed,
+            broadcast::error::TryRecvError::Lagged(lagged) => TryRecvError::Lagged(lagged),
+        }
+    }
+}
+
+impl From<mpsc::error::TryRecvError> for TryRecvError {
+    fn from(value: mpsc::error::TryRecvError) -> Self {
+        match value {
+            mpsc::error::TryRecvError::Empty => TryRecvError::Empty,
+            mpsc::error::TryRecvError::Disconnected => TryRecvError::Closed,
+        }
+    }
+}
+
+async fn expand_sql(
+    agent: &Agent,
+    stmt: &Statement,
+) -> Result<String, (StatusCode, CompactString)> {
+    match agent.pool().read().await {
+        Ok(conn) => match expanded_statement(&conn, stmt) {
+            Ok(Some(stmt)) => Ok(stmt),
+            Ok(None) => Err((
+                StatusCode::BAD_REQUEST,
+                "could not expand statement's sql w/ params".into(),
+            )),
+            Err(e) => Err((StatusCode::BAD_REQUEST, e.to_compact_string())),
+        },
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_compact_string())),
+    }
+}
+
 pub type MatcherCache = Arc<TokioRwLock<HashMap<String, Uuid>>>;
 
 pub async fn api_v1_watches(
@@ -699,17 +819,15 @@ pub async fn api_v1_watches(
     Extension(watch_cache): Extension<MatcherCache>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
-    let stmt = match stmt {
-        Statement::Simple(s) => s,
-        _ => {
+    let stmt = match expand_sql(&agent, &stmt).await {
+        Ok(stmt) => stmt,
+        Err((status, e)) => {
             return hyper::Response::builder()
-                .status(StatusCode::BAD_REQUEST)
+                .status(status)
                 .body(
-                    serde_json::to_vec(&QueryEvent::Error(
-                        "only simple statements (no params) are accepted for watches".into(),
-                    ))
-                    .expect("could not serialize queries stream error")
-                    .into(),
+                    serde_json::to_vec(&QueryEvent::Error(e))
+                        .expect("could not serialize queries stream error")
+                        .into(),
                 )
                 .expect("could not build error response");
         }
@@ -727,15 +845,6 @@ pub async fn api_v1_watches(
         }
     }
 
-    let (tx, body) = hyper::Body::channel();
-
-    // TODO: timeout on data send instead of infinitely waiting for channel space.
-    let (data_tx, data_rx) = channel(512);
-    let (change_tx, change_rx) = broadcast::channel(10240);
-
-    let matcher_id = Uuid::new_v4();
-    let cancel = CancellationToken::new();
-
     let conn = match agent.pool().dedicated().await {
         Ok(conn) => conn,
         Err(e) => {
@@ -749,6 +858,15 @@ pub async fn api_v1_watches(
                 .expect("could not build error response")
         }
     };
+
+    let (tx, body) = hyper::Body::channel();
+
+    // TODO: timeout on data send instead of infinitely waiting for channel space.
+    let (data_tx, data_rx) = channel(512);
+    let (change_tx, change_rx) = broadcast::channel(10240);
+
+    let matcher_id = Uuid::new_v4();
+    let cancel = CancellationToken::new();
 
     let matcher = match block_in_place(|| {
         Matcher::new(
