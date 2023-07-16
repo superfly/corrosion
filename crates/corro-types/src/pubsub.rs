@@ -5,6 +5,7 @@ use std::{
 
 use bytes::Buf;
 use compact_str::{CompactString, ToCompactString};
+use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -543,13 +544,6 @@ impl Matcher {
             }
         }
 
-        // let stmt = if let Some(stmt) = self.0.statements.get(agg.table) {
-        //     stmt
-        // } else {
-        //     trace!("irrelevant table!");
-        //     return Ok(());
-        // };
-
         self.0
             .cmd_tx
             .try_send(MatcherCmd::ProcessChange(candidates))
@@ -885,13 +879,15 @@ fn extract_expr_columns(
         }
 
         Expr::Name(colname) => {
+            let check_col_name = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
+
             let mut found = None;
             for tbl in parsed.table_columns.keys() {
                 if let Some(tbl) = schema.tables.get(tbl) {
-                    if tbl.columns.contains_key(&colname.0) {
+                    if tbl.columns.contains_key(&check_col_name) {
                         if found.is_some() {
                             return Err(MatcherError::QualificationRequired {
-                                col_name: colname.0.clone(),
+                                col_name: check_col_name.clone(),
                             });
                         }
                         found = Some(tbl.name.as_str());
@@ -904,25 +900,23 @@ fn extract_expr_columns(
                     .table_columns
                     .entry(found.to_owned())
                     .or_default()
-                    .insert(colname.0.clone());
+                    .insert(check_col_name.clone());
             } else {
                 return Err(MatcherError::TableForColumnNotFound {
-                    col_name: colname.0.clone(),
+                    col_name: check_col_name.clone(),
                 });
             }
         }
         Expr::Id(colname) => {
-            if colname.0.starts_with('"') {
-                return Ok(());
-            }
+            let check_col_name = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
 
             let mut found = None;
             for tbl in parsed.table_columns.keys() {
                 if let Some(tbl) = schema.tables.get(tbl) {
-                    if tbl.columns.contains_key(&colname.0) {
+                    if tbl.columns.contains_key(&check_col_name) {
                         if found.is_some() {
                             return Err(MatcherError::QualificationRequired {
-                                col_name: colname.0.clone(),
+                                col_name: check_col_name.clone(),
                             });
                         }
                         found = Some(tbl.name.as_str());
@@ -937,6 +931,9 @@ fn extract_expr_columns(
                     .or_default()
                     .insert(colname.0.clone());
             } else {
+                if colname.0.starts_with('"') {
+                    return Ok(());
+                }
                 return Err(MatcherError::TableForColumnNotFound {
                     col_name: colname.0.clone(),
                 });
@@ -1525,6 +1522,7 @@ mod tests {
                 let mut changes = vec![];
 
                 for row in rows {
+                    println!("change: {row:?}");
                     changes.push(row.unwrap());
                 }
                 changes
