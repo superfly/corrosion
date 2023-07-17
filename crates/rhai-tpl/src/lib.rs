@@ -21,6 +21,7 @@ use rhai::Scope;
 use rhai::{EvalAltResult, Map};
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
+use tokio::sync::OnceCell;
 use tokio::sync::{mpsc, RwLock as TokioRwLock};
 use tokio::time::sleep;
 use tokio_util::codec::{Decoder, LinesCodec};
@@ -92,6 +93,15 @@ impl QueryResponse {
             res: self.clone(),
         }
     }
+
+    fn to_csv(&mut self) -> SqlToCsv {
+        SqlToCsv { res: self.clone() }
+    }
+}
+
+#[derive(Clone)]
+pub struct SqlToCsv {
+    res: QueryResponse,
 }
 
 #[derive(Clone)]
@@ -108,8 +118,7 @@ impl IntoIterator for QueryResponse {
     fn into_iter(self) -> Self::IntoIter {
         QueryResponseIter {
             query: self.query.clone(),
-            body: None,
-            original: false,
+            body: OnceCell::new(),
             codec: LinesCodec::new(),
             buf: BytesMut::new(),
             handle: tokio::runtime::Handle::current(),
@@ -172,7 +181,7 @@ struct Cell {
 struct SqliteValueWrap(SqliteValue);
 
 impl SqliteValueWrap {
-    pub fn to_json(&mut self) -> String {
+    fn to_json(&mut self) -> String {
         match &self.0 {
             SqliteValue::Null => "null".into(),
             SqliteValue::Integer(i) => i.to_string(),
@@ -206,8 +215,7 @@ impl Cell {
 
 struct QueryResponseIter {
     query: Arc<TokioRwLock<QueryHandle>>,
-    body: Option<hyper::Body>,
-    original: bool,
+    body: OnceCell<hyper::Body>,
     buf: BytesMut,
     codec: LinesCodec,
     handle: tokio::runtime::Handle,
@@ -216,25 +224,73 @@ struct QueryResponseIter {
 }
 
 impl QueryResponseIter {
-    pub async fn recv(&mut self) -> Option<Result<Row, Box<EvalAltResult>>> {
-        let body = match self.body.as_mut() {
-            Some(body) => body,
-            None => match self.query.write().await.body().await {
-                Ok((body, original)) => {
-                    self.body = Some(body);
-                    self.original = original;
-                    self.body.as_mut().unwrap()
+    pub async fn body(&mut self) -> Result<&mut hyper::Body, Box<EvalAltResult>> {
+        self.body
+            .get_or_try_init(|| async {
+                match self.query.write().await.body().await {
+                    Ok((body, _)) => Ok(body),
+                    Err(e) => Err(Box::new(EvalAltResult::from(e.to_string()))),
                 }
+            })
+            .await?;
+        self.body.get_mut().ok_or_else(|| {
+            Box::new(EvalAltResult::from(
+                "unexpected error, body is gone from OnceCell",
+            ))
+        })
+    }
+
+    // pub async fn columns(&mut self) -> Result<Arc<Vec<CompactString>>, Box<EvalAltResult>> {
+    //     {
+    //         if let Some(cols) = self.columns.clone() {
+    //             return Ok(cols);
+    //         }
+    //     }
+
+    //     if let Some(Err(e)) = self.recv().await {
+    //         return Err(e);
+    //     }
+    //     if let Some(cols) = self.columns.clone() {
+    //         return Ok(cols);
+    //     }
+    //     return Err(Box::new(EvalAltResult::from("could not get columns")));
+    // }
+
+    pub async fn read_bytes(&mut self) -> Result<usize, Box<EvalAltResult>> {
+        let bytes_res = {
+            let body = match self.body().await {
+                Ok(body) => body,
                 Err(e) => {
                     self.done = true;
-                    return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
+                    return Err(e);
                 }
-            },
+            };
+            body.next().await
+        };
+        let len = match bytes_res {
+            Some(Ok(b)) => {
+                // debug!("read {} bytes", b.len());
+                self.buf.extend_from_slice(&b);
+                b.len()
+            }
+            Some(Err(e)) => {
+                self.done = true;
+                return Err(Box::new(EvalAltResult::from(e.to_string())));
+            }
+            None => {
+                self.done = true;
+                0
+            }
         };
 
+        Ok(len)
+    }
+
+    pub async fn recv(&mut self) -> Option<Result<Row, Box<EvalAltResult>>> {
         if self.done {
             return None;
         }
+
         loop {
             loop {
                 match self.codec.decode(&mut self.buf) {
@@ -278,20 +334,11 @@ impl QueryResponseIter {
                     }
                 }
             }
-            let bytes_res = body.next().await;
-            match bytes_res {
-                Some(Ok(b)) => {
-                    // debug!("read {} bytes", b.len());
-                    self.buf.extend_from_slice(&b)
+            match self.read_bytes().await {
+                Ok(n) => {
+                    trace!("read {n} bytes");
                 }
-                Some(Err(e)) => {
-                    self.done = true;
-                    return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
-                }
-                None => {
-                    self.done = true;
-                    return None;
-                }
+                Err(e) => return Some(Err(e)),
             }
         }
     }
@@ -387,6 +434,34 @@ impl TemplateWriter {
             .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?)
     }
 
+    fn write_sql_to_csv(&mut self, csv: SqlToCsv) -> Result<(), Box<EvalAltResult>> {
+        let mut rows = csv.res.into_iter();
+
+        let mut w = self.0.w.write();
+        let mut wtr = csv::Writer::from_writer(&mut *w);
+
+        let mut wrote_header = false;
+
+        while let Some(row) = rows.next() {
+            let row = row?;
+            if !wrote_header {
+                wtr.write_record(row.columns.as_slice())
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+                wrote_header = true;
+            }
+            wtr.serialize(row.cells.as_slice())
+                .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+        }
+        if !wrote_header {
+            if let Some(cols) = rows.columns.as_ref() {
+                wtr.write_record(cols.as_slice())
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn write_sql_to_json(&mut self, mut json: SqlToJson) -> Result<(), Box<EvalAltResult>> {
         debug!("write_sql_to_json");
         let mut rows = json.res.into_iter();
@@ -463,12 +538,14 @@ impl Engine {
         engine.register_fn("write", TemplateWriter::write_str);
         engine.register_fn("write", TemplateWriter::write_char);
         engine.register_fn("write", TemplateWriter::write_sql_to_json);
+        engine.register_fn("write", TemplateWriter::write_sql_to_csv);
         engine.register_fn("write", TemplateWriter::write_dynamic);
 
         engine.register_type_with_name::<QueryResponse>("QueryResponse");
         engine.register_iterator_result::<QueryResponse, Row>();
         engine.register_fn("to_json", QueryResponse::to_json);
         engine.register_fn("to_json", QueryResponse::to_json_w_options);
+        engine.register_fn("to_csv", QueryResponse::to_csv);
 
         engine.register_type_with_name::<Row>("Row");
         engine.register_iterator::<Row>();

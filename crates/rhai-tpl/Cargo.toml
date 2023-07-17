@@ -25,6 +25,7 @@ hex = { workspace = true }
 indexmap = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
+csv = { version = "1.2.2" }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
