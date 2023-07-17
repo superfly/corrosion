@@ -22,7 +22,7 @@ The only way to write data that propagates through the Corrosion cluster is to g
 
 Corrosion's HTTP API is rqlite-compatible. This is both meant as a shortcut and to have ready-made clients for it.
 
-### POST /db/execute
+### POST /v1/transactions
 
 See: https://rqlite.io/docs/api/api/#writing-data
 
@@ -40,9 +40,9 @@ Configuring Corrosion with `schema_paths` lets you define filesystem directories
 
 You can add or modify schema files in known paths or even modify the `schema_paths` and then send a SIGHUP signal to Corrosion to apply schema changes, without a restart.
 
-### POST /db/schema
+### POST /v1/migrations
 
-This endpoint accepts the same type of body as the `/db/execute` endpoint, except it will mutate Corrosion's schema.
+This endpoint accepts the same type of body as the `/v1/transactions` endpoint, except it will mutate Corrosion's schema.
 
 ## Subscribing to changes
 

@@ -1,0 +1,1 @@
+<%= sql("SELECT * FROM tests;").to_json(#{pretty: true}) %>

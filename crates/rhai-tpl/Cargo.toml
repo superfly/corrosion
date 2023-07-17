@@ -1,0 +1,32 @@
+[package]
+name = "rhai-tpl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rhai = { version = "1.15.1", features = ["sync"] }
+logos = { version = "0.13.0" }
+enquote = { workspace = true }
+thiserror = { workspace = true }
+hostname = { workspace = true }
+tracing = { workspace = true }
+corro-client = { path = "../corro-client" }
+tokio = { workspace = true }
+hyper = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+corro-types = { path = "../corro-types" }
+serde_json = { workspace = true }
+serde = { workspace = true }
+compact_str = { workspace = true }
+futures = { workspace = true }
+tripwire = { path = "../tripwire" }
+hex = { workspace = true }
+indexmap = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+corro-tests = { path = "../corro-tests" }

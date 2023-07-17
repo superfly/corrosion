@@ -10,9 +10,9 @@ use std::{
 
 use crate::{
     api::{
-        http::{api_v1_db_execute, api_v1_db_query, api_v1_db_schema},
+        http::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
         peer::{bidirectional_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncError},
-        pubsub::api_v1_subscribe_ws,
+        pubsub::{api_v1_watch_by_id, api_v1_watches, MatcherCache},
     },
     broadcast::{runtime_loop, ClientPool, FRAGMENTS_AT},
 };
@@ -29,11 +29,9 @@ use corro_types::{
     },
     change::Change,
     config::{Config, DEFAULT_GOSSIP_PORT},
-    filters::{match_expr, AggregateChange},
     members::{MemberEvent, Members},
-    pubsub::{SubscriptionEvent, SubscriptionMessage},
     schema::init_schema,
-    sqlite::{init_cr_conn, CrConn, CrConnManager, Migration},
+    sqlite::{init_cr_conn, CrConn, Migration, SqlitePoolError},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
 };
 
@@ -128,24 +126,10 @@ pub async fn setup(
 
     info!("Actor ID: {}", actor_id);
 
-    let rw_pool = bb8::Builder::new()
-        .max_size(1)
-        .min_idle(Some(1)) // create one right away and keep it idle
-        .build(CrConnManager::new(&conf.db_path))
-        .await?;
-
-    debug!("built RW pool");
-
-    let ro_pool = bb8::Builder::new()
-        .max_size(10)
-        .min_idle(Some(5)) // keep a few idling
-        .max_lifetime(Some(Duration::from_secs(30)))
-        .build(CrConnManager::new_read_only(&conf.db_path))
-        .await?;
-    debug!("built RO pool");
+    let pool = SplitPool::create(&conf.db_path, tripwire.clone()).await?;
 
     let schema = {
-        let mut conn = rw_pool.get().await?;
+        let mut conn = pool.write_priority().await?;
         migrate(&mut conn)?;
         init_schema(&conn)?
     };
@@ -156,7 +140,7 @@ pub async fn setup(
 
     {
         debug!("getting read-only conn for pull bookkeeping rows");
-        let conn = ro_pool.get().await?;
+        let conn = pool.read().await?;
 
         debug!("getting bookkept rows");
 
@@ -268,14 +252,12 @@ pub async fn setup(
 
     let agent = Agent::new(AgentConfig {
         actor_id,
-        ro_pool,
-        rw_pool,
+        pool,
         config: ArcSwap::from_pointee(conf),
         gossip_addr,
         api_addr,
         members: RwLock::new(Members::default()),
         clock: clock.clone(),
-        subscribers: Default::default(),
         bookie,
         tx_bcast,
         tx_apply,
@@ -623,8 +605,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let api = Router::new()
         .route(
-            "/db/execute",
-            post(api_v1_db_execute).route_layer(
+            "/v1/transactions",
+            post(api_v1_transactions).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -637,8 +619,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             ),
         )
         .route(
-            "/db/query",
-            post(api_v1_db_query).route_layer(
+            "/v1/queries",
+            post(api_v1_queries).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -651,7 +633,35 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             ),
         )
         .route(
-            "/db/schema",
+            "/v1/watches",
+            post(api_v1_watches).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(128)),
+            ),
+        )
+        .route(
+            "/v1/watches/:id",
+            get(api_v1_watch_by_id).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(128)),
+            ),
+        )
+        .route(
+            "/v1/migrations",
             post(api_v1_db_schema).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
@@ -664,11 +674,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     .layer(ConcurrencyLimitLayer::new(4)),
             ),
         )
-        .route("/v1/subscribe", get(api_v1_subscribe_ws))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
                 .layer(Extension(agent.clone()))
+                .layer(Extension(MatcherCache::default()))
                 .layer(Extension(tripwire.clone())),
         )
         .layer(DefaultBodyLimit::disable())
@@ -1500,8 +1510,8 @@ pub async fn process_single_version(
         (db_version, changeset)
     };
 
-    if let Some(db_version) = db_version {
-        process_subs(agent, changeset.changes(), db_version);
+    if db_version.is_some() {
+        process_subs(agent, changeset.changes());
     }
     debug!("processed subscriptions, if any!");
 
@@ -1524,33 +1534,22 @@ async fn process_msg(agent: &Agent, msg: Message) -> Result<Option<Message>, Cha
     })
 }
 
-pub fn process_subs(agent: &Agent, changeset: &[Change], db_version: i64) {
+pub fn process_subs(agent: &Agent, changeset: &[Change]) {
     trace!("process subs...");
-    let schema = agent.schema().read();
-    let aggs = AggregateChange::from_changes(changeset.iter(), &schema, db_version);
-    trace!("agg changes: {aggs:?}");
-    for agg in aggs {
-        let subscribers = agent.subscribers().read();
-        trace!("subs: {subscribers:?}");
-        for (sub, subscriptions) in subscribers.iter() {
-            trace!("looking at sub {sub}");
-            let subs = subscriptions.read();
-            if let Some((subs, sender)) = subs.as_local() {
-                for (id, info) in subs.iter() {
-                    if let Some(filter) = info.filter.as_ref() {
-                        if match_expr(filter, &agg) {
-                            trace!("matched subscriber: {id} w/ info: {info:?}!");
-                            if let Err(e) = sender.send(SubscriptionMessage::Event {
-                                id: id.clone(),
-                                event: SubscriptionEvent::Change(agg.to_owned()),
-                            }) {
-                                error!("could not send sub message: {e}")
-                            }
-                        }
-                    }
-                }
+
+    let mut matchers_to_delete = vec![];
+
+    {
+        let matchers = agent.matchers().read();
+        for (id, matcher) in matchers.iter() {
+            if let Err(e) = matcher.process_change(changeset) {
+                error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
+                matchers_to_delete.push(*id);
             }
         }
+    }
+    for id in matchers_to_delete {
+        agent.matchers().write().remove(&id);
     }
 }
 
@@ -1567,7 +1566,7 @@ pub enum SyncClientError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    Pool(#[from] SqlitePoolError),
     #[error("no good candidates found")]
     NoGoodCandidate,
     #[error("could not decode message: {0}")]
@@ -1867,22 +1866,6 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
             
                 PRIMARY KEY (tbl_name, type, name)
             ) WITHOUT ROWID;
-
-            -- all subscriptions ever
-            CREATE TABLE __corro_subs (
-                actor_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-            
-                filter TEXT NOT NULL DEFAULT "",
-                active INTEGER NOT NULL DEFAULT 1,
-
-                ts TEXT,
-            
-                PRIMARY KEY (actor_id, id)
-            ) WITHOUT ROWID;
-
-            -- that's how we'll propagate subscription changes
-            SELECT crsql_as_crr('__corro_subs');
         "#,
     )?;
 
@@ -1897,7 +1880,7 @@ pub mod tests {
         time::{Duration, Instant},
     };
 
-    use futures::{stream::FuturesUnordered, SinkExt, StreamExt, TryStreamExt};
+    use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
     use rand::{
         distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::IteratorRandom,
         SeedableRng,
@@ -1906,20 +1889,12 @@ pub mod tests {
     use serde_json::json;
     use spawn::wait_for_all_pending_handles;
     use tokio::time::{sleep, MissedTickBehavior};
-    use tokio_tungstenite::tungstenite::Message;
     use tracing::{info, info_span};
     use tripwire::Tripwire;
 
-    use crate::api::http::make_broadcastable_changes;
-
     use super::*;
 
-    use corro_types::{
-        api::{RqliteResponse, RqliteResult, Statement},
-        change::SqliteValue,
-        filters::{ChangeEvent, OwnedAggregateChange},
-        pubsub::{Subscription, SubscriptionId},
-    };
+    use corro_types::api::{RqliteResponse, RqliteResult, Statement};
 
     use corro_tests::*;
 
@@ -1944,8 +1919,7 @@ pub mod tests {
 
         let req_body: Vec<Statement> = serde_json::from_value(json!([[
             "INSERT INTO tests (id,text) VALUES (?,?)",
-            1,
-            "hello world 1"
+            [1, "hello world 1"]
         ],]))?;
 
         let res = timeout(
@@ -1953,7 +1927,7 @@ pub mod tests {
             client.request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
+                    .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
             ),
@@ -2016,15 +1990,14 @@ pub mod tests {
 
         let req_body: Vec<Statement> = serde_json::from_value(json!([[
             "INSERT INTO tests (id,text) VALUES (?,?)",
-            2,
-            "hello world 2"
+            [2, "hello world 2"]
         ]]))?;
 
         let res = client
             .request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
+                    .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
             )
@@ -2089,8 +2062,7 @@ pub mod tests {
             .map(|id| {
                 serde_json::json!([
                     "INSERT INTO tests (id,text) VALUES (?,?)",
-                    id,
-                    format!("hello world #{id}"),
+                    [id, format!("hello world #{id}")],
                 ])
             })
             .collect();
@@ -2102,7 +2074,7 @@ pub mod tests {
             client.request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
+                    .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
             ),
@@ -2198,23 +2170,19 @@ pub mod tests {
             serde_json::from_value::<Vec<Statement>>(json!([
                 [
                     "INSERT INTO tests (id,text) VALUES (?,?)",
-                    n,
-                    format!("hello world {n}")
+                    [n, format!("hello world {n}")]
                 ],
                 [
                     "INSERT INTO tests2 (id,text) VALUES (?,?)",
-                    n,
-                    format!("hello world {n}")
+                    [n, format!("hello world {n}")]
                 ],
                 [
                     "INSERT INTO tests (id,text) VALUES (?,?)",
-                    n + 10000,
-                    format!("hello world {n}")
+                    [n + 10000, format!("hello world {n}")]
                 ],
                 [
                     "INSERT INTO tests2 (id,text) VALUES (?,?)",
-                    n + 10000,
-                    format!("hello world {n}")
+                    [n + 10000, format!("hello world {n}")]
                 ]
             ]))
             .unwrap()
@@ -2235,7 +2203,7 @@ pub mod tests {
                             .request(
                                 hyper::Request::builder()
                                     .method(hyper::Method::POST)
-                                    .uri(format!("http://{chosen}/db/execute?transaction"))
+                                    .uri(format!("http://{chosen}/v1/transactions"))
                                     .header(hyper::header::CONTENT_TYPE, "application/json")
                                     .body(serde_json::to_vec(&statements)?.into())?,
                             )
@@ -2344,99 +2312,6 @@ pub mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn basic_pubsub() -> eyre::Result<()> {
-        _ = tracing_subscriber::fmt::try_init();
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-        let ta = launch_test_agent(
-            |conf| conf.api_addr("127.0.0.1:0".parse().unwrap()).build(),
-            tripwire.clone(),
-        )
-        .await?;
-
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{}/v1/subscribe", ta.agent.api_addr()))
-                .await?;
-
-        let id = SubscriptionId("blah".into());
-
-        ws.send(Message::binary(
-            serde_json::to_vec(&Subscription::Add {
-                id: id.clone(),
-                where_clause: Some("tbl_name = 'testsblob'".into()),
-                from_db_version: None,
-                is_priority: true,
-            })
-            .unwrap(),
-        ))
-        .await?;
-
-        println!("sent message!");
-
-        make_broadcastable_changes(&ta.agent, |tx| {
-            tx.execute(
-                "INSERT INTO testsblob (id,text) VALUES (?,?)",
-                params![&[1u8, 2u8, 3u8], "hello"],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-        let msg = ws.next().await.unwrap().unwrap();
-
-        let parsed: SubscriptionMessage = serde_json::from_slice(&msg.into_data()).unwrap();
-
-        println!("{parsed:#?}");
-
-        assert_eq!(
-            parsed,
-            SubscriptionMessage::Event {
-                id,
-                event: SubscriptionEvent::Change(OwnedAggregateChange {
-                    actor_id: ta.agent.actor_id(),
-                    version: 1,
-                    evt_type: ChangeEvent::Insert,
-                    table: "testsblob".into(),
-                    pk: vec![(String::from("id"), SqliteValue::Blob(vec![1, 2, 3]))]
-                        .into_iter()
-                        .collect(),
-                    data: vec![(String::from("text"), SqliteValue::Text("hello".into()))]
-                        .into_iter()
-                        .collect(),
-                })
-            }
-        );
-
-        let conn = ta.agent.pool().read().await?;
-
-        let changes = conn
-                    .prepare_cached(
-                        r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes ORDER BY db_version, seq ASC"#,
-                    )?
-                    .query_map([], |row| {
-                        Ok(Change {
-                            table: row.get(0)?,
-                            pk: row.get(1)?,
-                            cid: row.get(2)?,
-                            val: row.get(3)?,
-                            col_version: row.get(4)?,
-                            db_version: row.get(5)?,
-                            seq: row.get(6)?,
-                            site_id: row.get(7)?,
-                        })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        println!("changes: {changes:#?}");
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
     #[test]
     fn test_in_memory_versions_compaction() -> eyre::Result<()> {
         let mut conn = rusqlite::Connection::open_in_memory()?;
@@ -2486,7 +2361,7 @@ pub mod tests {
             client.request(
                 hyper::Request::builder()
                     .method(hyper::Method::POST)
-                    .uri(format!("http://{}/db/execute", ta1.agent.api_addr()))
+                    .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(serde_json::to_vec(&req_body)?.into())?,
             ),
@@ -2659,15 +2534,14 @@ pub mod tests {
 
                             let req_body = serde_json::from_value::<Vec<Statement>>(json!([[
                                 "INSERT INTO tests (id,text) VALUES (?,?)",
-                                start_id,
-                                format!("hello from {actor_id}")
+                                [start_id, format!("hello from {actor_id}")]
                             ],]))?;
 
                             let res = client
                                 .request(
                                     hyper::Request::builder()
                                         .method(hyper::Method::POST)
-                                        .uri(format!("http://{api_addr}/db/execute?transaction"))
+                                        .uri(format!("http://{api_addr}/v1/transactions"))
                                         .header(hyper::header::CONTENT_TYPE, "application/json")
                                         .body(serde_json::to_vec(&req_body)?.into())?,
                                 )

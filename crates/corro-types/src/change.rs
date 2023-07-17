@@ -1,16 +1,15 @@
-use std::{
-    fmt::{self, Write},
-    ops::Deref,
-};
+use std::fmt::{self, Write};
 
+use compact_str::{CompactString, ToCompactString};
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
     Row, ToSql,
 };
 use serde::{Deserialize, Serialize};
-use speedy::{Readable, Writable};
+use smallvec::{SmallVec, ToSmallVec};
+use speedy::{Context, Readable, Reader, Writable, Writer};
 
-use crate::filters::parse_sqlite_quoted_str;
+use crate::pubsub::ColumnType;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
 pub struct Change {
@@ -85,24 +84,34 @@ impl<'a> SqliteValueRef<'a> {
             SqliteValueRef::Null => SqliteValue::Null,
             SqliteValueRef::Integer(v) => SqliteValue::Integer(*v),
             SqliteValueRef::Real(v) => SqliteValue::Real(*v),
-            SqliteValueRef::Text(v) => SqliteValue::Text((*v).to_owned()),
-            SqliteValueRef::Blob(v) => SqliteValue::Blob(v.to_vec()),
+            SqliteValueRef::Text(v) => SqliteValue::Text((*v).to_compact_string()),
+            SqliteValueRef::Blob(v) => SqliteValue::Blob(v.to_smallvec()),
         }
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum SqliteValue {
     #[default]
     Null,
     Integer(i64),
     Real(f64),
-    Text(String),
-    Blob(Vec<u8>),
+    Text(CompactString),
+    Blob(SmallVec<[u8; 512]>),
 }
 
 impl SqliteValue {
+    pub fn column_type(&self) -> ColumnType {
+        match self {
+            SqliteValue::Null => ColumnType::Null,
+            SqliteValue::Integer(_) => ColumnType::Integer,
+            SqliteValue::Real(_) => ColumnType::Float,
+            SqliteValue::Text(_) => ColumnType::Text,
+            SqliteValue::Blob(_) => ColumnType::Blob,
+        }
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         if let Self::Text(ref s) = self {
             Some(s)
@@ -162,13 +171,13 @@ impl From<&str> for SqliteValue {
 
 impl From<Vec<u8>> for SqliteValue {
     fn from(value: Vec<u8>) -> Self {
-        Self::Blob(value)
+        Self::Blob(value.into())
     }
 }
 
 impl From<String> for SqliteValue {
     fn from(value: String) -> Self {
-        Self::Text(value)
+        Self::Text(value.into())
     }
 }
 
@@ -191,7 +200,9 @@ impl FromSql for SqliteValue {
             ValueRef::Integer(i) => SqliteValue::Integer(i),
             ValueRef::Real(f) => SqliteValue::Real(f),
             ValueRef::Text(t) => SqliteValue::Text(
-                String::from_utf8(t.into()).map_err(|e| FromSqlError::Other(Box::new(e)))?,
+                std::str::from_utf8(t.into())
+                    .map_err(|e| FromSqlError::Other(Box::new(e)))?
+                    .into(),
             ),
             ValueRef::Blob(b) => SqliteValue::Blob(b.into()),
         })
@@ -228,37 +239,76 @@ impl fmt::Display for SqliteValue {
     }
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
-pub struct SqliteQuotedValue {
-    pub value: SqliteValue,
-    src: String,
-}
+impl<'a, C> Readable<'a, C> for SqliteValue
+where
+    C: Context,
+{
+    #[inline]
+    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+        Ok(match u8::read_from(reader)? {
+            0 => SqliteValue::Null,
+            1 => SqliteValue::Integer(i64::read_from(reader)?),
+            2 => SqliteValue::Real(f64::read_from(reader)?),
+            3 => {
+                let len = reader.read_u32()? as usize;
 
-impl Deref for SqliteQuotedValue {
-    type Target = SqliteValue;
-
-    fn deref(&self) -> &Self::Target {
-        &self.value
-    }
-}
-
-impl FromSql for SqliteQuotedValue {
-    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        Ok(match value {
-            ValueRef::Text(t) => {
-                let src = String::from_utf8_lossy(t).into_owned();
-                Self {
-                    value: parse_sqlite_quoted_str(&src).ok_or(FromSqlError::InvalidType)?,
-                    src,
-                }
+                SqliteValue::Text(unsafe {
+                    CompactString::from_utf8_unchecked(reader.read_vec(len)?)
+                })
             }
-            _ => return Err(FromSqlError::InvalidType),
+            4 => {
+                let len = reader.read_u32()? as usize;
+                let mut vec = SmallVec::with_capacity(len);
+
+                reader.read_bytes(&mut vec)?;
+
+                SqliteValue::Blob(vec)
+            }
+            _ => return Err(speedy::Error::custom("unknown SqliteValue variant").into()),
         })
     }
+
+    #[inline]
+    fn minimum_bytes_needed() -> usize {
+        1
+    }
 }
 
-impl ToSql for SqliteQuotedValue {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Borrowed(ValueRef::Text(self.src.as_bytes())))
+impl<C> Writable<C> for SqliteValue
+where
+    C: Context,
+{
+    #[inline]
+    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
+        match self {
+            SqliteValue::Null => writer.write_u8(0),
+            SqliteValue::Integer(i) => {
+                1u8.write_to(writer)?;
+                i.write_to(writer)
+            }
+            SqliteValue::Real(f) => {
+                2u8.write_to(writer)?;
+                f.write_to(writer)
+            }
+            SqliteValue::Text(s) => {
+                3u8.write_to(writer)?;
+                s.as_bytes().write_to(writer)
+            }
+            SqliteValue::Blob(b) => {
+                4u8.write_to(writer)?;
+                b.as_slice().write_to(writer)
+            }
+        }
+    }
+
+    #[inline]
+    fn bytes_needed(&self) -> Result<usize, C::Error> {
+        Ok(1 + match self {
+            SqliteValue::Null => 0,
+            SqliteValue::Integer(i) => <i64 as Writable<C>>::bytes_needed(i)?,
+            SqliteValue::Real(f) => <f64 as Writable<C>>::bytes_needed(f)?,
+            SqliteValue::Text(s) => <[u8] as Writable<C>>::bytes_needed(s.as_bytes())?,
+            SqliteValue::Blob(b) => <[u8] as Writable<C>>::bytes_needed(b.as_slice())?,
+        })
     }
 }

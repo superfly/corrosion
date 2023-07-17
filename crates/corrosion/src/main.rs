@@ -1,16 +1,17 @@
 use std::net::SocketAddr;
 
 use admin::AdminConn;
+use bytes::BytesMut;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use corro_client::CorrosionApiClient;
 use corro_types::{
-    api::{RqliteResult, Statement},
+    api::{QueryEvent, RqliteResult, Statement},
     config::{default_admin_path, Config},
-    pubsub::{SubscriptionEvent, SubscriptionMessage},
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
+use tokio_util::codec::{Decoder, LinesCodec};
 
 pub mod admin;
 pub mod command;
@@ -42,55 +43,44 @@ async fn main() -> eyre::Result<()> {
         Command::Query {
             query,
             columns: show_columns,
-            timer,
+            ..
         } => {
-            let res = cli
+            let mut body = cli
                 .api_client()
-                .query(&[Statement::Simple(query.clone())])
+                .query(&Statement::Simple(query.clone()))
                 .await?;
 
-            for res in res.results {
+            let mut lines = LinesCodec::new();
+
+            let mut buf = BytesMut::new();
+
+            loop {
+                buf.extend_from_slice(&body.next().await.unwrap()?);
+                let s = lines.decode(&mut buf).unwrap().unwrap();
+                let res: QueryEvent = serde_json::from_str(&s)?;
+
                 match res {
-                    RqliteResult::QueryAssociative { rows, time, .. } => {
-                        for row in rows {
-                            println!(
-                                "{}",
-                                row.values()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("|")
-                            );
-                        }
-                        if let Some(elapsed) = timer.then_some(time).flatten() {
-                            println!("Run Time: real {elapsed}");
-                        }
-                    }
-                    RqliteResult::Query {
-                        values,
-                        time,
-                        columns,
-                        ..
-                    } => {
+                    QueryEvent::Columns(cols) => {
                         if *show_columns {
-                            println!("{}", columns.join("|"));
-                        }
-                        for row in values {
-                            println!(
-                                "{}",
-                                row.iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("|")
-                            );
-                        }
-                        if let Some(elapsed) = timer.then_some(time).flatten() {
-                            println!("Run Time: real {elapsed}");
+                            println!("{}", cols.join("|"));
                         }
                     }
-                    RqliteResult::Error { error } => {
-                        eprintln!("Error: {error}");
+                    QueryEvent::Row { cells, .. } => {
+                        println!(
+                            "{}",
+                            cells
+                                .iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        );
                     }
-                    _ => {}
+                    QueryEvent::EndOfQuery => {
+                        break;
+                    }
+                    QueryEvent::Error(e) => {
+                        eyre::bail!("{e}");
+                    }
                 }
             }
         }
@@ -118,40 +108,6 @@ async fn main() -> eyre::Result<()> {
                 }
             }
         }
-        Command::Sub { where_clause } => {
-            let id = "testing-testing";
-            let mut conn = cli.api_client().subscribe(id, where_clause.clone()).await?;
-
-            while let Some(event) = conn.next().await {
-                match event {
-                    Ok(event) => match event {
-                        SubscriptionMessage::Event { id, event } => match event {
-                            SubscriptionEvent::Change(change) => {
-                                print!(
-                                    "({id}) [{} on '{}'] {{ ",
-                                    change.evt_type.as_str(),
-                                    change.table,
-                                );
-                                for (k, v) in change.pk {
-                                    print!("{k}: {v}");
-                                }
-                                print!(" }} => {{ ");
-                                for (k, v) in change.data {
-                                    print!("{k}: {v}");
-                                }
-                                println!(" }}");
-                            }
-                            SubscriptionEvent::Error { error } => {
-                                eprintln!("Error: {error}");
-                            }
-                        },
-                    },
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                    }
-                }
-            }
-        }
         Command::Reload => {
             command::reload::run(cli.config().api_addr, &cli.config().schema_paths).await?
         }
@@ -161,6 +117,9 @@ async fn main() -> eyre::Result<()> {
                 corro_admin::SyncCommand::Generate,
             ))
             .await?;
+        }
+        Command::Template { template } => {
+            command::tpl::run(cli.api_addr(), template).await?;
         }
     }
 
@@ -261,16 +220,16 @@ enum Command {
         timer: bool,
     },
 
-    Sub {
-        where_clause: Option<String>,
-    },
-
     /// Reload the config
     Reload,
 
     /// Sync-related commands
     #[command(subcommand)]
     Sync(SyncCommand),
+
+    Template {
+        template: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]

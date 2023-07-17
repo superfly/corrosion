@@ -3,14 +3,14 @@ use std::collections::HashMap;
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
-use crate::change::SqliteValue;
+use crate::{change::SqliteValue, pubsub::ChangeType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Statement {
     Simple(String),
+    WithParams(String, Vec<SqliteValue>),
     WithNamedParams(String, HashMap<String, SqliteValue>),
-    WithParams(Vec<SqliteValue>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,6 +40,19 @@ pub enum RqliteResult {
     Error {
         error: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "event", content = "data")]
+pub enum QueryEvent {
+    Columns(Vec<CompactString>),
+    Row {
+        rowid: i64,
+        change_type: ChangeType,
+        cells: Vec<SqliteValue>,
+    },
+    EndOfQuery,
+    Error(CompactString),
 }
 
 #[derive(Default)]

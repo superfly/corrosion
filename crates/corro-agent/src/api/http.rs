@@ -3,20 +3,29 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::Extension;
-use compact_str::{CompactString, ToCompactString};
+use axum::{response::IntoResponse, Extension};
+use bytes::{BufMut, BytesMut};
+use compact_str::ToCompactString;
 use corro_types::{
-    agent::{Agent, ChangeError, KnownDbVersion, SplitPool},
-    api::{QueryResultBuilder, RqliteResponse, RqliteResult, Statement},
+    agent::{Agent, ChangeError, KnownDbVersion},
+    api::{QueryEvent, RqliteResponse, RqliteResult, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
-    change::row_to_change,
+    change::{row_to_change, SqliteValue},
+    pubsub::ChangeType,
     schema::{make_schema_inner, parse_sql},
+    sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
 use rusqlite::{params, params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
-use tokio::task::block_in_place;
-use tracing::{error, info, trace};
+use tokio::{
+    sync::{
+        mpsc::{self, channel},
+        oneshot,
+    },
+    task::block_in_place,
+};
+use tracing::{debug, error, info, trace};
 
 use corro_types::{
     broadcast::{BroadcastInput, Message, MessageV1},
@@ -204,7 +213,7 @@ where
                 while let Some(changes_seqs) = chunked.next() {
                     match changes_seqs {
                         Ok((changes, seqs)) => {
-                            process_subs(&agent, &changes, db_version);
+                            process_subs(&agent, &changes);
 
                             trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
@@ -248,15 +257,7 @@ where
 fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
     match stmt {
         Statement::Simple(q) => tx.execute(&q, []),
-        Statement::WithParams(params) => {
-            let mut params = params.into_iter();
-
-            let first = params.next();
-            match first.as_ref().and_then(|q| q.as_str()) {
-                Some(q) => tx.execute(&q, params_from_iter(params)),
-                None => Ok(0),
-            }
-        }
+        Statement::WithParams(q, params) => tx.execute(&q, params_from_iter(params.into_iter())),
         Statement::WithNamedParams(q, params) => tx.execute(
             &q,
             params
@@ -268,7 +269,7 @@ fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usi
     }
 }
 
-pub async fn api_v1_db_execute(
+pub async fn api_v1_transactions(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Extension(agent): Extension<Agent>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
@@ -343,181 +344,191 @@ pub async fn api_v1_db_execute(
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
     #[error("pool connection acquisition error")]
-    Pool(#[from] bb8::RunError<bb8_rusqlite::Error>),
+    Pool(#[from] SqlitePoolError),
     #[error("sqlite error: {0}")]
     Rusqlite(#[from] rusqlite::Error),
 }
 
-async fn query_statements(
-    pool: &SplitPool,
-    statements: &[Statement],
-    associative: bool,
-) -> Result<Vec<RqliteResult>, QueryError> {
-    let conn = pool.read().await?;
+async fn build_query_rows_response(
+    agent: &Agent,
+    data_tx: mpsc::Sender<QueryEvent>,
+    stmt: Statement,
+) -> Option<(StatusCode, RqliteResult)> {
+    let (res_tx, res_rx) = oneshot::channel();
 
-    let mut results = vec![];
+    let pool = agent.pool().clone();
 
-    block_in_place(|| {
-        for stmt in statements.iter() {
-            let start = Instant::now();
-            let prepped_res = match stmt {
-                Statement::Simple(q) => conn.prepare(q.as_str()),
-                Statement::WithParams(params) => match params.first().and_then(|v| v.as_str()) {
-                    Some(q) => conn.prepare(q),
-                    None => {
-                        let builder = QueryResultBuilder::new(
-                            vec![],
-                            vec![],
-                            Some(start.elapsed().as_secs_f64()),
-                        );
-                        results.push(if associative {
-                            builder.build_associative()
-                        } else {
-                            builder.build_associative()
-                        });
-                        continue;
-                    }
-                },
-                Statement::WithNamedParams(q, _) => conn.prepare(q.as_str()),
-            };
-
-            let mut prepped = match prepped_res {
-                Ok(prepped) => prepped,
-                Err(e) => {
-                    results.push(RqliteResult::Error {
+    tokio::spawn(async move {
+        let conn = match pool.read().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                _ = res_tx.send(Some((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    RqliteResult::Error {
                         error: e.to_string(),
-                    });
-                    continue;
-                }
-            };
+                    },
+                )));
+                return;
+            }
+        };
 
-            let col_names: Vec<CompactString> = prepped
-                .column_names()
-                .into_iter()
-                .map(|s| s.to_compact_string())
-                .collect();
+        let prepped_res = block_in_place(|| match stmt {
+            Statement::Simple(q) => conn.prepare(q.as_str()),
+            Statement::WithParams(q, _) => conn.prepare(q.as_str()),
+            Statement::WithNamedParams(q, _) => conn.prepare(q.as_str()),
+        });
 
-            let col_types: Vec<Option<CompactString>> = prepped
-                .columns()
-                .into_iter()
-                .map(|c| c.decl_type().map(|t| t.to_compact_string()))
-                .collect();
+        let mut prepped = match prepped_res {
+            Ok(prepped) => prepped,
+            Err(e) => {
+                _ = res_tx.send(Some((
+                    StatusCode::BAD_REQUEST,
+                    RqliteResult::Error {
+                        error: e.to_string(),
+                    },
+                )));
+                return;
+            }
+        };
 
-            let rows_res = match stmt {
-                Statement::Simple(_) => prepped.query(()),
-                Statement::WithParams(params) => {
-                    let mut iter = params.iter();
-                    // skip 1
-                    iter.next();
-                    prepped.query(params_from_iter(iter))
-                }
-                Statement::WithNamedParams(_, params) => prepped.query(
-                    params
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
-                        .collect::<Vec<(&str, &dyn ToSql)>>()
-                        .as_slice(),
-                ),
-            };
-            let elapsed = start.elapsed();
+        block_in_place(|| {
+            let col_count = prepped.column_count();
 
-            let sqlite_rows = match rows_res {
+            if let Err(e) = data_tx.blocking_send(QueryEvent::Columns(
+                prepped
+                    .columns()
+                    .into_iter()
+                    .map(|col| col.name().to_compact_string())
+                    .collect(),
+            )) {
+                error!("could not send back columns: {e}");
+                return;
+            }
+
+            let mut rows = match prepped.query(()) {
                 Ok(rows) => rows,
                 Err(e) => {
-                    results.push(RqliteResult::Error {
-                        error: e.to_string(),
-                    });
-                    continue;
+                    _ = res_tx.send(Some((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        RqliteResult::Error {
+                            error: e.to_string(),
+                        },
+                    )));
+                    return;
                 }
             };
 
-            results.push(rows_to_rqlite(
-                sqlite_rows,
-                col_names,
-                col_types,
-                elapsed,
-                associative,
-            ));
-        }
-    });
+            if let Err(_e) = res_tx.send(None) {
+                error!("could not send back response through oneshot channel, aborting");
+                return;
+            }
 
-    Ok(results)
-}
+            let mut rowid = 1;
 
-fn rows_to_rqlite<'stmt>(
-    mut sqlite_rows: rusqlite::Rows<'stmt>,
-    col_names: Vec<CompactString>,
-    col_types: Vec<Option<CompactString>>,
-    elapsed: Duration,
-    associative: bool,
-) -> RqliteResult {
-    let mut builder = QueryResultBuilder::new(col_names, col_types, Some(elapsed.as_secs_f64()));
-
-    loop {
-        match sqlite_rows.next() {
-            Ok(Some(row)) => {
-                if let Err(e) = builder.add_row(row) {
-                    return RqliteResult::Error {
-                        error: e.to_string(),
-                    };
+            loop {
+                match rows.next() {
+                    Ok(Some(row)) => {
+                        match (0..col_count)
+                            .map(|i| row.get::<_, SqliteValue>(i))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                        {
+                            Ok(cells) => {
+                                if let Err(e) = data_tx.blocking_send(QueryEvent::Row {
+                                    change_type: ChangeType::Upsert,
+                                    rowid,
+                                    cells,
+                                }) {
+                                    error!("could not send back row: {e}");
+                                    return;
+                                }
+                                rowid += 1;
+                            }
+                            Err(e) => {
+                                _ = data_tx.blocking_send(QueryEvent::Error(e.to_compact_string()));
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // done!
+                        break;
+                    }
+                    Err(e) => {
+                        _ = data_tx.blocking_send(QueryEvent::Error(e.to_compact_string()));
+                        return;
+                    }
                 }
             }
-            Ok(None) => {
-                break;
-            }
-            Err(e) => {
-                return RqliteResult::Error {
-                    error: e.to_string(),
-                };
-            }
-        }
-    }
+        });
+    });
 
-    if associative {
-        builder.build_associative()
-    } else {
-        builder.build()
+    match res_rx.await {
+        Ok(res) => res,
+        Err(e) => Some((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            RqliteResult::Error {
+                error: e.to_string(),
+            },
+        )),
     }
 }
 
-pub async fn api_v1_db_query(
-    // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+pub async fn api_v1_queries(
     Extension(agent): Extension<Agent>,
-    axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
-) -> (StatusCode, axum::Json<RqliteResponse>) {
-    if statements.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(RqliteResponse {
-                results: vec![RqliteResult::Error {
-                    error: "at least 1 statement is required".into(),
-                }],
-                time: None,
-            }),
-        );
-    }
+    axum::extract::Json(stmt): axum::extract::Json<Statement>,
+) -> impl IntoResponse {
+    let (mut tx, body) = hyper::Body::channel();
 
-    let start = Instant::now();
-    match query_statements(agent.pool(), &statements, false).await {
-        Ok(results) => {
-            let elapsed = start.elapsed();
-            (
-                StatusCode::OK,
-                axum::Json(RqliteResponse {
-                    results,
-                    time: Some(elapsed.as_secs_f64()),
-                }),
-            )
+    // TODO: timeout on data send instead of infinitely waiting for channel space.
+    let (data_tx, mut data_rx) = channel(512);
+
+    tokio::spawn(async move {
+        let mut buf = BytesMut::new();
+
+        while let Some(row_res) = data_rx.recv().await {
+            {
+                let mut writer = (&mut buf).writer();
+                if let Err(e) = serde_json::to_writer(&mut writer, &row_res) {
+                    _ = tx
+                        .send_data(
+                            serde_json::to_vec(&serde_json::json!(QueryEvent::Error(
+                                e.to_compact_string()
+                            )))
+                            .expect("could not serialize error json")
+                            .into(),
+                        )
+                        .await;
+                    return;
+                }
+            }
+
+            buf.extend_from_slice(b"\n");
+
+            if let Err(e) = tx.send_data(buf.split().freeze()).await {
+                error!("could not send data through body's channel: {e}");
+                return;
+            }
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(RqliteResponse {
-                results: vec![RqliteResult::Error {
-                    error: e.to_string(),
-                }],
-                time: None,
-            }),
-        ),
+        debug!("query body channel done");
+    });
+
+    match build_query_rows_response(&agent, data_tx, stmt).await {
+        Some((status, res)) => {
+            return hyper::Response::builder()
+                .status(status)
+                .body(
+                    serde_json::to_vec(&res)
+                        .expect("could not serialize query error response")
+                        .into(),
+                )
+                .expect("could not build query response body");
+        }
+        None => {
+            return hyper::Response::builder()
+                .status(StatusCode::OK)
+                .body(body)
+                .expect("could not build query response body");
+        }
     }
 }
 
@@ -606,8 +617,12 @@ pub async fn api_v1_db_schema(
 #[cfg(test)]
 mod tests {
     use arc_swap::ArcSwap;
-    use corro_types::{actor::ActorId, config::Config, schema::Type, sqlite::CrConnManager};
+    use bytes::Bytes;
+    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, schema::SqliteType};
+    use futures::Stream;
+    use http_body::{combinators::UnsyncBoxBody, Body};
     use tokio::sync::mpsc::{channel, error::TryRecvError};
+    use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
     use uuid::Uuid;
 
@@ -615,20 +630,31 @@ mod tests {
 
     use crate::agent::migrate;
 
+    struct UnsyncBodyStream(std::pin::Pin<Box<UnsyncBoxBody<Bytes, axum::Error>>>);
+
+    impl Stream for UnsyncBodyStream {
+        type Item = Result<Bytes, axum::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.0.as_mut().poll_data(cx)
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn rqlite_db_execute() -> eyre::Result<()> {
+    async fn test_api_db_execute() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
 
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
 
         let dir = tempfile::tempdir()?;
 
-        let rw_pool = bb8::Pool::builder()
-            .max_size(1)
-            .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
+        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
 
         {
-            let mut conn = rw_pool.get().await?;
+            let mut conn = pool.write_priority().await?;
             migrate(&mut conn)?;
         }
 
@@ -637,10 +663,7 @@ mod tests {
 
         let agent = Agent::new(corro_types::agent::AgentConfig {
             actor_id: ActorId(Uuid::new_v4()),
-            ro_pool: bb8::Pool::builder()
-                .max_size(1)
-                .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite"))),
-            rw_pool,
+            pool,
             config: ArcSwap::from_pointee(
                 Config::builder()
                     .db_path(dir.path().join("corrosion.db").display().to_string())
@@ -653,7 +676,6 @@ mod tests {
             members: Default::default(),
             clock: Default::default(),
             bookie: Default::default(),
-            subscribers: Default::default(),
             tx_bcast,
             tx_apply,
             schema: Default::default(),
@@ -668,13 +690,12 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
 
-        let (status_code, body) = api_v1_db_execute(
+        let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::Json(vec![Statement::WithParams(vec![
+            axum::Json(vec![Statement::WithParams(
                 "insert into tests (id, text) values (?,?)".into(),
-                "service-id".into(),
-                "service-name".into(),
-            ])]),
+                vec!["service-id".into(), "service-name".into()],
+            )]),
         )
         .await;
 
@@ -701,13 +722,12 @@ mod tests {
 
         println!("second req...");
 
-        let (status_code, body) = api_v1_db_execute(
+        let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::Json(vec![Statement::WithParams(vec![
+            axum::Json(vec![Statement::WithParams(
                 "update tests SET text = ? where id = ?".into(),
-                "service-name".into(),
-                "service-id".into(),
-            ])]),
+                vec!["service-name".into(), "service-id".into()],
+            )]),
         )
         .await;
 
@@ -724,30 +744,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn test_api_db_schema() -> eyre::Result<()> {
+    async fn test_api_db_query() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
+
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
 
         let dir = tempfile::tempdir()?;
 
-        let rw_pool = bb8::Pool::builder()
-            .max_size(1)
-            .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite")));
+        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
 
         {
-            let mut conn = rw_pool.get().await?;
+            let mut conn = pool.write_priority().await?;
             migrate(&mut conn)?;
-        };
+        }
 
         let (tx_bcast, _rx_bcast) = channel(1);
         let (tx_apply, _rx_apply) = channel(1);
 
         let agent = Agent::new(corro_types::agent::AgentConfig {
             actor_id: ActorId(Uuid::new_v4()),
-            ro_pool: bb8::Pool::builder()
-                .max_size(1)
-                .build_unchecked(CrConnManager::new(dir.path().join("./test.sqlite"))),
-            rw_pool,
+            pool,
             config: ArcSwap::from_pointee(
                 Config::builder()
                     .db_path(dir.path().join("corrosion.db").display().to_string())
@@ -760,7 +776,131 @@ mod tests {
             members: Default::default(),
             clock: Default::default(),
             bookie: Default::default(),
-            subscribers: Default::default(),
+            tx_bcast,
+            tx_apply,
+            schema: Default::default(),
+            tripwire,
+        });
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::Json(vec![
+                Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id".into(), "service-name".into()],
+                ),
+                Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-2".into(), "service-name-2".into()],
+                ),
+            ]),
+        )
+        .await;
+
+        // println!("{body:?}");
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        assert!(body.0.results.len() == 2);
+
+        let res = api_v1_queries(
+            Extension(agent.clone()),
+            axum::Json(Statement::Simple("select * from tests".into())),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut body = res.into_body();
+
+        let mut lines = LinesCodec::new();
+
+        let mut buf = BytesMut::new();
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        let cols: QueryEvent = serde_json::from_str(&s).unwrap();
+
+        assert_eq!(cols, QueryEvent::Columns(vec!["id".into(), "text".into()]));
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        let row: QueryEvent = serde_json::from_str(&s).unwrap();
+
+        assert_eq!(
+            row,
+            QueryEvent::Row {
+                rowid: 1,
+                change_type: ChangeType::Upsert,
+                cells: vec!["service-id".into(), "service-name".into()]
+            }
+        );
+
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        let row: QueryEvent = serde_json::from_str(&s).unwrap();
+
+        assert_eq!(
+            row,
+            QueryEvent::Row {
+                rowid: 2,
+                change_type: ChangeType::Upsert,
+                cells: vec!["service-id-2".into(), "service-name-2".into()]
+            }
+        );
+
+        assert!(body.data().await.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_api_db_schema() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
+        let dir = tempfile::tempdir()?;
+
+        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
+
+        {
+            let mut conn = pool.write_priority().await?;
+            migrate(&mut conn)?;
+        }
+
+        let (tx_bcast, _rx_bcast) = channel(1);
+        let (tx_apply, _rx_apply) = channel(1);
+
+        let agent = Agent::new(corro_types::agent::AgentConfig {
+            actor_id: ActorId(Uuid::new_v4()),
+            pool,
+            config: ArcSwap::from_pointee(
+                Config::builder()
+                    .db_path(dir.path().join("corrosion.db").display().to_string())
+                    .gossip_addr("127.0.0.1:1234".parse()?)
+                    .api_addr("127.0.0.1:8080".parse()?)
+                    .build()?,
+            ),
+            gossip_addr: "127.0.0.1:0".parse().unwrap(),
+            api_addr: "127.0.0.1:0".parse().unwrap(),
+            members: Default::default(),
+            clock: Default::default(),
+            bookie: Default::default(),
             tx_bcast,
             tx_apply,
             schema: Default::default(),
@@ -787,13 +927,13 @@ mod tests {
 
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
-            assert_eq!(id_col.sql_type, Type::Integer);
+            assert_eq!(id_col.sql_type, SqliteType::Integer);
             assert_eq!(id_col.nullable, true);
             assert_eq!(id_col.primary_key, true);
 
             let foo_col = tests.columns.get("foo").unwrap();
             assert_eq!(foo_col.name, "foo");
-            assert_eq!(foo_col.sql_type, Type::Text);
+            assert_eq!(foo_col.sql_type, SqliteType::Text);
             assert_eq!(foo_col.nullable, true);
             assert_eq!(foo_col.primary_key, false);
         }
@@ -817,13 +957,13 @@ mod tests {
 
         let id_col = tests.columns.get("id").unwrap();
         assert_eq!(id_col.name, "id");
-        assert_eq!(id_col.sql_type, Type::Integer);
+        assert_eq!(id_col.sql_type, SqliteType::Integer);
         assert_eq!(id_col.nullable, true);
         assert_eq!(id_col.primary_key, true);
 
         let foo_col = tests.columns.get("foo").unwrap();
         assert_eq!(foo_col.name, "foo");
-        assert_eq!(foo_col.sql_type, Type::Text);
+        assert_eq!(foo_col.sql_type, SqliteType::Text);
         assert_eq!(foo_col.nullable, true);
         assert_eq!(foo_col.primary_key, false);
 
@@ -834,13 +974,13 @@ mod tests {
 
         let id_col = tests.columns.get("id").unwrap();
         assert_eq!(id_col.name, "id");
-        assert_eq!(id_col.sql_type, Type::Integer);
+        assert_eq!(id_col.sql_type, SqliteType::Integer);
         assert_eq!(id_col.nullable, true);
         assert_eq!(id_col.primary_key, true);
 
         let foo_col = tests.columns.get("foo").unwrap();
         assert_eq!(foo_col.name, "foo");
-        assert_eq!(foo_col.sql_type, Type::Text);
+        assert_eq!(foo_col.sql_type, SqliteType::Text);
         assert_eq!(foo_col.nullable, true);
         assert_eq!(foo_col.primary_key, false);
 
