@@ -142,7 +142,7 @@ Options:
 ```
 ### `corrosion exec` example
 
-```
+```sh
 ./corrosion exec --timer "INSERT OR IGNORE INTO sw (machine_id, sandwich) VALUES (1, 'nonsense')"
 ```
 ```
@@ -248,21 +248,47 @@ The command doesn't return, but if I `^C` it and repeatedly `cat` the contents o
 **To note: How to stop it?**
 
 
-## Corrosion command examples
+## More Corrosion command examples
 
-### Add data with `corrosion exec`
 
+#### View the data in all columns of a table
+
+Command:
+```
+./corrosion query --timer --columns "SELECT * FROM tests;"
+```
+
+Output:
+```
+id|foo
+12|nonsense
+15|Woot
+Run Time: real 0.00001162
+```
+### Create a new table
+
+Command:
 ```
 ./corrosion exec "CREATE TABLE sw (machine_id INTEGER PRIMARY KEY, sandwich TEXT);"
 ```
-
-Add to a table!
-
+Output:
 ```
-./corrosion exec "INSERT INTO tests (id, foo) VALUES (15, \"Woot\")"
+Rows affected: 0
 ```
 
-Delete a row!
+### Add a a row to a table
+
+Command:
+```
+./corrosion exec "INSERT INTO sandwiches (machine_id, sandwich) VALUES (15, 'Woot');"
+```
+
+Output:
+```
+Rows affected: 1
+```
+
+### Delete a row
 
 ```
 ./corrosion exec "DELETE FROM tests WHERE id = 12;" 
@@ -270,54 +296,26 @@ Delete a row!
 
 Check it's gone:
 
+Command:
 ```
-$ ./corrosion query --columns --config ./config.example.toml 'SELECT * FROM tests;' 
-id|foo
-123|
-13|HOW
-15|Woot
-Run Time: real 0.00001071
-```
+./corrosion query --columns "SELECT * FROM tests;"
+``` 
 
-
-
-### Query Corrosion's database with `corrosion query`
-
-Look at the contents of the `tests` table:
-
-```
-$  ./corrosion query --timer --columns --config ./config.example.toml 'SELECT * FROM tests;'
-```
-
-Result:
-
+Output:
 ```
 id|foo
-123|
-12|
-13|HOW
 15|Woot
-Run Time: real 0.00001162
 ```
 
+### Check out the internal properties of a table:
 
-
-### Change the value of `foo` to `"boono"` in the row with `id = 1035` in table `tests`
-
+Command:
 ```
-./corrosion exec --timer --config ./config.example.toml "UPDATE tests SET foo = \"boono\" WHERE id = 1035"
+./corrosion query --timer --columns "PRAGMA table_info(tests);" 
 ```
 
-
-
-
-
-### More examples
-
-Check out the internal properties of the table:
-
+Output:
 ```
-$  ./corrosion query --timer --columns --config ./config.example.toml 'PRAGMA table_info(tests);' 
 cid|name|type|notnull|dflt_value|pk
 0|id|BIGINT|0||1
 1|foo|TEXT|0||0
