@@ -60,6 +60,8 @@ Options:
 
 Needs a setting in config, probably to say where to connect to a consul instance. Has a single subcommand `sync`.
 
+This is a command that calls the API on a running Corrosion agent.
+
 ```
 Usage: corrosion consul [OPTIONS] <COMMAND>
 
@@ -154,6 +156,9 @@ Run Time: real 0.000028875
 
 Reload Corrosion's configuration
 
+This is a command that calls the API on a running Corrosion agent.
+
+
 ```
 Usage: corrosion reload [OPTIONS]
 
@@ -171,6 +176,10 @@ Options:
 ## `sync`
 
 "Sync-related commands"
+
+This is a command that calls the API on a running Corrosion agent.
+
+
 ```
 Usage: corrosion sync [OPTIONS] <COMMAND>
 
@@ -213,6 +222,9 @@ $ ./corrosion sync generate
 Use Corrosion's template engine to generate and start updating a local file based on a `.rhai` template file and the latest data from Corrosion.
 
 Specify the name of the `.rhai` template and the desired name for the output file. 
+
+This is a command that calls the API on a running Corrosion agent.
+
 
 ```
 Usage: corrosion template [OPTIONS] [TEMPLATE]...
