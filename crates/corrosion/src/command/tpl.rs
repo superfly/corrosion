@@ -6,20 +6,32 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
+use clap::Args;
 use corro_client::CorrosionApiClient;
+use corro_tpl::{TemplateCommand, TemplateState};
 use futures::{stream::FuturesUnordered, StreamExt};
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
-use rhai_tpl::{TemplateCommand, TemplateWriter};
 use tokio::{
     sync::mpsc::{self, channel, Receiver, Sender},
     task::block_in_place,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<()> {
+#[derive(Args)]
+pub struct TemplateFlags {
+    #[arg(short, long)]
+    once: bool,
+}
+
+pub async fn run(
+    api_addr: SocketAddr,
+    template: &Vec<String>,
+    flags: &TemplateFlags,
+) -> eyre::Result<()> {
     let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
     println!("tracing-filter directives: {directives}");
     let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
@@ -32,7 +44,7 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
         .init();
 
     let client = CorrosionApiClient::new(api_addr);
-    let engine = rhai_tpl::Engine::new(client.clone());
+    let engine = corro_tpl::Engine::new(client);
 
     let mut filepaths = vec![];
 
@@ -85,13 +97,13 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
 
         let engine = engine.clone();
 
+        let once = flags.once;
+
         futs.push(async move {
             let mut checksum = crc32fast::hash(input.as_bytes());
 
             let mut tpl = engine.compile(&input)?;
             let tmp_filepath = dir.path().join(Uuid::new_v4().as_simple().to_string());
-
-            let mut tpl_writer = None;
 
             'outer: loop {
                 let f = tokio::fs::OpenOptions::new()
@@ -100,23 +112,23 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
                     .truncate(true)
                     .open(&tmp_filepath)
                     .await?;
-                let (tx, mut rx) = mpsc::channel(1);
 
-                let new_tpl_writer = TemplateWriter::new(f.into_std().await, tx);
-                let old_tpl_writer = tpl_writer.replace(new_tpl_writer.clone());
+                let f = f.into_std().await;
+
+                let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+                let cancel = CancellationToken::new();
+
+                let _drop_cancel = cancel.clone().drop_guard();
+                let state = TemplateState { cmd_tx, cancel };
 
                 debug!("rendering template...");
 
                 let res = block_in_place(|| {
                     let start = Instant::now();
-                    let res = tpl.render(new_tpl_writer);
+                    let res = tpl.render(f, state);
                     debug!("rendered template in {:?}", start.elapsed());
                     res
                 });
-
-                if let Some(tpl_writer) = old_tpl_writer {
-                    tpl_writer.cancel();
-                }
 
                 if let Err(e) = res {
                     error!("could not render template '{src}': {e}");
@@ -141,6 +153,10 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
                     }
                 }
 
+                if once {
+                    break;
+                }
+
                 loop {
                     enum Branch {
                         Recompile,
@@ -149,7 +165,7 @@ pub async fn run(api_addr: SocketAddr, template: &Vec<String>) -> eyre::Result<(
 
                     let branch = tokio::select! {
                         Some(_) = notify_rx.recv() => Branch::Recompile,
-                        Some(TemplateCommand::Render) = rx.recv() => Branch::Render,
+                        Some(TemplateCommand::Render) = cmd_rx.recv() => Branch::Render,
                         else => {
                             warn!("template renderer is done");
                             break 'outer;
