@@ -76,6 +76,7 @@ async-stream = { version = "0.3.5" }
 smallvec = { version = "1.11.0", features = ["serde", "write", "union"] }
 http-body = "0.4.5"
 eventsource-stream = "0.2.3"
+rhai = { version = "1.15.1", features = ["sync"] }
 
 [profile.release]
 debug = 1

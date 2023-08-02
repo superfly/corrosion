@@ -678,6 +678,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "corro-tpl"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "compact_str 0.7.0",
+ "corro-client",
+ "corro-tests",
+ "corro-types",
+ "csv",
+ "enquote",
+ "futures",
+ "hex",
+ "hostname",
+ "hyper",
+ "indexmap",
+ "parking_lot",
+ "rhai",
+ "rhai-tpl",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "tripwire",
+ "uuid",
+]
+
+[[package]]
 name = "corro-types"
 version = "0.1.0"
 dependencies = [
@@ -742,6 +773,7 @@ dependencies = [
  "corro-agent",
  "corro-client",
  "corro-tests",
+ "corro-tpl",
  "corro-types",
  "crc32fast",
  "eyre",
@@ -761,7 +793,6 @@ dependencies = [
  "quoted-string",
  "rand",
  "rangemap",
- "rhai-tpl",
  "rusqlite",
  "rustls",
  "seahash",
@@ -2513,31 +2544,14 @@ dependencies = [
 name = "rhai-tpl"
 version = "0.1.0"
 dependencies = [
- "bytes",
- "compact_str 0.7.0",
- "corro-client",
- "corro-tests",
- "corro-types",
- "csv",
  "enquote",
- "futures",
- "hex",
- "hostname",
- "hyper",
- "indexmap",
  "logos",
  "parking_lot",
  "rhai",
- "serde",
- "serde_json",
  "tempfile",
  "thiserror",
- "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
- "tripwire",
- "uuid",
 ]
 
 [[package]]

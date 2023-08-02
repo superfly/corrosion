@@ -4,6 +4,7 @@ use admin::AdminConn;
 use bytes::BytesMut;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
+use command::tpl::TemplateFlags;
 use corro_client::CorrosionApiClient;
 use corro_types::{
     api::{QueryEvent, RqliteResult, Statement},
@@ -118,8 +119,8 @@ async fn main() -> eyre::Result<()> {
             ))
             .await?;
         }
-        Command::Template { template } => {
-            command::tpl::run(cli.api_addr(), template).await?;
+        Command::Template { template, flags } => {
+            command::tpl::run(cli.api_addr(), template, flags).await?;
         }
     }
 
@@ -229,6 +230,8 @@ enum Command {
 
     Template {
         template: Vec<String>,
+        #[command(flatten)]
+        flags: TemplateFlags,
     },
 }
 

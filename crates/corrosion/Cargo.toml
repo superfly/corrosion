@@ -59,7 +59,7 @@ trust-dns-resolver = { workspace = true }
 uhlc = { workspace = true }
 uuid = { workspace = true }
 tikv-jemallocator = "0.5"
-rhai-tpl = { path = "../rhai-tpl" }
+corro-tpl = { path = "../corro-tpl" }
 shellwords = { version = "1" }
 notify = { version = "6.0.1", default-features = false, features = ["macos_kqueue"] }
 notify-debouncer-mini = { version = "0.3.0", default-features = false }
