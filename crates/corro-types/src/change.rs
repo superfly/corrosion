@@ -21,7 +21,7 @@ pub struct Change {
     pub db_version: i64,
     pub seq: i64,
     pub site_id: [u8; 16],
-    pub cl: Option<i64>,
+    pub cl: i64,
 }
 
 pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
