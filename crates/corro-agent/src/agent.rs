@@ -1210,7 +1210,7 @@ async fn process_fully_buffered_changes(
             .prepare_cached(
                 "
                 INSERT INTO crsql_changes
-                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id
+                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
                                 AND version = ?
@@ -1442,9 +1442,9 @@ pub async fn process_single_version(
                 tx.prepare_cached(
                     r#"
                         INSERT INTO crsql_changes
-                            ("table", pk, cid, val, col_version, db_version, seq, site_id)
+                            ("table", pk, cid, val, col_version, db_version, seq, site_id, cl)
                         VALUES
-                            (?,       ?,  ?,   ?,   ?,           ?,          ?,    ?)
+                            (?,       ?,  ?,   ?,   ?,           ?,          ?,    ?,      ?)
                     "#,
                 )?
                 .execute(params![
@@ -1455,7 +1455,8 @@ pub async fn process_single_version(
                     change.col_version,
                     change.db_version,
                     change.seq,
-                    &change.site_id
+                    &change.site_id,
+                    change.cl,
                 ])?;
                 let rows_impacted: i64 = tx
                     .prepare_cached("SELECT crsql_rows_impacted()")?
@@ -1839,6 +1840,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 db_version INTEGER NOT NULL,
                 site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
                 seq INTEGER NOT NULL,
+                cl INTEGER, -- causal length
 
                 version INTEGER NOT NULL,
 
