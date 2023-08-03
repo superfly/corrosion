@@ -216,7 +216,7 @@ fn process_version(
             last_seq,
             ts,
         } => {
-            let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()) FROM crsql_changes WHERE site_id IS ? AND db_version = ? ORDER BY seq ASC"#)?;
+            let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()), cl FROM crsql_changes WHERE site_id IS ? AND db_version = ? ORDER BY seq ASC"#)?;
             let site_id: Option<[u8; 16]> = (!is_local)
                 .then_some(actor_id)
                 .map(|actor_id| actor_id.to_bytes());
@@ -263,7 +263,7 @@ fn process_version(
                     let end_seq = cmp::min(range.end(), range_needed.end());
                     debug!("end seq: {end_seq}");
 
-                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id FROM __corro_buffered_changes WHERE site_id = ? AND version = ? AND seq >= ? AND seq <= ?"#)?;
+                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM __corro_buffered_changes WHERE site_id = ? AND version = ? AND seq >= ? AND seq <= ?"#)?;
 
                     let site_id: [u8; 16] = actor_id.to_bytes();
 

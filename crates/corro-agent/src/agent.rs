@@ -1210,7 +1210,7 @@ async fn process_fully_buffered_changes(
             .prepare_cached(
                 "
                 INSERT INTO crsql_changes
-                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id
+                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
                                 AND version = ?
@@ -1332,9 +1332,9 @@ pub async fn process_single_version(
                     inserted += tx.prepare_cached(
                         r#"
                             INSERT INTO __corro_buffered_changes
-                                ("table", pk, cid, val, col_version, db_version, site_id, seq, version)
+                                ("table", pk, cid, val, col_version, db_version, site_id, seq, cl, version)
                             VALUES
-                                (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,   ?)
+                                (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,   ?,  ?)
                             ON CONFLICT (site_id, db_version, version, seq)
                                 DO NOTHING
                         "#,
@@ -1348,6 +1348,7 @@ pub async fn process_single_version(
                         change.db_version,
                         &change.site_id,
                         change.seq,
+                        change.cl,
                         version,
                     ])?;
                 }
@@ -1442,9 +1443,9 @@ pub async fn process_single_version(
                 tx.prepare_cached(
                     r#"
                         INSERT INTO crsql_changes
-                            ("table", pk, cid, val, col_version, db_version, seq, site_id)
+                            ("table", pk, cid, val, col_version, db_version, seq, site_id, cl)
                         VALUES
-                            (?,       ?,  ?,   ?,   ?,           ?,          ?,    ?)
+                            (?,       ?,  ?,   ?,   ?,           ?,          ?,    ?,      ?)
                     "#,
                 )?
                 .execute(params![
@@ -1455,7 +1456,8 @@ pub async fn process_single_version(
                     change.col_version,
                     change.db_version,
                     change.seq,
-                    &change.site_id
+                    &change.site_id,
+                    change.cl,
                 ])?;
                 let rows_impacted: i64 = tx
                     .prepare_cached("SELECT crsql_rows_impacted()")?
@@ -1839,6 +1841,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 db_version INTEGER NOT NULL,
                 site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
                 seq INTEGER NOT NULL,
+                cl INTEGER NOT NULL, -- causal length
 
                 version INTEGER NOT NULL,
 
@@ -2240,9 +2243,9 @@ pub mod tests {
             Ok::<_, eyre::Report>(())
         });
 
-        let ops_count = 4 * count;
+        let changes_count = 8 * count;
 
-        println!("expecting {ops_count} ops");
+        println!("expecting {changes_count} ops");
 
         let start = Instant::now();
 
@@ -2273,17 +2276,17 @@ pub mod tests {
 
                 let actual_count: i64 =
                     conn.query_row("SELECT count(*) FROM crsql_changes;", (), |row| row.get(0))?;
-                info!("actual count: {actual_count}");
+                debug!("actual count: {actual_count}");
 
                 let bookie = ta.agent.bookie();
 
-                info!("last version: {:?}", bookie.last(&ta.agent.actor_id()));
+                debug!("last version: {:?}", bookie.last(&ta.agent.actor_id()));
 
                 let sync = generate_sync(bookie, ta.agent.actor_id());
                 let needed = sync.need_len();
 
-                info!("generated sync: {sync:?}");
-                info!("needed: {needed}");
+                debug!("generated sync: {sync:?}");
+                debug!("needed: {needed}");
 
                 v.push((counts.values().sum::<i64>(), needed));
             }
@@ -2291,7 +2294,8 @@ pub mod tests {
                 println!("got {} actors, expecting {}", v.len(), agents.len());
             }
             if v.len() == agents.len()
-                && v.iter().all(|(n, needed)| *n == ops_count && *needed == 0)
+                && v.iter()
+                    .all(|(n, needed)| *n == changes_count && *needed == 0)
             {
                 break;
             }
@@ -2325,13 +2329,9 @@ pub mod tests {
         // db version 1
         conn.execute("INSERT INTO foo (a) VALUES (1)", ())?;
         // db version 2
-        conn.execute("UPDATE foo SET b = 2 WHERE a = 1;", ())?;
+        conn.execute("DELETE FROM foo;", ())?;
 
-        let db_version: i64 = conn.query_row(
-            "SELECT db_version FROM crsql_changes WHERE site_id IS NULL",
-            (),
-            |row| row.get(0),
-        )?;
+        let db_version: i64 = conn.query_row("SELECT crsql_dbversion();", (), |row| row.get(0))?;
 
         assert_eq!(db_version, 2);
 
