@@ -2329,13 +2329,9 @@ pub mod tests {
         // db version 1
         conn.execute("INSERT INTO foo (a) VALUES (1)", ())?;
         // db version 2
-        conn.execute("UPDATE foo SET b = 2 WHERE a = 1;", ())?;
+        conn.execute("DELETE FROM foo;", ())?;
 
-        let db_version: i64 = conn.query_row(
-            "SELECT db_version FROM crsql_changes WHERE site_id IS NULL",
-            (),
-            |row| row.get(0),
-        )?;
+        let db_version: i64 = conn.query_row("SELECT crsql_dbversion();", (), |row| row.get(0))?;
 
         assert_eq!(db_version, 2);
 
