@@ -2235,7 +2235,7 @@ pub mod tests {
             Ok::<_, eyre::Report>(())
         });
 
-        let changes_count = 8 * count;
+        let changes_count = 4 * count;
 
         println!("expecting {changes_count} ops");
 
@@ -2292,7 +2292,15 @@ pub mod tests {
                 break;
             }
 
-            if start.elapsed() > Duration::from_secs(60) {
+            if start.elapsed() > Duration::from_secs(30) {
+                let conn = agents[0].agent.pool().read().await?;
+                let mut prepped = conn.prepare("SELECT * FROM crsql_changes;")?;
+                let mut rows = prepped.query(())?;
+
+                while let Ok(Some(row)) = rows.next() {
+                    println!("row: {row:?}");
+                }
+
                 panic!(
                     "failed to disseminate all updates to all nodes in {}s",
                     start.elapsed().as_secs_f32()

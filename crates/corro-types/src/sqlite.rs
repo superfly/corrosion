@@ -197,6 +197,7 @@ pub(crate) fn setup_conn(
         r#"
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            PRAGMA recursive_triggers = ON;
         "#,
     )?;
 
