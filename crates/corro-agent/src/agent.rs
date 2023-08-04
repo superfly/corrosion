@@ -464,7 +464,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     });
 
     tokio::spawn({
-        let self_actor_id = agent.actor_id();
         let pool = agent.pool().clone();
         let bookie = agent.bookie().clone();
         async move {
@@ -481,16 +480,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         read.current_versions()
                     };
 
-                    let site_id = if actor_id == self_actor_id {
-                        None
-                    } else {
-                        Some(actor_id.to_bytes())
-                    };
-
                     let res = block_in_place(|| {
                         let to_clear = {
                             let conn = pool.read_blocking()?;
-                            match compact_booked_for_actor(&conn, site_id, &versions) {
+                            match compact_booked_for_actor(&conn, &versions) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
                                         return Ok(());
@@ -797,12 +790,11 @@ pub async fn handle_broadcast(
 
 fn compact_booked_for_actor(
     conn: &Connection,
-    site_id: Option<[u8; 16]>,
     versions: &BTreeMap<i64, i64>,
 ) -> eyre::Result<HashSet<i64>> {
     // TODO: optimize that in a single query once cr-sqlite supports aggregation
 
-    let still_live: HashSet<i64> = conn.prepare_cached("SELECT DISTINCT(db_version) FROM crsql_changes WHERE site_id IS ? AND db_version >= ? AND db_version <= ?;")?.query_map(params![site_id, versions.first_key_value().map(|(db_v, _v)| *db_v), versions.last_key_value().map(|(db_v, _v)| *db_v)], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let still_live: HashSet<i64> = conn.prepare_cached("SELECT db_version FROM crsql_dbversions_count WHERE db_version >= ? AND db_version <= ?;")?.query_map(params![versions.first_key_value().map(|(db_v, _v)| *db_v), versions.last_key_value().map(|(db_v, _v)| *db_v)], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
 
     let keys: HashSet<i64> = versions.keys().copied().collect();
 
@@ -2243,7 +2235,7 @@ pub mod tests {
             Ok::<_, eyre::Report>(())
         });
 
-        let changes_count = 8 * count;
+        let changes_count = 4 * count;
 
         println!("expecting {changes_count} ops");
 
@@ -2300,7 +2292,15 @@ pub mod tests {
                 break;
             }
 
-            if start.elapsed() > Duration::from_secs(60) {
+            if start.elapsed() > Duration::from_secs(30) {
+                let conn = agents[0].agent.pool().read().await?;
+                let mut prepped = conn.prepare("SELECT * FROM crsql_changes;")?;
+                let mut rows = prepped.query(())?;
+
+                while let Ok(Some(row)) = rows.next() {
+                    println!("row: {row:?}");
+                }
+
                 panic!(
                     "failed to disseminate all updates to all nodes in {}s",
                     start.elapsed().as_secs_f32()
@@ -2335,7 +2335,7 @@ pub mod tests {
 
         assert_eq!(db_version, 2);
 
-        let diff = compact_booked_for_actor(&conn, None, &vec![(1, 1)].into_iter().collect())?;
+        let diff = compact_booked_for_actor(&conn, &vec![(1, 1)].into_iter().collect())?;
 
         assert!(diff.contains(&1));
         assert!(!diff.contains(&2));
