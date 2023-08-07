@@ -72,6 +72,7 @@ use uuid::Uuid;
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
+const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct AgentOptions {
     actor_id: ActorId,
@@ -103,22 +104,22 @@ pub async fn setup(
         let conn = Connection::open(&conf.db_path)?;
 
         trace!("got actor_id setup conn");
-        let crsql_siteid = conn
-            .query_row("SELECT site_id FROM __crsql_siteid LIMIT 1;", [], |row| {
+        let crsql_site_id = conn
+            .query_row("SELECT site_id FROM crsql_site_id LIMIT 1;", [], |row| {
                 row.get::<_, ActorId>(0)
             })
             .optional()?
             .unwrap_or(ActorId(Uuid::nil()));
 
-        debug!("crsql_siteid as ActorId: {crsql_siteid:?}");
+        debug!("crsql_site_id as ActorId: {crsql_site_id:?}");
 
-        if crsql_siteid != actor_id {
+        if crsql_site_id != actor_id {
             warn!(
-                "mismatched crsql_siteid {} and actor_id from file {}, override crsql's",
-                crsql_siteid, actor_id
+                "mismatched crsql_site_id {} and actor_id from file {}, override crsql's",
+                crsql_site_id, actor_id
             );
             conn.execute(
-                "UPDATE __crsql_siteid SET site_id = ?;",
+                "UPDATE crsql_site_id SET site_id = ?;",
                 [actor_id.to_bytes()],
             )?;
         }
@@ -469,7 +470,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             let pool = agent.pool();
             let bookie = agent.bookie();
             loop {
-                sleep(Duration::from_secs(300)).await;
+                sleep(COMPACT_BOOKED_INTERVAL).await;
 
                 let tables = agent.schema().read().tables.keys().cloned().collect();
                 let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
@@ -1249,7 +1250,7 @@ async fn process_fully_buffered_changes(
 
         let known_version = if rows_impacted > 0 {
             let db_version: i64 =
-                tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
+                tx.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
             debug!("db version: {db_version}");
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
@@ -1437,7 +1438,7 @@ pub async fn process_single_version(
             }
 
             let db_version: i64 =
-                tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
+                tx.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
 
             let mut impactful_changeset = vec![];
 
@@ -1945,13 +1946,13 @@ pub mod tests {
         let body: RqliteResponse =
             serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
 
-        let dbversion: i64 =
+        let db_version: i64 =
             ta1.agent
                 .pool()
                 .read()
                 .await?
-                .query_row("SELECT crsql_dbversion();", (), |row| row.get(0))?;
-        assert_eq!(dbversion, 1);
+                .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
+        assert_eq!(db_version, 1);
 
         println!("body: {body:?}");
 
@@ -2089,13 +2090,13 @@ pub mod tests {
         )
         .await??;
 
-        let dbversion: i64 =
+        let db_version: i64 =
             ta1.agent
                 .pool()
                 .read()
                 .await?
-                .query_row("SELECT crsql_dbversion();", (), |row| row.get(0))?;
-        assert_eq!(dbversion, 3);
+                .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
+        assert_eq!(db_version, 3);
 
         let expected_count: i64 =
             ta1.agent
@@ -2267,7 +2268,7 @@ pub mod tests {
                 let conn = ta.agent.pool().read().await?;
                 let counts: HashMap<ActorId, i64> = conn
                     .prepare_cached(
-                        "SELECT COALESCE(site_id, crsql_siteid()), count(*) FROM crsql_changes GROUP BY site_id;",
+                        "SELECT COALESCE(site_id, crsql_site_id()), count(*) FROM crsql_changes GROUP BY site_id;",
                     )?
                     .query_map([], |row| {
                         Ok((
@@ -2344,7 +2345,7 @@ pub mod tests {
         // db version 2
         conn.execute("DELETE FROM foo;", ())?;
 
-        let db_version: i64 = conn.query_row("SELECT crsql_dbversion();", (), |row| row.get(0))?;
+        let db_version: i64 = conn.query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
 
         assert_eq!(db_version, 2);
 
@@ -2390,13 +2391,13 @@ pub mod tests {
 
         println!("body: {body:?}");
 
-        let dbversion: i64 =
+        let db_version: i64 =
             ta1.agent
                 .pool()
                 .read()
                 .await?
-                .query_row("SELECT crsql_dbversion();", (), |row| row.get(0))?;
-        assert_eq!(dbversion, 1);
+                .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
+        assert_eq!(db_version, 1);
 
         sleep(Duration::from_secs(5)).await;
 

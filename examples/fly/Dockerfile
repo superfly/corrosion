@@ -24,13 +24,9 @@ RUN --mount=type=cache,target=/usr/local/cargo,from=rust:latest,source=/usr/loca
     --mount=type=cache,target=target \
     cargo build --release && mv target/release/corrosion ./
 
-# just sqlite3
-FROM keinos/sqlite3:3.42.0 as sqlite3
-
 # Runtime image
 FROM debian:bullseye-slim
 
-COPY --from=sqlite3 /usr/bin/sqlite3 /usr/bin/sqlite3
 COPY --from=builder /usr/local/bin/nperf /usr/local/bin/nperf
 
 # Run as "corrosion" user
