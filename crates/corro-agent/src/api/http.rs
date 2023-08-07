@@ -147,7 +147,7 @@ where
         let ts = Timestamp::from(agent.clock().new_timestamp());
 
         let db_version: i64 = tx
-            .prepare_cached("SELECT crsql_nextdbversion()")?
+            .prepare_cached("SELECT crsql_next_db_version()")?
             .query_row((), |row| row.get(0))?;
 
         let has_changes: bool = tx
@@ -207,7 +207,7 @@ where
             let conn = agent.pool().read().await?;
 
             block_in_place(|| {
-                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#)?;
+                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#)?;
                 let rows = prepped.query_map([db_version], row_to_change)?;
                 let mut chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_PER_MESSAGE);
                 while let Some(changes_seqs) = chunked.next() {

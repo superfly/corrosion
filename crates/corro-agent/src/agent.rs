@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     fmt,
     net::SocketAddr,
@@ -72,6 +72,7 @@ use uuid::Uuid;
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
+const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct AgentOptions {
     actor_id: ActorId,
@@ -103,22 +104,22 @@ pub async fn setup(
         let conn = Connection::open(&conf.db_path)?;
 
         trace!("got actor_id setup conn");
-        let crsql_siteid = conn
-            .query_row("SELECT site_id FROM __crsql_siteid LIMIT 1;", [], |row| {
+        let crsql_site_id = conn
+            .query_row("SELECT site_id FROM crsql_site_id LIMIT 1;", [], |row| {
                 row.get::<_, ActorId>(0)
             })
             .optional()?
             .unwrap_or(ActorId(Uuid::nil()));
 
-        debug!("crsql_siteid as ActorId: {crsql_siteid:?}");
+        debug!("crsql_site_id as ActorId: {crsql_site_id:?}");
 
-        if crsql_siteid != actor_id {
+        if crsql_site_id != actor_id {
             warn!(
-                "mismatched crsql_siteid {} and actor_id from file {}, override crsql's",
-                crsql_siteid, actor_id
+                "mismatched crsql_site_id {} and actor_id from file {}, override crsql's",
+                crsql_site_id, actor_id
             );
             conn.execute(
-                "UPDATE __crsql_siteid SET site_id = ?;",
+                "UPDATE crsql_site_id SET site_id = ?;",
                 [actor_id.to_bytes()],
             )?;
         }
@@ -464,12 +465,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     });
 
     tokio::spawn({
-        let pool = agent.pool().clone();
-        let bookie = agent.bookie().clone();
+        let agent = agent.clone();
         async move {
+            let pool = agent.pool();
+            let bookie = agent.bookie();
             loop {
-                sleep(Duration::from_secs(300)).await;
+                sleep(COMPACT_BOOKED_INTERVAL).await;
 
+                let tables = agent.schema().read().tables.keys().cloned().collect();
                 let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
 
                 for actor_id in to_check {
@@ -480,10 +483,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         read.current_versions()
                     };
 
+                    if versions.is_empty() {
+                        continue;
+                    }
+
                     let res = block_in_place(|| {
                         let to_clear = {
                             let conn = pool.read_blocking()?;
-                            match compact_booked_for_actor(&conn, &versions) {
+                            match compact_booked_for_actor(&conn, &tables, &versions) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
                                         return Ok(());
@@ -504,9 +511,19 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ?")?
                             .execute([actor_id])?;
 
+                        let mut new_copy = booked.read().clone();
+
+                        let cleared_len = to_clear.len();
+
+                        for db_version in to_clear {
+                            if let Some(version) = versions.get(&db_version) {
+                                new_copy.insert(*version..=*version, KnownDbVersion::Cleared);
+                            }
+                        }
+
                         let mut inserted = 0;
 
-                        for (range, known) in booked.read().iter() {
+                        for (range, known) in new_copy.iter() {
                             match known {
                                 KnownDbVersion::Current {
                                     db_version,
@@ -529,13 +546,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         info!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
                         let mut bookedw = booked.write();
-                        let cleared_len = to_clear.len();
-                        for db_version in to_clear {
-                            if let Some(version) = versions.get(&db_version) {
-                                bookedw.insert(*version, KnownDbVersion::Cleared);
-                            }
-                        }
-                        info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}");
+                        **bookedw.inner_mut() = new_copy;
+                        info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
 
                         Ok::<_, eyre::Report>(())
                     });
@@ -790,11 +802,28 @@ pub async fn handle_broadcast(
 
 fn compact_booked_for_actor(
     conn: &Connection,
+    tables: &BTreeSet<String>,
     versions: &BTreeMap<i64, i64>,
 ) -> eyre::Result<HashSet<i64>> {
     // TODO: optimize that in a single query once cr-sqlite supports aggregation
 
-    let still_live: HashSet<i64> = conn.prepare_cached("SELECT db_version FROM crsql_dbversions_count WHERE db_version >= ? AND db_version <= ?;")?.query_map(params![versions.first_key_value().map(|(db_v, _v)| *db_v), versions.last_key_value().map(|(db_v, _v)| *db_v)], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let (first, last) = match (
+        versions.first_key_value().map(|(db_v, _v)| *db_v),
+        versions.last_key_value().map(|(db_v, _v)| *db_v),
+    ) {
+        (Some(first), Some(last)) => (first, last),
+        _ => return Ok(HashSet::new()),
+    };
+
+    let still_live: HashSet<i64> = conn
+        .prepare(&format!(
+            "SELECT db_version FROM ({});",
+            tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table}__crsql_clock WHERE db_version >= {first} AND db_version <= {last}")).collect::<Vec<_>>().join(" UNION ")
+        ))?
+        .query_map([],
+            |row| row.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
 
     let keys: HashSet<i64> = versions.keys().copied().collect();
 
@@ -1236,7 +1265,7 @@ async fn process_fully_buffered_changes(
 
         let known_version = if rows_impacted > 0 {
             let db_version: i64 =
-                tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
+                tx.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
             debug!("db version: {db_version}");
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
@@ -1424,7 +1453,7 @@ pub async fn process_single_version(
             }
 
             let db_version: i64 =
-                tx.query_row("SELECT crsql_nextdbversion()", (), |row| row.get(0))?;
+                tx.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
 
             let mut impactful_changeset = vec![];
 
@@ -1932,13 +1961,13 @@ pub mod tests {
         let body: RqliteResponse =
             serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
 
-        let dbversion: i64 =
+        let db_version: i64 =
             ta1.agent
                 .pool()
                 .read()
                 .await?
-                .query_row("SELECT crsql_dbversion();", (), |row| row.get(0))?;
-        assert_eq!(dbversion, 1);
+                .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
+        assert_eq!(db_version, 1);
 
         println!("body: {body:?}");
 
@@ -2076,13 +2105,13 @@ pub mod tests {
         )
         .await??;
 
-        let dbversion: i64 =
+        let db_version: i64 =
             ta1.agent
                 .pool()
                 .read()
                 .await?
-                .query_row("SELECT crsql_dbversion();", (), |row| row.get(0))?;
-        assert_eq!(dbversion, 3);
+                .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
+        assert_eq!(db_version, 3);
 
         let expected_count: i64 =
             ta1.agent
@@ -2254,7 +2283,7 @@ pub mod tests {
                 let conn = ta.agent.pool().read().await?;
                 let counts: HashMap<ActorId, i64> = conn
                     .prepare_cached(
-                        "SELECT COALESCE(site_id, crsql_siteid()), count(*) FROM crsql_changes GROUP BY site_id;",
+                        "SELECT COALESCE(site_id, crsql_site_id()), count(*) FROM crsql_changes GROUP BY site_id;",
                     )?
                     .query_map([], |row| {
                         Ok((
@@ -2331,11 +2360,15 @@ pub mod tests {
         // db version 2
         conn.execute("DELETE FROM foo;", ())?;
 
-        let db_version: i64 = conn.query_row("SELECT crsql_dbversion();", (), |row| row.get(0))?;
+        let db_version: i64 = conn.query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
 
         assert_eq!(db_version, 2);
 
-        let diff = compact_booked_for_actor(&conn, &vec![(1, 1)].into_iter().collect())?;
+        let diff = compact_booked_for_actor(
+            &conn,
+            &vec!["foo".to_string()].into_iter().collect(),
+            &vec![(1, 1)].into_iter().collect(),
+        )?;
 
         assert!(diff.contains(&1));
         assert!(!diff.contains(&2));
@@ -2373,13 +2406,13 @@ pub mod tests {
 
         println!("body: {body:?}");
 
-        let dbversion: i64 =
+        let db_version: i64 =
             ta1.agent
                 .pool()
                 .read()
                 .await?
-                .query_row("SELECT crsql_dbversion();", (), |row| row.get(0))?;
-        assert_eq!(dbversion, 1);
+                .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
+        assert_eq!(db_version, 1);
 
         sleep(Duration::from_secs(5)).await;
 

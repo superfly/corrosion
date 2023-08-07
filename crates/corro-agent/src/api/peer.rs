@@ -216,7 +216,7 @@ fn process_version(
             last_seq,
             ts,
         } => {
-            let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_siteid()), cl FROM crsql_changes WHERE site_id IS ? AND db_version = ? ORDER BY seq ASC"#)?;
+            let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS ? AND db_version = ? ORDER BY seq ASC"#)?;
             let site_id: Option<[u8; 16]> = (!is_local)
                 .then_some(actor_id)
                 .map(|actor_id| actor_id.to_bytes());
