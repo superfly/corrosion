@@ -604,6 +604,10 @@ impl<'a> BookWriter<'a> {
     pub fn inner(&self) -> &RwLockWriteGuard<'a, BookedVersions> {
         &self.0
     }
+
+    pub fn inner_mut(&mut self) -> &mut RwLockWriteGuard<'a, BookedVersions> {
+        &mut self.0
+    }
 }
 
 pub type BookieInner = Arc<RwLock<HashMap<ActorId, Booked>>>;

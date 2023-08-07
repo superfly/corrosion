@@ -72,7 +72,7 @@ use uuid::Uuid;
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
-const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(300);
+const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct AgentOptions {
     actor_id: ActorId,
@@ -511,9 +511,19 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ?")?
                             .execute([actor_id])?;
 
+                        let mut new_copy = booked.read().clone();
+
+                        let cleared_len = to_clear.len();
+
+                        for db_version in to_clear {
+                            if let Some(version) = versions.get(&db_version) {
+                                new_copy.insert(*version..=*version, KnownDbVersion::Cleared);
+                            }
+                        }
+
                         let mut inserted = 0;
 
-                        for (range, known) in booked.read().iter() {
+                        for (range, known) in new_copy.iter() {
                             match known {
                                 KnownDbVersion::Current {
                                     db_version,
@@ -536,13 +546,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         info!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
                         let mut bookedw = booked.write();
-                        let cleared_len = to_clear.len();
-                        for db_version in to_clear {
-                            if let Some(version) = versions.get(&db_version) {
-                                bookedw.insert(*version, KnownDbVersion::Cleared);
-                            }
-                        }
-                        info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}");
+                        **bookedw.inner_mut() = new_copy;
+                        info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
 
                         Ok::<_, eyre::Report>(())
                     });
@@ -812,8 +817,8 @@ fn compact_booked_for_actor(
 
     let still_live: HashSet<i64> = conn
         .prepare(&format!(
-            "SELECT db_version, COUNT(*) FROM ({}) GROUP BY db_version;",
-            tables.iter().map(|table| format!("SELECT __crsql_db_version AS db_version FROM {table}__crsql_clock WHERE db_version >= {first} AND db_version <= {last}")).collect::<Vec<_>>().join(" UNION ALL ")
+            "SELECT db_version FROM ({});",
+            tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table}__crsql_clock WHERE db_version >= {first} AND db_version <= {last}")).collect::<Vec<_>>().join(" UNION ")
         ))?
         .query_map([],
             |row| row.get(0),
