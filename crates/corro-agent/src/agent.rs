@@ -483,6 +483,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         read.current_versions()
                     };
 
+                    if versions.is_empty() {
+                        continue;
+                    }
+
                     let res = block_in_place(|| {
                         let to_clear = {
                             let conn = pool.read_blocking()?;
@@ -798,12 +802,18 @@ fn compact_booked_for_actor(
 ) -> eyre::Result<HashSet<i64>> {
     // TODO: optimize that in a single query once cr-sqlite supports aggregation
 
-    // "WHERE db_version >= ? AND db_version <= ?"
+    let (first, last) = match (
+        versions.first_key_value().map(|(db_v, _v)| *db_v),
+        versions.last_key_value().map(|(db_v, _v)| *db_v),
+    ) {
+        (Some(first), Some(last)) => (first, last),
+        _ => return Ok(HashSet::new()),
+    };
 
     let still_live: HashSet<i64> = conn
         .prepare(&format!(
             "SELECT db_version, COUNT(*) FROM ({}) GROUP BY db_version;",
-            tables.iter().map(|table| format!("SELECT __crsql_db_version AS db_version FROM {table}__crsql_clock WHERE db_version >= {} AND db_version <= {}", versions.first_key_value().map(|(db_v, _v)| *db_v).unwrap(), versions.last_key_value().map(|(db_v, _v)| *db_v).unwrap())).collect::<Vec<_>>().join(" UNION ALL ")
+            tables.iter().map(|table| format!("SELECT __crsql_db_version AS db_version FROM {table}__crsql_clock WHERE db_version >= {first} AND db_version <= {last}")).collect::<Vec<_>>().join(" UNION ALL ")
         ))?
         .query_map([],
             |row| row.get(0),
