@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     fmt,
     net::SocketAddr,
@@ -464,12 +464,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     });
 
     tokio::spawn({
-        let pool = agent.pool().clone();
-        let bookie = agent.bookie().clone();
+        let agent = agent.clone();
         async move {
+            let pool = agent.pool();
+            let bookie = agent.bookie();
             loop {
                 sleep(Duration::from_secs(300)).await;
 
+                let tables = agent.schema().read().tables.keys().cloned().collect();
                 let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
 
                 for actor_id in to_check {
@@ -483,7 +485,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     let res = block_in_place(|| {
                         let to_clear = {
                             let conn = pool.read_blocking()?;
-                            match compact_booked_for_actor(&conn, &versions) {
+                            match compact_booked_for_actor(&conn, &tables, &versions) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
                                         return Ok(());
@@ -790,11 +792,22 @@ pub async fn handle_broadcast(
 
 fn compact_booked_for_actor(
     conn: &Connection,
+    tables: &BTreeSet<String>,
     versions: &BTreeMap<i64, i64>,
 ) -> eyre::Result<HashSet<i64>> {
     // TODO: optimize that in a single query once cr-sqlite supports aggregation
 
-    let still_live: HashSet<i64> = conn.prepare_cached("SELECT db_version FROM crsql_dbversions_count WHERE db_version >= ? AND db_version <= ?;")?.query_map(params![versions.first_key_value().map(|(db_v, _v)| *db_v), versions.last_key_value().map(|(db_v, _v)| *db_v)], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+    // "WHERE db_version >= ? AND db_version <= ?"
+
+    let still_live: HashSet<i64> = conn
+        .prepare(&format!(
+            "SELECT db_version, COUNT(*) FROM ({}) GROUP BY db_version;",
+            tables.iter().map(|table| format!("SELECT __crsql_db_version AS db_version FROM {table}__crsql_clock WHERE db_version >= {} AND db_version <= {}", versions.first_key_value().map(|(db_v, _v)| *db_v).unwrap(), versions.last_key_value().map(|(db_v, _v)| *db_v).unwrap())).collect::<Vec<_>>().join(" UNION ALL ")
+        ))?
+        .query_map([],
+            |row| row.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
 
     let keys: HashSet<i64> = versions.keys().copied().collect();
 
@@ -2335,7 +2348,11 @@ pub mod tests {
 
         assert_eq!(db_version, 2);
 
-        let diff = compact_booked_for_actor(&conn, &vec![(1, 1)].into_iter().collect())?;
+        let diff = compact_booked_for_actor(
+            &conn,
+            &vec!["foo".to_string()].into_iter().collect(),
+            &vec![(1, 1)].into_iter().collect(),
+        )?;
 
         assert!(diff.contains(&1));
         assert!(!diff.contains(&2));
