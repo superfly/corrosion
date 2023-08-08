@@ -6,10 +6,7 @@ use futures::{SinkExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
 use time::OffsetDateTime;
-use tokio::{
-    net::{UnixListener, UnixStream},
-    task::block_in_place,
-};
+use tokio::net::{UnixListener, UnixStream};
 use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
@@ -76,7 +73,7 @@ pub fn start_server(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
-    Backup { path: String },
+    Ping,
     Sync(SyncCommand),
 }
 
@@ -142,18 +139,9 @@ async fn handle_conn(
     loop {
         match stream.try_next().await {
             Ok(Some(cmd)) => match cmd {
-                Command::Backup { path } => {
-                    info_log(&mut stream, "Starting backup procedure...").await;
-                    match handle_backup(&agent, path).await {
-                        Ok(_) => {
-                            send_success(&mut stream).await;
-                        }
-                        Err(e) => {
-                            send_error(&mut stream, e).await;
-                        }
-                    }
-                }
+                Command::Ping => send_success(&mut stream).await,
                 Command::Sync(SyncCommand::Generate) => {
+                    info_log(&mut stream, "generating sync...").await;
                     let sync_state = generate_sync(agent.bookie(), agent.actor_id());
                     match serde_json::to_value(&sync_state) {
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
@@ -182,12 +170,6 @@ pub enum BackupError {
     Pool(#[from] SqlitePoolError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-}
-
-async fn handle_backup(agent: &Agent, path: String) -> Result<(), BackupError> {
-    let conn = agent.pool().read().await?;
-    block_in_place(|| conn.execute("VACUUM INTO ?;", [&path]))?;
-    Ok(())
 }
 
 async fn send(stream: &mut FramedStream, res: Response) {

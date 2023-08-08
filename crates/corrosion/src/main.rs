@@ -14,6 +14,7 @@ use futures::StreamExt;
 use once_cell::sync::OnceCell;
 use rusqlite::Connection;
 use tokio_util::codec::{Decoder, LinesCodec};
+use tracing::debug;
 
 pub mod admin;
 pub mod command;
@@ -59,18 +60,31 @@ async fn main() -> eyre::Result<()> {
 
                 for table in tables {
                     let n = conn.execute(&format!("UPDATE \"{table}\" SET __crsql_site_id = ? WHERE __crsql_site_id IS NULL"), [ordinal])?;
-                    println!("update {n} in {table}");
+                    debug!("updated {n} rows in {table}");
                 }
 
                 conn.execute_batch(
                     r#"
                     PRAGMA journal_mode = WAL; -- so the restore can be done online
+                    PRAGMA wal_checkpoint(TRUNCATE);
                     "#,
                 )?;
             }
+
+            println!("successfully cleaned for restoration and backed up database to {path}");
         }
         Command::Restore { path } => {
-            sqlite3_restore::restore(&path, &cli.config().db_path, Duration::from_secs(30))?;
+            if AdminConn::connect(cli.admin_path()).await.is_ok() {
+                eyre::bail!("corrosion is currently running, shut it down before restoring!");
+            }
+
+            let restored =
+                sqlite3_restore::restore(&path, &cli.config().db_path, Duration::from_secs(30))?;
+
+            println!(
+                "successfully restored! old size: {}, new size: {}",
+                restored.old_len, restored.new_len
+            );
         }
         Command::Consul(cmd) => match cmd {
             ConsulCommand::Sync => match cli.config().consul.as_ref() {
