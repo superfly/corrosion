@@ -49,7 +49,7 @@ use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, Transaction};
 use spawn::spawn_counted;
 use strum::FromRepr;
 use tokio::{
@@ -68,7 +68,6 @@ use trust_dns_resolver::{
     error::ResolveErrorKind,
     proto::rr::{RData, RecordType},
 };
-use uuid::Uuid;
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
@@ -84,46 +83,20 @@ pub struct AgentOptions {
     tripwire: Tripwire,
 }
 
-pub async fn setup(
-    actor_id: ActorId,
-    conf: Config,
-    tripwire: Tripwire,
-) -> eyre::Result<(Agent, AgentOptions)> {
+pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, AgentOptions)> {
     debug!("setting up corrosion @ {}", conf.db_path);
 
     if let Some(parent) = conf.db_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    {
-        {
-            let mut conn = CrConn(Connection::open(&conf.db_path)?);
-            init_cr_conn(&mut conn)?;
-        }
-
-        let conn = Connection::open(&conf.db_path)?;
-
-        trace!("got actor_id setup conn");
-        let crsql_site_id = conn
-            .query_row("SELECT site_id FROM crsql_site_id LIMIT 1;", [], |row| {
-                row.get::<_, ActorId>(0)
-            })
-            .optional()?
-            .unwrap_or(ActorId(Uuid::nil()));
-
-        debug!("crsql_site_id as ActorId: {crsql_site_id:?}");
-
-        if crsql_site_id != actor_id {
-            warn!(
-                "mismatched crsql_site_id {} and actor_id from file {}, override crsql's",
-                crsql_site_id, actor_id
-            );
-            conn.execute(
-                "UPDATE crsql_site_id SET site_id = ?;",
-                [actor_id.to_bytes()],
-            )?;
-        }
-    }
+    let actor_id = {
+        let mut conn = CrConn(Connection::open(&conf.db_path)?);
+        init_cr_conn(&mut conn)?;
+        conn.query_row("SELECT crsql_site_id();", [], |row| {
+            row.get::<_, ActorId>(0)
+        })?
+    };
 
     info!("Actor ID: {}", actor_id);
 
@@ -269,8 +242,8 @@ pub async fn setup(
     Ok((agent, opts))
 }
 
-pub async fn start(actor_id: ActorId, conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
-    let (agent, opts) = setup(actor_id, conf, tripwire.clone()).await?;
+pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
+    let (agent, opts) = setup(conf, tripwire.clone()).await?;
 
     tokio::spawn(run(agent.clone(), opts).inspect(|_| info!("corrosion agent run is done")));
 

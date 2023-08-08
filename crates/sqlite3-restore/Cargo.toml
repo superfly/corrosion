@@ -1,0 +1,13 @@
+[package]
+name = "sqlite3-restore"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nix = "*"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
+tempfile = { workspace = true }

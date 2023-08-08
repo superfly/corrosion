@@ -2,13 +2,11 @@ use std::sync::Arc;
 
 use corro_agent::agent::start;
 use corro_types::{
-    actor::ActorId,
     agent::Agent,
     config::{Config, ConfigBuilder, ConfigBuilderError},
 };
 use tempfile::TempDir;
 use tripwire::Tripwire;
-use uuid::Uuid;
 
 pub const TEST_SCHEMA: &str = r#"
         CREATE TABLE IF NOT EXISTS tests (
@@ -51,11 +49,9 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
     tokio::fs::create_dir(&schema_path).await?;
     tokio::fs::write(schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes()).await?;
 
-    let actor_id = ActorId(Uuid::new_v4());
-
     let schema_paths = conf.schema_paths.clone();
 
-    let agent = start(actor_id, conf, tripwire).await?;
+    let agent = start(conf, tripwire).await?;
 
     {
         let client = corro_client::CorrosionApiClient::new(agent.api_addr());
