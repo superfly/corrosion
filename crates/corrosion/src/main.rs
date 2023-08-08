@@ -63,6 +63,8 @@ async fn main() -> eyre::Result<()> {
                     debug!("updated {n} rows in {table}");
                 }
 
+                conn.execute("DELETE FROM __corro_members;", [])?;
+
                 conn.execute_batch(
                     r#"
                     PRAGMA journal_mode = WAL; -- so the restore can be done online
