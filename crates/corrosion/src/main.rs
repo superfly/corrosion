@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use admin::AdminConn;
 use bytes::BytesMut;
@@ -12,6 +12,7 @@ use corro_types::{
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
+use rusqlite::Connection;
 use tokio_util::codec::{Decoder, LinesCodec};
 
 pub mod admin;
@@ -31,6 +32,46 @@ async fn main() -> eyre::Result<()> {
 
     match &cli.command {
         Command::Agent => command::agent::run(cli.config(), &cli.config_path).await?,
+        Command::Backup { path } => {
+            let conf = cli.config();
+
+            {
+                let conn = Connection::open(&conf.db_path)?;
+                conn.execute("VACUUM INTO ?;", [&path])?;
+            }
+
+            {
+                let conn = Connection::open(&path)?;
+
+                let site_id: [u8; 16] = conn.query_row(
+                    "DELETE FROM crsql_site_id WHERE ordinal = 0 RETURNING site_id;",
+                    [],
+                    |row| row.get(0),
+                )?;
+
+                let ordinal: i64 = conn.query_row(
+                    "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal;",
+                    [&site_id],
+                    |row| row.get(0),
+                )?;
+
+                let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+
+                for table in tables {
+                    let n = conn.execute(&format!("UPDATE \"{table}\" SET __crsql_site_id = ? WHERE __crsql_site_id IS NULL"), [ordinal])?;
+                    println!("update {n} in {table}");
+                }
+
+                conn.execute_batch(
+                    r#"
+                    PRAGMA journal_mode = WAL; -- so the restore can be done online
+                    "#,
+                )?;
+            }
+        }
+        Command::Restore { path } => {
+            sqlite3_restore::restore(&path, &cli.config().db_path, Duration::from_secs(30))?;
+        }
         Command::Consul(cmd) => match cmd {
             ConsulCommand::Sync => match cli.config().consul.as_ref() {
                 Some(consul) => {
@@ -200,6 +241,12 @@ impl Cli {
 enum Command {
     /// Launches the agent
     Agent,
+
+    /// Backup the Corrosion DB
+    Backup { path: String },
+
+    /// Restore the Corrosion DB from a backup
+    Restore { path: PathBuf },
 
     /// Consul interactions
     #[command(subcommand)]

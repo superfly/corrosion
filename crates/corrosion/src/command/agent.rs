@@ -2,16 +2,11 @@ use std::net::SocketAddr;
 
 use camino::Utf8PathBuf;
 use corro_admin::AdminConfig;
-use corro_types::{
-    actor::ActorId,
-    config::{Config, LogFormat},
-};
+use corro_types::config::{Config, LogFormat};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use spawn::wait_for_all_pending_handles;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
-use uuid::Uuid;
 
 use crate::VERSION;
 
@@ -41,39 +36,13 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
 
     info!("Starting Corrosion Agent v{VERSION}");
 
-    let db_parent_path: Utf8PathBuf = config
-        .db_path
-        .parent()
-        .map(|p| p.into())
-        .unwrap_or_else(|| "./".into());
-
-    let mut actor_id_file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(db_parent_path.join("actor_id"))
-        .await?;
-
-    let mut id_str = String::new();
-    actor_id_file.read_to_string(&mut id_str).await?;
-
-    let actor_id = ActorId(if id_str.is_empty() {
-        let id = Uuid::new_v4();
-        actor_id_file.write_all(id.to_string().as_bytes()).await?;
-        id
-    } else {
-        id_str.parse()?
-    });
-
-    debug!("actor_id from file: {actor_id}");
-
     if let Some(metrics_addr) = config.metrics_addr {
         setup_prometheus(metrics_addr).expect("could not setup prometheus");
     }
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
-    let agent = corro_agent::agent::start(actor_id, config.clone(), tripwire.clone())
+    let agent = corro_agent::agent::start(config.clone(), tripwire.clone())
         .await
         .expect("could not start agent");
 
