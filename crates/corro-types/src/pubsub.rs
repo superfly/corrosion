@@ -1167,7 +1167,7 @@ mod tests {
     use crate::{
         change::{row_to_change, SqliteValue},
         schema::{make_schema_inner, parse_sql},
-        sqlite::{init_cr_conn, setup_conn},
+        sqlite::{setup_conn, CrConn},
     };
 
     use super::*;
@@ -1185,9 +1185,7 @@ mod tests {
         let tmpdir = tempfile::tempdir()?;
         let db_path = tmpdir.path().join("test.db");
 
-        let mut conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
-
-        init_cr_conn(&mut conn)?;
+        let mut conn = CrConn::init(rusqlite::Connection::open(&db_path)?)?;
 
         setup_conn(
             &mut conn,
@@ -1314,9 +1312,9 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let db_path = tmpdir.path().join("test.db");
 
-        let mut conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
-
-        init_cr_conn(&mut conn).unwrap();
+        let mut conn =
+            CrConn::init(rusqlite::Connection::open(&db_path).expect("could not open conn"))
+                .expect("could not init crsql");
 
         setup_conn(
             &mut conn,
@@ -1363,10 +1361,11 @@ mod tests {
         }
 
         {
-            let mut conn2 = rusqlite::Connection::open(tmpdir.path().join("test2.db"))
-                .expect("could not open conn");
-
-            init_cr_conn(&mut conn2).unwrap();
+            let mut conn2 = CrConn::init(
+                rusqlite::Connection::open(tmpdir.path().join("test2.db"))
+                    .expect("could not open conn"),
+            )
+            .expect("could not init crsql");
 
             setup_conn(
                 &mut conn2,
