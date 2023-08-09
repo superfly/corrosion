@@ -137,9 +137,14 @@ impl ManageConnection for CrConnManager {
 }
 
 #[derive(Debug)]
-pub struct CrConn(pub Connection);
+pub struct CrConn(Connection);
 
 impl CrConn {
+    pub fn init(mut conn: Connection) -> Result<Self, rusqlite::Error> {
+        init_cr_conn(&mut conn)?;
+        Ok(Self(conn))
+    }
+
     pub fn transaction(&mut self) -> rusqlite::Result<Transaction> {
         self.0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -168,7 +173,7 @@ impl Drop for CrConn {
     }
 }
 
-pub fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let ext_dir = &CRSQL_EXT_DIR;
     trace!(
         "loading crsqlite extension from path: {}",

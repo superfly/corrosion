@@ -31,7 +31,7 @@ use corro_types::{
     config::{Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members},
     schema::init_schema,
-    sqlite::{init_cr_conn, CrConn, Migration, SqlitePoolError},
+    sqlite::{CrConn, Migration, SqlitePoolError},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
 };
 
@@ -91,8 +91,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     }
 
     let actor_id = {
-        let mut conn = CrConn(Connection::open(&conf.db_path)?);
-        init_cr_conn(&mut conn)?;
+        let conn = CrConn::init(Connection::open(&conf.db_path)?)?;
         conn.query_row("SELECT crsql_site_id();", [], |row| {
             row.get::<_, ActorId>(0)
         })?
@@ -2320,9 +2319,7 @@ pub mod tests {
 
     #[test]
     fn test_in_memory_versions_compaction() -> eyre::Result<()> {
-        let mut conn = rusqlite::Connection::open_in_memory()?;
-
-        init_cr_conn(&mut conn)?;
+        let conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
 
         conn.execute_batch(
             "CREATE TABLE foo (a INTEGER PRIMARY KEY, b INTEGER); SELECT crsql_as_crr('foo');",
