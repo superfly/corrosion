@@ -31,7 +31,6 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
-pgwire = { workspace = true }
 quoted-string = { workspace = true }
 rand = { workspace = true }
 rangemap = { workspace = true }

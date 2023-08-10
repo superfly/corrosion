@@ -2,38 +2,14 @@ use std::net::SocketAddr;
 
 use camino::Utf8PathBuf;
 use corro_admin::AdminConfig;
-use corro_types::config::{Config, LogFormat};
+use corro_types::config::Config;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use spawn::wait_for_all_pending_handles;
 use tracing::{error, info};
-use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
 use crate::VERSION;
 
 pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> {
-    let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
-    println!("tracing-filter directives: {directives}");
-    let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
-    if let Some(diags) = diags {
-        eprintln!("While parsing env filters: {diags}, using default");
-    }
-
-    // Tracing
-    let (env_filter, _handle) = tracing_subscriber::reload::Layer::new(filter.layer());
-
-    let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
-
-    match config.log.format {
-        LogFormat::Plaintext => {
-            sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
-                .init();
-        }
-        LogFormat::Json => {
-            sub.with(tracing_subscriber::fmt::Layer::new().json())
-                .init();
-        }
-    }
-
     info!("Starting Corrosion Agent v{VERSION}");
 
     if let Some(metrics_addr) = config.metrics_addr {

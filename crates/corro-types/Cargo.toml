@@ -38,7 +38,6 @@ time = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }

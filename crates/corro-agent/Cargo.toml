@@ -24,7 +24,6 @@ hyper = { workspace = true }
 metrics = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
-pgwire = { workspace = true }
 quoted-string = { workspace = true }
 rand = { workspace = true }
 rangemap = { workspace = true }
@@ -53,4 +52,3 @@ uuid = { workspace = true }
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
 http-body = { workspace = true }
-eventsource-stream = { workspace = true }
