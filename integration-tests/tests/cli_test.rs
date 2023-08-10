@@ -1,11 +1,23 @@
-use assert_cmd::Command;
+use assert_cmd::prelude::OutputAssertExt;
 use corro_tests::launch_test_agent;
+use escargot::CargoRun;
+use once_cell::sync::Lazy;
 use spawn::wait_for_all_pending_handles;
 use tripwire::Tripwire;
 
+static CORROSION_BIN: Lazy<CargoRun> = Lazy::new(|| {
+    escargot::CargoBuild::new()
+        .bin("corrosion")
+        .current_release()
+        // .current_target()
+        .manifest_path("../Cargo.toml")
+        .run()
+        .unwrap()
+});
+
 #[test]
 fn test_help() {
-    let mut cmd = Command::cargo_bin("corrosion").unwrap();
+    let mut cmd = CORROSION_BIN.command();
 
     cmd.arg("--help").assert().success();
 }
@@ -18,7 +30,7 @@ async fn test_query() {
         .await
         .unwrap();
 
-    let mut cmd = Command::cargo_bin("corrosion").unwrap();
+    let mut cmd = CORROSION_BIN.command();
 
     let api_addr = ta.agent.api_addr();
 
