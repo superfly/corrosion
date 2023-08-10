@@ -8,13 +8,17 @@ use command::tpl::TemplateFlags;
 use corro_client::CorrosionApiClient;
 use corro_types::{
     api::{QueryEvent, RqliteResult, Statement},
-    config::{default_admin_path, Config},
+    config::{default_admin_path, Config, ConfigError, LogFormat},
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
 use rusqlite::Connection;
 use tokio_util::codec::{Decoder, LinesCodec};
-use tracing::debug;
+use tracing::{debug, error, info};
+use tracing_subscriber::{
+    fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
+    EnvFilter,
+};
 
 pub mod admin;
 pub mod command;
@@ -27,21 +31,68 @@ pub const API_CLIENT: OnceCell<CorrosionApiClient> = OnceCell::new();
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
-    let cli: Cli = Cli::parse();
+fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
+    if matches!(cli.command, Command::Agent) {
+        let config = cli.config()?;
+
+        let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+        println!("tracing-filter directives: {directives}");
+        let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
+        if let Some(diags) = diags {
+            eprintln!("While parsing env filters: {diags}, using default");
+        }
+
+        // Tracing
+        let (env_filter, _handle) = tracing_subscriber::reload::Layer::new(filter.layer());
+
+        let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
+
+        match config.log.format {
+            LogFormat::Plaintext => {
+                sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
+                    .init();
+            }
+            LogFormat::Json => {
+                sub.with(tracing_subscriber::fmt::Layer::new().json())
+                    .init();
+            }
+        }
+    } else {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().event_format(Format::default().without_time()))
+            .with(
+                EnvFilter::try_from_default_env()
+                    .or_else(|_| EnvFilter::try_new("info"))
+                    .unwrap(),
+            )
+            .init();
+    }
+
+    Ok(())
+}
+
+async fn process_cli(cli: Cli) -> eyre::Result<()> {
+    init_tracing(&cli)?;
 
     match &cli.command {
-        Command::Agent => command::agent::run(cli.config(), &cli.config_path).await?,
+        Command::Agent => command::agent::run(cli.config()?, &cli.config_path).await?,
+
         Command::Backup { path } => {
-            let conf = cli.config();
+            let db_path = cli.db_path()?;
 
             {
-                let conn = Connection::open(&conf.db_path)?;
+                let conn = Connection::open(&db_path)?;
                 conn.execute("VACUUM INTO ?;", [&path])?;
             }
 
             {
+                let path = PathBuf::from(path);
+
+                // make sure parent path exists
+                if let Some(parent) = path.parent() {
+                    _ = tokio::fs::create_dir_all(parent).await;
+                }
+
                 let conn = Connection::open(&path)?;
 
                 let site_id: [u8; 16] = conn.query_row(
@@ -73,7 +124,7 @@ async fn main() -> eyre::Result<()> {
                 )?;
             }
 
-            println!("successfully cleaned for restoration and backed up database to {path}");
+            info!("successfully cleaned for restoration and backed up database to {path}");
         }
         Command::Restore { path } => {
             if AdminConn::connect(cli.admin_path()).await.is_ok() {
@@ -81,20 +132,20 @@ async fn main() -> eyre::Result<()> {
             }
 
             let restored =
-                sqlite3_restore::restore(&path, &cli.config().db_path, Duration::from_secs(30))?;
+                sqlite3_restore::restore(&path, &cli.config()?.db_path, Duration::from_secs(30))?;
 
-            println!(
+            info!(
                 "successfully restored! old size: {}, new size: {}",
                 restored.old_len, restored.new_len
             );
         }
         Command::Consul(cmd) => match cmd {
-            ConsulCommand::Sync => match cli.config().consul.as_ref() {
+            ConsulCommand::Sync => match cli.config()?.consul.as_ref() {
                 Some(consul) => {
-                    command::consul::sync::run(consul, cli.api_addr(), cli.db_path()).await?
+                    command::consul::sync::run(consul, cli.api_addr()?, cli.db_path()?).await?
                 }
                 None => {
-                    eprintln!("missing `consul` block in corrosion config");
+                    error!("missing `consul` block in corrosion config");
                 }
             },
         },
@@ -104,7 +155,7 @@ async fn main() -> eyre::Result<()> {
             ..
         } => {
             let mut body = cli
-                .api_client()
+                .api_client()?
                 .query(&Statement::Simple(query.clone()))
                 .await?;
 
@@ -114,7 +165,10 @@ async fn main() -> eyre::Result<()> {
 
             loop {
                 buf.extend_from_slice(&body.next().await.unwrap()?);
-                let s = lines.decode(&mut buf).unwrap().unwrap();
+                let s = match lines.decode(&mut buf)? {
+                    Some(s) => s,
+                    None => break,
+                };
                 let res: QueryEvent = serde_json::from_str(&s)?;
 
                 match res {
@@ -144,7 +198,7 @@ async fn main() -> eyre::Result<()> {
         }
         Command::Exec { query, timer } => {
             let res = cli
-                .api_client()
+                .api_client()?
                 .execute(&[Statement::Simple(query.clone())])
                 .await?;
 
@@ -154,20 +208,20 @@ async fn main() -> eyre::Result<()> {
                         rows_affected,
                         time,
                     } => {
-                        println!("Rows affected: {rows_affected}");
+                        info!("Rows affected: {rows_affected}");
                         if let Some(elapsed) = timer.then_some(time).flatten() {
                             println!("Run Time: real {elapsed}");
                         }
                     }
                     RqliteResult::Error { error } => {
-                        eprintln!("Error: {error}");
+                        error!("{error}");
                     }
                     _ => {}
                 }
             }
         }
         Command::Reload => {
-            command::reload::run(cli.config().api_addr, &cli.config().schema_paths).await?
+            command::reload::run(cli.api_addr()?, &cli.config()?.schema_paths).await?
         }
         Command::Sync(SyncCommand::Generate) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
@@ -177,11 +231,20 @@ async fn main() -> eyre::Result<()> {
             .await?;
         }
         Command::Template { template, flags } => {
-            command::tpl::run(cli.api_addr(), template, flags).await?;
+            command::tpl::run(cli.api_addr()?, template, flags).await?;
         }
     }
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    let cli: Cli = Cli::parse();
+
+    if let Err(e) = process_cli(cli).await {
+        eprintln!("{e}");
+    }
 }
 
 #[derive(Parser)]
@@ -210,26 +273,26 @@ struct Cli {
 }
 
 impl Cli {
-    fn api_client(&self) -> CorrosionApiClient {
+    fn api_client(&self) -> Result<CorrosionApiClient, ConfigError> {
         API_CLIENT
-            .get_or_init(|| CorrosionApiClient::new(self.api_addr()))
-            .clone()
+            .get_or_try_init(|| Ok(CorrosionApiClient::new(self.api_addr()?)))
+            .cloned()
     }
 
-    fn api_addr(&self) -> SocketAddr {
-        if let Some(api_addr) = self.api_addr {
+    fn api_addr(&self) -> Result<SocketAddr, ConfigError> {
+        Ok(if let Some(api_addr) = self.api_addr {
             api_addr
         } else {
-            self.config().api_addr
-        }
+            self.config()?.api_addr
+        })
     }
 
-    fn db_path(&self) -> Utf8PathBuf {
-        if let Some(ref db_path) = self.db_path {
+    fn db_path(&self) -> Result<Utf8PathBuf, ConfigError> {
+        Ok(if let Some(ref db_path) = self.db_path {
             db_path.clone()
         } else {
-            self.config().db_path
-        }
+            self.config()?.db_path
+        })
     }
 
     fn admin_path(&self) -> Utf8PathBuf {
@@ -242,14 +305,13 @@ impl Cli {
         }
     }
 
-    fn config(&self) -> Config {
+    fn config(&self) -> Result<Config, ConfigError> {
         CONFIG
-            .get_or_init(|| {
+            .get_or_try_init(|| {
                 let config_path = &self.config_path;
                 Config::load(config_path.as_str())
-                    .expect("could not read config from file at {config_path}")
             })
-            .clone()
+            .cloned()
     }
 }
 
@@ -308,4 +370,47 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_cmd::Command;
+    use corro_tests::launch_test_agent;
+    use spawn::wait_for_all_pending_handles;
+    use tripwire::Tripwire;
+
+    #[test]
+    fn test_help() {
+        let mut cmd = Command::cargo_bin("corrosion").unwrap();
+
+        cmd.arg("--help").assert().success();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_query() {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let ta = launch_test_agent(|conf| conf.build(), tripwire.clone())
+            .await
+            .unwrap();
+
+        let mut cmd = Command::cargo_bin("corrosion").unwrap();
+
+        let api_addr = ta.agent.api_addr();
+
+        let expected = ta.agent.actor_id().as_simple().to_string().to_uppercase();
+
+        let assert = cmd
+            .arg("--api-addr")
+            .arg(api_addr.to_string())
+            .arg("query")
+            .arg("SELECT hex(site_id) FROM crsql_site_id WHERE ordinal = 0")
+            .assert();
+
+        assert.success().stdout(format!("{expected}\n"));
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+    }
 }
