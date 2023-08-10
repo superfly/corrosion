@@ -1,6 +1,7 @@
 [workspace]
 members = [
 	"crates/*",
+	"integration-tests"
 ]
 
 [workspace.dependencies]

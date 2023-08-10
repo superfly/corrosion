@@ -8,5 +8,5 @@ mod preempt;
 mod signalstream;
 mod tripwire;
 
+pub use crate::tripwire::{Tripwire, TripwireWorker};
 pub use preempt::{Outcome, PreemptibleFuture, PreemptibleFutureExt, TimeoutFutureExt};
-pub use tripwire::{Tripwire, TripwireWorker};

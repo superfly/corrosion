@@ -68,5 +68,3 @@ sqlite3-restore = { path = "../sqlite3-restore" }
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
 toml = { workspace = true }
-assert_cmd = "2.0.12"
-spawn = { path = "../spawn" }
