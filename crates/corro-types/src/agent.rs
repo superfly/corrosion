@@ -15,7 +15,6 @@ use metrics::{gauge, histogram, increment_counter};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{Connection, InterruptHandle};
-use spawn::spawn_counted;
 use tempfile::TempDir;
 use tokio::{
     runtime::Handle,
@@ -249,7 +248,7 @@ impl SplitPool {
         let (normal_tx, mut normal_rx) = channel(512);
         let (low_tx, mut low_rx) = channel(1024);
 
-        spawn_counted(async move {
+        tokio::spawn(async move {
             loop {
                 let tx: oneshot::Sender<CancellationToken> = tokio::select! {
                     biased;

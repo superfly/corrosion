@@ -165,7 +165,7 @@ checksum = "b9ccdd8f2a161be9bd5c023df56f1b2a0bd1d83872ae53b71a84a12c9bf6e842"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -428,7 +428,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "consul-client"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "camino",
  "hyper",
@@ -601,7 +601,6 @@ dependencies = [
  "serde",
  "serde_json",
  "spawn",
- "speedy",
  "sqlite3-parser",
  "strum",
  "tempfile",
@@ -620,21 +619,53 @@ dependencies = [
 ]
 
 [[package]]
-name = "corro-client"
-version = "0.1.0"
+name = "corro-api-types"
+version = "0.1.0-alpha.1"
 dependencies = [
+ "async-trait",
  "bb8",
  "camino",
  "compact_str 0.7.0",
- "corro-types",
+ "corro-speedy",
+ "pin-project-lite",
+ "rusqlite",
+ "serde",
+ "smallvec",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "corro-client"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "bb8",
+ "bytes",
+ "camino",
+ "compact_str 0.7.0",
+ "corro-api-types",
  "futures",
  "hyper",
- "pin-project-lite",
  "rusqlite",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-serde",
+ "tokio-stream",
+ "tokio-util",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "corro-speedy"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcbc8dd22992b785a0375e7065168b3a3b95599d3ffe2cf3d5d4a752278fdaba"
+dependencies = [
+ "memoffset 0.8.0",
+ "smallvec",
+ "speedy-derive",
  "uuid",
 ]
 
@@ -686,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "corro-types"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -696,6 +727,8 @@ dependencies = [
  "compact_str 0.7.0",
  "config",
  "consul-client",
+ "corro-api-types",
+ "corro-speedy",
  "crc32fast",
  "enquote",
  "fallible-iterator",
@@ -714,8 +747,6 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
- "spawn",
- "speedy",
  "sqlite3-parser",
  "tempfile",
  "thiserror",
@@ -774,7 +805,6 @@ dependencies = [
  "serde_json",
  "shellwords",
  "spawn",
- "speedy",
  "sqlite3-parser",
  "sqlite3-restore",
  "tempfile",
@@ -907,7 +937,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "scratch",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -924,7 +954,7 @@ checksum = "2345488264226bf682893e25de0769f3360aac9957980ec49361b083ddaa5bc5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -1245,7 +1275,7 @@ checksum = "89ca545a94061b6365f2c7355b4b32bd20df3ff95f02da9329b34ccc3bd6ee72"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -1794,7 +1824,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex-syntax",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -1911,7 +1941,7 @@ checksum = "ddece26afd34c31585c74a4db0630c376df271c285d682d1e55012197830b6df"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -2311,9 +2341,9 @@ checksum = "dc375e1527247fe1a97d8b7156678dfe7c1af2fc075c9a4db3690ecd2a148068"
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.56"
+version = "1.0.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b63bdb0cd06f1f4dedf69b254734f9b45af66e4a031e42a7480257d9898b435"
+checksum = "18fb31db3f9bddb2ea821cde30a9f70117e3f119938b5ee630b7403aa6e2ead9"
 dependencies = [
  "unicode-ident",
 ]
@@ -2342,9 +2372,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quote"
-version = "1.0.26"
+version = "1.0.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4424af4bf778aae2051a77b60283332f386554255d722233d09fbfc7e30da2fc"
+checksum = "50f3b39ccfb720540debaa0164757101c08ecb8d326b15358ce76a62c7e85965"
 dependencies = [
  "proc-macro2",
 ]
@@ -2478,12 +2508,13 @@ dependencies = [
 [[package]]
 name = "rhai-tpl"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26c23c1f619074d445c80d703917f82225b208f80655c84b19833d2a35807e7c"
 dependencies = [
  "enquote",
  "logos",
  "parking_lot",
  "rhai",
- "tempfile",
  "thiserror",
  "tracing",
 ]
@@ -2707,7 +2738,7 @@ checksum = "4c614d17805b093df4b147b51339e7e44bf05ef59fba1e45d83500bcfb4d8585"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -2877,24 +2908,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "speedy"
-version = "0.8.6"
-source = "git+https://github.com/koute/speedy?rev=c0f715d3b16758f4a1d278e7affbd3e7bb9f1ff7#c0f715d3b16758f4a1d278e7affbd3e7bb9f1ff7"
-dependencies = [
- "memoffset 0.8.0",
- "smallvec",
- "speedy-derive",
- "uuid",
-]
-
-[[package]]
 name = "speedy-derive"
 version = "0.8.6"
-source = "git+https://github.com/koute/speedy?rev=c0f715d3b16758f4a1d278e7affbd3e7bb9f1ff7#c0f715d3b16758f4a1d278e7affbd3e7bb9f1ff7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d395866cb6778625150f77a430cc0af764ce0300f6a3d3413477785fa34b6c7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -3014,9 +3035,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "2.0.13"
+version = "2.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c9da457c5285ac1f936ebd076af6dac17a61cfe7826f2076b4d015cf47bc8ec"
+checksum = "04361975b3f5e348b2189d8dc55bc942f278b2d482a6a0365de5bdd62d351567"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3080,22 +3101,22 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.40"
+version = "1.0.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "978c9a314bd8dc99be594bc3c175faaa9794be04a5a5e153caba6915336cebac"
+checksum = "611040a08a0439f8248d1990b111c95baa9c704c805fa1f62104b39655fd7f90"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "1.0.40"
+version = "1.0.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9456a42c5b0d803c8cd86e73dd7cc9edd429499f37a3550d286d5e86720569f"
+checksum = "090198534930841fab3a5d1bb637cde49e339654e606195f8d9c76eeb081dc96"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -3207,7 +3228,7 @@ checksum = "630bdcf245f78637c13ec01ffae6187cca34625e8c63150d424b59e55af2675e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.13",
+ "syn 2.0.28",
 ]
 
 [[package]]
@@ -3427,7 +3448,7 @@ dependencies = [
 
 [[package]]
 name = "tripwire"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "assert2",
  "futures",

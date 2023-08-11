@@ -25,13 +25,13 @@ pub const CRSQL_EXT_FILENAME: &str = "crsqlite.dylib";
 pub const CRSQL_EXT_FILENAME: &str = "crsqlite.so";
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../../../crsqlite-darwin-aarch64.dylib");
+pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-aarch64.dylib");
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../../../crsqlite-darwin-x86_64.dylib");
+pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-x86_64.dylib");
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../../../crsqlite-linux-x86_64.so");
+pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-x86_64.so");
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../../../crsqlite-linux-aarch64.so");
+pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-aarch64.so");
 
 // TODO: support windows
 

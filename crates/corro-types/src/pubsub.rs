@@ -5,12 +5,12 @@ use std::{
 
 use bytes::Buf;
 use compact_str::{CompactString, ToCompactString};
+use corro_api_types::{Change, ColumnType, SqliteValue, SqliteValueRef};
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use rusqlite::{params_from_iter, Connection};
-use serde::{Deserialize, Serialize};
 use sqlite3_parser::{
     ast::{
         As, Cmd, Expr, JoinConstraint, Name, OneSelect, Operator, QualifiedName, ResultColumn,
@@ -28,9 +28,10 @@ use uuid::Uuid;
 
 use crate::{
     api::QueryEvent,
-    change::{Change, SqliteValue, SqliteValueRef},
     schema::{NormalizedSchema, NormalizedTable},
 };
+
+pub use corro_api_types::sqlite::ChangeType;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NormalizeStatementError {
@@ -70,28 +71,6 @@ pub enum UnpackError {
     Abort,
     #[error("misuse")]
     Misuse,
-}
-
-#[derive(PartialEq, Debug)]
-pub enum ColumnType {
-    Integer = 1,
-    Float = 2,
-    Text = 3,
-    Blob = 4,
-    Null = 5,
-}
-
-impl ColumnType {
-    fn from_u8(u: u8) -> Option<Self> {
-        Some(match u {
-            1 => Self::Integer,
-            2 => Self::Float,
-            3 => Self::Text,
-            4 => Self::Blob,
-            5 => Self::Null,
-            _ => return None,
-        })
-    }
 }
 
 pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError> {
@@ -151,13 +130,6 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError
     }
 
     Ok(ret)
-}
-
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeType {
-    Upsert,
-    Delete,
 }
 
 pub enum MatcherCmd {
@@ -1162,10 +1134,10 @@ pub enum MatcherError {
 
 #[cfg(test)]
 mod tests {
+    use corro_api_types::row_to_change;
     use rusqlite::params;
 
     use crate::{
-        change::{row_to_change, SqliteValue},
         schema::{make_schema_inner, parse_sql},
         sqlite::{setup_conn, CrConn},
     };

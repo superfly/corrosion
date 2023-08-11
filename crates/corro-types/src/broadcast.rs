@@ -7,6 +7,7 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use corro_api_types::Change;
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use metrics::increment_counter;
 use rusqlite::{
@@ -21,10 +22,7 @@ use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 use tracing::{error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
-use crate::{
-    actor::{Actor, ActorId},
-    change::Change,
-};
+use crate::actor::{Actor, ActorId};
 
 pub const FRAGMENTS_AT: usize = 1420 // wg0 MTU
                               - 40 // 40 bytes IPv6 header
