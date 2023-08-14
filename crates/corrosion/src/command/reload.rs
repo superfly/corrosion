@@ -27,7 +27,7 @@ mod tests {
 
         let client = corro_client::CorrosionApiClient::new(ta.agent.api_addr());
         client
-            .schema_from_paths(&ta.agent.config().schema_paths)
+            .schema_from_paths(&ta.agent.config().db.schema_paths)
             .await?;
 
         let mut conf = ta.agent.config().as_ref().clone();
@@ -40,12 +40,13 @@ mod tests {
         )
         .await?;
 
-        conf.schema_paths
+        conf.db
+            .schema_paths
             .push(new_path.display().to_string().into());
 
         println!("conf: {conf:?}");
 
-        run(ta.agent.api_addr(), &conf.schema_paths).await?;
+        run(ta.agent.api_addr(), &conf.db.schema_paths).await?;
 
         assert!(ta.agent.schema().read().tables.contains_key("blah"));
 

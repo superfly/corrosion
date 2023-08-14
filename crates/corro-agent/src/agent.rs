@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
-    fmt,
     net::SocketAddr,
     ops::RangeInclusive,
     sync::{atomic::AtomicI64, Arc},
@@ -11,24 +10,25 @@ use std::{
 use crate::{
     api::{
         http::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
-        peer::{bidirectional_sync, peer_api_v1_broadcast, peer_api_v1_sync_post, SyncError},
+        peer::{bidirectional_sync, SyncError},
         pubsub::{api_v1_watch_by_id, api_v1_watches, MatcherCache},
     },
-    broadcast::{runtime_loop, ClientPool, FRAGMENTS_AT},
+    broadcast::runtime_loop,
+    transport::{ConnectError, Transport},
 };
 
 use arc_swap::ArcSwap;
 use corro_types::{
-    actor::{Actor, ActorId},
+    actor::{Actor, ActorId, ActorName},
     agent::{
         Agent, AgentConfig, Booked, BookedVersions, Bookie, ChangeError, KnownDbVersion, SplitPool,
     },
     broadcast::{
-        BroadcastInput, BroadcastSrc, ChangeV1, Changeset, FocaInput, Message, MessageDecodeError,
-        MessageV1, Timestamp,
+        BiPayload, BiPayloadV1, Broadcast, BroadcastInput, BroadcastV1, ChangeV1, Changeset,
+        FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
     change::Change,
-    config::{Config, DEFAULT_GOSSIP_PORT},
+    config::{Config, GossipConfig, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members},
     schema::init_schema,
     sqlite::{CrConn, Migration, SqlitePoolError},
@@ -41,7 +41,7 @@ use axum::{
     routing::{get, post},
     BoxError, Extension, Router,
 };
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use foca::{Member, Notification};
 use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
@@ -51,16 +51,17 @@ use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection, Transaction};
 use spawn::spawn_counted;
-use strum::FromRepr;
+use speedy::{Readable, Writable};
 use tokio::{
-    net::{TcpListener, UdpSocket},
+    io::AsyncReadExt,
+    net::TcpListener,
     sync::mpsc::{channel, Receiver, Sender},
     task::block_in_place,
-    time::{sleep, timeout},
+    time::sleep,
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tokio_util::codec::LengthDelimitedCodec;
-use tower::{buffer::BufferLayer, limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
+use tokio_util::codec::{Decoder, Encoder, FramedRead, LengthDelimitedCodec};
+use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{PreemptibleFutureExt, Tripwire};
@@ -75,7 +76,9 @@ const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct AgentOptions {
     actor_id: ActorId,
-    gossip_listener: TcpListener,
+    name: ActorName,
+    gossip_server_endpoint: quinn::Endpoint,
+    transport: Transport,
     api_listener: TcpListener,
     bootstrap: Vec<String>,
     rx_bcast: Receiver<BroadcastInput>,
@@ -84,14 +87,14 @@ pub struct AgentOptions {
 }
 
 pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, AgentOptions)> {
-    debug!("setting up corrosion @ {}", conf.db_path);
+    debug!("setting up corrosion @ {}", conf.db.path);
 
-    if let Some(parent) = conf.db_path.parent() {
+    if let Some(parent) = conf.db.path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
     let actor_id = {
-        let conn = CrConn::init(Connection::open(&conf.db_path)?)?;
+        let conn = CrConn::init(Connection::open(&conf.db.path)?)?;
         conn.query_row("SELECT crsql_site_id();", [], |row| {
             row.get::<_, ActorId>(0)
         })?
@@ -99,7 +102,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     info!("Actor ID: {}", actor_id);
 
-    let pool = SplitPool::create(&conf.db_path, tripwire.clone()).await?;
+    let pool = SplitPool::create(&conf.db.path, tripwire.clone()).await?;
 
     let schema = {
         let mut conn = pool.write_priority().await?;
@@ -198,10 +201,20 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             .collect(),
     )));
 
-    let gossip_listener = TcpListener::bind(conf.gossip_addr).await?;
-    let gossip_addr = gossip_listener.local_addr()?;
+    let gossip_server_endpoint = gossip_server_endpoint(&conf.gossip).await?;
+    let gossip_addr = gossip_server_endpoint.local_addr()?;
 
-    let api_listener = TcpListener::bind(conf.api_addr).await?;
+    let gossip_client_endpoint = gossip_client_endpoint(&conf.gossip)?;
+    let transport = Transport::new(
+        gossip_client_endpoint,
+        conf.gossip
+            .tls
+            .as_ref()
+            .map(|tls| tls.default_server_name.clone())
+            .unwrap_or_else(|| "corrosion".into()),
+    );
+
+    let api_listener = TcpListener::bind(conf.api.bind_addr).await?;
     let api_addr = api_listener.local_addr()?;
 
     let clock = Arc::new(
@@ -215,9 +228,11 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let opts = AgentOptions {
         actor_id,
-        gossip_listener,
+        name: conf.node_name.clone(),
+        gossip_server_endpoint,
+        transport,
         api_listener,
-        bootstrap: conf.bootstrap.clone(),
+        bootstrap: conf.gossip.bootstrap.clone(),
         rx_bcast,
         rx_apply,
         tripwire: tripwire.clone(),
@@ -241,6 +256,76 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     Ok((agent, opts))
 }
 
+async fn gossip_server_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
+    if config.plaintext {
+        eyre::bail!("plaintext is current unsupported");
+    }
+
+    let tls = config
+        .tls
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("tls config required"))?;
+
+    let key = tokio::fs::read(&tls.key_file).await?;
+    let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
+        rustls::PrivateKey(key)
+    } else {
+        let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
+        match pkcs8.into_iter().next() {
+            Some(x) => rustls::PrivateKey(x),
+            None => {
+                let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
+                match rsa.into_iter().next() {
+                    Some(x) => rustls::PrivateKey(x),
+                    None => {
+                        eyre::bail!("no private keys found");
+                    }
+                }
+            }
+        }
+    };
+    let certs = tokio::fs::read(&tls.cert_file).await?;
+    let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
+        vec![rustls::Certificate(certs)]
+    } else {
+        rustls_pemfile::certs(&mut &*certs)?
+            .into_iter()
+            .map(rustls::Certificate)
+            .collect()
+    };
+
+    let server_crypto = rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
+    server_config.use_retry(true);
+
+    Ok(quinn::Endpoint::server(server_config, config.bind_addr)?)
+}
+
+fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
+    if config.plaintext {
+        eyre::bail!("plaintext is current unsupported");
+    }
+
+    let tls = config
+        .tls
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("tls config required"))?;
+
+    if !tls.insecure {
+        eyre::bail!("only insecure connections are supported");
+    }
+
+    let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
+
+    // FIXME: check for insecure flag before building insecure client
+    endpoint.set_default_client_config(configure_client());
+    Ok(endpoint)
+}
+
 pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
     let (agent, opts) = setup(conf, tripwire.clone()).await?;
 
@@ -249,10 +334,45 @@ pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
     Ok(agent)
 }
 
+/// Dummy certificate verifier that treats any certificate as valid.
+/// NOTE, such verification is vulnerable to MITM attacks, but convenient for testing.
+struct SkipServerVerification;
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+impl rustls::client::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
+fn configure_client() -> quinn::ClientConfig {
+    let crypto = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        .with_no_client_auth();
+
+    quinn::ClientConfig::new(Arc::new(crypto))
+}
+
 pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     let AgentOptions {
         actor_id,
-        gossip_listener,
+        name,
+        gossip_server_endpoint,
+        transport,
         api_listener,
         bootstrap,
         mut tripwire,
@@ -264,148 +384,239 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     let (to_send_tx, to_send_rx) = channel(10240);
     let (notifications_tx, notifications_rx) = channel(10240);
 
-    let (bcast_msg_tx, bcast_rx) = channel::<Message>(10240);
+    let (bcast_msg_tx, bcast_rx) = channel::<Broadcast>(10240);
 
-    let client = hyper::Client::builder()
-        .pool_max_idle_per_host(1)
-        .pool_idle_timeout(Duration::from_secs(5))
-        .build_http();
-
-    let gossip_addr = gossip_listener.local_addr()?;
-    let udp_gossip = Arc::new(UdpSocket::bind(gossip_addr).await?);
-    info!("Started UDP gossip listener on {gossip_addr}");
+    let gossip_addr = gossip_server_endpoint.local_addr()?;
+    // let udp_gossip = Arc::new(UdpSocket::bind(gossip_addr).await?);
+    info!("Started QUIC gossip listener on {gossip_addr}");
 
     let (foca_tx, foca_rx) = channel(10240);
     let (member_events_tx, member_events_rx) = tokio::sync::broadcast::channel::<MemberEvent>(512);
 
     runtime_loop(
-        Actor::new(actor_id, agent.gossip_addr()),
+        Actor::new(actor_id, name, agent.gossip_addr()),
         agent.clone(),
-        udp_gossip.clone(),
+        transport.clone(),
         foca_rx,
         rx_bcast,
         member_events_rx.resubscribe(),
         to_send_tx,
         notifications_tx,
-        client.clone(),
         agent.clock().clone(),
         tripwire.clone(),
     );
 
-    let (decode_tx, mut decode_rx) = channel(10240);
-
-    let peer_api = Router::new()
-        .route(
-            "/v1/sync",
-            post(peer_api_v1_sync_post).route_layer(
-                tower::ServiceBuilder::new()
-                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
-                        increment_counter!("corro.api.peer.shed.count", "route" => "POST /v1/sync");
-                        Ok::<_, Infallible>((StatusCode::SERVICE_UNAVAILABLE, "sync has reached its concurrency limit".to_string()))
-                    }))
-                    // only allow 2 syncs at the same time...
-                    .layer(LoadShedLayer::new())
-                    .layer(ConcurrencyLimitLayer::new(3)),
-            ),
-        )
-        .route(
-            "/v1/broadcast",
-            post(peer_api_v1_broadcast).route_layer(
-                tower::ServiceBuilder::new()
-                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
-                        increment_counter!("corro.api.peer.shed.count", "route" => "POST /v1/broadcast");
-                        Ok::<_, Infallible>((StatusCode::SERVICE_UNAVAILABLE, "broadcast has reached its concurrency limit".to_string()))
-                    }))
-                    .layer(LoadShedLayer::new())
-                    .layer(BufferLayer::new(1024))
-                    .layer(ConcurrencyLimitLayer::new(512)),
-            ),
-        )
-        .layer(
-            tower::ServiceBuilder::new()
-                .layer(Extension(foca_tx.clone()))
-                .layer(Extension(agent.clone()))
-                .layer(Extension(bcast_msg_tx.clone()))
-                .layer(Extension(decode_tx.clone()))
-        )
-        .layer(DefaultBodyLimit::disable())
-        .layer(TraceLayer::new_for_http());
+    let (process_uni_tx, mut process_uni_rx) = channel(10240);
 
     // async message decoder task
     tokio::spawn({
         let bookie = agent.bookie().clone();
         let self_actor_id = agent.actor_id();
+        let foca_tx = foca_tx.clone();
         async move {
-            let mut codec = LengthDelimitedCodec::builder()
-                .length_field_type::<u32>()
-                .new_codec();
-
-            while let Some(mut buf) = decode_rx.recv().await {
-                if let Err(e) =
-                    handle_broadcast(&mut codec, &mut buf, self_actor_id, &bookie, &bcast_msg_tx)
-                        .await
-                {
-                    error!("could not handle broadcast: {e}");
+            while let Some(payload) = process_uni_rx.recv().await {
+                match payload {
+                    UniPayload::V1(UniPayloadV1::Gossip(data)) => {
+                        if let Err(e) = foca_tx.send(FocaInput::Data(data.into())).await {
+                            error!("could not send foca data to channel for processing: {e}");
+                            continue;
+                        }
+                    }
+                    UniPayload::V1(UniPayloadV1::Broadcast(bcast)) => {
+                        handle_change(bcast, self_actor_id, &bookie, &bcast_msg_tx).await
+                    }
                 }
             }
 
-            info!("Broadcast decode loop is done!");
+            info!("uni payload process loop is done!");
         }
     });
 
     tokio::spawn({
-        let foca_tx = foca_tx.clone();
-        let socket = udp_gossip.clone();
+        let agent = agent.clone();
         async move {
-            let mut recv_buf = vec![0u8; FRAGMENTS_AT];
+            while let Some(connecting) = gossip_server_endpoint.accept().await {
+                let process_uni_tx = process_uni_tx.clone();
+                let agent = agent.clone();
+                tokio::spawn(async move {
+                    let remote_addr = connecting.remote_address();
+                    let local_ip = connecting.local_ip().unwrap();
+                    debug!("got a connection from {remote_addr}");
 
-            let mut databuf = BytesMut::new();
+                    let conn = match connecting.await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            error!("could not connection from {remote_addr} to {local_ip}: {e}");
+                            return;
+                        }
+                    };
 
-            loop {
-                match socket.recv_from(&mut recv_buf).await {
-                    Ok((len, from_addr)) => {
-                        trace!("udp received len: {len} from {from_addr}");
-                        let mut recv = &recv_buf[..len];
+                    debug!("accepted a QUIC conn from {remote_addr}");
 
-                        let payload_byte = recv.get_u8();
-                        match PayloadKind::from_repr(payload_byte) {
-                            None => {
-                                warn!("received unknown payload kind (byte: {payload_byte})");
-                                continue;
-                            }
-                            Some(PayloadKind::Swim) => {
-                                if let Err(e) = foca_tx.try_send(FocaInput::Data(
-                                    Bytes::copy_from_slice(recv),
-                                    BroadcastSrc::Udp(from_addr),
-                                )) {
-                                    error!("could not send SWIM message to foca from UDP: {e}");
-                                }
-                            }
-                            Some(PayloadKind::Broadcast | PayloadKind::PriorityBroadcast) => {
-                                databuf.extend_from_slice(recv);
+                    tokio::spawn({
+                        let conn = conn.clone();
+                        async move {
+                            loop {
+                                let mut rx = match conn.accept_uni().await {
+                                    Ok(rx) => rx,
+                                    Err(e) => {
+                                        warn!("could accept unidirectional stream from connection: {e}");
+                                        return;
+                                    }
+                                };
 
-                                if let Err(e) = decode_tx.try_send(databuf.split()) {
-                                    error!("could not send UDP broadcast message to decoder: {e}");
-                                }
+                                info!(
+                                    "accepted a unidirectional conn from {}",
+                                    conn.remote_address()
+                                );
+
+                                let process_uni_tx = process_uni_tx.clone();
+                                tokio::spawn(async move {
+                                    let mut codec = LengthDelimitedCodec::new();
+                                    let mut buf = BytesMut::new();
+                                    loop {
+                                        loop {
+                                            match codec.decode(&mut buf) {
+                                                Ok(Some(b)) => {
+                                                    // TODO: checksum?
+                                                    let b = b.freeze();
+
+                                                    match UniPayload::read_from_buffer(&b) {
+                                                        Ok(payload) => {
+                                                            trace!("parsed a payload: {payload:?}");
+
+                                                            // if let
+
+                                                            if let Err(e) =
+                                                                process_uni_tx.send(payload).await
+                                                            {
+                                                                error!("could not send UniPayload for processing: {e}");
+                                                                // this means we won't be able to process more...
+                                                                return;
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!(
+                                                                "could not decode UniPayload: {e}"
+                                                            );
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                                Ok(None) => break,
+                                                Err(e) => {
+                                                    println!("decode error: {e}");
+                                                }
+                                            }
+                                        }
+                                        match rx.read_buf(&mut buf).await {
+                                            Ok(0) => {
+                                                // println!("EOF");
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                trace!("read {n} bytes");
+                                            }
+                                            Err(e) => {
+                                                error!("error reading bytes into buffer: {e}");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    // let mut framed =
+                                    //     FramedRead::new(rx, LengthDelimitedCodec::new());
+
+                                    // while let Some(res) = framed.next().await {
+                                    //     let b = match res {
+                                    //         Ok(b) => b,
+                                    //         Err(e) => {
+                                    //             error!("could not read framed payload from unidirectional stream: {e}");
+                                    //             return;
+                                    //         }
+                                    //     };
+
+                                    //     // TODO: checksum?
+                                    //     let b = b.freeze();
+
+                                    //     match UniPayload::read_from_buffer(&b) {
+                                    //         Ok(payload) => {
+                                    //             if let Err(e) = process_uni_tx.send(payload).await {
+                                    //                 error!("could not send UniPayload for processing: {e}");
+                                    //                 // this means we won't be able to process more...
+                                    //                 return;
+                                    //             }
+                                    //         }
+                                    //         Err(e) => {
+                                    //             warn!("could not decode UniPayload: {e}");
+                                    //             continue;
+                                    //         }
+                                    //     }
+                                    // }
+                                });
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("error receiving on gossip udp socket: {e}");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
+                    });
+
+                    tokio::spawn(async move {
+                        loop {
+                            let (tx, rx) = match conn.accept_bi().await {
+                                Ok(res) => res,
+                                Err(e) => {
+                                    warn!("could accept bidirectional stream from connection: {e}");
+                                    return;
+                                }
+                            };
+
+                            info!(
+                                "accepted a bidirectional stream from {}",
+                                conn.remote_address()
+                            );
+
+                            // TODO: implement concurrency limit for sync requests
+
+                            let agent = agent.clone();
+                            tokio::spawn(async move {
+                                let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
+
+                                match framed.next().await {
+                                    None => {
+                                        return;
+                                    }
+                                    Some(res) => match res {
+                                        Ok(b) => match BiPayload::read_from_buffer(&b) {
+                                            Ok(payload) => match payload {
+                                                BiPayload::V1(BiPayloadV1::SyncState(state)) => {
+                                                    // println!("got sync state: {state:?}");
+                                                    if let Err(e) = bidirectional_sync(
+                                                        &agent,
+                                                        state,
+                                                        framed.into_inner(),
+                                                        tx,
+                                                    )
+                                                    .await
+                                                    {
+                                                        warn!("could not complete bidirectional sync: {e}");
+                                                    }
+                                                }
+                                            },
+                                            Err(e) => {
+                                                warn!("could not decode BiPayload: {e}");
+                                            }
+                                        },
+                                        Err(e) => {
+                                            error!("could not read framed payload from bidirectional stream: {e}");
+                                        }
+                                    },
+                                }
+                            });
+                        }
+                    });
+                });
             }
         }
     });
 
-    info!("Starting gossip server on {gossip_addr}");
-
-    tokio::spawn(
-        axum::Server::builder(AddrIncoming::from_listener(gossip_listener)?)
-            .serve(peer_api.into_make_service_with_connect_info::<SocketAddr>())
-            .preemptible(tripwire.clone()),
-    );
+    info!("Starting peer API on {gossip_addr} (QUIC)");
 
     tokio::spawn({
         let agent = agent.clone();
@@ -679,14 +890,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     );
 
     spawn_counted(
-        sync_loop(agent.clone(), client.clone(), rx_apply, tripwire.clone())
+        sync_loop(agent.clone(), transport.clone(), rx_apply, tripwire.clone())
             .inspect(|_| info!("corrosion agent sync loop is done")),
     );
 
     let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
 
-    tokio::spawn(handle_gossip_to_send(udp_gossip.clone(), to_send_rx));
+    tokio::spawn(handle_gossip_to_send(transport, to_send_rx));
     tokio::spawn(handle_notifications(
         agent.clone(),
         notifications_rx,
@@ -737,39 +948,34 @@ fn collect_metrics(agent: Agent) {
     agent.pool().emit_metrics();
 }
 
-pub async fn handle_broadcast(
-    codec: &mut LengthDelimitedCodec,
-    buf: &mut BytesMut,
+pub async fn handle_change(
+    bcast: Broadcast,
     self_actor_id: ActorId,
     bookie: &Bookie,
-    bcast_msg_tx: &Sender<Message>,
-) -> Result<(), MessageDecodeError> {
-    while let Some(msg) = Message::decode(codec, buf)? {
-        trace!("broadcast: {msg:?}");
+    bcast_msg_tx: &Sender<Broadcast>,
+) {
+    match bcast {
+        Broadcast::V1(BroadcastV1::Change(change)) => {
+            increment_counter!("corro.broadcast.recv.count", "kind" => "change");
 
-        match &msg {
-            Message::V1(MessageV1::Change(ChangeV1 {
-                actor_id,
-                changeset,
-            })) => {
-                increment_counter!("corro.broadcast.recv.count", "kind" => "change");
+            trace!("handling {} changes", change.len());
 
-                if bookie.contains(actor_id, changeset.versions(), changeset.seqs()) {
-                    trace!("already seen, stop disseminating");
-                    continue;
-                }
+            if bookie.contains(&change.actor_id, change.versions(), change.seqs()) {
+                trace!("already seen, stop disseminating");
+                return;
+            }
 
-                if *actor_id == self_actor_id {
-                    continue;
-                }
+            if change.actor_id == self_actor_id {
+                return;
+            }
+            if let Err(e) = bcast_msg_tx
+                .send(Broadcast::V1(BroadcastV1::Change(change)))
+                .await
+            {
+                error!("could not send change message through broadcast channel: {e}");
             }
         }
-
-        if let Err(e) = bcast_msg_tx.send(msg).await {
-            error!("could not send change message through broadcast channel: {e}");
-        }
     }
-    Ok(())
 }
 
 fn compact_booked_for_actor(
@@ -802,41 +1008,61 @@ fn compact_booked_for_actor(
     Ok(keys.difference(&still_live).copied().collect())
 }
 
-async fn handle_gossip_to_send(socket: Arc<UdpSocket>, mut to_send_rx: Receiver<(Actor, Bytes)>) {
-    let mut buf = BytesMut::with_capacity(FRAGMENTS_AT);
+async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Vec<u8>)>) {
+    let mut buf = BytesMut::new();
+    let mut codec = LengthDelimitedCodec::new();
 
-    while let Some((actor, payload)) = to_send_rx.recv().await {
+    while let Some((actor, data)) = to_send_rx.recv().await {
         trace!("got gossip to send to {actor:?}");
+
         let addr = actor.addr();
-        buf.put_u8(0);
-        buf.put_slice(&payload);
+        let server_name = actor.name().clone();
+
+        let payload = UniPayload::V1(UniPayloadV1::Gossip(data));
+        if let Err(e) = payload.write_to_stream((&mut buf).writer()) {
+            error!("could not write to buf: {e}");
+            continue;
+        }
+
+        if let Err(e) = codec.encode(buf.split().freeze(), &mut buf) {
+            error!("could not encode buf: {e}");
+            continue;
+        }
 
         let bytes = buf.split().freeze();
-        let socket = socket.clone();
+
+        let transport = transport.clone();
+
         spawn_counted(async move {
-            trace!("in gossip send task");
-            match timeout(Duration::from_secs(5), socket.send_to(bytes.as_ref(), addr)).await {
-                Ok(Ok(n)) => {
-                    trace!("successfully sent gossip to {addr}");
-                    histogram!("corro.gossip.sent.bytes", n as f64, "actor_id" => actor.id().to_string());
+            let conn = match transport.connect(addr, server_name.as_str()).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!("could not connect to peer {server_name} on {addr}: {e}");
+                    return;
                 }
-                Ok(Err(e)) => {
-                    error!("could not send SWIM message via udp to {addr}: {e}");
+            };
+
+            let mut stream = match conn.open_uni().await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("could not open unidirectional stream to {server_name} on {addr}: {e}");
+                    return;
                 }
-                Err(_e) => {
-                    error!("could not send SWIM message via udp to {addr}: timed out");
-                }
+            };
+
+            if let Err(e) = stream.write_all(&bytes).await {
+                error!("could not write to uni stream to {server_name} on {addr}: {e}");
+                return;
             }
         });
+
         increment_counter!("corro.gossip.send.count", "actor_id" => actor.id().to_string());
     }
 }
 
-// async fn handle_one_gossip()
-
 async fn handle_gossip(
     agent: Agent,
-    messages: Vec<Message>,
+    messages: Vec<Broadcast>,
     high_priority: bool,
 ) -> eyre::Result<()> {
     let priority_label = if high_priority { "high" } else { "normal" };
@@ -1096,24 +1322,6 @@ async fn resolve_bootstrap(
     Ok(addrs)
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, FromRepr)]
-#[repr(u8)]
-pub enum PayloadKind {
-    Swim = 0,
-    Broadcast,
-    PriorityBroadcast,
-}
-
-impl fmt::Display for PayloadKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PayloadKind::Swim => write!(f, "swim"),
-            PayloadKind::Broadcast => write!(f, "broadcast"),
-            PayloadKind::PriorityBroadcast => write!(f, "priority-broadcast"),
-        }
-    }
-}
-
 fn store_empty_changeset(
     tx: Transaction,
     actor_id: ActorId,
@@ -1283,7 +1491,7 @@ pub async fn process_single_version(
         return Ok(None);
     }
 
-    trace!(
+    debug!(
         "received {} changes to process from: {actor_id}, versions: {:?}, seqs: {:?} (last_seq: {:?})",
         changeset.len(),
         changeset.versions(),
@@ -1374,7 +1582,7 @@ pub async fn process_single_version(
                 // figure out how many seq gaps we have between 0 and the last seq for this version
                 let gaps_count = seqs_recorded.gaps(&full_seqs_range).count();
 
-                trace!(actor = %agent.actor_id(), "still missing {gaps_count} seqs");
+                debug!(actor = %agent.actor_id(), "still missing {gaps_count} seqs");
 
                 // if we have no gaps, then we can schedule applying all these changes.
                 if gaps_count == 0 {
@@ -1500,7 +1708,7 @@ pub async fn process_single_version(
         })?;
 
         booked_write.insert_many(changeset.versions(), known_version);
-        debug!("inserted into in-memory bookkeeping");
+        trace!("inserted into in-memory bookkeeping");
 
         (db_version, changeset)
     };
@@ -1508,19 +1716,19 @@ pub async fn process_single_version(
     if db_version.is_some() {
         process_subs(agent, changeset.changes());
     }
-    debug!("processed subscriptions, if any!");
+    trace!("processed subscriptions, if any!");
 
     Ok(Some(changeset))
 }
 
-async fn process_msg(agent: &Agent, msg: Message) -> Result<Option<Message>, ChangeError> {
-    Ok(match msg {
-        Message::V1(MessageV1::Change(change)) => {
+async fn process_msg(agent: &Agent, bcast: Broadcast) -> Result<Option<Broadcast>, ChangeError> {
+    Ok(match bcast {
+        Broadcast::V1(BroadcastV1::Change(change)) => {
             let actor_id = change.actor_id;
             let changeset = process_single_version(agent, change).await?;
 
             changeset.map(|changeset| {
-                Message::V1(MessageV1::Change(ChangeV1 {
+                Broadcast::V1(BroadcastV1::Change(ChangeV1 {
                     actor_id,
                     changeset,
                 }))
@@ -1555,7 +1763,7 @@ pub enum SyncClientError {
     #[error("service unavailable right now")]
     Unavailable,
     #[error(transparent)]
-    Hyper(#[from] hyper::Error),
+    Connect(#[from] ConnectError),
     #[error("request timed out")]
     RequestTimedOut,
     #[error(transparent)]
@@ -1591,7 +1799,7 @@ pub enum SyncRecvError {
     UnexpectedSyncMessage,
 }
 
-async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClientError> {
+async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
     let sync_state = generate_sync(agent.bookie(), agent.actor_id());
     for (actor_id, needed) in sync_state.need.iter() {
         gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
@@ -1600,12 +1808,8 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
         gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
     }
 
-    let mut boff = backoff::Backoff::new(5)
-        .timeout_range(Duration::from_millis(100), Duration::from_secs(1))
-        .iter();
-
     loop {
-        let (actor_id, addr) = {
+        let (actor_id, addr, server_name) = {
             let candidates = {
                 let members = agent.members().read();
 
@@ -1613,8 +1817,8 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
                     .states
                     .iter()
                     .filter(|(id, _state)| **id != agent.actor_id())
-                    .map(|(id, state)| (*id, state.addr))
-                    .collect::<Vec<(ActorId, SocketAddr)>>()
+                    .map(|(id, state)| (*id, state.addr, state.name.clone()))
+                    .collect::<Vec<(ActorId, SocketAddr, ActorName)>>()
             };
 
             if candidates.is_empty() {
@@ -1640,8 +1844,7 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
         };
 
         info!(
-            "syncing {} with: {}, need len: {}",
-            agent.actor_id(),
+            actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
             actor_id,
             sync_state.need_len(),
         );
@@ -1655,51 +1858,20 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
             sync_state.need.len() as f64
         );
 
-        let (sender, body) = hyper::body::Body::channel();
-        let req = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(format!("http://{addr}/v1/sync"))
-            .header(
-                "corro-clock",
-                serde_json::to_string(&agent.clock().new_timestamp())
-                    .expect("could not serialize clock"),
-            )
-            .body(body)
-            .unwrap();
+        let conn = transport.connect(addr, server_name.as_str()).await?;
 
-        increment_counter!("corro.sync.client.request.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+        let (tx, rx) = conn
+            .open_bi()
+            .await
+            .map_err(crate::transport::ConnectError::from)?;
+
+        increment_counter!("corro.sync.attempts.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+
+        // FIXME: check if it's ok to sync (don't overload host)
 
         let start = Instant::now();
-        let res = match timeout(Duration::from_secs(15), client.request(req)).await {
-            Ok(Ok(res)) => {
-                histogram!("corro.sync.client.response.time.seconds", start.elapsed().as_secs_f64(), "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "status" => res.status().to_string());
-                res
-            }
-            Ok(Err(e)) => {
-                increment_counter!("corro.sync.client.request.error", "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "error" => e.to_string());
-                return Err(e.into());
-            }
-            Err(_e) => {
-                increment_counter!("corro.sync.client.request.error", "id" => actor_id.0.to_string(), "addr" => addr.to_string(), "error" => "timed out waiting for headers");
-                return Err(SyncClientError::RequestTimedOut);
-            }
-        };
+        let n = bidirectional_sync(&agent, sync_state, rx, tx).await?;
 
-        let status = res.status();
-        if status != hyper::StatusCode::OK {
-            if status == hyper::StatusCode::SERVICE_UNAVAILABLE {
-                if let Some(dur) = boff.next() {
-                    tokio::time::sleep(dur).await;
-                    continue;
-                }
-                return Err(SyncClientError::Unavailable);
-            }
-            return Err(SyncClientError::Status(status));
-        }
-
-        let start = Instant::now();
-
-        let n = bidirectional_sync(agent, sync_state, res.into_body(), sender).await?;
         let elapsed = start.elapsed();
         info!(
             "synced {n} changes w/ {} in {}s @ {} changes/s",
@@ -1713,7 +1885,7 @@ async fn handle_sync(agent: &Agent, client: &ClientPool) -> Result<(), SyncClien
 
 async fn sync_loop(
     agent: Agent,
-    client: ClientPool,
+    transport: Transport,
     mut rx_apply: Receiver<(ActorId, i64)>,
     mut tripwire: Tripwire,
 ) {
@@ -1751,7 +1923,7 @@ async fn sync_loop(
         match branch {
             Branch::Tick => {
                 // ignoring here, there is trying and logging going on inside
-                match handle_sync(&agent, &client)
+                match handle_sync(&agent, &transport)
                     .preemptible(&mut tripwire)
                     .await
                 {
@@ -1761,12 +1933,13 @@ async fn sync_loop(
                     }
                     tripwire::Outcome::Completed(_res) => {}
                 }
+                debug!(actor_id = %agent.actor_id(), "actually done with sync!");
                 next_sync_at
                     .as_mut()
                     .reset(tokio::time::Instant::now() + sync_backoff.next().unwrap());
             }
             Branch::BackgroundApply { actor_id, version } => {
-                warn!(actor_id = %agent.actor_id(), "picked up background apply for actor: {actor_id} v{version}");
+                info!(actor_id = %agent.actor_id(), "picked up background apply for actor: {actor_id} v{version}");
                 match process_fully_buffered_changes(&agent, actor_id, version).await {
                     Ok(_applied) => {
                         // TODO: do something, I guess?
@@ -1884,7 +2057,7 @@ pub mod tests {
     use serde::Deserialize;
     use serde_json::json;
     use spawn::wait_for_all_pending_handles;
-    use tokio::time::{sleep, MissedTickBehavior};
+    use tokio::time::{sleep, timeout, MissedTickBehavior};
     use tracing::{info, info_span};
     use tripwire::Tripwire;
 
@@ -2092,7 +2265,7 @@ pub mod tests {
                 .await?
                 .query_row("SELECT COUNT(*) FROM tests", (), |row| row.get(0))?;
 
-        sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(5)).await;
 
         let got_count: i64 =
             ta2.agent

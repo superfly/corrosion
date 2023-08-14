@@ -132,7 +132,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             }
 
             let restored =
-                sqlite3_restore::restore(&path, &cli.config()?.db_path, Duration::from_secs(30))?;
+                sqlite3_restore::restore(&path, &cli.config()?.db.path, Duration::from_secs(30))?;
 
             info!(
                 "successfully restored! old size: {}, new size: {}",
@@ -221,7 +221,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             }
         }
         Command::Reload => {
-            command::reload::run(cli.api_addr()?, &cli.config()?.schema_paths).await?
+            command::reload::run(cli.api_addr()?, &cli.config()?.db.schema_paths).await?
         }
         Command::Sync(SyncCommand::Generate) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
@@ -283,7 +283,7 @@ impl Cli {
         Ok(if let Some(api_addr) = self.api_addr {
             api_addr
         } else {
-            self.config()?.api_addr
+            self.config()?.api.bind_addr
         })
     }
 
@@ -291,7 +291,7 @@ impl Cli {
         Ok(if let Some(ref db_path) = self.db_path {
             db_path.clone()
         } else {
-            self.config()?.db_path
+            self.config()?.db.path
         })
     }
 
@@ -299,7 +299,7 @@ impl Cli {
         if let Some(ref admin_path) = self.admin_path {
             admin_path.clone()
         } else if let Ok(config) = Config::load(self.config_path.as_str()) {
-            config.admin_path
+            config.admin.uds_path
         } else {
             default_admin_path()
         }

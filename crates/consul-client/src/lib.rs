@@ -71,7 +71,7 @@ impl Client {
             let tls_config = rustls::ClientConfig::builder()
                 .with_safe_defaults()
                 .with_root_certificates(root_store)
-                .with_single_cert(certs, key)?;
+                .with_client_auth_cert(certs, key)?;
 
             hyper_rustls::HttpsConnectorBuilder::new()
                 .with_tls_config(tls_config)

@@ -44,9 +44,4 @@ tripwire = { version = "0.1.0-alpha.0", path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }
 smallvec = { workspace = true }
-
-[target.aarch64-apple-darwin.package]
-include = ["../crsqlite-darwin-aarch64.dylib"]
-
-[target.x86_64-unknown-linux-gnu.package]
-include = ["../crsqlite-linux-x86_64.so"]
+hostname = { workspace = true }

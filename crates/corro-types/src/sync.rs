@@ -1,10 +1,9 @@
 use std::{collections::HashMap, io, ops::RangeInclusive};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
-use tracing::trace;
 
 use crate::{
     actor::ActorId,
@@ -83,9 +82,11 @@ pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             None => continue,
         };
 
-        state
-            .need
-            .insert(actor_id, booked.read().gaps(&(1..=last_version)).collect());
+        let need: Vec<_> = booked.read().gaps(&(1..=last_version)).collect();
+
+        if !need.is_empty() {
+            state.need.insert(actor_id, need);
+        }
 
         {
             let read = booked.read();
@@ -147,35 +148,32 @@ impl SyncMessage {
         buf: &mut BytesMut,
     ) -> Result<(), SyncMessageEncodeError> {
         self.write_to_stream(buf.writer())?;
-        let mut bytes = buf.split();
-        let hash = crc32fast::hash(&bytes);
-        bytes.put_u32(hash);
+        // let mut bytes = buf.split();
+        // let hash = crc32fast::hash(&bytes);
+        // bytes.put_u32(hash);
 
-        codec.encode(bytes.split().freeze(), buf)?;
-
-        Ok(())
-    }
-
-    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), SyncMessageEncodeError> {
-        let mut codec = LengthDelimitedCodec::builder()
-            .length_field_type::<u32>()
-            .new_codec();
-        self.encode_w_codec(&mut codec, buf)?;
+        codec.encode(buf.split().freeze(), buf)?;
 
         Ok(())
     }
+
+    // pub fn encode(&self, buf: &mut BytesMut) -> Result<(), SyncMessageEncodeError> {
+    //     let mut codec = LengthDelimitedCodec::builder()
+    //         .length_field_type::<u32>()
+    //         .new_codec();
+    //     self.encode_w_codec(&mut codec, buf)?;
+
+    //     Ok(())
+    // }
 
     pub fn from_buf(buf: &mut BytesMut) -> Result<Self, SyncMessageDecodeError> {
-        let len = buf.len();
-        trace!("successfully decoded a frame, len: {len}");
+        // let mut crc_bytes = buf.split_off(len - 4);
 
-        let mut crc_bytes = buf.split_off(len - 4);
-
-        let crc = crc_bytes.get_u32();
-        let new_crc = crc32fast::hash(&buf);
-        if crc != new_crc {
-            return Err(SyncMessageDecodeError::Corrupted(crc, new_crc));
-        }
+        // let crc = crc_bytes.get_u32();
+        // let new_crc = crc32fast::hash(&buf);
+        // if crc != new_crc {
+        //     return Err(SyncMessageDecodeError::Corrupted(crc, new_crc));
+        // }
 
         Ok(Self::from_slice(&buf)?)
     }

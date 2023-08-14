@@ -13,3 +13,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tripwire = { path = "../tripwire" }
 uuid = { workspace = true }
+hostname = { workspace = true }
+rcgen = "0.11.1"
+camino = { workspace = true }

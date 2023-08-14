@@ -137,7 +137,7 @@ impl Agent {
     }
 
     pub fn db_path(&self) -> Utf8PathBuf {
-        self.0.config.load().db_path.clone()
+        self.0.config.load().db.path.clone()
     }
 
     pub fn config(&self) -> arc_swap::Guard<Arc<Config>, arc_swap::strategy::DefaultStrategy> {

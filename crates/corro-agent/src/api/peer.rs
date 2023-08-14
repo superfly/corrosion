@@ -1,113 +1,29 @@
+use std::cmp;
 use std::collections::HashMap;
-use std::error::Error;
 use std::ops::RangeInclusive;
-use std::time::Duration;
-use std::{cmp, io};
 
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::{extract::RawBody, Extension};
-use bytes::{Buf, BytesMut};
+use bytes::{BufMut, BytesMut};
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
-use corro_types::broadcast::{ChangeV1, Changeset, Message};
+use corro_types::broadcast::{ChangeV1, Changeset};
 use corro_types::change::row_to_change;
-use corro_types::sync::{
-    generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1,
-};
-use futures::{StreamExt, TryFutureExt, TryStreamExt};
-use metrics::{counter, increment_counter};
+use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
+use futures::{SinkExt, StreamExt, TryFutureExt};
+use metrics::counter;
+use quinn::{RecvStream, SendStream};
 use rusqlite::{params, Connection};
+use speedy::Writable;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::block_in_place;
-use tokio::time::timeout;
-use tokio_util::codec::LengthDelimitedCodec;
-use tokio_util::io::StreamReader;
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, error, trace, warn};
 
-use crate::agent::{handle_broadcast, process_single_version, PayloadKind, SyncRecvError};
+use crate::agent::{process_single_version, SyncRecvError};
 use crate::api::http::{ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
 
 use corro_types::{
     actor::ActorId,
     agent::{Booked, Bookie},
 };
-
-#[allow(clippy::too_many_arguments)]
-pub async fn peer_api_v1_broadcast(
-    headers: HeaderMap,
-    Extension(agent): Extension<Agent>,
-    Extension(bcast_msg_tx): Extension<Sender<Message>>,
-    RawBody(mut body): RawBody,
-) -> impl IntoResponse {
-    match headers.get("corro-clock") {
-        Some(value) => match serde_json::from_slice::<'_, uhlc::Timestamp>(value.as_bytes()) {
-            Ok(ts) => {
-                if let Err(e) = agent.clock().update_with_timestamp(&ts) {
-                    warn!("clock drifted too much! {e}");
-                }
-            }
-            Err(e) => {
-                error!("could not parse timestamp: {e}");
-            }
-        },
-        None => {
-            debug!("old corroded geezer");
-        }
-    }
-
-    let mut codec = LengthDelimitedCodec::builder()
-        .length_field_type::<u32>()
-        .new_codec();
-
-    let mut buf = BytesMut::new();
-
-    let mut kind = None;
-
-    loop {
-        match body.next().await {
-            Some(Ok(mut bytes)) => {
-                match kind.get_or_insert_with(|| {
-                    PayloadKind::from_repr(bytes.get_u8()).map(|kind| {
-                        increment_counter!("corro.payload.recv.count", "kind" => kind.to_string());
-                        kind
-                    })
-                }) {
-                    None => {
-                        return StatusCode::UNPROCESSABLE_ENTITY;
-                    }
-                    // I'm not sure this can ever happen, I doubt it...
-                    Some(PayloadKind::Swim) => {
-                        return StatusCode::BAD_REQUEST;
-                    }
-                    Some(PayloadKind::Broadcast | PayloadKind::PriorityBroadcast) => {
-                        buf.extend_from_slice(&bytes);
-
-                        if let Err(e) = handle_broadcast(
-                            &mut codec,
-                            &mut buf,
-                            agent.actor_id(),
-                            agent.bookie(),
-                            &bcast_msg_tx,
-                        )
-                        .await
-                        {
-                            error!("could not handle broadcast from HTTP: {e}");
-                        }
-                    }
-                }
-            }
-            Some(Err(e)) => {
-                error!("error reading bytes from gossip body: {e}");
-                return StatusCode::UNPROCESSABLE_ENTITY;
-            }
-            None => {
-                break;
-            }
-        }
-    }
-
-    StatusCode::ACCEPTED
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -119,6 +35,9 @@ pub enum SyncError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncSendError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
     #[error(transparent)]
     Rusqlite(#[from] rusqlite::Error),
 
@@ -378,159 +297,98 @@ async fn process_sync(
         )?;
     }
 
-    debug!("done with sync process");
+    debug!("done processing sync state");
 
     Ok(())
 }
 
-pub async fn peer_api_v1_sync_post(
-    headers: HeaderMap,
-    Extension(agent): Extension<Agent>,
-    RawBody(req_body): RawBody,
-) -> impl IntoResponse {
-    match headers.get("corro-clock") {
-        Some(value) => match serde_json::from_slice::<'_, uhlc::Timestamp>(value.as_bytes()) {
-            Ok(ts) => {
-                if let Err(e) = agent.clock().update_with_timestamp(&ts) {
-                    error!("clock drifted too much! {e}");
-                }
-            }
-            Err(e) => {
-                error!("could not parse timestamp: {e}");
-            }
-        },
-        None => {
-            debug!("old corroded geezer");
-        }
-    }
-
-    let (sender, body) = hyper::body::Body::channel();
-
-    let sync_state = generate_sync(agent.bookie(), agent.actor_id());
-
-    tokio::spawn(async move {
-        if let Err(e) = bidirectional_sync(&agent, sync_state, req_body, sender).await {
-            error!("error bidirectionally syncing: {e}");
-        }
-    });
-
-    hyper::Response::builder().body(body).unwrap()
-}
-
-// #[derive(Debug, Copy, Clone, Default)]
-// pub struct SyncSummary {
-//     send_count: usize,
-//     recv_count: usize,
-// }
-
 pub async fn bidirectional_sync(
     agent: &Agent,
     sync_state: SyncStateV1,
-    body_in: hyper::Body,
-    mut body_out: hyper::body::Sender,
+    read: RecvStream,
+    write: SendStream,
 ) -> Result<usize, SyncError> {
     let (tx, mut rx) = channel::<SyncMessage>(256);
 
-    tokio::spawn(async move {
-        let mut codec = LengthDelimitedCodec::builder()
-            .length_field_type::<u32>()
-            .new_codec();
-        let mut buf = BytesMut::new();
-
-        while let Some(msg) = rx.recv().await {
-            if let Err(e) = msg.encode_w_codec(&mut codec, &mut buf) {
-                error!("could not encode message, skipping: {e}");
-                continue;
-            }
-
-            let buf_len = buf.len();
-
-            match timeout(
-                Duration::from_secs(5),
-                body_out.send_data(buf.split().freeze()),
-            )
-            .await
-            {
-                Err(_) => {
-                    error!("sending data timed out");
-                    break;
-                }
-                // this only happens if the channel closes...
-                Ok(Err(e)) => {
-                    debug!("error sending data: {e}");
-                    break;
-                }
-                Ok(_) => {}
-            }
-
-            counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
-        }
-    });
-
-    // send our sync state
+    let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
+    let mut write = FramedWrite::new(write, LengthDelimitedCodec::new());
 
     tx.send(SyncMessage::V1(SyncMessageV1::State(sync_state)))
         .await
         .map_err(|_| SyncSendError::ChannelClosed)?;
 
-    let body = StreamReader::new(body_in.map_err(|e| {
-        if let Some(io_error) = e
-            .source()
-            .and_then(|source| source.downcast_ref::<io::Error>())
-        {
-            return io::Error::from(io_error.kind());
-        }
-        io::Error::new(io::ErrorKind::Other, e)
-    }));
+    let (_sent_count, recv_count) = tokio::try_join!(
+        async move {
+            let mut count = 0;
+            let mut buf = BytesMut::new();
+            while let Some(msg) = rx.recv().await {
+                msg.write_to_stream((&mut buf).writer())
+                    .map_err(SyncMessageEncodeError::from)
+                    .map_err(SyncSendError::from)?;
 
-    let mut framed = LengthDelimitedCodec::builder()
-        .length_field_type::<u32>()
-        .new_read(body)
-        .inspect_ok(|b| counter!("corro.sync.chunk.recv.bytes", b.len() as u64));
+                let buf_len = buf.len();
+                write
+                    .send(buf.split().freeze())
+                    .await
+                    .map_err(SyncSendError::from)?;
 
-    if let Some(buf_res) = framed.next().await {
-        let mut buf = buf_res.map_err(SyncRecvError::from)?;
-        let msg = SyncMessage::from_buf(&mut buf).map_err(SyncRecvError::from)?;
-        if let SyncMessage::V1(SyncMessageV1::State(sync)) = msg {
-            tokio::spawn(
-                process_sync(
-                    agent.actor_id(),
-                    agent.pool().clone(),
-                    agent.bookie().clone(),
-                    sync,
-                    tx,
-                )
-                .inspect_err(|e| error!("could not process sync request: {e}")),
-            );
-        } else {
-            return Err(SyncRecvError::UnexpectedSyncMessage.into());
-        }
-    }
+                count += 1;
 
-    let mut count = 0;
-
-    while let Some(buf_res) = framed.next().await {
-        let mut buf = buf_res.map_err(SyncRecvError::from)?;
-        match SyncMessage::from_buf(&mut buf) {
-            Ok(msg) => {
-                let len = match msg {
-                    SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
-                        let len = change.len();
-                        process_single_version(agent, change)
-                            .await
-                            .map_err(SyncRecvError::from)?;
-                        len
-                    }
-                    SyncMessage::V1(SyncMessageV1::State(_)) => {
-                        warn!("received sync state message more than once, ignoring");
-                        continue;
-                    }
-                };
-                count += len;
+                counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
             }
-            Err(e) => return Err(SyncRecvError::from(e).into()),
-        }
-    }
+            debug!(actor_id = %agent.actor_id(), "done writing sync messages");
 
-    Ok(count)
+            Ok::<_, SyncError>(count)
+        },
+        async move {
+            if let Some(buf_res) = read.next().await {
+                let mut buf = buf_res.map_err(SyncRecvError::from)?;
+                let msg = SyncMessage::from_buf(&mut buf).map_err(SyncRecvError::from)?;
+                if let SyncMessage::V1(SyncMessageV1::State(sync)) = msg {
+                    tokio::spawn(
+                        process_sync(
+                            agent.actor_id(),
+                            agent.pool().clone(),
+                            agent.bookie().clone(),
+                            sync,
+                            tx,
+                        )
+                        .inspect_err(|e| error!("could not process sync request: {e}")),
+                    );
+                } else {
+                    return Err(SyncRecvError::UnexpectedSyncMessage.into());
+                }
+            }
+
+            let mut count = 0;
+
+            while let Some(buf_res) = read.next().await {
+                let mut buf = buf_res.map_err(SyncRecvError::from)?;
+                match SyncMessage::from_buf(&mut buf) {
+                    Ok(msg) => {
+                        let len = match msg {
+                            SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
+                                let len = change.len();
+                                process_single_version(agent, change)
+                                    .await
+                                    .map_err(SyncRecvError::from)?;
+                                len
+                            }
+                            SyncMessage::V1(SyncMessageV1::State(_)) => {
+                                warn!("received sync state message more than once, ignoring");
+                                continue;
+                            }
+                        };
+                        count += len;
+                    }
+                    Err(e) => return Err(SyncRecvError::from(e).into()),
+                }
+            }
+            debug!(actor_id = %agent.actor_id(), "done reading sync messages");
+
+            Ok(count)
+        }
+    )?;
+
+    Ok(recv_count)
 }
