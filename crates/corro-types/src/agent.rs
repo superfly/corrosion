@@ -448,7 +448,7 @@ impl<'a> DerefMut for WriteConn<'a> {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum KnownDbVersion {
     Current {
         db_version: i64,

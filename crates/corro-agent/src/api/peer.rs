@@ -246,6 +246,7 @@ async fn process_sync(
             // don't send the requester's data
             continue;
         }
+        trace!(actor_id = %local_actor_id, "processing sync for {actor_id}, last: {:?}", booked.last());
 
         let is_local = actor_id == local_actor_id;
 
@@ -280,7 +281,7 @@ async fn process_sync(
         let their_last_version = sync_state.heads.get(&actor_id).copied().unwrap_or(0);
         let our_last_version = booked.last().unwrap_or(0);
 
-        trace!("their last version: {their_last_version} vs ours: {our_last_version}");
+        debug!(actor_id = %local_actor_id, "their last version: {their_last_version} vs ours: {our_last_version}");
 
         if their_last_version >= our_last_version {
             // nothing to teach the other node!
@@ -304,7 +305,8 @@ async fn process_sync(
 
 pub async fn bidirectional_sync(
     agent: &Agent,
-    sync_state: SyncStateV1,
+    our_sync_state: SyncStateV1,
+    their_sync_state: Option<SyncStateV1>,
     read: RecvStream,
     write: SendStream,
 ) -> Result<usize, SyncError> {
@@ -313,7 +315,7 @@ pub async fn bidirectional_sync(
     let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
     let mut write = FramedWrite::new(write, LengthDelimitedCodec::new());
 
-    tx.send(SyncMessage::V1(SyncMessageV1::State(sync_state)))
+    tx.send(SyncMessage::V1(SyncMessageV1::State(our_sync_state)))
         .await
         .map_err(|_| SyncSendError::ChannelClosed)?;
 
@@ -336,29 +338,38 @@ pub async fn bidirectional_sync(
 
                 counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
             }
-            debug!(actor_id = %agent.actor_id(), "done writing sync messages");
+            debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
 
             Ok::<_, SyncError>(count)
         },
         async move {
-            if let Some(buf_res) = read.next().await {
-                let mut buf = buf_res.map_err(SyncRecvError::from)?;
-                let msg = SyncMessage::from_buf(&mut buf).map_err(SyncRecvError::from)?;
-                if let SyncMessage::V1(SyncMessageV1::State(sync)) = msg {
-                    tokio::spawn(
-                        process_sync(
-                            agent.actor_id(),
-                            agent.pool().clone(),
-                            agent.bookie().clone(),
-                            sync,
-                            tx,
-                        )
-                        .inspect_err(|e| error!("could not process sync request: {e}")),
-                    );
-                } else {
-                    return Err(SyncRecvError::UnexpectedSyncMessage.into());
+            let their_sync_state = match their_sync_state {
+                Some(state) => state,
+                None => {
+                    if let Some(buf_res) = read.next().await {
+                        let mut buf = buf_res.map_err(SyncRecvError::from)?;
+                        let msg = SyncMessage::from_buf(&mut buf).map_err(SyncRecvError::from)?;
+                        if let SyncMessage::V1(SyncMessageV1::State(state)) = msg {
+                            state
+                        } else {
+                            return Err(SyncRecvError::UnexpectedSyncMessage.into());
+                        }
+                    } else {
+                        return Err(SyncRecvError::UnexpectedEndOfStream.into());
+                    }
                 }
-            }
+            };
+
+            tokio::spawn(
+                process_sync(
+                    agent.actor_id(),
+                    agent.pool().clone(),
+                    agent.bookie().clone(),
+                    their_sync_state,
+                    tx,
+                )
+                .inspect_err(|e| error!("could not process sync request: {e}")),
+            );
 
             let mut count = 0;
 

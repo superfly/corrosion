@@ -1,6 +1,5 @@
 use std::{fmt, net::SocketAddr, ops::Deref};
 
-use compact_str::CompactString;
 use foca::Identity;
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput},
@@ -42,7 +41,7 @@ impl fmt::Display for ActorId {
     }
 }
 
-const ULID_SIZE: usize = 16;
+const UUID_SIZE: usize = 16;
 
 impl<'a, C> Readable<'a, C> for ActorId
 where
@@ -55,7 +54,7 @@ where
 
     #[inline]
     fn minimum_bytes_needed() -> usize {
-        ULID_SIZE
+        UUID_SIZE
     }
 }
 
@@ -70,7 +69,7 @@ where
 
     #[inline]
     fn bytes_needed(&self) -> Result<usize, C::Error> {
-        Ok(ULID_SIZE)
+        Ok(UUID_SIZE)
     }
 }
 
@@ -98,71 +97,19 @@ impl FromSql for ActorId {
     }
 }
 
-#[derive(Debug, Default, Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct ActorName(pub CompactString);
-
-impl fmt::Display for ActorName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl Deref for ActorName {
-    type Target = CompactString;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'a, C> Readable<'a, C> for ActorName
-where
-    C: Context,
-{
-    #[inline]
-    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
-        Ok(ActorName(CompactString::from(
-            reader.read_value::<&'a str>()?,
-        )))
-    }
-
-    #[inline]
-    fn minimum_bytes_needed() -> usize {
-        <String as Readable<'a, C>>::minimum_bytes_needed()
-    }
-}
-
-impl<C> Writable<C> for ActorName
-where
-    C: Context,
-{
-    #[inline]
-    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
-        self.0.as_bytes().write_to(writer)
-    }
-
-    #[inline]
-    fn bytes_needed(&self) -> Result<usize, C::Error> {
-        Writable::<C>::bytes_needed(self.0.as_bytes())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Actor {
     id: ActorId,
-    name: ActorName,
     addr: SocketAddr,
     // An extra field to allow fast rejoin
     bump: u16,
 }
 
 impl Actor {
-    pub fn new(id: ActorId, name: ActorName, addr: SocketAddr) -> Self {
+    pub fn new(id: ActorId, addr: SocketAddr) -> Self {
         Self {
             id,
             addr,
-            name,
             bump: rand::random(),
         }
     }
@@ -173,18 +120,11 @@ impl Actor {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
-    pub fn name(&self) -> &ActorName {
-        &self.name
-    }
 }
 
 impl From<SocketAddr> for Actor {
     fn from(value: SocketAddr) -> Self {
-        Self::new(
-            ActorId(Uuid::nil()),
-            ActorName(CompactString::default()),
-            value,
-        )
+        Self::new(ActorId(Uuid::nil()), value)
     }
 }
 
@@ -209,7 +149,6 @@ impl Identity for Actor {
     fn renew(&self) -> Option<Self> {
         Some(Self {
             id: self.id,
-            name: self.name.clone(),
             addr: self.addr,
             bump: self.bump.wrapping_add(1),
         })

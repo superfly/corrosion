@@ -19,7 +19,7 @@ use crate::{
 
 use arc_swap::ArcSwap;
 use corro_types::{
-    actor::{Actor, ActorId, ActorName},
+    actor::{Actor, ActorId},
     agent::{
         Agent, AgentConfig, Booked, BookedVersions, Bookie, ChangeError, KnownDbVersion, SplitPool,
     },
@@ -76,7 +76,6 @@ const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct AgentOptions {
     actor_id: ActorId,
-    name: ActorName,
     gossip_server_endpoint: quinn::Endpoint,
     transport: Transport,
     api_listener: TcpListener,
@@ -205,14 +204,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
     let gossip_client_endpoint = gossip_client_endpoint(&conf.gossip)?;
-    let transport = Transport::new(
-        gossip_client_endpoint,
-        conf.gossip
-            .tls
-            .as_ref()
-            .map(|tls| tls.default_server_name.clone())
-            .unwrap_or_else(|| "corrosion".into()),
-    );
+    let transport = Transport::new(gossip_client_endpoint);
 
     let api_listener = TcpListener::bind(conf.api.bind_addr).await?;
     let api_addr = api_listener.local_addr()?;
@@ -228,7 +220,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let opts = AgentOptions {
         actor_id,
-        name: conf.node_name.clone(),
         gossip_server_endpoint,
         transport,
         api_listener,
@@ -370,7 +361,6 @@ fn configure_client() -> quinn::ClientConfig {
 pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     let AgentOptions {
         actor_id,
-        name,
         gossip_server_endpoint,
         transport,
         api_listener,
@@ -394,7 +384,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     let (member_events_tx, member_events_rx) = tokio::sync::broadcast::channel::<MemberEvent>(512);
 
     runtime_loop(
-        Actor::new(actor_id, name, agent.gossip_addr()),
+        Actor::new(actor_id, agent.gossip_addr()),
         agent.clone(),
         transport.clone(),
         foca_rx,
@@ -402,7 +392,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         member_events_rx.resubscribe(),
         to_send_tx,
         notifications_tx,
-        agent.clock().clone(),
         tripwire.clone(),
     );
 
@@ -460,13 +449,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 let mut rx = match conn.accept_uni().await {
                                     Ok(rx) => rx,
                                     Err(e) => {
-                                        warn!("could accept unidirectional stream from connection: {e}");
+                                        debug!("could not accept unidirectional stream from connection: {e}");
                                         return;
                                     }
                                 };
 
                                 info!(
-                                    "accepted a unidirectional conn from {}",
+                                    "accepted a unidirectional stream from {}",
                                     conn.remote_address()
                                 );
 
@@ -562,7 +551,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             let (tx, rx) = match conn.accept_bi().await {
                                 Ok(res) => res,
                                 Err(e) => {
-                                    warn!("could accept bidirectional stream from connection: {e}");
+                                    debug!("could not accept bidirectional stream from connection: {e}");
                                     return;
                                 }
                             };
@@ -589,7 +578,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                     // println!("got sync state: {state:?}");
                                                     if let Err(e) = bidirectional_sync(
                                                         &agent,
-                                                        state,
+                                                        generate_sync(
+                                                            agent.bookie(),
+                                                            agent.actor_id(),
+                                                        ),
+                                                        Some(state),
                                                         framed.into_inner(),
                                                         tx,
                                                     )
@@ -1016,7 +1009,6 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
         trace!("got gossip to send to {actor:?}");
 
         let addr = actor.addr();
-        let server_name = actor.name().clone();
 
         let payload = UniPayload::V1(UniPayloadV1::Gossip(data));
         if let Err(e) = payload.write_to_stream((&mut buf).writer()) {
@@ -1034,24 +1026,16 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
         let transport = transport.clone();
 
         spawn_counted(async move {
-            let conn = match transport.connect(addr, server_name.as_str()).await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    error!("could not connect to peer {server_name} on {addr}: {e}");
-                    return;
-                }
-            };
-
-            let mut stream = match conn.open_uni().await {
+            let mut stream = match transport.open_uni(addr).await {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("could not open unidirectional stream to {server_name} on {addr}: {e}");
+                    error!("could not open unidirectional stream {addr}: {e}");
                     return;
                 }
             };
 
             if let Err(e) = stream.write_all(&bytes).await {
-                error!("could not write to uni stream to {server_name} on {addr}: {e}");
+                error!("could not write to uni stream {addr}: {e}");
                 return;
             }
         });
@@ -1797,6 +1781,8 @@ pub enum SyncRecvError {
     Io(#[from] std::io::Error),
     #[error("unexpected sync message")]
     UnexpectedSyncMessage,
+    #[error("unexpected end of stream")]
+    UnexpectedEndOfStream,
 }
 
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
@@ -1809,7 +1795,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
     }
 
     loop {
-        let (actor_id, addr, server_name) = {
+        let (actor_id, addr) = {
             let candidates = {
                 let members = agent.members().read();
 
@@ -1817,8 +1803,8 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
                     .states
                     .iter()
                     .filter(|(id, _state)| **id != agent.actor_id())
-                    .map(|(id, state)| (*id, state.addr, state.name.clone()))
-                    .collect::<Vec<(ActorId, SocketAddr, ActorName)>>()
+                    .map(|(id, state)| (*id, state.addr))
+                    .collect::<Vec<(ActorId, SocketAddr)>>()
             };
 
             if candidates.is_empty() {
@@ -1858,10 +1844,8 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
             sync_state.need.len() as f64
         );
 
-        let conn = transport.connect(addr, server_name.as_str()).await?;
-
-        let (tx, rx) = conn
-            .open_bi()
+        let (tx, rx) = transport
+            .open_bi(addr)
             .await
             .map_err(crate::transport::ConnectError::from)?;
 
@@ -1870,7 +1854,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         // FIXME: check if it's ok to sync (don't overload host)
 
         let start = Instant::now();
-        let n = bidirectional_sync(&agent, sync_state, rx, tx).await?;
+        let n = bidirectional_sync(&agent, sync_state, None, rx, tx).await?;
 
         let elapsed = start.elapsed();
         info!(

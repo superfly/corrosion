@@ -2,23 +2,18 @@ use std::{collections::HashMap, net::SocketAddr};
 
 use tracing::trace;
 
-use crate::actor::{Actor, ActorId, ActorName};
+use crate::actor::{Actor, ActorId};
 
 #[derive(Clone, Debug)]
 pub struct MemberState {
     pub addr: SocketAddr,
-    pub name: ActorName,
 
     counter: u8,
 }
 
 impl MemberState {
-    pub fn new(addr: SocketAddr, name: ActorName) -> Self {
-        Self {
-            addr,
-            name,
-            counter: 0,
-        }
+    pub fn new(addr: SocketAddr) -> Self {
+        Self { addr, counter: 0 }
     }
 }
 
@@ -38,12 +33,9 @@ impl Members {
         let member = self
             .states
             .entry(actor.id())
-            .or_insert_with(|| MemberState::new(actor.addr(), actor.name().clone()));
+            .or_insert_with(|| MemberState::new(actor.addr()));
 
         member.addr = actor.addr();
-        if member.name.is_empty() {
-            member.name = actor.name().clone();
-        }
 
         trace!("member: {member:?}");
 

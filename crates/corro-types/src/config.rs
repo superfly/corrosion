@@ -4,14 +4,10 @@ use camino::Utf8PathBuf;
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
-use crate::actor::ActorName;
-
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default = "default_node_name")]
-    pub node_name: ActorName,
     pub db: DbConfig,
     pub api: ApiConfig,
     pub gossip: GossipConfig,
@@ -26,15 +22,6 @@ pub struct Config {
     pub log: LogConfig,
     #[serde(default)]
     pub consul: Option<ConsulConfig>,
-}
-
-fn default_node_name() -> ActorName {
-    ActorName(
-        hostname::get()
-            .expect("could not get hostname")
-            .to_string_lossy()
-            .into(),
-    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,7 +130,6 @@ impl Config {
 
 #[derive(Debug, Default)]
 pub struct ConfigBuilder {
-    node_name: Option<ActorName>,
     pub db_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
     api_addr: Option<SocketAddr>,
@@ -213,15 +199,9 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn node_name<C: Into<CompactString>>(mut self, name: C) -> Self {
-        self.node_name = Some(ActorName(name.into()));
-        self
-    }
-
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
         Ok(Config {
-            node_name: self.node_name.unwrap_or_else(default_node_name),
             db: DbConfig {
                 path: db_path,
                 schema_paths: self.schema_paths,

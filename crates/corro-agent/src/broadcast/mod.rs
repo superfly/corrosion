@@ -33,7 +33,7 @@ use tracing::{debug, error, log::info, trace, warn};
 use tripwire::Tripwire;
 
 use corro_types::{
-    actor::{Actor, ActorName},
+    actor::Actor,
     agent::Agent,
     broadcast::{Broadcast, BroadcastInput, DispatchRuntime, FocaInput, UniPayload, UniPayloadV1},
     members::MemberEvent,
@@ -99,7 +99,6 @@ pub fn runtime_loop(
     member_events: tokio::sync::broadcast::Receiver<MemberEvent>,
     to_send_tx: Sender<(Actor, Vec<u8>)>,
     notifications_tx: Sender<Notification<Actor>>,
-    clock: Arc<uhlc::HLC>,
     mut tripwire: Tripwire,
 ) {
     debug!("starting runtime loop for actor: {actor:?}");
@@ -107,8 +106,6 @@ pub fn runtime_loop(
     let actor_id = actor.id();
 
     let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
-
-    let actor_name = actor.name().clone();
 
     let mut foca = Foca::with_custom_broadcast(
         actor,
@@ -603,7 +600,7 @@ pub fn runtime_loop(
                         .states
                         .iter()
                         .filter_map(|(member_id, state)| {
-                            (!state.name.is_empty() && (*member_id != actor_id)).then(|| state.addr)
+                            (*member_id != actor_id).then(|| state.addr)
                         })
                         .choose_multiple(&mut rng, member_count as usize)
                 };
@@ -611,12 +608,7 @@ pub fn runtime_loop(
                 for addr in broadcast_to {
                     debug!(actor = %actor_id, "broadcasting {} bytes to: {addr} (send count: {})", pending.payload.len(), pending.send_count);
 
-                    single_broadcast(
-                        pending.payload.clone(),
-                        transport.clone(),
-                        addr,
-                        actor_name.clone(),
-                    );
+                    single_broadcast(pending.payload.clone(), transport.clone(), addr);
                 }
 
                 pending.send_count = pending.send_count.wrapping_add(1);
@@ -726,32 +718,19 @@ where
     }
 }
 
-fn single_broadcast(
-    payload: Bytes,
-    transport: Transport,
-    addr: SocketAddr,
-    server_name: ActorName,
-) {
+fn single_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
     tokio::spawn(async move {
         trace!("singly broadcasting to {addr}");
-        let conn = match transport.connect(addr, server_name.as_str()).await {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!("could not connect to peer {server_name} on {addr}: {e}");
-                return;
-            }
-        };
-
-        let mut stream = match conn.open_uni().await {
+        let mut stream = match transport.open_uni(addr).await {
             Ok(s) => s,
             Err(e) => {
-                error!("could not open unidirectional stream to {server_name} on {addr}: {e}");
+                error!("could not open unidirectional stream to {addr}: {e}");
                 return;
             }
         };
 
         if let Err(e) = stream.write_all(&payload).await {
-            error!("could not write to uni stream to {server_name} on {addr}: {e}");
+            error!("could not write to uni stream to {addr}: {e}");
             return;
         }
     });
