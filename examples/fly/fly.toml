@@ -1,4 +1,5 @@
 app = "corrosion2"
+primary_region = "iad"
 
 [env]
 RUST_BACKTRACE="1"

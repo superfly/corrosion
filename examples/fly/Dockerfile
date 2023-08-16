@@ -37,7 +37,7 @@ COPY examples/fly/entrypoint.sh /entrypoint
 USER corrosion
 WORKDIR /app
 
-COPY examples/fly/config.toml /app/config.toml
+COPY examples/fly/config.toml /app/corrosion.toml
 COPY examples/fly/schemas /app/schemas
 
 # Get compiled binaries from builder's cargo install directory
@@ -45,4 +45,4 @@ COPY --from=builder /usr/src/app/corrosion /app/corrosion
 
 ENTRYPOINT ["/entrypoint"]
 # Run the app
-CMD ["/app/corrosion", "agent", "-c", "/app/config.toml"]
+CMD ["/app/corrosion", "agent"]
