@@ -6,7 +6,7 @@ schema_paths = ["/app/schemas"]
 addr = "fly-local-6pn:8787"
 bootstrap = ["corrosion2.internal:8787"]
 plaintext = true
-max_mtu = 1400
+max_mtu = 1372
 
 [api]
 addr = "[::]:8080"
