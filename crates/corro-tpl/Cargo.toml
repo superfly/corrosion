@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 rhai = { workspace = true }
-rhai-tpl = { path = "../rhai-tpl" }
+rhai-tpl = { version = "0.1.0" }
 corro-client = { path = "../corro-client" }
 hostname = { workspace = true }
 tracing = { workspace = true }

@@ -1,6 +1,4 @@
 use std::{
-    cmp,
-    iter::Peekable,
     net::SocketAddr,
     num::NonZeroU32,
     pin::Pin,
@@ -8,47 +6,39 @@ use std::{
     time::{Duration, Instant},
 };
 
-use backoff::Backoff;
 use bytes::{BufMut, Bytes, BytesMut};
 use foca::{Foca, NoCustomBroadcast, Notification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
-    Future, FutureExt,
+    Future,
 };
-use hyper::client::HttpConnector;
-use metrics::{gauge, histogram, increment_counter};
+use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
+use speedy::Writable;
 use strum::EnumDiscriminants;
 use tokio::{
-    net::UdpSocket,
     sync::mpsc::{self, channel, Receiver, Sender},
     task::{block_in_place, LocalSet},
-    time::{interval, MissedTickBehavior},
+    time::interval,
 };
-use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
+use tokio_stream::{
+    wrappers::{errors::BroadcastStreamRecvError, ReceiverStream},
+    StreamExt,
+};
+use tokio_util::codec::{Encoder, LengthDelimitedCodec};
 use tracing::{debug, error, log::info, trace, warn};
 use tripwire::Tripwire;
 
 use corro_types::{
     actor::Actor,
     agent::Agent,
-    broadcast::{BroadcastInput, DispatchRuntime, FocaInput, Message},
+    broadcast::{Broadcast, BroadcastInput, DispatchRuntime, FocaInput, UniPayload, UniPayloadV1},
     members::MemberEvent,
 };
 
-// TODO: do not hard code...
-pub const FRAGMENTS_AT: usize = 1420 // wg0 MTU
-                              - 40 // 40 bytes IPv6 header
-                              - 8; // UDP header bytes
-pub const EFFECTIVE_CAP: usize = FRAGMENTS_AT - 1; // fragmentation cap - 1 for the message type byte
-pub const HTTP_BROADCAST_SIZE: usize = 64 * 1024;
-pub const EFFECTIVE_HTTP_BROADCAST_SIZE: usize = HTTP_BROADCAST_SIZE - 1;
-
-const BIG_PAYLOAD_THRESHOLD: usize = 32 * 1024;
-
-pub type ClientPool = hyper::Client<HttpConnector, hyper::Body>;
+use crate::transport::Transport;
 
 #[derive(Clone)]
 struct TimerSpawner {
@@ -102,14 +92,12 @@ impl TimerSpawner {
 pub fn runtime_loop(
     actor: Actor,
     agent: Agent,
-    socket: Arc<UdpSocket>,
+    transport: Transport,
     mut rx_foca: Receiver<FocaInput>,
     mut rx_bcast: Receiver<BroadcastInput>,
     member_events: tokio::sync::broadcast::Receiver<MemberEvent>,
-    to_send_tx: Sender<(Actor, Bytes)>,
+    to_send_tx: Sender<(Actor, Vec<u8>)>,
     notifications_tx: Sender<Notification<Actor>>,
-    client: ClientPool,
-    clock: Arc<uhlc::HLC>,
     mut tripwire: Tripwire,
 ) {
     debug!("starting runtime loop for actor: {actor:?}");
@@ -303,11 +291,11 @@ pub fn runtime_loop(
                                 error!("foca announce error: {e}");
                             }
                         }
-                        FocaInput::Data(data, from) => {
+                        FocaInput::Data(data) => {
                             trace!("handling FocaInput::Data");
                             histogram!("corro.gossip.recv.bytes", data.len() as f64);
                             if let Err(e) = foca.handle_data(&data, &mut runtime) {
-                                error!("error handling foca data from {from:?}: {e}");
+                                error!("error handling foca data: {e}");
                             }
                         }
                         FocaInput::ClusterSize(size) => {
@@ -466,22 +454,10 @@ pub fn runtime_loop(
     });
 
     tokio::spawn(async move {
-        let mut bcast_interval = interval(Duration::from_millis(200));
-        // don't want this to go apeshit when delay is created...
-        bcast_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let (bcast_tx, bcast_rx) = channel::<Broadcast>(10240);
 
-        let mut http_bcast_interval = interval(Duration::from_millis(200));
-        // don't want this to go apeshit when delay is created...
-        http_bcast_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-        let (bcast_tx, mut bcast_rx) = channel(10240);
-
-        let mut bcast_buf = BytesMut::with_capacity(FRAGMENTS_AT);
-        // prepare for first broadcast..
-        bcast_buf.put_u8(1);
-
-        let mut http_bcast_buf = BytesMut::with_capacity(HTTP_BROADCAST_SIZE);
-        http_bcast_buf.put_u8(1);
+        let mut bcast_buf = BytesMut::new();
+        let mut bcast_codec = LengthDelimitedCodec::new();
 
         let mut metrics_interval = interval(Duration::from_secs(10));
 
@@ -491,11 +467,13 @@ pub fn runtime_loop(
             Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>,
         >::new();
 
+        let chunked_bcast =
+            ReceiverStream::new(bcast_rx).chunks_timeout(4, Duration::from_millis(100));
+        tokio::pin!(chunked_bcast);
+
         enum Branch {
             Broadcast(BroadcastInput),
-            SendBroadcast(Message),
-            BroadcastDeadline,
-            HttpBroadcastDeadline,
+            SendBroadcast(Vec<Broadcast>),
             WokePendingBroadcast(PendingBroadcast),
             Tripped,
             Metrics,
@@ -516,21 +494,8 @@ pub fn runtime_loop(
                         break;
                     }
                 },
-                bytes = bcast_rx.recv() => match bytes {
-                    Some(msg) => {
-                        trace!("queueing broadcast: {msg:?}");
-                        Branch::SendBroadcast(msg)
-                    },
-                    None => {
-                        warn!("no more broadcast data");
-                        break;
-                    }
-                },
-                _ = bcast_interval.tick() => {
-                    Branch::BroadcastDeadline
-                },
-                _ = http_bcast_interval.tick() => {
-                    Branch::HttpBroadcastDeadline
+                Some(payloads) = chunked_bcast.next() => {
+                    Branch::SendBroadcast(payloads)
                 },
                 maybe_woke = idle_pendings.next(), if !idle_pendings.is_terminated() => match maybe_woke {
                     Some(woke) => Branch::WokePendingBroadcast(woke),
@@ -559,31 +524,19 @@ pub fn runtime_loop(
                 Branch::Broadcast(input) => {
                     trace!("handling Branch::Broadcast");
                     match input {
-                        BroadcastInput::Rebroadcast(msg) => {
+                        BroadcastInput::Rebroadcast(payload) => {
                             let bcast_tx = bcast_tx.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = bcast_tx.send(msg).await {
+                                if let Err(e) = bcast_tx.send(payload).await {
                                     error!("could not send broadcast to receiver: {e:?}");
                                 }
                             });
                         }
-                        BroadcastInput::AddBroadcast(msg) => {
-                            // TODO: bring back priority broadcasting
-                            // trace!("PRIORITY BROADCASTING: {msg:?}");
-                            // if let Err(e) = handle_priority_broadcast(
-                            //     &msg,
-                            //     &foca.read(),
-                            //     // &agent,
-                            //     &socket,
-                            //     &client,
-                            // ) {
-                            //     error!("priority broadcast error: {e}");
-                            // }
-                            // for msg in changes {
+                        BroadcastInput::AddBroadcast(payload) => {
                             // queue this to be broadcasted normally..
                             let bcast_tx = bcast_tx.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = bcast_tx.send(msg).await {
+                                if let Err(e) = bcast_tx.send(payload).await {
                                     error!("could not send broadcast (from priority) to receiver: {e:?}");
                                 }
                             });
@@ -591,76 +544,28 @@ pub fn runtime_loop(
                         }
                     }
                 }
-                Branch::SendBroadcast(msg) => {
+                Branch::SendBroadcast(broadcasts) => {
                     trace!("handling Branch::SendBroadcast");
-                    match serialize_broadcast(&msg, &mut ser_buf) {
-                        Ok(bytes) => {
-                            let config = config.read();
-                            if bytes.len() > EFFECTIVE_CAP {
-                                trace!(
-                                    "broadcast too big for UDP (len: {}), sending via HTTP",
-                                    bytes.len()
-                                );
-                                if bytes.len() > HTTP_BROADCAST_SIZE - http_bcast_buf.len() {
-                                    to_broadcast = Some(PendingBroadcast::from_buf(
-                                        &mut http_bcast_buf,
-                                        config.num_indirect_probes.get(),
-                                        config.max_transmissions.get(),
-                                        true,
-                                    ));
-                                    increment_counter!("corro.broadcast.added.count", "transport" => "http", "reason" => "broadcast");
 
-                                    // reset this since we already reached the max buffer len we care about
-                                    http_bcast_interval.reset();
-                                };
-                                http_bcast_buf.put_slice(&bytes);
-                            } else {
-                                if bytes.len() > FRAGMENTS_AT - bcast_buf.len() {
-                                    to_broadcast = Some(PendingBroadcast::from_buf(
-                                        &mut bcast_buf,
-                                        config.num_indirect_probes.get(),
-                                        config.max_transmissions.get(),
-                                        false,
-                                    ));
-
-                                    increment_counter!("corro.broadcast.added.count", "transport" => "udp", "reason" => "broadcast");
-
-                                    // reset this since we already reached the max buffer len we care about
-                                    bcast_interval.reset();
-                                }
-                                bcast_buf.put_slice(&bytes);
-                            }
+                    for bcast in broadcasts {
+                        if let Err(e) = UniPayload::V1(UniPayloadV1::Broadcast(bcast))
+                            .write_to_stream((&mut ser_buf).writer())
+                        {
+                            error!("could not encode UniPayload::V1 Broadcast: {e}");
+                            continue;
                         }
-                        Err(e) => {
-                            error!("could not serialize low-priority broadcast: {e}");
+                        trace!("ser buf len: {}", ser_buf.len());
+                        if let Err(e) = bcast_codec.encode(ser_buf.split().freeze(), &mut bcast_buf)
+                        {
+                            error!("could not encode broadcast: {e}");
+                            continue;
                         }
+                        // bcast_buf.extend_from_slice(&ser_buf.split());
                     }
-                }
-                Branch::BroadcastDeadline => {
-                    trace!("handling Branch::BroadcastDeadline");
-                    let config = config.read();
-                    if bcast_buf.len() > 1 {
-                        to_broadcast = Some(PendingBroadcast::from_buf(
-                            &mut bcast_buf,
-                            config.num_indirect_probes.get(),
-                            config.max_transmissions.get(),
-                            false,
-                        ));
-                        increment_counter!("corro.broadcast.added.count", "transport" => "udp", "reason" => "deadline");
-                    }
-                }
-                Branch::HttpBroadcastDeadline => {
-                    trace!("handling Branch::HttpBroadcastDeadline");
-                    let config = config.read();
-                    if http_bcast_buf.len() > 1 {
-                        to_broadcast = Some(PendingBroadcast::from_buf(
-                            &mut http_bcast_buf,
-                            config.num_indirect_probes.get(),
-                            config.max_transmissions.get(),
-                            true,
-                        ));
-                        increment_counter!("corro.broadcast.added.count", "transport" => "http", "reason" => "deadline");
-                    }
+
+                    trace!("bcast_buf len: {}", bcast_buf.len());
+
+                    to_broadcast = Some(PendingBroadcast::new(bcast_buf.split().freeze()));
                 }
                 Branch::WokePendingBroadcast(pending) => {
                     trace!("handling Branch::WokePendingBroadcast");
@@ -678,6 +583,15 @@ pub fn runtime_loop(
 
             if let Some(mut pending) = to_broadcast.take() {
                 trace!("{} to broadcast: {pending:?}", actor_id);
+
+                let (member_count, max_transmissions) = {
+                    let config = config.read();
+                    (
+                        config.num_indirect_probes.get(),
+                        config.max_transmissions.get(),
+                    )
+                };
+
                 let broadcast_to = {
                     agent
                         .members()
@@ -687,21 +601,27 @@ pub fn runtime_loop(
                         .filter_map(|(member_id, state)| {
                             (*member_id != actor_id).then(|| state.addr)
                         })
-                        .choose_multiple(&mut rng, pending.count)
+                        .choose_multiple(&mut rng, member_count as usize)
                 };
 
                 for addr in broadcast_to {
-                    trace!(actor = %actor_id, "broadcasting {} bytes to: {addr} (count: {}, send count: {})", pending.payload.len(), pending.count, pending.send_count());
-                    if pending.http {
-                        single_http_broadcast(pending.payload.clone(), &client, addr, &clock);
-                    } else {
-                        single_broadcast(pending.payload.clone(), socket.clone(), addr);
-                    }
+                    debug!(actor = %actor_id, "broadcasting {} bytes to: {addr} (send count: {})", pending.payload.len(), pending.send_count);
+
+                    transmit_broadcast(pending.payload.clone(), transport.clone(), addr);
                 }
 
-                if let Some(dur) = pending.backoff.next() {
+                pending.send_count = pending.send_count.wrapping_add(1);
+
+                debug!(
+                    "send_count: {}, max_transmissions: {max_transmissions}",
+                    pending.send_count
+                );
+
+                if pending.send_count < max_transmissions {
+                    debug!("queueing for re-send");
                     idle_pendings.push(Box::pin(async move {
-                        tokio::time::sleep(dur).await;
+                        // FIXME: calculate sleep duration based on send count
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                         pending
                     }));
                 }
@@ -716,198 +636,40 @@ fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
     config.remove_down_after = Duration::from_secs(2 * 24 * 60 * 60);
 
     // max payload size for udp over ipv6 wg - 1 for payload type
-    config.max_packet_size = EFFECTIVE_CAP.try_into().unwrap();
+    // config.max_packet_size = EFFECTIVE_CAP.try_into().unwrap();
 
     config
 }
 
-fn split_broadcast(buf: &mut BytesMut) -> Bytes {
-    let bytes = buf.split().freeze();
-
-    // set the buffer to send a byte of 1 first, custom broadcast stuff!
-    buf.put_u8(1);
-
-    bytes
-}
-
 #[derive(Debug)]
 struct PendingBroadcast {
-    http: bool,
     payload: Bytes,
-    count: usize,
-    backoff: backoff::Iter,
+    send_count: u8,
 }
 
 impl PendingBroadcast {
-    pub fn send_count(&self) -> u32 {
-        self.backoff.retry_count()
-    }
-
-    pub fn from_buf(
-        buf: &mut BytesMut,
-        mut count: usize,
-        mut max_transmissions: u8,
-        http: bool,
-    ) -> Self {
-        trace!("creating pending broadcast for {count} members");
-
-        let payload = split_broadcast(buf);
-
-        if payload.len() >= BIG_PAYLOAD_THRESHOLD {
-            count /= 2;
-            max_transmissions /= 2;
-        }
-
-        max_transmissions = cmp::max(max_transmissions, 1);
-
-        // do at least a few!
-        // max_transmissions = cmp::max(max_transmissions, 20);
-
-        // debug!("using max transmissions: {max_transmissions}");
-
+    pub fn new(payload: Bytes) -> Self {
         Self {
-            http,
             payload,
-            count,
-            backoff: Backoff::new(max_transmissions as u32)
-                .timeout_range(Duration::from_millis(200), Duration::from_secs(10))
-                .iter(),
+            send_count: 0,
         }
     }
 }
 
-fn serialize_broadcast<'a>(msg: &Message, buf: &mut BytesMut) -> eyre::Result<Bytes> {
-    trace!("serializing change {msg:?}");
-
-    msg.encode(buf)?;
-
-    Ok(buf.split().freeze())
-}
-
-pub struct BroadcastIter<'b, I: Iterator<Item = &'b Bytes>> {
-    buf: &'b mut BytesMut,
-    chunks: Peekable<I>,
-    byte: u8,
-    cap: usize,
-}
-
-impl<'b, I> BroadcastIter<'b, I>
-where
-    I: Iterator<Item = &'b Bytes>,
-{
-    pub fn new(buf: &'b mut BytesMut, chunks: I, cap: usize) -> Self {
-        Self {
-            buf,
-            chunks: chunks.peekable(),
-            byte: 1,
-            cap,
-        }
-    }
-    pub fn new_priority(buf: &'b mut BytesMut, chunks: I, cap: usize) -> Self {
-        Self {
-            buf,
-            chunks: chunks.peekable(),
-            byte: 2,
-            cap,
-        }
-    }
-}
-
-impl<'b, I> Iterator for BroadcastIter<'b, I>
-where
-    I: Iterator<Item = &'b Bytes>,
-{
-    type Item = Bytes;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let next_wont_fit = self
-                .chunks
-                .peek()
-                .map(|bytes| bytes.len() > self.cap - self.buf.len())
-                .unwrap_or(false);
-
-            if !next_wont_fit {
-                if let Some(bytes) = self.chunks.next() {
-                    if self.buf.is_empty() {
-                        self.buf.put_u8(self.byte);
-                    }
-                    self.buf.put_slice(bytes.as_ref());
-                    continue;
-                }
-            }
-
-            if self.buf.is_empty() {
-                break None;
-            }
-            break Some(self.buf.split().freeze());
-        }
-    }
-}
-
-fn single_broadcast(payload: Bytes, socket: Arc<UdpSocket>, addr: SocketAddr) {
+fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
     tokio::spawn(async move {
         trace!("singly broadcasting to {addr}");
-        match socket.send_to(payload.as_ref(), addr).await {
-            Ok(n) => {
-                histogram!("corro.broadcast.sent.bytes", n as f64, "transport" => "udp");
-                trace!("sent {n} bytes to {addr}");
-            }
+        let mut stream = match transport.open_uni(addr).await {
+            Ok(s) => s,
             Err(e) => {
-                error!(
-                    "could not send UDP broadcast to {addr} (len: {}): {e}",
-                    payload.len()
-                );
+                error!("could not open unidirectional stream to {addr}: {e}");
+                return;
             }
+        };
+
+        if let Err(e) = stream.write_all(&payload).await {
+            error!("could not write to uni stream to {addr}: {e}");
+            return;
         }
     });
-}
-
-fn single_http_broadcast(payload: Bytes, client: &ClientPool, addr: SocketAddr, clock: &uhlc::HLC) {
-    let start = Instant::now();
-    trace!("single http broadcast with first byte: {}", payload[0]);
-    let len = payload.len();
-    let req = client
-        .request(http_broadcast_request(
-            addr,
-            clock,
-            hyper::Body::from(payload),
-        ))
-        .inspect(move |res| match res {
-            Ok(_) => {
-                histogram!("corro.broadcast.sent.bytes", len as f64, "transport" => "http");
-            }
-            Err(e) => {
-                error!(
-                    "could not send single http broadcast to addr: '{addr}' (len: {}): {e}",
-                    len
-                );
-            }
-        });
-    tokio::spawn(async move {
-        match req.await {
-            Ok(res) => {
-                histogram!("corro.gossip.broadcast.response.time.seconds", start.elapsed().as_secs_f64(), "status" => res.status().to_string(), "kind" => "single");
-            }
-            Err(e) => error!("error sending priority broadcast (single): {e}"),
-        }
-    });
-}
-
-fn http_broadcast_request(
-    addr: SocketAddr,
-    clock: &uhlc::HLC,
-    body: hyper::Body,
-) -> hyper::Request<hyper::Body> {
-    hyper::Request::builder()
-        .method(hyper::Method::POST)
-        .uri(format!("http://{addr}/v1/broadcast"))
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .header(hyper::header::ACCEPT, "application/json")
-        .header(
-            "corro-clock",
-            serde_json::to_string(&clock.new_timestamp()).expect("could not serialize clock"),
-        )
-        .body(body)
-        .expect("could not build request")
 }

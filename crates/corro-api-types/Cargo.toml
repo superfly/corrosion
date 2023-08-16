@@ -1,0 +1,19 @@
+[package]
+name = "corro-api-types"
+version = "0.1.0-alpha.1"
+edition = "2021"
+description = "common API types for corrosion"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+speedy = { workspace = true }
+compact_str = { workspace = true }
+rusqlite = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true } 
+bb8 = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+camino = { workspace = true }
+pin-project-lite = { workspace = true }

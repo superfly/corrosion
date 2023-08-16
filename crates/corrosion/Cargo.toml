@@ -40,7 +40,6 @@ seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spawn = { path = "../spawn" }
-speedy = { workspace = true }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }

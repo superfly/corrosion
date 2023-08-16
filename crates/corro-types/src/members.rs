@@ -1,8 +1,10 @@
 use std::{collections::HashMap, net::SocketAddr};
 
+use tracing::trace;
+
 use crate::actor::{Actor, ActorId};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MemberState {
     pub addr: SocketAddr,
 
@@ -34,6 +36,8 @@ impl Members {
             .or_insert_with(|| MemberState::new(actor.addr()));
 
         member.addr = actor.addr();
+
+        trace!("member: {member:?}");
 
         member.counter += 1;
         member.counter == 1

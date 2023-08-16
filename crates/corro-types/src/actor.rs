@@ -41,7 +41,7 @@ impl fmt::Display for ActorId {
     }
 }
 
-const ULID_SIZE: usize = 16;
+const UUID_SIZE: usize = 16;
 
 impl<'a, C> Readable<'a, C> for ActorId
 where
@@ -54,7 +54,7 @@ where
 
     #[inline]
     fn minimum_bytes_needed() -> usize {
-        ULID_SIZE
+        UUID_SIZE
     }
 }
 
@@ -69,7 +69,7 @@ where
 
     #[inline]
     fn bytes_needed(&self) -> Result<usize, C::Error> {
-        Ok(ULID_SIZE)
+        Ok(UUID_SIZE)
     }
 }
 
@@ -97,11 +97,10 @@ impl FromSql for ActorId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Actor {
     id: ActorId,
     addr: SocketAddr,
-
     // An extra field to allow fast rejoin
     bump: u16,
 }

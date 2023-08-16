@@ -28,7 +28,7 @@ use tokio::{
 use tracing::{debug, error, info, trace};
 
 use corro_types::{
-    broadcast::{BroadcastInput, Message, MessageV1},
+    broadcast::{Broadcast, BroadcastInput, BroadcastV1},
     change::Change,
 };
 
@@ -220,8 +220,8 @@ where
                             let tx_bcast = agent.tx_bcast().clone();
                             tokio::spawn(async move {
                                 if let Err(e) = tx_bcast
-                                    .send(BroadcastInput::AddBroadcast(Message::V1(
-                                        MessageV1::Change(ChangeV1 {
+                                    .send(BroadcastInput::AddBroadcast(Broadcast::V1(
+                                        BroadcastV1::Change(ChangeV1 {
                                             actor_id,
                                             changeset: Changeset::Full {
                                                 version,
@@ -712,7 +712,7 @@ mod tests {
 
         assert!(matches!(
             msg,
-            BroadcastInput::AddBroadcast(Message::V1(MessageV1::Change(ChangeV1 {
+            BroadcastInput::AddBroadcast(Broadcast::V1(BroadcastV1::Change(ChangeV1 {
                 changeset: Changeset::Full { version: 1, .. },
                 ..
             })))

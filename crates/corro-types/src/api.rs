@@ -1,59 +1,7 @@
-use std::collections::HashMap;
-
 use compact_str::CompactString;
-use serde::{Deserialize, Serialize};
+use corro_api_types::SqliteValue;
 
-use crate::{change::SqliteValue, pubsub::ChangeType};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Statement {
-    Simple(String),
-    WithParams(String, Vec<SqliteValue>),
-    WithNamedParams(String, HashMap<String, SqliteValue>),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RqliteResponse {
-    pub results: Vec<RqliteResult>,
-    pub time: Option<f64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RqliteResult {
-    Execute {
-        rows_affected: usize,
-        time: Option<f64>,
-    },
-    Query {
-        columns: Vec<CompactString>,
-        types: Vec<Option<CompactString>>,
-        values: Vec<Vec<SqliteValue>>,
-        time: Option<f64>,
-    },
-    QueryAssociative {
-        types: HashMap<CompactString, Option<CompactString>>,
-        rows: Vec<HashMap<CompactString, SqliteValue>>,
-        time: Option<f64>,
-    },
-    Error {
-        error: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case", tag = "event", content = "data")]
-pub enum QueryEvent {
-    Columns(Vec<CompactString>),
-    Row {
-        rowid: i64,
-        change_type: ChangeType,
-        cells: Vec<SqliteValue>,
-    },
-    EndOfQuery,
-    Error(CompactString),
-}
+pub use corro_api_types::{QueryEvent, RqliteResponse, RqliteResult, Statement};
 
 #[derive(Default)]
 pub struct QueryResultBuilder {

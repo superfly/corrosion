@@ -1,12 +1,12 @@
 use std::{
     fmt, io,
-    net::SocketAddr,
     num::NonZeroU32,
     ops::{Deref, RangeInclusive},
     time::Duration,
 };
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::Bytes;
+use corro_api_types::Change;
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use metrics::increment_counter;
 use rusqlite::{
@@ -17,43 +17,50 @@ use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
-use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 use tracing::{error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
     actor::{Actor, ActorId},
-    change::Change,
+    sync::SyncStateV1,
 };
 
-pub const FRAGMENTS_AT: usize = 1420 // wg0 MTU
-                              - 40 // 40 bytes IPv6 header
-                              - 8; // UDP header bytes
-pub const EFFECTIVE_CAP: usize = FRAGMENTS_AT - 1; // fragmentation cap - 1 for the message type byte
-pub const HTTP_BROADCAST_SIZE: usize = 64 * 1024;
-pub const EFFECTIVE_HTTP_BROADCAST_SIZE: usize = HTTP_BROADCAST_SIZE - 1;
+#[derive(Debug, Clone, Readable, Writable)]
+pub enum UniPayload {
+    V1(UniPayloadV1),
+}
 
-#[derive(Debug)]
-pub enum BroadcastSrc {
-    Http(SocketAddr),
-    Udp(SocketAddr),
+#[derive(Debug, Clone, Readable, Writable)]
+pub enum UniPayloadV1 {
+    Gossip(Vec<u8>),
+    Broadcast(Broadcast),
+}
+
+#[derive(Debug, Clone, Readable, Writable)]
+pub enum BiPayload {
+    V1(BiPayloadV1),
+}
+
+#[derive(Debug, Clone, Readable, Writable)]
+pub enum BiPayloadV1 {
+    SyncState(SyncStateV1),
 }
 
 #[derive(Debug)]
 pub enum FocaInput {
     Announce(Actor),
-    Data(Bytes, BroadcastSrc),
+    Data(Bytes),
     ClusterSize(NonZeroU32),
     ApplyMany(Vec<Member<Actor>>),
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
-pub enum Message {
-    V1(MessageV1),
+pub enum Broadcast {
+    V1(BroadcastV1),
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
-pub enum MessageV1 {
+pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
@@ -207,7 +214,7 @@ impl ToSql for Timestamp {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum MessageEncodeError {
+pub enum BroadcastEncodeError {
     #[error(transparent)]
     Encode(#[from] speedy::Error),
     #[error(transparent)]
@@ -215,7 +222,7 @@ pub enum MessageEncodeError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum MessageDecodeError {
+pub enum BroadcastDecodeError {
     #[error(transparent)]
     Decode(#[from] speedy::Error),
     #[error("corrupted message, crc mismatch (got: {0}, expected {1})")]
@@ -226,63 +233,64 @@ pub enum MessageDecodeError {
     InsufficientLength(usize),
 }
 
-impl Message {
+impl Broadcast {
     pub fn from_slice<S: AsRef<[u8]>>(slice: S) -> Result<Self, speedy::Error> {
         Self::read_from_buffer(slice.as_ref())
     }
 
-    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), MessageEncodeError> {
-        self.write_to_stream(buf.writer())?;
-        let mut bytes = buf.split();
-        let hash = crc32fast::hash(&bytes);
-        bytes.put_u32(hash);
+    // pub fn encode<E: Encoder<Bytes, Error = std::io::Error>>(
+    //     &self,
+    //     buf: &mut BytesMut,
+    //     codec: &mut E,
+    // ) -> Result<(), BroadcastEncodeError> {
+    //     self.write_to_stream(buf.writer())?;
+    //     // let mut bytes = buf.split();
+    //     // let hash = crc32fast::hash(&bytes);
+    //     // bytes.put_u32(hash);
 
-        let mut codec = LengthDelimitedCodec::builder()
-            .length_field_type::<u32>()
-            .new_codec();
-        codec.encode(bytes.split().freeze(), buf)?;
+    //     codec.encode(buf.split().freeze(), buf)?;
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    pub fn from_buf(buf: &mut BytesMut) -> Result<Message, MessageDecodeError> {
-        let len = buf.len();
-        trace!("successfully decoded a frame, len: {len}");
+    // pub fn from_buf(buf: &mut BytesMut) -> Result<Broadcast, BroadcastDecodeError> {
+    //     let len = buf.len();
+    //     trace!("successfully decoded a frame, len: {len}");
 
-        if len < 4 {
-            return Err(MessageDecodeError::InsufficientLength(len));
-        }
+    //     if len < 4 {
+    //         return Err(BroadcastDecodeError::InsufficientLength(len));
+    //     }
 
-        let mut crc_bytes = buf.split_off(len - 4);
+    //     let mut crc_bytes = buf.split_off(len - 4);
 
-        let crc = crc_bytes.get_u32();
-        let new_crc = crc32fast::hash(&buf);
-        if crc != new_crc {
-            return Err(MessageDecodeError::Corrupted(crc, new_crc));
-        }
+    //     let crc = crc_bytes.get_u32();
+    //     let new_crc = crc32fast::hash(&buf);
+    //     if crc != new_crc {
+    //         return Err(BroadcastDecodeError::Corrupted(crc, new_crc));
+    //     }
 
-        Ok(Message::from_slice(&buf)?)
-    }
+    //     Ok(Broadcast::from_slice(&buf)?)
+    // }
 
-    pub fn decode(
-        codec: &mut LengthDelimitedCodec,
-        buf: &mut BytesMut,
-    ) -> Result<Option<Self>, MessageDecodeError> {
-        Ok(match codec.decode(buf)? {
-            Some(mut buf) => Some(Self::from_buf(&mut buf)?),
-            None => None,
-        })
-    }
+    // pub fn decode(
+    //     codec: &mut LengthDelimitedCodec,
+    //     buf: &mut BytesMut,
+    // ) -> Result<Option<Self>, BroadcastDecodeError> {
+    //     Ok(match codec.decode(buf)? {
+    //         Some(mut buf) => Some(Self::from_buf(&mut buf)?),
+    //         None => None,
+    //     })
+    // }
 }
 
 #[derive(Debug)]
 pub enum BroadcastInput {
-    Rebroadcast(Message),
-    AddBroadcast(Message),
+    Rebroadcast(Broadcast),
+    AddBroadcast(Broadcast),
 }
 
 pub struct DispatchRuntime<T> {
-    pub to_send: Sender<(T, Bytes)>,
+    pub to_send: Sender<(T, Vec<u8>)>,
     pub to_schedule: Sender<(Duration, Timer<T>)>,
     pub notifications: Sender<Notification<T>>,
     pub active: bool,
@@ -309,7 +317,7 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
         trace!("cluster send_to {to:?}");
         let packet = data.to_vec();
 
-        if let Err(e) = self.to_send.try_send((to, packet.into())) {
+        if let Err(e) = self.to_send.try_send((to, packet)) {
             increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_send");
             error!("error dispatching broadcast packet: {e}");
         }
@@ -325,7 +333,7 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
 
 impl<T> DispatchRuntime<T> {
     pub fn new(
-        to_send: Sender<(T, Bytes)>,
+        to_send: Sender<(T, Vec<u8>)>,
         to_schedule: Sender<(Duration, Timer<T>)>,
         notifications: Sender<Notification<T>>,
     ) -> Self {

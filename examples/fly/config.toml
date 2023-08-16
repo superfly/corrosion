@@ -1,17 +1,21 @@
-db_path = "/var/lib/corrosion/state.db"
-
-gossip_addr = "fly-local-6pn:8787"
-api_addr = "[::]:8080"
-
-admin_path = "/app/admin.sock"
-
-metrics_addr = "0.0.0.0:9090"
-
-bootstrap = ["corrosion2.internal:8787"]
-
+[db]
+path = "/var/lib/corrosion/state.db"
 schema_paths = ["/app/schemas"]
+
+[gossip]
+addr = "fly-local-6pn:8787"
+bootstrap = ["corrosion2.internal:8787"]
+plaintext = true
+max_mtu = 1372
+
+[api]
+addr = "[::]:8080"
+
+[admin]
+path = "/app/admin.sock"
+
+[telemetry]
+prometheus.addr = "0.0.0.0:9090"
 
 [log]
 colors = false
-
-# log_format = "json"

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use camino::Utf8PathBuf;
 use corro_agent::agent::start;
 use corro_types::{
     agent::Agent,
@@ -39,6 +40,20 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 
     let schema_path = tmpdir.path().join("schema");
 
+    let tls_path = Utf8PathBuf::from(tmpdir.path().display().to_string()).join("tls");
+    let cert_path = tls_path.join("cert.pem");
+    let key_path = tls_path.join("key.pem");
+
+    let cert = rcgen::generate_simple_self_signed(vec![hostname::get()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()])?;
+    let key = cert.serialize_private_key_pem();
+    let cert = cert.serialize_pem().unwrap();
+    tokio::fs::create_dir_all(tls_path).await?;
+    tokio::fs::write(&cert_path, &cert).await?;
+    tokio::fs::write(&key_path, &key).await?;
+
     let conf = f(Config::builder()
         .api_addr("127.0.0.1:0".parse()?)
         .gossip_addr("127.0.0.1:0".parse()?)
@@ -49,7 +64,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
     tokio::fs::create_dir(&schema_path).await?;
     tokio::fs::write(schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes()).await?;
 
-    let schema_paths = conf.schema_paths.clone();
+    let schema_paths = conf.db.schema_paths.clone();
 
     let agent = start(conf, tripwire).await?;
 

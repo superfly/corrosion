@@ -15,7 +15,6 @@ use metrics::{gauge, histogram, increment_counter};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{Connection, InterruptHandle};
-use spawn::spawn_counted;
 use tempfile::TempDir;
 use tokio::{
     runtime::Handle,
@@ -138,7 +137,7 @@ impl Agent {
     }
 
     pub fn db_path(&self) -> Utf8PathBuf {
-        self.0.config.load().db_path.clone()
+        self.0.config.load().db.path.clone()
     }
 
     pub fn config(&self) -> arc_swap::Guard<Arc<Config>, arc_swap::strategy::DefaultStrategy> {
@@ -249,7 +248,7 @@ impl SplitPool {
         let (normal_tx, mut normal_rx) = channel(512);
         let (low_tx, mut low_rx) = channel(1024);
 
-        spawn_counted(async move {
+        tokio::spawn(async move {
             loop {
                 let tx: oneshot::Sender<CancellationToken> = tokio::select! {
                     biased;
@@ -449,7 +448,7 @@ impl<'a> DerefMut for WriteConn<'a> {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum KnownDbVersion {
     Current {
         db_version: i64,

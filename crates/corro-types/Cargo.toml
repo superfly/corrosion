@@ -1,7 +1,9 @@
 [package]
 name = "corro-types"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
+description = "common types for corrosion"
+license = "MIT"
 
 [dependencies]
 arc-swap = { workspace = true }
@@ -11,7 +13,8 @@ bytes = { workspace = true }
 camino = { workspace = true }
 compact_str = { workspace = true }
 config = { workspace = true }
-consul-client = { path = "../consul-client" }
+consul-client = { version = "0.1.0-alpha.0", path = "../consul-client" }
+corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
 crc32fast = { workspace = true }
 enquote = { workspace = true }
 fallible-iterator = { workspace = true }
@@ -29,7 +32,6 @@ rangemap = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-spawn = { path = "../spawn" }
 speedy = { workspace = true }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }
@@ -38,7 +40,8 @@ time = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-tripwire = { path = "../tripwire" }
+tripwire = { version = "0.1.0-alpha.0", path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }
 smallvec = { workspace = true }
+hostname = { workspace = true }

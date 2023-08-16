@@ -44,7 +44,7 @@ pub async fn run(
         .init();
 
     let client = CorrosionApiClient::new(api_addr);
-    let engine = corro_tpl::Engine::new(client);
+    let engine = corro_tpl::Engine::new::<std::fs::File>(client);
 
     let mut filepaths = vec![];
 

@@ -1,27 +1,22 @@
 use std::net::SocketAddr;
 
 use camino::Utf8PathBuf;
+use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
-pub const MAX_CHANGE_SIZE: i64 = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub db_path: Utf8PathBuf,
-    pub gossip_addr: SocketAddr,
-    pub api_addr: SocketAddr,
-    #[serde(default = "default_admin_path")]
-    pub admin_path: Utf8PathBuf,
-    pub metrics_addr: Option<SocketAddr>,
-    #[serde(default)]
-    pub bootstrap: Vec<String>,
+    pub db: DbConfig,
+    pub api: ApiConfig,
+    pub gossip: GossipConfig,
 
     #[serde(default)]
-    pub schema_paths: Vec<Utf8PathBuf>,
+    pub admin: AdminConfig,
 
-    #[serde(default = "default_max_change_size")]
-    pub max_change_size: i64,
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
 
     #[serde(default)]
     pub log: LogConfig,
@@ -29,12 +24,81 @@ pub struct Config {
     pub consul: Option<ConsulConfig>,
 }
 
-pub fn default_admin_path() -> Utf8PathBuf {
-    "/var/run/corrosion/admin.sock".into()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryConfig {
+    Prometheus {
+        #[serde(alias = "addr")]
+        bind_addr: SocketAddr,
+    },
 }
 
-pub fn default_max_change_size() -> i64 {
-    MAX_CHANGE_SIZE
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    #[serde(alias = "path")]
+    pub uds_path: Utf8PathBuf,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            uds_path: default_admin_path(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbConfig {
+    pub path: Utf8PathBuf,
+    #[serde(default)]
+    pub schema_paths: Vec<Utf8PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    #[serde(alias = "addr")]
+    pub bind_addr: SocketAddr,
+    #[serde(alias = "authz", default)]
+    pub authorization: Option<AuthzConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthzConfig {
+    BearerToken(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GossipConfig {
+    #[serde(alias = "addr")]
+    pub bind_addr: SocketAddr,
+    #[serde(default)]
+    pub bootstrap: Vec<String>,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    #[serde(default)]
+    pub plaintext: bool,
+    #[serde(default)]
+    pub max_mtu: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Certificate file
+    pub cert_file: Utf8PathBuf,
+    /// Private key file
+    pub key_file: Utf8PathBuf,
+    /// CA (Certificate Authority) file
+    pub ca_file: Option<Utf8PathBuf>,
+
+    pub default_server_name: CompactString,
+
+    #[serde(default)]
+    pub insecure: bool,
+}
+
+pub fn default_admin_path() -> Utf8PathBuf {
+    "/var/run/corrosion/admin.sock".into()
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +143,7 @@ pub struct ConfigBuilder {
     schema_paths: Vec<Utf8PathBuf>,
     max_change_size: Option<i64>,
     consul: Option<ConsulConfig>,
+    tls: Option<TlsConfig>,
 }
 
 impl ConfigBuilder {
@@ -132,20 +197,38 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn tls_config(mut self, config: TlsConfig) -> Self {
+        self.tls = Some(config);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
-        let db_path = self.db_path.unwrap_or_else(default_db_path);
+        let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
         Ok(Config {
-            db_path,
-            gossip_addr: self
-                .gossip_addr
-                .ok_or(ConfigBuilderError::GossipAddrRequired)?,
-            api_addr: self.api_addr.ok_or(ConfigBuilderError::ApiAddrRequired)?,
-            admin_path: self.admin_path.unwrap_or_else(default_admin_path),
-            metrics_addr: self.metrics_addr,
-            bootstrap: self.bootstrap.unwrap_or_default(),
+            db: DbConfig {
+                path: db_path,
+                schema_paths: self.schema_paths,
+            },
+            api: ApiConfig {
+                bind_addr: self.api_addr.ok_or(ConfigBuilderError::ApiAddrRequired)?,
+                authorization: None,
+            },
+            gossip: GossipConfig {
+                bind_addr: self
+                    .gossip_addr
+                    .ok_or(ConfigBuilderError::GossipAddrRequired)?,
+                bootstrap: self.bootstrap.unwrap_or_default(),
+                plaintext: self.tls.is_none(),
+                tls: self.tls,
+                max_mtu: None, // TODO: add a builder function for it
+            },
+            admin: AdminConfig {
+                uds_path: self.admin_path.unwrap_or_else(default_admin_path),
+            },
+            telemetry: self
+                .metrics_addr
+                .map(|bind_addr| TelemetryConfig::Prometheus { bind_addr }),
             log: self.log.unwrap_or_default(),
-            schema_paths: self.schema_paths,
-            max_change_size: self.max_change_size.unwrap_or(MAX_CHANGE_SIZE),
 
             consul: self.consul,
         })
@@ -154,14 +237,12 @@ impl ConfigBuilder {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigBuilderError {
-    #[error("gossip_addr required")]
+    #[error("db.path required")]
+    DbPathRequired,
+    #[error("gossip.addr required")]
     GossipAddrRequired,
-    #[error("api_addr required")]
+    #[error("api.addr required")]
     ApiAddrRequired,
-}
-
-fn default_db_path() -> Utf8PathBuf {
-    "./corro.db".into()
 }
 
 /// Log format (JSON only)

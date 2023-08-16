@@ -1,26 +1,28 @@
 use std::collections::HashMap;
+use std::io;
 use std::io::Write;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::BytesMut;
 use compact_str::CompactString;
 use compact_str::ToCompactString;
 use corro_client::CorrosionApiClient;
 use corro_types::api::QueryEvent;
 use corro_types::api::Statement;
 use corro_types::change::SqliteValue;
+use futures::Stream;
 use futures::StreamExt;
 use indexmap::IndexMap;
 use rhai::Dynamic;
 use rhai::{EvalAltResult, Map};
 use rhai_tpl::TemplateWriter;
+use rhai_tpl::Writer;
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
 use tokio::sync::OnceCell;
 use tokio::sync::{mpsc, RwLock as TokioRwLock};
 use tokio::time::sleep;
-use tokio_util::codec::{Decoder, LinesCodec};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
@@ -93,8 +95,6 @@ impl IntoIterator for QueryResponse {
         QueryResponseIter {
             query: self.query.clone(),
             body: OnceCell::new(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
             handle: tokio::runtime::Handle::current(),
             done: false,
             columns: None,
@@ -189,16 +189,14 @@ impl Cell {
 
 struct QueryResponseIter {
     query: Arc<TokioRwLock<QueryHandle>>,
-    body: OnceCell<hyper::Body>,
-    buf: BytesMut,
-    codec: LinesCodec,
+    body: OnceCell<BoxedWatchStream>,
     handle: tokio::runtime::Handle,
     done: bool,
     columns: Option<Arc<Vec<CompactString>>>,
 }
 
 impl QueryResponseIter {
-    pub async fn body(&mut self) -> Result<&mut hyper::Body, Box<EvalAltResult>> {
+    pub async fn body(&mut self) -> Result<&mut BoxedWatchStream, Box<EvalAltResult>> {
         self.body
             .get_or_try_init(|| async {
                 match self.query.write().await.body().await {
@@ -214,105 +212,56 @@ impl QueryResponseIter {
         })
     }
 
-    // pub async fn columns(&mut self) -> Result<Arc<Vec<CompactString>>, Box<EvalAltResult>> {
-    //     {
-    //         if let Some(cols) = self.columns.clone() {
-    //             return Ok(cols);
-    //         }
-    //     }
-
-    //     if let Some(Err(e)) = self.recv().await {
-    //         return Err(e);
-    //     }
-    //     if let Some(cols) = self.columns.clone() {
-    //         return Ok(cols);
-    //     }
-    //     return Err(Box::new(EvalAltResult::from("could not get columns")));
-    // }
-
-    pub async fn read_bytes(&mut self) -> Result<usize, Box<EvalAltResult>> {
-        let bytes_res = {
-            let body = match self.body().await {
-                Ok(body) => body,
-                Err(e) => {
-                    self.done = true;
-                    return Err(e);
-                }
-            };
-            body.next().await
-        };
-        let len = match bytes_res {
-            Some(Ok(b)) => {
-                // debug!("read {} bytes", b.len());
-                self.buf.extend_from_slice(&b);
-                b.len()
-            }
-            Some(Err(e)) => {
-                self.done = true;
-                return Err(Box::new(EvalAltResult::from(e.to_string())));
-            }
-            None => {
-                self.done = true;
-                0
-            }
-        };
-
-        Ok(len)
-    }
-
     pub async fn recv(&mut self) -> Option<Result<Row, Box<EvalAltResult>>> {
         if self.done {
             return None;
         }
 
         loop {
-            loop {
-                match self.codec.decode(&mut self.buf) {
-                    Ok(Some(line)) => match serde_json::from_str(&line) {
-                        Ok(res) => match res {
-                            QueryEvent::Columns(cols) => self.columns = Some(Arc::new(cols)),
-                            QueryEvent::Row { rowid, cells, .. } => match self.columns.as_ref() {
-                                Some(columns) => {
-                                    return Some(Ok(Row {
-                                        id: rowid,
-                                        columns: columns.clone(),
-                                        cells,
-                                    }));
-                                }
-                                None => {
-                                    self.done = true;
-                                    return Some(Err(Box::new(EvalAltResult::from(
-                                        "did not receive columns data",
-                                    ))));
-                                }
-                            },
-                            QueryEvent::EndOfQuery => {
-                                return None;
-                            }
-                            QueryEvent::Error(e) => {
-                                self.done = true;
-                                return Some(Err(Box::new(EvalAltResult::from(e))));
-                            }
-                        },
-                        Err(e) => {
-                            self.done = true;
-                            return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
-                        }
-                    },
-                    Ok(None) => {
-                        break;
-                    }
+            let res = {
+                let body = match self.body().await {
+                    Ok(body) => body,
                     Err(e) => {
                         self.done = true;
-                        return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
+                        return Some(Err(e));
                     }
+                };
+                body.next().await
+            };
+            match res {
+                Some(Ok(evt)) => match evt {
+                    QueryEvent::Columns(cols) => self.columns = Some(Arc::new(cols)),
+                    QueryEvent::Row { rowid, cells, .. } => match self.columns.as_ref() {
+                        Some(columns) => {
+                            return Some(Ok(Row {
+                                id: rowid,
+                                columns: columns.clone(),
+                                cells,
+                            }));
+                        }
+                        None => {
+                            self.done = true;
+                            return Some(Err(Box::new(EvalAltResult::from(
+                                "did not receive columns data",
+                            ))));
+                        }
+                    },
+                    QueryEvent::EndOfQuery => {
+                        return None;
+                    }
+                    QueryEvent::Error(e) => {
+                        self.done = true;
+                        return Some(Err(Box::new(EvalAltResult::from(e))));
+                    }
+                },
+                Some(Err(e)) => {
+                    self.done = true;
+                    return Some(Err(Box::new(EvalAltResult::from(e.to_string()))));
                 }
-            }
-            match self.read_bytes().await {
-                Ok(n) => {
-                    trace!("read {n} bytes");
+                None => {
+                    self.done = true;
+                    return None;
                 }
-                Err(e) => return Some(Err(e)),
             }
         }
     }
@@ -329,19 +278,22 @@ impl Iterator for QueryResponseIter {
     }
 }
 
+pub type BoxedWatchStream =
+    Pin<Box<dyn Stream<Item = io::Result<QueryEvent>> + Send + Sync + 'static>>;
+
 pub struct QueryHandle {
     id: Uuid,
-    body: Option<hyper::Body>,
+    body: Option<BoxedWatchStream>,
     client: CorrosionApiClient,
 }
 
 impl QueryHandle {
-    async fn body(&mut self) -> Result<(hyper::Body, bool), corro_client::Error> {
+    async fn body(&mut self) -> Result<(BoxedWatchStream, bool), corro_client::Error> {
         if let Some(body) = self.body.take() {
             return Ok((body, true));
         }
 
-        Ok((self.client.watched_query(self.id).await?, false))
+        Ok((Box::pin(self.client.watched_query(self.id).await?), false))
     }
 }
 
@@ -356,8 +308,8 @@ pub enum TemplateCommand {
     Render,
 }
 
-fn write_sql_to_csv(
-    tw: &mut TemplateWriter<TemplateState>,
+fn write_sql_to_csv<W: Write>(
+    tw: &mut TemplateWriter<W, TemplateState>,
     csv: SqlToCsv,
 ) -> Result<QueryResponseIter, Box<EvalAltResult>> {
     let mut rows = csv.res.into_iter();
@@ -386,8 +338,8 @@ fn write_sql_to_csv(
     Ok(rows)
 }
 
-fn write_sql_to_json(
-    tw: &mut TemplateWriter<TemplateState>,
+fn write_sql_to_json<W: Write>(
+    tw: &mut TemplateWriter<W, TemplateState>,
     mut json: SqlToJson,
 ) -> Result<QueryResponseIter, Box<EvalAltResult>> {
     debug!("write_sql_to_json");
@@ -455,12 +407,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(client: corro_client::CorrosionApiClient) -> Self {
-        let mut engine = rhai_tpl::Engine::new::<TemplateState>();
+    pub fn new<W: Writer>(client: corro_client::CorrosionApiClient) -> Self {
+        let mut engine = rhai_tpl::Engine::new::<W, TemplateState>();
 
         // custom, efficient, write functions
         engine.register_fn("write", {
-            move |tw: &mut TemplateWriter<TemplateState>,
+            move |tw: &mut TemplateWriter<W, TemplateState>,
                   json: SqlToJson|
                   -> Result<(), Box<EvalAltResult>> {
                 let rows = write_sql_to_json(tw, json)?;
@@ -477,7 +429,7 @@ impl Engine {
 
         engine.register_fn(
             "write",
-            |tw: &mut TemplateWriter<TemplateState>,
+            |tw: &mut TemplateWriter<W, TemplateState>,
              csv: SqlToCsv|
              -> Result<(), Box<EvalAltResult>> {
                 let rows = write_sql_to_csv(tw, csv)?;
@@ -522,7 +474,7 @@ impl Engine {
 
             let handle = Arc::new(TokioRwLock::new(QueryHandle {
                 id: query_id,
-                body: Some(body),
+                body: Some(Box::pin(body)),
                 client: client.clone(),
             }));
 
@@ -743,7 +695,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(1);
 
-        let engine = Engine::new(client.clone());
+        let engine = Engine::new::<std::fs::File>(client.clone());
 
         // loop {
         // let cmd = cmd_rx.recv().await.unwrap();

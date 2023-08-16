@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use camino::Utf8PathBuf;
 use corro_admin::AdminConfig;
-use corro_types::config::Config;
+use corro_types::config::{Config, TelemetryConfig};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use spawn::wait_for_all_pending_handles;
 use tracing::{error, info};
@@ -12,8 +12,8 @@ use crate::VERSION;
 pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> {
     info!("Starting Corrosion Agent v{VERSION}");
 
-    if let Some(metrics_addr) = config.metrics_addr {
-        setup_prometheus(metrics_addr).expect("could not setup prometheus");
+    if let Some(TelemetryConfig::Prometheus { bind_addr }) = config.telemetry {
+        setup_prometheus(bind_addr).expect("could not setup prometheus");
     }
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
@@ -25,16 +25,16 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
     corro_admin::start_server(
         agent,
         AdminConfig {
-            listen_path: config.admin_path.clone(),
+            listen_path: config.admin.uds_path.clone(),
             config_path: config_path.clone(),
         },
         tripwire,
     )?;
 
-    if !config.schema_paths.is_empty() {
-        let client = corro_client::CorrosionApiClient::new(config.api_addr);
+    if !config.db.schema_paths.is_empty() {
+        let client = corro_client::CorrosionApiClient::new(config.api.bind_addr);
         match client
-            .schema_from_paths(config.schema_paths.as_slice())
+            .schema_from_paths(config.db.schema_paths.as_slice())
             .await
         {
             Ok(res) => {

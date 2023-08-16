@@ -466,7 +466,7 @@ pub fn make_schema_inner(
 }
 
 pub fn parse_sql_to_schema(schema: &mut NormalizedSchema, sql: &str) -> Result<(), SchemaError> {
-    info!("parsing {sql}");
+    debug!("parsing {sql}");
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
 
     loop {
