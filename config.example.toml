@@ -1,14 +1,20 @@
-db_path = "./corrosion.db"
-
-gossip_addr = "[::]:8787"
-api_addr = "127.0.0.1:8080"
-
-admin_path = "/var/run/corrosion/admin.sock"
-
-metrics_addr = "127.0.0.1:9090"
-
-bootstrap = []
-
-log_format = "json"
-
+[db]
+path = "./corrosion.db"
 schema_paths = ["/etc/corrosion/schemas"]
+
+[gossip]
+addr = "[::]:8787"
+bootstrap = []
+plaintext = true
+
+[api]
+addr = "127.0.0.1:8080"
+
+[admin]
+path = "/var/run/corrosion/admin.sock"
+
+[telemetry]
+prometheus.addr = "127.0.0.1:9090"
+
+[log]
+format = "json"

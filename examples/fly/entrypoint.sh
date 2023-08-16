@@ -1,7 +1,7 @@
 #!/bin/bash
 
-export GOSSIP_ADDR="[$(getent hosts fly-local-6pn | cut -d ' ' -f1)]:8787"
+export GOSSIP__ADDR="[$(getent hosts fly-local-6pn | cut -d ' ' -f1)]:8787"
 
-echo "Set GOSSIP_ADDR=$GOSSIP_ADDR"
+echo "Set GOSSIP__ADDR=$GOSSIP__ADDR"
 
 exec "$@"

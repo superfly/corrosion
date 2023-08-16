@@ -47,6 +47,7 @@ use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
+use quinn::MtuDiscoveryConfig;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection, Transaction};
@@ -247,78 +248,115 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     Ok((agent, opts))
 }
 
-async fn gossip_server_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
-    if config.plaintext {
-        return Ok(quinn::Endpoint::server(
-            quinn_plaintext::server_config(),
-            config.bind_addr,
-        )?);
+fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig {
+    let mut transport_config = quinn::TransportConfig::default();
+
+    // max 1024 concurrent bidirectional streams
+    transport_config.max_concurrent_bidi_streams(1024u32.into());
+
+    // max 10240 concurrent unidirectional streams
+    transport_config.max_concurrent_uni_streams(10240u32.into());
+
+    if let Some(max_mtu) = config.max_mtu {
+        info!("Setting maximum MTU for QUIC at {max_mtu}");
+        transport_config.initial_mtu(1200);
+        let mut mtu_discovery = MtuDiscoveryConfig::default();
+        mtu_discovery.upper_bound(max_mtu);
+        transport_config.mtu_discovery_config(Some(mtu_discovery));
     }
 
-    let tls = config
-        .tls
-        .as_ref()
-        .ok_or_else(|| eyre::eyre!("tls config required"))?;
+    transport_config
+}
 
-    let key = tokio::fs::read(&tls.key_file).await?;
-    let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
-        rustls::PrivateKey(key)
+async fn build_quinn_server_config(config: &GossipConfig) -> eyre::Result<quinn::ServerConfig> {
+    let mut server_config = if config.plaintext {
+        quinn_plaintext::server_config()
     } else {
-        let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
-        match pkcs8.into_iter().next() {
-            Some(x) => rustls::PrivateKey(x),
-            None => {
-                let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
-                match rsa.into_iter().next() {
-                    Some(x) => rustls::PrivateKey(x),
-                    None => {
-                        eyre::bail!("no private keys found");
+        let tls = config
+            .tls
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("tls config required"))?;
+
+        let key = tokio::fs::read(&tls.key_file).await?;
+        let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
+            rustls::PrivateKey(key)
+        } else {
+            let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
+            match pkcs8.into_iter().next() {
+                Some(x) => rustls::PrivateKey(x),
+                None => {
+                    let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
+                    match rsa.into_iter().next() {
+                        Some(x) => rustls::PrivateKey(x),
+                        None => {
+                            eyre::bail!("no private keys found");
+                        }
                     }
                 }
             }
-        }
-    };
-    let certs = tokio::fs::read(&tls.cert_file).await?;
-    let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
-        vec![rustls::Certificate(certs)]
-    } else {
-        rustls_pemfile::certs(&mut &*certs)?
-            .into_iter()
-            .map(rustls::Certificate)
-            .collect()
+        };
+        let certs = tokio::fs::read(&tls.cert_file).await?;
+        let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
+            vec![rustls::Certificate(certs)]
+        } else {
+            rustls_pemfile::certs(&mut &*certs)?
+                .into_iter()
+                .map(rustls::Certificate)
+                .collect()
+        };
+
+        let server_crypto = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
+
+        quinn::ServerConfig::with_crypto(Arc::new(server_crypto))
     };
 
-    let server_crypto = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+    let transport_config = build_quinn_transport_config(config);
 
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
-    server_config.use_retry(true);
+    server_config.transport_config(Arc::new(transport_config));
+
+    Ok(server_config)
+}
+
+async fn gossip_server_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
+    let server_config = build_quinn_server_config(config).await?;
 
     Ok(quinn::Endpoint::server(server_config, config.bind_addr)?)
 }
 
+fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn::ClientConfig> {
+    let mut client_config = if config.plaintext {
+        quinn_plaintext::client_config()
+    } else {
+        let tls = config
+            .tls
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("tls config required"))?;
+
+        if !tls.insecure {
+            eyre::bail!("only insecure connections are supported");
+        }
+
+        let crypto = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_no_client_auth();
+
+        quinn::ClientConfig::new(Arc::new(crypto))
+    };
+
+    client_config.transport_config(Arc::new(build_quinn_transport_config(config)));
+
+    Ok(client_config)
+}
+
 fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
-    if config.plaintext {
-        let mut client = quinn::Endpoint::client("[::]:0".parse()?)?;
-        client.set_default_client_config(quinn_plaintext::client_config());
-        return Ok(client);
-    }
-
-    let tls = config
-        .tls
-        .as_ref()
-        .ok_or_else(|| eyre::eyre!("tls config required"))?;
-
-    if !tls.insecure {
-        eyre::bail!("only insecure connections are supported");
-    }
-
+    let client_config = build_quinn_client_config(config)?;
     let mut client = quinn::Endpoint::client("[::]:0".parse()?)?;
 
-    // FIXME: check for insecure flag before building insecure client
-    client.set_default_client_config(configure_client());
+    client.set_default_client_config(client_config);
     Ok(client)
 }
 
@@ -352,15 +390,6 @@ impl rustls::client::ServerCertVerifier for SkipServerVerification {
     ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::ServerCertVerified::assertion())
     }
-}
-
-fn configure_client() -> quinn::ClientConfig {
-    let crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(SkipServerVerification::new())
-        .with_no_client_auth();
-
-    quinn::ClientConfig::new(Arc::new(crypto))
 }
 
 pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
@@ -459,7 +488,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                     }
                                 };
 
-                                info!(
+                                debug!(
                                     "accepted a unidirectional stream from {}",
                                     conn.remote_address()
                                 );
@@ -561,7 +590,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 }
                             };
 
-                            info!(
+                            debug!(
                                 "accepted a bidirectional stream from {}",
                                 conn.remote_address()
                             );

@@ -1,5 +1,4 @@
 use std::{
-    iter::Peekable,
     net::SocketAddr,
     num::NonZeroU32,
     pin::Pin,
@@ -608,7 +607,7 @@ pub fn runtime_loop(
                 for addr in broadcast_to {
                     debug!(actor = %actor_id, "broadcasting {} bytes to: {addr} (send count: {})", pending.payload.len(), pending.send_count);
 
-                    single_broadcast(pending.payload.clone(), transport.clone(), addr);
+                    transmit_broadcast(pending.payload.clone(), transport.clone(), addr);
                 }
 
                 pending.send_count = pending.send_count.wrapping_add(1);
@@ -657,68 +656,7 @@ impl PendingBroadcast {
     }
 }
 
-pub struct BroadcastIter<'b, I: Iterator<Item = &'b Bytes>> {
-    buf: &'b mut BytesMut,
-    chunks: Peekable<I>,
-    byte: u8,
-    cap: usize,
-}
-
-impl<'b, I> BroadcastIter<'b, I>
-where
-    I: Iterator<Item = &'b Bytes>,
-{
-    pub fn new(buf: &'b mut BytesMut, chunks: I, cap: usize) -> Self {
-        Self {
-            buf,
-            chunks: chunks.peekable(),
-            byte: 1,
-            cap,
-        }
-    }
-    pub fn new_priority(buf: &'b mut BytesMut, chunks: I, cap: usize) -> Self {
-        Self {
-            buf,
-            chunks: chunks.peekable(),
-            byte: 2,
-            cap,
-        }
-    }
-}
-
-impl<'b, I> Iterator for BroadcastIter<'b, I>
-where
-    I: Iterator<Item = &'b Bytes>,
-{
-    type Item = Bytes;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let next_wont_fit = self
-                .chunks
-                .peek()
-                .map(|bytes| bytes.len() > self.cap - self.buf.len())
-                .unwrap_or(false);
-
-            if !next_wont_fit {
-                if let Some(bytes) = self.chunks.next() {
-                    if self.buf.is_empty() {
-                        self.buf.put_u8(self.byte);
-                    }
-                    self.buf.put_slice(bytes.as_ref());
-                    continue;
-                }
-            }
-
-            if self.buf.is_empty() {
-                break None;
-            }
-            break Some(self.buf.split().freeze());
-        }
-    }
-}
-
-fn single_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
+fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
     tokio::spawn(async move {
         trace!("singly broadcasting to {addr}");
         let mut stream = match transport.open_uni(addr).await {
@@ -735,52 +673,3 @@ fn single_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
         }
     });
 }
-
-// fn single_http_broadcast(payload: Bytes, client: &ClientPool, addr: SocketAddr, clock: &uhlc::HLC) {
-//     let start = Instant::now();
-//     trace!("single http broadcast with first byte: {}", payload[0]);
-//     let len = payload.len();
-//     let req = client
-//         .request(http_broadcast_request(
-//             addr,
-//             clock,
-//             hyper::Body::from(payload),
-//         ))
-//         .inspect(move |res| match res {
-//             Ok(_) => {
-//                 histogram!("corro.broadcast.sent.bytes", len as f64, "transport" => "http");
-//             }
-//             Err(e) => {
-//                 error!(
-//                     "could not send single http broadcast to addr: '{addr}' (len: {}): {e}",
-//                     len
-//                 );
-//             }
-//         });
-//     tokio::spawn(async move {
-//         match req.await {
-//             Ok(res) => {
-//                 histogram!("corro.gossip.broadcast.response.time.seconds", start.elapsed().as_secs_f64(), "status" => res.status().to_string(), "kind" => "single");
-//             }
-//             Err(e) => error!("error sending priority broadcast (single): {e}"),
-//         }
-//     });
-// }
-
-// fn http_broadcast_request(
-//     addr: SocketAddr,
-//     clock: &uhlc::HLC,
-//     body: hyper::Body,
-// ) -> hyper::Request<hyper::Body> {
-//     hyper::Request::builder()
-//         .method(hyper::Method::POST)
-//         .uri(format!("http://{addr}/v1/broadcast"))
-//         .header(hyper::header::CONTENT_TYPE, "application/json")
-//         .header(hyper::header::ACCEPT, "application/json")
-//         .header(
-//             "corro-clock",
-//             serde_json::to_string(&clock.new_timestamp()).expect("could not serialize clock"),
-//         )
-//         .body(body)
-//         .expect("could not build request")
-// }

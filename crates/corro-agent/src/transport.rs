@@ -92,7 +92,15 @@ impl Transport {
                 .and_then(|map| map.get(server_name.as_str()))
                 .cloned()
             {
-                return Ok(conn);
+                match conn.close_reason() {
+                    None => return Ok(conn),
+                    Some(ConnectionError::TimedOut) => {
+                        // do nothing, pretty normal stuff
+                    }
+                    Some(e) => {
+                        warn!("cached connection was closed abnormally, reconnecting: {e}");
+                    }
+                }
             }
 
             let conn = self.endpoint.connect(addr, server_name.as_str())?.await?;

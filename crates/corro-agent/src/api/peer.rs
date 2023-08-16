@@ -338,6 +338,12 @@ pub async fn bidirectional_sync(
 
                 counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
             }
+
+            let mut send = write.into_inner();
+            if let Err(e) = send.finish().await {
+                warn!("could not properly finish QUIC send stream: {e}");
+            }
+
             debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
 
             Ok::<_, SyncError>(count)

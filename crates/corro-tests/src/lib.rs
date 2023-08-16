@@ -4,7 +4,7 @@ use camino::Utf8PathBuf;
 use corro_agent::agent::start;
 use corro_types::{
     agent::Agent,
-    config::{Config, ConfigBuilder, ConfigBuilderError, TlsConfig},
+    config::{Config, ConfigBuilder, ConfigBuilderError},
 };
 use tempfile::TempDir;
 use tripwire::Tripwire;

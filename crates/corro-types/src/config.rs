@@ -35,6 +35,7 @@ pub enum TelemetryConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
+    #[serde(alias = "path")]
     pub uds_path: Utf8PathBuf,
 }
 
@@ -77,6 +78,8 @@ pub struct GossipConfig {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub plaintext: bool,
+    #[serde(default)]
+    pub max_mtu: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +220,7 @@ impl ConfigBuilder {
                 bootstrap: self.bootstrap.unwrap_or_default(),
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
+                max_mtu: None, // TODO: add a builder function for it
             },
             admin: AdminConfig {
                 uds_path: self.admin_path.unwrap_or_else(default_admin_path),
