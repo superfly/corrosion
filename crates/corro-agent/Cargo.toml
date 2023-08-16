@@ -48,6 +48,7 @@ trust-dns-resolver = { workspace = true }
 uhlc = { workspace = true }
 uuid = { workspace = true }
 quinn = { workspace = true }
+quinn-plaintext = { workspace = true }
 rustls-pemfile = "*"
 speedy = { workspace = true }
 

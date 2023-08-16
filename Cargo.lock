@@ -595,6 +595,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "quinn",
+ "quinn-plaintext",
  "quoted-string",
  "rand",
  "rangemap",
@@ -2401,6 +2402,18 @@ dependencies = [
  "rustls",
  "thiserror",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "quinn-plaintext"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9faf9244e8c859d9413e82e7cebe51cf2f8b173236d9c4a24559d761b66b7ee"
+dependencies = [
+ "bytes",
+ "quinn",
+ "quinn-proto",
  "tracing",
 ]
 

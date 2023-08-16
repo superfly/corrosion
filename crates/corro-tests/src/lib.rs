@@ -57,13 +57,6 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
     let conf = f(Config::builder()
         .api_addr("127.0.0.1:0".parse()?)
         .gossip_addr("127.0.0.1:0".parse()?)
-        .tls_config(TlsConfig {
-            cert_file: cert_path,
-            key_file: key_path,
-            ca_file: None,
-            insecure: true,
-            default_server_name: "cluster.test".into(),
-        })
         .admin_path(tmpdir.path().join("admin.sock").display().to_string())
         .db_path(tmpdir.path().join("corrosion.db").display().to_string())
         .add_schema_path(schema_path.display().to_string()))?;

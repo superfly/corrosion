@@ -76,6 +76,7 @@ smallvec = { version = "1.11.0", features = ["serde", "write", "union"] }
 http-body = "0.4.5"
 rhai = { version = "1.15.1", features = ["sync"] }
 quinn = "0.10.2"
+quinn-plaintext = "0.1.0"
 
 [profile.release]
 debug = 1

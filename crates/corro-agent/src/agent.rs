@@ -249,7 +249,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
 async fn gossip_server_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
     if config.plaintext {
-        eyre::bail!("plaintext is current unsupported");
+        return Ok(quinn::Endpoint::server(
+            quinn_plaintext::server_config(),
+            config.bind_addr,
+        )?);
     }
 
     let tls = config
@@ -298,7 +301,9 @@ async fn gossip_server_endpoint(config: &GossipConfig) -> eyre::Result<quinn::En
 
 fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
     if config.plaintext {
-        eyre::bail!("plaintext is current unsupported");
+        let mut client = quinn::Endpoint::client("[::]:0".parse()?)?;
+        client.set_default_client_config(quinn_plaintext::client_config());
+        return Ok(client);
     }
 
     let tls = config
@@ -310,11 +315,11 @@ fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint
         eyre::bail!("only insecure connections are supported");
     }
 
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
+    let mut client = quinn::Endpoint::client("[::]:0".parse()?)?;
 
     // FIXME: check for insecure flag before building insecure client
-    endpoint.set_default_client_config(configure_client());
-    Ok(endpoint)
+    client.set_default_client_config(configure_client());
+    Ok(client)
 }
 
 pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
