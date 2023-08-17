@@ -45,3 +45,4 @@ uhlc = { workspace = true }
 uuid = { workspace = true }
 smallvec = { workspace = true }
 hostname = { workspace = true }
+rcgen = { workspace = true }

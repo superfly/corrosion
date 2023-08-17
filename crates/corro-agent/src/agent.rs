@@ -9,8 +9,8 @@ use std::{
 
 use crate::{
     api::{
-        http::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
-        peer::{bidirectional_sync, SyncError},
+        client::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
+        peer::{bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, SyncError},
         pubsub::{api_v1_watch_by_id, api_v1_watches, MatcherCache},
     },
     broadcast::runtime_loop,
@@ -28,7 +28,7 @@ use corro_types::{
         Timestamp, UniPayload, UniPayloadV1,
     },
     change::Change,
-    config::{AuthzConfig, Config, GossipConfig, DEFAULT_GOSSIP_PORT},
+    config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members},
     schema::init_schema,
     sqlite::{CrConn, Migration, SqlitePoolError},
@@ -48,7 +48,6 @@ use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
-use quinn::MtuDiscoveryConfig;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection, Transaction};
@@ -204,7 +203,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let gossip_server_endpoint = gossip_server_endpoint(&conf.gossip).await?;
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
-    let gossip_client_endpoint = gossip_client_endpoint(&conf.gossip)?;
+    let gossip_client_endpoint = gossip_client_endpoint(&conf.gossip).await?;
     let transport = Transport::new(gossip_client_endpoint);
 
     let api_listener = TcpListener::bind(conf.api.bind_addr).await?;
@@ -247,148 +246,12 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     Ok((agent, opts))
 }
 
-fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig {
-    let mut transport_config = quinn::TransportConfig::default();
-
-    // max 1024 concurrent bidirectional streams
-    transport_config.max_concurrent_bidi_streams(1024u32.into());
-
-    // max 10240 concurrent unidirectional streams
-    transport_config.max_concurrent_uni_streams(10240u32.into());
-
-    if let Some(max_mtu) = config.max_mtu {
-        info!("Setting maximum MTU for QUIC at {max_mtu}");
-        transport_config.initial_mtu(1200);
-        let mut mtu_discovery = MtuDiscoveryConfig::default();
-        mtu_discovery.upper_bound(max_mtu);
-        transport_config.mtu_discovery_config(Some(mtu_discovery));
-    }
-
-    transport_config
-}
-
-async fn build_quinn_server_config(config: &GossipConfig) -> eyre::Result<quinn::ServerConfig> {
-    let mut server_config = if config.plaintext {
-        quinn_plaintext::server_config()
-    } else {
-        let tls = config
-            .tls
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("tls config required"))?;
-
-        let key = tokio::fs::read(&tls.key_file).await?;
-        let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
-            rustls::PrivateKey(key)
-        } else {
-            let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
-            match pkcs8.into_iter().next() {
-                Some(x) => rustls::PrivateKey(x),
-                None => {
-                    let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
-                    match rsa.into_iter().next() {
-                        Some(x) => rustls::PrivateKey(x),
-                        None => {
-                            eyre::bail!("no private keys found");
-                        }
-                    }
-                }
-            }
-        };
-        let certs = tokio::fs::read(&tls.cert_file).await?;
-        let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
-            vec![rustls::Certificate(certs)]
-        } else {
-            rustls_pemfile::certs(&mut &*certs)?
-                .into_iter()
-                .map(rustls::Certificate)
-                .collect()
-        };
-
-        let server_crypto = rustls::ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?;
-
-        quinn::ServerConfig::with_crypto(Arc::new(server_crypto))
-    };
-
-    let transport_config = build_quinn_transport_config(config);
-
-    server_config.transport_config(Arc::new(transport_config));
-
-    Ok(server_config)
-}
-
-async fn gossip_server_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
-    let server_config = build_quinn_server_config(config).await?;
-
-    Ok(quinn::Endpoint::server(server_config, config.bind_addr)?)
-}
-
-fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn::ClientConfig> {
-    let mut client_config = if config.plaintext {
-        quinn_plaintext::client_config()
-    } else {
-        let tls = config
-            .tls
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("tls config required"))?;
-
-        if !tls.insecure {
-            eyre::bail!("only insecure connections are supported");
-        }
-
-        let crypto = rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_custom_certificate_verifier(SkipServerVerification::new())
-            .with_no_client_auth();
-
-        quinn::ClientConfig::new(Arc::new(crypto))
-    };
-
-    client_config.transport_config(Arc::new(build_quinn_transport_config(config)));
-
-    Ok(client_config)
-}
-
-fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
-    let client_config = build_quinn_client_config(config)?;
-    let mut client = quinn::Endpoint::client("[::]:0".parse()?)?;
-
-    client.set_default_client_config(client_config);
-    Ok(client)
-}
-
 pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
     let (agent, opts) = setup(conf, tripwire.clone()).await?;
 
     tokio::spawn(run(agent.clone(), opts).inspect(|_| info!("corrosion agent run is done")));
 
     Ok(agent)
-}
-
-/// Dummy certificate verifier that treats any certificate as valid.
-/// NOTE, such verification is vulnerable to MITM attacks, but convenient for testing.
-struct SkipServerVerification;
-
-impl SkipServerVerification {
-    fn new() -> Arc<Self> {
-        Arc::new(Self)
-    }
-}
-
-impl rustls::client::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
-    }
 }
 
 pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {

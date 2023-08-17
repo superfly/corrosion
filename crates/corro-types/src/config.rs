@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 use camino::Utf8PathBuf;
-use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
@@ -81,9 +80,6 @@ pub struct GossipConfig {
     pub plaintext: bool,
     #[serde(default)]
     pub max_mtu: Option<u16>,
-
-    #[serde(alias = "authz_token", default)]
-    pub authorization_token: Option<CompactString>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,13 +88,25 @@ pub struct TlsConfig {
     pub cert_file: Utf8PathBuf,
     /// Private key file
     pub key_file: Utf8PathBuf,
+
     /// CA (Certificate Authority) file
+    #[serde(default)]
     pub ca_file: Option<Utf8PathBuf>,
 
-    pub default_server_name: CompactString,
+    /// Mutual TLS configuration
+    #[serde(default)]
+    pub client: Option<TlsClientConfig>,
 
     #[serde(default)]
     pub insecure: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsClientConfig {
+    /// Certificate file
+    pub cert_file: Utf8PathBuf,
+    /// Private key file
+    pub key_file: Utf8PathBuf,
 }
 
 pub fn default_admin_path() -> Utf8PathBuf {
@@ -224,8 +232,7 @@ impl ConfigBuilder {
                 bootstrap: self.bootstrap.unwrap_or_default(),
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
-                max_mtu: None,             // TODO: add a builder function for it
-                authorization_token: None, // TODO: add a builder function for it
+                max_mtu: None, // TODO: add a builder function for it
             },
             admin: AdminConfig {
                 uds_path: self.admin_path.unwrap_or_else(default_admin_path),
