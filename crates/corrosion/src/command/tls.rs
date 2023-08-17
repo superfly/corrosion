@@ -6,6 +6,7 @@ use rcgen::{
 };
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
+use tracing::info;
 
 pub async fn generate_ca() -> eyre::Result<()> {
     let mut params = CertificateParams::default();
@@ -32,11 +33,15 @@ pub async fn generate_ca() -> eyre::Result<()> {
     let mut cert_file = tokio::fs::File::create("ca.pem").await?;
     cert_file.write_all(cert_pem.unwrap().as_bytes()).await?;
 
+    info!("Wrote CA cert to ./ca.pem");
+
     let private_key_pem = cert.serialize_private_key_pem();
     let mut private_key_file = tokio::fs::File::create("ca.key").await?;
     private_key_file
         .write_all(private_key_pem.as_bytes())
         .await?;
+
+    info!("Wrote CA key to ./ca.key");
 
     Ok(())
 }
@@ -79,11 +84,15 @@ pub async fn generate_server_cert<P1: AsRef<Path>, P2: AsRef<Path>>(
     let mut cert_file = tokio::fs::File::create("cert.pem").await?;
     cert_file.write_all(cert_signed.as_bytes()).await?;
 
+    info!("Wrote server certificate to ./cert.pem");
+
     let private_key_pem = cert.serialize_private_key_pem();
     let mut private_key_file = tokio::fs::File::create("cert.key").await?;
     private_key_file
         .write_all(private_key_pem.as_bytes())
         .await?;
+
+    info!("Wrote server key to ./cert.key");
 
     Ok(())
 }
@@ -119,11 +128,15 @@ pub async fn generate_client_cert<P1: AsRef<Path>, P2: AsRef<Path>>(
     let mut cert_file = tokio::fs::File::create("client-cert.pem").await?;
     cert_file.write_all(cert_signed.as_bytes()).await?;
 
+    info!("Wrote client certificate to ./client-cert.pem");
+
     let private_key_pem = cert.serialize_private_key_pem();
     let mut private_key_file = tokio::fs::File::create("client-cert.key").await?;
     private_key_file
         .write_all(private_key_pem.as_bytes())
         .await?;
+
+    info!("Wrote client key to ./client-key.pem");
 
     Ok(())
 }
