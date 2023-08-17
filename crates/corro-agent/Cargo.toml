@@ -55,3 +55,4 @@ uuid = { workspace = true }
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
 http-body = { workspace = true }
+rcgen = { workspace = true }

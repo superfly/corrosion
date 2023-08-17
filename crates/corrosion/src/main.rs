@@ -241,7 +241,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             command::tpl::run(cli.api_addr()?, template, flags).await?;
         }
         Command::Tls(tls) => match tls {
-            TlsCommand::Ca(TlsCaCommand::Generate) => generate_ca().await?,
+            TlsCommand::Ca(TlsCaCommand::Generate) => generate_ca(std::env::current_dir()?).await?,
             TlsCommand::Server(TlsServerCommand::Generate {
                 ip,
                 ca_key,

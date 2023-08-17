@@ -9,3 +9,4 @@ pub mod pubsub;
 pub mod schema;
 pub mod sqlite;
 pub mod sync;
+pub mod tls;

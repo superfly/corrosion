@@ -1,24 +1,26 @@
 use std::cmp;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
 use corro_types::broadcast::{ChangeV1, Changeset};
 use corro_types::change::row_to_change;
+use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use metrics::counter;
-use quinn::{RecvStream, SendStream};
+use quinn::{MtuDiscoveryConfig, RecvStream, SendStream};
 use rusqlite::{params, Connection};
 use speedy::Writable;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::block_in_place;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::agent::{process_single_version, SyncRecvError};
-use crate::api::http::{ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
+use crate::api::client::{ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
 
 use corro_types::{
     actor::ActorId,
@@ -69,9 +71,233 @@ pub enum SyncSendError {
     ChannelClosed,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("unknown accept header value '{0}'")]
-pub struct UnknownAcceptHeaderValue(String);
+fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig {
+    let mut transport_config = quinn::TransportConfig::default();
+
+    // max 1024 concurrent bidirectional streams
+    transport_config.max_concurrent_bidi_streams(1024u32.into());
+
+    // max 10240 concurrent unidirectional streams
+    transport_config.max_concurrent_uni_streams(10240u32.into());
+
+    if let Some(max_mtu) = config.max_mtu {
+        info!("Setting maximum MTU for QUIC at {max_mtu}");
+        transport_config.initial_mtu(1200);
+        let mut mtu_discovery = MtuDiscoveryConfig::default();
+        mtu_discovery.upper_bound(max_mtu);
+        transport_config.mtu_discovery_config(Some(mtu_discovery));
+    }
+
+    transport_config
+}
+
+async fn build_quinn_server_config(config: &GossipConfig) -> eyre::Result<quinn::ServerConfig> {
+    let mut server_config = if config.plaintext {
+        quinn_plaintext::server_config()
+    } else {
+        let tls = config
+            .tls
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("either plaintext or a tls config is required"))?;
+
+        let key = tokio::fs::read(&tls.key_file).await?;
+        let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
+            rustls::PrivateKey(key)
+        } else {
+            let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
+            match pkcs8.into_iter().next() {
+                Some(x) => rustls::PrivateKey(x),
+                None => {
+                    let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
+                    match rsa.into_iter().next() {
+                        Some(x) => rustls::PrivateKey(x),
+                        None => {
+                            eyre::bail!("no private keys found");
+                        }
+                    }
+                }
+            }
+        };
+
+        let certs = tokio::fs::read(&tls.cert_file).await?;
+        let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
+            vec![rustls::Certificate(certs)]
+        } else {
+            rustls_pemfile::certs(&mut &*certs)?
+                .into_iter()
+                .map(rustls::Certificate)
+                .collect()
+        };
+
+        let server_crypto = rustls::ServerConfig::builder().with_safe_defaults();
+
+        let server_crypto = if tls.client.is_some() {
+            let ca_file = match &tls.ca_file {
+                None => {
+                    eyre::bail!(
+                        "ca_file required in tls config for server client cert auth verification"
+                    );
+                }
+                Some(ca_file) => ca_file,
+            };
+
+            let ca_certs = tokio::fs::read(&ca_file).await?;
+            let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
+                vec![rustls::Certificate(ca_certs)]
+            } else {
+                rustls_pemfile::certs(&mut &*ca_certs)?
+                    .into_iter()
+                    .map(rustls::Certificate)
+                    .collect()
+            };
+
+            let mut root_store = rustls::RootCertStore::empty();
+
+            for cert in ca_certs {
+                root_store.add(&cert)?;
+            }
+
+            server_crypto.with_client_cert_verifier(Arc::new(
+                rustls::server::AllowAnyAuthenticatedClient::new(root_store),
+            ))
+        } else {
+            server_crypto.with_no_client_auth()
+        };
+
+        quinn::ServerConfig::with_crypto(Arc::new(server_crypto.with_single_cert(certs, key)?))
+    };
+
+    let transport_config = build_quinn_transport_config(config);
+
+    server_config.transport_config(Arc::new(transport_config));
+
+    Ok(server_config)
+}
+
+pub async fn gossip_server_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
+    let server_config = build_quinn_server_config(config).await?;
+
+    Ok(quinn::Endpoint::server(server_config, config.bind_addr)?)
+}
+
+fn client_cert_auth(
+    config: &TlsClientConfig,
+) -> eyre::Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
+    let mut cert_file = std::io::BufReader::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(&config.cert_file)?,
+    );
+    let certs = rustls_pemfile::certs(&mut cert_file)?
+        .into_iter()
+        .map(rustls::Certificate)
+        .collect();
+
+    let mut key_file = std::io::BufReader::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(&config.key_file)?,
+    );
+    let key = rustls_pemfile::pkcs8_private_keys(&mut key_file)?
+        .into_iter()
+        .map(rustls::PrivateKey)
+        .next()
+        .ok_or_else(|| eyre::eyre!("could not find client tls key"))?;
+
+    Ok((certs, key))
+}
+
+async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn::ClientConfig> {
+    let mut client_config = if config.plaintext {
+        quinn_plaintext::client_config()
+    } else {
+        let tls = config
+            .tls
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("tls config required"))?;
+
+        let client_crypto = rustls::ClientConfig::builder().with_safe_defaults();
+
+        let client_crypto = if let Some(ca_file) = &tls.ca_file {
+            let ca_certs = tokio::fs::read(&ca_file).await?;
+            let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
+                vec![rustls::Certificate(ca_certs)]
+            } else {
+                rustls_pemfile::certs(&mut &*ca_certs)?
+                    .into_iter()
+                    .map(rustls::Certificate)
+                    .collect()
+            };
+
+            let mut root_store = rustls::RootCertStore::empty();
+
+            for cert in ca_certs {
+                root_store.add(&cert)?;
+            }
+
+            let client_crypto = client_crypto.with_root_certificates(root_store);
+
+            if let Some(client_config) = &tls.client {
+                let (certs, key) = client_cert_auth(client_config)?;
+                client_crypto.with_client_auth_cert(certs, key)?
+            } else {
+                client_crypto.with_no_client_auth()
+            }
+        } else {
+            if !tls.insecure {
+                eyre::bail!(
+                    "insecure setting needs to be explicitly true if no ca_file is provided"
+                );
+            }
+            let client_crypto =
+                client_crypto.with_custom_certificate_verifier(SkipServerVerification::new());
+            if let Some(client_config) = &tls.client {
+                let (certs, key) = client_cert_auth(client_config)?;
+                client_crypto.with_client_auth_cert(certs, key)?
+            } else {
+                client_crypto.with_no_client_auth()
+            }
+        };
+
+        quinn::ClientConfig::new(Arc::new(client_crypto))
+    };
+
+    client_config.transport_config(Arc::new(build_quinn_transport_config(config)));
+
+    Ok(client_config)
+}
+
+pub async fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
+    let client_config = build_quinn_client_config(config).await?;
+    let mut client = quinn::Endpoint::client("[::]:0".parse()?)?;
+
+    client.set_default_client_config(client_config);
+    Ok(client)
+}
+
+/// Dummy certificate verifier that treats any certificate as valid.
+/// NOTE, such verification is vulnerable to MITM attacks, but convenient for testing.
+struct SkipServerVerification;
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+impl rustls::client::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
 
 fn process_range(
     booked: &Booked,
@@ -408,4 +634,122 @@ pub async fn bidirectional_sync(
     )?;
 
     Ok(recv_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+    use corro_types::{
+        config::TlsConfig,
+        tls::{generate_ca, generate_client_cert, generate_server_cert},
+    };
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_mutual_tls() -> eyre::Result<()> {
+        let ca_cert = generate_ca()?;
+        let (server_cert, server_cert_signed) = generate_server_cert(
+            &ca_cert.serialize_pem()?,
+            &ca_cert.serialize_private_key_pem(),
+            "127.0.0.1".parse()?,
+        )?;
+
+        let (client_cert, client_cert_signed) = generate_client_cert(
+            &ca_cert.serialize_pem()?,
+            &ca_cert.serialize_private_key_pem(),
+        )?;
+
+        let tmpdir = TempDir::new()?;
+        let base_path = Utf8PathBuf::from(tmpdir.path().display().to_string());
+
+        let cert_file = base_path.join("cert.pem");
+        let key_file = base_path.join("cert.key");
+        let ca_file = base_path.join("ca.pem");
+
+        let client_cert_file = base_path.join("client-cert.pem");
+        let client_key_file = base_path.join("client-cert.key");
+
+        tokio::fs::write(&cert_file, &server_cert_signed).await?;
+        tokio::fs::write(&key_file, server_cert.serialize_private_key_pem()).await?;
+
+        tokio::fs::write(&ca_file, ca_cert.serialize_pem()?).await?;
+
+        tokio::fs::write(&client_cert_file, &client_cert_signed).await?;
+        tokio::fs::write(&client_key_file, client_cert.serialize_private_key_pem()).await?;
+
+        let gossip_config = GossipConfig {
+            bind_addr: "127.0.0.1:0".parse()?,
+            bootstrap: vec![],
+            tls: Some(TlsConfig {
+                cert_file,
+                key_file,
+                ca_file: Some(ca_file),
+                client: Some(TlsClientConfig {
+                    cert_file: client_cert_file,
+                    key_file: client_key_file,
+                }),
+                insecure: false,
+            }),
+            plaintext: false,
+            max_mtu: None,
+        };
+
+        let server = gossip_server_endpoint(&gossip_config).await?;
+        let addr = server.local_addr()?;
+
+        let client = gossip_client_endpoint(&gossip_config).await?;
+
+        let res = tokio::try_join!(
+            async {
+                Ok(client
+                    .connect(addr, &addr.ip().to_string())
+                    .unwrap()
+                    .await
+                    .unwrap())
+            },
+            async {
+                let conn = match server.accept().await {
+                    None => eyre::bail!("None accept!"),
+                    Some(connecting) => connecting.await.unwrap(),
+                };
+                Ok(conn)
+            }
+        )?;
+
+        let client_conn = res.0;
+
+        let client_conn_peer_id = client_conn
+            .peer_identity()
+            .unwrap()
+            .downcast::<Vec<rustls::Certificate>>()
+            .unwrap();
+
+        let mut server_cert_signed_buf =
+            std::io::Cursor::new(server_cert_signed.as_bytes().to_vec());
+
+        assert_eq!(
+            client_conn_peer_id[0].0,
+            rustls_pemfile::certs(&mut server_cert_signed_buf)?[0]
+        );
+
+        let server_conn = res.1;
+
+        let server_conn_peer_id = server_conn
+            .peer_identity()
+            .unwrap()
+            .downcast::<Vec<rustls::Certificate>>()
+            .unwrap();
+
+        let mut client_cert_signed_buf =
+            std::io::Cursor::new(client_cert_signed.as_bytes().to_vec());
+
+        assert_eq!(
+            server_conn_peer_id[0].0,
+            rustls_pemfile::certs(&mut client_cert_signed_buf)?[0]
+        );
+
+        Ok(())
+    }
 }

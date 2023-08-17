@@ -9,8 +9,8 @@ use std::{
 
 use crate::{
     api::{
-        http::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
-        peer::{bidirectional_sync, SyncError},
+        client::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
+        peer::{bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, SyncError},
         pubsub::{api_v1_watch_by_id, api_v1_watches, MatcherCache},
     },
     broadcast::runtime_loop,
@@ -28,7 +28,7 @@ use corro_types::{
         Timestamp, UniPayload, UniPayloadV1,
     },
     change::Change,
-    config::{AuthzConfig, Config, GossipConfig, TlsClientConfig, DEFAULT_GOSSIP_PORT},
+    config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members},
     schema::init_schema,
     sqlite::{CrConn, Migration, SqlitePoolError},
@@ -48,7 +48,6 @@ use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
-use quinn::MtuDiscoveryConfig;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection, Transaction};
@@ -247,246 +246,12 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     Ok((agent, opts))
 }
 
-fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig {
-    let mut transport_config = quinn::TransportConfig::default();
-
-    // max 1024 concurrent bidirectional streams
-    transport_config.max_concurrent_bidi_streams(1024u32.into());
-
-    // max 10240 concurrent unidirectional streams
-    transport_config.max_concurrent_uni_streams(10240u32.into());
-
-    if let Some(max_mtu) = config.max_mtu {
-        info!("Setting maximum MTU for QUIC at {max_mtu}");
-        transport_config.initial_mtu(1200);
-        let mut mtu_discovery = MtuDiscoveryConfig::default();
-        mtu_discovery.upper_bound(max_mtu);
-        transport_config.mtu_discovery_config(Some(mtu_discovery));
-    }
-
-    transport_config
-}
-
-async fn build_quinn_server_config(config: &GossipConfig) -> eyre::Result<quinn::ServerConfig> {
-    let mut server_config = if config.plaintext {
-        quinn_plaintext::server_config()
-    } else {
-        let tls = config
-            .tls
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("either plaintext or a tls config is required"))?;
-
-        let key = tokio::fs::read(&tls.key_file).await?;
-        let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
-            rustls::PrivateKey(key)
-        } else {
-            let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
-            match pkcs8.into_iter().next() {
-                Some(x) => rustls::PrivateKey(x),
-                None => {
-                    let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
-                    match rsa.into_iter().next() {
-                        Some(x) => rustls::PrivateKey(x),
-                        None => {
-                            eyre::bail!("no private keys found");
-                        }
-                    }
-                }
-            }
-        };
-
-        let certs = tokio::fs::read(&tls.cert_file).await?;
-        let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
-            vec![rustls::Certificate(certs)]
-        } else {
-            rustls_pemfile::certs(&mut &*certs)?
-                .into_iter()
-                .map(rustls::Certificate)
-                .collect()
-        };
-
-        let server_crypto = rustls::ServerConfig::builder().with_safe_defaults();
-
-        let server_crypto = if tls.client.is_some() {
-            let ca_file = match &tls.ca_file {
-                None => {
-                    eyre::bail!(
-                        "ca_file required in tls config for server client cert auth verification"
-                    );
-                }
-                Some(ca_file) => ca_file,
-            };
-
-            let ca_certs = tokio::fs::read(&ca_file).await?;
-            let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
-                vec![rustls::Certificate(ca_certs)]
-            } else {
-                rustls_pemfile::certs(&mut &*ca_certs)?
-                    .into_iter()
-                    .map(rustls::Certificate)
-                    .collect()
-            };
-
-            let mut root_store = rustls::RootCertStore::empty();
-
-            for cert in ca_certs {
-                root_store.add(&cert)?;
-            }
-
-            server_crypto.with_client_cert_verifier(Arc::new(
-                rustls::server::AllowAnyAuthenticatedClient::new(root_store),
-            ))
-        } else {
-            server_crypto.with_no_client_auth()
-        };
-
-        quinn::ServerConfig::with_crypto(Arc::new(server_crypto.with_single_cert(certs, key)?))
-    };
-
-    let transport_config = build_quinn_transport_config(config);
-
-    server_config.transport_config(Arc::new(transport_config));
-
-    Ok(server_config)
-}
-
-async fn gossip_server_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
-    let server_config = build_quinn_server_config(config).await?;
-
-    Ok(quinn::Endpoint::server(server_config, config.bind_addr)?)
-}
-
-fn client_cert_auth(
-    config: &TlsClientConfig,
-) -> eyre::Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
-    let mut cert_file = std::io::BufReader::new(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .open(&config.cert_file)?,
-    );
-    let certs = rustls_pemfile::certs(&mut cert_file)?
-        .into_iter()
-        .map(rustls::Certificate)
-        .collect();
-
-    let mut key_file = std::io::BufReader::new(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .open(&config.key_file)?,
-    );
-    let key = rustls_pemfile::pkcs8_private_keys(&mut key_file)?
-        .into_iter()
-        .map(rustls::PrivateKey)
-        .next()
-        .ok_or_else(|| eyre::eyre!("could not find client tls key"))?;
-
-    Ok((certs, key))
-}
-
-async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn::ClientConfig> {
-    let mut client_config = if config.plaintext {
-        quinn_plaintext::client_config()
-    } else {
-        let tls = config
-            .tls
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("tls config required"))?;
-
-        let client_crypto = rustls::ClientConfig::builder().with_safe_defaults();
-
-        let client_crypto = if let Some(ca_file) = &tls.ca_file {
-            let ca_certs = tokio::fs::read(&ca_file).await?;
-            let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
-                vec![rustls::Certificate(ca_certs)]
-            } else {
-                rustls_pemfile::certs(&mut &*ca_certs)?
-                    .into_iter()
-                    .map(rustls::Certificate)
-                    .collect()
-            };
-
-            let mut root_store = rustls::RootCertStore::empty();
-
-            for cert in ca_certs {
-                root_store.add(&cert)?;
-            }
-
-            let client_crypto = client_crypto.with_root_certificates(root_store);
-
-            if let Some(client_config) = &tls.client {
-                let (certs, key) = client_cert_auth(client_config)?;
-                client_crypto.with_client_auth_cert(certs, key)?
-            } else {
-                client_crypto.with_no_client_auth()
-            }
-        } else {
-            if !tls.insecure {
-                eyre::bail!(
-                    "insecure setting needs to be explicitly true if no ca_file is provided"
-                );
-            }
-            let client_crypto =
-                client_crypto.with_custom_certificate_verifier(SkipServerVerification::new());
-            if let Some(client_config) = &tls.client {
-                let (certs, key) = client_cert_auth(client_config)?;
-                client_crypto.with_client_auth_cert(certs, key)?
-            } else {
-                client_crypto.with_no_client_auth()
-            }
-        };
-
-        // if let Some(client_config) = &tls.client_config {
-
-        // } else {
-
-        // }
-
-        quinn::ClientConfig::new(Arc::new(client_crypto))
-    };
-
-    client_config.transport_config(Arc::new(build_quinn_transport_config(config)));
-
-    Ok(client_config)
-}
-
-async fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
-    let client_config = build_quinn_client_config(config).await?;
-    let mut client = quinn::Endpoint::client("[::]:0".parse()?)?;
-
-    client.set_default_client_config(client_config);
-    Ok(client)
-}
-
 pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
     let (agent, opts) = setup(conf, tripwire.clone()).await?;
 
     tokio::spawn(run(agent.clone(), opts).inspect(|_| info!("corrosion agent run is done")));
 
     Ok(agent)
-}
-
-/// Dummy certificate verifier that treats any certificate as valid.
-/// NOTE, such verification is vulnerable to MITM attacks, but convenient for testing.
-struct SkipServerVerification;
-
-impl SkipServerVerification {
-    fn new() -> Arc<Self> {
-        Arc::new(Self)
-    }
-}
-
-impl rustls::client::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
-    }
 }
 
 pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
