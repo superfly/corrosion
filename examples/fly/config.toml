@@ -10,6 +10,7 @@ max_mtu = 1372
 
 [api]
 addr = "[::]:8080"
+authz = { bearer = "secure-token" }
 
 [admin]
 path = "/app/admin.sock"

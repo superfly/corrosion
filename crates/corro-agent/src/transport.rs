@@ -73,14 +73,8 @@ impl Transport {
                 .and_then(|map| map.get(server_name.as_str()))
                 .cloned()
             {
-                match conn.close_reason() {
-                    None => return Ok(conn),
-                    Some(ConnectionError::TimedOut) => {
-                        // do nothing, pretty normal stuff
-                    }
-                    Some(e) => {
-                        warn!("cached connection was closed abnormally, reconnecting: {e}");
-                    }
+                if test_conn(&conn) {
+                    return Ok(conn);
                 }
             }
         }
@@ -92,14 +86,8 @@ impl Transport {
                 .and_then(|map| map.get(server_name.as_str()))
                 .cloned()
             {
-                match conn.close_reason() {
-                    None => return Ok(conn),
-                    Some(ConnectionError::TimedOut) => {
-                        // do nothing, pretty normal stuff
-                    }
-                    Some(e) => {
-                        warn!("cached connection was closed abnormally, reconnecting: {e}");
-                    }
+                if test_conn(&conn) {
+                    return Ok(conn);
                 }
             }
 
@@ -111,5 +99,19 @@ impl Transport {
         };
 
         Ok(conn)
+    }
+}
+
+fn test_conn(conn: &Connection) -> bool {
+    match conn.close_reason() {
+        None => true,
+        Some(ConnectionError::TimedOut) => {
+            // don't log, pretty normal stuff
+            false
+        }
+        Some(e) => {
+            warn!("cached connection was closed abnormally, reconnecting: {e}");
+            false
+        }
     }
 }

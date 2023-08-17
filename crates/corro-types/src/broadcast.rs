@@ -33,7 +33,7 @@ pub enum UniPayload {
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
     Gossip(Vec<u8>),
-    Broadcast(Broadcast),
+    Broadcast(BroadcastV1),
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -55,8 +55,8 @@ pub enum FocaInput {
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
-pub enum Broadcast {
-    V1(BroadcastV1),
+pub enum AuthzV1 {
+    Token(String),
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -233,60 +233,10 @@ pub enum BroadcastDecodeError {
     InsufficientLength(usize),
 }
 
-impl Broadcast {
-    pub fn from_slice<S: AsRef<[u8]>>(slice: S) -> Result<Self, speedy::Error> {
-        Self::read_from_buffer(slice.as_ref())
-    }
-
-    // pub fn encode<E: Encoder<Bytes, Error = std::io::Error>>(
-    //     &self,
-    //     buf: &mut BytesMut,
-    //     codec: &mut E,
-    // ) -> Result<(), BroadcastEncodeError> {
-    //     self.write_to_stream(buf.writer())?;
-    //     // let mut bytes = buf.split();
-    //     // let hash = crc32fast::hash(&bytes);
-    //     // bytes.put_u32(hash);
-
-    //     codec.encode(buf.split().freeze(), buf)?;
-
-    //     Ok(())
-    // }
-
-    // pub fn from_buf(buf: &mut BytesMut) -> Result<Broadcast, BroadcastDecodeError> {
-    //     let len = buf.len();
-    //     trace!("successfully decoded a frame, len: {len}");
-
-    //     if len < 4 {
-    //         return Err(BroadcastDecodeError::InsufficientLength(len));
-    //     }
-
-    //     let mut crc_bytes = buf.split_off(len - 4);
-
-    //     let crc = crc_bytes.get_u32();
-    //     let new_crc = crc32fast::hash(&buf);
-    //     if crc != new_crc {
-    //         return Err(BroadcastDecodeError::Corrupted(crc, new_crc));
-    //     }
-
-    //     Ok(Broadcast::from_slice(&buf)?)
-    // }
-
-    // pub fn decode(
-    //     codec: &mut LengthDelimitedCodec,
-    //     buf: &mut BytesMut,
-    // ) -> Result<Option<Self>, BroadcastDecodeError> {
-    //     Ok(match codec.decode(buf)? {
-    //         Some(mut buf) => Some(Self::from_buf(&mut buf)?),
-    //         None => None,
-    //     })
-    // }
-}
-
 #[derive(Debug)]
 pub enum BroadcastInput {
-    Rebroadcast(Broadcast),
-    AddBroadcast(Broadcast),
+    Rebroadcast(BroadcastV1),
+    AddBroadcast(BroadcastV1),
 }
 
 pub struct DispatchRuntime<T> {
