@@ -24,11 +24,11 @@ use corro_types::{
         Agent, AgentConfig, Booked, BookedVersions, Bookie, ChangeError, KnownDbVersion, SplitPool,
     },
     broadcast::{
-        BiPayload, BiPayloadV1, Broadcast, BroadcastInput, BroadcastV1, ChangeV1, Changeset,
-        FocaInput, Timestamp, UniPayload, UniPayloadV1,
+        BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeV1, Changeset, FocaInput,
+        Timestamp, UniPayload, UniPayloadV1,
     },
     change::Change,
-    config::{Config, GossipConfig, DEFAULT_GOSSIP_PORT},
+    config::{AuthzConfig, Config, GossipConfig, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members},
     schema::init_schema,
     sqlite::{CrConn, Migration, SqlitePoolError},
@@ -38,8 +38,9 @@ use corro_types::{
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
+    headers::{authorization::Bearer, Authorization},
     routing::{get, post},
-    BoxError, Extension, Router,
+    BoxError, Extension, Router, TypedHeader,
 };
 use bytes::{BufMut, BytesMut};
 use foca::{Member, Notification};
@@ -80,7 +81,6 @@ pub struct AgentOptions {
     gossip_server_endpoint: quinn::Endpoint,
     transport: Transport,
     api_listener: TcpListener,
-    bootstrap: Vec<String>,
     rx_bcast: Receiver<BroadcastInput>,
     rx_apply: Receiver<(ActorId, i64)>,
     tripwire: Tripwire,
@@ -224,7 +224,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         gossip_server_endpoint,
         transport,
         api_listener,
-        bootstrap: conf.gossip.bootstrap.clone(),
         rx_bcast,
         rx_apply,
         tripwire: tripwire.clone(),
@@ -398,7 +397,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         gossip_server_endpoint,
         transport,
         api_listener,
-        bootstrap,
         mut tripwire,
         rx_bcast,
         rx_apply,
@@ -408,7 +406,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     let (to_send_tx, to_send_rx) = channel(10240);
     let (notifications_tx, notifications_rx) = channel(10240);
 
-    let (bcast_msg_tx, bcast_rx) = channel::<Broadcast>(10240);
+    let (bcast_msg_tx, bcast_rx) = channel::<BroadcastV1>(10240);
 
     let gossip_addr = gossip_server_endpoint.local_addr()?;
     // let udp_gossip = Arc::new(UdpSocket::bind(gossip_addr).await?);
@@ -457,10 +455,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     tokio::spawn({
         let agent = agent.clone();
+        let tripwire = tripwire.clone();
         async move {
             while let Some(connecting) = gossip_server_endpoint.accept().await {
                 let process_uni_tx = process_uni_tx.clone();
                 let agent = agent.clone();
+                let tripwire = tripwire.clone();
                 tokio::spawn(async move {
                     let remote_addr = connecting.remote_address();
                     let local_ip = connecting.local_ip().unwrap();
@@ -478,12 +478,19 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                     tokio::spawn({
                         let conn = conn.clone();
+                        let mut tripwire = tripwire.clone();
                         async move {
                             loop {
-                                let mut rx = match conn.accept_uni().await {
-                                    Ok(rx) => rx,
-                                    Err(e) => {
-                                        debug!("could not accept unidirectional stream from connection: {e}");
+                                let mut rx = tokio::select! {
+                                    rx_res = conn.accept_uni() => match rx_res {
+                                        Ok(rx) => rx,
+                                        Err(e) => {
+                                            debug!("could not accept unidirectional stream from connection: {e}");
+                                            return;
+                                        }
+                                    },
+                                    _ = &mut tripwire => {
+                                        debug!("connection cancelled");
                                         return;
                                     }
                                 };
@@ -493,99 +500,80 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                     conn.remote_address()
                                 );
 
-                                let process_uni_tx = process_uni_tx.clone();
-                                tokio::spawn(async move {
-                                    let mut codec = LengthDelimitedCodec::new();
-                                    let mut buf = BytesMut::new();
-                                    loop {
+                                tokio::spawn({
+                                    let process_uni_tx = process_uni_tx.clone();
+                                    async move {
+                                        let mut codec = LengthDelimitedCodec::new();
+                                        let mut buf = BytesMut::new();
                                         loop {
-                                            match codec.decode(&mut buf) {
-                                                Ok(Some(b)) => {
-                                                    // TODO: checksum?
-                                                    let b = b.freeze();
+                                            loop {
+                                                match codec.decode(&mut buf) {
+                                                    Ok(Some(b)) => {
+                                                        // TODO: checksum?
+                                                        let b = b.freeze();
 
-                                                    match UniPayload::read_from_buffer(&b) {
-                                                        Ok(payload) => {
-                                                            trace!("parsed a payload: {payload:?}");
+                                                        match UniPayload::read_from_buffer(&b) {
+                                                            Ok(payload) => {
+                                                                trace!(
+                                                                    "parsed a payload: {payload:?}"
+                                                                );
 
-                                                            // if let
-
-                                                            if let Err(e) =
-                                                                process_uni_tx.send(payload).await
-                                                            {
-                                                                error!("could not send UniPayload for processing: {e}");
-                                                                // this means we won't be able to process more...
-                                                                return;
+                                                                if let Err(e) = process_uni_tx
+                                                                    .send(payload)
+                                                                    .await
+                                                                {
+                                                                    error!("could not send UniPayload for processing: {e}");
+                                                                    // this means we won't be able to process more...
+                                                                    return;
+                                                                }
                                                             }
-                                                        }
-                                                        Err(e) => {
-                                                            error!(
+                                                            Err(e) => {
+                                                                error!(
                                                                 "could not decode UniPayload: {e}"
                                                             );
-                                                            continue;
+                                                                continue;
+                                                            }
                                                         }
                                                     }
+                                                    Ok(None) => break,
+                                                    Err(e) => {
+                                                        println!("decode error: {e}");
+                                                    }
                                                 }
-                                                Ok(None) => break,
+                                            }
+                                            match rx.read_buf(&mut buf).await {
+                                                Ok(0) => {
+                                                    // println!("EOF");
+                                                    break;
+                                                }
+                                                Ok(n) => {
+                                                    trace!("read {n} bytes");
+                                                }
                                                 Err(e) => {
-                                                    println!("decode error: {e}");
+                                                    error!("error reading bytes into buffer: {e}");
+                                                    break;
                                                 }
-                                            }
-                                        }
-                                        match rx.read_buf(&mut buf).await {
-                                            Ok(0) => {
-                                                // println!("EOF");
-                                                break;
-                                            }
-                                            Ok(n) => {
-                                                trace!("read {n} bytes");
-                                            }
-                                            Err(e) => {
-                                                error!("error reading bytes into buffer: {e}");
-                                                break;
                                             }
                                         }
                                     }
-                                    // let mut framed =
-                                    //     FramedRead::new(rx, LengthDelimitedCodec::new());
-
-                                    // while let Some(res) = framed.next().await {
-                                    //     let b = match res {
-                                    //         Ok(b) => b,
-                                    //         Err(e) => {
-                                    //             error!("could not read framed payload from unidirectional stream: {e}");
-                                    //             return;
-                                    //         }
-                                    //     };
-
-                                    //     // TODO: checksum?
-                                    //     let b = b.freeze();
-
-                                    //     match UniPayload::read_from_buffer(&b) {
-                                    //         Ok(payload) => {
-                                    //             if let Err(e) = process_uni_tx.send(payload).await {
-                                    //                 error!("could not send UniPayload for processing: {e}");
-                                    //                 // this means we won't be able to process more...
-                                    //                 return;
-                                    //             }
-                                    //         }
-                                    //         Err(e) => {
-                                    //             warn!("could not decode UniPayload: {e}");
-                                    //             continue;
-                                    //         }
-                                    //     }
-                                    // }
                                 });
                             }
                         }
                     });
 
                     tokio::spawn(async move {
+                        let mut tripwire = tripwire.clone();
                         loop {
-                            let (tx, rx) = match conn.accept_bi().await {
-                                Ok(res) => res,
-                                Err(e) => {
-                                    debug!("could not accept bidirectional stream from connection: {e}");
+                            let (tx, rx) = tokio::select! {
+                                tx_rx_res = conn.accept_bi() => match tx_rx_res {
+                                    Ok(tx_rx) => tx_rx,
+                                    Err(e) => {
+                                        debug!("could not accept bidirectional stream from connection: {e}");
+                                        return;
+                                    }
+                                },
+                                _ = &mut tripwire => {
+                                    debug!("connection cancelled");
                                     return;
                                 }
                             };
@@ -596,44 +584,53 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             );
 
                             // TODO: implement concurrency limit for sync requests
+                            tokio::spawn({
+                                let agent = agent.clone();
+                                async move {
+                                    let mut framed =
+                                        FramedRead::new(rx, LengthDelimitedCodec::new());
 
-                            let agent = agent.clone();
-                            tokio::spawn(async move {
-                                let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
-
-                                match framed.next().await {
-                                    None => {
-                                        return;
-                                    }
-                                    Some(res) => match res {
-                                        Ok(b) => match BiPayload::read_from_buffer(&b) {
-                                            Ok(payload) => match payload {
-                                                BiPayload::V1(BiPayloadV1::SyncState(state)) => {
-                                                    // println!("got sync state: {state:?}");
-                                                    if let Err(e) = bidirectional_sync(
-                                                        &agent,
-                                                        generate_sync(
-                                                            agent.bookie(),
-                                                            agent.actor_id(),
-                                                        ),
-                                                        Some(state),
-                                                        framed.into_inner(),
-                                                        tx,
-                                                    )
-                                                    .await
-                                                    {
-                                                        warn!("could not complete bidirectional sync: {e}");
+                                    loop {
+                                        match framed.next().await {
+                                            None => {
+                                                return;
+                                            }
+                                            Some(res) => match res {
+                                                Ok(b) => match BiPayload::read_from_buffer(&b) {
+                                                    Ok(payload) => {
+                                                        match payload {
+                                                            BiPayload::V1(
+                                                                BiPayloadV1::SyncState(state),
+                                                            ) => {
+                                                                // println!("got sync state: {state:?}");
+                                                                if let Err(e) = bidirectional_sync(
+                                                                    &agent,
+                                                                    generate_sync(
+                                                                        agent.bookie(),
+                                                                        agent.actor_id(),
+                                                                    ),
+                                                                    Some(state),
+                                                                    framed.into_inner(),
+                                                                    tx,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    warn!("could not complete bidirectional sync: {e}");
+                                                                }
+                                                                break;
+                                                            }
+                                                        }
                                                     }
+                                                    Err(e) => {
+                                                        warn!("could not decode BiPayload: {e}");
+                                                    }
+                                                },
+                                                Err(e) => {
+                                                    error!("could not read framed payload from bidirectional stream: {e}");
                                                 }
                                             },
-                                            Err(e) => {
-                                                warn!("could not decode BiPayload: {e}");
-                                            }
-                                        },
-                                        Err(e) => {
-                                            error!("could not read framed payload from bidirectional stream: {e}");
                                         }
-                                    },
+                                    }
                                 }
                             });
                         }
@@ -654,7 +651,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             loop {
                 interval.tick().await;
 
-                match generate_bootstrap(bootstrap.as_slice(), gossip_addr, agent.pool()).await {
+                match generate_bootstrap(
+                    agent.config().gossip.bootstrap.as_slice(),
+                    gossip_addr,
+                    agent.pool(),
+                )
+                .await
+                {
                     Ok(addrs) => {
                         for addr in addrs.iter() {
                             debug!("Bootstrapping w/ {addr}");
@@ -808,14 +811,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     };
 
     if !states.is_empty() {
-        // let cluster_size = states.len();
         foca_tx.send(FocaInput::ApplyMany(states)).await.ok();
-        // foca_tx
-        //     .send(FocaInput::ClusterSize(
-        //         (cluster_size as u32).try_into().unwrap(),
-        //     ))
-        //     .await
-        //     .ok();
     }
 
     let api = Router::new()
@@ -889,6 +885,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     .layer(ConcurrencyLimitLayer::new(4)),
             ),
         )
+        .layer(axum::middleware::from_fn(require_authz))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
@@ -971,18 +968,41 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     Ok(())
 }
 
+async fn require_authz<B>(
+    Extension(agent): Extension<Agent>,
+    maybe_authz_header: Option<TypedHeader<Authorization<Bearer>>>,
+    request: axum::http::Request<B>,
+    next: axum::middleware::Next<B>,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    let passed = if let Some(ref authz) = agent.config().api.authorization {
+        match authz {
+            AuthzConfig::BearerToken(token) => maybe_authz_header
+                .map(|h| h.token() == token)
+                .unwrap_or(false),
+        }
+    } else {
+        true
+    };
+
+    if !passed {
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(request).await)
+}
+
 fn collect_metrics(agent: Agent) {
     agent.pool().emit_metrics();
 }
 
 pub async fn handle_change(
-    bcast: Broadcast,
+    bcast: BroadcastV1,
     self_actor_id: ActorId,
     bookie: &Bookie,
-    bcast_msg_tx: &Sender<Broadcast>,
+    bcast_msg_tx: &Sender<BroadcastV1>,
 ) {
     match bcast {
-        Broadcast::V1(BroadcastV1::Change(change)) => {
+        BroadcastV1::Change(change) => {
             increment_counter!("corro.broadcast.recv.count", "kind" => "change");
 
             trace!("handling {} changes", change.len());
@@ -995,10 +1015,7 @@ pub async fn handle_change(
             if change.actor_id == self_actor_id {
                 return;
             }
-            if let Err(e) = bcast_msg_tx
-                .send(Broadcast::V1(BroadcastV1::Change(change)))
-                .await
-            {
+            if let Err(e) = bcast_msg_tx.send(BroadcastV1::Change(change)).await {
                 error!("could not send change message through broadcast channel: {e}");
             }
         }
@@ -1080,7 +1097,7 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
 
 async fn handle_gossip(
     agent: Agent,
-    messages: Vec<Broadcast>,
+    messages: Vec<BroadcastV1>,
     high_priority: bool,
 ) -> eyre::Result<()> {
     let priority_label = if high_priority { "high" } else { "normal" };
@@ -1739,17 +1756,20 @@ pub async fn process_single_version(
     Ok(Some(changeset))
 }
 
-async fn process_msg(agent: &Agent, bcast: Broadcast) -> Result<Option<Broadcast>, ChangeError> {
+async fn process_msg(
+    agent: &Agent,
+    bcast: BroadcastV1,
+) -> Result<Option<BroadcastV1>, ChangeError> {
     Ok(match bcast {
-        Broadcast::V1(BroadcastV1::Change(change)) => {
+        BroadcastV1::Change(change) => {
             let actor_id = change.actor_id;
             let changeset = process_single_version(agent, change).await?;
 
             changeset.map(|changeset| {
-                Broadcast::V1(BroadcastV1::Change(ChangeV1 {
+                BroadcastV1::Change(ChangeV1 {
                     actor_id,
                     changeset,
-                }))
+                })
             })
         }
     })

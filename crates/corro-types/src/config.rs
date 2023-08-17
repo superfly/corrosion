@@ -25,7 +25,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum TelemetryConfig {
     Prometheus {
         #[serde(alias = "addr")]
@@ -63,8 +63,9 @@ pub struct ApiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum AuthzConfig {
+    #[serde(alias = "bearer")]
     BearerToken(String),
 }
 
@@ -80,6 +81,9 @@ pub struct GossipConfig {
     pub plaintext: bool,
     #[serde(default)]
     pub max_mtu: Option<u16>,
+
+    #[serde(alias = "authz_token", default)]
+    pub authorization_token: Option<CompactString>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,7 +224,8 @@ impl ConfigBuilder {
                 bootstrap: self.bootstrap.unwrap_or_default(),
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
-                max_mtu: None, // TODO: add a builder function for it
+                max_mtu: None,             // TODO: add a builder function for it
+                authorization_token: None, // TODO: add a builder function for it
             },
             admin: AdminConfig {
                 uds_path: self.admin_path.unwrap_or_else(default_admin_path),
@@ -256,7 +261,7 @@ pub enum LogFormat {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub struct ConsulConfig {
     #[serde(default)]
     pub extra_services_columns: Vec<String>,

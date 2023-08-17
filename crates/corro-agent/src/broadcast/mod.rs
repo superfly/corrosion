@@ -34,7 +34,9 @@ use tripwire::Tripwire;
 use corro_types::{
     actor::Actor,
     agent::Agent,
-    broadcast::{Broadcast, BroadcastInput, DispatchRuntime, FocaInput, UniPayload, UniPayloadV1},
+    broadcast::{
+        BroadcastInput, BroadcastV1, DispatchRuntime, FocaInput, UniPayload, UniPayloadV1,
+    },
     members::MemberEvent,
 };
 
@@ -454,7 +456,7 @@ pub fn runtime_loop(
     });
 
     tokio::spawn(async move {
-        let (bcast_tx, bcast_rx) = channel::<Broadcast>(10240);
+        let (bcast_tx, bcast_rx) = channel::<BroadcastV1>(10240);
 
         let mut bcast_buf = BytesMut::new();
         let mut bcast_codec = LengthDelimitedCodec::new();
@@ -473,7 +475,7 @@ pub fn runtime_loop(
 
         enum Branch {
             Broadcast(BroadcastInput),
-            SendBroadcast(Vec<Broadcast>),
+            SendBroadcast(Vec<BroadcastV1>),
             WokePendingBroadcast(PendingBroadcast),
             Tripped,
             Metrics,

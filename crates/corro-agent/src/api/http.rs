@@ -28,7 +28,7 @@ use tokio::{
 use tracing::{debug, error, info, trace};
 
 use corro_types::{
-    broadcast::{Broadcast, BroadcastInput, BroadcastV1},
+    broadcast::{BroadcastInput, BroadcastV1},
     change::Change,
 };
 
@@ -220,8 +220,8 @@ where
                             let tx_bcast = agent.tx_bcast().clone();
                             tokio::spawn(async move {
                                 if let Err(e) = tx_bcast
-                                    .send(BroadcastInput::AddBroadcast(Broadcast::V1(
-                                        BroadcastV1::Change(ChangeV1 {
+                                    .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
+                                        ChangeV1 {
                                             actor_id,
                                             changeset: Changeset::Full {
                                                 version,
@@ -230,7 +230,7 @@ where
                                                 last_seq,
                                                 ts,
                                             },
-                                        }),
+                                        },
                                     )))
                                     .await
                                 {
@@ -712,10 +712,10 @@ mod tests {
 
         assert!(matches!(
             msg,
-            BroadcastInput::AddBroadcast(Broadcast::V1(BroadcastV1::Change(ChangeV1 {
+            BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
                 changeset: Changeset::Full { version: 1, .. },
                 ..
-            })))
+            }))
         ));
 
         assert_eq!(agent.bookie().last(&agent.actor_id()), Some(1));
