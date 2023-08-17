@@ -38,8 +38,9 @@ use corro_types::{
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
+    headers::{authorization::Bearer, Authorization},
     routing::{get, post},
-    BoxError, Extension, Router,
+    BoxError, Extension, Router, TypedHeader,
 };
 use bytes::{BufMut, BytesMut};
 use foca::{Member, Notification};
@@ -810,17 +811,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     };
 
     if !states.is_empty() {
-        // let cluster_size = states.len();
         foca_tx.send(FocaInput::ApplyMany(states)).await.ok();
-        // foca_tx
-        //     .send(FocaInput::ClusterSize(
-        //         (cluster_size as u32).try_into().unwrap(),
-        //     ))
-        //     .await
-        //     .ok();
     }
 
-    let mut api = Router::new()
+    let api = Router::new()
         .route(
             "/v1/transactions",
             post(api_v1_transactions).route_layer(
@@ -891,6 +885,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     .layer(ConcurrencyLimitLayer::new(4)),
             ),
         )
+        .layer(axum::middleware::from_fn(require_authz))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
@@ -900,17 +895,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         )
         .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http());
-
-    if let Some(ref authz) = agent.config().api.authorization {
-        match authz {
-            AuthzConfig::BearerToken(token) => {
-                info!("Using Bearer token authorization for the client API");
-                api = api.layer(tower_http::auth::AddAuthorizationLayer::bearer(
-                    token.as_str(),
-                ));
-            }
-        }
-    }
 
     let api_addr = api_listener.local_addr()?;
     info!("Starting public API server on {api_addr}");
@@ -982,6 +966,29 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+async fn require_authz<B>(
+    Extension(agent): Extension<Agent>,
+    maybe_authz_header: Option<TypedHeader<Authorization<Bearer>>>,
+    request: axum::http::Request<B>,
+    next: axum::middleware::Next<B>,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    let passed = if let Some(ref authz) = agent.config().api.authorization {
+        match authz {
+            AuthzConfig::BearerToken(token) => maybe_authz_header
+                .map(|h| h.token() == token)
+                .unwrap_or(false),
+        }
+    } else {
+        true
+    };
+
+    if !passed {
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(request).await)
 }
 
 fn collect_metrics(agent: Agent) {

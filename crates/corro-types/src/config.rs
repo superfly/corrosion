@@ -25,7 +25,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum TelemetryConfig {
     Prometheus {
         #[serde(alias = "addr")]
@@ -63,7 +63,7 @@ pub struct ApiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum AuthzConfig {
     #[serde(alias = "bearer")]
     BearerToken(String),
@@ -261,7 +261,7 @@ pub enum LogFormat {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub struct ConsulConfig {
     #[serde(default)]
     pub extra_services_columns: Vec<String>,
