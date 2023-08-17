@@ -1,10 +1,17 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use admin::AdminConn;
 use bytes::BytesMut;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
-use command::tpl::TemplateFlags;
+use command::{
+    tls::{generate_ca, generate_client_cert, generate_server_cert},
+    tpl::TemplateFlags,
+};
 use corro_client::CorrosionApiClient;
 use corro_types::{
     api::{QueryEvent, RqliteResult, Statement},
@@ -233,6 +240,17 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
         Command::Template { template, flags } => {
             command::tpl::run(cli.api_addr()?, template, flags).await?;
         }
+        Command::Tls(tls) => match tls {
+            TlsCommand::Ca(TlsCaCommand::Generate) => generate_ca().await?,
+            TlsCommand::Server(TlsServerCommand::Generate {
+                ip,
+                ca_key,
+                ca_cert,
+            }) => generate_server_cert(ca_cert, ca_key, *ip).await?,
+            TlsCommand::Client(TlsClientCommand::Generate { ca_key, ca_cert }) => {
+                generate_client_cert(ca_cert, ca_key).await?
+            }
+        },
     }
 
     Ok(())
@@ -358,6 +376,10 @@ enum Command {
         #[command(flatten)]
         flags: TemplateFlags,
     },
+
+    /// Tls-related commands
+    #[command(subcommand)]
+    Tls(TlsCommand),
 }
 
 #[derive(Subcommand)]
@@ -372,45 +394,44 @@ enum SyncCommand {
     Generate,
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use assert_cmd::Command;
-//     use corro_tests::launch_test_agent;
-//     use spawn::wait_for_all_pending_handles;
-//     use tripwire::Tripwire;
+#[derive(Subcommand)]
+enum TlsCommand {
+    /// TLS certificate authority commands
+    #[command(subcommand)]
+    Ca(TlsCaCommand),
+    /// TLS server certificate commands
+    #[command(subcommand)]
+    Server(TlsServerCommand),
+    /// TLS client certificate commands (for mutual TLS)
+    #[command(subcommand)]
+    Client(TlsClientCommand),
+}
 
-//     #[test]
-//     fn test_help() {
-//         let mut cmd = Command::cargo_bin("corrosion").unwrap();
+#[derive(Subcommand)]
+enum TlsCaCommand {
+    /// Generate a TLS certificate authority
+    Generate,
+}
 
-//         cmd.arg("--help").assert().success();
-//     }
+#[derive(Subcommand)]
+enum TlsServerCommand {
+    /// Generate a TLS server certificate from a CA
+    Generate {
+        ip: IpAddr,
+        #[arg(long)]
+        ca_key: Utf8PathBuf,
+        #[arg(long)]
+        ca_cert: Utf8PathBuf,
+    },
+}
 
-//     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-//     async fn test_query() {
-//         _ = tracing_subscriber::fmt::try_init();
-//         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-//         let ta = launch_test_agent(|conf| conf.build(), tripwire.clone())
-//             .await
-//             .unwrap();
-
-//         let mut cmd = Command::cargo_bin("corrosion").unwrap();
-
-//         let api_addr = ta.agent.api_addr();
-
-//         let expected = ta.agent.actor_id().as_simple().to_string().to_uppercase();
-
-//         let assert = cmd
-//             .arg("--api-addr")
-//             .arg(api_addr.to_string())
-//             .arg("query")
-//             .arg("SELECT hex(site_id) FROM crsql_site_id WHERE ordinal = 0")
-//             .assert();
-
-//         assert.success().stdout(format!("{expected}\n"));
-
-//         tripwire_tx.send(()).await.ok();
-//         tripwire_worker.await;
-//         wait_for_all_pending_handles().await;
-//     }
-// }
+#[derive(Subcommand)]
+enum TlsClientCommand {
+    /// Generate a TLS certificate from a CA
+    Generate {
+        #[arg(long)]
+        ca_key: Utf8PathBuf,
+        #[arg(long)]
+        ca_cert: Utf8PathBuf,
+    },
+}

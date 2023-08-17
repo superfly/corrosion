@@ -92,13 +92,25 @@ pub struct TlsConfig {
     pub cert_file: Utf8PathBuf,
     /// Private key file
     pub key_file: Utf8PathBuf,
+
     /// CA (Certificate Authority) file
+    #[serde(default)]
     pub ca_file: Option<Utf8PathBuf>,
 
-    pub default_server_name: CompactString,
+    /// Mutual TLS configuration
+    #[serde(default)]
+    pub client: Option<TlsClientConfig>,
 
     #[serde(default)]
     pub insecure: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsClientConfig {
+    /// Certificate file
+    pub cert_file: Utf8PathBuf,
+    /// Private key file
+    pub key_file: Utf8PathBuf,
 }
 
 pub fn default_admin_path() -> Utf8PathBuf {
