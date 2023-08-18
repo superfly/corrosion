@@ -231,23 +231,26 @@ impl QueryResponseIter {
             match res {
                 Some(Ok(evt)) => match evt {
                     QueryEvent::Columns(cols) => self.columns = Some(Arc::new(cols)),
-                    QueryEvent::Row { rowid, cells, .. } => match self.columns.as_ref() {
-                        Some(columns) => {
-                            return Some(Ok(Row {
-                                id: rowid,
-                                columns: columns.clone(),
-                                cells,
-                            }));
-                        }
-                        None => {
-                            self.done = true;
-                            return Some(Err(Box::new(EvalAltResult::from(
-                                "did not receive columns data",
-                            ))));
-                        }
-                    },
-                    QueryEvent::EndOfQuery => {
+                    QueryEvent::EndOfQuery { .. } => {
                         return None;
+                    }
+                    QueryEvent::Row(rowid, cells) | QueryEvent::Change(_, rowid, cells) => {
+                        println!("got a row (rowid: {rowid}) or a change...");
+                        match self.columns.as_ref() {
+                            Some(columns) => {
+                                return Some(Ok(Row {
+                                    id: rowid,
+                                    columns: columns.clone(),
+                                    cells,
+                                }));
+                            }
+                            None => {
+                                self.done = true;
+                                return Some(Err(Box::new(EvalAltResult::from(
+                                    "did not receive columns data",
+                                ))));
+                            }
+                        }
                     }
                     QueryEvent::Error(e) => {
                         self.done = true;

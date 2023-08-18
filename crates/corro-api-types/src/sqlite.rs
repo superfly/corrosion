@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeType {
-    Upsert,
+    Insert,
+    Update,
     Delete,
 }
 

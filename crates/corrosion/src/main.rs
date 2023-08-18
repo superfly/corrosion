@@ -159,7 +159,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
         Command::Query {
             query,
             columns: show_columns,
-            ..
+            timer,
         } => {
             let mut body = cli
                 .api_client()?
@@ -184,7 +184,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                             println!("{}", cols.join("|"));
                         }
                     }
-                    QueryEvent::Row { cells, .. } => {
+                    QueryEvent::Row(_, cells) => {
                         println!(
                             "{}",
                             cells
@@ -194,7 +194,12 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                                 .join("|")
                         );
                     }
-                    QueryEvent::EndOfQuery => {
+                    QueryEvent::EndOfQuery { time } => {
+                        if *timer {
+                            println!("time: {time}s");
+                        }
+                    }
+                    QueryEvent::Change(_, _, _) => {
                         break;
                     }
                     QueryEvent::Error(e) => {

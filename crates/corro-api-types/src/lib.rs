@@ -16,17 +16,19 @@ use sqlite::ChangeType;
 pub mod sqlite;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case", tag = "event", content = "data")]
+#[serde(rename_all = "snake_case")]
 pub enum QueryEvent {
     Columns(Vec<CompactString>),
-    Row {
-        rowid: i64,
-        change_type: ChangeType,
-        cells: Vec<SqliteValue>,
+    Row(i64, Vec<SqliteValue>),
+    #[serde(rename = "eoq")]
+    EndOfQuery {
+        time: f64,
     },
-    EndOfQuery,
+    Change(ChangeType, i64, Vec<SqliteValue>),
     Error(CompactString),
 }
+
+pub type RowIdCells = (i64, Vec<SqliteValue>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
