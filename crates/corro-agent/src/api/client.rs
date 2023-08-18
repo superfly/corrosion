@@ -11,7 +11,6 @@ use corro_types::{
     api::{QueryEvent, RqliteResponse, RqliteResult, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{row_to_change, SqliteValue},
-    pubsub::ChangeType,
     schema::{make_schema_inner, parse_sql},
     sqlite::SqlitePoolError,
 };
@@ -433,11 +432,8 @@ async fn build_query_rows_response(
                             .collect::<rusqlite::Result<Vec<_>>>()
                         {
                             Ok(cells) => {
-                                if let Err(e) = data_tx.blocking_send(QueryEvent::Row {
-                                    change_type: ChangeType::Upsert,
-                                    rowid,
-                                    cells,
-                                }) {
+                                if let Err(e) = data_tx.blocking_send(QueryEvent::Row(rowid, cells))
+                                {
                                     error!("could not send back row: {e}");
                                     return;
                                 }
@@ -618,7 +614,9 @@ pub async fn api_v1_db_schema(
 mod tests {
     use arc_swap::ArcSwap;
     use bytes::Bytes;
-    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, schema::SqliteType};
+    use corro_types::{
+        actor::ActorId, agent::SplitPool, config::Config, pubsub::ChangeType, schema::SqliteType,
+    };
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
     use tokio::sync::mpsc::{channel, error::TryRecvError};
@@ -842,11 +840,11 @@ mod tests {
 
         assert_eq!(
             row,
-            QueryEvent::Row {
-                rowid: 1,
-                change_type: ChangeType::Upsert,
-                cells: vec!["service-id".into(), "service-name".into()]
-            }
+            QueryEvent::Change(
+                ChangeType::Insert,
+                1,
+                vec!["service-id".into(), "service-name".into()]
+            )
         );
 
         buf.extend_from_slice(&body.data().await.unwrap()?);
@@ -857,11 +855,11 @@ mod tests {
 
         assert_eq!(
             row,
-            QueryEvent::Row {
-                rowid: 2,
-                change_type: ChangeType::Upsert,
-                cells: vec!["service-id-2".into(), "service-name-2".into()]
-            }
+            QueryEvent::Change(
+                ChangeType::Insert,
+                2,
+                vec!["service-id-2".into(), "service-name-2".into()]
+            )
         );
 
         assert!(body.data().await.is_none());

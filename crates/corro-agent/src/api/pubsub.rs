@@ -7,7 +7,7 @@ use corro_types::{
     agent::Agent,
     api::{QueryEvent, Statement},
     change::SqliteValue,
-    pubsub::{normalize_sql, ChangeType, Matcher, MatcherCmd},
+    pubsub::{normalize_sql, Matcher, MatcherCmd},
 };
 use futures::future::poll_fn;
 use rusqlite::Connection;
@@ -114,11 +114,7 @@ async fn watch_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
                     .map(|i| row.get::<_, SqliteValue>(i))
                     .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                init_tx.blocking_send(QueryEvent::Row {
-                    rowid,
-                    change_type: ChangeType::Upsert,
-                    cells,
-                })?;
+                init_tx.blocking_send(QueryEvent::Row(rowid, cells))?;
             }
 
             Ok::<_, QueryTempError>(())
@@ -127,8 +123,6 @@ async fn watch_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
         if let Err(QueryTempError::Sqlite(e)) = res {
             _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
         }
-
-        _ = init_tx.send(QueryEvent::EndOfQuery).await;
     });
 
     hyper::Response::builder()
@@ -189,7 +183,7 @@ async fn process_watch_channel(
             let mut query_evt = query_evt;
 
             loop {
-                if matches!(query_evt, QueryEvent::EndOfQuery) {
+                if !init_done && matches!(query_evt, QueryEvent::Change(_, _, _)) {
                     init_done = true;
                 }
 
@@ -459,7 +453,7 @@ pub async fn api_v1_watches(
 #[cfg(test)]
 mod tests {
     use arc_swap::ArcSwap;
-    use corro_types::{actor::ActorId, agent::SplitPool, config::Config};
+    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, pubsub::ChangeType};
     use http_body::Body;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
@@ -578,31 +572,21 @@ mod tests {
 
         assert_eq!(
             rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Row {
-                rowid: 1,
-                change_type: ChangeType::Upsert,
-                cells: vec!["service-id".into(), "service-name".into()]
-            }
+            QueryEvent::Row(1, vec!["service-id".into(), "service-name".into()])
         );
 
         assert_eq!(
             rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Row {
-                rowid: 2,
-                change_type: ChangeType::Upsert,
-                cells: vec!["service-id-2".into(), "service-name-2".into()]
-            }
+            QueryEvent::Row(2, vec!["service-id-2".into(), "service-name-2".into()])
         );
-
-        assert_eq!(rows.recv().await.unwrap().unwrap(), QueryEvent::EndOfQuery,);
 
         assert_eq!(
             rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Row {
-                rowid: 3,
-                change_type: ChangeType::Upsert,
-                cells: vec!["service-id-3".into(), "service-name-3".into()]
-            }
+            QueryEvent::Change(
+                ChangeType::Insert,
+                3,
+                vec!["service-id-3".into(), "service-name-3".into()]
+            )
         );
 
         let (status_code, _) = api_v1_transactions(
@@ -618,11 +602,11 @@ mod tests {
 
         assert_eq!(
             rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Row {
-                rowid: 4,
-                change_type: ChangeType::Upsert,
-                cells: vec!["service-id-4".into(), "service-name-4".into()]
-            }
+            QueryEvent::Change(
+                ChangeType::Insert,
+                4,
+                vec!["service-id-4".into(), "service-name-4".into()]
+            )
         );
 
         Ok(())

@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -10,6 +11,7 @@ use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::IndexMap;
 use itertools::Itertools;
+use parking_lot::Mutex;
 use rusqlite::{params_from_iter, Connection};
 use sqlite3_parser::{
     ast::{
@@ -158,6 +160,7 @@ pub struct InnerMatcher {
     pub change_tx: broadcast::Sender<QueryEvent>,
     pub cmd_tx: mpsc::Sender<MatcherCmd>,
     pub col_names: Vec<CompactString>,
+    pub last_rowid: Mutex<i64>,
     pub cancel: CancellationToken,
 }
 
@@ -327,6 +330,7 @@ impl Matcher {
             cmd_tx,
             col_names: col_names.clone(),
             cancel: cancel.clone(),
+            last_rowid: Mutex::new(0),
         }));
 
         let mut tmp_cols = matcher
@@ -388,6 +392,8 @@ impl Matcher {
                         query_cols.join(","),
                     );
 
+                    let mut last_rowid = 0;
+
                     {
                         let mut prepped = tx.prepare(&insert_into)?;
 
@@ -401,14 +407,14 @@ impl Matcher {
                                         .map(|i| row.get::<_, SqliteValue>(i))
                                         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                                    if let Err(e) = init_tx.blocking_send(QueryEvent::Row {
-                                        change_type: ChangeType::Upsert,
-                                        rowid,
-                                        cells,
-                                    }) {
+                                    if let Err(e) =
+                                        init_tx.blocking_send(QueryEvent::Row(rowid, cells))
+                                    {
                                         error!("could not send back row: {e}");
                                         return Err(MatcherError::ChangeReceiverClosed);
                                     }
+
+                                    last_rowid = cmp::max(rowid, last_rowid);
                                 }
                                 Ok(None) => {
                                     // done!
@@ -423,16 +429,13 @@ impl Matcher {
 
                     tx.commit()?;
 
+                    *matcher.0.last_rowid.lock() = last_rowid;
+
                     Ok::<_, MatcherError>(())
                 });
 
                 if let Err(e) = res {
                     _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
-                    return;
-                }
-
-                if let Err(e) = init_tx.send(QueryEvent::EndOfQuery).await {
-                    error!("could not send back end-of-query message: {e}");
                     return;
                 }
 
@@ -565,6 +568,9 @@ impl Matcher {
             }
         }
 
+        let last_rowid = { *self.0.last_rowid.lock() };
+        let mut new_last_rowid = last_rowid;
+
         for table in tables.iter() {
             let stmt = match self.0.statements.get(table.as_str()) {
                 Some(stmt) => stmt,
@@ -652,8 +658,8 @@ impl Matcher {
             let delete_prepped = tx.prepare_cached(&sql)?;
 
             for (change_type, mut prepped) in [
-                (ChangeType::Upsert, insert_prepped),
-                (ChangeType::Delete, delete_prepped),
+                (None, insert_prepped),
+                (Some(ChangeType::Delete), delete_prepped),
             ] {
                 let col_count = prepped.column_count();
 
@@ -662,16 +668,26 @@ impl Matcher {
                 while let Ok(Some(row)) = rows.next() {
                     let rowid: i64 = row.get(0)?;
 
+                    let change_type = change_type.clone().take().unwrap_or_else(|| {
+                        if rowid > last_rowid {
+                            ChangeType::Insert
+                        } else {
+                            ChangeType::Update
+                        }
+                    });
+
+                    new_last_rowid = cmp::max(new_last_rowid, rowid);
+
                     match (1..col_count)
                         .map(|i| row.get::<_, SqliteValue>(i))
                         .collect::<rusqlite::Result<Vec<_>>>()
                     {
                         Ok(cells) => {
-                            if let Err(e) = self.0.change_tx.send(QueryEvent::Row {
-                                rowid,
-                                change_type,
-                                cells,
-                            }) {
+                            if let Err(e) =
+                                self.0
+                                    .change_tx
+                                    .send(QueryEvent::Change(change_type, rowid, cells))
+                            {
                                 error!("could not send back row to matcher sub sender: {e}");
                                 return Err(MatcherError::ChangeReceiverClosed);
                             }
@@ -696,6 +712,8 @@ impl Matcher {
         }
 
         tx.commit()?;
+
+        *self.0.last_rowid.lock() = new_last_rowid;
 
         Ok(())
     }
@@ -1429,15 +1447,7 @@ mod tests {
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
-            assert_eq!(
-                rx.recv().await.unwrap(),
-                QueryEvent::Row {
-                    rowid: 1,
-                    change_type: ChangeType::Upsert,
-                    cells
-                }
-            );
-            assert!(matches!(rx.recv().await.unwrap(), QueryEvent::EndOfQuery));
+            assert_eq!(rx.recv().await.unwrap(), QueryEvent::Row(1, cells).into());
 
             // insert the second row
             {
@@ -1472,11 +1482,7 @@ mod tests {
 
             assert_eq!(
                 change_rx.recv().await.unwrap(),
-                QueryEvent::Row {
-                    rowid: 2,
-                    change_type: ChangeType::Upsert,
-                    cells
-                }
+                QueryEvent::Change(ChangeType::Insert, 2, cells)
             );
 
             // delete the first row
@@ -1507,11 +1513,39 @@ mod tests {
 
             assert_eq!(
                 change_rx.recv().await.unwrap(),
-                QueryEvent::Row {
-                    rowid: 1,
-                    change_type: ChangeType::Delete,
-                    cells
+                QueryEvent::Change(ChangeType::Delete, 1, cells)
+            );
+
+            // update the second row
+            {
+                let tx = conn.transaction().unwrap();
+                let n = tx.execute(r#"
+                        UPDATE consul_services SET address = '127.0.0.2' WHERE node = 'test-hostname' AND id = 'service-3';
+                    "#, ()).unwrap();
+                assert_eq!(n, 1);
+                tx.commit().unwrap();
+            }
+
+            let changes = {
+                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
+                let rows = prepped.query_map([4], row_to_change).unwrap();
+
+                let mut changes = vec![];
+
+                for row in rows {
+                    println!("change: {row:?}");
+                    changes.push(row.unwrap());
                 }
+                changes
+            };
+
+            matcher.process_change(&changes.as_slice()).unwrap();
+
+            let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
+
+            assert_eq!(
+                change_rx.recv().await.unwrap(),
+                QueryEvent::Change(ChangeType::Update, 2, cells)
             );
         }
     }

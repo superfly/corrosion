@@ -231,7 +231,7 @@ impl QueryResponseIter {
             match res {
                 Some(Ok(evt)) => match evt {
                     QueryEvent::Columns(cols) => self.columns = Some(Arc::new(cols)),
-                    QueryEvent::Row { rowid, cells, .. } => match self.columns.as_ref() {
+                    QueryEvent::Row(rowid, cells) => match self.columns.as_ref() {
                         Some(columns) => {
                             return Some(Ok(Row {
                                 id: rowid,
@@ -246,7 +246,7 @@ impl QueryResponseIter {
                             ))));
                         }
                     },
-                    QueryEvent::EndOfQuery => {
+                    QueryEvent::Change(_, _, _) => {
                         return None;
                     }
                     QueryEvent::Error(e) => {
