@@ -2053,11 +2053,6 @@ pub mod tests {
         assert_eq!(svc.id, 1);
         assert_eq!(svc.text, "hello world 1");
 
-        // assert_eq!(
-        //     bod["outcomes"],
-        //     serde_json::json!([{"result": "applied", "version": 1}])
-        // );
-
         let req_body: Vec<Statement> = serde_json::from_value(json!([[
             "INSERT INTO tests (id,text) VALUES (?,?)",
             [2, "hello world 2"]

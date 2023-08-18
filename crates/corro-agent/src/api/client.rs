@@ -35,16 +35,6 @@ use crate::agent::process_subs;
 
 pub const MAX_CHANGES_PER_MESSAGE: usize = 50;
 
-// TODO: accept a few options
-// #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
-// #[serde(rename_all = "snake_case")]
-// pub struct RqliteRequestOptions {
-//     pretty: Option<bool>,
-//     timings: Option<bool>,
-//     transaction: Option<bool>,
-//     q: Option<String>,
-// }
-
 pub struct ChunkedChanges<I> {
     iter: I,
     changes: Vec<Change>,
