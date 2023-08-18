@@ -859,6 +859,14 @@ mod tests {
             QueryEvent::Row(2, vec!["service-id-2".into(), "service-name-2".into()])
         );
 
+        buf.extend_from_slice(&body.data().await.unwrap()?);
+
+        let s = lines.decode(&mut buf).unwrap().unwrap();
+
+        let query_evt: QueryEvent = serde_json::from_str(&s).unwrap();
+
+        assert!(matches!(query_evt, QueryEvent::EndOfQuery { .. }));
+
         assert!(body.data().await.is_none());
 
         Ok(())
