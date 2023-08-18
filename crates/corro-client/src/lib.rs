@@ -170,9 +170,6 @@ impl CorrosionApiClient {
                                     match tokio::fs::read_to_string(entry.path()).await {
                                         Ok(s) => {
                                             statements.push(Statement::Simple(s));
-                                            // pushed.push(
-                                            //     entry.path().to_string_lossy().to_string().into(),
-                                            // );
                                         }
                                         Err(e) => {
                                             warn!(

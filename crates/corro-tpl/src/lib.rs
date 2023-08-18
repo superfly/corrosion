@@ -676,20 +676,6 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let filepath = tmpdir.path().join("output");
 
-        // enum Command {
-        //     Render,
-        // }
-
-        // enum Reply {
-        //     Rendered,
-        // }
-
-        // let (cmd_tx, mut cmd_rx) = mpsc::channel(10);
-        // let (reply_tx, mut reply_rx) = mpsc::channel(10);
-
-        // tokio::spawn({
-        //     let filepath = filepath.clone();
-        //     async move {
         let f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -699,10 +685,6 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         let engine = Engine::new::<std::fs::File>(client.clone());
-
-        // loop {
-        // let cmd = cmd_rx.recv().await.unwrap();
-        // assert!(matches!(cmd, Command::Render));
 
         {
             let cancel = CancellationToken::new();
@@ -720,14 +702,6 @@ mod tests {
                 )
                 .unwrap();
             });
-            // reply_tx.send(Reply::Rendered).await.unwrap();
-            // }
-            // }
-            // });
-
-            // cmd_tx.send(Command::Render).await.unwrap();
-            // let replied = reply_rx.recv().await.unwrap();
-            // assert!(matches!(replied, Reply::Rendered));
 
             let output = std::fs::read_to_string(&filepath).unwrap();
 
