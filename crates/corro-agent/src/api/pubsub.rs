@@ -1,4 +1,9 @@
-use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    io::Write,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
@@ -101,7 +106,9 @@ async fn watch_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
 
             init_tx.blocking_send(QueryEvent::Columns(matcher.0.col_names.clone()))?;
 
+            let start = Instant::now();
             let mut rows = prepped.query(())?;
+            let elapsed = start.elapsed();
 
             loop {
                 let row = match rows.next()? {
@@ -116,6 +123,10 @@ async fn watch_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
 
                 init_tx.blocking_send(QueryEvent::Row(rowid, cells))?;
             }
+
+            _ = init_tx.blocking_send(QueryEvent::EndOfQuery {
+                time: elapsed.as_secs_f64(),
+            })?;
 
             Ok::<_, QueryTempError>(())
         });
@@ -183,7 +194,7 @@ async fn process_watch_channel(
             let mut query_evt = query_evt;
 
             loop {
-                if !init_done && matches!(query_evt, QueryEvent::Change(_, _, _)) {
+                if matches!(query_evt, QueryEvent::EndOfQuery { .. }) {
                     init_done = true;
                 }
 
@@ -579,6 +590,11 @@ mod tests {
             rows.recv().await.unwrap().unwrap(),
             QueryEvent::Row(2, vec!["service-id-2".into(), "service-name-2".into()])
         );
+
+        assert!(matches!(
+            rows.recv().await.unwrap().unwrap(),
+            QueryEvent::EndOfQuery { .. }
+        ));
 
         assert_eq!(
             rows.recv().await.unwrap().unwrap(),

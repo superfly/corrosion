@@ -159,7 +159,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
         Command::Query {
             query,
             columns: show_columns,
-            ..
+            timer,
         } => {
             let mut body = cli
                 .api_client()?
@@ -193,6 +193,11 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                                 .collect::<Vec<_>>()
                                 .join("|")
                         );
+                    }
+                    QueryEvent::EndOfQuery { time } => {
+                        if *timer {
+                            println!("time: {time}s");
+                        }
                     }
                     QueryEvent::Change(_, _, _) => {
                         break;

@@ -2,6 +2,7 @@ use std::{
     cmp,
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Instant,
 };
 
 use bytes::Buf;
@@ -394,10 +395,12 @@ impl Matcher {
 
                     let mut last_rowid = 0;
 
-                    {
+                    let elapsed = {
                         let mut prepped = tx.prepare(&insert_into)?;
 
+                        let start = Instant::now();
                         let mut rows = prepped.query(())?;
+                        let elapsed = start.elapsed();
 
                         loop {
                             match rows.next() {
@@ -425,14 +428,33 @@ impl Matcher {
                                 }
                             }
                         }
-                    }
+                        elapsed
+                    };
 
                     tx.commit()?;
 
                     *matcher.0.last_rowid.lock() = last_rowid;
 
-                    Ok::<_, MatcherError>(())
+                    Ok::<_, MatcherError>(elapsed)
                 });
+
+                match res {
+                    Ok(elapsed) => {
+                        if let Err(e) = init_tx
+                            .send(QueryEvent::EndOfQuery {
+                                time: elapsed.as_secs_f64(),
+                            })
+                            .await
+                        {
+                            error!("could not return end of query event: {e}");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
+                        return;
+                    }
+                }
 
                 if let Err(e) = res {
                     _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
@@ -1448,6 +1470,10 @@ mod tests {
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
             assert_eq!(rx.recv().await.unwrap(), QueryEvent::Row(1, cells).into());
+            assert!(matches!(
+                rx.recv().await.unwrap(),
+                QueryEvent::EndOfQuery { .. }
+            ));
 
             // insert the second row
             {

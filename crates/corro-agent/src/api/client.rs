@@ -352,7 +352,7 @@ async fn build_query_rows_response(
     agent: &Agent,
     data_tx: mpsc::Sender<QueryEvent>,
     stmt: Statement,
-) -> Option<(StatusCode, RqliteResult)> {
+) -> Result<(), (StatusCode, RqliteResult)> {
     let (res_tx, res_rx) = oneshot::channel();
 
     let pool = agent.pool().clone();
@@ -361,7 +361,7 @@ async fn build_query_rows_response(
         let conn = match pool.read().await {
             Ok(conn) => conn,
             Err(e) => {
-                _ = res_tx.send(Some((
+                _ = res_tx.send(Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     RqliteResult::Error {
                         error: e.to_string(),
@@ -380,7 +380,7 @@ async fn build_query_rows_response(
         let mut prepped = match prepped_res {
             Ok(prepped) => prepped,
             Err(e) => {
-                _ = res_tx.send(Some((
+                _ = res_tx.send(Err((
                     StatusCode::BAD_REQUEST,
                     RqliteResult::Error {
                         error: e.to_string(),
@@ -404,10 +404,12 @@ async fn build_query_rows_response(
                 return;
             }
 
+            let start = Instant::now();
+
             let mut rows = match prepped.query(()) {
                 Ok(rows) => rows,
                 Err(e) => {
-                    _ = res_tx.send(Some((
+                    _ = res_tx.send(Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         RqliteResult::Error {
                             error: e.to_string(),
@@ -416,8 +418,9 @@ async fn build_query_rows_response(
                     return;
                 }
             };
+            let elapsed = start.elapsed();
 
-            if let Err(_e) = res_tx.send(None) {
+            if let Err(_e) = res_tx.send(Ok(())) {
                 error!("could not send back response through oneshot channel, aborting");
                 return;
             }
@@ -455,12 +458,16 @@ async fn build_query_rows_response(
                     }
                 }
             }
+
+            _ = data_tx.blocking_send(QueryEvent::EndOfQuery {
+                time: elapsed.as_secs_f64(),
+            });
         });
     });
 
     match res_rx.await {
         Ok(res) => res,
-        Err(e) => Some((
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             RqliteResult::Error {
                 error: e.to_string(),
@@ -509,7 +516,13 @@ pub async fn api_v1_queries(
     });
 
     match build_query_rows_response(&agent, data_tx, stmt).await {
-        Some((status, res)) => {
+        Ok(_) => {
+            return hyper::Response::builder()
+                .status(StatusCode::OK)
+                .body(body)
+                .expect("could not build query response body");
+        }
+        Err((status, res)) => {
             return hyper::Response::builder()
                 .status(status)
                 .body(
@@ -517,12 +530,6 @@ pub async fn api_v1_queries(
                         .expect("could not serialize query error response")
                         .into(),
                 )
-                .expect("could not build query response body");
-        }
-        None => {
-            return hyper::Response::builder()
-                .status(StatusCode::OK)
-                .body(body)
                 .expect("could not build query response body");
         }
     }
@@ -614,9 +621,7 @@ pub async fn api_v1_db_schema(
 mod tests {
     use arc_swap::ArcSwap;
     use bytes::Bytes;
-    use corro_types::{
-        actor::ActorId, agent::SplitPool, config::Config, pubsub::ChangeType, schema::SqliteType,
-    };
+    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, schema::SqliteType};
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
     use tokio::sync::mpsc::{channel, error::TryRecvError};
@@ -840,11 +845,7 @@ mod tests {
 
         assert_eq!(
             row,
-            QueryEvent::Change(
-                ChangeType::Insert,
-                1,
-                vec!["service-id".into(), "service-name".into()]
-            )
+            QueryEvent::Row(1, vec!["service-id".into(), "service-name".into()])
         );
 
         buf.extend_from_slice(&body.data().await.unwrap()?);
@@ -855,11 +856,7 @@ mod tests {
 
         assert_eq!(
             row,
-            QueryEvent::Change(
-                ChangeType::Insert,
-                2,
-                vec!["service-id-2".into(), "service-name-2".into()]
-            )
+            QueryEvent::Row(2, vec!["service-id-2".into(), "service-name-2".into()])
         );
 
         assert!(body.data().await.is_none());

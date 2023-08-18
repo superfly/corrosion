@@ -20,6 +20,10 @@ pub mod sqlite;
 pub enum QueryEvent {
     Columns(Vec<CompactString>),
     Row(i64, Vec<SqliteValue>),
+    #[serde(rename = "eoq")]
+    EndOfQuery {
+        time: f64,
+    },
     Change(ChangeType, i64, Vec<SqliteValue>),
     Error(CompactString),
 }
