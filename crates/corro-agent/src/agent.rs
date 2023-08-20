@@ -326,13 +326,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 let tripwire = tripwire.clone();
                 tokio::spawn(async move {
                     let remote_addr = connecting.remote_address();
-                    let local_ip = connecting.local_ip().unwrap();
+                    // let local_ip = connecting.local_ip().unwrap();
                     debug!("got a connection from {remote_addr}");
 
                     let conn = match connecting.await {
                         Ok(conn) => conn,
                         Err(e) => {
-                            error!("could not connection from {remote_addr} to {local_ip}: {e}");
+                            error!("could not connection from {remote_addr}: {e}");
                             return;
                         }
                     };
@@ -793,7 +793,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     ));
 
     let gossip_chunker =
-        ReceiverStream::new(bcast_rx).chunks_timeout(512, Duration::from_millis(500));
+        ReceiverStream::new(bcast_rx).chunks_timeout(10, Duration::from_millis(500));
     tokio::pin!(gossip_chunker);
 
     loop {
@@ -1100,7 +1100,7 @@ async fn generate_bootstrap(
         // fallback to in-db nodes
         let conn = pool.read().await?;
         addrs = block_in_place(|| {
-            let mut prepped = conn.prepare("select address from __corro_members limit 5")?;
+            let mut prepped = conn.prepare("SELECT address FROM __corro_members LIMIT 5")?;
             let node_addrs = prepped.query_map([], |row| row.get::<_, String>(0))?;
             Ok::<_, rusqlite::Error>(
                 node_addrs

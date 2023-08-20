@@ -7,6 +7,7 @@ addr = "fly-local-6pn:8787"
 bootstrap = ["corrosion2.internal:8787"]
 plaintext = true
 max_mtu = 1372
+disable_gso = true
 
 [api]
 addr = "[::]:8080"

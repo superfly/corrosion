@@ -88,6 +88,10 @@ fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig
         transport_config.mtu_discovery_config(Some(mtu_discovery));
     }
 
+    if config.disable_gso {
+        transport_config.enable_segmentation_offload(false);
+    }
+
     transport_config
 }
 
@@ -694,6 +698,7 @@ mod tests {
             }),
             plaintext: false,
             max_mtu: None,
+            disable_gso: false,
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;
