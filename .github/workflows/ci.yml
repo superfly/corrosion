@@ -15,6 +15,7 @@ jobs:
       name: Test
       strategy:
         matrix:
+          fail-fast: false
           include:
             - target: x86_64-apple-darwin
               os: macos-latest
@@ -30,9 +31,13 @@ jobs:
       steps:
         - uses: actions/checkout@v3
         
-        - uses: dtolnay/rust-toolchain@stable
+        - name: Install cross-compilation tools
+          uses: taiki-e/setup-cross-toolchain-action@v1
           with:
-            targets: ${{ matrix.target }}
+            target: ${{ matrix.target }}
+          if: startsWith(matrix.os, 'ubuntu')
+
+        - uses: rui314/setup-mold@v1
         
         - uses: Swatinem/rust-cache@v2
           with:
