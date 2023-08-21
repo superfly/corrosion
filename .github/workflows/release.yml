@@ -11,6 +11,8 @@ on:
 env:
   RUSTFLAGS: -D warnings
   CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   create-release:
@@ -45,9 +47,8 @@ jobs:
 
       - uses: rui314/setup-mold@v1
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.os }}-${{ matrix.target }}
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.3
 
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
