@@ -80,6 +80,8 @@ pub struct GossipConfig {
     pub plaintext: bool,
     #[serde(default)]
     pub max_mtu: Option<u16>,
+    #[serde(default)]
+    pub disable_gso: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +235,7 @@ impl ConfigBuilder {
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
                 max_mtu: None, // TODO: add a builder function for it
+                disable_gso: false,
             },
             admin: AdminConfig {
                 uds_path: self.admin_path.unwrap_or_else(default_admin_path),
