@@ -35,7 +35,7 @@ jobs:
           uses: taiki-e/setup-cross-toolchain-action@v1
           with:
             target: ${{ matrix.target }}
-          if: startsWith(matrix.os, 'ubuntu')
+          # if: startsWith(matrix.os, 'ubuntu')
 
         - uses: rui314/setup-mold@v1
         
