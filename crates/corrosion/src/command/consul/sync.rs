@@ -21,8 +21,6 @@ pub async fn run<P: AsRef<Path>>(
     api_addr: SocketAddr,
     db_path: P,
 ) -> eyre::Result<()> {
-    tracing_subscriber::fmt::init();
-
     let (mut tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
     let node: &'static str = Box::leak(
