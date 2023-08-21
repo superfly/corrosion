@@ -19,11 +19,7 @@ jobs:
           include:
             - target: x86_64-apple-darwin
               os: macos-latest
-            - target: aarch64-apple-darwin
-              os: macos-latest
             - target: x86_64-unknown-linux-gnu
-              os: ubuntu-latest
-            - target: aarch64-unknown-linux-gnu
               os: ubuntu-latest
       
       runs-on: ${{ matrix.os }}
@@ -42,10 +38,6 @@ jobs:
           uses: taiki-e/install-action@v2
           with:
             tool: cargo-nextest
-
-        - uses: taiki-e/setup-cross-toolchain-action@v1
-          with:
-            target: ${{ matrix.target }}
 
         - uses: Swatinem/rust-cache@v2
           with:
