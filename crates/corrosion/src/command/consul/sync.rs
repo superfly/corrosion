@@ -1,4 +1,5 @@
 use consul_client::{AgentCheck, AgentService, Client};
+use corro_api_types::ColumnType;
 use corro_client::CorrosionClient;
 use corro_types::{api::Statement, config::ConsulConfig};
 use metrics::{histogram, increment_counter};
@@ -21,8 +22,6 @@ pub async fn run<P: AsRef<Path>>(
     api_addr: SocketAddr,
     db_path: P,
 ) -> eyre::Result<()> {
-    tracing_subscriber::fmt::init();
-
     let (mut tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
     let node: &'static str = Box::leak(
@@ -37,9 +36,7 @@ pub async fn run<P: AsRef<Path>>(
 
     info!("Setting up corrosion for consul sync");
     setup(
-        &corrosion,
-        config.extra_services_columns.as_slice(),
-        config.extra_statements.as_slice(),
+        &corrosion
     )
     .await?;
 
@@ -120,12 +117,9 @@ pub async fn run<P: AsRef<Path>>(
 
 async fn setup(
     corrosion: &CorrosionClient,
-    extra_services_columns: &[String],
-    extra_statements: &[String],
 ) -> eyre::Result<()> {
+    let mut conn = corrosion.pool().get().await?;
     {
-        let mut conn = corrosion.pool().get().await?;
-
         let tx = conn.transaction()?;
 
         info!("Creating internal tables");
@@ -145,51 +139,51 @@ async fn setup(
         tx.commit()?;
     }
     info!("Ensuring schema...");
-    corrosion
-        .schema(&build_schema(extra_services_columns, extra_statements))
-        .await?;
-    Ok(())
-}
 
-fn build_schema(extra_services_columns: &[String], extra_statements: &[String]) -> Vec<Statement> {
-    let extra = extra_services_columns.join(",");
-    let mut statements = vec![
-        Statement::Simple(format!("CREATE TABLE consul_services (
-            node TEXT NOT NULL,
-            id TEXT NOT NULL,
-            name TEXT NOT NULL DEFAULT '',
-            tags TEXT NOT NULL DEFAULT '[]',
-            meta TEXT NOT NULL DEFAULT '{{}}',
-            port INTEGER NOT NULL DEFAULT 0,
-            address TEXT NOT NULL DEFAULT '',
-            updated_at INTEGER NOT NULL DEFAULT 0,
-
-            {}
-            
-            PRIMARY KEY (node, id)
-        ) WITHOUT ROWID;", if extra.is_empty() { String::new() } else {format!("{extra},")})),
-        Statement::Simple("CREATE INDEX consul_services_node_id_updated_at ON consul_services (node, id, updated_at);".to_string()),
-
-        Statement::Simple("CREATE TABLE consul_checks (
-            node TEXT NOT NULL,
-            id TEXT NOT NULL,
-            service_id TEXT NOT NULL DEFAULT '',
-            service_name TEXT NOT NULL DEFAULT '',
-            name TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT '',
-            output TEXT NOT NULL DEFAULT '',
-            updated_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (node, id)
-        ) WITHOUT ROWID;".to_string()),
-        Statement::Simple("CREATE INDEX consul_checks_node_id_updated_at ON consul_checks (node, id, updated_at);".to_string()),
-        Statement::Simple("CREATE INDEX consul_checks_node_service_id ON consul_checks (node, service_id);".to_string()),
-    ];
-
-    for s in extra_statements {
-        statements.push(Statement::Simple(s.clone()));
+    struct ColumnInfo {
+        name: String,
+        kind: corro_api_types::ColumnType
     }
 
-    statements
+    let col_infos: Vec<ColumnInfo> = conn.prepare("PRAGMA table_info(consul_services)")?.query_map([], |row| Ok(ColumnInfo { name: row.get(1)?, kind: row.get(2)? })).map_err(|e| eyre::eyre!("could not query consul_services' table_info: {e}"))?.collect::<Result<Vec<_>, _>>()?;
+    
+    let expected_cols = [
+        ("node", ColumnType::Text), 
+        ("id", ColumnType::Text),
+        ("name", ColumnType::Text),
+        ("tags", ColumnType::Text),
+        ("meta", ColumnType::Text),
+        ("port", ColumnType::Integer),
+        ("address", ColumnType::Text),
+        ("updated_at", ColumnType::Integer),
+    ];
+
+    for (name, kind) in expected_cols {
+        if col_infos.iter().find(|info| info.name == name && info.kind == kind ).is_none() {
+            eyre::bail!("expected a column consul_services.{name} w/ type {kind:?}");
+        }
+    }
+
+    let col_infos: Vec<ColumnInfo> = conn.prepare("PRAGMA table_info(consul_checks)")?.query_map([], |row| Ok(ColumnInfo { name: row.get(1)?, kind: row.get(2)? })).map_err(|e| eyre::eyre!("could not query consul_checks' table_info: {e}"))?.collect::<Result<Vec<_>, _>>()?;
+    
+    let expected_cols = [
+        ("node", ColumnType::Text), 
+        ("id", ColumnType::Text),
+        ("service_id", ColumnType::Text),
+        ("service_name", ColumnType::Text),
+        ("name", ColumnType::Text),
+        ("status", ColumnType::Text),
+        ("output", ColumnType::Text),
+        ("updated_at", ColumnType::Integer),
+    ];
+
+    for (name, kind) in expected_cols {
+        if col_infos.iter().find(|info| info.name == name && info.kind == kind ).is_none() {
+            eyre::bail!("expected a column consul_checks.{name} w/ type {kind:?}");
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -584,10 +578,39 @@ mod tests {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
-        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+        let tmpdir = tempfile::TempDir::new()?;
+        tokio::fs::write(tmpdir.path().join("consul.sql"), b"
+            CREATE TABLE consul_services (
+                node TEXT NOT NULL,
+                id TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
+                meta TEXT NOT NULL DEFAULT '{}',
+                port INTEGER NOT NULL DEFAULT 0,
+                address TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                app_id INTEGER AS (CAST(JSON_EXTRACT(meta, '$.app_id') AS INTEGER)),        
+
+                PRIMARY KEY (node, id)
+            );
+
+            CREATE TABLE consul_checks (
+                node TEXT NOT NULL,
+                id TEXT NOT NULL,
+                service_id TEXT NOT NULL DEFAULT '',
+                service_name TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                output TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (node, id)
+            );
+        ").await?;
+
+        let ta1 = launch_test_agent(|conf| conf.add_schema_path(tmpdir.path().display().to_string()).build(), tripwire.clone()).await?;
         let ta2 = launch_test_agent(
             |conf| {
-                conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+                conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()]).add_schema_path(tmpdir.path().display().to_string())
                     .build()
             },
             tripwire.clone(),
@@ -598,8 +621,6 @@ mod tests {
 
         setup(
             &ta1_client,
-            &["app_id INTEGER AS (CAST (JSON_EXTRACT (meta, '$.app_id') AS INTEGER))".into()],
-            &[],
         )
         .await?;
 
@@ -655,8 +676,6 @@ mod tests {
 
         setup(
             &ta2_client,
-            &["app_id INTEGER AS (CAST (JSON_EXTRACT (meta, '$.app_id') AS INTEGER))".into()],
-            &[],
         )
         .await?;
 

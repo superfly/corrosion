@@ -830,6 +830,7 @@ dependencies = [
  "consul-client",
  "corro-admin",
  "corro-agent",
+ "corro-api-types",
  "corro-client",
  "corro-tests",
  "corro-tpl",

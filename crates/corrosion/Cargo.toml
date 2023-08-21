@@ -20,6 +20,7 @@ corro-admin = { path = "../corro-admin" }
 corro-agent = { path = "../corro-agent" }
 corro-client = { path = "../corro-client" }
 corro-types = { path = "../corro-types" }
+corro-api-types = { path = "../corro-api-types" }
 crc32fast = { workspace = true }
 eyre = { workspace = true }
 fallible-iterator = { workspace = true }

@@ -1,0 +1,47 @@
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches:
+      - main
+
+name: CI
+env:
+  RUSTFLAGS: -D warnings
+  CARGO_TERM_COLOR: always
+
+jobs:
+    build:
+      name: Test
+      strategy:
+        fail-fast: false
+        matrix:
+          include:
+            - target: x86_64-apple-darwin
+              os: macos-latest
+            - target: x86_64-unknown-linux-gnu
+              os: ubuntu-latest
+      
+      runs-on: ${{ matrix.os }}
+
+      steps:
+        - uses: actions/checkout@v3
+
+        - uses: rui314/setup-mold@v1
+
+        - name: Install Rust stable
+          uses: dtolnay/rust-toolchain@stable
+          with:
+            target: ${{ matrix.target }}
+
+        - name: Install cargo-nextest
+          uses: taiki-e/install-action@v2
+          with:
+            tool: cargo-nextest
+
+        - uses: Swatinem/rust-cache@v2
+          with:
+            cache-on-failure: true
+        
+        - name: Test with latest nextest release
+          run: cargo nextest run --workspace --target ${{ matrix.target }}

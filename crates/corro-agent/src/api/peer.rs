@@ -1,5 +1,6 @@
 use std::cmp;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
@@ -273,7 +274,12 @@ async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn:
 
 pub async fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
     let client_config = build_quinn_client_config(config).await?;
-    let mut client = quinn::Endpoint::client("[::]:0".parse()?)?;
+
+    let client_bind_addr = match config.bind_addr {
+        SocketAddr::V4(_) => "0.0.0.0:0".parse()?,
+        SocketAddr::V6(_) => "[::]:0".parse()?,
+    };
+    let mut client = quinn::Endpoint::client(client_bind_addr)?;
 
     client.set_default_client_config(client_config);
     Ok(client)
