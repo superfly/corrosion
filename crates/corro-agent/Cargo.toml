@@ -5,24 +5,19 @@ edition = "2021"
 
 [dependencies]
 arc-swap = { workspace = true }
-async-trait = { workspace = true }
 axum = { workspace = true }
 backoff = { path = "../backoff" }
-bb8 = { workspace = true }
 bincode = { workspace = true }
 bytes = { workspace = true }
 camino = { workspace = true }
 compact_str = { workspace = true }
 config = { workspace = true }
 corro-types = { path = "../corro-types" }
-crc32fast = { workspace = true }
 eyre = { workspace = true }
-fallible-iterator = { workspace = true }
 foca = { workspace = true }
 futures = { workspace = true }
 hyper = { workspace = true }
 metrics = { workspace = true }
-once_cell = { workspace = true }
 parking_lot = { workspace = true }
 quinn = { workspace = true }
 quinn-plaintext = { workspace = true }

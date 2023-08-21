@@ -4,67 +4,45 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-arc-swap = { workspace = true }
-async-trait = { workspace = true }
-axum = { workspace = true }
-backoff = { path = "../backoff" }
-bb8 = { workspace = true }
-bincode = { workspace = true }
 bytes = { workspace = true }
 camino = { workspace = true }
 clap = { workspace = true }
-compact_str = { workspace = true }
 config = { workspace = true }
 consul-client = { path = "../consul-client" }
 corro-admin = { path = "../corro-admin" }
 corro-agent = { path = "../corro-agent" }
-corro-client = { path = "../corro-client" }
-corro-types = { path = "../corro-types" }
 corro-api-types = { path = "../corro-api-types" }
+corro-client = { path = "../corro-client" }
+corro-tpl = { path = "../corro-tpl" }
+corro-types = { path = "../corro-types" }
 crc32fast = { workspace = true }
 eyre = { workspace = true }
-fallible-iterator = { workspace = true }
-foca = { workspace = true }
 futures = { workspace = true }
 hostname = { workspace = true }
 hyper = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+notify = { version = "6.0.1", default-features = false, features = ["macos_kqueue"] }
+notify-debouncer-mini = { version = "0.3.0", default-features = false }
 once_cell = { workspace = true }
-parking_lot = { workspace = true }
-quoted-string = { workspace = true }
-rand = { workspace = true }
-rangemap = { workspace = true }
 rusqlite = { workspace = true }
-rustls = { workspace = true }
 seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+shellwords = { version = "1" }
 spawn = { path = "../spawn" }
-sqlite3-parser = { workspace = true }
+sqlite3-restore = { path = "../sqlite3-restore" }
 tempfile = { workspace = true }
-thiserror = { workspace = true }
+tikv-jemallocator = "0.5"
+time = { workspace = true }
 tokio = { workspace = true }
 tokio-serde = { workspace = true }
-tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-filter = { workspace = true }
 tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
-trust-dns-resolver = { workspace = true }
-uhlc = { workspace = true }
 uuid = { workspace = true }
-tikv-jemallocator = "0.5"
-corro-tpl = { path = "../corro-tpl" }
-shellwords = { version = "1" }
-notify = { version = "6.0.1", default-features = false, features = ["macos_kqueue"] }
-notify-debouncer-mini = { version = "0.3.0", default-features = false }
-itertools = { workspace = true }
-sqlite3-restore = { path = "../sqlite3-restore" }
-time = { workspace = true }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }

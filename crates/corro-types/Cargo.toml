@@ -15,13 +15,10 @@ compact_str = { workspace = true }
 config = { workspace = true }
 consul-client = { version = "0.1.0-alpha.0", path = "../consul-client" }
 corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
-crc32fast = { workspace = true }
 enquote = { workspace = true }
 fallible-iterator = { workspace = true }
 foca = { workspace = true } 
 futures = { workspace = true }
-hex = { workspace = true }
-hostname = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
@@ -32,8 +29,6 @@ rangemap = { workspace = true }
 rcgen = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-smallvec = { workspace = true }
 speedy = { workspace = true }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }
