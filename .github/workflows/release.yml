@@ -39,16 +39,13 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Install cross-compilation tools
-        uses: taiki-e/setup-cross-toolchain-action@v1
-        with:
-          target: ${{ matrix.target }}
-        if: startsWith(matrix.os, 'ubuntu')
-
       - uses: rui314/setup-mold@v1
 
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
 
       - uses: taiki-e/upload-rust-binary-action@v1
         with:

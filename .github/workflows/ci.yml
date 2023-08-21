@@ -32,20 +32,25 @@ jobs:
 
       steps:
         - uses: actions/checkout@v3
-        
-        - name: Install cross-compilation tools
-          uses: taiki-e/setup-cross-toolchain-action@v1
-          with:
-            target: ${{ matrix.target }}
-          # if: startsWith(matrix.os, 'ubuntu')
 
         - uses: rui314/setup-mold@v1
-        
-        - name: Run sccache-cache
-          uses: mozilla-actions/sccache-action@v0.0.3
-        
-        - name: Install latest nextest release
-          uses: taiki-e/install-action@nextest
+
+        - name: Install Rust stable
+          uses: dtolnay/rust-toolchain@stable
+          with:
+            toolchain: ${{ env.rust_stable }}
+            target: ${{ matrix.target }}
+
+        - name: Install cargo-nextest
+          uses: taiki-e/install-action@v2
+          with:
+            tool: cargo-nextest
+
+        - uses: taiki-e/setup-cross-toolchain-action@v1
+          with:
+            target: ${{ matrix.target }}
+
+        - uses: Swatinem/rust-cache@v2
         
         - name: Test with latest nextest release
           run: cargo nextest run --workspace --target ${{ matrix.target }}
