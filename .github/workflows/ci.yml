@@ -44,4 +44,4 @@ jobs:
             cache-on-failure: true
         
         - name: Test with latest nextest release
-          run: cargo nextest run --workspace --target ${{ matrix.target }}
+          run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
