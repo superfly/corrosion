@@ -21,17 +21,19 @@ fallible-iterator = { workspace = true }
 foca = { workspace = true } 
 futures = { workspace = true }
 hex = { workspace = true }
+hostname = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
-nom = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 rangemap = { workspace = true }
+rcgen = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+smallvec = { workspace = true }
 speedy = { workspace = true }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }
@@ -43,6 +45,3 @@ tracing = { workspace = true }
 tripwire = { version = "0.1.0-alpha.0", path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }
-smallvec = { workspace = true }
-hostname = { workspace = true }
-rcgen = { workspace = true }

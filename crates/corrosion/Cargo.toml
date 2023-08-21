@@ -68,4 +68,3 @@ time = { workspace = true }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
-toml = { workspace = true }

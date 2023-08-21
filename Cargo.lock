@@ -790,7 +790,6 @@ dependencies = [
  "indexmap",
  "itertools",
  "metrics",
- "nom",
  "once_cell",
  "parking_lot",
  "rand",
@@ -869,7 +868,6 @@ dependencies = [
  "tokio-serde",
  "tokio-stream",
  "tokio-util",
- "toml",
  "tower",
  "tower-http",
  "tracing",
@@ -1725,7 +1723,6 @@ dependencies = [
  "once_cell",
  "spawn",
  "tokio",
- "toml",
  "tracing-subscriber",
  "tripwire",
 ]
