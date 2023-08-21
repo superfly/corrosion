@@ -8,6 +8,10 @@ on:
     tags:
       - v[0-9]+.*
 
+env:
+  RUSTFLAGS: -D warnings
+  CARGO_TERM_COLOR: always
+
 jobs:
   create-release:
     runs-on: ubuntu-latest
@@ -32,7 +36,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install cross-compilation tools
         uses: taiki-e/setup-cross-toolchain-action@v1
         with:
@@ -43,7 +47,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.os }} ${{ matrix.target }}
+          key: ${{ matrix.os }}-${{ matrix.target }}
 
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
