@@ -38,7 +38,6 @@ jobs:
         - name: Install Rust stable
           uses: dtolnay/rust-toolchain@stable
           with:
-            toolchain: ${{ env.rust_stable }}
             target: ${{ matrix.target }}
 
         - name: Install cargo-nextest
