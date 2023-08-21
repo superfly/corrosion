@@ -1,0 +1,45 @@
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches:
+      - main
+
+name: CI
+env:
+  RUSTFLAGS: -D warnings
+  CARGO_TERM_COLOR: always
+
+jobs:
+    build:
+      name: Test
+      strategy:
+        matrix:
+          include:
+            - target: x86_64-apple-darwin
+              os: macos-latest
+            - target: aarch64-apple-darwin
+              os: macos-latest
+            - target: x86_64-unknown-linux-gnu
+              os: ubuntu-latest
+            - target: aarch64-unknown-linux-gnu
+              os: ubuntu-latest
+      
+      runs-on: ${{ matrix.os }}
+
+      steps:
+        - uses: actions/checkout@v3
+        
+        - uses: dtolnay/rust-toolchain@stable
+          with:
+            targets: [ "${{ matrix.target }}" ]
+        
+        - uses: Swatinem/rust-cache@v2
+          with:
+            key: ${{ matrix.os }} ${{ matrix.target }}
+        
+        - name: Install latest nextest release
+          uses: taiki-e/install-action@nextest
+        
+        - name: Test with latest nextest release
+          run: cargo nextest run --workspace
