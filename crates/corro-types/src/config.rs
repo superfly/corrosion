@@ -273,10 +273,5 @@ pub enum LogFormat {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ConsulConfig {
-    #[serde(default)]
-    pub extra_services_columns: Vec<String>,
-    #[serde(default)]
-    pub extra_statements: Vec<String>,
-
     pub client: consul_client::Config,
 }

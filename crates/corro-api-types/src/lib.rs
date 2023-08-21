@@ -168,6 +168,33 @@ impl ColumnType {
             _ => return None,
         })
     }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "INTEGER" => Self::Integer,
+            "REAL" => Self::Float,
+            "TEXT" => Self::Text,
+            "BLOB" => Self::Blob,
+            _ => return None,
+        })
+    }
+}
+
+impl FromSql for ColumnType {
+    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value {
+            ValueRef::Text(s) => Ok(match String::from_utf8_lossy(s).as_ref() {
+                "INTEGER" => Self::Integer,
+                "REAL" => Self::Float,
+                "TEXT" => Self::Text,
+                "BLOB" => Self::Blob,
+                _ => {
+                    return Err(FromSqlError::InvalidType);
+                }
+            }),
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
