@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
     ops::RangeInclusive,
@@ -573,6 +573,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     let res = block_in_place(move || {
                         let mut bookedw = booked.write();
 
+                        let versions = bookedw.current_versions();
+
+                        if versions.is_empty() {
+                            return Ok(());
+                        }
+
                         let to_clear = {
                             match compact_booked_for_actor(&conn, &versions) {
                                 Ok(to_clear) => {
@@ -587,6 +593,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 }
                             }
                         };
+
+                        info!("to clear: {to_clear:?}");
 
                         let tx = conn.transaction()?;
 
@@ -924,15 +932,13 @@ pub async fn handle_change(
 fn compact_booked_for_actor(
     conn: &Connection,
     versions: &BTreeMap<i64, i64>,
-) -> eyre::Result<HashSet<i64>> {
-    // TODO: optimize that in a single query once cr-sqlite supports aggregation
-
+) -> eyre::Result<BTreeSet<i64>> {
     let (first, last) = match (
         versions.first_key_value().map(|(db_v, _v)| *db_v),
         versions.last_key_value().map(|(db_v, _v)| *db_v),
     ) {
         (Some(first), Some(last)) => (first, last),
-        _ => return Ok(HashSet::new()),
+        _ => return Ok(BTreeSet::new()),
     };
 
     let tables = conn
@@ -942,7 +948,7 @@ fn compact_booked_for_actor(
         .query_map([], |row| row.get(0))?
         .collect::<Result<Vec<String>, _>>()?;
 
-    let still_live: HashSet<i64> = conn
+    let still_live: BTreeSet<i64> = conn
         .prepare(&format!(
             "SELECT db_version FROM ({});",
             tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table} WHERE db_version >= {first} AND db_version <= {last}")).collect::<Vec<_>>().join(" UNION ")
@@ -952,7 +958,9 @@ fn compact_booked_for_actor(
         )?
         .collect::<rusqlite::Result<_>>()?;
 
-    let keys: HashSet<i64> = versions.keys().copied().collect();
+    info!("still live: {still_live:?}");
+
+    let keys: BTreeSet<i64> = versions.keys().copied().collect();
 
     Ok(keys.difference(&still_live).copied().collect())
 }
@@ -2433,7 +2441,13 @@ pub mod tests {
         let conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
 
         conn.execute_batch(
-            "CREATE TABLE foo (a INTEGER PRIMARY KEY, b INTEGER); SELECT crsql_as_crr('foo');",
+            "
+            CREATE TABLE foo (a INTEGER PRIMARY KEY, b INTEGER);
+            SELECT crsql_as_crr('foo');
+
+            CREATE TABLE foo2 (a INTEGER PRIMARY KEY, b INTEGER);
+            SELECT crsql_as_crr('foo2');
+            ",
         )?;
 
         // db version 1
@@ -2445,10 +2459,33 @@ pub mod tests {
 
         assert_eq!(db_version, 2);
 
-        let diff = compact_booked_for_actor(&conn, &vec![(1, 1)].into_iter().collect())?;
+        let to_clear = compact_booked_for_actor(&conn, &vec![(1, 1)].into_iter().collect())?;
 
-        assert!(diff.contains(&1));
-        assert!(!diff.contains(&2));
+        assert!(to_clear.contains(&1));
+        assert!(!to_clear.contains(&2));
+
+        let to_clear = compact_booked_for_actor(&conn, &vec![(2, 2)].into_iter().collect())?;
+        assert!(to_clear.is_empty());
+
+        conn.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
+
+        let to_clear =
+            compact_booked_for_actor(&conn, &vec![(2, 2), (3, 3)].into_iter().collect())?;
+        assert!(to_clear.is_empty());
+
+        conn.execute("INSERT INTO foo (a) VALUES (1)", ())?;
+
+        let to_clear =
+            compact_booked_for_actor(&conn, &vec![(2, 2), (3, 3), (4, 4)].into_iter().collect())?;
+
+        assert!(to_clear.contains(&2));
+        assert!(!to_clear.contains(&3));
+        assert!(!to_clear.contains(&4));
+
+        let to_clear =
+            compact_booked_for_actor(&conn, &vec![(3, 3), (4, 4)].into_iter().collect())?;
+
+        assert!(to_clear.is_empty());
 
         Ok(())
     }
