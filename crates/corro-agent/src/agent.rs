@@ -597,7 +597,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             }
                         };
 
-                        info!("to clear: {to_clear:?}");
+                        info!(actor_id = %actor_id, "to clear: {to_clear:?}");
 
                         let tx = conn.transaction()?;
 
@@ -940,6 +940,8 @@ fn compact_booked_for_actor(
         (Some(first), Some(last)) => (first, last),
         _ => return Ok(BTreeSet::new()),
     };
+
+    info!("checking versions between {first} and {last}");
 
     let tables = conn
         .prepare_cached(
@@ -1334,27 +1336,30 @@ async fn process_fully_buffered_changes(
         }
     };
 
-    info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
-
     let known_version = block_in_place(|| {
         let tx = conn.transaction()?;
 
-        let count: i64 = tx
+        let max_db_version: Option<i64> = tx
             .prepare_cached(
                 "
-                SELECT count(*)
+                SELECT MAX(db_version)
                     FROM __corro_buffered_changes
                         WHERE site_id = ?
                             AND version = ?
                         ",
             )?
             .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
-        debug!(actor = %agent.actor_id(), "total buffered rows: {count}");
+        debug!(actor = %agent.actor_id(), "max db_version from buffered rows: {max_db_version:?}");
 
-        if count == 0 {
-            warn!("zero rows to move, aborting!");
-            return Ok(None);
-        }
+        let max_db_version = match max_db_version {
+            None => {
+                warn!("zero rows to move, aborting!");
+                return Ok(None);
+            }
+            Some(v) => v,
+        };
+
+        info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
         let start = Instant::now();
         // insert all buffered changes into crsql_changes directly from the buffered changes table
@@ -1395,8 +1400,11 @@ async fn process_fully_buffered_changes(
         info!(actor = %agent.actor_id(), "rows impacted by changes: {rows_impacted}");
 
         let known_version = if rows_impacted > 0 {
-            let db_version: i64 =
-                tx.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
+            let db_version: i64 = tx.query_row(
+                "SELECT MAX(?, crsql_next_db_version())",
+                [max_db_version],
+                |row| row.get(0),
+            )?;
             debug!("db version: {db_version}");
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
@@ -1586,7 +1594,7 @@ pub async fn process_single_version(
                 ));
             }
 
-            let db_version: i64 =
+            let mut db_version: i64 =
                 tx.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
 
             let mut impactful_changeset = vec![];
@@ -1620,6 +1628,7 @@ pub async fn process_single_version(
 
                 if rows_impacted > last_rows_impacted {
                     debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
+                    db_version = std::cmp::max(change.db_version, db_version);
                     impactful_changeset.push(change);
                 }
                 last_rows_impacted = rows_impacted;
