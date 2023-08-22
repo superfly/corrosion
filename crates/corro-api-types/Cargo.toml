@@ -6,14 +6,13 @@ description = "common API types for corrosion"
 license = "MIT"
 
 [dependencies]
-serde = { workspace = true }
-speedy = { workspace = true }
+async-trait = { workspace = true }
+bb8 = { workspace = true }
+camino = { workspace = true }
 compact_str = { workspace = true }
 rusqlite = { workspace = true }
+serde = { workspace = true }
 smallvec = { workspace = true }
+speedy = { workspace = true }
 thiserror = { workspace = true } 
-bb8 = { workspace = true }
-async-trait = { workspace = true }
 tokio = { workspace = true }
-camino = { workspace = true }
-pin-project-lite = { workspace = true }

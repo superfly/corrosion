@@ -10,17 +10,13 @@ license = "MIT"
 [dependencies]
 bb8 = { workspace = true }
 bytes = { workspace = true }
-camino = { workspace = true }
-compact_str = { workspace = true }
 corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
 futures = { workspace = true }
 hyper = { workspace = true }
-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-serde = { workspace = true }
-tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

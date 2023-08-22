@@ -148,18 +148,18 @@ async fn setup(
     let col_infos: Vec<ColumnInfo> = conn.prepare("PRAGMA table_info(consul_services)")?.query_map([], |row| Ok(ColumnInfo { name: row.get(1)?, kind: row.get(2)? })).map_err(|e| eyre::eyre!("could not query consul_services' table_info: {e}"))?.collect::<Result<Vec<_>, _>>()?;
     
     let expected_cols = [
-        ("node", ColumnType::Text), 
-        ("id", ColumnType::Text),
-        ("name", ColumnType::Text),
-        ("tags", ColumnType::Text),
-        ("meta", ColumnType::Text),
-        ("port", ColumnType::Integer),
-        ("address", ColumnType::Text),
-        ("updated_at", ColumnType::Integer),
+        ("node", vec![ColumnType::Text]), 
+        ("id", vec![ColumnType::Text]),
+        ("name", vec![ColumnType::Text]),
+        ("tags", vec![ColumnType::Text, ColumnType::Blob]),
+        ("meta", vec![ColumnType::Text, ColumnType::Blob]),
+        ("port", vec![ColumnType::Integer]),
+        ("address", vec![ColumnType::Text]),
+        ("updated_at", vec![ColumnType::Integer]),
     ];
 
     for (name, kind) in expected_cols {
-        if col_infos.iter().find(|info| info.name == name && info.kind == kind ).is_none() {
+        if col_infos.iter().find(|info| info.name == name && kind.contains(&info.kind) ).is_none() {
             eyre::bail!("expected a column consul_services.{name} w/ type {kind:?}");
         }
     }
@@ -167,18 +167,18 @@ async fn setup(
     let col_infos: Vec<ColumnInfo> = conn.prepare("PRAGMA table_info(consul_checks)")?.query_map([], |row| Ok(ColumnInfo { name: row.get(1)?, kind: row.get(2)? })).map_err(|e| eyre::eyre!("could not query consul_checks' table_info: {e}"))?.collect::<Result<Vec<_>, _>>()?;
     
     let expected_cols = [
-        ("node", ColumnType::Text), 
-        ("id", ColumnType::Text),
-        ("service_id", ColumnType::Text),
-        ("service_name", ColumnType::Text),
-        ("name", ColumnType::Text),
-        ("status", ColumnType::Text),
-        ("output", ColumnType::Text),
-        ("updated_at", ColumnType::Integer),
+        ("node", vec![ColumnType::Text]), 
+        ("id", vec![ColumnType::Text]),
+        ("service_id", vec![ColumnType::Text]),
+        ("service_name", vec![ColumnType::Text]),
+        ("name", vec![ColumnType::Text]),
+        ("status", vec![ColumnType::Text]),
+        ("output", vec![ColumnType::Text]),
+        ("updated_at", vec![ColumnType::Integer]),
     ];
 
     for (name, kind) in expected_cols {
-        if col_infos.iter().find(|info| info.name == name && info.kind == kind ).is_none() {
+        if col_infos.iter().find(|info| info.name == name && kind.contains(&info.kind) ).is_none() {
             eyre::bail!("expected a column consul_checks.{name} w/ type {kind:?}");
         }
     }

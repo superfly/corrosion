@@ -47,6 +47,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          key: ${{ matrix.target }}
 
       - uses: taiki-e/upload-rust-binary-action@v1
         with:

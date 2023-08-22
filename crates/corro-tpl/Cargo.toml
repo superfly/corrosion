@@ -4,28 +4,25 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+compact_str = { workspace = true }
+corro-client = { path = "../corro-client" }
+corro-types = { path = "../corro-types" }
+csv = { version = "1.2.2" }
+enquote = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+hostname = { workspace = true }
+indexmap = { workspace = true }
 rhai = { workspace = true }
 rhai-tpl = { version = "0.1.0" }
-corro-client = { path = "../corro-client" }
-hostname = { workspace = true }
-tracing = { workspace = true }
-tokio = { workspace = true }
-hyper = { workspace = true }
-tokio-util = { workspace = true }
-bytes = { workspace = true }
-corro-types = { path = "../corro-types" }
-serde_json = { workspace = true }
 serde = { workspace = true }
-compact_str = { workspace = true }
-futures = { workspace = true }
-tripwire = { path = "../tripwire" }
-hex = { workspace = true }
-indexmap = { workspace = true }
-parking_lot = { workspace = true }
-uuid = { workspace = true }
-csv = { version = "1.2.2" }
+serde_json = { workspace = true }
 thiserror = { workspace = true } 
-enquote = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tripwire = { path = "../tripwire" }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
