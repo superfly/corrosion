@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
     ops::RangeInclusive,
@@ -580,7 +580,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         }
 
                         let to_clear = {
-                            match compact_booked_for_actor(&conn, &versions) {
+                            match compact_booked_for_actor(
+                                &conn,
+                                &versions.keys().copied().collect(),
+                            ) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
                                         return Ok(());
@@ -931,12 +934,9 @@ pub async fn handle_change(
 
 fn compact_booked_for_actor(
     conn: &Connection,
-    versions: &BTreeMap<i64, i64>,
+    versions: &BTreeSet<i64>,
 ) -> eyre::Result<BTreeSet<i64>> {
-    let (first, last) = match (
-        versions.first_key_value().map(|(db_v, _v)| *db_v),
-        versions.last_key_value().map(|(db_v, _v)| *db_v),
-    ) {
+    let (first, last) = match (versions.first().copied(), versions.last().copied()) {
         (Some(first), Some(last)) => (first, last),
         _ => return Ok(BTreeSet::new()),
     };
@@ -960,9 +960,7 @@ fn compact_booked_for_actor(
 
     info!("still live: {still_live:?}");
 
-    let keys: BTreeSet<i64> = versions.keys().copied().collect();
-
-    Ok(keys.difference(&still_live).copied().collect())
+    Ok(versions.difference(&still_live).copied().collect())
 }
 
 async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Vec<u8>)>) {
@@ -1353,6 +1351,11 @@ async fn process_fully_buffered_changes(
             .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
         debug!(actor = %agent.actor_id(), "total buffered rows: {count}");
 
+        if count == 0 {
+            warn!("zero rows to move, aborting!");
+            return Ok(None);
+        }
+
         let start = Instant::now();
         // insert all buffered changes into crsql_changes directly from the buffered changes table
         let count = tx
@@ -1398,14 +1401,14 @@ async fn process_fully_buffered_changes(
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
 
-            KnownDbVersion::Current {
+            Some(KnownDbVersion::Current {
                 db_version,
                 last_seq,
                 ts,
-            }
+            })
         } else {
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, last_seq, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, last_seq, ts])?;
-            KnownDbVersion::Cleared
+            Some(KnownDbVersion::Cleared)
         };
 
         tx.commit()?;
@@ -1413,9 +1416,12 @@ async fn process_fully_buffered_changes(
         Ok::<_, rusqlite::Error>(known_version)
     })?;
 
-    bookedw.insert(version, known_version);
-
-    Ok(true)
+    Ok(if let Some(known_version) = known_version {
+        bookedw.insert(version, known_version);
+        true
+    } else {
+        false
+    })
 }
 
 pub async fn process_single_version(
@@ -1534,10 +1540,10 @@ pub async fn process_single_version(
 
                 // if we have no gaps, then we can schedule applying all these changes.
                 if gaps_count == 0 {
-                    if let Err(e) = agent.tx_apply().blocking_send((actor_id, version)) {
-                        error!(
-                            "could not send trigger for applying fully buffered changes later: {e}"
-                        );
+                    if inserted > 0 {
+                        if let Err(e) = agent.tx_apply().blocking_send((actor_id, version)) {
+                            error!("could not send trigger for applying fully buffered changes later: {e}");
+                        }
                     }
                 } else {
                     tx.prepare_cached(
@@ -1892,8 +1898,11 @@ async fn sync_loop(
             Branch::BackgroundApply { actor_id, version } => {
                 info!(actor_id = %agent.actor_id(), "picked up background apply for actor: {actor_id} v{version}");
                 match process_fully_buffered_changes(&agent, actor_id, version).await {
-                    Ok(_applied) => {
-                        // TODO: do something, I guess?
+                    Ok(false) => {
+                        warn!("did not apply buffered changes");
+                    }
+                    Ok(true) => {
+                        info!("succesfully applied buffered changes");
                     }
                     Err(e) => {
                         error!("could not apply fully buffered changes: {e}");
@@ -2459,31 +2468,28 @@ pub mod tests {
 
         assert_eq!(db_version, 2);
 
-        let to_clear = compact_booked_for_actor(&conn, &vec![(1, 1)].into_iter().collect())?;
+        let to_clear = compact_booked_for_actor(&conn, &[1].into())?;
 
         assert!(to_clear.contains(&1));
         assert!(!to_clear.contains(&2));
 
-        let to_clear = compact_booked_for_actor(&conn, &vec![(2, 2)].into_iter().collect())?;
+        let to_clear = compact_booked_for_actor(&conn, &[2].into())?;
         assert!(to_clear.is_empty());
 
         conn.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
 
-        let to_clear =
-            compact_booked_for_actor(&conn, &vec![(2, 2), (3, 3)].into_iter().collect())?;
+        let to_clear = compact_booked_for_actor(&conn, &[2, 3].into())?;
         assert!(to_clear.is_empty());
 
         conn.execute("INSERT INTO foo (a) VALUES (1)", ())?;
 
-        let to_clear =
-            compact_booked_for_actor(&conn, &vec![(2, 2), (3, 3), (4, 4)].into_iter().collect())?;
+        let to_clear = compact_booked_for_actor(&conn, &[2, 3, 4].into())?;
 
         assert!(to_clear.contains(&2));
         assert!(!to_clear.contains(&3));
         assert!(!to_clear.contains(&4));
 
-        let to_clear =
-            compact_booked_for_actor(&conn, &vec![(3, 3), (4, 4)].into_iter().collect())?;
+        let to_clear = compact_booked_for_actor(&conn, &[3, 4].into())?;
 
         assert!(to_clear.is_empty());
 
