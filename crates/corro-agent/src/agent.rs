@@ -597,8 +597,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             }
                         };
 
-                        info!(actor_id = %actor_id, "to clear: {to_clear:?}");
-
                         let tx = conn.transaction()?;
 
                         let deleted = tx
@@ -941,8 +939,6 @@ fn compact_booked_for_actor(
         _ => return Ok(BTreeSet::new()),
     };
 
-    info!("checking versions between {first} and {last}");
-
     let tables = conn
         .prepare_cached(
             "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'",
@@ -959,8 +955,6 @@ fn compact_booked_for_actor(
             |row| row.get(0),
         )?
         .collect::<rusqlite::Result<_>>()?;
-
-    info!("still live: {still_live:?}");
 
     Ok(versions.difference(&still_live).copied().collect())
 }
@@ -1401,7 +1395,7 @@ async fn process_fully_buffered_changes(
 
         let known_version = if rows_impacted > 0 {
             let db_version: i64 = tx.query_row(
-                "SELECT MAX(?, crsql_next_db_version())",
+                "SELECT MAX(?, crsql_db_version() + 1)",
                 [max_db_version],
                 |row| row.get(0),
             )?;
@@ -1595,7 +1589,7 @@ pub async fn process_single_version(
             }
 
             let mut db_version: i64 =
-                tx.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
+                tx.query_row("SELECT crsql_db_version() + 1", (), |row| row.get(0))?;
 
             let mut impactful_changeset = vec![];
 

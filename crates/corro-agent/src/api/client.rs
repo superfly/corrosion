@@ -136,7 +136,7 @@ where
         let ts = Timestamp::from(agent.clock().new_timestamp());
 
         let db_version: i64 = tx
-            .prepare_cached("SELECT crsql_next_db_version()")?
+            .prepare_cached("SELECT crsql_db_version() + 1")?
             .query_row((), |row| row.get(0))?;
 
         let has_changes: bool = tx
