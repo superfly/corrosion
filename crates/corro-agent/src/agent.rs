@@ -594,7 +594,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ?")?
                             .execute([actor_id])?;
 
-                        let mut new_copy = booked.read().clone();
+                        let mut new_copy = bookedw.clone();
 
                         let cleared_len = to_clear.len();
 

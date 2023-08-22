@@ -609,6 +609,14 @@ impl<'a> BookWriter<'a> {
     }
 }
 
+impl<'a> Deref for BookWriter<'a> {
+    type Target = RwLockWriteGuard<'a, BookedVersions>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub type BookieInner = Arc<RwLock<HashMap<ActorId, Booked>>>;
 
 #[derive(Default, Clone)]
