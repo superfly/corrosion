@@ -1,7 +1,9 @@
 use std::{error::Error as StdError, io, net::SocketAddr, ops::Deref, path::Path, time::Duration};
 
 use bytes::{Buf, BytesMut};
-use corro_api_types::{sqlite::RusqliteConnManager, QueryEvent, RqliteResponse, Statement};
+use corro_api_types::{
+    sqlite::RusqliteConnManager, QueryEvent, RqliteResponse, RqliteResult, Statement,
+};
 use futures::{Stream, TryStreamExt};
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use tokio_serde::{formats::SymmetricalJson, SymmetricallyFramed};
@@ -9,7 +11,7 @@ use tokio_util::{
     codec::{Decoder, FramedRead, LinesCodecError},
     io::StreamReader,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -37,7 +39,29 @@ impl CorrosionApiClient {
         let res = self.api_client.request(req).await?;
 
         if !res.status().is_success() {
-            return Err(Error::UnexpectedStatusCode(res.status()));
+            let status = res.status();
+            match hyper::body::to_bytes(res.into_body()).await {
+                Ok(b) => match serde_json::from_slice(&b) {
+                    Ok(res) => match res {
+                        RqliteResult::Error { error } => return Err(Error::ResponseError(error)),
+                        res => return Err(Error::UnexpectedResult(res)),
+                    },
+                    Err(e) => {
+                        debug!(
+                            error = %e,
+                            "could not deserialize response body, sending generic error..."
+                        );
+                        return Err(Error::UnexpectedStatusCode(status));
+                    }
+                },
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        "could not aggregate response body bytes, sending generic error..."
+                    );
+                    return Err(Error::UnexpectedStatusCode(status));
+                }
+            }
         }
 
         Ok(res.into_body())
@@ -395,6 +419,12 @@ pub enum Error {
 
     #[error("received unexpected response code: {0}")]
     UnexpectedStatusCode(StatusCode),
+
+    #[error("{0}")]
+    ResponseError(String),
+
+    #[error("unexpected result: {0:?}")]
+    UnexpectedResult(RqliteResult),
 
     #[error("could not retrieve watch id from headers")]
     ExpectedQueryId,
