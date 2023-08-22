@@ -856,6 +856,36 @@ async fn require_authz<B>(
 
 fn collect_metrics(agent: Agent) {
     agent.pool().emit_metrics();
+
+    let tables = agent
+        .schema()
+        .read()
+        .tables
+        .keys()
+        .cloned()
+        .collect::<Vec<String>>();
+
+    let conn = match agent.pool().read_blocking() {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("could not acquire read connection for metrics purposes: {e}");
+            return;
+        }
+    };
+
+    for table in tables {
+        match conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            Ok(count) => {
+                gauge!("corro.db.table.rows.total", count as f64, "table" => table);
+            }
+            Err(e) => {
+                error!("could not query count for table {table}: {e}");
+                continue;
+            }
+        }
+    }
 }
 
 pub async fn handle_change(
