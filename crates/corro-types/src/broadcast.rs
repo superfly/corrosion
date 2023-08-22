@@ -102,6 +102,10 @@ impl Changeset {
         }
     }
 
+    pub fn max_db_version(&self) -> Option<i64> {
+        self.changes().iter().map(|c| c.db_version).max()
+    }
+
     pub fn seqs(&self) -> Option<&RangeInclusive<i64>> {
         match self {
             Changeset::Empty { .. } => None,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
     ops::RangeInclusive,
@@ -548,7 +548,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             loop {
                 sleep(COMPACT_BOOKED_INTERVAL).await;
 
-                let tables = agent.schema().read().tables.keys().cloned().collect();
                 let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
 
                 for actor_id in to_check {
@@ -563,10 +562,28 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         continue;
                     }
 
-                    let res = block_in_place(|| {
+                    let mut conn = match pool.write_low().await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            error!("could not acquire low priority write connection for compaction: {e}");
+                            continue;
+                        }
+                    };
+
+                    let res = block_in_place(move || {
+                        let mut bookedw = booked.write();
+
+                        let versions = bookedw.current_versions();
+
+                        if versions.is_empty() {
+                            return Ok(());
+                        }
+
                         let to_clear = {
-                            let conn = pool.read_blocking()?;
-                            match compact_booked_for_actor(&conn, &tables, &versions) {
+                            match compact_booked_for_actor(
+                                &conn,
+                                &versions.keys().copied().collect(),
+                            ) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
                                         return Ok(());
@@ -580,14 +597,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             }
                         };
 
-                        let mut conn = pool.blocking_write_low()?;
                         let tx = conn.transaction()?;
 
                         let deleted = tx
                             .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ?")?
                             .execute([actor_id])?;
 
-                        let mut new_copy = booked.read().clone();
+                        let mut new_copy = bookedw.clone();
 
                         let cleared_len = to_clear.len();
 
@@ -621,7 +637,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         info!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
-                        let mut bookedw = booked.write();
                         **bookedw.inner_mut() = new_copy;
                         info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
 
@@ -856,6 +871,36 @@ async fn require_authz<B>(
 
 fn collect_metrics(agent: Agent) {
     agent.pool().emit_metrics();
+
+    let tables = agent
+        .schema()
+        .read()
+        .tables
+        .keys()
+        .cloned()
+        .collect::<Vec<String>>();
+
+    let conn = match agent.pool().read_blocking() {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("could not acquire read connection for metrics purposes: {e}");
+            return;
+        }
+    };
+
+    for table in tables {
+        match conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            Ok(count) => {
+                gauge!("corro.db.table.rows.total", count as f64, "table" => table);
+            }
+            Err(e) => {
+                error!("could not query count for table {table}: {e}");
+                continue;
+            }
+        }
+    }
 }
 
 pub async fn handle_change(
@@ -887,32 +932,31 @@ pub async fn handle_change(
 
 fn compact_booked_for_actor(
     conn: &Connection,
-    tables: &BTreeSet<String>,
-    versions: &BTreeMap<i64, i64>,
-) -> eyre::Result<HashSet<i64>> {
-    // TODO: optimize that in a single query once cr-sqlite supports aggregation
-
-    let (first, last) = match (
-        versions.first_key_value().map(|(db_v, _v)| *db_v),
-        versions.last_key_value().map(|(db_v, _v)| *db_v),
-    ) {
+    versions: &BTreeSet<i64>,
+) -> eyre::Result<BTreeSet<i64>> {
+    let (first, last) = match (versions.first().copied(), versions.last().copied()) {
         (Some(first), Some(last)) => (first, last),
-        _ => return Ok(HashSet::new()),
+        _ => return Ok(BTreeSet::new()),
     };
 
-    let still_live: HashSet<i64> = conn
+    let tables = conn
+        .prepare_cached(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    let still_live: BTreeSet<i64> = conn
         .prepare(&format!(
             "SELECT db_version FROM ({});",
-            tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table}__crsql_clock WHERE db_version >= {first} AND db_version <= {last}")).collect::<Vec<_>>().join(" UNION ")
+            tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table} WHERE db_version >= {first} AND db_version <= {last}")).collect::<Vec<_>>().join(" UNION ")
         ))?
         .query_map([],
             |row| row.get(0),
         )?
         .collect::<rusqlite::Result<_>>()?;
 
-    let keys: HashSet<i64> = versions.keys().copied().collect();
-
-    Ok(keys.difference(&still_live).copied().collect())
+    Ok(versions.difference(&still_live).copied().collect())
 }
 
 async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Vec<u8>)>) {
@@ -1286,22 +1330,30 @@ async fn process_fully_buffered_changes(
         }
     };
 
-    info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
-
     let known_version = block_in_place(|| {
         let tx = conn.transaction()?;
 
-        let count: i64 = tx
+        let max_db_version: Option<i64> = tx
             .prepare_cached(
                 "
-                SELECT count(*)
+                SELECT MAX(db_version)
                     FROM __corro_buffered_changes
                         WHERE site_id = ?
                             AND version = ?
                         ",
             )?
             .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
-        debug!(actor = %agent.actor_id(), "total buffered rows: {count}");
+        debug!(actor = %agent.actor_id(), "max db_version from buffered rows: {max_db_version:?}");
+
+        let max_db_version = match max_db_version {
+            None => {
+                warn!("zero rows to move, aborting!");
+                return Ok(None);
+            }
+            Some(v) => v,
+        };
+
+        info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
         let start = Instant::now();
         // insert all buffered changes into crsql_changes directly from the buffered changes table
@@ -1342,20 +1394,23 @@ async fn process_fully_buffered_changes(
         info!(actor = %agent.actor_id(), "rows impacted by changes: {rows_impacted}");
 
         let known_version = if rows_impacted > 0 {
-            let db_version: i64 =
-                tx.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
+            let db_version: i64 = tx.query_row(
+                "SELECT MAX(?, crsql_db_version() + 1)",
+                [max_db_version],
+                |row| row.get(0),
+            )?;
             debug!("db version: {db_version}");
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
 
-            KnownDbVersion::Current {
+            Some(KnownDbVersion::Current {
                 db_version,
                 last_seq,
                 ts,
-            }
+            })
         } else {
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, last_seq, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, last_seq, ts])?;
-            KnownDbVersion::Cleared
+            Some(KnownDbVersion::Cleared)
         };
 
         tx.commit()?;
@@ -1363,9 +1418,12 @@ async fn process_fully_buffered_changes(
         Ok::<_, rusqlite::Error>(known_version)
     })?;
 
-    bookedw.insert(version, known_version);
-
-    Ok(true)
+    Ok(if let Some(known_version) = known_version {
+        bookedw.insert(version, known_version);
+        true
+    } else {
+        false
+    })
 }
 
 pub async fn process_single_version(
@@ -1484,10 +1542,10 @@ pub async fn process_single_version(
 
                 // if we have no gaps, then we can schedule applying all these changes.
                 if gaps_count == 0 {
-                    if let Err(e) = agent.tx_apply().blocking_send((actor_id, version)) {
-                        error!(
-                            "could not send trigger for applying fully buffered changes later: {e}"
-                        );
+                    if inserted > 0 {
+                        if let Err(e) = agent.tx_apply().blocking_send((actor_id, version)) {
+                            error!("could not send trigger for applying fully buffered changes later: {e}");
+                        }
                     }
                 } else {
                     tx.prepare_cached(
@@ -1530,8 +1588,8 @@ pub async fn process_single_version(
                 ));
             }
 
-            let db_version: i64 =
-                tx.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
+            let mut db_version: i64 =
+                tx.query_row("SELECT crsql_db_version() + 1", (), |row| row.get(0))?;
 
             let mut impactful_changeset = vec![];
 
@@ -1564,6 +1622,7 @@ pub async fn process_single_version(
 
                 if rows_impacted > last_rows_impacted {
                     debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
+                    db_version = std::cmp::max(change.db_version, db_version);
                     impactful_changeset.push(change);
                 }
                 last_rows_impacted = rows_impacted;
@@ -1842,8 +1901,11 @@ async fn sync_loop(
             Branch::BackgroundApply { actor_id, version } => {
                 info!(actor_id = %agent.actor_id(), "picked up background apply for actor: {actor_id} v{version}");
                 match process_fully_buffered_changes(&agent, actor_id, version).await {
-                    Ok(_applied) => {
-                        // TODO: do something, I guess?
+                    Ok(false) => {
+                        warn!("did not apply buffered changes");
+                    }
+                    Ok(true) => {
+                        info!("succesfully applied buffered changes");
                     }
                     Err(e) => {
                         error!("could not apply fully buffered changes: {e}");
@@ -2391,7 +2453,13 @@ pub mod tests {
         let conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
 
         conn.execute_batch(
-            "CREATE TABLE foo (a INTEGER PRIMARY KEY, b INTEGER); SELECT crsql_as_crr('foo');",
+            "
+            CREATE TABLE foo (a INTEGER PRIMARY KEY, b INTEGER);
+            SELECT crsql_as_crr('foo');
+
+            CREATE TABLE foo2 (a INTEGER PRIMARY KEY, b INTEGER);
+            SELECT crsql_as_crr('foo2');
+            ",
         )?;
 
         // db version 1
@@ -2403,14 +2471,30 @@ pub mod tests {
 
         assert_eq!(db_version, 2);
 
-        let diff = compact_booked_for_actor(
-            &conn,
-            &vec!["foo".to_string()].into_iter().collect(),
-            &vec![(1, 1)].into_iter().collect(),
-        )?;
+        let to_clear = compact_booked_for_actor(&conn, &[1].into())?;
 
-        assert!(diff.contains(&1));
-        assert!(!diff.contains(&2));
+        assert!(to_clear.contains(&1));
+        assert!(!to_clear.contains(&2));
+
+        let to_clear = compact_booked_for_actor(&conn, &[2].into())?;
+        assert!(to_clear.is_empty());
+
+        conn.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
+
+        let to_clear = compact_booked_for_actor(&conn, &[2, 3].into())?;
+        assert!(to_clear.is_empty());
+
+        conn.execute("INSERT INTO foo (a) VALUES (1)", ())?;
+
+        let to_clear = compact_booked_for_actor(&conn, &[2, 3, 4].into())?;
+
+        assert!(to_clear.contains(&2));
+        assert!(!to_clear.contains(&3));
+        assert!(!to_clear.contains(&4));
+
+        let to_clear = compact_booked_for_actor(&conn, &[3, 4].into())?;
+
+        assert!(to_clear.is_empty());
 
         Ok(())
     }

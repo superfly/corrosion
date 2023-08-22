@@ -670,6 +670,7 @@ dependencies = [
  "camino",
  "compact_str 0.7.0",
  "corro-speedy",
+ "hex",
  "rusqlite",
  "serde",
  "smallvec",

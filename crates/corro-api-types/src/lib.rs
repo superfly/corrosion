@@ -337,9 +337,7 @@ impl fmt::Display for SqliteValue {
             SqliteValue::Text(v) => v.fmt(f),
             SqliteValue::Blob(v) => {
                 f.write_str("x'")?;
-                for b in v.iter() {
-                    write!(f, "{b:x}")?;
-                }
+                f.write_str(&hex::encode(v))?;
                 f.write_char('\'')
             }
         }
