@@ -25,14 +25,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-pub async fn api_v1_watch_by_id(
+pub async fn api_v1_subscription_by_id(
     Extension(agent): Extension<Agent>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> impl IntoResponse {
-    watch_by_id(agent, id).await
+    subscription_by_id(agent, id).await
 }
 
-async fn watch_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
+async fn subscription_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
     let matcher = match { agent.matchers().read().get(&id).cloned() } {
         Some(matcher) => matcher,
         None => {
@@ -40,7 +40,7 @@ async fn watch_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
                 .status(StatusCode::NOT_FOUND)
                 .body(
                     serde_json::to_vec(&QueryEvent::Error(format_compact!(
-                        "could not find watcher with id {id}"
+                        "could not find subscriptioner with id {id}"
                     )))
                     .expect("could not serialize queries stream error")
                     .into(),
@@ -56,7 +56,7 @@ async fn watch_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
     let change_rx = matcher.subscribe();
     let cancel = matcher.cancel();
 
-    tokio::spawn(process_watch_channel(
+    tokio::spawn(process_subscription_channel(
         agent.clone(),
         id,
         tx,
@@ -143,7 +143,7 @@ async fn watch_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
         .expect("could not build query response body")
 }
 
-async fn process_watch_channel(
+async fn process_subscription_channel(
     agent: Agent,
     matcher_id: Uuid,
     mut tx: hyper::body::Sender,
@@ -229,15 +229,17 @@ async fn process_watch_channel(
 
                 match recv.try_recv() {
                     Ok(new) => query_evt = new,
-                    Err(e) => match e {
-                        TryRecvError::Empty => break,
-                        TryRecvError::Closed => break,
+                    Err(e) => {
+                        match e {
+                            TryRecvError::Empty => break,
+                            TryRecvError::Closed => break,
 
-                        TryRecvError::Lagged(lagged) => {
-                            error!("change recv lagged by {lagged}, stopping watch processing");
-                            return;
+                            TryRecvError::Lagged(lagged) => {
+                                error!("change recv lagged by {lagged}, stopping subscription processing");
+                                return;
+                            }
                         }
-                    },
+                    }
                 }
             }
         }
@@ -361,9 +363,9 @@ async fn expand_sql(
 
 pub type MatcherCache = Arc<TokioRwLock<HashMap<String, Uuid>>>;
 
-pub async fn api_v1_watches(
+pub async fn api_v1_subscriptions(
     Extension(agent): Extension<Agent>,
-    Extension(watch_cache): Extension<MatcherCache>,
+    Extension(subscription_cache): Extension<MatcherCache>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
     let stmt = match expand_sql(&agent, &stmt).await {
@@ -380,15 +382,15 @@ pub async fn api_v1_watches(
         }
     };
 
-    let matcher_id = { watch_cache.read().await.get(&stmt).cloned() };
+    let matcher_id = { subscription_cache.read().await.get(&stmt).cloned() };
 
     if let Some(matcher_id) = matcher_id {
         let contains = { agent.matchers().read().contains_key(&matcher_id) };
         if contains {
             info!("reusing matcher id {matcher_id}");
-            return watch_by_id(agent, matcher_id).await;
+            return subscription_by_id(agent, matcher_id).await;
         } else {
-            watch_cache.write().await.remove(&stmt);
+            subscription_cache.write().await.remove(&stmt);
         }
     }
 
@@ -441,10 +443,10 @@ pub async fn api_v1_watches(
 
     {
         agent.matchers().write().insert(matcher_id, matcher.clone());
-        watch_cache.write().await.insert(stmt, matcher_id);
+        subscription_cache.write().await.insert(stmt, matcher_id);
     }
 
-    tokio::spawn(process_watch_channel(
+    tokio::spawn(process_subscription_channel(
         agent.clone(),
         matcher_id,
         tx,
@@ -477,7 +479,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn test_api_v1_watches() -> eyre::Result<()> {
+    async fn test_api_v1_subscriptions() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
 
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
@@ -548,7 +550,7 @@ mod tests {
 
         assert!(body.0.results.len() == 2);
 
-        let res = api_v1_watches(
+        let res = api_v1_subscriptions(
             Extension(agent.clone()),
             Extension(Default::default()),
             axum::Json(Statement::Simple("select * from tests".into())),

@@ -229,7 +229,7 @@ fn async_watcher() -> notify::Result<(Debouncer<RecommendedWatcher>, Receiver<De
     let (tx, rx) = channel(1);
 
     // Automatically select the best implementation for your platform.
-    // You can also access each implementation directly e.g. INotifyWatcher.
+    // You can also access each implementation directly e.g. INotifySubscriptioner.
     let debouncer = new_debouncer(
         Duration::from_secs(1),
         None,
@@ -295,7 +295,7 @@ async fn async_watch(paths: Vec<(Utf8PathBuf, Sender<()>)>) -> notify::Result<()
                     _ = debouncer.watcher().unwatch(path.as_std_path());
                 }
             }
-            Err(e) => error!("watch error: {:?}", e),
+            Err(e) => error!("subscription error: {:?}", e),
         }
     }
 

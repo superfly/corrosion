@@ -67,7 +67,7 @@ impl CorrosionApiClient {
         Ok(res.into_body())
     }
 
-    pub async fn watch(
+    pub async fn subscription(
         &self,
         statement: &Statement,
     ) -> Result<
@@ -79,7 +79,7 @@ impl CorrosionApiClient {
     > {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/v1/watches", self.api_addr))
+            .uri(format!("http://{}/v1/subscriptions", self.api_addr))
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statement)?))?;
@@ -97,16 +97,16 @@ impl CorrosionApiClient {
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
             .ok_or(Error::ExpectedQueryId)?;
 
-        Ok((id, watch_stream(res.into_body())))
+        Ok((id, subscription_stream(res.into_body())))
     }
 
-    pub async fn watched_query(
+    pub async fn subscriptioned_query(
         &self,
         id: Uuid,
     ) -> Result<impl Stream<Item = io::Result<QueryEvent>> + Send + Sync + 'static, Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::GET)
-            .uri(format!("http://{}/v1/watches/{}", self.api_addr, id))
+            .uri(format!("http://{}/v1/subscriptions/{}", self.api_addr, id))
             .header(hyper::header::ACCEPT, "application/json")
             .body(hyper::Body::empty())?;
 
@@ -116,7 +116,7 @@ impl CorrosionApiClient {
             return Err(Error::UnexpectedStatusCode(res.status()));
         }
 
-        Ok(watch_stream(res.into_body()))
+        Ok(subscription_stream(res.into_body()))
     }
 
     pub async fn execute(&self, statements: &[Statement]) -> Result<RqliteResponse, Error> {
@@ -240,7 +240,7 @@ impl CorrosionApiClient {
     }
 }
 
-fn watch_stream(body: hyper::Body) -> impl Stream<Item = io::Result<QueryEvent>> {
+fn subscription_stream(body: hyper::Body) -> impl Stream<Item = io::Result<QueryEvent>> {
     let body = StreamReader::new(body.map_err(|e| {
         if let Some(io_error) = e
             .source()
@@ -426,6 +426,6 @@ pub enum Error {
     #[error("unexpected result: {0:?}")]
     UnexpectedResult(RqliteResult),
 
-    #[error("could not retrieve watch id from headers")]
+    #[error("could not retrieve subscription id from headers")]
     ExpectedQueryId,
 }

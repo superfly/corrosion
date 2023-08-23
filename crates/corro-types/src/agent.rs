@@ -222,10 +222,16 @@ impl SplitPool {
 
         let dedicated_pool = bb8::Pool::builder()
             .max_size(100)
-            .build(RusqliteConnManager::new(path.as_ref()).attach(
-                tmp_db_dir.path().join("watches.db").display().to_string(),
-                "watches",
-            ))
+            .build(
+                RusqliteConnManager::new(path.as_ref()).attach(
+                    tmp_db_dir
+                        .path()
+                        .join("subscriptions.db")
+                        .display()
+                        .to_string(),
+                    "subscriptions",
+                ),
+            )
             .await?;
 
         Ok(Self::new(
