@@ -4,12 +4,20 @@
 
 # User guide
 - [Authorization]()
+- [Backup / Restore]()
+- [CRDTs](crdts.md)
 - [Encryption]()
+- [Gossip]()
 - [Schema]()
 - [Subscriptions]()
+- [Synchronization]()
 - [Templates]()
 
 # Reference
+- [API]()
+    - [POST /v1/exec]()
+    - [POST /v1/query]()
+    - [POST /v1/subscriptions]()
 - [Command-line Interface](cli/README.md)
     - [agent]()
     - [backup](cli/backup.md)
