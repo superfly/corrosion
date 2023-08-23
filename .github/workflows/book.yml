@@ -1,0 +1,39 @@
+name: Book
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # To push a branch 
+      pages: write  # To push to a GitHub Pages site
+      id-token: write # To update the deployment status
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook,mdbook-linkcheck
+      
+      - name: Build Book
+        run: mdbook build
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v2
+      
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v1
+        with:
+          # Upload entire repository
+          path: 'book'
+      
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v1

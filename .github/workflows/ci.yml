@@ -11,37 +11,55 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-    build:
-      name: Test
-      strategy:
-        fail-fast: false
-        matrix:
-          include:
-            - target: x86_64-apple-darwin
-              os: macos-latest
-            - target: x86_64-unknown-linux-gnu
-              os: ubuntu-latest
+  test:
+    name: Test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: rui314/setup-mold@v1
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Test with latest nextest release
+        run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
+  
+  book-test:
+    name: Build book
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # To push a branch 
+      pull-requests: write  # To create a PR from that branch
+    steps:
+      - uses: actions/checkout@master
       
-      runs-on: ${{ matrix.os }}
+      - uses: dtolnay/rust-toolchain@stable
 
-      steps:
-        - uses: actions/checkout@v3
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook,mdbook-linkcheck
 
-        - uses: rui314/setup-mold@v1
-
-        - name: Install Rust stable
-          uses: dtolnay/rust-toolchain@stable
-          with:
-            target: ${{ matrix.target }}
-
-        - name: Install cargo-nextest
-          uses: taiki-e/install-action@v2
-          with:
-            tool: cargo-nextest
-
-        - uses: Swatinem/rust-cache@v2
-          with:
-            cache-on-failure: true
-        
-        - name: Test with latest nextest release
-          run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
+      - name: Build Book
+        run: mdbook build

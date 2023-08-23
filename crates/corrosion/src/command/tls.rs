@@ -1,13 +1,14 @@
 use std::{net::IpAddr, path::Path};
 
+use camino::Utf8PathBuf;
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
 pub async fn generate_ca<P: AsRef<Path>>(output_path: P) -> eyre::Result<()> {
     let cert = corro_types::tls::generate_ca()?;
 
-    let cert_path = output_path.as_ref().join("ca.pem");
-    let key_path = output_path.as_ref().join("ca.key");
+    let cert_path = output_path.as_ref().join("ca_cert.pem");
+    let key_path = output_path.as_ref().join("ca_key.pem");
 
     let cert_pem = cert.serialize_pem();
     let mut cert_file = tokio::fs::File::create(&cert_path).await?;
@@ -40,18 +41,22 @@ pub async fn generate_server_cert<P1: AsRef<Path>, P2: AsRef<Path>>(
     let (cert, cert_signed) =
         corro_types::tls::generate_server_cert(&ca_cert_pem, &ca_key_pem, ip)?;
 
-    let mut cert_file = tokio::fs::File::create("cert.pem").await?;
+    let cert_file_path = Utf8PathBuf::from("server_cert.pem");
+
+    let mut cert_file = tokio::fs::File::create(&cert_file_path).await?;
     cert_file.write_all(cert_signed.as_bytes()).await?;
 
-    info!("Wrote server certificate to ./cert.pem");
+    info!("Wrote server certificate to {cert_file_path}");
+
+    let key_file_path = Utf8PathBuf::from("server_key.pem");
 
     let private_key_pem = cert.serialize_private_key_pem();
-    let mut private_key_file = tokio::fs::File::create("cert.key").await?;
+    let mut private_key_file = tokio::fs::File::create(&key_file_path).await?;
     private_key_file
         .write_all(private_key_pem.as_bytes())
         .await?;
 
-    info!("Wrote server key to ./cert.key");
+    info!("Wrote server key to {key_file_path}");
 
     Ok(())
 }
@@ -68,18 +73,22 @@ pub async fn generate_client_cert<P1: AsRef<Path>, P2: AsRef<Path>>(
 
     let (cert, cert_signed) = corro_types::tls::generate_client_cert(&ca_cert_pem, &ca_key_pem)?;
 
-    let mut cert_file = tokio::fs::File::create("client-cert.pem").await?;
+    let cert_file_path = Utf8PathBuf::from("client_cert.pem");
+
+    let mut cert_file = tokio::fs::File::create(&cert_file_path).await?;
     cert_file.write_all(cert_signed.as_bytes()).await?;
 
     info!("Wrote client certificate to ./client-cert.pem");
 
+    let key_file_path = Utf8PathBuf::from("client_key.pem");
+
     let private_key_pem = cert.serialize_private_key_pem();
-    let mut private_key_file = tokio::fs::File::create("client-cert.key").await?;
+    let mut private_key_file = tokio::fs::File::create(&key_file_path).await?;
     private_key_file
         .write_all(private_key_pem.as_bytes())
         .await?;
 
-    info!("Wrote client key to ./client-key.pem");
+    info!("Wrote client key to {key_file_path}");
 
     Ok(())
 }
