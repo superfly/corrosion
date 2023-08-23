@@ -42,6 +42,6 @@ jobs:
         - uses: Swatinem/rust-cache@v2
           with:
             cache-on-failure: true
-        
+
         - name: Test with latest nextest release
           run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}

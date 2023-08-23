@@ -8,8 +8,6 @@ use tripwire::Tripwire;
 static CORROSION_BIN: Lazy<CargoRun> = Lazy::new(|| {
     escargot::CargoBuild::new()
         .bin("corrosion")
-        .current_release()
-        // .current_target()
         .manifest_path("../Cargo.toml")
         .run()
         .unwrap()

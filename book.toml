@@ -1,0 +1,6 @@
+[book]
+authors = ["Jerome Gravel-Niquet"]
+language = "en"
+multilingual = false
+src = "doc"
+title = "Corrosion"
