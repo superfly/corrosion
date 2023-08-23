@@ -3,7 +3,11 @@
 [Introduction](intro.md)
 
 # User guide
-- [Operations Guide]()
+- [Authorization]()
+- [Encryption]()
+- [Schema]()
+- [Subscriptions]()
+- [Templates]()
 
 # Reference
 - [Command-line Interface](cli/README.md)
