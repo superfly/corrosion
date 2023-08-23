@@ -71,8 +71,8 @@ uuid = { version = "1.3.1", features = ["v4", "serde"] }
 webpki = { version = "0.22.0", features = ["std"] }
 
 [patch.crates-io]
-quinn = { git = "https://github.com/jeromegn/quinn", rev = "4f9f685f" }
-quinn-proto = { git = "https://github.com/jeromegn/quinn", rev = "4f9f685f" }
+quinn = { git = "https://github.com/jeromegn/quinn", rev = "2b49c16c" }
+quinn-proto = { git = "https://github.com/jeromegn/quinn", rev = "2b49c16c" }
 
 [profile.release]
 debug = 1
