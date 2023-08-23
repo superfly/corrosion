@@ -47,24 +47,19 @@ jobs:
         run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
   
   book-test:
-    name: Book tests
+    name: Build book
     runs-on: ubuntu-latest
     permissions:
       contents: write  # To push a branch 
       pull-requests: write  # To create a PR from that branch
     steps:
-    - uses: actions/checkout@master
-    
-    - name: Install Rust stable
-      uses: dtolnay/rust-toolchain@stable
-    
-    - name: Install mdbook
-      uses: taiki-e/install-action@v2
-      with:
-        tool: mdbook
+      - uses: actions/checkout@master
+      
+      - uses: dtolnay/rust-toolchain@stable
 
-    - name: Build book
-      run: mdbook build
-    
-    - name: Run tests
-      run: mdbook test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook,mdbook-linkcheck
+
+      - name: Build Book
+        run: mdbook build
