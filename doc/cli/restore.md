@@ -1,4 +1,4 @@
-# The `restore` command
+# The `corrosion restore` command
 
 Restores a database from a backup produced by `corrosion backup`. This is an "online restore", it acquires all the appropriate locks on the sqlite3 database so as to not disrupt database readers. It then replaces the database in-place and releases the locks.
 

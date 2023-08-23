@@ -1,4 +1,4 @@
-# The `backup` command
+# The `corrosion backup` command
 
 Creates a backup of the current database by running `VACUUM INTO` and cleaning up node-specific data. This includes removing `crsql_site_id` as well as rewriting `__crsql_clock` tables to make the backup generic, ready for a `corrosion restore`.
 
