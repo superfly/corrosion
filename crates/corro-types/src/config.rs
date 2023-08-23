@@ -95,12 +95,12 @@ pub struct TlsConfig {
     #[serde(default)]
     pub ca_file: Option<Utf8PathBuf>,
 
+    #[serde(default)]
+    pub insecure: bool,
+
     /// Mutual TLS configuration
     #[serde(default)]
     pub client: Option<TlsClientConfig>,
-
-    #[serde(default)]
-    pub insecure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

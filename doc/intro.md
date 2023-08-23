@@ -8,5 +8,6 @@
 - Eventually consistent
 - RESTful HTTP API
 - Subscribe to SQL queries
+- QUIC peer-to-peer
 - SWIM cluster formation
 - Fast, gossip-based, updates dissimination
