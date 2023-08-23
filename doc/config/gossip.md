@@ -38,7 +38,9 @@ bootstrap = ["my-fly-app.internal:3333@[fdaa::3]:53"]
 
 Allows using QUIC without encryption. The only reason to set this to `true` is if you're running a toy cluster or if the underlying transport is already handling cryptography (such as WireGuard) AND authorization is bound by the network (such is the case for a [Fly.io](https://fly.io) app's private network).
 
+```admonish warning
 It's highly recommended to use the `gossip.tls` configuration block to setup encryption and `gossip.tls.client` to setup authorization.
+```
 
 #### `gossip.max_mtu`
 
