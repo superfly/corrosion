@@ -390,6 +390,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                     async move {
                                         let mut codec = LengthDelimitedCodec::new();
                                         let mut buf = BytesMut::new();
+
+                                        let mut stream_ended = false;
+
                                         loop {
                                             loop {
                                                 match codec.decode(&mut buf) {
@@ -422,7 +425,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                     }
                                                     Ok(None) => break,
                                                     Err(e) => {
-                                                        println!("decode error: {e}");
+                                                        error!("decode error: {e}");
                                                     }
                                                 }
                                             }
@@ -433,7 +436,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                             .await
                                             {
                                                 Ok(Ok(0)) => {
-                                                    // println!("EOF");
+                                                    stream_ended = true;
                                                     break;
                                                 }
                                                 Ok(Ok(n)) => {
@@ -441,6 +444,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                 }
                                                 Ok(Err(e)) => {
                                                     error!("error reading bytes into buffer: {e}");
+                                                    stream_ended = true;
                                                     break;
                                                 }
                                                 Err(_e) => {
@@ -450,8 +454,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                             }
                                         }
 
-                                        if let Err(e) = rx.stop(0u32.into()) {
-                                            warn!("error stopping recved uni stream: {e}");
+                                        if !stream_ended {
+                                            if let Err(e) = rx.stop(0u32.into()) {
+                                                warn!("error stopping recved uni stream: {e}");
+                                            }
                                         }
                                     }
                                 });

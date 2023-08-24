@@ -77,7 +77,11 @@ fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig
     let mut transport_config = quinn::TransportConfig::default();
 
     // max idle timeout
-    transport_config.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+    transport_config.max_idle_timeout(Some(
+        Duration::from_secs(std::cmp::min(config.idle_timeout_secs as u64, 10))
+            .try_into()
+            .unwrap(),
+    ));
 
     // max 1024 concurrent bidirectional streams
     transport_config.max_concurrent_bidi_streams(1024u32.into());
@@ -713,6 +717,7 @@ mod tests {
                 }),
                 insecure: false,
             }),
+            idle_timeout_secs: 30,
             plaintext: false,
             max_mtu: None,
             disable_gso: false,
