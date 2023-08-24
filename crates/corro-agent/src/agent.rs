@@ -42,7 +42,7 @@ use axum::{
     routing::{get, post},
     BoxError, Extension, Router, TypedHeader,
 };
-use bytes::{BufMut, BytesMut};
+use bytes::{Bytes, BytesMut};
 use foca::{Member, Notification};
 use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
@@ -52,7 +52,7 @@ use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection, Transaction};
 use spawn::spawn_counted;
-use speedy::{Readable, Writable};
+use speedy::Readable;
 use tokio::{
     io::AsyncReadExt,
     net::TcpListener,
@@ -61,7 +61,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tokio_util::codec::{Decoder, Encoder, FramedRead, LengthDelimitedCodec};
+use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
@@ -319,11 +319,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     tokio::spawn({
         let agent = agent.clone();
         let tripwire = tripwire.clone();
+        let foca_tx = foca_tx.clone();
         async move {
             while let Some(connecting) = gossip_server_endpoint.accept().await {
                 let process_uni_tx = process_uni_tx.clone();
                 let agent = agent.clone();
                 let tripwire = tripwire.clone();
+                let foca_tx = foca_tx.clone();
                 tokio::spawn(async move {
                     let remote_addr = connecting.remote_address();
                     // let local_ip = connecting.local_ip().unwrap();
@@ -338,6 +340,33 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     };
 
                     debug!("accepted a QUIC conn from {remote_addr}");
+
+                    tokio::spawn({
+                        let conn = conn.clone();
+                        let mut tripwire = tripwire.clone();
+                        let foca_tx = foca_tx.clone();
+                        async move {
+                            loop {
+                                let b = tokio::select! {
+                                    b_res = conn.read_datagram() => match b_res {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            debug!("could not read datagram from connection: {e}");
+                                            return;
+                                        }
+                                    },
+                                    _ = &mut tripwire => {
+                                        debug!("connection cancelled");
+                                        return;
+                                    }
+                                };
+
+                                if let Err(e) = foca_tx.send(FocaInput::Data(b)).await {
+                                    error!("could not send data foca input: {e}");
+                                }
+                            }
+                        }
+                    });
 
                     tokio::spawn({
                         let conn = conn.clone();
@@ -992,27 +1021,24 @@ fn compact_booked_for_actor(
     Ok(versions.difference(&still_live).copied().collect())
 }
 
-async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Vec<u8>)>) {
-    let mut buf = BytesMut::new();
-    let mut codec = LengthDelimitedCodec::new();
-
+async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Bytes)>) {
     while let Some((actor, data)) = to_send_rx.recv().await {
         trace!("got gossip to send to {actor:?}");
 
         let addr = actor.addr();
 
-        let payload = UniPayload::V1(UniPayloadV1::Gossip(data));
-        if let Err(e) = payload.write_to_stream((&mut buf).writer()) {
-            error!("could not write to buf: {e}");
-            continue;
-        }
+        // let payload = UniPayload::V1(UniPayloadV1::Gossip(data));
+        // if let Err(e) = payload.write_to_stream((&mut buf).writer()) {
+        //     error!("could not write to buf: {e}");
+        //     continue;
+        // }
 
-        if let Err(e) = codec.encode(buf.split().freeze(), &mut buf) {
-            error!("could not encode buf: {e}");
-            continue;
-        }
+        // if let Err(e) = codec.encode(buf.split().freeze(), &mut buf) {
+        //     error!("could not encode buf: {e}");
+        //     continue;
+        // }
 
-        let bytes = buf.split().freeze();
+        // let bytes = buf.split().freeze();
 
         let transport = transport.clone();
 
@@ -1025,7 +1051,7 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
             //     }
             // };
 
-            match timeout(Duration::from_secs(5), transport.send_datagram(addr, bytes)).await {
+            match timeout(Duration::from_secs(5), transport.send_datagram(addr, data)).await {
                 Err(_e) => {
                     warn!("timed out writing gossip as datagram {addr}");
                     return;
@@ -1039,7 +1065,7 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
         });
 
         increment_counter!("corro.gossip.send.count", "actor_id" => actor.id().to_string());
-        gauge!("corro.gossip.send.buffer.capacity", buf.capacity() as f64);
+        // gauge!("corro.gossip.send.buffer.capacity", buf.capacity() as f64);
     }
 }
 

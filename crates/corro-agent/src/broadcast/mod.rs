@@ -98,7 +98,7 @@ pub fn runtime_loop(
     mut rx_foca: Receiver<FocaInput>,
     mut rx_bcast: Receiver<BroadcastInput>,
     member_events: tokio::sync::broadcast::Receiver<MemberEvent>,
-    to_send_tx: Sender<(Actor, Vec<u8>)>,
+    to_send_tx: Sender<(Actor, Bytes)>,
     notifications_tx: Sender<Notification<Actor>>,
     mut tripwire: Tripwire,
 ) {
@@ -646,6 +646,7 @@ fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
     config.remove_down_after = Duration::from_secs(2 * 24 * 60 * 60);
 
     // max payload size for udp datagrams, use a safe value here...
+    // TODO: calculate from smallest max datagram size for all peers
     config.max_packet_size = 1200.try_into().unwrap();
 
     config
