@@ -582,12 +582,12 @@ pub async fn bidirectional_sync(
 
             debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
 
-            if buf.capacity() >= 64 * 1024 {
-                info!(
-                    "big buffer from bidirectional sync sender: {}",
-                    buf.capacity()
-                );
-            }
+            // if buf.capacity() >= 64 * 1024 {
+            //     info!(
+            //         "big buffer from bidirectional sync sender: {}",
+            //         buf.capacity()
+            //     );
+            // }
 
             Ok::<_, SyncError>(count)
         },

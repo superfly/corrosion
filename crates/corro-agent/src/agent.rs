@@ -419,12 +419,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                             }
                                         }
 
-                                        if buf.capacity() >= 64 * 1024 {
-                                            info!(
-                                                "big buf from processing unidirectional stream: {}",
-                                                buf.capacity()
-                                            );
-                                        }
+                                        // if buf.capacity() >= 64 * 1024 {
+                                        //     info!(
+                                        //         "big buf from processing unidirectional stream: {}",
+                                        //         buf.capacity()
+                                        //     );
+                                        // }
                                     }
                                 });
                             }
@@ -467,12 +467,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                             }
                                             Some(res) => match res {
                                                 Ok(b) => {
-                                                    if b.capacity() >= 64 * 1024 {
-                                                        info!(
-                                                            "big buf from processing bidirectional stream: {}",
-                                                            b.capacity()
-                                                        );
-                                                    }
+                                                    // if b.capacity() >= 64 * 1024 {
+                                                    //     info!(
+                                                    //         "big buf from processing bidirectional stream: {}",
+                                                    //         b.capacity()
+                                                    //     );
+                                                    // }
                                                     match BiPayload::read_from_buffer(&b) {
                                                         Ok(payload) => {
                                                             match payload {
