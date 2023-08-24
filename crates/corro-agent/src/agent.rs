@@ -73,7 +73,7 @@ use trust_dns_resolver::{
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
-const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(60);
+const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(300);
 
 pub struct AgentOptions {
     actor_id: ActorId,
