@@ -211,7 +211,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let clock = Arc::new(
         uhlc::HLCBuilder::default()
-            .with_id(actor_id.0.into())
+            .with_id(actor_id.into())
             .with_max_delta(Duration::from_millis(300))
             .build(),
     );
@@ -1972,7 +1972,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
         r#"
             -- internal bookkeeping
             CREATE TABLE __corro_bookkeeping (
-                actor_id TEXT NOT NULL,
+                actor_id BLOB NOT NULL,
                 start_version INTEGER NOT NULL,
                 end_version INTEGER,
                 db_version INTEGER,
@@ -2022,7 +2022,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
             
             -- SWIM memberships
             CREATE TABLE __corro_members (
-                id TEXT PRIMARY KEY NOT NULL,
+                actor_id BLOB PRIMARY KEY NOT NULL,
                 address TEXT NOT NULL,
             
                 state TEXT NOT NULL DEFAULT 'down',

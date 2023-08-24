@@ -247,9 +247,9 @@ pub fn runtime_loop(
                                         for (id, address, state, foca_state) in states {
                                             let db_res = tx.prepare_cached(
                                                     "
-                                                INSERT INTO __corro_members (id, address, state, foca_state)
+                                                INSERT INTO __corro_members (actor_id, address, state, foca_state)
                                                     VALUES (?, ?, ?, ?)
-                                                ON CONFLICT (id) DO UPDATE SET
+                                                ON CONFLICT (actor_id) DO UPDATE SET
                                                     address = excluded.address,
                                                     state = excluded.state,
                                                     foca_state = excluded.foca_state;
@@ -383,9 +383,9 @@ pub fn runtime_loop(
                                     trace!(
                                         "updating {id} {address} as {state} w/ state: {foca_state:?}",
                                     );
-                                    let upserted = tx.prepare_cached("INSERT INTO __corro_members (id, address, state, foca_state)
+                                    let upserted = tx.prepare_cached("INSERT INTO __corro_members (actor_id, address, state, foca_state)
                                                 VALUES (?, ?, ?, ?)
-                                            ON CONFLICT (id) DO UPDATE SET
+                                            ON CONFLICT (actor_id) DO UPDATE SET
                                                 address = excluded.address,
                                                 state = excluded.state,
                                                 foca_state = excluded.foca_state;")?

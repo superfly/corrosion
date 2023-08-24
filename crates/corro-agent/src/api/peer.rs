@@ -609,6 +609,14 @@ pub async fn bidirectional_sync(
                 }
             };
 
+            let their_actor_id = their_sync_state.actor_id;
+
+            tx.send(SyncMessage::V1(SyncMessageV1::Clock(
+                agent.clock().new_timestamp().into(),
+            )))
+            .await
+            .map_err(|_| SyncSendError::ChannelClosed)?;
+
             tokio::spawn(
                 process_sync(
                     agent.actor_id(),
@@ -638,6 +646,16 @@ pub async fn bidirectional_sync(
                             }
                             SyncMessage::V1(SyncMessageV1::State(_)) => {
                                 warn!("received sync state message more than once, ignoring");
+                                continue;
+                            }
+                            SyncMessage::V1(SyncMessageV1::Clock(ts)) => {
+                                if let Err(e) = agent.clock().update_with_timestamp(
+                                    &uhlc::Timestamp::new(ts.to_ntp64(), their_actor_id.into()),
+                                ) {
+                                    warn!(
+                                        "could not update clock from actor {their_actor_id}: {e}"
+                                    );
+                                }
                                 continue;
                             }
                         };

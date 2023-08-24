@@ -179,6 +179,10 @@ impl Timestamp {
         OffsetDateTime::from_unix_timestamp(t.as_secs() as i64).unwrap()
             + time::Duration::nanoseconds(t.subsec_nanos() as i64)
     }
+
+    pub fn to_ntp64(&self) -> NTP64 {
+        NTP64(self.0)
+    }
 }
 
 impl fmt::Display for Timestamp {

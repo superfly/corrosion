@@ -8,7 +8,7 @@ use tokio_util::codec::{Decoder, LengthDelimitedCodec};
 use crate::{
     actor::ActorId,
     agent::{Booked, Bookie, KnownDbVersion},
-    broadcast::ChangeV1,
+    broadcast::{ChangeV1, Timestamp},
 };
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -20,6 +20,7 @@ pub enum SyncMessage {
 pub enum SyncMessageV1 {
     State(SyncStateV1),
     Changeset(ChangeV1),
+    Clock(Timestamp),
 }
 
 #[derive(Debug, Default, Clone, Readable, Writable, Serialize, Deserialize)]
