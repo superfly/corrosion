@@ -2,7 +2,7 @@ use std::{fmt, hash::Hash, net::SocketAddr, ops::Deref};
 
 use foca::Identity;
 use rusqlite::{
-    types::{FromSql, FromSqlError, ToSqlOutput},
+    types::{FromSql, ToSqlOutput},
     ToSql,
 };
 use serde::{Deserialize, Serialize};
@@ -84,25 +84,13 @@ where
 
 impl ToSql for ActorId {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Owned(rusqlite::types::Value::Text(
-            self.0.to_string(),
-        )))
+        self.0.to_sql()
     }
 }
 
 impl FromSql for ActorId {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        match value {
-            rusqlite::types::ValueRef::Text(s) => Ok(ActorId(
-                String::from_utf8_lossy(s)
-                    .parse()
-                    .map_err(|e| FromSqlError::Other(Box::new(e)))?,
-            )),
-            rusqlite::types::ValueRef::Blob(b) => Ok(ActorId(
-                Uuid::from_slice(b).map_err(|e| FromSqlError::Other(Box::new(e)))?,
-            )),
-            _ => Err(rusqlite::types::FromSqlError::InvalidType),
-        }
+        Ok(Self(FromSql::column_result(value)?))
     }
 }
 
