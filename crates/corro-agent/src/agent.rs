@@ -1083,7 +1083,7 @@ async fn handle_notifications(
                 let added = { agent.members().write().add_member(&actor) };
                 debug!("Member Up {actor:?} (added: {added})");
                 if added {
-                    debug!("Member Up {actor:?}");
+                    info!("Member Up {actor:?}");
                     increment_counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
                     // actually added a member
                     // notify of new cluster size
