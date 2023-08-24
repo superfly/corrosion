@@ -144,7 +144,7 @@ pub fn runtime_loop(
 
             let member_events_chunks =
                 tokio_stream::wrappers::BroadcastStream::new(member_events.resubscribe())
-                    .chunks_timeout(100, Duration::from_secs(5));
+                    .chunks_timeout(1000, Duration::from_secs(2));
             tokio::pin!(member_events_chunks);
 
             #[derive(EnumDiscriminants)]
@@ -380,7 +380,7 @@ pub fn runtime_loop(
                                 let tx = conn.transaction()?;
 
                                 for (id, address, state, foca_state) in splitted {
-                                    info!(
+                                    trace!(
                                         "updating {id} {address} as {state} w/ state: {foca_state:?}",
                                     );
                                     let upserted = tx.prepare_cached("INSERT INTO __corro_members (id, address, state, foca_state)
