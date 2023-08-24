@@ -18,7 +18,7 @@ use speedy::{Readable, Writable};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
 use tracing::{error, trace};
-use uhlc::{ParseNTP64Error, NTP64};
+use uhlc::{ParseTimestampError, NTP64};
 
 use crate::{
     actor::{Actor, ActorId},
@@ -164,32 +164,68 @@ impl Changeset {
 #[derive(Debug, thiserror::Error)]
 pub enum TimestampParseError {
     #[error("could not parse timestamp: {0:?}")]
-    Parse(ParseNTP64Error),
+    Parse(ParseTimestampError),
 }
 
-#[derive(
-    Debug, Default, Clone, Copy, Serialize, Deserialize, Readable, Writable, PartialEq, Eq,
-)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
-pub struct Timestamp(pub u64);
+pub struct Timestamp(uhlc::Timestamp);
 
 impl Timestamp {
     pub fn to_time(&self) -> OffsetDateTime {
-        let t = NTP64(self.0);
+        let t = self.0.get_time();
         OffsetDateTime::from_unix_timestamp(t.as_secs() as i64).unwrap()
             + time::Duration::nanoseconds(t.subsec_nanos() as i64)
     }
 }
 
+impl Deref for Timestamp {
+    type Target = uhlc::Timestamp;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        NTP64(self.0).fmt(f)
+        self.0.fmt(f)
     }
 }
 
 impl From<uhlc::Timestamp> for Timestamp {
     fn from(ts: uhlc::Timestamp) -> Self {
-        Self(ts.get_time().as_u64())
+        Self(ts)
+    }
+}
+
+impl<'a, C> Readable<'a, C> for Timestamp
+where
+    C: speedy::Context,
+{
+    fn read_from<R: speedy::Reader<'a, C>>(
+        reader: &mut R,
+    ) -> Result<Self, <C as speedy::Context>::Error> {
+        let time: u64 = Readable::read_from(reader)?;
+        let id: [u8; 16] = Readable::read_from(reader)?;
+        Ok(uhlc::Timestamp::new(
+            NTP64(time),
+            id.try_into().map_err(|e| speedy::Error::custom(e))?,
+        )
+        .into())
+    }
+}
+
+impl<C> Writable<C> for Timestamp
+where
+    C: speedy::Context,
+{
+    fn write_to<T: ?Sized + speedy::Writer<C>>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), <C as speedy::Context>::Error> {
+        self.get_time().0.write_to(writer)?;
+        self.get_id().to_le_bytes().write_to(writer)
     }
 }
 
@@ -197,8 +233,8 @@ impl FromSql for Timestamp {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         match value {
             rusqlite::types::ValueRef::Text(b) => match std::str::from_utf8(b) {
-                Ok(s) => match s.parse::<NTP64>() {
-                    Ok(ntp) => Ok(Timestamp(ntp.as_u64())),
+                Ok(s) => match s.parse::<uhlc::Timestamp>() {
+                    Ok(ts) => Ok(Timestamp(ts)),
                     Err(e) => Err(FromSqlError::Other(Box::new(TimestampParseError::Parse(e)))),
                 },
                 Err(e) => Err(FromSqlError::Other(Box::new(e))),
@@ -211,7 +247,7 @@ impl FromSql for Timestamp {
 impl ToSql for Timestamp {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         Ok(rusqlite::types::ToSqlOutput::Owned(
-            rusqlite::types::Value::Text(NTP64(self.0).to_string()),
+            rusqlite::types::Value::Text(self.0.to_string()),
         ))
     }
 }
