@@ -649,11 +649,6 @@ pub async fn bidirectional_sync(
             }
             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
 
-            let mut recv = read.into_inner();
-            if let Err(e) = recv.stop(0u32.into()) {
-                warn!("could not stop recv stream during sync: {e}");
-            }
-
             Ok(count)
         }
     )?;
