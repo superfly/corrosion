@@ -67,7 +67,7 @@ impl CorrosionApiClient {
         Ok(res.into_body())
     }
 
-    pub async fn subscription(
+    pub async fn subscribe(
         &self,
         statement: &Statement,
     ) -> Result<
@@ -100,7 +100,7 @@ impl CorrosionApiClient {
         Ok((id, subscription_stream(res.into_body())))
     }
 
-    pub async fn subscriptioned_query(
+    pub async fn subscription(
         &self,
         id: Uuid,
     ) -> Result<impl Stream<Item = io::Result<QueryEvent>> + Send + Sync + 'static, Error> {

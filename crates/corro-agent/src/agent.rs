@@ -11,7 +11,7 @@ use crate::{
     api::{
         client::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
         peer::{bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, SyncError},
-        pubsub::{api_v1_subscription_by_id, api_v1_subscriptions, MatcherCache},
+        pubsub::{api_v1_sub_by_id, api_v1_subs, MatcherCache},
     },
     broadcast::runtime_loop,
     transport::{ConnectError, Transport},
@@ -723,7 +723,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         )
         .route(
             "/v1/subscriptions",
-            post(api_v1_subscriptions).route_layer(
+            post(api_v1_subs).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -737,7 +737,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         )
         .route(
             "/v1/subscriptions/:id",
-            get(api_v1_subscription_by_id).route_layer(
+            get(api_v1_sub_by_id).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((

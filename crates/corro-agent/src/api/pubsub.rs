@@ -25,14 +25,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-pub async fn api_v1_subscription_by_id(
+pub async fn api_v1_sub_by_id(
     Extension(agent): Extension<Agent>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> impl IntoResponse {
-    subscription_by_id(agent, id).await
+    sub_by_id(agent, id).await
 }
 
-async fn subscription_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
+async fn sub_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
     let matcher = match { agent.matchers().read().get(&id).cloned() } {
         Some(matcher) => matcher,
         None => {
@@ -40,7 +40,7 @@ async fn subscription_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Bo
                 .status(StatusCode::NOT_FOUND)
                 .body(
                     serde_json::to_vec(&QueryEvent::Error(format_compact!(
-                        "could not find subscriptioner with id {id}"
+                        "could not find subscription with id {id}"
                     )))
                     .expect("could not serialize queries stream error")
                     .into(),
@@ -56,7 +56,7 @@ async fn subscription_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Bo
     let change_rx = matcher.subscribe();
     let cancel = matcher.cancel();
 
-    tokio::spawn(process_subscription_channel(
+    tokio::spawn(process_sub_channel(
         agent.clone(),
         id,
         tx,
@@ -143,7 +143,7 @@ async fn subscription_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Bo
         .expect("could not build query response body")
 }
 
-async fn process_subscription_channel(
+async fn process_sub_channel(
     agent: Agent,
     matcher_id: Uuid,
     mut tx: hyper::body::Sender,
@@ -363,7 +363,7 @@ async fn expand_sql(
 
 pub type MatcherCache = Arc<TokioRwLock<HashMap<String, Uuid>>>;
 
-pub async fn api_v1_subscriptions(
+pub async fn api_v1_subs(
     Extension(agent): Extension<Agent>,
     Extension(subscription_cache): Extension<MatcherCache>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
@@ -388,7 +388,7 @@ pub async fn api_v1_subscriptions(
         let contains = { agent.matchers().read().contains_key(&matcher_id) };
         if contains {
             info!("reusing matcher id {matcher_id}");
-            return subscription_by_id(agent, matcher_id).await;
+            return sub_by_id(agent, matcher_id).await;
         } else {
             subscription_cache.write().await.remove(&stmt);
         }
@@ -446,7 +446,7 @@ pub async fn api_v1_subscriptions(
         subscription_cache.write().await.insert(stmt, matcher_id);
     }
 
-    tokio::spawn(process_subscription_channel(
+    tokio::spawn(process_sub_channel(
         agent.clone(),
         matcher_id,
         tx,
@@ -479,7 +479,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn test_api_v1_subscriptions() -> eyre::Result<()> {
+    async fn test_api_v1_subs() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
 
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
@@ -550,7 +550,7 @@ mod tests {
 
         assert!(body.0.results.len() == 2);
 
-        let res = api_v1_subscriptions(
+        let res = api_v1_subs(
             Extension(agent.clone()),
             Extension(Default::default()),
             axum::Json(Statement::Simple("select * from tests".into())),
