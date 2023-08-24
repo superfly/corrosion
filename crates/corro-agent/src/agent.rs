@@ -418,6 +418,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                 }
                                             }
                                         }
+
+                                        if buf.capacity() >= 64 * 1024 {
+                                            info!(
+                                                "big buf from processing unidirectional stream: {}",
+                                                buf.capacity()
+                                            );
+                                        }
                                     }
                                 });
                             }
@@ -459,35 +466,48 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                 return;
                                             }
                                             Some(res) => match res {
-                                                Ok(b) => match BiPayload::read_from_buffer(&b) {
-                                                    Ok(payload) => {
-                                                        match payload {
-                                                            BiPayload::V1(
-                                                                BiPayloadV1::SyncState(state),
-                                                            ) => {
-                                                                // println!("got sync state: {state:?}");
-                                                                if let Err(e) = bidirectional_sync(
-                                                                    &agent,
-                                                                    generate_sync(
-                                                                        agent.bookie(),
-                                                                        agent.actor_id(),
-                                                                    ),
-                                                                    Some(state),
-                                                                    framed.into_inner(),
-                                                                    tx,
-                                                                )
-                                                                .await
-                                                                {
-                                                                    warn!("could not complete bidirectional sync: {e}");
+                                                Ok(b) => {
+                                                    if b.capacity() >= 64 * 1024 {
+                                                        info!(
+                                                            "big buf from processing bidirectional stream: {}",
+                                                            b.capacity()
+                                                        );
+                                                    }
+                                                    match BiPayload::read_from_buffer(&b) {
+                                                        Ok(payload) => {
+                                                            match payload {
+                                                                BiPayload::V1(
+                                                                    BiPayloadV1::SyncState(state),
+                                                                ) => {
+                                                                    // println!("got sync state: {state:?}");
+                                                                    if let Err(e) =
+                                                                        bidirectional_sync(
+                                                                            &agent,
+                                                                            generate_sync(
+                                                                                agent.bookie(),
+                                                                                agent.actor_id(),
+                                                                            ),
+                                                                            Some(state),
+                                                                            framed.into_inner(),
+                                                                            tx,
+                                                                        )
+                                                                        .await
+                                                                    {
+                                                                        warn!("could not complete bidirectional sync: {e}");
+                                                                    }
+                                                                    break;
                                                                 }
-                                                                break;
                                                             }
                                                         }
+
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "could not decode BiPayload: {e}"
+                                                            );
+                                                        }
                                                     }
-                                                    Err(e) => {
-                                                        warn!("could not decode BiPayload: {e}");
-                                                    }
-                                                },
+                                                }
+
                                                 Err(e) => {
                                                     error!("could not read framed payload from bidirectional stream: {e}");
                                                 }
@@ -999,6 +1019,7 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
         });
 
         increment_counter!("corro.gossip.send.count", "actor_id" => actor.id().to_string());
+        gauge!("corro.gossip.send.buffer.capacity", buf.capacity() as f64);
     }
 }
 
