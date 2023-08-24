@@ -376,16 +376,12 @@ pub fn runtime_loop(
                                 let tx = conn.transaction()?;
 
                                 for (id, address, state, foca_state) in splitted {
-                                    tx.prepare_cached(
-                                        "
-                                            INSERT INTO __corro_members (id, address, state, foca_state)
+                                    tx.prepare_cached("INSERT INTO __corro_members (id, address, state, foca_state)
                                                 VALUES (?, ?, ?, ?)
                                             ON CONFLICT (id) DO UPDATE SET
                                                 address = excluded.address,
                                                 state = excluded.state,
-                                                foca_state = excluded.foca_state;
-                                        ",
-                                    )?
+                                                foca_state = excluded.foca_state;")?
                                     .execute(params![
                                         id,
                                         address.to_string(),

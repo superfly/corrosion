@@ -713,8 +713,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
                 {
                     Ok(foca_states) => {
-                        foca_states.iter().filter_map(|state| match serde_json::from_str(state.as_str()) {
-                            Ok(fs) => Some(fs),
+                        foca_states.iter().filter_map(|state| match serde_json::from_str::<foca::Member<Actor>>(state.as_str()) {
+                            Ok(fs) => match fs.state() {
+                                foca::State::Suspect => None,
+                                _ => Some(fs)
+                            },
                             Err(e) => {
                                 error!("could not deserialize foca member state: {e} (json: {state})");
                                 None
