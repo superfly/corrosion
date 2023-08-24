@@ -1078,8 +1078,9 @@ async fn handle_notifications(
         match notification {
             Notification::MemberUp(actor) => {
                 let added = { agent.members().write().add_member(&actor) };
-                info!("Member Up {actor:?} (added: {added})");
+                debug!("Member Up {actor:?} (added: {added})");
                 if added {
+                    debug!("Member Up {actor:?}");
                     increment_counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
                     // actually added a member
                     // notify of new cluster size
@@ -1095,8 +1096,9 @@ async fn handle_notifications(
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
-                info!("Member Down {actor:?} (removed: {removed})");
+                debug!("Member Down {actor:?} (removed: {removed})");
                 if removed {
+                    info!("Member Down {actor:?}");
                     increment_counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
                     // actually removed a member
                     // notify of new cluster size
@@ -1841,7 +1843,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
             }
         };
 
-        info!(
+        debug!(
             actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
             actor_id,
             sync_state.need_len(),
@@ -1869,12 +1871,14 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         let n = bidirectional_sync(&agent, sync_state, None, rx, tx).await?;
 
         let elapsed = start.elapsed();
-        info!(
-            "synced {n} changes w/ {} in {}s @ {} changes/s",
-            actor_id,
-            elapsed.as_secs_f64(),
-            n as f64 / elapsed.as_secs_f64()
-        );
+        if n > 0 {
+            info!(
+                "synced {n} changes w/ {} in {}s @ {} changes/s",
+                actor_id,
+                elapsed.as_secs_f64(),
+                n as f64 / elapsed.as_secs_f64()
+            );
+        }
         return Ok(());
     }
 }
