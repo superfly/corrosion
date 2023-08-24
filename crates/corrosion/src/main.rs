@@ -278,7 +278,7 @@ struct Cli {
         long = "config",
         short,
         global = true,
-        default_value = "corrosion.toml"
+        default_value = "/etc/corrosion/config.toml"
     )]
     config_path: Utf8PathBuf,
 

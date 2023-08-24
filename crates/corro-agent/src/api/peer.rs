@@ -83,11 +83,11 @@ fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig
             .unwrap(),
     ));
 
-    // max 1024 concurrent bidirectional streams
-    transport_config.max_concurrent_bidi_streams(1024u32.into());
+    // max concurrent bidirectional streams
+    transport_config.max_concurrent_bidi_streams(32u32.into());
 
-    // max 10240 concurrent unidirectional streams
-    transport_config.max_concurrent_uni_streams(10240u32.into());
+    // max concurrent unidirectional streams
+    transport_config.max_concurrent_uni_streams(512u32.into());
 
     if let Some(max_mtu) = config.max_mtu {
         info!("Setting maximum MTU for QUIC at {max_mtu}");

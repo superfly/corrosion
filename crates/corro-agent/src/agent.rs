@@ -713,8 +713,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
                 {
                     Ok(foca_states) => {
-                        foca_states.iter().filter_map(|state| match serde_json::from_str(state.as_str()) {
-                            Ok(fs) => Some(fs),
+                        foca_states.iter().filter_map(|state| match serde_json::from_str::<foca::Member<Actor>>(state.as_str()) {
+                            Ok(fs) => match fs.state() {
+                                foca::State::Suspect => None,
+                                _ => Some(fs)
+                            },
                             Err(e) => {
                                 error!("could not deserialize foca member state: {e} (json: {state})");
                                 None
@@ -1080,7 +1083,7 @@ async fn handle_notifications(
                 let added = { agent.members().write().add_member(&actor) };
                 debug!("Member Up {actor:?} (added: {added})");
                 if added {
-                    debug!("Member Up {actor:?}");
+                    info!("Member Up {actor:?}");
                     increment_counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
                     // actually added a member
                     // notify of new cluster size

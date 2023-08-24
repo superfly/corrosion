@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     num::NonZeroU32,
     pin::Pin,
@@ -16,6 +17,7 @@ use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
+use spawn::spawn_counted;
 use speedy::Writable;
 use strum::EnumDiscriminants;
 use tokio::{
@@ -132,7 +134,7 @@ pub fn runtime_loop(
 
     // foca SWIM operations loop.
     // NOTE: every turn of that loop should be fast or else we risk being suspected of being down
-    tokio::spawn({
+    spawn_counted({
         let config = config.clone();
         let agent = agent.clone();
         let mut tripwire = tripwire.clone();
@@ -142,7 +144,7 @@ pub fn runtime_loop(
 
             let member_events_chunks =
                 tokio_stream::wrappers::BroadcastStream::new(member_events.resubscribe())
-                    .chunks_timeout(100, Duration::from_secs(30));
+                    .chunks_timeout(1000, Duration::from_secs(2));
             tokio::pin!(member_events_chunks);
 
             #[derive(EnumDiscriminants)]
@@ -283,6 +285,9 @@ pub fn runtime_loop(
                             }
                         }
 
+                        // extra time for leave message to propagate
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+
                         break;
                     }
                     Branch::Foca(input) => match input {
@@ -331,8 +336,12 @@ pub fn runtime_loop(
                         let splitted: Vec<_> = evts
                             .iter()
                             .flatten()
-                            .filter_map(|evt| {
-                                let actor = evt.actor();
+                            .fold(HashMap::new(), |mut acc, evt| {
+                                acc.insert(evt.actor(), evt.as_str());
+                                acc
+                            })
+                            .into_iter()
+                            .filter_map(|(actor, evt)| {
                                 let foca_state = {
                                     // need to bind this...
                                     let foca_state = foca
@@ -350,9 +359,8 @@ pub fn runtime_loop(
                                     foca_state
                                 };
 
-                                foca_state.map(|foca_state| {
-                                    (actor.id(), actor.addr(), evt.as_str(), foca_state)
-                                })
+                                foca_state
+                                    .map(|foca_state| (actor.id(), actor.addr(), evt, foca_state))
                             })
                             .collect();
 
@@ -372,22 +380,25 @@ pub fn runtime_loop(
                                 let tx = conn.transaction()?;
 
                                 for (id, address, state, foca_state) in splitted {
-                                    tx.prepare_cached(
-                                        "
-                                            INSERT INTO __corro_members (id, address, state, foca_state)
+                                    trace!(
+                                        "updating {id} {address} as {state} w/ state: {foca_state:?}",
+                                    );
+                                    let upserted = tx.prepare_cached("INSERT INTO __corro_members (id, address, state, foca_state)
                                                 VALUES (?, ?, ?, ?)
                                             ON CONFLICT (id) DO UPDATE SET
                                                 address = excluded.address,
                                                 state = excluded.state,
-                                                foca_state = excluded.foca_state;
-                                        ",
-                                    )?
+                                                foca_state = excluded.foca_state;")?
                                     .execute(params![
                                         id,
                                         address.to_string(),
                                         state,
                                         foca_state
                                     ])?;
+
+                                    if upserted != 1 {
+                                        warn!("did not update member");
+                                    }
                                 }
 
                                 tx.commit()?;
@@ -691,7 +702,7 @@ fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
         }
 
         if let Err(e) = stream.finish().await {
-            warn!("error finishing broadcast uni stream to {addr}: {e}");
+            debug!("could not finish broadcast uni stream to {addr}: {e}");
         }
     });
 }
