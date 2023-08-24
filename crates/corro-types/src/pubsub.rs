@@ -306,7 +306,7 @@ impl Matcher {
                 MatcherStmt {
                     new_query,
                     temp_query: format!(
-                        "SELECT {} FROM {} WHERE ({}) IN watch_{}_{}",
+                        "SELECT {} FROM {} WHERE ({}) IN subscription_{}_{}",
                         tmp_cols.join(","),
                         query_table,
                         pk_cols,
@@ -325,7 +325,7 @@ impl Matcher {
             statements: statements,
             pks,
             parsed,
-            qualified_table_name: format!("watches.{query_table}"),
+            qualified_table_name: format!("subscriptions.{query_table}"),
             query_table,
             change_tx,
             cmd_tx,
@@ -348,7 +348,7 @@ impl Matcher {
 
         let create_temp_table = format!(
             "CREATE TABLE {} (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {});
-            CREATE UNIQUE INDEX watches.index_{}_pk ON {} ({});",
+            CREATE UNIQUE INDEX subscriptions.index_{}_pk ON {} ({});",
             matcher.0.qualified_table_name,
             tmp_cols.join(","),
             matcher.0.id.as_simple(),
@@ -565,7 +565,7 @@ impl Matcher {
         for (table, pks) in candidates {
             // TODO: cache the statement string somewhere, it's always the same!
             tx.prepare_cached(&format!(
-                "CREATE TEMP TABLE watch_{}_{} ({})",
+                "CREATE TEMP TABLE subscription_{}_{} ({})",
                 self.0.id.as_simple(),
                 table,
                 self.0
@@ -581,7 +581,7 @@ impl Matcher {
 
             for pks in pks {
                 tx.prepare_cached(&format!(
-                    "INSERT INTO watch_{}_{} VALUES ({})",
+                    "INSERT INTO subscription_{}_{} VALUES ({})",
                     self.0.id.as_simple(),
                     table,
                     (0..pks.len()).map(|_i| "?").collect::<Vec<_>>().join(",")
@@ -726,7 +726,7 @@ impl Matcher {
         // clean up temporary tables immediately
         for table in tables {
             tx.prepare_cached(&format!(
-                "DROP TABLE watch_{}_{}",
+                "DROP TABLE subscription_{}_{}",
                 self.0.id.as_simple(),
                 table
             ))?
@@ -1127,7 +1127,7 @@ fn table_to_expr(
                 .collect(),
         ),
         false,
-        QualifiedName::single(Name(format!("watch_{}_{table}", id.as_simple()))),
+        QualifiedName::single(Name(format!("subscription_{}_{table}", id.as_simple()))),
         None,
     );
 
@@ -1204,11 +1204,11 @@ mod tests {
             &[(
                 tmpdir
                     .path()
-                    .join("watches.db")
+                    .join("subscriptions.db")
                     .display()
                     .to_string()
                     .into(),
-                "watches".into(),
+                "subscriptions".into(),
             )]
             .into(),
         )?;
@@ -1226,11 +1226,11 @@ mod tests {
             &[(
                 tmpdir
                     .path()
-                    .join("watches.db")
+                    .join("subscriptions.db")
                     .display()
                     .to_string()
                     .into(),
-                "watches".into(),
+                "subscriptions".into(),
             )]
             .into(),
         )?;
@@ -1333,11 +1333,11 @@ mod tests {
             &[(
                 tmpdir
                     .path()
-                    .join("watches.db")
+                    .join("subscriptions.db")
                     .display()
                     .to_string()
                     .into(),
-                "watches".into(),
+                "subscriptions".into(),
             )]
             .into(),
         )
@@ -1384,11 +1384,11 @@ mod tests {
                 &[(
                     tmpdir
                         .path()
-                        .join("watches.db")
+                        .join("subscriptions.db")
                         .display()
                         .to_string()
                         .into(),
-                    "watches".into(),
+                    "subscriptions".into(),
                 )]
                 .into(),
             )
@@ -1449,11 +1449,11 @@ mod tests {
             &[(
                 tmpdir
                     .path()
-                    .join("watches.db")
+                    .join("subscriptions.db")
                     .display()
                     .to_string()
                     .into(),
-                "watches".into(),
+                "subscriptions".into(),
             )]
             .into(),
         )

@@ -19,8 +19,8 @@ use crate::signalstream::SignalStream;
 /// `drop`ped.
 #[derive(Debug)]
 pub struct Tripwire {
-    watch: WatchStream<TripwireState>,
-    watch_rx: watch::Receiver<TripwireState>,
+    subscription: WatchStream<TripwireState>,
+    subscription_rx: watch::Receiver<TripwireState>,
 }
 
 impl Tripwire {
@@ -32,10 +32,13 @@ impl Tripwire {
     {
         let (sender, receiver) = watch::channel(TripwireState::Running);
         let tripwire = Tripwire {
-            watch: WatchStream::new(receiver.clone()),
-            watch_rx: receiver,
+            subscription: WatchStream::new(receiver.clone()),
+            subscription_rx: receiver,
         };
-        let worker = TripwireWorker { watch: sender, stream };
+        let worker = TripwireWorker {
+            subscription: sender,
+            stream,
+        };
         (tripwire, worker)
     }
 
@@ -56,7 +59,7 @@ impl Tripwire {
 
     /// Returns an Arc of the current [TripwireState]
     pub fn state(&self) -> TripwireState {
-        *self.watch_rx.borrow()
+        *self.subscription_rx.borrow()
     }
 
     /// Returns true if we're shutting down
@@ -66,15 +69,18 @@ impl Tripwire {
 
     /// Returns a [Future] that completes when this wire is tripped
     pub fn tripwired<F>(self, inner: F) -> Tripwired<F> {
-        Tripwired { tripwire: self, inner }
+        Tripwired {
+            tripwire: self,
+            inner,
+        }
     }
 }
 
 impl Clone for Tripwire {
     fn clone(&self) -> Self {
         Tripwire {
-            watch: WatchStream::new(self.watch_rx.clone()),
-            watch_rx: self.watch_rx.clone(),
+            subscription: WatchStream::new(self.subscription_rx.clone()),
+            subscription_rx: self.subscription_rx.clone(),
         }
     }
 }
@@ -84,7 +90,7 @@ impl Future for Tripwire {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         loop {
-            match futures::ready!(Pin::new(&mut self.watch).poll_next(cx)) {
+            match futures::ready!(Pin::new(&mut self.subscription).poll_next(cx)) {
                 Some(TripwireState::Running) => {}
                 Some(TripwireState::ShuttingDown) => return Poll::Ready(()),
                 None => return Poll::Ready(()),
@@ -140,7 +146,7 @@ pub enum TripwireState {
 /// Trips the [Tripwire] when receiving anything from a stream
 /// (used for signals), or when dropping.
 pub struct TripwireWorker<S> {
-    watch: watch::Sender<TripwireState>,
+    subscription: watch::Sender<TripwireState>,
     stream: S,
 }
 
@@ -159,10 +165,10 @@ where
         println!(); // cleaner logs! (new line after ^C)
         debug!("TripwireWorker tripped");
 
-        if let Err(error) = self.watch.send(TripwireState::ShuttingDown) {
-            warn!("all watch handles have been cancelled?: {:?}", error);
+        if let Err(error) = self.subscription.send(TripwireState::ShuttingDown) {
+            warn!("all subscription handles have been cancelled?: {:?}", error);
         }
-        debug!("tripwire worker's watch has been updated");
+        debug!("tripwire worker's subscription has been updated");
         Poll::Ready(())
     }
 }

@@ -189,14 +189,14 @@ impl Cell {
 
 struct QueryResponseIter {
     query: Arc<TokioRwLock<QueryHandle>>,
-    body: OnceCell<BoxedWatchStream>,
+    body: OnceCell<BoxedSubscriptionStream>,
     handle: tokio::runtime::Handle,
     done: bool,
     columns: Option<Arc<Vec<CompactString>>>,
 }
 
 impl QueryResponseIter {
-    pub async fn body(&mut self) -> Result<&mut BoxedWatchStream, Box<EvalAltResult>> {
+    pub async fn body(&mut self) -> Result<&mut BoxedSubscriptionStream, Box<EvalAltResult>> {
         self.body
             .get_or_try_init(|| async {
                 match self.query.write().await.body().await {
@@ -281,22 +281,22 @@ impl Iterator for QueryResponseIter {
     }
 }
 
-pub type BoxedWatchStream =
+pub type BoxedSubscriptionStream =
     Pin<Box<dyn Stream<Item = io::Result<QueryEvent>> + Send + Sync + 'static>>;
 
 pub struct QueryHandle {
     id: Uuid,
-    body: Option<BoxedWatchStream>,
+    body: Option<BoxedSubscriptionStream>,
     client: CorrosionApiClient,
 }
 
 impl QueryHandle {
-    async fn body(&mut self) -> Result<(BoxedWatchStream, bool), corro_client::Error> {
+    async fn body(&mut self) -> Result<(BoxedSubscriptionStream, bool), corro_client::Error> {
         if let Some(body) = self.body.take() {
             return Ok((body, true));
         }
 
-        Ok((Box::pin(self.client.watched_query(self.id).await?), false))
+        Ok((Box::pin(self.client.subscription(self.id).await?), false))
     }
 }
 
@@ -470,7 +470,7 @@ impl Engine {
         ) -> Result<QueryResponse, Box<EvalAltResult>> {
             debug!("sql function call {stmt:?}");
             let (query_id, body) = tokio::runtime::Handle::current()
-                .block_on(client.watch(&stmt))
+                .block_on(client.subscribe(&stmt))
                 .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
 
             debug!("got res w/ id: {query_id}");

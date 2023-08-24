@@ -580,6 +580,14 @@ pub fn runtime_loop(
                         bcast_tx.capacity() as f64
                     );
                     gauge!("corro.broadcast.pending.count", idle_pendings.len() as f64);
+                    gauge!(
+                        "corro.broadcast.buffer.capacity",
+                        bcast_buf.capacity() as f64
+                    );
+                    gauge!(
+                        "corro.broadcast.serialization.buffer.capacity",
+                        ser_buf.capacity() as f64
+                    );
                 }
             }
 
