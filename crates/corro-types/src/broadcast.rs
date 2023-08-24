@@ -32,7 +32,6 @@ pub enum UniPayload {
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
-    Gossip(Vec<u8>),
     Broadcast(BroadcastV1),
 }
 

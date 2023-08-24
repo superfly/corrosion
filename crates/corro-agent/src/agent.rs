@@ -296,16 +296,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     tokio::spawn({
         let bookie = agent.bookie().clone();
         let self_actor_id = agent.actor_id();
-        let foca_tx = foca_tx.clone();
         async move {
             while let Some(payload) = process_uni_rx.recv().await {
                 match payload {
-                    UniPayload::V1(UniPayloadV1::Gossip(data)) => {
-                        if let Err(e) = foca_tx.send(FocaInput::Data(data.into())).await {
-                            error!("could not send foca data to channel for processing: {e}");
-                            continue;
-                        }
-                    }
                     UniPayload::V1(UniPayloadV1::Broadcast(bcast)) => {
                         handle_change(bcast, self_actor_id, &bookie, &bcast_msg_tx).await
                     }
@@ -457,12 +450,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                             }
                                         }
 
-                                        // if buf.capacity() >= 64 * 1024 {
-                                        //     info!(
-                                        //         "big buf from processing unidirectional stream: {}",
-                                        //         buf.capacity()
-                                        //     );
-                                        // }
+                                        if let Err(e) = rx.stop(0u32.into()) {
+                                            warn!("error stopping recved uni stream: {e}");
+                                        }
                                     }
                                 });
                             }
@@ -509,12 +499,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                             }
                                             Ok(Some(res)) => match res {
                                                 Ok(b) => {
-                                                    // if b.capacity() >= 64 * 1024 {
-                                                    //     info!(
-                                                    //         "big buf from processing bidirectional stream: {}",
-                                                    //         b.capacity()
-                                                    //     );
-                                                    // }
                                                     match BiPayload::read_from_buffer(&b) {
                                                         Ok(payload) => {
                                                             match payload {
@@ -1022,35 +1006,15 @@ fn compact_booked_for_actor(
 }
 
 async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Bytes)>) {
+    // TODO: use tripwire and drain messages to send when that happens...
     while let Some((actor, data)) = to_send_rx.recv().await {
         trace!("got gossip to send to {actor:?}");
 
         let addr = actor.addr();
 
-        // let payload = UniPayload::V1(UniPayloadV1::Gossip(data));
-        // if let Err(e) = payload.write_to_stream((&mut buf).writer()) {
-        //     error!("could not write to buf: {e}");
-        //     continue;
-        // }
-
-        // if let Err(e) = codec.encode(buf.split().freeze(), &mut buf) {
-        //     error!("could not encode buf: {e}");
-        //     continue;
-        // }
-
-        // let bytes = buf.split().freeze();
-
         let transport = transport.clone();
 
         spawn_counted(async move {
-            // let mut stream = match transport.open_uni(addr).await {
-            //     Ok(s) => s,
-            //     Err(e) => {
-            //         error!("could not open unidirectional stream {addr}: {e}");
-            //         return;
-            //     }
-            // };
-
             match timeout(Duration::from_secs(5), transport.send_datagram(addr, data)).await {
                 Err(_e) => {
                     warn!("timed out writing gossip as datagram {addr}");
@@ -1065,7 +1029,6 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
         });
 
         increment_counter!("corro.gossip.send.count", "actor_id" => actor.id().to_string());
-        // gauge!("corro.gossip.send.buffer.capacity", buf.capacity() as f64);
     }
 }
 

@@ -689,5 +689,9 @@ fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
             }
             _ => {}
         }
+
+        if let Err(e) = stream.finish().await {
+            warn!("error finishing broadcast uni stream to {addr}: {e}");
+        }
     });
 }
