@@ -42,6 +42,12 @@ Allows using QUIC without encryption. The only reason to set this to `true` is i
 It's highly recommended to use the `gossip.tls` configuration block to setup encryption and `gossip.tls.client` to setup authorization.
 ```
 
+#### `gossip.idle_timeout_secs`
+
+The max idle timeout in seconds for QUIC connection.
+
+Defaults to 30 seconds.
+
 #### `gossip.max_mtu`
 
 Define the max MTU for QUIC. Instead of attempting to discover the best MTU value automatically, you can define this upper bound.
