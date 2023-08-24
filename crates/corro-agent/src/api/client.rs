@@ -189,6 +189,7 @@ where
                 ts,
             },
         );
+        drop(book_writer);
 
         let agent = agent.clone();
 
