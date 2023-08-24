@@ -562,12 +562,6 @@ pub async fn bidirectional_sync(
         .await
         .map_err(|_| SyncSendError::ChannelClosed)?;
 
-    tx.send(SyncMessage::V1(SyncMessageV1::Clock(
-        agent.clock().new_timestamp().into(),
-    )))
-    .await
-    .map_err(|_| SyncSendError::ChannelClosed)?;
-
     let (_sent_count, recv_count) = tokio::try_join!(
         async move {
             let mut count = 0;
@@ -616,6 +610,12 @@ pub async fn bidirectional_sync(
             };
 
             let their_actor_id = their_sync_state.actor_id;
+
+            tx.send(SyncMessage::V1(SyncMessageV1::Clock(
+                agent.clock().new_timestamp().into(),
+            )))
+            .await
+            .map_err(|_| SyncSendError::ChannelClosed)?;
 
             tokio::spawn(
                 process_sync(
