@@ -29,10 +29,7 @@ impl ActorId {
 
 impl Into<uhlc::ID> for ActorId {
     fn into(self) -> uhlc::ID {
-        self.0
-            .as_u128()
-            .try_into()
-            .expect("attempted to convert a nil (0) actor id a uhlc ID and failed!")
+        self.0.into()
     }
 }
 

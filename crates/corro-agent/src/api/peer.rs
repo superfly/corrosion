@@ -649,7 +649,9 @@ pub async fn bidirectional_sync(
                                 continue;
                             }
                             SyncMessage::V1(SyncMessageV1::Clock(ts)) => {
-                                if let Err(e) = agent.clock().update_with_timestamp(&ts) {
+                                if let Err(e) = agent.clock().update_with_timestamp(
+                                    &uhlc::Timestamp::new(ts.to_ntp64(), their_actor_id.into()),
+                                ) {
                                     warn!(
                                         "could not update clock from actor {their_actor_id}: {e}"
                                     );

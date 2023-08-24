@@ -163,19 +163,14 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             let row = rows.next()?;
             match row {
                 None => break,
-                Some(row) => match partials.entry((row.get(0)?, row.get(1)?)) {
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        let (range, last_seq, ts) = entry.get_mut();
-                        range.insert(row.get(2)?..=row.get(3)?);
-                        *last_seq = row.get(4)?;
-                        *ts = row.get(5)?;
-                    }
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        let mut range: RangeInclusiveSet<i64> = Default::default();
-                        range.insert(row.get(2)?..=row.get(3)?);
-                        entry.insert((range, row.get(4)?, row.get(5)?));
-                    }
-                },
+                Some(row) => {
+                    let (range, last_seq, ts) =
+                        partials.entry((row.get(0)?, row.get(1)?)).or_default();
+
+                    range.insert(row.get(2)?..=row.get(3)?);
+                    *last_seq = row.get(4)?;
+                    *ts = row.get(5)?;
+                }
             }
         }
 
