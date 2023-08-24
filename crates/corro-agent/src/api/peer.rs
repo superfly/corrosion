@@ -13,7 +13,7 @@ use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use metrics::counter;
-use quinn::{MtuDiscoveryConfig, RecvStream, SendStream};
+use quinn::{RecvStream, SendStream};
 use rusqlite::{params, Connection};
 use speedy::Writable;
 use tokio::sync::mpsc::{channel, Sender};
@@ -91,10 +91,9 @@ fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig
 
     if let Some(max_mtu) = config.max_mtu {
         info!("Setting maximum MTU for QUIC at {max_mtu}");
-        transport_config.initial_mtu(1200);
-        let mut mtu_discovery = MtuDiscoveryConfig::default();
-        mtu_discovery.upper_bound(max_mtu);
-        transport_config.mtu_discovery_config(Some(mtu_discovery));
+        transport_config.initial_mtu(max_mtu);
+        // disable discovery
+        transport_config.mtu_discovery_config(None);
     }
 
     if config.disable_gso {
