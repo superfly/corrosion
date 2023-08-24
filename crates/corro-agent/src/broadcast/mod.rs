@@ -376,7 +376,10 @@ pub fn runtime_loop(
                                 let tx = conn.transaction()?;
 
                                 for (id, address, state, foca_state) in splitted {
-                                    tx.prepare_cached("INSERT INTO __corro_members (id, address, state, foca_state)
+                                    info!(
+                                        "updating {id} {address} as {state} w/ state: {foca_state:?}",
+                                    );
+                                    let upserted = tx.prepare_cached("INSERT INTO __corro_members (id, address, state, foca_state)
                                                 VALUES (?, ?, ?, ?)
                                             ON CONFLICT (id) DO UPDATE SET
                                                 address = excluded.address,
@@ -388,6 +391,10 @@ pub fn runtime_loop(
                                         state,
                                         foca_state
                                     ])?;
+
+                                    if upserted != 1 {
+                                        warn!("did not update member");
+                                    }
                                 }
 
                                 tx.commit()?;
