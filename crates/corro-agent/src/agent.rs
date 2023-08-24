@@ -1017,21 +1017,21 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
         let transport = transport.clone();
 
         spawn_counted(async move {
-            let mut stream = match transport.open_uni(addr).await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("could not open unidirectional stream {addr}: {e}");
-                    return;
-                }
-            };
+            // let mut stream = match transport.open_uni(addr).await {
+            //     Ok(s) => s,
+            //     Err(e) => {
+            //         error!("could not open unidirectional stream {addr}: {e}");
+            //         return;
+            //     }
+            // };
 
-            match timeout(Duration::from_secs(5), stream.write_all(&bytes)).await {
+            match timeout(Duration::from_secs(5), transport.send_datagram(addr, bytes)).await {
                 Err(_e) => {
-                    warn!("timed out writing gossip to uni stream {addr}");
+                    warn!("timed out writing gossip as datagram {addr}");
                     return;
                 }
                 Ok(Err(e)) => {
-                    error!("could not write to uni stream {addr}: {e}");
+                    error!("could not write datagram {addr}: {e}");
                     return;
                 }
                 _ => {}

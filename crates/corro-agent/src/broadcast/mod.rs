@@ -645,8 +645,8 @@ fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
     let mut config = foca::Config::new_wan(cluster_size);
     config.remove_down_after = Duration::from_secs(2 * 24 * 60 * 60);
 
-    // max payload size for udp over ipv6 wg - 1 for payload type
-    // config.max_packet_size = EFFECTIVE_CAP.try_into().unwrap();
+    // max payload size for udp datagrams, use a safe value here...
+    config.max_packet_size = 1200.try_into().unwrap();
 
     config
 }
