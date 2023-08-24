@@ -2,7 +2,10 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use compact_str::CompactString;
-use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError, SendStream};
+use quinn::{
+    ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
+    SendStream,
+};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -124,10 +127,20 @@ impl Transport {
     }
 }
 
+const NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0);
+
 fn test_conn(conn: &Connection) -> bool {
     match conn.close_reason() {
         None => true,
-        Some(ConnectionError::TimedOut) => {
+        Some(
+            ConnectionError::TimedOut
+            | ConnectionError::Reset
+            | ConnectionError::LocallyClosed
+            | ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: NO_ERROR,
+                ..
+            }),
+        ) => {
             // don't log, pretty normal stuff
             false
         }
