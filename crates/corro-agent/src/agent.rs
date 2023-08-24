@@ -1349,29 +1349,29 @@ async fn process_fully_buffered_changes(
 
     let mut conn = agent.pool().write_normal().await?;
 
-    let mut bookedw = booked.write();
+    let inserted = block_in_place(|| {
+        let mut bookedw = booked.write();
 
-    let (last_seq, ts) = {
-        match bookedw.inner().get(&version) {
-            Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
-                if seqs.gaps(&(0..=*last_seq)).count() != 0 {
-                    // TODO: return an error here
+        let (last_seq, ts) = {
+            match bookedw.inner().get(&version) {
+                Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
+                    if seqs.gaps(&(0..=*last_seq)).count() != 0 {
+                        // TODO: return an error here
+                        return Ok(false);
+                    }
+                    (*last_seq, *ts)
+                }
+                Some(_) => {
+                    warn!(%actor_id, %version, "already processed buffered changes, returning");
                     return Ok(false);
                 }
-                (*last_seq, *ts)
+                None => {
+                    warn!(%actor_id, %version, "version not found in cache,returning");
+                    return Ok(false);
+                }
             }
-            Some(_) => {
-                warn!(%actor_id, %version, "already processed buffered changes, returning");
-                return Ok(false);
-            }
-            None => {
-                warn!(%actor_id, %version, "version not found in cache,returning");
-                return Ok(false);
-            }
-        }
-    };
+        };
 
-    let known_version = block_in_place(|| {
         let tx = conn.transaction()?;
 
         let max_db_version: Option<i64> = tx
@@ -1389,7 +1389,7 @@ async fn process_fully_buffered_changes(
         let max_db_version = match max_db_version {
             None => {
                 warn!("zero rows to move, aborting!");
-                return Ok(None);
+                return Ok(false);
             }
             Some(v) => v,
         };
@@ -1456,15 +1456,17 @@ async fn process_fully_buffered_changes(
 
         tx.commit()?;
 
-        Ok::<_, rusqlite::Error>(known_version)
+        let inserted = if let Some(known_version) = known_version {
+            bookedw.insert(version, known_version);
+            true
+        } else {
+            false
+        };
+
+        Ok::<_, rusqlite::Error>(inserted)
     })?;
 
-    Ok(if let Some(known_version) = known_version {
-        bookedw.insert(version, known_version);
-        true
-    } else {
-        false
-    })
+    Ok(inserted)
 }
 
 pub async fn process_single_version(
@@ -1500,22 +1502,26 @@ pub async fn process_single_version(
 
     let booked = bookie.for_actor(actor_id);
     let (db_version, changeset) = {
-        let mut booked_write = booked.write();
+        {
+            let booked_write = booked.write();
 
-        // check again, might've changed since we acquired the lock
-        if booked_write.contains_all(changeset.versions(), changeset.seqs()) {
-            trace!("previously unknown versions are now deemed known, aborting inserts");
-            return Ok(None);
+            // check again, might've changed since we acquired the lock
+            if booked_write.contains_all(changeset.versions(), changeset.seqs()) {
+                trace!("previously unknown versions are now deemed known, aborting inserts");
+                return Ok(None);
+            }
         }
 
-        let (known_version, changeset, db_version) = block_in_place(move || {
+        let (changeset, db_version) = block_in_place(move || {
+            let mut booked_write = booked.write();
             let tx = conn.transaction()?;
 
             let versions = changeset.versions();
             let (version, changes, seqs, last_seq, ts) = match changeset.into_parts() {
                 None => {
                     store_empty_changeset(tx, actor_id, versions.clone())?;
-                    return Ok((KnownDbVersion::Cleared, Changeset::Empty { versions }, None));
+                    booked_write.insert_many(versions.clone(), KnownDbVersion::Cleared);
+                    return Ok((Changeset::Empty { versions }, None));
                 }
                 Some(parts) => parts,
             };
@@ -1612,21 +1618,24 @@ pub async fn process_single_version(
 
                 tx.commit()?;
 
-                return Ok((
+                let changeset = Changeset::Full {
+                    version,
+                    changes,
+                    seqs,
+                    last_seq,
+                    ts,
+                };
+
+                booked_write.insert_many(
+                    changeset.versions(),
                     KnownDbVersion::Partial {
                         seqs: seqs_recorded,
                         last_seq,
                         ts,
                     },
-                    Changeset::Full {
-                        version,
-                        changes,
-                        seqs,
-                        last_seq,
-                        ts,
-                    },
-                    None,
-                ));
+                );
+
+                return Ok((changeset, None));
             }
 
             let mut db_version: i64 =
@@ -1702,11 +1711,11 @@ pub async fn process_single_version(
 
             debug!("committed transaction");
 
-            Ok::<_, rusqlite::Error>((known_version, new_changeset, db_version))
-        })?;
+            booked_write.insert_many(new_changeset.versions(), known_version);
+            trace!("inserted into in-memory bookkeeping");
 
-        booked_write.insert_many(changeset.versions(), known_version);
-        trace!("inserted into in-memory bookkeeping");
+            Ok::<_, rusqlite::Error>((new_changeset, db_version))
+        })?;
 
         (db_version, changeset)
     };
