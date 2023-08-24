@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
@@ -12,7 +13,7 @@ use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use metrics::counter;
-use quinn::{MtuDiscoveryConfig, RecvStream, SendStream};
+use quinn::{RecvStream, SendStream};
 use rusqlite::{params, Connection};
 use speedy::Writable;
 use tokio::sync::mpsc::{channel, Sender};
@@ -75,6 +76,13 @@ pub enum SyncSendError {
 fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig {
     let mut transport_config = quinn::TransportConfig::default();
 
+    // max idle timeout
+    transport_config.max_idle_timeout(Some(
+        Duration::from_secs(std::cmp::min(config.idle_timeout_secs as u64, 10))
+            .try_into()
+            .unwrap(),
+    ));
+
     // max 1024 concurrent bidirectional streams
     transport_config.max_concurrent_bidi_streams(1024u32.into());
 
@@ -83,10 +91,9 @@ fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig
 
     if let Some(max_mtu) = config.max_mtu {
         info!("Setting maximum MTU for QUIC at {max_mtu}");
-        transport_config.initial_mtu(1200);
-        let mut mtu_discovery = MtuDiscoveryConfig::default();
-        mtu_discovery.upper_bound(max_mtu);
-        transport_config.mtu_discovery_config(Some(mtu_discovery));
+        transport_config.initial_mtu(max_mtu);
+        // disable discovery
+        transport_config.mtu_discovery_config(None);
     }
 
     if config.disable_gso {
@@ -582,13 +589,6 @@ pub async fn bidirectional_sync(
 
             debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
 
-            if buf.capacity() >= 64 * 1024 {
-                info!(
-                    "big buffer from bidirectional sync sender: {}",
-                    buf.capacity()
-                );
-            }
-
             Ok::<_, SyncError>(count)
         },
         async move {
@@ -622,7 +622,9 @@ pub async fn bidirectional_sync(
 
             let mut count = 0;
 
-            while let Some(buf_res) = read.next().await {
+            while let Ok(Some(buf_res)) =
+                tokio::time::timeout(Duration::from_secs(5), read.next()).await
+            {
                 let mut buf = buf_res.map_err(SyncRecvError::from)?;
                 match SyncMessage::from_buf(&mut buf) {
                     Ok(msg) => {
@@ -709,6 +711,7 @@ mod tests {
                 }),
                 insecure: false,
             }),
+            idle_timeout_secs: 30,
             plaintext: false,
             max_mtu: None,
             disable_gso: false,

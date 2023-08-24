@@ -1,7 +1,11 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use bytes::Bytes;
 use compact_str::CompactString;
-use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream};
+use quinn::{
+    ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
+    SendStream,
+};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -17,6 +21,8 @@ pub enum ConnectError {
     Connect(#[from] quinn::ConnectError),
     #[error(transparent)]
     Connection(#[from] quinn::ConnectionError),
+    #[error(transparent)]
+    Datagram(#[from] SendDatagramError),
 }
 
 impl Transport {
@@ -25,6 +31,25 @@ impl Transport {
             endpoint,
             conns: Default::default(),
         }
+    }
+
+    pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), ConnectError> {
+        let conn = self.connect(addr).await?;
+        match conn.send_datagram(data.clone()) {
+            Ok(send) => return Ok(send),
+            Err(e @ SendDatagramError::ConnectionLost(ConnectionError::VersionMismatch)) => {
+                return Err(e.into());
+            }
+            Err(SendDatagramError::ConnectionLost(e)) => {
+                debug!("retryable error attempting to open unidirectional stream: {e}");
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+
+        let conn = self.connect(addr).await?;
+        Ok(conn.send_datagram(data)?)
     }
 
     pub async fn open_uni(&self, addr: SocketAddr) -> Result<SendStream, ConnectError> {
@@ -102,10 +127,20 @@ impl Transport {
     }
 }
 
+const NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0);
+
 fn test_conn(conn: &Connection) -> bool {
     match conn.close_reason() {
         None => true,
-        Some(ConnectionError::TimedOut) => {
+        Some(
+            ConnectionError::TimedOut
+            | ConnectionError::Reset
+            | ConnectionError::LocallyClosed
+            | ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: NO_ERROR,
+                ..
+            }),
+        ) => {
             // don't log, pretty normal stuff
             false
         }

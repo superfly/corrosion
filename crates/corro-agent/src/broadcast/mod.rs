@@ -98,7 +98,7 @@ pub fn runtime_loop(
     mut rx_foca: Receiver<FocaInput>,
     mut rx_bcast: Receiver<BroadcastInput>,
     member_events: tokio::sync::broadcast::Receiver<MemberEvent>,
-    to_send_tx: Sender<(Actor, Vec<u8>)>,
+    to_send_tx: Sender<(Actor, Bytes)>,
     notifications_tx: Sender<Notification<Actor>>,
     mut tripwire: Tripwire,
 ) {
@@ -645,8 +645,9 @@ fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
     let mut config = foca::Config::new_wan(cluster_size);
     config.remove_down_after = Duration::from_secs(2 * 24 * 60 * 60);
 
-    // max payload size for udp over ipv6 wg - 1 for payload type
-    // config.max_packet_size = EFFECTIVE_CAP.try_into().unwrap();
+    // max payload size for udp datagrams, use a safe value here...
+    // TODO: calculate from smallest max datagram size for all QUIC conns
+    config.max_packet_size = 1200.try_into().unwrap();
 
     config
 }
@@ -677,9 +678,20 @@ fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
             }
         };
 
-        if let Err(e) = stream.write_all(&payload).await {
-            error!("could not write to uni stream to {addr}: {e}");
-            return;
+        match tokio::time::timeout(Duration::from_secs(5), stream.write_all(&payload)).await {
+            Err(_e) => {
+                warn!("timed out writing broadcast to uni stream");
+                return;
+            }
+            Ok(Err(e)) => {
+                error!("could not write to uni stream to {addr}: {e}");
+                return;
+            }
+            _ => {}
+        }
+
+        if let Err(e) = stream.finish().await {
+            warn!("error finishing broadcast uni stream to {addr}: {e}");
         }
     });
 }

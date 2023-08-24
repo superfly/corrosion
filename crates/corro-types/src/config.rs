@@ -4,6 +4,7 @@ use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
+const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -80,8 +81,14 @@ pub struct GossipConfig {
     pub plaintext: bool,
     #[serde(default)]
     pub max_mtu: Option<u16>,
+    #[serde(default = "default_gossip_idle_timeout")]
+    pub idle_timeout_secs: u32,
     #[serde(default)]
     pub disable_gso: bool,
+}
+
+fn default_gossip_idle_timeout() -> u32 {
+    DEFAULT_GOSSIP_IDLE_TIMEOUT
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +241,7 @@ impl ConfigBuilder {
                 bootstrap: self.bootstrap.unwrap_or_default(),
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
+                idle_timeout_secs: default_gossip_idle_timeout(),
                 max_mtu: None, // TODO: add a builder function for it
                 disable_gso: false,
             },

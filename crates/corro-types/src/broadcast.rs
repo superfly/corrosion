@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use corro_api_types::Change;
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use metrics::increment_counter;
@@ -32,7 +32,6 @@ pub enum UniPayload {
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
-    Gossip(Vec<u8>),
     Broadcast(BroadcastV1),
 }
 
@@ -244,10 +243,11 @@ pub enum BroadcastInput {
 }
 
 pub struct DispatchRuntime<T> {
-    pub to_send: Sender<(T, Vec<u8>)>,
+    pub to_send: Sender<(T, Bytes)>,
     pub to_schedule: Sender<(Duration, Timer<T>)>,
     pub notifications: Sender<Notification<T>>,
     pub active: bool,
+    pub buf: BytesMut,
 }
 
 impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
@@ -269,9 +269,9 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
 
     fn send_to(&mut self, to: T, data: &[u8]) {
         trace!("cluster send_to {to:?}");
-        let packet = data.to_vec();
+        self.buf.extend_from_slice(data);
 
-        if let Err(e) = self.to_send.try_send((to, packet)) {
+        if let Err(e) = self.to_send.try_send((to, self.buf.split().freeze())) {
             increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_send");
             error!("error dispatching broadcast packet: {e}");
         }
@@ -287,7 +287,7 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
 
 impl<T> DispatchRuntime<T> {
     pub fn new(
-        to_send: Sender<(T, Vec<u8>)>,
+        to_send: Sender<(T, Bytes)>,
         to_schedule: Sender<(Duration, Timer<T>)>,
         notifications: Sender<Notification<T>>,
     ) -> Self {
@@ -296,6 +296,7 @@ impl<T> DispatchRuntime<T> {
             to_schedule,
             notifications,
             active: false,
+            buf: BytesMut::new(),
         }
     }
 }

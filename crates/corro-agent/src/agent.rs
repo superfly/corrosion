@@ -42,7 +42,7 @@ use axum::{
     routing::{get, post},
     BoxError, Extension, Router, TypedHeader,
 };
-use bytes::{BufMut, BytesMut};
+use bytes::{Bytes, BytesMut};
 use foca::{Member, Notification};
 use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
@@ -52,16 +52,16 @@ use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection, Transaction};
 use spawn::spawn_counted;
-use speedy::{Readable, Writable};
+use speedy::Readable;
 use tokio::{
     io::AsyncReadExt,
     net::TcpListener,
     sync::mpsc::{channel, Receiver, Sender},
     task::block_in_place,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tokio_util::codec::{Decoder, Encoder, FramedRead, LengthDelimitedCodec};
+use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
@@ -73,7 +73,7 @@ use trust_dns_resolver::{
 
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
-const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(60);
+const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(300);
 
 pub struct AgentOptions {
     actor_id: ActorId,
@@ -296,16 +296,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     tokio::spawn({
         let bookie = agent.bookie().clone();
         let self_actor_id = agent.actor_id();
-        let foca_tx = foca_tx.clone();
         async move {
             while let Some(payload) = process_uni_rx.recv().await {
                 match payload {
-                    UniPayload::V1(UniPayloadV1::Gossip(data)) => {
-                        if let Err(e) = foca_tx.send(FocaInput::Data(data.into())).await {
-                            error!("could not send foca data to channel for processing: {e}");
-                            continue;
-                        }
-                    }
                     UniPayload::V1(UniPayloadV1::Broadcast(bcast)) => {
                         handle_change(bcast, self_actor_id, &bookie, &bcast_msg_tx).await
                     }
@@ -319,11 +312,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     tokio::spawn({
         let agent = agent.clone();
         let tripwire = tripwire.clone();
+        let foca_tx = foca_tx.clone();
         async move {
             while let Some(connecting) = gossip_server_endpoint.accept().await {
                 let process_uni_tx = process_uni_tx.clone();
                 let agent = agent.clone();
                 let tripwire = tripwire.clone();
+                let foca_tx = foca_tx.clone();
                 tokio::spawn(async move {
                     let remote_addr = connecting.remote_address();
                     // let local_ip = connecting.local_ip().unwrap();
@@ -338,6 +333,33 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     };
 
                     debug!("accepted a QUIC conn from {remote_addr}");
+
+                    tokio::spawn({
+                        let conn = conn.clone();
+                        let mut tripwire = tripwire.clone();
+                        let foca_tx = foca_tx.clone();
+                        async move {
+                            loop {
+                                let b = tokio::select! {
+                                    b_res = conn.read_datagram() => match b_res {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            debug!("could not read datagram from connection: {e}");
+                                            return;
+                                        }
+                                    },
+                                    _ = &mut tripwire => {
+                                        debug!("connection cancelled");
+                                        return;
+                                    }
+                                };
+
+                                if let Err(e) = foca_tx.send(FocaInput::Data(b)).await {
+                                    error!("could not send data foca input: {e}");
+                                }
+                            }
+                        }
+                    });
 
                     tokio::spawn({
                         let conn = conn.clone();
@@ -368,6 +390,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                     async move {
                                         let mut codec = LengthDelimitedCodec::new();
                                         let mut buf = BytesMut::new();
+
+                                        let mut stream_ended = false;
+
                                         loop {
                                             loop {
                                                 match codec.decode(&mut buf) {
@@ -400,30 +425,39 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                     }
                                                     Ok(None) => break,
                                                     Err(e) => {
-                                                        println!("decode error: {e}");
+                                                        error!("decode error: {e}");
                                                     }
                                                 }
                                             }
-                                            match rx.read_buf(&mut buf).await {
-                                                Ok(0) => {
-                                                    // println!("EOF");
+                                            match timeout(
+                                                Duration::from_secs(5),
+                                                rx.read_buf(&mut buf),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(0)) => {
+                                                    stream_ended = true;
                                                     break;
                                                 }
-                                                Ok(n) => {
+                                                Ok(Ok(n)) => {
                                                     trace!("read {n} bytes");
                                                 }
-                                                Err(e) => {
+                                                Ok(Err(e)) => {
                                                     error!("error reading bytes into buffer: {e}");
+                                                    stream_ended = true;
+                                                    break;
+                                                }
+                                                Err(_e) => {
+                                                    warn!("timed out reading from unidirectional stream");
                                                     break;
                                                 }
                                             }
                                         }
 
-                                        if buf.capacity() >= 64 * 1024 {
-                                            info!(
-                                                "big buf from processing unidirectional stream: {}",
-                                                buf.capacity()
-                                            );
+                                        if !stream_ended {
+                                            if let Err(e) = rx.stop(0u32.into()) {
+                                                warn!("error stopping recved uni stream: {e}");
+                                            }
                                         }
                                     }
                                 });
@@ -461,18 +495,16 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                         FramedRead::new(rx, LengthDelimitedCodec::new());
 
                                     loop {
-                                        match framed.next().await {
-                                            None => {
+                                        match timeout(Duration::from_secs(5), framed.next()).await {
+                                            Err(_e) => {
+                                                warn!("timed out receiving bidirectional frame");
                                                 return;
                                             }
-                                            Some(res) => match res {
+                                            Ok(None) => {
+                                                return;
+                                            }
+                                            Ok(Some(res)) => match res {
                                                 Ok(b) => {
-                                                    if b.capacity() >= 64 * 1024 {
-                                                        info!(
-                                                            "big buf from processing bidirectional stream: {}",
-                                                            b.capacity()
-                                                        );
-                                                    }
                                                     match BiPayload::read_from_buffer(&b) {
                                                         Ok(payload) => {
                                                             match payload {
@@ -979,47 +1011,30 @@ fn compact_booked_for_actor(
     Ok(versions.difference(&still_live).copied().collect())
 }
 
-async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Vec<u8>)>) {
-    let mut buf = BytesMut::new();
-    let mut codec = LengthDelimitedCodec::new();
-
+async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Bytes)>) {
+    // TODO: use tripwire and drain messages to send when that happens...
     while let Some((actor, data)) = to_send_rx.recv().await {
         trace!("got gossip to send to {actor:?}");
 
         let addr = actor.addr();
 
-        let payload = UniPayload::V1(UniPayloadV1::Gossip(data));
-        if let Err(e) = payload.write_to_stream((&mut buf).writer()) {
-            error!("could not write to buf: {e}");
-            continue;
-        }
-
-        if let Err(e) = codec.encode(buf.split().freeze(), &mut buf) {
-            error!("could not encode buf: {e}");
-            continue;
-        }
-
-        let bytes = buf.split().freeze();
-
         let transport = transport.clone();
 
         spawn_counted(async move {
-            let mut stream = match transport.open_uni(addr).await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("could not open unidirectional stream {addr}: {e}");
+            match timeout(Duration::from_secs(5), transport.send_datagram(addr, data)).await {
+                Err(_e) => {
+                    warn!("timed out writing gossip as datagram {addr}");
                     return;
                 }
-            };
-
-            if let Err(e) = stream.write_all(&bytes).await {
-                error!("could not write to uni stream {addr}: {e}");
-                return;
+                Ok(Err(e)) => {
+                    error!("could not write datagram {addr}: {e}");
+                    return;
+                }
+                _ => {}
             }
         });
 
         increment_counter!("corro.gossip.send.count", "actor_id" => actor.id().to_string());
-        gauge!("corro.gossip.send.buffer.capacity", buf.capacity() as f64);
     }
 }
 
@@ -1063,8 +1078,9 @@ async fn handle_notifications(
         match notification {
             Notification::MemberUp(actor) => {
                 let added = { agent.members().write().add_member(&actor) };
-                info!("Member Up {actor:?} (added: {added})");
+                debug!("Member Up {actor:?} (added: {added})");
                 if added {
+                    debug!("Member Up {actor:?}");
                     increment_counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
                     // actually added a member
                     // notify of new cluster size
@@ -1080,8 +1096,9 @@ async fn handle_notifications(
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
-                info!("Member Down {actor:?} (removed: {removed})");
+                debug!("Member Down {actor:?} (removed: {removed})");
                 if removed {
+                    info!("Member Down {actor:?}");
                     increment_counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
                     // actually removed a member
                     // notify of new cluster size
@@ -1826,7 +1843,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
             }
         };
 
-        info!(
+        debug!(
             actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
             actor_id,
             sync_state.need_len(),
@@ -1854,12 +1871,14 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         let n = bidirectional_sync(&agent, sync_state, None, rx, tx).await?;
 
         let elapsed = start.elapsed();
-        info!(
-            "synced {n} changes w/ {} in {}s @ {} changes/s",
-            actor_id,
-            elapsed.as_secs_f64(),
-            n as f64 / elapsed.as_secs_f64()
-        );
+        if n > 0 {
+            info!(
+                "synced {n} changes w/ {} in {}s @ {} changes/s",
+                actor_id,
+                elapsed.as_secs_f64(),
+                n as f64 / elapsed.as_secs_f64()
+            );
+        }
         return Ok(());
     }
 }
