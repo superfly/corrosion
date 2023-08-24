@@ -1,5 +1,5 @@
 use std::{
-    fmt, io,
+    fmt, io, mem,
     num::NonZeroU32,
     ops::{Deref, RangeInclusive},
     time::Duration,
@@ -199,10 +199,13 @@ impl From<uhlc::Timestamp> for Timestamp {
     }
 }
 
+const TS_SIZE: usize = mem::size_of::<u64>() + 16;
+
 impl<'a, C> Readable<'a, C> for Timestamp
 where
     C: speedy::Context,
 {
+    #[inline]
     fn read_from<R: speedy::Reader<'a, C>>(
         reader: &mut R,
     ) -> Result<Self, <C as speedy::Context>::Error> {
@@ -214,18 +217,29 @@ where
         )
         .into())
     }
+
+    #[inline]
+    fn minimum_bytes_needed() -> usize {
+        TS_SIZE
+    }
 }
 
 impl<C> Writable<C> for Timestamp
 where
     C: speedy::Context,
 {
+    #[inline]
     fn write_to<T: ?Sized + speedy::Writer<C>>(
         &self,
         writer: &mut T,
     ) -> Result<(), <C as speedy::Context>::Error> {
         self.get_time().0.write_to(writer)?;
         self.get_id().to_le_bytes().write_to(writer)
+    }
+
+    #[inline]
+    fn bytes_needed(&self) -> Result<usize, C::Error> {
+        Ok(TS_SIZE)
     }
 }
 
