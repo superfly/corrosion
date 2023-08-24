@@ -16,6 +16,7 @@ use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
+use spawn::spawn_counted;
 use speedy::Writable;
 use strum::EnumDiscriminants;
 use tokio::{
@@ -132,7 +133,7 @@ pub fn runtime_loop(
 
     // foca SWIM operations loop.
     // NOTE: every turn of that loop should be fast or else we risk being suspected of being down
-    tokio::spawn({
+    spawn_counted({
         let config = config.clone();
         let agent = agent.clone();
         let mut tripwire = tripwire.clone();
@@ -282,6 +283,9 @@ pub fn runtime_loop(
                                 }
                             }
                         }
+
+                        // extra time for leave message to propagate
+                        tokio::time::sleep(Duration::from_secs(2)).await;
 
                         break;
                     }
