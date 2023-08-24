@@ -3,7 +3,8 @@ path = "/var/lib/corrosion/state.db"
 schema_paths = ["/app/schemas"]
 
 [gossip]
-# addr and bootstrap for Fly.io deployment example are written on startup by entrypoint script
+# addr and bootstrap for Fly.io deployment example are written 
+# on startup by entrypoint script
 plaintext = true
 max_mtu = 1372
 disable_gso = true
