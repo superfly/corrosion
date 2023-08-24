@@ -35,10 +35,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CONFIG: OnceCell<Config> = OnceCell::new();
 pub const API_CLIENT: OnceCell<CorrosionApiClient> = OnceCell::new();
 
-// #[global_allocator]
-// static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
     if matches!(cli.command, Command::Agent) {
@@ -265,7 +263,6 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
 
 #[tokio::main]
 async fn main() {
-    let _profiler = dhat::Profiler::new_heap();
     let cli: Cli = Cli::parse();
 
     if let Err(e) = process_cli(cli).await {

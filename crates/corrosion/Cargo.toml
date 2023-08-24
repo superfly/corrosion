@@ -44,7 +44,5 @@ tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
 uuid = { workspace = true }
 
-dhat = { workspace = true }
-
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
