@@ -72,6 +72,9 @@ webpki = { version = "0.22.0", features = ["std"] }
 
 dhat = "0.3.2"
 
+[patch.crates-io]
+quinn-proto = { git = "https://github.com/jeromegn/quinn", rev = "763f3454" }
+
 
 [profile.release]
 debug = 1
