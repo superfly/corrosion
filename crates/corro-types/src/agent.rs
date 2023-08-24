@@ -415,11 +415,11 @@ async fn timeout_wait(
             histogram!("corro.sqlite.pool.execution.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
             return;
         },
-        _ = tokio::time::sleep(timeout) => {
-            warn!("conn execution timed out, interrupting!");
-        }
+        // _ = tokio::time::sleep(timeout) => {
+        //     warn!("conn execution timed out, interrupting!");
+        // }
     }
-    handle.interrupt();
+    // handle.interrupt();
     increment_counter!("corro.sqlite.pool.execution.timeout");
     // FIXME: do we need to cancel the token?
 }
