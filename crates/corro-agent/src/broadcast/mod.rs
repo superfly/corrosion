@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     num::NonZeroU32,
     pin::Pin,
@@ -143,7 +144,7 @@ pub fn runtime_loop(
 
             let member_events_chunks =
                 tokio_stream::wrappers::BroadcastStream::new(member_events.resubscribe())
-                    .chunks_timeout(100, Duration::from_secs(30));
+                    .chunks_timeout(100, Duration::from_secs(5));
             tokio::pin!(member_events_chunks);
 
             #[derive(EnumDiscriminants)]
@@ -335,8 +336,12 @@ pub fn runtime_loop(
                         let splitted: Vec<_> = evts
                             .iter()
                             .flatten()
-                            .filter_map(|evt| {
-                                let actor = evt.actor();
+                            .fold(HashMap::new(), |mut acc, evt| {
+                                acc.insert(evt.actor(), evt.as_str());
+                                acc
+                            })
+                            .into_iter()
+                            .filter_map(|(actor, evt)| {
                                 let foca_state = {
                                     // need to bind this...
                                     let foca_state = foca
@@ -354,9 +359,8 @@ pub fn runtime_loop(
                                     foca_state
                                 };
 
-                                foca_state.map(|foca_state| {
-                                    (actor.id(), actor.addr(), evt.as_str(), foca_state)
-                                })
+                                foca_state
+                                    .map(|foca_state| (actor.id(), actor.addr(), evt, foca_state))
                             })
                             .collect();
 

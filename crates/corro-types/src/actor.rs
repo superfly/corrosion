@@ -1,4 +1,4 @@
-use std::{fmt, net::SocketAddr, ops::Deref};
+use std::{fmt, hash::Hash, net::SocketAddr, ops::Deref};
 
 use foca::Identity;
 use rusqlite::{
@@ -103,6 +103,13 @@ pub struct Actor {
     addr: SocketAddr,
     // An extra field to allow fast rejoin
     bump: u16,
+}
+
+impl Hash for Actor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.addr.hash(state);
+    }
 }
 
 impl Actor {
