@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
@@ -622,7 +623,9 @@ pub async fn bidirectional_sync(
 
             let mut count = 0;
 
-            while let Some(buf_res) = read.next().await {
+            while let Ok(Some(buf_res)) =
+                tokio::time::timeout(Duration::from_secs(5), read.next()).await
+            {
                 let mut buf = buf_res.map_err(SyncRecvError::from)?;
                 match SyncMessage::from_buf(&mut buf) {
                     Ok(msg) => {

@@ -58,7 +58,7 @@ use tokio::{
     net::TcpListener,
     sync::mpsc::{channel, Receiver, Sender},
     task::block_in_place,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::codec::{Decoder, Encoder, FramedRead, LengthDelimitedCodec};
@@ -404,16 +404,25 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                     }
                                                 }
                                             }
-                                            match rx.read_buf(&mut buf).await {
-                                                Ok(0) => {
+                                            match timeout(
+                                                Duration::from_secs(5),
+                                                rx.read_buf(&mut buf),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(0)) => {
                                                     // println!("EOF");
                                                     break;
                                                 }
-                                                Ok(n) => {
+                                                Ok(Ok(n)) => {
                                                     trace!("read {n} bytes");
                                                 }
-                                                Err(e) => {
+                                                Ok(Err(e)) => {
                                                     error!("error reading bytes into buffer: {e}");
+                                                    break;
+                                                }
+                                                Err(_e) => {
+                                                    warn!("timed out reading from unidirectional stream");
                                                     break;
                                                 }
                                             }
@@ -461,11 +470,15 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                         FramedRead::new(rx, LengthDelimitedCodec::new());
 
                                     loop {
-                                        match framed.next().await {
-                                            None => {
+                                        match timeout(Duration::from_secs(5), framed.next()).await {
+                                            Err(_e) => {
+                                                warn!("timed out receiving bidirectional frame");
                                                 return;
                                             }
-                                            Some(res) => match res {
+                                            Ok(None) => {
+                                                return;
+                                            }
+                                            Ok(Some(res)) => match res {
                                                 Ok(b) => {
                                                     // if b.capacity() >= 64 * 1024 {
                                                     //     info!(
@@ -1012,9 +1025,16 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
                 }
             };
 
-            if let Err(e) = stream.write_all(&bytes).await {
-                error!("could not write to uni stream {addr}: {e}");
-                return;
+            match timeout(Duration::from_secs(5), stream.write_all(&bytes)).await {
+                Err(_e) => {
+                    warn!("timed out writing gossip to uni stream {addr}");
+                    return;
+                }
+                Ok(Err(e)) => {
+                    error!("could not write to uni stream {addr}: {e}");
+                    return;
+                }
+                _ => {}
             }
         });
 

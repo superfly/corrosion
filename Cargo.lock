@@ -2481,7 +2481,8 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.10.4"
-source = "git+https://github.com/jeromegn/quinn?rev=763f3454#763f345482eba5726ef022c28b10e6b2dabb6e6f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13f81c9a9d574310b8351f8666f5a93ac3b0069c45c28ad52c10291389a7cf9"
 dependencies = [
  "bytes",
  "rand",

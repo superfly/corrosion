@@ -677,9 +677,16 @@ fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
             }
         };
 
-        if let Err(e) = stream.write_all(&payload).await {
-            error!("could not write to uni stream to {addr}: {e}");
-            return;
+        match tokio::time::timeout(Duration::from_secs(5), stream.write_all(&payload)).await {
+            Err(_e) => {
+                warn!("timed out writing broadcast to uni stream");
+                return;
+            }
+            Ok(Err(e)) => {
+                error!("could not write to uni stream to {addr}: {e}");
+                return;
+            }
+            _ => {}
         }
     });
 }
