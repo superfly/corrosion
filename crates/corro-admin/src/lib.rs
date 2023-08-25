@@ -142,7 +142,7 @@ async fn handle_conn(
                 Command::Ping => send_success(&mut stream).await,
                 Command::Sync(SyncCommand::Generate) => {
                     info_log(&mut stream, "generating sync...").await;
-                    let sync_state = generate_sync(agent.bookie(), agent.actor_id());
+                    let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
                     match serde_json::to_value(&sync_state) {
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,

@@ -1,7 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
-use compact_str::CompactString;
 use quinn::{
     ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
     SendStream,
@@ -12,7 +11,7 @@ use tracing::{debug, warn};
 #[derive(Debug, Clone)]
 pub struct Transport {
     endpoint: Endpoint,
-    conns: Arc<RwLock<HashMap<SocketAddr, HashMap<CompactString, Connection>>>>,
+    conns: Arc<RwLock<HashMap<SocketAddr, Connection>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -35,8 +34,12 @@ impl Transport {
 
     pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), ConnectError> {
         let conn = self.connect(addr).await?;
+        debug!("connected to {addr}");
         match conn.send_datagram(data.clone()) {
-            Ok(send) => return Ok(send),
+            Ok(send) => {
+                debug!("sent datagram to {addr}");
+                return Ok(send);
+            }
             Err(e @ SendDatagramError::ConnectionLost(ConnectionError::VersionMismatch)) => {
                 return Err(e.into());
             }
@@ -49,6 +52,7 @@ impl Transport {
         }
 
         let conn = self.connect(addr).await?;
+        debug!("re-connected to {addr}");
         Ok(conn.send_datagram(data)?)
     }
 
@@ -93,11 +97,7 @@ impl Transport {
 
         {
             let r = self.conns.read().await;
-            if let Some(conn) = r
-                .get(&addr)
-                .and_then(|map| map.get(server_name.as_str()))
-                .cloned()
-            {
+            if let Some(conn) = r.get(&addr).cloned() {
                 if test_conn(&conn) {
                     return Ok(conn);
                 }
@@ -106,20 +106,14 @@ impl Transport {
 
         let conn = {
             let mut w = self.conns.write().await;
-            if let Some(conn) = w
-                .get(&addr)
-                .and_then(|map| map.get(server_name.as_str()))
-                .cloned()
-            {
+            if let Some(conn) = w.get(&addr).cloned() {
                 if test_conn(&conn) {
                     return Ok(conn);
                 }
             }
 
             let conn = self.endpoint.connect(addr, server_name.as_str())?.await?;
-            w.entry(addr)
-                .or_default()
-                .insert(server_name.into(), conn.clone());
+            w.insert(addr, conn.clone());
             conn
         };
 

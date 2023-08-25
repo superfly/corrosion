@@ -316,9 +316,9 @@ impl rustls::client::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-fn process_range(
+async fn process_range(
     booked: &Booked,
-    conn: &Connection,
+    pool: &SplitPool,
     range: &RangeInclusive<i64>,
     actor_id: ActorId,
     is_local: bool,
@@ -330,41 +330,43 @@ fn process_range(
     let overlapping: Vec<(_, KnownDbVersion)> = {
         booked
             .read()
+            .await
             .overlapping(range)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     };
 
     for (versions, known_version) in overlapping {
-        block_in_place(|| {
-            if let KnownDbVersion::Cleared = &known_version {
-                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Empty { versions },
-                })))?;
-                return Ok(());
-            }
+        // block_in_place(|| {
+        if let KnownDbVersion::Cleared = &known_version {
+            sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                actor_id,
+                changeset: Changeset::Empty { versions },
+            })))?;
+            return Ok(());
+        }
 
-            for version in versions {
-                process_version(
-                    &conn,
-                    actor_id,
-                    is_local,
-                    version,
-                    &known_version,
-                    vec![],
-                    &sender,
-                )?;
-            }
-            Ok::<_, eyre::Report>(())
-        })?;
+        for version in versions {
+            process_version(
+                pool,
+                actor_id,
+                is_local,
+                version,
+                &known_version,
+                vec![],
+                &sender,
+            )
+            .await?;
+        }
+        //     Ok::<_, eyre::Report>(())
+        // })?;
     }
 
     Ok(())
 }
 
-fn process_version(
-    conn: &Connection,
+async fn process_version(
+    pool: &SplitPool,
     actor_id: ActorId,
     is_local: bool,
     version: i64,
@@ -372,99 +374,110 @@ fn process_version(
     mut seqs_needed: Vec<RangeInclusive<i64>>,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
-    match known_version {
-        KnownDbVersion::Current {
-            db_version,
-            last_seq,
-            ts,
-        } => {
-            let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS ? AND db_version = ? ORDER BY seq ASC"#)?;
-            let site_id: Option<[u8; 16]> = (!is_local)
-                .then_some(actor_id)
-                .map(|actor_id| actor_id.to_bytes());
+    let conn = pool.read().await?;
 
-            let rows = prepped.query_map(params![site_id, db_version], row_to_change)?;
+    block_in_place(|| {
+        match known_version {
+            KnownDbVersion::Current {
+                db_version,
+                last_seq,
+                ts,
+            } => {
+                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS ? AND db_version = ? ORDER BY seq ASC"#)?;
+                let site_id: Option<[u8; 16]> = (!is_local)
+                    .then_some(actor_id)
+                    .map(|actor_id| actor_id.to_bytes());
 
-            let mut chunked = ChunkedChanges::new(rows, 0, *last_seq, MAX_CHANGES_PER_MESSAGE);
-            while let Some(changes_seqs) = chunked.next() {
-                match changes_seqs {
-                    Ok((changes, seqs)) => {
-                        if let Err(_) = sender.blocking_send(SyncMessage::V1(
-                            SyncMessageV1::Changeset(ChangeV1 {
-                                actor_id,
-                                changeset: Changeset::Full {
-                                    version,
-                                    changes,
-                                    seqs,
-                                    last_seq: *last_seq,
-                                    ts: *ts,
-                                },
-                            }),
-                        )) {
-                            eyre::bail!("sync message sender channel is closed");
+                let rows = prepped.query_map(params![site_id, db_version], row_to_change)?;
+
+                let mut chunked = ChunkedChanges::new(rows, 0, *last_seq, MAX_CHANGES_PER_MESSAGE);
+                while let Some(changes_seqs) = chunked.next() {
+                    match changes_seqs {
+                        Ok((changes, seqs)) => {
+                            if let Err(_) = sender.blocking_send(SyncMessage::V1(
+                                SyncMessageV1::Changeset(ChangeV1 {
+                                    actor_id,
+                                    changeset: Changeset::Full {
+                                        version,
+                                        changes,
+                                        seqs,
+                                        last_seq: *last_seq,
+                                        ts: *ts,
+                                    },
+                                }),
+                            )) {
+                                eyre::bail!("sync message sender channel is closed");
+                            }
                         }
-                    }
-                    Err(e) => {
-                        error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                        break;
+                        Err(e) => {
+                            error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                            break;
+                        }
                     }
                 }
             }
-        }
-        KnownDbVersion::Partial { seqs, last_seq, ts } => {
-            debug!("seqs needed: {seqs_needed:?}");
-            debug!("seqs we got: {seqs:?}");
-            if seqs_needed.is_empty() {
-                seqs_needed = vec![(0..=*last_seq)];
-            }
+            KnownDbVersion::Partial { seqs, last_seq, ts } => {
+                debug!("seqs needed: {seqs_needed:?}");
+                debug!("seqs we got: {seqs:?}");
+                if seqs_needed.is_empty() {
+                    seqs_needed = vec![(0..=*last_seq)];
+                }
 
-            for range_needed in seqs_needed {
-                for range in seqs.overlapping(&range_needed) {
-                    let start_seq = cmp::max(range.start(), range_needed.start());
-                    debug!("start seq: {start_seq}");
-                    let end_seq = cmp::min(range.end(), range_needed.end());
-                    debug!("end seq: {end_seq}");
+                for range_needed in seqs_needed {
+                    for range in seqs.overlapping(&range_needed) {
+                        let start_seq = cmp::max(range.start(), range_needed.start());
+                        debug!("start seq: {start_seq}");
+                        let end_seq = cmp::min(range.end(), range_needed.end());
+                        debug!("end seq: {end_seq}");
 
-                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM __corro_buffered_changes WHERE site_id = ? AND version = ? AND seq >= ? AND seq <= ?"#)?;
+                        let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM __corro_buffered_changes WHERE site_id = ? AND version = ? AND seq >= ? AND seq <= ?"#)?;
 
-                    let site_id: [u8; 16] = actor_id.to_bytes();
+                        let site_id: [u8; 16] = actor_id.to_bytes();
 
-                    let rows = prepped
-                        .query_map(params![site_id, version, start_seq, end_seq], row_to_change)?;
+                        let rows = prepped.query_map(
+                            params![site_id, version, start_seq, end_seq],
+                            row_to_change,
+                        )?;
 
-                    let mut chunked =
-                        ChunkedChanges::new(rows, *start_seq, *end_seq, MAX_CHANGES_PER_MESSAGE);
-                    while let Some(changes_seqs) = chunked.next() {
-                        match changes_seqs {
-                            Ok((changes, seqs)) => {
-                                if let Err(_e) = sender.blocking_send(SyncMessage::V1(
-                                    SyncMessageV1::Changeset(ChangeV1 {
-                                        actor_id,
-                                        changeset: Changeset::Full {
-                                            version,
-                                            changes,
-                                            seqs,
-                                            last_seq: *last_seq,
-                                            ts: *ts,
-                                        },
-                                    }),
-                                )) {
-                                    eyre::bail!("sync message sender channel is closed");
+                        let mut chunked = ChunkedChanges::new(
+                            rows,
+                            *start_seq,
+                            *end_seq,
+                            MAX_CHANGES_PER_MESSAGE,
+                        );
+                        while let Some(changes_seqs) = chunked.next() {
+                            match changes_seqs {
+                                Ok((changes, seqs)) => {
+                                    if let Err(_e) = sender.blocking_send(SyncMessage::V1(
+                                        SyncMessageV1::Changeset(ChangeV1 {
+                                            actor_id,
+                                            changeset: Changeset::Full {
+                                                version,
+                                                changes,
+                                                seqs,
+                                                last_seq: *last_seq,
+                                                ts: *ts,
+                                            },
+                                        }),
+                                    )) {
+                                        eyre::bail!("sync message sender channel is closed");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("could not process buffered crsql change (version: {version}) for broadcast: {e}");
+                                    break;
                                 }
                             }
-                            Err(e) => {
-                                error!("could not process buffered crsql change (version: {version}) for broadcast: {e}");
-                                break;
-                            }
                         }
                     }
                 }
             }
+            _ => {
+                warn!("not supposed to happen");
+            }
         }
-        _ => {
-            warn!("not supposed to happen");
-        }
-    }
+        Ok(())
+    })?;
 
     trace!("done processing version: {version} for actor_id: {actor_id}");
 
@@ -478,10 +491,14 @@ async fn process_sync(
     sync_state: SyncStateV1,
     sender: Sender<SyncMessage>,
 ) -> eyre::Result<()> {
-    let conn = pool.read().await?;
-
-    let booked_actors: HashMap<ActorId, Booked> =
-        { bookie.read().iter().map(|(k, v)| (*k, v.clone())).collect() };
+    let booked_actors: HashMap<ActorId, Booked> = {
+        bookie
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    };
 
     for (actor_id, booked) in booked_actors {
         if actor_id == sync_state.actor_id {
@@ -489,40 +506,41 @@ async fn process_sync(
             // don't send the requester's data
             continue;
         }
-        trace!(actor_id = %local_actor_id, "processing sync for {actor_id}, last: {:?}", booked.last());
+        // trace!(actor_id = %local_actor_id, "processing sync for {actor_id}, last: {:?}", booked.last().await);
 
         let is_local = actor_id == local_actor_id;
 
         // 1. process needed versions
         if let Some(needed) = sync_state.need.get(&actor_id) {
             for range in needed {
-                process_range(&booked, &conn, range, actor_id, is_local, &sender)?;
+                process_range(&booked, &pool, range, actor_id, is_local, &sender).await?;
             }
         }
 
         // 2. process partial needs
         if let Some(partially_needed) = sync_state.partial_need.get(&actor_id) {
             for (version, seqs_needed) in partially_needed.iter() {
-                let known = { booked.read().get(version).cloned() };
+                let known = { booked.read().await.get(version).cloned() };
                 if let Some(known) = known {
-                    block_in_place(|| {
-                        process_version(
-                            &conn,
-                            actor_id,
-                            is_local,
-                            *version,
-                            &known,
-                            seqs_needed.clone(),
-                            &sender,
-                        )
-                    })?;
+                    // block_in_place(|| {
+                    process_version(
+                        &pool,
+                        actor_id,
+                        is_local,
+                        *version,
+                        &known,
+                        seqs_needed.clone(),
+                        &sender,
+                    )
+                    .await?;
+                    // })?;
                 }
             }
         }
 
         // 3. process newer-than-heads
         let their_last_version = sync_state.heads.get(&actor_id).copied().unwrap_or(0);
-        let our_last_version = booked.last().unwrap_or(0);
+        let our_last_version = booked.last().await.unwrap_or(0);
 
         debug!(actor_id = %local_actor_id, "their last version: {their_last_version} vs ours: {our_last_version}");
 
@@ -533,12 +551,13 @@ async fn process_sync(
 
         process_range(
             &booked,
-            &conn,
+            &pool,
             &((their_last_version + 1)..=our_last_version),
             actor_id,
             is_local,
             &sender,
-        )?;
+        )
+        .await?;
     }
 
     debug!("done processing sync state");

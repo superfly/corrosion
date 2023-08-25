@@ -126,6 +126,11 @@ where
 
     let actor_id = agent.actor_id();
 
+    let booked = agent.bookie().for_actor(actor_id).await;
+    // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
+    // so it probably doesn't matter too much, except for reads of internal state
+    let mut book_writer = booked.write().await;
+
     let start = Instant::now();
     block_in_place(move || {
         let tx = conn.transaction()?;
@@ -155,11 +160,6 @@ where
                 "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
             )?
             .query_row([db_version], |row| row.get(0))?;
-
-        let booked = agent.bookie().for_actor(actor_id);
-        // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
-        // so it probably doesn't matter too much, except for reads of internal state
-        let mut book_writer = booked.write();
 
         let last_version = book_writer.last().unwrap_or(0);
         trace!("last_version: {last_version}");
@@ -712,7 +712,7 @@ mod tests {
             }))
         ));
 
-        assert_eq!(agent.bookie().last(&agent.actor_id()), Some(1));
+        assert_eq!(agent.bookie().last(&agent.actor_id()).await, Some(1));
 
         println!("second req...");
 

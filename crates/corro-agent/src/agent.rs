@@ -194,9 +194,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     debug!("done building bookkeeping");
 
-    let bookie = Bookie::new(Arc::new(RwLock::new(
+    let bookie = Bookie::new(Arc::new(tokio::sync::RwLock::new(
         bk.into_iter()
-            .map(|(k, v)| (k, Booked::new(Arc::new(RwLock::new(v)))))
+            .map(|(k, v)| (k, Booked::new(Arc::new(tokio::sync::RwLock::new(v)))))
             .collect(),
     )));
 
@@ -518,7 +518,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                                             generate_sync(
                                                                                 agent.bookie(),
                                                                                 agent.actor_id(),
-                                                                            ),
+                                                                            )
+                                                                            .await,
                                                                             Some(state),
                                                                             framed.into_inner(),
                                                                             tx,
@@ -600,13 +601,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             loop {
                 sleep(COMPACT_BOOKED_INTERVAL).await;
 
-                let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
+                let to_check: Vec<ActorId> = { bookie.read().await.keys().copied().collect() };
 
                 for actor_id in to_check {
-                    let booked = bookie.for_actor(actor_id);
+                    let booked = bookie.for_actor(actor_id).await;
 
                     let versions = {
-                        let read = booked.read();
+                        let read = booked.read().await;
                         read.current_versions()
                     };
 
@@ -622,9 +623,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         }
                     };
 
-                    let res = block_in_place(move || {
-                        let mut bookedw = booked.write();
+                    let mut bookedw = booked.write().await;
 
+                    let res = block_in_place(move || {
                         let versions = bookedw.current_versions();
 
                         if versions.is_empty() {
@@ -970,7 +971,10 @@ pub async fn handle_change(
 
             trace!("handling {} changes", change.len());
 
-            if bookie.contains(&change.actor_id, change.versions(), change.seqs()) {
+            if bookie
+                .contains(&change.actor_id, change.versions(), change.seqs())
+                .await
+            {
                 trace!("already seen, stop disseminating");
                 return;
             }
@@ -1345,13 +1349,12 @@ async fn process_fully_buffered_changes(
     actor_id: ActorId,
     version: i64,
 ) -> Result<bool, ChangeError> {
-    let booked = agent.bookie().for_actor(actor_id);
-
     let mut conn = agent.pool().write_normal().await?;
 
-    let inserted = block_in_place(|| {
-        let mut bookedw = booked.write();
+    let booked = agent.bookie().for_actor(actor_id).await;
+    let mut bookedw = booked.write().await;
 
+    let inserted = block_in_place(|| {
         let (last_seq, ts) = {
             match bookedw.inner().get(&version) {
                 Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
@@ -1482,7 +1485,10 @@ pub async fn process_single_version(
         changeset,
     } = change;
 
-    if bookie.contains(&actor_id, changeset.versions(), changeset.seqs()) {
+    if bookie
+        .contains(&actor_id, changeset.versions(), changeset.seqs())
+        .await
+    {
         trace!(
             "already seen these versions from: {actor_id}, version: {:?}",
             changeset.versions()
@@ -1500,21 +1506,17 @@ pub async fn process_single_version(
 
     let mut conn = agent.pool().write_normal().await?;
 
-    let booked = bookie.for_actor(actor_id);
+    let booked = bookie.for_actor(actor_id).await;
     let (db_version, changeset) = {
-        {
-            let read = booked.read();
-
-            // check again, might've changed since we acquired the lock
-            if read.contains_all(changeset.versions(), changeset.seqs()) {
-                trace!("previously unknown versions are now deemed known, aborting inserts");
-                return Ok(None);
-            }
+        let mut booked_write = booked.write().await;
+        // check again, might've changed since we acquired the lock
+        if booked_write.contains_all(changeset.versions(), changeset.seqs()) {
+            trace!("previously unknown versions are now deemed known, aborting inserts");
+            return Ok(None);
         }
 
         let (changeset, db_version) = block_in_place(move || {
             let tx = conn.transaction()?;
-            let mut booked_write = booked.write();
 
             let versions = changeset.versions();
             let (version, changes, seqs, last_seq, ts) = match changeset.into_parts() {
@@ -1812,7 +1814,7 @@ pub enum SyncRecvError {
 }
 
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
-    let sync_state = generate_sync(agent.bookie(), agent.actor_id());
+    let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
     for (actor_id, needed) in sync_state.need.iter() {
         gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
     }
@@ -2456,9 +2458,12 @@ pub mod tests {
 
                 let bookie = ta.agent.bookie();
 
-                debug!("last version: {:?}", bookie.last(&ta.agent.actor_id()));
+                debug!(
+                    "last version: {:?}",
+                    bookie.last(&ta.agent.actor_id()).await
+                );
 
-                let sync = generate_sync(bookie, ta.agent.actor_id());
+                let sync = generate_sync(bookie, ta.agent.actor_id()).await;
                 let needed = sync.need_len();
 
                 debug!("generated sync: {sync:?}");

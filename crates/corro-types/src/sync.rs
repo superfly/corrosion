@@ -68,29 +68,35 @@ impl From<SyncStateV1> for SyncMessage {
 }
 
 // generates a `SyncMessage` to tell another node what versions we're missing
-pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
+pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
     let mut state = SyncStateV1 {
         actor_id,
         ..Default::default()
     };
 
-    let actors: Vec<(ActorId, Booked)> =
-        { bookie.read().iter().map(|(k, v)| (*k, v.clone())).collect() };
+    let actors: Vec<(ActorId, Booked)> = {
+        bookie
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    };
 
     for (actor_id, booked) in actors {
-        let last_version = match booked.last() {
+        let last_version = match booked.last().await {
             Some(v) => v,
             None => continue,
         };
 
-        let need: Vec<_> = { booked.read().gaps(&(1..=last_version)).collect() };
+        let need: Vec<_> = { booked.read().await.gaps(&(1..=last_version)).collect() };
 
         if !need.is_empty() {
             state.need.insert(actor_id, need);
         }
 
         {
-            let read = booked.read();
+            let read = booked.read().await;
             for (range, known) in read.iter() {
                 if let KnownDbVersion::Partial { seqs, last_seq, .. } = known {
                     if seqs.gaps(&(0..=*last_seq)).count() == 0 {

@@ -9,6 +9,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use bb8::PooledConnection;
 use camino::Utf8PathBuf;
 use metrics::{gauge, histogram, increment_counter};
@@ -16,6 +17,10 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{Connection, InterruptHandle};
 use tempfile::TempDir;
+use tokio::sync::{
+    RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
+    RwLockWriteGuard as TokioRwLockWriteGuard,
+};
 use tokio::{
     runtime::Handle,
     sync::{
@@ -454,6 +459,53 @@ impl<'a> DerefMut for WriteConn<'a> {
     }
 }
 
+#[derive(Default)]
+pub struct Bookkeeper {
+    booked: BTreeMap<ActorId, RangeInclusiveMap<i64, KnownDbVersion>>,
+}
+
+impl xtra::Actor for Bookkeeper {}
+
+pub struct InsertVersions(pub ActorId, pub RangeInclusive<i64>, pub KnownDbVersion);
+
+impl xtra::Message for InsertVersions {
+    type Result = ();
+}
+
+#[async_trait]
+impl xtra::Handler<InsertVersions> for Bookkeeper {
+    async fn handle(
+        &mut self,
+        InsertVersions(actor_id, versions, known): InsertVersions,
+        _ctx: &mut xtra::Context<Self>,
+    ) {
+        self.booked
+            .entry(actor_id)
+            .or_default()
+            .insert(versions, known);
+    }
+}
+
+pub struct ContainsAllVersions(pub ActorId, pub RangeInclusive<i64>);
+
+impl xtra::Message for ContainsAllVersions {
+    type Result = bool;
+}
+
+#[async_trait]
+impl xtra::Handler<ContainsAllVersions> for Bookkeeper {
+    async fn handle(
+        &mut self,
+        ContainsAllVersions(actor_id, mut versions): ContainsAllVersions,
+        _ctx: &mut xtra::Context<Self>,
+    ) -> bool {
+        self.booked
+            .get(&actor_id)
+            .map(|set| versions.all(|v| set.contains_key(&v)))
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum KnownDbVersion {
     Current {
@@ -470,7 +522,7 @@ pub enum KnownDbVersion {
 }
 
 pub type BookedVersions = RangeInclusiveMap<i64, KnownDbVersion>;
-pub type BookedInner = Arc<RwLock<BookedVersions>>;
+pub type BookedInner = Arc<TokioRwLock<BookedVersions>>;
 
 #[derive(Default, Clone)]
 pub struct Booked(BookedInner);
@@ -480,14 +532,14 @@ impl Booked {
         Self(inner)
     }
 
-    pub fn insert(&self, version: i64, db_version: KnownDbVersion) {
-        self.0.write().insert(version..=version, db_version);
+    pub async fn insert(&self, version: i64, db_version: KnownDbVersion) {
+        self.0.write().await.insert(version..=version, db_version);
     }
 
-    pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
+    pub async fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
         match seqs {
             Some(check_seqs) => {
-                let read = self.0.read();
+                let read = self.0.read().await;
                 match read.get(&version) {
                     Some(known) => match known {
                         KnownDbVersion::Partial { seqs, .. } => {
@@ -498,24 +550,24 @@ impl Booked {
                     None => false,
                 }
             }
-            None => self.0.read().contains_key(&version),
+            None => self.0.read().await.contains_key(&version),
         }
     }
 
-    pub fn last(&self) -> Option<i64> {
-        self.0.read().iter().map(|(k, _v)| *k.end()).max()
+    pub async fn last(&self) -> Option<i64> {
+        self.0.read().await.iter().map(|(k, _v)| *k.end()).max()
     }
 
-    pub fn read(&self) -> BookReader {
-        BookReader(self.0.read())
+    pub async fn read(&self) -> BookReader {
+        BookReader(self.0.read().await)
     }
 
-    pub fn write(&self) -> BookWriter {
-        BookWriter(self.0.write())
+    pub async fn write(&self) -> BookWriter {
+        BookWriter(self.0.write().await)
     }
 }
 
-pub struct BookReader<'a>(RwLockReadGuard<'a, BookedVersions>);
+pub struct BookReader<'a>(TokioRwLockReadGuard<'a, BookedVersions>);
 
 impl<'a> BookReader<'a> {
     pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
@@ -556,14 +608,14 @@ impl<'a> BookReader<'a> {
 }
 
 impl<'a> Deref for BookReader<'a> {
-    type Target = RwLockReadGuard<'a, BookedVersions>;
+    type Target = TokioRwLockReadGuard<'a, BookedVersions>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-pub struct BookWriter<'a>(RwLockWriteGuard<'a, BookedVersions>);
+pub struct BookWriter<'a>(TokioRwLockWriteGuard<'a, BookedVersions>);
 
 impl<'a> BookWriter<'a> {
     pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
@@ -614,24 +666,24 @@ impl<'a> BookWriter<'a> {
             .collect()
     }
 
-    pub fn inner(&self) -> &RwLockWriteGuard<'a, BookedVersions> {
+    pub fn inner(&self) -> &TokioRwLockWriteGuard<'a, BookedVersions> {
         &self.0
     }
 
-    pub fn inner_mut(&mut self) -> &mut RwLockWriteGuard<'a, BookedVersions> {
+    pub fn inner_mut(&mut self) -> &mut TokioRwLockWriteGuard<'a, BookedVersions> {
         &mut self.0
     }
 }
 
 impl<'a> Deref for BookWriter<'a> {
-    type Target = RwLockWriteGuard<'a, BookedVersions>;
+    type Target = TokioRwLockWriteGuard<'a, BookedVersions>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-pub type BookieInner = Arc<RwLock<HashMap<ActorId, Booked>>>;
+pub type BookieInner = Arc<TokioRwLock<HashMap<ActorId, Booked>>>;
 
 #[derive(Default, Clone)]
 pub struct Bookie(BookieInner);
@@ -641,48 +693,47 @@ impl Bookie {
         Self(inner)
     }
 
-    pub fn add(&self, actor_id: ActorId, version: i64, db_version: KnownDbVersion) {
+    pub async fn add(&self, actor_id: ActorId, version: i64, db_version: KnownDbVersion) {
         {
-            if let Some(booked) = self.0.read().get(&actor_id) {
-                booked.insert(version, db_version);
+            if let Some(booked) = self.0.read().await.get(&actor_id) {
+                booked.insert(version, db_version).await;
                 return;
             }
         };
 
-        let mut w = self.0.write();
+        let mut w = self.0.write().await;
         let booked = w.entry(actor_id).or_default();
-        booked.insert(version, db_version);
+        booked.insert(version, db_version).await;
     }
 
-    pub fn for_actor(&self, actor_id: ActorId) -> Booked {
-        let mut w = self.0.write();
+    pub async fn for_actor(&self, actor_id: ActorId) -> Booked {
+        let mut w = self.0.write().await;
         w.entry(actor_id).or_default().clone()
     }
 
-    pub fn contains(
+    pub async fn contains(
         &self,
         actor_id: &ActorId,
         mut versions: RangeInclusive<i64>,
         seqs: Option<&RangeInclusive<i64>>,
     ) -> bool {
-        self.0
-            .read()
-            .get(actor_id)
-            .map(|booked| {
-                let read = booked.read();
-                versions.all(|v| read.contains(v, seqs))
-            })
-            .unwrap_or(false)
+        if let Some(booked) = self.0.read().await.get(actor_id) {
+            let read = booked.read().await;
+            versions.all(|v| read.contains(v, seqs))
+        } else {
+            false
+        }
     }
 
-    pub fn last(&self, actor_id: &ActorId) -> Option<i64> {
-        self.0
-            .read()
-            .get(&actor_id)
-            .and_then(|booked| booked.last())
+    pub async fn last(&self, actor_id: &ActorId) -> Option<i64> {
+        if let Some(booked) = self.0.read().await.get(&actor_id) {
+            booked.last().await
+        } else {
+            None
+        }
     }
 
-    pub fn read(&self) -> RwLockReadGuard<HashMap<ActorId, Booked>> {
-        self.0.read()
+    pub async fn read(&self) -> TokioRwLockReadGuard<HashMap<ActorId, Booked>> {
+        self.0.read().await
     }
 }

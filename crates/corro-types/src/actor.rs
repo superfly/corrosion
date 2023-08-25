@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use uuid::Uuid;
 
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Deserialize, Serialize)]
+#[derive(
+    Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
+)]
 #[serde(transparent)]
 pub struct ActorId(pub Uuid);
 
