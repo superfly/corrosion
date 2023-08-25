@@ -533,6 +533,14 @@ impl<'a> BookReader<'a> {
         }
     }
 
+    pub fn contains_all(
+        &self,
+        mut versions: RangeInclusive<i64>,
+        seqs: Option<&RangeInclusive<i64>>,
+    ) -> bool {
+        versions.all(|version| self.contains(version, seqs))
+    }
+
     pub fn current_versions(&self) -> BTreeMap<i64, i64> {
         self.0
             .iter()

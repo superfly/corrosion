@@ -1503,10 +1503,10 @@ pub async fn process_single_version(
     let booked = bookie.for_actor(actor_id);
     let (db_version, changeset) = {
         {
-            let booked_write = booked.write();
+            let read = booked.read();
 
             // check again, might've changed since we acquired the lock
-            if booked_write.contains_all(changeset.versions(), changeset.seqs()) {
+            if read.contains_all(changeset.versions(), changeset.seqs()) {
                 trace!("previously unknown versions are now deemed known, aborting inserts");
                 return Ok(None);
             }
