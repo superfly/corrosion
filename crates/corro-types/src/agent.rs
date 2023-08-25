@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bb8::PooledConnection;
 use camino::Utf8PathBuf;
 use metrics::{gauge, histogram, increment_counter};
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::RwLock;
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{Connection, InterruptHandle};
 use tempfile::TempDir;

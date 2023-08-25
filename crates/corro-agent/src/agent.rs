@@ -109,7 +109,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         init_schema(&conn)?
     };
 
-    let (tx_apply, rx_apply) = channel(512);
+    let (tx_apply, rx_apply) = channel(10240);
 
     let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 

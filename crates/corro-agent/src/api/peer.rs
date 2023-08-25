@@ -653,6 +653,9 @@ pub async fn bidirectional_sync(
                 tokio::time::timeout(Duration::from_secs(5), read.next()).await
             {
                 let mut buf = buf_res.map_err(SyncRecvError::from)?;
+
+                counter!("corro.sync.chunk.recv.bytes", buf.len() as u64);
+
                 match SyncMessage::from_buf(&mut buf) {
                     Ok(msg) => {
                         let len = match msg {
