@@ -339,10 +339,12 @@ async fn process_range(
     for (versions, known_version) in overlapping {
         // block_in_place(|| {
         if let KnownDbVersion::Cleared = &known_version {
-            sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                actor_id,
-                changeset: Changeset::Empty { versions },
-            })))?;
+            sender
+                .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty { versions },
+                })))
+                .await?;
             return Ok(());
         }
 
