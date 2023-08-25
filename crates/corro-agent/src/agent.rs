@@ -1513,8 +1513,8 @@ pub async fn process_single_version(
         }
 
         let (changeset, db_version) = block_in_place(move || {
-            let mut booked_write = booked.write();
             let tx = conn.transaction()?;
+            let mut booked_write = booked.write();
 
             let versions = changeset.versions();
             let (version, changes, seqs, last_seq, ts) = match changeset.into_parts() {

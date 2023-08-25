@@ -480,10 +480,10 @@ async fn process_sync(
 ) -> eyre::Result<()> {
     let conn = pool.read().await?;
 
-    let bookie: HashMap<ActorId, Booked> =
+    let booked_actors: HashMap<ActorId, Booked> =
         { bookie.read().iter().map(|(k, v)| (*k, v.clone())).collect() };
 
-    for (actor_id, booked) in bookie {
+    for (actor_id, booked) in booked_actors {
         if actor_id == sync_state.actor_id {
             trace!("skipping itself!");
             // don't send the requester's data
