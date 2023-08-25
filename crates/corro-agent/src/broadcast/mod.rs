@@ -245,6 +245,12 @@ pub fn runtime_loop(
                                 Ok(mut conn) => block_in_place(|| match conn.transaction() {
                                     Ok(tx) => {
                                         for (id, address, state, foca_state) in states {
+                                            if let Err(e) = tx
+                                                .prepare_cached("DELETE FROM __corro_members;")
+                                                .and_then(|mut prepped| prepped.execute([]))
+                                            {
+                                                warn!("could not clear all corro members before re-inserting them: {e}");
+                                            }
                                             let db_res = tx.prepare_cached(
                                                     "
                                                 INSERT INTO __corro_members (actor_id, address, state, foca_state)
