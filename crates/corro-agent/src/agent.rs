@@ -624,22 +624,21 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     };
 
                     let mut bookedw = booked.write().await;
+                    let versions = bookedw.current_versions();
 
-                    let res = block_in_place(move || {
-                        let versions = bookedw.current_versions();
+                    if versions.is_empty() {
+                        continue;
+                    }
 
-                        if versions.is_empty() {
-                            return Ok(());
-                        }
+                    let res = block_in_place(|| {
+                        let tx = conn.transaction()?;
 
                         let to_clear = {
-                            match compact_booked_for_actor(
-                                &conn,
-                                &versions.keys().copied().collect(),
-                            ) {
+                            match compact_booked_for_actor(&tx, &versions.keys().copied().collect())
+                            {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
-                                        return Ok(());
+                                        return Ok(None);
                                     }
                                     to_clear
                                 }
@@ -649,8 +648,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 }
                             }
                         };
-
-                        let tx = conn.transaction()?;
 
                         let deleted = tx
                             .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ?")?
@@ -690,14 +687,18 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         info!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
-                        **bookedw.inner_mut() = new_copy;
-                        info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
-
-                        Ok::<_, eyre::Report>(())
+                        Ok::<_, eyre::Report>(Some((new_copy, cleared_len)))
                     });
 
-                    if let Err(e) = res {
-                        error!("could not compact versions for actor {actor_id}: {e}");
+                    match res {
+                        Ok(Some((new_booked, cleared_len))) => {
+                            **bookedw.inner_mut() = new_booked;
+                            info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            error!("could not compact versions for actor {actor_id}: {e}");
+                        }
                     }
                 }
             }
@@ -990,7 +991,7 @@ pub async fn handle_change(
 }
 
 fn compact_booked_for_actor(
-    conn: &Connection,
+    tx: &Transaction,
     versions: &BTreeSet<i64>,
 ) -> eyre::Result<BTreeSet<i64>> {
     let (first, last) = match (versions.first().copied(), versions.last().copied()) {
@@ -998,14 +999,14 @@ fn compact_booked_for_actor(
         _ => return Ok(BTreeSet::new()),
     };
 
-    let tables = conn
+    let tables = tx
         .prepare_cached(
             "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'",
         )?
         .query_map([], |row| row.get(0))?
         .collect::<Result<Vec<String>, _>>()?;
 
-    let still_live: BTreeSet<i64> = conn
+    let still_live: BTreeSet<i64> = tx
         .prepare(&format!(
             "SELECT db_version FROM ({});",
             tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table} WHERE db_version >= {first} AND db_version <= {last}")).collect::<Vec<_>>().join(" UNION ")
@@ -2510,7 +2511,7 @@ pub mod tests {
 
     #[test]
     fn test_in_memory_versions_compaction() -> eyre::Result<()> {
-        let conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
+        let mut conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
 
         conn.execute_batch(
             "
@@ -2531,28 +2532,34 @@ pub mod tests {
 
         assert_eq!(db_version, 2);
 
-        let to_clear = compact_booked_for_actor(&conn, &[1].into())?;
+        let tx = conn.transaction()?;
+
+        let to_clear = compact_booked_for_actor(&tx, &[1].into())?;
 
         assert!(to_clear.contains(&1));
         assert!(!to_clear.contains(&2));
 
-        let to_clear = compact_booked_for_actor(&conn, &[2].into())?;
+        let to_clear = compact_booked_for_actor(&tx, &[2].into())?;
         assert!(to_clear.is_empty());
 
-        conn.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
+        tx.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
+        tx.commit()?;
 
-        let to_clear = compact_booked_for_actor(&conn, &[2, 3].into())?;
+        let tx = conn.transaction()?;
+        let to_clear = compact_booked_for_actor(&tx, &[2, 3].into())?;
         assert!(to_clear.is_empty());
 
-        conn.execute("INSERT INTO foo (a) VALUES (1)", ())?;
+        tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
+        tx.commit()?;
 
-        let to_clear = compact_booked_for_actor(&conn, &[2, 3, 4].into())?;
+        let tx = conn.transaction()?;
+        let to_clear = compact_booked_for_actor(&tx, &[2, 3, 4].into())?;
 
         assert!(to_clear.contains(&2));
         assert!(!to_clear.contains(&3));
         assert!(!to_clear.contains(&4));
 
-        let to_clear = compact_booked_for_actor(&conn, &[3, 4].into())?;
+        let to_clear = compact_booked_for_actor(&tx, &[3, 4].into())?;
 
         assert!(to_clear.is_empty());
 

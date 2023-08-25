@@ -70,8 +70,6 @@ uhlc = { version = "0.5.2", features = ["defmt"] }
 uuid = { version = "1.3.1", features = ["v4", "serde"] }
 webpki = { version = "0.22.0", features = ["std"] }
 
-xtra = { version = "0.5.2", features = ["with-tokio-1"] }
-
 
 [profile.release]
 debug = 1

@@ -9,7 +9,6 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use bb8::PooledConnection;
 use camino::Utf8PathBuf;
 use metrics::{gauge, histogram, increment_counter};
@@ -29,7 +28,7 @@ use tokio::{
     },
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 use tripwire::Tripwire;
 
 use crate::{
@@ -462,48 +461,6 @@ impl<'a> DerefMut for WriteConn<'a> {
 #[derive(Default)]
 pub struct Bookkeeper {
     booked: BTreeMap<ActorId, RangeInclusiveMap<i64, KnownDbVersion>>,
-}
-
-impl xtra::Actor for Bookkeeper {}
-
-pub struct InsertVersions(pub ActorId, pub RangeInclusive<i64>, pub KnownDbVersion);
-
-impl xtra::Message for InsertVersions {
-    type Result = ();
-}
-
-#[async_trait]
-impl xtra::Handler<InsertVersions> for Bookkeeper {
-    async fn handle(
-        &mut self,
-        InsertVersions(actor_id, versions, known): InsertVersions,
-        _ctx: &mut xtra::Context<Self>,
-    ) {
-        self.booked
-            .entry(actor_id)
-            .or_default()
-            .insert(versions, known);
-    }
-}
-
-pub struct ContainsAllVersions(pub ActorId, pub RangeInclusive<i64>);
-
-impl xtra::Message for ContainsAllVersions {
-    type Result = bool;
-}
-
-#[async_trait]
-impl xtra::Handler<ContainsAllVersions> for Bookkeeper {
-    async fn handle(
-        &mut self,
-        ContainsAllVersions(actor_id, mut versions): ContainsAllVersions,
-        _ctx: &mut xtra::Context<Self>,
-    ) -> bool {
-        self.booked
-            .get(&actor_id)
-            .map(|set| versions.all(|v| set.contains_key(&v)))
-            .unwrap_or(false)
-    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

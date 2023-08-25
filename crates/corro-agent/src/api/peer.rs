@@ -1,6 +1,5 @@
 use std::cmp;
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, Sync
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use speedy::Writable;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::block_in_place;
