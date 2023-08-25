@@ -83,7 +83,7 @@ pub fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             None => continue,
         };
 
-        let need: Vec<_> = booked.read().gaps(&(1..=last_version)).collect();
+        let need: Vec<_> = { booked.read().gaps(&(1..=last_version)).collect() };
 
         if !need.is_empty() {
             state.need.insert(actor_id, need);
