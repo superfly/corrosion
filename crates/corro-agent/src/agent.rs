@@ -1592,9 +1592,12 @@ pub async fn process_single_version(
                 // if we have no gaps, then we can schedule applying all these changes.
                 if gaps_count == 0 {
                     if inserted > 0 {
-                        if let Err(e) = agent.tx_apply().blocking_send((actor_id, version)) {
-                            error!("could not send trigger for applying fully buffered changes later: {e}");
-                        }
+                        let tx_apply = agent.tx_apply().clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tx_apply.send((actor_id, version)).await {
+                                error!("could not send trigger for applying fully buffered changes later: {e}");
+                            }
+                        });
                     }
                 } else {
                     tx.prepare_cached(
