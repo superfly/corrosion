@@ -45,7 +45,7 @@ impl Deref for ActorId {
 
 impl fmt::Display for ActorId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        self.0.as_simple().fmt(f)
     }
 }
 

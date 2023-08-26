@@ -337,7 +337,6 @@ async fn process_range(
     };
 
     for (versions, known_version) in overlapping {
-        // block_in_place(|| {
         if let KnownDbVersion::Cleared = &known_version {
             sender
                 .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
@@ -360,8 +359,6 @@ async fn process_range(
             )
             .await?;
         }
-        //     Ok::<_, eyre::Report>(())
-        // })?;
     }
 
     Ok(())
@@ -385,35 +382,48 @@ async fn process_version(
                 last_seq,
                 ts,
             } => {
-                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS ? AND db_version = ? ORDER BY seq ASC"#)?;
-                let site_id: Option<[u8; 16]> = (!is_local)
-                    .then_some(actor_id)
-                    .map(|actor_id| actor_id.to_bytes());
+                if seqs_needed.is_empty() {
+                    seqs_needed = vec![(0..=*last_seq)];
+                }
 
-                let rows = prepped.query_map(params![site_id, db_version], row_to_change)?;
+                for range_needed in seqs_needed {
+                    let start_seq = range_needed.start();
+                    let end_seq = range_needed.end();
 
-                let mut chunked = ChunkedChanges::new(rows, 0, *last_seq, MAX_CHANGES_PER_MESSAGE);
-                while let Some(changes_seqs) = chunked.next() {
-                    match changes_seqs {
-                        Ok((changes, seqs)) => {
-                            if let Err(_) = sender.blocking_send(SyncMessage::V1(
-                                SyncMessageV1::Changeset(ChangeV1 {
-                                    actor_id,
-                                    changeset: Changeset::Full {
-                                        version,
-                                        changes,
-                                        seqs,
-                                        last_seq: *last_seq,
-                                        ts: *ts,
-                                    },
-                                }),
-                            )) {
-                                eyre::bail!("sync message sender channel is closed");
+                    let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS ? AND db_version = ? AND seq >= ? AND seq <= ? ORDER BY seq ASC"#)?;
+                    let site_id: Option<[u8; 16]> = (!is_local)
+                        .then_some(actor_id)
+                        .map(|actor_id| actor_id.to_bytes());
+
+                    let rows = prepped.query_map(
+                        params![site_id, db_version, start_seq, end_seq],
+                        row_to_change,
+                    )?;
+
+                    let mut chunked =
+                        ChunkedChanges::new(rows, 0, *last_seq, MAX_CHANGES_PER_MESSAGE);
+                    while let Some(changes_seqs) = chunked.next() {
+                        match changes_seqs {
+                            Ok((changes, seqs)) => {
+                                if let Err(_) = sender.blocking_send(SyncMessage::V1(
+                                    SyncMessageV1::Changeset(ChangeV1 {
+                                        actor_id,
+                                        changeset: Changeset::Full {
+                                            version,
+                                            changes,
+                                            seqs,
+                                            last_seq: *last_seq,
+                                            ts: *ts,
+                                        },
+                                    }),
+                                )) {
+                                    eyre::bail!("sync message sender channel is closed");
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                            break;
+                            Err(e) => {
+                                error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                                break;
+                            }
                         }
                     }
                 }
@@ -524,7 +534,6 @@ async fn process_sync(
             for (version, seqs_needed) in partially_needed.iter() {
                 let known = { booked.read().await.get(version).cloned() };
                 if let Some(known) = known {
-                    // block_in_place(|| {
                     process_version(
                         &pool,
                         actor_id,
@@ -535,7 +544,6 @@ async fn process_sync(
                         &sender,
                     )
                     .await?;
-                    // })?;
                 }
             }
         }
