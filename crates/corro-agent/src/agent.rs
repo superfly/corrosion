@@ -1539,9 +1539,9 @@ pub async fn process_single_version(
                     inserted += tx.prepare_cached(
                         r#"
                             INSERT INTO __corro_buffered_changes
-                                ("table", pk, cid, val, col_version, db_version, site_id, seq, cl, version)
+                                ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, version)
                             VALUES
-                                (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,   ?,  ?)
+                                (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?,   ?)
                             ON CONFLICT (site_id, db_version, version, seq)
                                 DO NOTHING
                         "#,
@@ -1554,8 +1554,8 @@ pub async fn process_single_version(
                         change.col_version,
                         change.db_version,
                         &change.site_id,
-                        change.seq,
                         change.cl,
+                        change.seq,
                         version,
                     ])?;
                 }
@@ -1656,9 +1656,9 @@ pub async fn process_single_version(
                 tx.prepare_cached(
                     r#"
                         INSERT INTO crsql_changes
-                            ("table", pk, cid, val, col_version, db_version, seq, site_id, cl)
+                            ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
                         VALUES
-                            (?,       ?,  ?,   ?,   ?,           ?,          ?,    ?,      ?)
+                            (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?)
                     "#,
                 )?
                 .execute(params![
@@ -1668,9 +1668,9 @@ pub async fn process_single_version(
                     &change.val,
                     change.col_version,
                     change.db_version,
-                    change.seq,
                     &change.site_id,
                     change.cl,
+                    change.seq,
                 ])?;
                 let rows_impacted: i64 = tx
                     .prepare_cached("SELECT crsql_rows_impacted()")?

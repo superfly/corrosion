@@ -429,60 +429,70 @@ async fn process_version(
                 }
             }
             KnownDbVersion::Partial { seqs, last_seq, ts } => {
-                debug!("seqs needed: {seqs_needed:?}");
-                debug!("seqs we got: {seqs:?}");
-                if seqs_needed.is_empty() {
-                    seqs_needed = vec![(0..=*last_seq)];
-                }
+                // TODO: find a way to make this safe...
+                // FIXME: there's a race here between getting this cached "known db version" and processing+clearing the rows in buffered changes
 
-                for range_needed in seqs_needed {
-                    for range in seqs.overlapping(&range_needed) {
-                        let start_seq = cmp::max(range.start(), range_needed.start());
-                        debug!("start seq: {start_seq}");
-                        let end_seq = cmp::min(range.end(), range_needed.end());
-                        debug!("end seq: {end_seq}");
+                // debug!("seqs needed: {seqs_needed:?}");
+                // debug!("seqs we got: {seqs:?}");
+                // if seqs_needed.is_empty() {
+                //     seqs_needed = vec![(0..=*last_seq)];
+                // }
 
-                        let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM __corro_buffered_changes WHERE site_id = ? AND version = ? AND seq >= ? AND seq <= ?"#)?;
+                // for range_needed in seqs_needed {
+                //     for range in seqs.overlapping(&range_needed) {
+                //         let start_seq = cmp::max(range.start(), range_needed.start());
+                //         debug!("start seq: {start_seq}");
+                //         let end_seq = cmp::min(range.end(), range_needed.end());
+                //         debug!("end seq: {end_seq}");
 
-                        let site_id: [u8; 16] = actor_id.to_bytes();
+                //         let mut prepped = conn.prepare_cached(
+                //             r#"
+                //             SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                //                 FROM __corro_buffered_changes
+                //                 WHERE site_id = ?
+                //                   AND version = ?
+                //                   AND seq >= ? AND seq <= ?"#,
+                //         )?;
 
-                        let rows = prepped.query_map(
-                            params![site_id, version, start_seq, end_seq],
-                            row_to_change,
-                        )?;
+                //         let site_id: [u8; 16] = actor_id.to_bytes();
 
-                        let mut chunked = ChunkedChanges::new(
-                            rows,
-                            *start_seq,
-                            *end_seq,
-                            MAX_CHANGES_PER_MESSAGE,
-                        );
-                        while let Some(changes_seqs) = chunked.next() {
-                            match changes_seqs {
-                                Ok((changes, seqs)) => {
-                                    if let Err(_e) = sender.blocking_send(SyncMessage::V1(
-                                        SyncMessageV1::Changeset(ChangeV1 {
-                                            actor_id,
-                                            changeset: Changeset::Full {
-                                                version,
-                                                changes,
-                                                seqs,
-                                                last_seq: *last_seq,
-                                                ts: *ts,
-                                            },
-                                        }),
-                                    )) {
-                                        eyre::bail!("sync message sender channel is closed");
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("could not process buffered crsql change (version: {version}) for broadcast: {e}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+                //         let rows = prepped.query_map(
+                //             params![site_id, version, start_seq, end_seq],
+                //             row_to_change,
+                //         )?;
+
+                //         let mut chunked = ChunkedChanges::new(
+                //             rows,
+                //             *start_seq,
+                //             *end_seq,
+                //             MAX_CHANGES_PER_MESSAGE,
+                //         );
+                //         while let Some(changes_seqs) = chunked.next() {
+                //             match changes_seqs {
+                //                 Ok((changes, seqs)) => {
+                //                     if let Err(_e) = sender.blocking_send(SyncMessage::V1(
+                //                         SyncMessageV1::Changeset(ChangeV1 {
+                //                             actor_id,
+                //                             changeset: Changeset::Full {
+                //                                 version,
+                //                                 changes,
+                //                                 seqs,
+                //                                 last_seq: *last_seq,
+                //                                 ts: *ts,
+                //                             },
+                //                         }),
+                //                     )) {
+                //                         eyre::bail!("sync message sender channel is closed");
+                //                     }
+                //                 }
+                //                 Err(e) => {
+                //                     error!("could not process buffered crsql change (version: {version}) for broadcast: {e}");
+                //                     break;
+                //                 }
+                //             }
+                //         }
+                //     }
+                // }
             }
             _ => {
                 warn!("not supposed to happen");
