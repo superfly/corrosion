@@ -704,7 +704,7 @@ fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
                 return;
             }
             Ok(Ok(_)) => {
-                counter!("corro.peer.stream.bytes.sent.total", payload.len() as u64, "stream" => "uni");
+                counter!("corro.peer.stream.bytes.sent.total", payload.len() as u64, "type" => "uni");
             }
         }
 
