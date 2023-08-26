@@ -13,7 +13,7 @@ use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future,
 };
-use metrics::{gauge, histogram};
+use metrics::{counter, gauge, histogram};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
@@ -704,7 +704,9 @@ fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
                 error!("could not write to uni stream to {addr}: {e}");
                 return;
             }
-            _ => {}
+            Ok(Ok(_)) => {
+                counter!("corro.api.peer.quic.streams.bytes.sent.total", payload.len() as u64, "type" => "uni");
+            }
         }
 
         if let Err(e) = stream.finish().await {
