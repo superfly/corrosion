@@ -261,11 +261,16 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli: Cli = Cli::parse();
 
-    if let Err(e) = process_cli(cli).await {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .expect("could not build tokio runtime");
+
+    if let Err(e) = rt.block_on(process_cli(cli)) {
         eprintln!("{e}");
     }
 }

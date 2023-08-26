@@ -1418,9 +1418,9 @@ mod tests {
                 tx.prepare_cached(
                     r#"
                     INSERT INTO crsql_changes
-                        ("table", pk, cid, val, col_version, db_version, seq, site_id, cl)
+                        ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
                     VALUES
-                        (?,       ?,  ?,   ?,   ?,           ?,          ?,    ?,      ?)
+                        (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?)
                 "#,
                 )
                 .unwrap()
@@ -1431,9 +1431,9 @@ mod tests {
                     &change.val,
                     change.col_version,
                     change.db_version,
-                    change.seq,
                     &change.site_id,
-                    change.cl
+                    change.cl,
+                    change.seq,
                 ])
                 .unwrap();
             }

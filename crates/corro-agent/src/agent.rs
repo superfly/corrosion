@@ -109,7 +109,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         init_schema(&conn)?
     };
 
-    let (tx_apply, rx_apply) = channel(512);
+    let (tx_apply, rx_apply) = channel(10240);
 
     let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 
@@ -194,9 +194,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     debug!("done building bookkeeping");
 
-    let bookie = Bookie::new(Arc::new(RwLock::new(
+    let bookie = Bookie::new(Arc::new(tokio::sync::RwLock::new(
         bk.into_iter()
-            .map(|(k, v)| (k, Booked::new(Arc::new(RwLock::new(v)))))
+            .map(|(k, v)| (k, Booked::new(Arc::new(tokio::sync::RwLock::new(v)))))
             .collect(),
     )));
 
@@ -332,6 +332,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         }
                     };
 
+                    increment_counter!("corro.peer.connection.accept.total");
+
                     debug!("accepted a QUIC conn from {remote_addr}");
 
                     tokio::spawn({
@@ -342,7 +344,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             loop {
                                 let b = tokio::select! {
                                     b_res = conn.read_datagram() => match b_res {
-                                        Ok(b) => b,
+                                        Ok(b) => {
+                                            increment_counter!("corro.peer.datagram.recv.total");
+                                            counter!("corro.peer.datagram.bytes.recv.total", b.len() as u64);
+                                            b
+                                        },
                                         Err(e) => {
                                             debug!("could not read datagram from connection: {e}");
                                             return;
@@ -379,6 +385,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                         return;
                                     }
                                 };
+
+                                increment_counter!("corro.peer.stream.accept.total", "type" => "uni");
 
                                 debug!(
                                     "accepted a unidirectional stream from {}",
@@ -440,6 +448,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                     break;
                                                 }
                                                 Ok(Ok(n)) => {
+                                                    counter!("corro.peer.stream.bytes.recv.total", n as u64, "type" => "uni");
                                                     trace!("read {n} bytes");
                                                 }
                                                 Ok(Err(e)) => {
@@ -482,6 +491,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 }
                             };
 
+                            increment_counter!("corro.peer.streams.accept.total", "type" => "bi");
+
                             debug!(
                                 "accepted a bidirectional stream from {}",
                                 conn.remote_address()
@@ -518,7 +529,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                                             generate_sync(
                                                                                 agent.bookie(),
                                                                                 agent.actor_id(),
-                                                                            ),
+                                                                            )
+                                                                            .await,
                                                                             Some(state),
                                                                             framed.into_inner(),
                                                                             tx,
@@ -600,13 +612,16 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             loop {
                 sleep(COMPACT_BOOKED_INTERVAL).await;
 
-                let to_check: Vec<ActorId> = { bookie.read().keys().copied().collect() };
+                let to_check: Vec<ActorId> = { bookie.read().await.keys().copied().collect() };
+
+                let mut inserted = 0;
+                let mut deleted = 0;
 
                 for actor_id in to_check {
-                    let booked = bookie.for_actor(actor_id);
+                    let booked = bookie.for_actor(actor_id).await;
 
                     let versions = {
-                        let read = booked.read();
+                        let read = booked.read().await;
                         read.current_versions()
                     };
 
@@ -622,23 +637,22 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         }
                     };
 
-                    let res = block_in_place(move || {
-                        let mut bookedw = booked.write();
+                    let mut bookedw = booked.write().await;
+                    let versions = bookedw.current_versions();
 
-                        let versions = bookedw.current_versions();
+                    if versions.is_empty() {
+                        continue;
+                    }
 
-                        if versions.is_empty() {
-                            return Ok(());
-                        }
+                    let res = block_in_place(|| {
+                        let tx = conn.transaction()?;
 
                         let to_clear = {
-                            match compact_booked_for_actor(
-                                &conn,
-                                &versions.keys().copied().collect(),
-                            ) {
+                            match compact_booked_for_actor(&tx, &versions.keys().copied().collect())
+                            {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
-                                        return Ok(());
+                                        return Ok(None);
                                     }
                                     to_clear
                                 }
@@ -649,9 +663,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             }
                         };
 
-                        let tx = conn.transaction()?;
-
-                        let deleted = tx
+                        deleted += tx
                             .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ?")?
                             .execute([actor_id])?;
 
@@ -664,8 +676,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 new_copy.insert(*version..=*version, KnownDbVersion::Cleared);
                             }
                         }
-
-                        let mut inserted = 0;
 
                         for (range, known) in new_copy.iter() {
                             match known {
@@ -687,18 +697,27 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         tx.commit()?;
 
-                        info!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
+                        debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
-                        **bookedw.inner_mut() = new_copy;
-                        info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
-
-                        Ok::<_, eyre::Report>(())
+                        Ok::<_, eyre::Report>(Some((new_copy, cleared_len)))
                     });
 
-                    if let Err(e) = res {
-                        error!("could not compact versions for actor {actor_id}: {e}");
+                    match res {
+                        Ok(Some((new_booked, cleared_len))) => {
+                            **bookedw.inner_mut() = new_booked;
+                            debug!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            error!("could not compact versions for actor {actor_id}: {e}");
+                        }
                     }
                 }
+
+                info!(
+                    "compaction done, cleared {} db bookkeeping table rows",
+                    deleted - inserted
+                );
             }
         }
     });
@@ -970,7 +989,10 @@ pub async fn handle_change(
 
             trace!("handling {} changes", change.len());
 
-            if bookie.contains(&change.actor_id, change.versions(), change.seqs()) {
+            if bookie
+                .contains(&change.actor_id, change.versions(), change.seqs())
+                .await
+            {
                 trace!("already seen, stop disseminating");
                 return;
             }
@@ -986,7 +1008,7 @@ pub async fn handle_change(
 }
 
 fn compact_booked_for_actor(
-    conn: &Connection,
+    tx: &Transaction,
     versions: &BTreeSet<i64>,
 ) -> eyre::Result<BTreeSet<i64>> {
     let (first, last) = match (versions.first().copied(), versions.last().copied()) {
@@ -994,14 +1016,14 @@ fn compact_booked_for_actor(
         _ => return Ok(BTreeSet::new()),
     };
 
-    let tables = conn
+    let tables = tx
         .prepare_cached(
             "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'",
         )?
         .query_map([], |row| row.get(0))?
         .collect::<Result<Vec<String>, _>>()?;
 
-    let still_live: BTreeSet<i64> = conn
+    let still_live: BTreeSet<i64> = tx
         .prepare(&format!(
             "SELECT db_version FROM ({});",
             tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table} WHERE db_version >= {first} AND db_version <= {last}")).collect::<Vec<_>>().join(" UNION ")
@@ -1024,6 +1046,7 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
         let transport = transport.clone();
 
         spawn_counted(async move {
+            let len = data.len();
             match timeout(Duration::from_secs(5), transport.send_datagram(addr, data)).await {
                 Err(_e) => {
                     warn!("timed out writing gossip as datagram {addr}");
@@ -1035,9 +1058,9 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
                 }
                 _ => {}
             }
+            increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor.id().to_string());
+            counter!("corro.peer.datagram.bytes.sent.total", len as u64);
         });
-
-        increment_counter!("corro.gossip.send.count", "actor_id" => actor.id().to_string());
     }
 }
 
@@ -1345,33 +1368,32 @@ async fn process_fully_buffered_changes(
     actor_id: ActorId,
     version: i64,
 ) -> Result<bool, ChangeError> {
-    let booked = agent.bookie().for_actor(actor_id);
-
     let mut conn = agent.pool().write_normal().await?;
 
-    let mut bookedw = booked.write();
+    let booked = agent.bookie().for_actor(actor_id).await;
+    let mut bookedw = booked.write().await;
 
-    let (last_seq, ts) = {
-        match bookedw.inner().get(&version) {
-            Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
-                if seqs.gaps(&(0..=*last_seq)).count() != 0 {
-                    // TODO: return an error here
+    let inserted = block_in_place(|| {
+        let (last_seq, ts) = {
+            match bookedw.inner().get(&version) {
+                Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
+                    if seqs.gaps(&(0..=*last_seq)).count() != 0 {
+                        // TODO: return an error here
+                        return Ok(false);
+                    }
+                    (*last_seq, *ts)
+                }
+                Some(_) => {
+                    warn!(%actor_id, %version, "already processed buffered changes, returning");
                     return Ok(false);
                 }
-                (*last_seq, *ts)
+                None => {
+                    warn!(%actor_id, %version, "version not found in cache,returning");
+                    return Ok(false);
+                }
             }
-            Some(_) => {
-                warn!(%actor_id, %version, "already processed buffered changes, returning");
-                return Ok(false);
-            }
-            None => {
-                warn!(%actor_id, %version, "version not found in cache,returning");
-                return Ok(false);
-            }
-        }
-    };
+        };
 
-    let known_version = block_in_place(|| {
         let tx = conn.transaction()?;
 
         let max_db_version: Option<i64> = tx
@@ -1389,7 +1411,7 @@ async fn process_fully_buffered_changes(
         let max_db_version = match max_db_version {
             None => {
                 warn!("zero rows to move, aborting!");
-                return Ok(None);
+                return Ok(false);
             }
             Some(v) => v,
         };
@@ -1401,8 +1423,8 @@ async fn process_fully_buffered_changes(
         let count = tx
             .prepare_cached(
                 "
-                INSERT INTO crsql_changes
-                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl
+                INSERT INTO crsql_changes (\"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
                                 AND version = ?
@@ -1456,15 +1478,17 @@ async fn process_fully_buffered_changes(
 
         tx.commit()?;
 
-        Ok::<_, rusqlite::Error>(known_version)
+        let inserted = if let Some(known_version) = known_version {
+            bookedw.insert(version, known_version);
+            true
+        } else {
+            false
+        };
+
+        Ok::<_, rusqlite::Error>(inserted)
     })?;
 
-    Ok(if let Some(known_version) = known_version {
-        bookedw.insert(version, known_version);
-        true
-    } else {
-        false
-    })
+    Ok(inserted)
 }
 
 pub async fn process_single_version(
@@ -1480,7 +1504,10 @@ pub async fn process_single_version(
         changeset,
     } = change;
 
-    if bookie.contains(&actor_id, changeset.versions(), changeset.seqs()) {
+    if bookie
+        .contains(&actor_id, changeset.versions(), changeset.seqs())
+        .await
+    {
         trace!(
             "already seen these versions from: {actor_id}, version: {:?}",
             changeset.versions()
@@ -1498,24 +1525,24 @@ pub async fn process_single_version(
 
     let mut conn = agent.pool().write_normal().await?;
 
-    let booked = bookie.for_actor(actor_id);
+    let booked = bookie.for_actor(actor_id).await;
     let (db_version, changeset) = {
-        let mut booked_write = booked.write();
-
+        let mut booked_write = booked.write().await;
         // check again, might've changed since we acquired the lock
         if booked_write.contains_all(changeset.versions(), changeset.seqs()) {
             trace!("previously unknown versions are now deemed known, aborting inserts");
             return Ok(None);
         }
 
-        let (known_version, changeset, db_version) = block_in_place(move || {
+        let (changeset, db_version) = block_in_place(move || {
             let tx = conn.transaction()?;
 
             let versions = changeset.versions();
             let (version, changes, seqs, last_seq, ts) = match changeset.into_parts() {
                 None => {
                     store_empty_changeset(tx, actor_id, versions.clone())?;
-                    return Ok((KnownDbVersion::Cleared, Changeset::Empty { versions }, None));
+                    booked_write.insert_many(versions.clone(), KnownDbVersion::Cleared);
+                    return Ok((Changeset::Empty { versions }, None));
                 }
                 Some(parts) => parts,
             };
@@ -1530,9 +1557,9 @@ pub async fn process_single_version(
                     inserted += tx.prepare_cached(
                         r#"
                             INSERT INTO __corro_buffered_changes
-                                ("table", pk, cid, val, col_version, db_version, site_id, seq, cl, version)
+                                ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, version)
                             VALUES
-                                (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,   ?,  ?)
+                                (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?,   ?)
                             ON CONFLICT (site_id, db_version, version, seq)
                                 DO NOTHING
                         "#,
@@ -1545,8 +1572,8 @@ pub async fn process_single_version(
                         change.col_version,
                         change.db_version,
                         &change.site_id,
-                        change.seq,
                         change.cl,
+                        change.seq,
                         version,
                     ])?;
                 }
@@ -1584,9 +1611,12 @@ pub async fn process_single_version(
                 // if we have no gaps, then we can schedule applying all these changes.
                 if gaps_count == 0 {
                     if inserted > 0 {
-                        if let Err(e) = agent.tx_apply().blocking_send((actor_id, version)) {
-                            error!("could not send trigger for applying fully buffered changes later: {e}");
-                        }
+                        let tx_apply = agent.tx_apply().clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tx_apply.send((actor_id, version)).await {
+                                error!("could not send trigger for applying fully buffered changes later: {e}");
+                            }
+                        });
                     }
                 } else {
                     tx.prepare_cached(
@@ -1612,21 +1642,24 @@ pub async fn process_single_version(
 
                 tx.commit()?;
 
-                return Ok((
+                let changeset = Changeset::Full {
+                    version,
+                    changes,
+                    seqs,
+                    last_seq,
+                    ts,
+                };
+
+                booked_write.insert_many(
+                    changeset.versions(),
                     KnownDbVersion::Partial {
                         seqs: seqs_recorded,
                         last_seq,
                         ts,
                     },
-                    Changeset::Full {
-                        version,
-                        changes,
-                        seqs,
-                        last_seq,
-                        ts,
-                    },
-                    None,
-                ));
+                );
+
+                return Ok((changeset, None));
             }
 
             let mut db_version: i64 =
@@ -1641,9 +1674,9 @@ pub async fn process_single_version(
                 tx.prepare_cached(
                     r#"
                         INSERT INTO crsql_changes
-                            ("table", pk, cid, val, col_version, db_version, seq, site_id, cl)
+                            ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
                         VALUES
-                            (?,       ?,  ?,   ?,   ?,           ?,          ?,    ?,      ?)
+                            (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?)
                     "#,
                 )?
                 .execute(params![
@@ -1653,9 +1686,9 @@ pub async fn process_single_version(
                     &change.val,
                     change.col_version,
                     change.db_version,
-                    change.seq,
                     &change.site_id,
                     change.cl,
+                    change.seq,
                 ])?;
                 let rows_impacted: i64 = tx
                     .prepare_cached("SELECT crsql_rows_impacted()")?
@@ -1702,11 +1735,11 @@ pub async fn process_single_version(
 
             debug!("committed transaction");
 
-            Ok::<_, rusqlite::Error>((known_version, new_changeset, db_version))
-        })?;
+            booked_write.insert_many(new_changeset.versions(), known_version);
+            trace!("inserted into in-memory bookkeeping");
 
-        booked_write.insert_many(changeset.versions(), known_version);
-        trace!("inserted into in-memory bookkeeping");
+            Ok::<_, rusqlite::Error>((new_changeset, db_version))
+        })?;
 
         (db_version, changeset)
     };
@@ -1803,7 +1836,7 @@ pub enum SyncRecvError {
 }
 
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
-    let sync_state = generate_sync(agent.bookie(), agent.actor_id());
+    let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
     for (actor_id, needed) in sync_state.need.iter() {
         gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
     }
@@ -2447,9 +2480,12 @@ pub mod tests {
 
                 let bookie = ta.agent.bookie();
 
-                debug!("last version: {:?}", bookie.last(&ta.agent.actor_id()));
+                debug!(
+                    "last version: {:?}",
+                    bookie.last(&ta.agent.actor_id()).await
+                );
 
-                let sync = generate_sync(bookie, ta.agent.actor_id());
+                let sync = generate_sync(bookie, ta.agent.actor_id()).await;
                 let needed = sync.need_len();
 
                 debug!("generated sync: {sync:?}");
@@ -2493,7 +2529,7 @@ pub mod tests {
 
     #[test]
     fn test_in_memory_versions_compaction() -> eyre::Result<()> {
-        let conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
+        let mut conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
 
         conn.execute_batch(
             "
@@ -2514,28 +2550,34 @@ pub mod tests {
 
         assert_eq!(db_version, 2);
 
-        let to_clear = compact_booked_for_actor(&conn, &[1].into())?;
+        let tx = conn.transaction()?;
+
+        let to_clear = compact_booked_for_actor(&tx, &[1].into())?;
 
         assert!(to_clear.contains(&1));
         assert!(!to_clear.contains(&2));
 
-        let to_clear = compact_booked_for_actor(&conn, &[2].into())?;
+        let to_clear = compact_booked_for_actor(&tx, &[2].into())?;
         assert!(to_clear.is_empty());
 
-        conn.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
+        tx.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
+        tx.commit()?;
 
-        let to_clear = compact_booked_for_actor(&conn, &[2, 3].into())?;
+        let tx = conn.transaction()?;
+        let to_clear = compact_booked_for_actor(&tx, &[2, 3].into())?;
         assert!(to_clear.is_empty());
 
-        conn.execute("INSERT INTO foo (a) VALUES (1)", ())?;
+        tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
+        tx.commit()?;
 
-        let to_clear = compact_booked_for_actor(&conn, &[2, 3, 4].into())?;
+        let tx = conn.transaction()?;
+        let to_clear = compact_booked_for_actor(&tx, &[2, 3, 4].into())?;
 
         assert!(to_clear.contains(&2));
         assert!(!to_clear.contains(&3));
         assert!(!to_clear.contains(&4));
 
-        let to_clear = compact_booked_for_actor(&conn, &[3, 4].into())?;
+        let to_clear = compact_booked_for_actor(&tx, &[3, 4].into())?;
 
         assert!(to_clear.is_empty());
 
@@ -2616,6 +2658,11 @@ pub mod tests {
                 .prepare_cached("SELECT COUNT(*) FROM tests;")?
                 .query_row((), |row| row.get(0))?;
 
+            println!(
+                "{:#?}",
+                generate_sync(ta2.agent.bookie(), ta2.agent.actor_id()).await
+            );
+
             assert_eq!(
                 count,
                 10000,
@@ -2631,6 +2678,11 @@ pub mod tests {
                 .prepare_cached("SELECT COUNT(*) FROM tests;")?
                 .query_row((), |row| row.get(0))?;
 
+            println!(
+                "{:#?}",
+                generate_sync(ta3.agent.bookie(), ta3.agent.actor_id()).await
+            );
+
             assert_eq!(
                 count,
                 10000,
@@ -2644,6 +2696,11 @@ pub mod tests {
             let count: i64 = conn
                 .prepare_cached("SELECT COUNT(*) FROM tests;")?
                 .query_row((), |row| row.get(0))?;
+
+            println!(
+                "{:#?}",
+                generate_sync(ta4.agent.bookie(), ta4.agent.actor_id()).await
+            );
 
             assert_eq!(
                 count,

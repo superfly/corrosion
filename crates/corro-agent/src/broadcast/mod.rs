@@ -13,7 +13,7 @@ use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future,
 };
-use metrics::{gauge, histogram};
+use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
@@ -245,6 +245,12 @@ pub fn runtime_loop(
                                 Ok(mut conn) => block_in_place(|| match conn.transaction() {
                                     Ok(tx) => {
                                         for (id, address, state, foca_state) in states {
+                                            if let Err(e) = tx
+                                                .prepare_cached("DELETE FROM __corro_members;")
+                                                .and_then(|mut prepped| prepped.execute([]))
+                                            {
+                                                warn!("could not clear all corro members before re-inserting them: {e}");
+                                            }
                                             let db_res = tx.prepare_cached(
                                                     "
                                                 INSERT INTO __corro_members (actor_id, address, state, foca_state)
@@ -300,7 +306,6 @@ pub fn runtime_loop(
                         }
                         FocaInput::Data(data) => {
                             trace!("handling FocaInput::Data");
-                            histogram!("corro.gossip.recv.bytes", data.len() as f64);
                             if let Err(e) = foca.handle_data(&data, &mut runtime) {
                                 error!("error handling foca data: {e}");
                             }
@@ -698,7 +703,9 @@ fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
                 error!("could not write to uni stream to {addr}: {e}");
                 return;
             }
-            _ => {}
+            Ok(Ok(_)) => {
+                counter!("corro.peer.stream.bytes.sent.total", payload.len() as u64, "type" => "uni");
+            }
         }
 
         if let Err(e) = stream.finish().await {
