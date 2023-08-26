@@ -603,6 +603,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                 let to_check: Vec<ActorId> = { bookie.read().await.keys().copied().collect() };
 
+                let mut inserted = 0;
+                let mut deleted = 0;
+
                 for actor_id in to_check {
                     let booked = bookie.for_actor(actor_id).await;
 
@@ -649,7 +652,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             }
                         };
 
-                        let deleted = tx
+                        deleted += tx
                             .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ?")?
                             .execute([actor_id])?;
 
@@ -662,8 +665,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 new_copy.insert(*version..=*version, KnownDbVersion::Cleared);
                             }
                         }
-
-                        let mut inserted = 0;
 
                         for (range, known) in new_copy.iter() {
                             match known {
@@ -685,7 +686,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         tx.commit()?;
 
-                        info!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
+                        debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
                         Ok::<_, eyre::Report>(Some((new_copy, cleared_len)))
                     });
@@ -693,7 +694,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     match res {
                         Ok(Some((new_booked, cleared_len))) => {
                             **bookedw.inner_mut() = new_booked;
-                            info!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
+                            debug!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -701,6 +702,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         }
                     }
                 }
+
+                info!(
+                    "compaction done, cleared {} db bookkeeping table rows",
+                    deleted - inserted
+                );
             }
         }
     });
