@@ -963,9 +963,10 @@ fn collect_metrics(agent: Agent) {
     };
 
     for table in tables {
-        match conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-            row.get::<_, i64>(0)
-        }) {
+        match conn
+            .prepare_cached(&format!("SELECT count(*) FROM {table}"))
+            .and_then(|mut prepped| prepped.query_row([], |row| row.get::<_, i64>(0)))
+        {
             Ok(count) => {
                 gauge!("corro.db.table.rows.total", count as f64, "table" => table);
             }
@@ -973,6 +974,25 @@ fn collect_metrics(agent: Agent) {
                 error!("could not query count for table {table}: {e}");
                 continue;
             }
+        }
+    }
+
+    match conn
+        .prepare_cached("SELECT site_id, count(*) FROM __corro_buffered_changes GROUP BY site_id")
+        .and_then(|mut prepped| {
+            prepped
+                .query_map((), |row| {
+                    Ok((row.get::<_, ActorId>(0)?, row.get::<_, i64>(1)?))
+                })
+                .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
+        }) {
+        Ok(mapped) => {
+            for (actor_id, count) in mapped {
+                gauge!("corro.db.buffered.changes.rows.total", count as f64, "actor_id" => actor_id.to_string())
+            }
+        }
+        Err(e) => {
+            error!("could not query count for buffered changes: {e}");
         }
     }
 }
