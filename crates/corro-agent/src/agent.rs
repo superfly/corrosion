@@ -1486,10 +1486,10 @@ pub async fn process_single_version(
         changeset,
     } = change;
 
-    let booked = bookie.for_actor(actor_id).await;
-    let mut booked_write = booked.write().await;
-
-    if booked_write.contains_all(changeset.versions(), changeset.seqs()) {
+    if bookie
+        .contains(&actor_id, changeset.versions(), changeset.seqs())
+        .await
+    {
         trace!(
             "already seen these versions from: {actor_id}, version: {:?}",
             changeset.versions()
@@ -1507,27 +1507,36 @@ pub async fn process_single_version(
 
     let mut conn = agent.pool().write_normal().await?;
 
-    let (changeset, db_version) = block_in_place(move || {
-        let tx = conn.transaction()?;
+    let booked = bookie.for_actor(actor_id).await;
+    let (db_version, changeset) = {
+        let mut booked_write = booked.write().await;
+        // check again, might've changed since we acquired the lock
+        if booked_write.contains_all(changeset.versions(), changeset.seqs()) {
+            trace!("previously unknown versions are now deemed known, aborting inserts");
+            return Ok(None);
+        }
 
-        let versions = changeset.versions();
-        let (version, changes, seqs, last_seq, ts) = match changeset.into_parts() {
-            None => {
-                store_empty_changeset(tx, actor_id, versions.clone())?;
-                booked_write.insert_many(versions.clone(), KnownDbVersion::Cleared);
-                return Ok((Changeset::Empty { versions }, None));
-            }
-            Some(parts) => parts,
-        };
+        let (changeset, db_version) = block_in_place(move || {
+            let tx = conn.transaction()?;
 
-        // received changes that does not cover 0 .. =last_seq
-        if !is_complete {
-            let mut inserted = 0;
-            for change in changes.iter() {
-                trace!("buffering change! {change:?}");
+            let versions = changeset.versions();
+            let (version, changes, seqs, last_seq, ts) = match changeset.into_parts() {
+                None => {
+                    store_empty_changeset(tx, actor_id, versions.clone())?;
+                    booked_write.insert_many(versions.clone(), KnownDbVersion::Cleared);
+                    return Ok((Changeset::Empty { versions }, None));
+                }
+                Some(parts) => parts,
+            };
 
-                // insert change, do nothing on conflict
-                inserted += tx.prepare_cached(
+            // if not a full range!
+            if !is_complete {
+                let mut inserted = 0;
+                for change in changes.iter() {
+                    trace!("buffering change! {change:?}");
+
+                    // insert change, do nothing on conflict
+                    inserted += tx.prepare_cached(
                         r#"
                             INSERT INTO __corro_buffered_changes
                                 ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, version)
@@ -1549,56 +1558,56 @@ pub async fn process_single_version(
                         change.seq,
                         version,
                     ])?;
-            }
+                }
 
-            if changes.len() != inserted {
-                debug!(actor = %agent.actor_id(), "did not insert as many changes... {inserted}");
-            }
+                if changes.len() != inserted {
+                    debug!(actor = %agent.actor_id(), "did not insert as many changes... {inserted}");
+                }
 
-            // calculate all known sequences for the actor + version combo
-            let mut seqs_recorded: RangeInclusiveSet<i64> = tx
-                .prepare_cached(
-                    "
+                // calculate all known sequences for the actor + version combo
+                let mut seqs_recorded: RangeInclusiveSet<i64> = tx
+                    .prepare_cached(
+                        "
                     SELECT start_seq, end_seq
                         FROM __corro_seq_bookkeeping
                         WHERE site_id = ?
                           AND version = ?
                 ",
-                )?
-                .query_map(params![actor_id, version], |row| {
-                    Ok(row.get(0)?..=row.get(1)?)
-                })?
-                .collect::<rusqlite::Result<_>>()?;
+                    )?
+                    .query_map(params![actor_id, version], |row| {
+                        Ok(row.get(0)?..=row.get(1)?)
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
 
-            // immediately add this new range to the recorded seqs ranges
-            seqs_recorded.insert(seqs.clone());
+                // immediately add this new range to the recorded seqs ranges
+                seqs_recorded.insert(seqs.clone());
 
-            // all seq for this version (from 0 to the last seq, inclusively)
-            let full_seqs_range = 0..=last_seq;
+                // all seq for this version (from 0 to the last seq, inclusively)
+                let full_seqs_range = 0..=last_seq;
 
-            // figure out how many seq gaps we have between 0 and the last seq for this version
-            let gaps_count = seqs_recorded.gaps(&full_seqs_range).count();
+                // figure out how many seq gaps we have between 0 and the last seq for this version
+                let gaps_count = seqs_recorded.gaps(&full_seqs_range).count();
 
-            debug!(actor = %agent.actor_id(), "still missing {gaps_count} seqs");
+                debug!(actor = %agent.actor_id(), "still missing {gaps_count} seqs");
 
-            // if we have no gaps, then we can schedule applying all these changes.
-            if gaps_count == 0 {
-                if inserted > 0 {
-                    let tx_apply = agent.tx_apply().clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = tx_apply.send((actor_id, version)).await {
-                            error!("could not send trigger for applying fully buffered changes later: {e}");
-                        }
-                    });
-                }
-            } else {
-                tx.prepare_cached(
-                    "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
-                )?
-                .execute(params![actor_id, version])?;
+                // if we have no gaps, then we can schedule applying all these changes.
+                if gaps_count == 0 {
+                    if inserted > 0 {
+                        let tx_apply = agent.tx_apply().clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tx_apply.send((actor_id, version)).await {
+                                error!("could not send trigger for applying fully buffered changes later: {e}");
+                            }
+                        });
+                    }
+                } else {
+                    tx.prepare_cached(
+                        "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
+                    )?
+                    .execute(params![actor_id, version])?;
 
-                for range in seqs_recorded.iter() {
-                    tx.prepare_cached("INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
+                    for range in seqs_recorded.iter() {
+                        tx.prepare_cached("INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
                         VALUES (?, ?, ?, ?, ?, ?)
                             ",
                         )?
@@ -1610,109 +1619,112 @@ pub async fn process_single_version(
                             last_seq,
                             ts
                         ])?;
+                    }
                 }
-            }
 
-            tx.commit()?;
+                tx.commit()?;
 
-            let changeset = Changeset::Full {
-                version,
-                changes,
-                seqs,
-                last_seq,
-                ts,
-            };
-
-            booked_write.insert_many(
-                changeset.versions(),
-                KnownDbVersion::Partial {
-                    seqs: seqs_recorded,
+                let changeset = Changeset::Full {
+                    version,
+                    changes,
+                    seqs,
                     last_seq,
                     ts,
-                },
-            );
+                };
 
-            return Ok((changeset, None));
-        }
+                booked_write.insert_many(
+                    changeset.versions(),
+                    KnownDbVersion::Partial {
+                        seqs: seqs_recorded,
+                        last_seq,
+                        ts,
+                    },
+                );
 
-        let mut db_version: i64 =
-            tx.query_row("SELECT crsql_db_version() + 1", (), |row| row.get(0))?;
+                return Ok((changeset, None));
+            }
 
-        let mut impactful_changeset = vec![];
+            let mut db_version: i64 =
+                tx.query_row("SELECT crsql_db_version() + 1", (), |row| row.get(0))?;
 
-        let mut last_rows_impacted = 0;
+            let mut impactful_changeset = vec![];
 
-        for change in changes {
-            trace!("inserting change! {change:?}");
-            tx.prepare_cached(
-                r#"
+            let mut last_rows_impacted = 0;
+
+            for change in changes {
+                trace!("inserting change! {change:?}");
+                tx.prepare_cached(
+                    r#"
                         INSERT INTO crsql_changes
                             ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
                         VALUES
                             (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?)
                     "#,
-            )?
-            .execute(params![
-                change.table.as_str(),
-                change.pk,
-                change.cid.as_str(),
-                &change.val,
-                change.col_version,
-                change.db_version,
-                &change.site_id,
-                change.cl,
-                change.seq,
-            ])?;
-            let rows_impacted: i64 = tx
-                .prepare_cached("SELECT crsql_rows_impacted()")?
-                .query_row((), |row| row.get(0))?;
+                )?
+                .execute(params![
+                    change.table.as_str(),
+                    change.pk,
+                    change.cid.as_str(),
+                    &change.val,
+                    change.col_version,
+                    change.db_version,
+                    &change.site_id,
+                    change.cl,
+                    change.seq,
+                ])?;
+                let rows_impacted: i64 = tx
+                    .prepare_cached("SELECT crsql_rows_impacted()")?
+                    .query_row((), |row| row.get(0))?;
 
-            if rows_impacted > last_rows_impacted {
-                debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
-                db_version = std::cmp::max(change.db_version, db_version);
-                impactful_changeset.push(change);
+                if rows_impacted > last_rows_impacted {
+                    debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
+                    db_version = std::cmp::max(change.db_version, db_version);
+                    impactful_changeset.push(change);
+                }
+                last_rows_impacted = rows_impacted;
             }
-            last_rows_impacted = rows_impacted;
-        }
 
-        debug!(
-            "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?}",
-            actor_id, version, db_version, ts
-        );
+            debug!(
+                "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?}",
+                actor_id, version, db_version, ts
+            );
 
-        tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
+            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
 
-        debug!("inserted bookkeeping row");
+            debug!("inserted bookkeeping row");
 
-        let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
-            (KnownDbVersion::Cleared, Changeset::Empty { versions }, None)
-        } else {
-            (
-                KnownDbVersion::Current {
-                    db_version,
-                    last_seq,
-                    ts,
-                },
-                Changeset::Full {
-                    version,
-                    changes: impactful_changeset,
-                    seqs,
-                    last_seq,
-                    ts,
-                },
-                Some(db_version),
-            )
-        };
+            let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
+                (KnownDbVersion::Cleared, Changeset::Empty { versions }, None)
+            } else {
+                (
+                    KnownDbVersion::Current {
+                        db_version,
+                        last_seq,
+                        ts,
+                    },
+                    Changeset::Full {
+                        version,
+                        changes: impactful_changeset,
+                        seqs,
+                        last_seq,
+                        ts,
+                    },
+                    Some(db_version),
+                )
+            };
 
-        tx.commit()?;
+            tx.commit()?;
 
-        debug!("committed transaction");
+            debug!("committed transaction");
 
-        booked_write.insert_many(new_changeset.versions(), known_version);
-        trace!("inserted into in-memory bookkeeping");
+            booked_write.insert_many(new_changeset.versions(), known_version);
+            trace!("inserted into in-memory bookkeeping");
 
-        Ok::<_, rusqlite::Error>((new_changeset, db_version))
-    })?;
+            Ok::<_, rusqlite::Error>((new_changeset, db_version))
+        })?;
+
+        (db_version, changeset)
+    };
 
     if db_version.is_some() {
         process_subs(agent, changeset.changes());
