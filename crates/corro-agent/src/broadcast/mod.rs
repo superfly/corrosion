@@ -13,7 +13,7 @@ use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future,
 };
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
@@ -306,7 +306,6 @@ pub fn runtime_loop(
                         }
                         FocaInput::Data(data) => {
                             trace!("handling FocaInput::Data");
-                            histogram!("corro.gossip.recv.bytes", data.len() as f64);
                             if let Err(e) = foca.handle_data(&data, &mut runtime) {
                                 error!("error handling foca data: {e}");
                             }
@@ -705,7 +704,7 @@ fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
                 return;
             }
             Ok(Ok(_)) => {
-                counter!("corro.api.peer.bytes.sent.total", payload.len() as u64, "stream" => "uni");
+                counter!("corro.peer.stream.bytes.sent.total", payload.len() as u64, "stream" => "uni");
             }
         }
 

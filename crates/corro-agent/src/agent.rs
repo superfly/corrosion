@@ -332,7 +332,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         }
                     };
 
-                    increment_counter!("corro.api.peer.quic.connections.accept.total");
+                    increment_counter!("corro.peer.connection.accept.total");
 
                     debug!("accepted a QUIC conn from {remote_addr}");
 
@@ -345,7 +345,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 let b = tokio::select! {
                                     b_res = conn.read_datagram() => match b_res {
                                         Ok(b) => {
-                                            increment_counter!("corro.api.peer.quic.datagrams.recv.total");
+                                            increment_counter!("corro.peer.datagram.recv.total");
+                                            counter!("corro.peer.datagram.bytes.recv.total", b.len() as u64);
                                             b
                                         },
                                         Err(e) => {
@@ -385,7 +386,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                     }
                                 };
 
-                                increment_counter!("corro.api.peer.streams.accept.total", "type" => "uni");
+                                increment_counter!("corro.peer.stream.accept.total", "type" => "uni");
 
                                 debug!(
                                     "accepted a unidirectional stream from {}",
@@ -447,7 +448,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                     break;
                                                 }
                                                 Ok(Ok(n)) => {
-                                                    counter!("corro.api.peer.bytes.recv.total", n as u64, "stream" => "uni");
+                                                    counter!("corro.peer.stream.bytes.recv.total", n as u64, "type" => "uni");
                                                     trace!("read {n} bytes");
                                                 }
                                                 Ok(Err(e)) => {
@@ -490,7 +491,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 }
                             };
 
-                            increment_counter!("corro.api.peer.streams.accept.total", "type" => "bi");
+                            increment_counter!("corro.peer.streams.accept.total", "type" => "bi");
 
                             debug!(
                                 "accepted a bidirectional stream from {}",
@@ -1045,6 +1046,7 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
         let transport = transport.clone();
 
         spawn_counted(async move {
+            let len = data.len();
             match timeout(Duration::from_secs(5), transport.send_datagram(addr, data)).await {
                 Err(_e) => {
                     warn!("timed out writing gossip as datagram {addr}");
@@ -1056,9 +1058,9 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
                 }
                 _ => {}
             }
+            increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor.id().to_string());
+            counter!("corro.peer.datagram.bytes.sent.total", len as u64);
         });
-
-        increment_counter!("corro.gossip.send.count", "actor_id" => actor.id().to_string());
     }
 }
 
