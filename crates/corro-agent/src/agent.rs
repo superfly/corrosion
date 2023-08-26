@@ -1405,8 +1405,8 @@ async fn process_fully_buffered_changes(
         let count = tx
             .prepare_cached(
                 "
-                INSERT INTO crsql_changes
-                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl
+                INSERT INTO crsql_changes (\"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
                                 AND version = ?
@@ -2640,6 +2640,11 @@ pub mod tests {
                 .prepare_cached("SELECT COUNT(*) FROM tests;")?
                 .query_row((), |row| row.get(0))?;
 
+            println!(
+                "{:#?}",
+                generate_sync(ta2.agent.bookie(), ta2.agent.actor_id()).await
+            );
+
             assert_eq!(
                 count,
                 10000,
@@ -2655,6 +2660,11 @@ pub mod tests {
                 .prepare_cached("SELECT COUNT(*) FROM tests;")?
                 .query_row((), |row| row.get(0))?;
 
+            println!(
+                "{:#?}",
+                generate_sync(ta3.agent.bookie(), ta3.agent.actor_id()).await
+            );
+
             assert_eq!(
                 count,
                 10000,
@@ -2668,6 +2678,11 @@ pub mod tests {
             let count: i64 = conn
                 .prepare_cached("SELECT COUNT(*) FROM tests;")?
                 .query_row((), |row| row.get(0))?;
+
+            println!(
+                "{:#?}",
+                generate_sync(ta4.agent.bookie(), ta4.agent.actor_id()).await
+            );
 
             assert_eq!(
                 count,
