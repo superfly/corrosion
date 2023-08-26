@@ -401,7 +401,7 @@ async fn process_version(
                     )?;
 
                     let mut chunked =
-                        ChunkedChanges::new(rows, 0, *last_seq, MAX_CHANGES_PER_MESSAGE);
+                        ChunkedChanges::new(rows, *start_seq, *end_seq, MAX_CHANGES_PER_MESSAGE);
                     while let Some(changes_seqs) = chunked.next() {
                         match changes_seqs {
                             Ok((changes, seqs)) => {
