@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+build-info = { workspace = true }
 bytes = { workspace = true }
 camino = { workspace = true }
 clap = { workspace = true }
@@ -43,6 +44,9 @@ tracing-filter = { workspace = true }
 tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
 uuid = { workspace = true }
+
+[build-dependencies]
+build-info-build = { workspace = true }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }

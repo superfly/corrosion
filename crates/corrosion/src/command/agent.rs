@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use camino::Utf8PathBuf;
 use corro_admin::AdminConfig;
 use corro_types::config::{Config, TelemetryConfig};
+use metrics::gauge;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use spawn::wait_for_all_pending_handles;
 use tracing::{error, info};
@@ -14,6 +15,8 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
 
     if let Some(TelemetryConfig::Prometheus { bind_addr }) = config.telemetry {
         setup_prometheus(bind_addr).expect("could not setup prometheus");
+        let info = crate::version();
+        gauge!("corro.build.info", 1.0, "version" => info.crate_info.version.to_string(), "ts" => info.timestamp.to_string(), "rustc_version" => info.compiler.version.to_string());
     }
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();

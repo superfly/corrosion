@@ -35,6 +35,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CONFIG: OnceCell<Config> = OnceCell::new();
 pub const API_CLIENT: OnceCell<CorrosionApiClient> = OnceCell::new();
 
+build_info::build_info!(pub fn version);
+
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
