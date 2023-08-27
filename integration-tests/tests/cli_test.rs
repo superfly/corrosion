@@ -9,7 +9,6 @@ static CORROSION_BIN: Lazy<CargoRun> = Lazy::new(|| {
     escargot::CargoBuild::new()
         .bin("corrosion")
         .manifest_path("../Cargo.toml")
-        .target_dir("../target/escargot")
         .run()
         .unwrap()
 });
