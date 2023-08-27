@@ -993,31 +993,34 @@ fn collect_metrics(agent: Agent) {
 
     for (name, table) in schema.tables.iter() {
         let pks = table.pk.iter().cloned().collect::<Vec<String>>().join(",");
-        match conn.prepare_cached(&format!("SELECT site_id, {pks}, __crsql_col_name FROM {name}__crsql_clock LEFT JOIN crsql_site_id ON ordinal = COALESCE(__crsql_site_id, 0) ORDER BY site_id, {pks}, __crsql_seq")).and_then(|mut prepped|{
-            prepped.query(()).and_then(|mut rows|{
-                let mut hasher = DefaultHasher::new();
-                let len = table.pk.len() + 2;
-                while let Ok(Some(row)) = rows.next() {
+        let cols = table
+            .columns
+            .keys()
+            .cloned()
+            .collect::<Vec<String>>()
+            .join(",");
 
-                    for idx in 0..len {
-                        if idx == 0 {
-                            let v: [u8; 16] = row.get(idx)?;
-                            v.hash(&mut hasher);
-                        } else {
+        match conn
+            .prepare_cached(&format!("SELECT {pks},{cols} FROM {name} ORDER BY {pks}"))
+            .and_then(|mut prepped| {
+                let col_count = prepped.column_count();
+                prepped.query(()).and_then(|mut rows| {
+                    let mut hasher = DefaultHasher::new();
+                    while let Ok(Some(row)) = rows.next() {
+                        for idx in 0..col_count {
                             let v: SqliteValue = row.get(idx)?;
                             v.hash(&mut hasher);
                         }
                     }
-                }
-                Ok(hasher.finish())
-            })
-        }) {
+                    Ok(hasher.finish())
+                })
+            }) {
             Ok(hash) => {
                 absolute_counter!("corro.db.table.hash", hash, "table" => name.clone());
-            },
+            }
             Err(e) => {
                 error!("could not query clock table values for hashing {table}: {e}");
-            },
+            }
         }
     }
 }
