@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ahash = { workspace = true }
 arc-swap = { workspace = true }
 axum = { workspace = true }
 backoff = { path = "../backoff" }
@@ -28,7 +29,6 @@ rangemap = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = "*"
-seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spawn = { path = "../spawn" }

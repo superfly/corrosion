@@ -944,13 +944,6 @@ async fn require_authz<B>(
     Ok(next.run(request).await)
 }
 
-const STABLE_SEEDS: (u64, u64, u64, u64) = (
-    0x16f11fe89b0d677c,
-    0xb480a793d8e6c86c,
-    0x6fe2e5aaf078ebc9,
-    0x14f994a4c5259381,
-);
-
 fn collect_metrics(agent: Agent) {
     agent.pool().emit_metrics();
 
@@ -1012,12 +1005,7 @@ fn collect_metrics(agent: Agent) {
             .and_then(|mut prepped| {
                 let col_count = prepped.column_count();
                 prepped.query(()).and_then(|mut rows| {
-                    let mut hasher = seahash::SeaHasher::with_seeds(
-                        STABLE_SEEDS.0,
-                        STABLE_SEEDS.1,
-                        STABLE_SEEDS.2,
-                        STABLE_SEEDS.3,
-                    );
+                    let mut hasher = ahash::AHasher::default();
                     while let Ok(Some(row)) = rows.next() {
                         for idx in 0..col_count {
                             let v: SqliteValue = row.get(idx)?;
