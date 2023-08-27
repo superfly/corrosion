@@ -47,7 +47,7 @@ use bytes::{Bytes, BytesMut};
 use foca::{Member, Notification};
 use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
-use metrics::{counter, gauge, histogram, increment_counter};
+use metrics::{absolute_counter, counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
@@ -993,14 +993,16 @@ fn collect_metrics(agent: Agent) {
 
     for (name, table) in schema.tables.iter() {
         let pks = table.pk.iter().cloned().collect::<Vec<String>>().join(",");
-        match conn.prepare_cached(&format!("SELECT site_id, {pks} FROM {name}__crsql_clock LEFT JOIN crsql_site_id ON ordinal = COALESCE(__crsql_site_id, 0) ORDER BY site_id, {pks}, __crsql_seq")).and_then(|mut prepped|{
+        match conn.prepare_cached(&format!("SELECT site_id, {pks}, __crsql_col_name FROM {name}__crsql_clock LEFT JOIN crsql_site_id ON ordinal = COALESCE(__crsql_site_id, 0) ORDER BY site_id, {pks}, __crsql_seq")).and_then(|mut prepped|{
             prepped.query(()).and_then(|mut rows|{
                 let mut hasher = DefaultHasher::new();
+                let len = table.pk.len() + 2;
                 while let Ok(Some(row)) = rows.next() {
-                    for idx in 0..(table.pk.len() + 1) {
+
+                    for idx in 0..len {
                         if idx == 0 {
                             let v: [u8; 16] = row.get(idx)?;
-                            v.hash(&mut hasher);       
+                            v.hash(&mut hasher);
                         } else {
                             let v: SqliteValue = row.get(idx)?;
                             v.hash(&mut hasher);
@@ -1011,8 +1013,7 @@ fn collect_metrics(agent: Agent) {
             })
         }) {
             Ok(hash) => {
-                let hex = hex::encode(hash.to_be_bytes().as_slice());
-                gauge!("corro.db.table.hash", 1.0, "table" => name.clone(), "hash" => hex);
+                absolute_counter!("corro.db.table.hash", hash, "table" => name.clone());
             },
             Err(e) => {
                 error!("could not query clock table values for hashing {table}: {e}");
