@@ -993,13 +993,18 @@ fn collect_metrics(agent: Agent) {
 
     for (name, table) in schema.tables.iter() {
         let pks = table.pk.iter().cloned().collect::<Vec<String>>().join(",");
-        match conn.prepare_cached(&format!("SELECT __crsql_site_id, {pks} FROM {name}__crsql_clock ORDER BY __crsql_site_id, __crsql_db_version, __crsql_seq, {pks}")).and_then(|mut prepped|{
+        match conn.prepare_cached(&format!("SELECT site_id, {pks} FROM {name}__crsql_clock LEFT JOIN crsql_site_it ON ordinal = __crsql_site_id ORDER BY site_id, __crsql_db_version, __crsql_seq, {pks}")).and_then(|mut prepped|{
             prepped.query(()).and_then(|mut rows|{
                 let mut hasher = DefaultHasher::new();
                 while let Ok(Some(row)) = rows.next() {
                     for idx in 0..(table.pk.len() + 1) {
+                        if idx == 0 {
+                            let v: [u8; 16] = row.get(idx)?;
+                            v.hash(&mut hasher);       
+                        } else {
                         let v: SqliteValue = row.get(idx)?;
                         v.hash(&mut hasher);
+                        }
                     }
                 }
                 Ok(hasher.finish())
@@ -1010,7 +1015,7 @@ fn collect_metrics(agent: Agent) {
                 gauge!("corro.db.table.hash", 1.0, "table" => name.clone(), "hash" => hex);
             },
             Err(e) => {
-                error!("could not query clock table values for hashing: {e}");
+                error!("could not query clock table values for hashing {table}: {e}");
             },
         }
     }
