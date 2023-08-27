@@ -1007,7 +1007,7 @@ fn collect_metrics(agent: Agent) {
         }) {
             Ok(hash) => {
                 let hex = hex::encode(hash.to_be_bytes().as_slice());
-                gauge!("corro.db.table.hash", 1.0, "hash" => hex);
+                gauge!("corro.db.table.hash", 1.0, "table" => name.clone(), "hash" => hex);
             },
             Err(e) => {
                 error!("could not query clock table values for hashing: {e}");
