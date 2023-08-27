@@ -993,15 +993,9 @@ fn collect_metrics(agent: Agent) {
 
     for (name, table) in schema.tables.iter() {
         let pks = table.pk.iter().cloned().collect::<Vec<String>>().join(",");
-        let cols = table
-            .columns
-            .keys()
-            .cloned()
-            .collect::<Vec<String>>()
-            .join(",");
 
         match conn
-            .prepare_cached(&format!("SELECT {pks},{cols} FROM {name} ORDER BY {pks}"))
+            .prepare_cached(&format!("SELECT * FROM {name} ORDER BY {pks}"))
             .and_then(|mut prepped| {
                 let col_count = prepped.column_count();
                 prepped.query(()).and_then(|mut rows| {
