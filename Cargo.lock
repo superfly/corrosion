@@ -735,6 +735,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-pemfile",
+ "seahash",
  "serde",
  "serde_json",
  "spawn",

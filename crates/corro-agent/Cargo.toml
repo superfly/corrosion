@@ -28,6 +28,7 @@ rangemap = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = "*"
+seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spawn = { path = "../spawn" }
