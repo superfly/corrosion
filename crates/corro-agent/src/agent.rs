@@ -993,7 +993,7 @@ fn collect_metrics(agent: Agent) {
 
     for (name, table) in schema.tables.iter() {
         let pks = table.pk.iter().cloned().collect::<Vec<String>>().join(",");
-        match conn.prepare_cached(&format!("SELECT site_id, {pks} FROM {name}__crsql_clock LEFT JOIN crsql_site_it ON ordinal = __crsql_site_id ORDER BY site_id, __crsql_db_version, __crsql_seq, {pks}")).and_then(|mut prepped|{
+        match conn.prepare_cached(&format!("SELECT site_id, {pks} FROM {name}__crsql_clock LEFT JOIN crsql_site_it ON ordinal = __crsql_site_id ORDER BY site_id, {pks}, __crsql_seq")).and_then(|mut prepped|{
             prepped.query(()).and_then(|mut rows|{
                 let mut hasher = DefaultHasher::new();
                 while let Ok(Some(row)) = rows.next() {
@@ -1002,8 +1002,8 @@ fn collect_metrics(agent: Agent) {
                             let v: [u8; 16] = row.get(idx)?;
                             v.hash(&mut hasher);       
                         } else {
-                        let v: SqliteValue = row.get(idx)?;
-                        v.hash(&mut hasher);
+                            let v: SqliteValue = row.get(idx)?;
+                            v.hash(&mut hasher);
                         }
                     }
                 }
