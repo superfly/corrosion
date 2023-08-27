@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, BTreeSet, HashMap, HashSet},
     convert::Infallible,
+    hash::{Hash, Hasher},
     net::SocketAddr,
     ops::RangeInclusive,
     sync::{atomic::AtomicI64, Arc},
@@ -27,7 +28,7 @@ use corro_types::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeV1, Changeset, FocaInput,
         Timestamp, UniPayload, UniPayloadV1,
     },
-    change::Change,
+    change::{Change, SqliteValue},
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members},
     schema::init_schema,
@@ -946,13 +947,7 @@ async fn require_authz<B>(
 fn collect_metrics(agent: Agent) {
     agent.pool().emit_metrics();
 
-    let tables = agent
-        .schema()
-        .read()
-        .tables
-        .keys()
-        .cloned()
-        .collect::<Vec<String>>();
+    let schema = agent.schema().read();
 
     let conn = match agent.pool().read_blocking() {
         Ok(conn) => conn,
@@ -962,13 +957,13 @@ fn collect_metrics(agent: Agent) {
         }
     };
 
-    for table in tables {
+    for table in schema.tables.keys() {
         match conn
             .prepare_cached(&format!("SELECT count(*) FROM {table}"))
             .and_then(|mut prepped| prepped.query_row([], |row| row.get::<_, i64>(0)))
         {
             Ok(count) => {
-                gauge!("corro.db.table.rows.total", count as f64, "table" => table);
+                gauge!("corro.db.table.rows.total", count as f64, "table" => table.clone());
             }
             Err(e) => {
                 error!("could not query count for table {table}: {e}");
@@ -993,6 +988,30 @@ fn collect_metrics(agent: Agent) {
         }
         Err(e) => {
             error!("could not query count for buffered changes: {e}");
+        }
+    }
+
+    for (name, table) in schema.tables.iter() {
+        let pks = table.pk.iter().cloned().collect::<Vec<String>>().join(",");
+        match conn.prepare_cached(&format!("SELECT __crsql_site_id, {pks} FROM {name}__crsql_clock ORDER BY __crsql_site_id, __crsql_db_version, __crsql_seq, {pks}")).and_then(|mut prepped|{
+            prepped.query(()).and_then(|mut rows|{
+                let mut hasher = DefaultHasher::new();
+                while let Ok(Some(row)) = rows.next() {
+                    for idx in 0..(table.pk.len() + 1) {
+                        let v: SqliteValue = row.get(idx)?;
+                        v.hash(&mut hasher);
+                    }
+                }
+                Ok(hasher.finish())
+            })
+        }) {
+            Ok(hash) => {
+                let hex = hex::encode(hash.to_be_bytes().as_slice());
+                gauge!("corro.db.table.hash", 1.0, "hash" => hex);
+            },
+            Err(e) => {
+                error!("could not query clock table values for hashing: {e}");
+            },
         }
     }
 }

@@ -16,6 +16,7 @@ corro-types = { path = "../corro-types" }
 eyre = { workspace = true }
 foca = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 hyper = { workspace = true }
 metrics = { workspace = true }
 parking_lot = { workspace = true }

@@ -629,6 +629,7 @@ dependencies = [
  "eyre",
  "foca",
  "futures",
+ "hex",
  "http-body",
  "hyper",
  "metrics",
@@ -674,6 +675,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "smallvec",
+ "strum",
  "thiserror",
  "tokio",
 ]

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fmt::{self, Write},
+    hash::Hash,
 };
 
 use compact_str::{CompactString, ToCompactString};
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, ToSmallVec};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use sqlite::ChangeType;
+use strum::EnumDiscriminants;
 
 pub mod sqlite;
 
@@ -197,7 +199,8 @@ impl FromSql for ColumnType {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, EnumDiscriminants)]
+#[strum_discriminants(repr(u8))]
 #[serde(untagged)]
 pub enum SqliteValue {
     #[default]
@@ -206,6 +209,34 @@ pub enum SqliteValue {
     Real(f64),
     Text(CompactString),
     Blob(SmallVec<[u8; 512]>),
+}
+
+fn integer_decode(val: f64) -> (u64, i16, i8) {
+    let bits: u64 = unsafe { std::mem::transmute(val) };
+    let sign: i8 = if bits >> 63 == 0 { 1 } else { -1 };
+    let mut exponent: i16 = ((bits >> 52) & 0x7ff) as i16;
+    let mantissa = if exponent == 0 {
+        (bits & 0xfffffffffffff) << 1
+    } else {
+        (bits & 0xfffffffffffff) | 0x10000000000000
+    };
+
+    exponent -= 1023 + 52;
+    (mantissa, exponent, sign)
+}
+
+impl Hash for SqliteValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let d: SqliteValueDiscriminants = self.into();
+        (d as u8).hash(state);
+        match self {
+            SqliteValue::Null => {}
+            SqliteValue::Integer(i) => i.hash(state),
+            SqliteValue::Real(f) => integer_decode(*f).hash(state),
+            SqliteValue::Text(s) => s.hash(state),
+            SqliteValue::Blob(v) => v.hash(state),
+        }
+    }
 }
 
 impl SqliteValue {
