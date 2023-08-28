@@ -247,7 +247,7 @@ where
 fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
     match stmt {
         Statement::Simple(q) => tx.execute(&q, []),
-        Statement::WithParams(q, params) => tx.execute(&q, params_from_iter(params.into_iter())),
+        Statement::WithParams(q, params) => tx.execute(&q, params_from_iter(params)),
         Statement::WithNamedParams(q, params) => tx.execute(
             &q,
             params
@@ -362,7 +362,7 @@ async fn build_query_rows_response(
             }
         };
 
-        let prepped_res = block_in_place(|| match stmt {
+        let prepped_res = block_in_place(|| match &stmt {
             Statement::Simple(q) => conn.prepare(q.as_str()),
             Statement::WithParams(q, _) => conn.prepare(q.as_str()),
             Statement::WithNamedParams(q, _) => conn.prepare(q.as_str()),
@@ -397,7 +397,19 @@ async fn build_query_rows_response(
 
             let start = Instant::now();
 
-            let mut rows = match prepped.query(()) {
+            let query = match stmt {
+                Statement::Simple(_) => prepped.query(()),
+                Statement::WithParams(_, params) => prepped.query(params_from_iter(params)),
+                Statement::WithNamedParams(_, params) => prepped.query(
+                    params
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
+                        .collect::<Vec<(&str, &dyn ToSql)>>()
+                        .as_slice(),
+                ),
+            };
+
+            let mut rows = match query {
                 Ok(rows) => rows,
                 Err(e) => {
                     _ = res_tx.send(Err((
