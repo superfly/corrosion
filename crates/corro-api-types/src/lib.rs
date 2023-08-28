@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fmt::{self, Write},
     hash::Hash,
+    ops::Deref,
 };
 
 use compact_str::{CompactString, ToCompactString};
@@ -13,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, ToSmallVec};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use sqlite::ChangeType;
-use strum::EnumDiscriminants;
 
 pub mod sqlite;
 
@@ -143,7 +143,7 @@ impl<'a> SqliteValueRef<'a> {
         match self {
             SqliteValueRef::Null => SqliteValue::Null,
             SqliteValueRef::Integer(v) => SqliteValue::Integer(*v),
-            SqliteValueRef::Real(v) => SqliteValue::Real(*v),
+            SqliteValueRef::Real(v) => SqliteValue::Real(Real(*v)),
             SqliteValueRef::Text(v) => SqliteValue::Text((*v).to_compact_string()),
             SqliteValueRef::Blob(v) => SqliteValue::Blob(v.to_smallvec()),
         }
@@ -199,16 +199,33 @@ impl FromSql for ColumnType {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, EnumDiscriminants)]
-#[strum_discriminants(repr(u8))]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Hash)]
 #[serde(untagged)]
 pub enum SqliteValue {
     #[default]
     Null,
     Integer(i64),
-    Real(f64),
+    Real(Real),
     Text(CompactString),
     Blob(SmallVec<[u8; 512]>),
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(transparent)]
+pub struct Real(pub f64);
+
+impl Deref for Real {
+    type Target = f64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Hash for Real {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        integer_decode(self.0).hash(state)
+    }
 }
 
 fn integer_decode(val: f64) -> (u64, i16, i8) {
@@ -223,20 +240,6 @@ fn integer_decode(val: f64) -> (u64, i16, i8) {
 
     exponent -= 1023 + 52;
     (mantissa, exponent, sign)
-}
-
-impl Hash for SqliteValue {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let d: SqliteValueDiscriminants = self.into();
-        (d as u8).hash(state);
-        match self {
-            SqliteValue::Null => {}
-            SqliteValue::Integer(i) => i.hash(state),
-            SqliteValue::Real(f) => integer_decode(*f).hash(state),
-            SqliteValue::Text(s) => s.hash(state),
-            SqliteValue::Blob(v) => v.hash(state),
-        }
-    }
 }
 
 impl SqliteValue {
@@ -294,7 +297,7 @@ impl SqliteValue {
         match self {
             SqliteValue::Null => SqliteValueRef::Null,
             SqliteValue::Integer(i) => SqliteValueRef::Integer(*i),
-            SqliteValue::Real(f) => SqliteValueRef::Real(*f),
+            SqliteValue::Real(r) => SqliteValueRef::Real(r.0),
             SqliteValue::Text(s) => SqliteValueRef::Text(s.as_str()),
             SqliteValue::Blob(v) => SqliteValueRef::Blob(v.as_slice()),
         }
@@ -336,7 +339,7 @@ impl FromSql for SqliteValue {
         Ok(match value {
             ValueRef::Null => SqliteValue::Null,
             ValueRef::Integer(i) => SqliteValue::Integer(i),
-            ValueRef::Real(f) => SqliteValue::Real(f),
+            ValueRef::Real(f) => SqliteValue::Real(Real(f)),
             ValueRef::Text(t) => SqliteValue::Text(
                 std::str::from_utf8(t.into())
                     .map_err(|e| FromSqlError::Other(Box::new(e)))?
@@ -352,7 +355,7 @@ impl ToSql for SqliteValue {
         Ok(match self {
             SqliteValue::Null => ToSqlOutput::Owned(Value::Null),
             SqliteValue::Integer(i) => ToSqlOutput::Owned(Value::Integer(*i)),
-            SqliteValue::Real(f) => ToSqlOutput::Owned(Value::Real(*f)),
+            SqliteValue::Real(f) => ToSqlOutput::Owned(Value::Real(f.0)),
             SqliteValue::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
             SqliteValue::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b.as_slice())),
         })
@@ -384,7 +387,7 @@ where
         Ok(match u8::read_from(reader)? {
             0 => SqliteValue::Null,
             1 => SqliteValue::Integer(i64::read_from(reader)?),
-            2 => SqliteValue::Real(f64::read_from(reader)?),
+            2 => SqliteValue::Real(Real(f64::read_from(reader)?)),
             3 => {
                 let len = reader.read_u32()? as usize;
 

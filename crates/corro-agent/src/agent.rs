@@ -944,12 +944,12 @@ async fn require_authz<B>(
     Ok(next.run(request).await)
 }
 
-const PI: [u64; 4] = [
+const AHASH_RANDOM_STATE: ahash::RandomState = ahash::RandomState::with_seeds(
     0x243f_6a88_85a3_08d3,
     0x1319_8a2e_0370_7344,
     0xa409_3822_299f_31d0,
     0x082e_fa98_ec4e_6c89,
-];
+);
 
 fn collect_metrics(agent: Agent) {
     agent.pool().emit_metrics();
@@ -1006,8 +1006,7 @@ fn collect_metrics(agent: Agent) {
             .and_then(|mut prepped| {
                 let col_count = prepped.column_count();
                 prepped.query(()).and_then(|mut rows| {
-                    let mut hasher =
-                        ahash::RandomState::with_seeds(PI[0], PI[1], PI[2], PI[3]).build_hasher();
+                    let mut hasher = AHASH_RANDOM_STATE.build_hasher();
                     while let Ok(Some(row)) = rows.next() {
                         for idx in 0..col_count {
                             let v: SqliteValue = row.get(idx)?;
