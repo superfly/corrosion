@@ -708,7 +708,6 @@ dependencies = [
 name = "corro-agent"
 version = "0.1.0"
 dependencies = [
- "ahash 0.8.3",
  "arc-swap",
  "axum",
  "backoff",
@@ -736,6 +735,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-pemfile",
+ "seahash",
  "serde",
  "serde_json",
  "spawn",

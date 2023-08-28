@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     convert::Infallible,
-    hash::{BuildHasher, Hash, Hasher},
+    hash::{Hash, Hasher},
     net::SocketAddr,
     ops::RangeInclusive,
     sync::{atomic::AtomicI64, Arc},
@@ -940,12 +940,12 @@ async fn require_authz<B>(
     Ok(next.run(request).await)
 }
 
-const AHASH_RANDOM_STATE: ahash::RandomState = ahash::RandomState::with_seeds(
-    0x243f_6a88_85a3_08d3,
-    0x1319_8a2e_0370_7344,
-    0xa409_3822_299f_31d0,
-    0x082e_fa98_ec4e_6c89,
-);
+const CHECKSUM_SEEDS: [u64; 4] = [
+    0x16f11fe89b0d677c,
+    0xb480a793d8e6c86c,
+    0x6fe2e5aaf078ebc9,
+    0x14f994a4c5259381,
+];
 
 async fn metrics_loop(agent: Agent) {
     let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
@@ -1012,7 +1012,12 @@ fn collect_metrics(agent: &Agent) {
             .and_then(|mut prepped| {
                 let col_count = prepped.column_count();
                 prepped.query(()).and_then(|mut rows| {
-                    let mut hasher = AHASH_RANDOM_STATE.build_hasher();
+                    let mut hasher = seahash::SeaHasher::with_seeds(
+                        CHECKSUM_SEEDS[0],
+                        CHECKSUM_SEEDS[1],
+                        CHECKSUM_SEEDS[2],
+                        CHECKSUM_SEEDS[3],
+                    );
                     while let Ok(Some(row)) = rows.next() {
                         for idx in 0..col_count {
                             let v: SqliteValue = row.get(idx)?;

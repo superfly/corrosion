@@ -5,7 +5,6 @@ members = [
 ]
 
 [workspace.dependencies]
-ahash = { version = "0.8.3", default-features = false, features = ["std", "no-rng"] }
 arc-swap = { version = "1.6.0" }
 assert2 = "0.3.10"
 async-trait = "0.1.68"
