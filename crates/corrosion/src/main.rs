@@ -12,6 +12,7 @@ use command::{
     tls::{generate_ca, generate_client_cert, generate_server_cert},
     tpl::TemplateFlags,
 };
+use corro_api_types::SqliteValue;
 use corro_client::CorrosionApiClient;
 use corro_types::{
     api::{QueryEvent, RqliteResult, Statement},
@@ -162,11 +163,21 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             query,
             columns: show_columns,
             timer,
+            param,
         } => {
-            let mut body = cli
-                .api_client()?
-                .query(&Statement::Simple(query.clone()))
-                .await?;
+            let stmt = if param.is_empty() {
+                Statement::Simple(query.clone())
+            } else {
+                Statement::WithParams(
+                    query.clone(),
+                    param
+                        .into_iter()
+                        .map(|p| SqliteValue::Text(p.into()))
+                        .collect(),
+                )
+            };
+
+            let mut body = cli.api_client()?.query(&stmt).await?;
 
             let mut lines = LinesCodec::new();
 
@@ -367,6 +378,9 @@ enum Command {
         columns: bool,
         #[arg(long, default_value = "false")]
         timer: bool,
+
+        #[arg(long)]
+        param: Vec<String>,
     },
 
     /// Execute a SQL statement that mutates the state of Corrosion
