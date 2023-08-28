@@ -47,7 +47,7 @@ use bytes::{Bytes, BytesMut};
 use foca::{Member, Notification};
 use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
-use metrics::{absolute_counter, counter, gauge, histogram, increment_counter};
+use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
@@ -871,7 +871,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             .inspect(|_| info!("corrosion agent sync loop is done")),
     );
 
-    let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
 
     tokio::spawn(handle_gossip_to_send(transport, to_send_rx));
@@ -881,6 +880,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         foca_tx.clone(),
         member_events_tx,
     ));
+    tokio::spawn(metrics_loop(agent.clone()));
 
     let gossip_chunker =
         ReceiverStream::new(bcast_rx).chunks_timeout(10, Duration::from_millis(500));
@@ -906,10 +906,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             },
             _ = db_cleanup_interval.tick() => {
                 tokio::spawn(handle_db_cleanup(agent.pool().clone()).preemptible(tripwire.clone()));
-            },
-            _ = metrics_interval.tick() => {
-                let agent = agent.clone();
-                tokio::spawn(async move { block_in_place(move || collect_metrics(agent)) });
             },
             _ = &mut tripwire => {
                 debug!("tripped corrosion");
@@ -951,7 +947,17 @@ const AHASH_RANDOM_STATE: ahash::RandomState = ahash::RandomState::with_seeds(
     0x082e_fa98_ec4e_6c89,
 );
 
-fn collect_metrics(agent: Agent) {
+async fn metrics_loop(agent: Agent) {
+    let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
+
+    loop {
+        metrics_interval.tick().await;
+
+        block_in_place(|| collect_metrics(&agent));
+    }
+}
+
+fn collect_metrics(agent: &Agent) {
     agent.pool().emit_metrics();
 
     let schema = agent.schema().read();
@@ -1017,7 +1023,7 @@ fn collect_metrics(agent: Agent) {
                 })
             }) {
             Ok(hash) => {
-                absolute_counter!("corro.db.table.hash", hash, "table" => name.clone());
+                gauge!("corro.db.table.checksum", hash as f64, "table" => name.clone());
             }
             Err(e) => {
                 error!("could not query clock table values for hashing {table}: {e}");
