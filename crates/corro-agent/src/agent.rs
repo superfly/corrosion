@@ -656,12 +656,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
 
+                        let db_versions = versions.keys().copied().collect();
+
                         let to_clear = {
-                            match compact_booked_for_actor(&tx, &versions.keys().copied().collect())
-                            {
+                            match find_cleared_db_versions_for_actor(&tx, &db_versions) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
-                                        return Ok(None);
+                                        return Ok(());
                                     }
                                     to_clear
                                 }
@@ -680,8 +681,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         let cleared_len = to_clear.len();
 
-                        for db_version in to_clear {
-                            if let Some(version) = versions.get(&db_version) {
+                        for db_version in to_clear.iter() {
+                            if let Some(version) = versions.get(db_version) {
                                 new_copy.insert(*version..=*version, KnownDbVersion::Cleared);
                             }
                         }
@@ -706,20 +707,18 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         tx.commit()?;
 
+                        info!(actor_id = %actor_id, "cleared versions: {to_clear:?}");
+
                         debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
-                        Ok::<_, eyre::Report>(Some((new_copy, cleared_len)))
+                        **bookedw.inner_mut() = new_copy;
+                        debug!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
+
+                        Ok::<_, eyre::Report>(())
                     });
 
-                    match res {
-                        Ok(Some((new_booked, cleared_len))) => {
-                            **bookedw.inner_mut() = new_booked;
-                            debug!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            error!("could not compact versions for actor {actor_id}: {e}");
-                        }
+                    if let Err(e) = res {
+                        error!("could not compact versions for actor {actor_id}: {e}");
                     }
                 }
 
@@ -1075,7 +1074,7 @@ pub async fn handle_change(
     }
 }
 
-fn compact_booked_for_actor(
+fn find_cleared_db_versions_for_actor(
     tx: &Transaction,
     versions: &BTreeSet<i64>,
 ) -> eyre::Result<BTreeSet<i64>> {
@@ -1770,18 +1769,19 @@ pub async fn process_single_version(
                 last_rows_impacted = rows_impacted;
             }
 
-            debug!(
-                "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?}",
-                actor_id, version, db_version, ts
-            );
-
-            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
-
-            debug!("inserted bookkeeping row");
-
             let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
+                info!(
+                    "inserting CLEARED bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (rows impacted: {last_rows_impacted})",
+                    actor_id, version, db_version, ts
+                );
+                tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);")?.execute(params![actor_id, version, version])?;
                 (KnownDbVersion::Cleared, Changeset::Empty { versions }, None)
             } else {
+                info!(
+                    "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (rows impacted: {last_rows_impacted})",
+                    actor_id, version, db_version, ts
+                );
+                tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
                 (
                     KnownDbVersion::Current {
                         db_version,
@@ -1798,6 +1798,8 @@ pub async fn process_single_version(
                     Some(db_version),
                 )
             };
+
+            debug!("inserted bookkeeping row");
 
             tx.commit()?;
 
@@ -2620,32 +2622,32 @@ pub mod tests {
 
         let tx = conn.transaction()?;
 
-        let to_clear = compact_booked_for_actor(&tx, &[1].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &[1].into())?;
 
         assert!(to_clear.contains(&1));
         assert!(!to_clear.contains(&2));
 
-        let to_clear = compact_booked_for_actor(&tx, &[2].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &[2].into())?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = compact_booked_for_actor(&tx, &[2, 3].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &[2, 3].into())?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = compact_booked_for_actor(&tx, &[2, 3, 4].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &[2, 3, 4].into())?;
 
         assert!(to_clear.contains(&2));
         assert!(!to_clear.contains(&3));
         assert!(!to_clear.contains(&4));
 
-        let to_clear = compact_booked_for_actor(&tx, &[3, 4].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &[3, 4].into())?;
 
         assert!(to_clear.is_empty());
 
