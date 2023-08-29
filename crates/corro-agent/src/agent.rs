@@ -578,8 +578,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             let mut boff = backoff::Backoff::new(10)
                 .timeout_range(Duration::from_secs(5), Duration::from_secs(120))
                 .iter();
-            let timer =
-                tokio::time::sleep(boff.next().expect("could not get initial backoff duration"));
+            let timer = tokio::time::sleep(Duration::new(0, 0));
             tokio::pin!(timer);
 
             loop {
