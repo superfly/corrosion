@@ -1737,6 +1737,10 @@ pub async fn process_single_version(
             let mut last_rows_impacted = 0;
 
             let changes_len = changes.len();
+            let mut cls = BTreeSet::new();
+
+            let mut col_vers = BTreeSet::new();
+            let mut pks = BTreeSet::new();
 
             for change in changes {
                 trace!("inserting change! {change:?}");
@@ -1766,21 +1770,24 @@ pub async fn process_single_version(
                 if rows_impacted > last_rows_impacted {
                     debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
                     db_version = std::cmp::max(change.db_version, db_version);
+                    cls.insert(change.cl);
+                    col_vers.insert((change.col_version, change.cid.clone()));
+                    pks.insert(hex::encode(&change.pk));
                     impactful_changeset.push(change);
                 }
                 last_rows_impacted = rows_impacted;
             }
 
             let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
-                info!(
-                    "inserting CLEARED bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
+                debug!(
+                    "inserting CLEARED bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted}, CLs: {cls:?}, column versions {col_vers:?}, pks: {pks:?})",
                     actor_id, version, db_version, ts
                 );
                 tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);")?.execute(params![actor_id, version, version])?;
                 (KnownDbVersion::Cleared, Changeset::Empty { versions }, None)
             } else {
                 info!(
-                    "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
+                    "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted}, CLs: {cls:?}, column versions {col_vers:?}, pks: {pks:?})",
                     actor_id, version, db_version, ts
                 );
                 tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
@@ -2131,8 +2138,19 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 address TEXT NOT NULL,
             
                 state TEXT NOT NULL DEFAULT 'down',
-            
                 foca_state JSON
+            ) WITHOUT ROWID;
+
+            -- RTT for members
+            CREATE TABLE __corro_member_rtts (
+                actor_id BLOB PRIMARY KEY NOT NULL,
+
+                rtt_min REAL,
+                rtt_mean REAL,
+                rtt_max REAL,
+
+                last_recorded TEXT NOT NULL DEFAULT '[]' -- JSON
+
             ) WITHOUT ROWID;
 
             -- tracked corrosion schema
