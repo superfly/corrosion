@@ -1736,6 +1736,8 @@ pub async fn process_single_version(
 
             let mut last_rows_impacted = 0;
 
+            let changes_len = changes.len();
+
             for change in changes {
                 trace!("inserting change! {change:?}");
                 tx.prepare_cached(
@@ -1771,14 +1773,14 @@ pub async fn process_single_version(
 
             let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
                 info!(
-                    "inserting CLEARED bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (rows impacted: {last_rows_impacted})",
+                    "inserting CLEARED bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
                     actor_id, version, db_version, ts
                 );
                 tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);")?.execute(params![actor_id, version, version])?;
                 (KnownDbVersion::Cleared, Changeset::Empty { versions }, None)
             } else {
                 info!(
-                    "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (rows impacted: {last_rows_impacted})",
+                    "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
                     actor_id, version, db_version, ts
                 );
                 tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
