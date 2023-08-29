@@ -75,6 +75,7 @@ use trust_dns_resolver::{
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
 const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(300);
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
 
 pub struct AgentOptions {
     actor_id: ActorId,
@@ -574,10 +575,15 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         let agent = agent.clone();
         let foca_tx = foca_tx.clone();
         async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            let mut boff = backoff::Backoff::new(10)
+                .timeout_range(Duration::from_secs(5), Duration::from_secs(120))
+                .iter();
+            let timer =
+                tokio::time::sleep(boff.next().expect("could not get initial backoff duration"));
+            tokio::pin!(timer);
 
             loop {
-                interval.tick().await;
+                timer.as_mut().await;
 
                 match generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),
@@ -601,6 +607,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         error!("could not find nodes to announce ourselves to: {e}");
                     }
                 }
+
+                let dur = boff.next().unwrap_or(ANNOUNCE_INTERVAL);
+                timer.as_mut().reset(tokio::time::Instant::now() + dur);
             }
         }
     });
