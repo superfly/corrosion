@@ -994,7 +994,7 @@ fn collect_metrics(agent: &Agent) {
     }
 
     match conn
-        .prepare_cached("SELECT site_id, count(*) FROM __corro_buffered_changes GROUP BY site_id")
+        .prepare_cached("SELECT hex(actor_id), count(site_id) FROM __corro_members LEFT JOIN __corro_buffered_changes ON site_id = actor_id GROUP BY actor_id")
         .and_then(|mut prepped| {
             prepped
                 .query_map((), |row| {
