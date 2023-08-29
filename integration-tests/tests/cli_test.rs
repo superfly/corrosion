@@ -38,8 +38,9 @@ async fn test_query() {
         .arg("--api-addr")
         .arg(api_addr.to_string())
         .arg("query")
-        // .arg("--param=0")
-        .arg("SELECT hex(site_id) FROM crsql_site_id WHERE ordinal = 0")
+        .arg("--param")
+        .arg("0")
+        .arg("SELECT hex(site_id) FROM crsql_site_id WHERE ordinal = ?")
         .assert();
 
     assert.success().stdout(format!("{expected}\n"));
