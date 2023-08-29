@@ -337,6 +337,7 @@ async fn process_range(
     };
 
     for (versions, known_version) in overlapping {
+        // optimization, cleared versions can't be revived... sending a single batch!
         if let KnownDbVersion::Cleared = &known_version {
             sender
                 .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
@@ -348,17 +349,19 @@ async fn process_range(
         }
 
         for version in versions {
-            let _booked_guard = booked.write().await;
-            process_version(
-                pool,
-                actor_id,
-                is_local,
-                version,
-                &known_version,
-                vec![],
-                &sender,
-            )
-            .await?;
+            let bw = booked.write().await;
+            if let Some(known_version) = bw.get(&version) {
+                process_version(
+                    pool,
+                    actor_id,
+                    is_local,
+                    version,
+                    known_version,
+                    vec![],
+                    &sender,
+                )
+                .await?;
+            }
         }
     }
 
@@ -501,8 +504,13 @@ async fn process_version(
                     }
                 }
             }
-            _ => {
-                // warn!("not supposed to happen");
+            KnownDbVersion::Cleared => {
+                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty {
+                        versions: version..=version,
+                    },
+                })))?;
             }
         }
         Ok(())
