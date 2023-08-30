@@ -1801,6 +1801,8 @@ pub async fn process_single_version(
 
             tx.commit()?;
 
+            counter!("corro.changes.committed", last_rows_impacted as u64, "source" => "remote");
+
             debug!("committed transaction");
 
             booked_write.insert_many(new_changeset.versions(), known_version);

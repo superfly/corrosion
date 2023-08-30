@@ -617,11 +617,34 @@ pub async fn bidirectional_sync(
         .await
         .map_err(|_| SyncSendError::ChannelClosed)?;
 
+    let their_sync_state = match their_sync_state {
+        Some(state) => state,
+        None => {
+            if let Some(buf_res) = read.next().await {
+                let mut buf = buf_res.map_err(SyncRecvError::from)?;
+                let msg = SyncMessage::from_buf(&mut buf).map_err(SyncRecvError::from)?;
+                if let SyncMessage::V1(SyncMessageV1::State(state)) = msg {
+                    state
+                } else {
+                    return Err(SyncRecvError::UnexpectedSyncMessage.into());
+                }
+            } else {
+                return Err(SyncRecvError::UnexpectedEndOfStream.into());
+            }
+        }
+    };
+
+    let their_actor_id = their_sync_state.actor_id;
+
     let (_sent_count, recv_count) = tokio::try_join!(
         async move {
             let mut count = 0;
             let mut buf = BytesMut::new();
             while let Some(msg) = rx.recv().await {
+                if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+                    count += change.len();
+                }
+
                 msg.write_to_stream((&mut buf).writer())
                     .map_err(SyncMessageEncodeError::from)
                     .map_err(SyncSendError::from)?;
@@ -631,8 +654,6 @@ pub async fn bidirectional_sync(
                     .send(buf.split().freeze())
                     .await
                     .map_err(SyncSendError::from)?;
-
-                count += 1;
 
                 counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
             }
@@ -644,28 +665,11 @@ pub async fn bidirectional_sync(
 
             debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
 
+            counter!("corro.sync.changes.sent", count as u64, "actor_id" => their_actor_id.to_string());
+
             Ok::<_, SyncError>(count)
         },
         async move {
-            let their_sync_state = match their_sync_state {
-                Some(state) => state,
-                None => {
-                    if let Some(buf_res) = read.next().await {
-                        let mut buf = buf_res.map_err(SyncRecvError::from)?;
-                        let msg = SyncMessage::from_buf(&mut buf).map_err(SyncRecvError::from)?;
-                        if let SyncMessage::V1(SyncMessageV1::State(state)) = msg {
-                            state
-                        } else {
-                            return Err(SyncRecvError::UnexpectedSyncMessage.into());
-                        }
-                    } else {
-                        return Err(SyncRecvError::UnexpectedEndOfStream.into());
-                    }
-                }
-            };
-
-            let their_actor_id = their_sync_state.actor_id;
-
             tx.send(SyncMessage::V1(SyncMessageV1::Clock(
                 agent.clock().new_timestamp().into(),
             )))
@@ -723,6 +727,8 @@ pub async fn bidirectional_sync(
                 }
             }
             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
+
+            counter!("corro.sync.changes.recv", count as u64, "actor_id" => their_actor_id.to_string());
 
             Ok(count)
         }

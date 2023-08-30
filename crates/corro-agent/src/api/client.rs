@@ -16,6 +16,7 @@ use corro_types::{
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
+use metrics::counter;
 use rusqlite::{params, params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
@@ -224,6 +225,7 @@ where
                 while let Some(changes_seqs) = chunked.next() {
                     match changes_seqs {
                         Ok((changes, seqs)) => {
+                            counter!("corro.changes.committed", changes.len() as u64, "source" => "local");
                             process_subs(&agent, &changes);
 
                             trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
