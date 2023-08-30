@@ -5,13 +5,13 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
 use corro_types::broadcast::{ChangeV1, Changeset};
 use corro_types::change::row_to_change;
 use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
-use futures::{SinkExt, StreamExt, TryFutureExt};
+use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rusqlite::params;
@@ -601,6 +601,38 @@ async fn process_sync(
     Ok(())
 }
 
+async fn write_sync_msg<W: Sink<Bytes, Error = std::io::Error> + Unpin>(
+    buf: &mut BytesMut,
+    msg: SyncMessage,
+    write: &mut W,
+) -> Result<(), SyncSendError> {
+    msg.write_to_stream(buf.writer())
+        .map_err(SyncMessageEncodeError::from)?;
+
+    let buf_len = buf.len();
+    write.send(buf.split().freeze()).await?;
+
+    counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
+
+    Ok(())
+}
+
+pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
+    read: &mut R,
+) -> Result<Option<SyncMessage>, SyncRecvError> {
+    match tokio::time::timeout(Duration::from_secs(5), read.next()).await {
+        Ok(Some(buf_res)) => match buf_res {
+            Ok(mut buf) => match SyncMessage::from_buf(&mut buf) {
+                Ok(msg) => Ok(Some(msg)),
+                Err(e) => Err(SyncRecvError::from(e)),
+            },
+            Err(e) => Err(SyncRecvError::from(e)),
+        },
+        Ok(None) => Ok(None),
+        Err(_e) => Err(SyncRecvError::TimedOut),
+    }
+}
+
 pub async fn bidirectional_sync(
     agent: &Agent,
     our_sync_state: SyncStateV1,
@@ -613,49 +645,66 @@ pub async fn bidirectional_sync(
     let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
     let mut write = FramedWrite::new(write, LengthDelimitedCodec::new());
 
-    tx.send(SyncMessage::V1(SyncMessageV1::State(our_sync_state)))
-        .await
-        .map_err(|_| SyncSendError::ChannelClosed)?;
+    let mut send_buf = BytesMut::new();
+
+    write_sync_msg(
+        &mut send_buf,
+        SyncMessage::V1(SyncMessageV1::State(our_sync_state)),
+        &mut write,
+    )
+    .await?;
 
     let their_sync_state = match their_sync_state {
         Some(state) => state,
-        None => {
-            if let Some(buf_res) = read.next().await {
-                let mut buf = buf_res.map_err(SyncRecvError::from)?;
-                let msg = SyncMessage::from_buf(&mut buf).map_err(SyncRecvError::from)?;
-                if let SyncMessage::V1(SyncMessageV1::State(state)) = msg {
-                    state
-                } else {
-                    return Err(SyncRecvError::UnexpectedSyncMessage.into());
-                }
-            } else {
-                return Err(SyncRecvError::UnexpectedEndOfStream.into());
-            }
-        }
+        None => match read_sync_msg(&mut read).await? {
+            Some(SyncMessage::V1(SyncMessageV1::State(state))) => state,
+            Some(_) => return Err(SyncRecvError::ExpectedSyncState.into()),
+            None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
+        },
     };
 
     let their_actor_id = their_sync_state.actor_id;
 
+    write_sync_msg(
+        &mut send_buf,
+        SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
+        &mut write,
+    )
+    .await?;
+
+    match read_sync_msg(&mut read).await? {
+        Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => {
+            if let Err(e) = agent
+                .clock()
+                .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), their_actor_id.into()))
+            {
+                warn!("could not update clock from actor {their_actor_id}: {e}");
+            }
+        }
+        Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
+        None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
+    }
+
+    tokio::spawn(
+        process_sync(
+            agent.actor_id(),
+            agent.pool().clone(),
+            agent.bookie().clone(),
+            their_sync_state,
+            tx,
+        )
+        .inspect_err(|e| error!("could not process sync request: {e}")),
+    );
+
     let (_sent_count, recv_count) = tokio::try_join!(
         async move {
             let mut count = 0;
-            let mut buf = BytesMut::new();
             while let Some(msg) = rx.recv().await {
                 if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
                     count += change.len();
                 }
 
-                msg.write_to_stream((&mut buf).writer())
-                    .map_err(SyncMessageEncodeError::from)
-                    .map_err(SyncSendError::from)?;
-
-                let buf_len = buf.len();
-                write
-                    .send(buf.split().freeze())
-                    .await
-                    .map_err(SyncSendError::from)?;
-
-                counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
+                write_sync_msg(&mut send_buf, msg, &mut write).await?;
             }
 
             let mut send = write.into_inner();
@@ -670,34 +719,18 @@ pub async fn bidirectional_sync(
             Ok::<_, SyncError>(count)
         },
         async move {
-            tx.send(SyncMessage::V1(SyncMessageV1::Clock(
-                agent.clock().new_timestamp().into(),
-            )))
-            .await
-            .map_err(|_| SyncSendError::ChannelClosed)?;
-
-            tokio::spawn(
-                process_sync(
-                    agent.actor_id(),
-                    agent.pool().clone(),
-                    agent.bookie().clone(),
-                    their_sync_state,
-                    tx,
-                )
-                .inspect_err(|e| error!("could not process sync request: {e}")),
-            );
-
             let mut count = 0;
 
-            while let Ok(Some(buf_res)) =
-                tokio::time::timeout(Duration::from_secs(5), read.next()).await
-            {
-                let mut buf = buf_res.map_err(SyncRecvError::from)?;
-
-                counter!("corro.sync.chunk.recv.bytes", buf.len() as u64);
-
-                match SyncMessage::from_buf(&mut buf) {
-                    Ok(msg) => {
+            loop {
+                match read_sync_msg(&mut read).await {
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(e) => {
+                        error!("sync recv error: {e}");
+                        break;
+                    }
+                    Ok(Some(msg)) => {
                         let len = match msg {
                             SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
                                 let len = change.len();
@@ -710,22 +743,16 @@ pub async fn bidirectional_sync(
                                 warn!("received sync state message more than once, ignoring");
                                 continue;
                             }
-                            SyncMessage::V1(SyncMessageV1::Clock(ts)) => {
-                                if let Err(e) = agent.clock().update_with_timestamp(
-                                    &uhlc::Timestamp::new(ts.to_ntp64(), their_actor_id.into()),
-                                ) {
-                                    warn!(
-                                        "could not update clock from actor {their_actor_id}: {e}"
-                                    );
-                                }
+                            SyncMessage::V1(SyncMessageV1::Clock(_)) => {
+                                warn!("received sync clock message more than once, ignoring");
                                 continue;
                             }
                         };
                         count += len;
                     }
-                    Err(e) => return Err(SyncRecvError::from(e).into()),
                 }
             }
+
             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
 
             counter!("corro.sync.changes.recv", count as u64, "actor_id" => their_actor_id.to_string());

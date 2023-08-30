@@ -1899,10 +1899,14 @@ pub enum SyncRecvError {
     Change(#[from] ChangeError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("unexpected sync message")]
-    UnexpectedSyncMessage,
+    #[error("expected sync state message, received something else")]
+    ExpectedSyncState,
     #[error("unexpected end of stream")]
     UnexpectedEndOfStream,
+    #[error("expected sync clock message, received something else")]
+    ExpectedClockMessage,
+    #[error("timed out waiting for sync message")]
+    TimedOut,
 }
 
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
@@ -2730,7 +2734,7 @@ pub mod tests {
         )
         .await?;
 
-        sleep(Duration::from_secs(20)).await;
+        sleep(Duration::from_secs(10)).await;
 
         {
             let conn = ta2.agent.pool().read().await?;
