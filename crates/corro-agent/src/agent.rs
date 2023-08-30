@@ -707,8 +707,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         tx.commit()?;
 
-                        info!(actor_id = %actor_id, "cleared versions: {to_clear:?}");
-
                         debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
                         **bookedw.inner_mut() = new_copy;
@@ -1737,10 +1735,6 @@ pub async fn process_single_version(
             let mut last_rows_impacted = 0;
 
             let changes_len = changes.len();
-            let mut cls = BTreeSet::new();
-
-            let mut col_vers = BTreeSet::new();
-            let mut pks = BTreeSet::new();
 
             for change in changes {
                 trace!("inserting change! {change:?}");
@@ -1770,9 +1764,6 @@ pub async fn process_single_version(
                 if rows_impacted > last_rows_impacted {
                     debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
                     db_version = std::cmp::max(change.db_version, db_version);
-                    cls.insert(change.cl);
-                    col_vers.insert((change.col_version, change.cid.clone()));
-                    pks.insert(hex::encode(&change.pk));
                     impactful_changeset.push(change);
                 }
                 last_rows_impacted = rows_impacted;
@@ -1780,15 +1771,13 @@ pub async fn process_single_version(
 
             let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
                 debug!(
-                    "inserting CLEARED bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted}, CLs: {cls:?}, column versions {col_vers:?}, pks: {pks:?})",
-                    actor_id, version, db_version, ts
+                    "inserting CLEARED bookkeeping row for actor {actor_id}, version: {version}, db_version: {db_version}, ts: {ts:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
                 );
                 tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);")?.execute(params![actor_id, version, version])?;
                 (KnownDbVersion::Cleared, Changeset::Empty { versions }, None)
             } else {
-                info!(
-                    "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted}, CLs: {cls:?}, column versions {col_vers:?}, pks: {pks:?})",
-                    actor_id, version, db_version, ts
+                debug!(
+                    "inserting bookkeeping row for actor {actor_id}, version: {version}, db_version: {db_version}, ts: {ts:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
                 );
                 tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
                 (
