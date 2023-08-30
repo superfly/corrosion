@@ -18,6 +18,7 @@ foca = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 hyper = { workspace = true }
+itertools = { workspace = true }
 metrics = { workspace = true }
 parking_lot = { workspace = true }
 quinn = { workspace = true }

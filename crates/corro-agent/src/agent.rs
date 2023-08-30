@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     hash::{Hash, Hasher},
     net::SocketAddr,
@@ -1736,6 +1736,8 @@ pub async fn process_single_version(
 
             let changes_len = changes.len();
 
+            let mut changes_per_table = BTreeMap::new();
+
             for change in changes {
                 trace!("inserting change! {change:?}");
                 tx.prepare_cached(
@@ -1765,6 +1767,13 @@ pub async fn process_single_version(
                     debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
                     db_version = std::cmp::max(change.db_version, db_version);
                     impactful_changeset.push(change);
+                    if let Some(c) = impactful_changeset.last() {
+                        if let Some(counter) = changes_per_table.get_mut(&c.table) {
+                            *counter = *counter + 1;
+                        } else {
+                            changes_per_table.insert(c.table.clone(), 1);
+                        }
+                    }
                 }
                 last_rows_impacted = rows_impacted;
             }
@@ -1801,7 +1810,9 @@ pub async fn process_single_version(
 
             tx.commit()?;
 
-            counter!("corro.changes.committed", last_rows_impacted as u64, "source" => "remote");
+            for (table_name, count) in changes_per_table {
+                counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
+            }
 
             debug!("committed transaction");
 

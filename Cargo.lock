@@ -725,6 +725,7 @@ dependencies = [
  "hex",
  "http-body",
  "hyper",
+ "itertools",
  "metrics",
  "parking_lot",
  "quinn",

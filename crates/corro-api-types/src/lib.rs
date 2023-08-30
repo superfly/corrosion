@@ -71,9 +71,9 @@ pub enum RqliteResult {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
 pub struct Change {
-    pub table: String,
+    pub table: TableName,
     pub pk: Vec<u8>,
-    pub cid: String,
+    pub cid: ColumnName,
     pub val: SqliteValue,
     pub col_version: i64,
     pub db_version: i64,
@@ -449,5 +449,105 @@ where
             SqliteValue::Text(s) => <[u8] as Writable<C>>::bytes_needed(s.as_bytes())?,
             SqliteValue::Blob(b) => <[u8] as Writable<C>>::bytes_needed(b.as_slice())?,
         })
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct TableName(pub CompactString);
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct ColumnName(pub CompactString);
+
+impl Deref for TableName {
+    type Target = CompactString;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<C> Writable<C> for TableName
+where
+    C: Context,
+{
+    #[inline]
+    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), <C as Context>::Error> {
+        self.0.as_str().write_to(writer)
+    }
+
+    #[inline]
+    fn bytes_needed(&self) -> Result<usize, <C as Context>::Error> {
+        Writable::<C>::bytes_needed(self.0.as_str())
+    }
+}
+
+impl<'a, C> Readable<'a, C> for TableName
+where
+    C: Context,
+{
+    #[inline]
+    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, <C as Context>::Error> {
+        let s: &'a str = Readable::<'a, C>::read_from(reader)?;
+        Ok(Self(CompactString::new(s)))
+    }
+}
+
+impl FromSql for TableName {
+    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        Ok(Self(CompactString::new(value.as_str()?)))
+    }
+}
+
+impl ToSql for TableName {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.as_str().to_sql()
+    }
+}
+
+impl Deref for ColumnName {
+    type Target = CompactString;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<C> Writable<C> for ColumnName
+where
+    C: Context,
+{
+    #[inline]
+    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), <C as Context>::Error> {
+        self.0.as_str().write_to(writer)
+    }
+
+    #[inline]
+    fn bytes_needed(&self) -> Result<usize, <C as Context>::Error> {
+        Writable::<C>::bytes_needed(self.0.as_str())
+    }
+}
+
+impl<'a, C> Readable<'a, C> for ColumnName
+where
+    C: Context,
+{
+    #[inline]
+    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, <C as Context>::Error> {
+        let s: &'a str = Readable::<'a, C>::read_from(reader)?;
+        Ok(Self(CompactString::new(s)))
+    }
+}
+
+impl FromSql for ColumnName {
+    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        Ok(Self(CompactString::new(value.as_str()?)))
+    }
+}
+
+impl ToSql for ColumnName {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.as_str().to_sql()
     }
 }
