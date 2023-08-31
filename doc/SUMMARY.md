@@ -12,7 +12,8 @@
 - [Schema](schema.md)
 - [Subscriptions]()
 - [Synchronization]()
-- [Telemetry]()
+- [Telemetry](telemetry/README.md)
+    - [Prometheus](telemetry/prometheus.md)
 - [Templates]()
 
 # Reference
