@@ -1461,26 +1461,6 @@ async fn process_fully_buffered_changes(
 
         let tx = conn.transaction()?;
 
-        let max_db_version: Option<i64> = tx
-            .prepare_cached(
-                "
-                SELECT MAX(db_version)
-                    FROM __corro_buffered_changes
-                        WHERE site_id = ?
-                            AND version = ?
-                        ",
-            )?
-            .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
-        debug!(actor = %agent.actor_id(), "max db_version from buffered rows: {max_db_version:?}");
-
-        let max_db_version = match max_db_version {
-            None => {
-                warn!("zero rows to move, aborting!");
-                return Ok(false);
-            }
-            Some(v) => v,
-        };
-
         info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
         let start = Instant::now();
@@ -1522,11 +1502,8 @@ async fn process_fully_buffered_changes(
         info!(actor = %agent.actor_id(), "rows impacted by changes: {rows_impacted}");
 
         let known_version = if rows_impacted > 0 {
-            let db_version: i64 = tx.query_row(
-                "SELECT MAX(?, crsql_db_version() + 1)",
-                [max_db_version],
-                |row| row.get(0),
-            )?;
+            let db_version: i64 =
+                tx.query_row("SELECT crsql_next_db_version()", [], |row| row.get(0))?;
             debug!("db version: {db_version}");
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
@@ -1727,9 +1704,6 @@ pub async fn process_single_version(
                 return Ok((changeset, None));
             }
 
-            let mut db_version: i64 =
-                tx.query_row("SELECT crsql_db_version() + 1", (), |row| row.get(0))?;
-
             let mut impactful_changeset = vec![];
 
             let mut last_rows_impacted = 0;
@@ -1765,7 +1739,6 @@ pub async fn process_single_version(
 
                 if rows_impacted > last_rows_impacted {
                     debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
-                    db_version = std::cmp::max(change.db_version, db_version);
                     impactful_changeset.push(change);
                     if let Some(c) = impactful_changeset.last() {
                         if let Some(counter) = changes_per_table.get_mut(&c.table) {
@@ -1777,6 +1750,10 @@ pub async fn process_single_version(
                 }
                 last_rows_impacted = rows_impacted;
             }
+
+            let db_version: i64 = tx
+                .prepare_cached("SELECT crsql_next_db_version()")?
+                .query_row((), |row| row.get(0))?;
 
             let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
                 debug!(
@@ -1929,79 +1906,77 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
     }
 
-    loop {
-        let (actor_id, addr) = {
-            let candidates = {
-                let members = agent.members().read();
+    let (actor_id, addr) = {
+        let candidates = {
+            let members = agent.members().read();
 
-                members
-                    .states
-                    .iter()
-                    .filter(|(id, _state)| **id != agent.actor_id())
-                    .map(|(id, state)| (*id, state.addr))
-                    .collect::<Vec<(ActorId, SocketAddr)>>()
-            };
-
-            if candidates.is_empty() {
-                warn!("could not find any good candidate for sync");
-                return Err(SyncClientError::NoGoodCandidate);
-            }
-
-            let mut rng = StdRng::from_entropy();
-
-            let mut choices = candidates.into_iter().choose_multiple(&mut rng, 2);
-
-            choices.sort_by(|a, b| {
-                sync_state
-                    .need_len_for_actor(&b.0)
-                    .cmp(&sync_state.need_len_for_actor(&a.0))
-            });
-
-            if let Some(chosen) = choices.get(0).cloned() {
-                chosen
-            } else {
-                return Err(SyncClientError::NoGoodCandidate);
-            }
+            members
+                .states
+                .iter()
+                .filter(|(id, _state)| **id != agent.actor_id())
+                .map(|(id, state)| (*id, state.addr))
+                .collect::<Vec<(ActorId, SocketAddr)>>()
         };
 
-        debug!(
-            actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
-            actor_id,
-            sync_state.need_len(),
-        );
-
-        debug!(actor = %agent.actor_id(), "sync message: {sync_state:?}");
-
-        increment_counter!("corro.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
-
-        histogram!(
-            "corro.sync.client.request.operations.need.count",
-            sync_state.need.len() as f64
-        );
-
-        let (tx, rx) = transport
-            .open_bi(addr)
-            .await
-            .map_err(crate::transport::ConnectError::from)?;
-
-        increment_counter!("corro.sync.attempts.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
-
-        // FIXME: check if it's ok to sync (don't overload host)
-
-        let start = Instant::now();
-        let n = bidirectional_sync(&agent, sync_state, None, rx, tx).await?;
-
-        let elapsed = start.elapsed();
-        if n > 0 {
-            info!(
-                "synced {n} changes w/ {} in {}s @ {} changes/s",
-                actor_id,
-                elapsed.as_secs_f64(),
-                n as f64 / elapsed.as_secs_f64()
-            );
+        if candidates.is_empty() {
+            warn!("could not find any good candidate for sync");
+            return Err(SyncClientError::NoGoodCandidate);
         }
-        return Ok(());
+
+        let mut rng = StdRng::from_entropy();
+
+        let mut choices = candidates.into_iter().choose_multiple(&mut rng, 2);
+
+        choices.sort_by(|a, b| {
+            sync_state
+                .need_len_for_actor(&b.0)
+                .cmp(&sync_state.need_len_for_actor(&a.0))
+        });
+
+        if let Some(chosen) = choices.get(0).cloned() {
+            chosen
+        } else {
+            return Err(SyncClientError::NoGoodCandidate);
+        }
+    };
+
+    debug!(
+        actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
+        actor_id,
+        sync_state.need_len(),
+    );
+
+    debug!(actor = %agent.actor_id(), "sync message: {sync_state:?}");
+
+    increment_counter!("corro.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+
+    histogram!(
+        "corro.sync.client.request.operations.need.count",
+        sync_state.need.len() as f64
+    );
+
+    let (tx, rx) = transport
+        .open_bi(addr)
+        .await
+        .map_err(crate::transport::ConnectError::from)?;
+
+    increment_counter!("corro.sync.attempts.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+
+    // FIXME: check if it's ok to sync (don't overload host)
+
+    let start = Instant::now();
+    let n = bidirectional_sync(agent, sync_state, None, rx, tx).await?;
+
+    let elapsed = start.elapsed();
+    if n > 0 {
+        info!(
+            "synced {n} changes w/ {} in {}s @ {} changes/s",
+            actor_id,
+            elapsed.as_secs_f64(),
+            n as f64 / elapsed.as_secs_f64()
+        );
     }
+    Ok(())
 }
 
 async fn sync_loop(

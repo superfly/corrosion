@@ -679,7 +679,7 @@ impl Matcher {
 
             let delete_prepped = tx.prepare_cached(&sql)?;
 
-            for (change_type, mut prepped) in [
+            for (mut change_type, mut prepped) in [
                 (None, insert_prepped),
                 (Some(ChangeType::Delete), delete_prepped),
             ] {
@@ -690,7 +690,7 @@ impl Matcher {
                 while let Ok(Some(row)) = rows.next() {
                     let rowid: i64 = row.get(0)?;
 
-                    let change_type = change_type.clone().take().unwrap_or_else(|| {
+                    let change_type = change_type.take().unwrap_or({
                         if rowid > last_rowid {
                             ChangeType::Insert
                         } else {

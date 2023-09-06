@@ -216,9 +216,10 @@ async fn process_sub_channel(
                         .await;
                     return;
                 }
+
                 // NOTE: I think that's infaillible...
                 writer
-                    .write(b"\n")
+                    .write_all(b"\n")
                     .expect("could not write new line to BytesMut Writer");
 
                 // accumulate up to ~64KB
@@ -643,24 +644,23 @@ mod tests {
                 return None;
             }
             loop {
-                loop {
-                    match self.codec.decode(&mut self.buf) {
-                        Ok(Some(line)) => match serde_json::from_str(&line) {
-                            Ok(res) => return Some(Ok(res)),
-                            Err(e) => {
-                                self.done = true;
-                                return Some(Err(e.into()));
-                            }
-                        },
-                        Ok(None) => {
-                            break;
-                        }
+                match self.codec.decode(&mut self.buf) {
+                    Ok(Some(line)) => match serde_json::from_str(&line) {
+                        Ok(res) => return Some(Ok(res)),
                         Err(e) => {
                             self.done = true;
                             return Some(Err(e.into()));
                         }
+                    },
+                    Ok(None) => {
+                        // fall through
+                    }
+                    Err(e) => {
+                        self.done = true;
+                        return Some(Err(e.into()));
                     }
                 }
+
                 let bytes_res = self.body.data().await;
                 match bytes_res {
                     Some(Ok(b)) => {
