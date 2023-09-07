@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
     fmt::{self, Write},
+    hash::Hash,
+    ops::Deref,
 };
 
 use compact_str::{CompactString, ToCompactString};
@@ -69,9 +71,9 @@ pub enum RqliteResult {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
 pub struct Change {
-    pub table: String,
+    pub table: TableName,
     pub pk: Vec<u8>,
-    pub cid: String,
+    pub cid: ColumnName,
     pub val: SqliteValue,
     pub col_version: i64,
     pub db_version: i64,
@@ -141,7 +143,7 @@ impl<'a> SqliteValueRef<'a> {
         match self {
             SqliteValueRef::Null => SqliteValue::Null,
             SqliteValueRef::Integer(v) => SqliteValue::Integer(*v),
-            SqliteValueRef::Real(v) => SqliteValue::Real(*v),
+            SqliteValueRef::Real(v) => SqliteValue::Real(Real(*v)),
             SqliteValueRef::Text(v) => SqliteValue::Text((*v).to_compact_string()),
             SqliteValueRef::Blob(v) => SqliteValue::Blob(v.to_smallvec()),
         }
@@ -197,15 +199,47 @@ impl FromSql for ColumnType {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Hash)]
 #[serde(untagged)]
 pub enum SqliteValue {
     #[default]
     Null,
     Integer(i64),
-    Real(f64),
+    Real(Real),
     Text(CompactString),
     Blob(SmallVec<[u8; 512]>),
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(transparent)]
+pub struct Real(pub f64);
+
+impl Deref for Real {
+    type Target = f64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Hash for Real {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        integer_decode(self.0).hash(state)
+    }
+}
+
+fn integer_decode(val: f64) -> (u64, i16, i8) {
+    let bits: u64 = unsafe { std::mem::transmute(val) };
+    let sign: i8 = if bits >> 63 == 0 { 1 } else { -1 };
+    let mut exponent: i16 = ((bits >> 52) & 0x7ff) as i16;
+    let mantissa = if exponent == 0 {
+        (bits & 0xfffffffffffff) << 1
+    } else {
+        (bits & 0xfffffffffffff) | 0x10000000000000
+    };
+
+    exponent -= 1023 + 52;
+    (mantissa, exponent, sign)
 }
 
 impl SqliteValue {
@@ -263,7 +297,7 @@ impl SqliteValue {
         match self {
             SqliteValue::Null => SqliteValueRef::Null,
             SqliteValue::Integer(i) => SqliteValueRef::Integer(*i),
-            SqliteValue::Real(f) => SqliteValueRef::Real(*f),
+            SqliteValue::Real(r) => SqliteValueRef::Real(r.0),
             SqliteValue::Text(s) => SqliteValueRef::Text(s.as_str()),
             SqliteValue::Blob(v) => SqliteValueRef::Blob(v.as_slice()),
         }
@@ -305,7 +339,7 @@ impl FromSql for SqliteValue {
         Ok(match value {
             ValueRef::Null => SqliteValue::Null,
             ValueRef::Integer(i) => SqliteValue::Integer(i),
-            ValueRef::Real(f) => SqliteValue::Real(f),
+            ValueRef::Real(f) => SqliteValue::Real(Real(f)),
             ValueRef::Text(t) => SqliteValue::Text(
                 std::str::from_utf8(t.into())
                     .map_err(|e| FromSqlError::Other(Box::new(e)))?
@@ -321,7 +355,7 @@ impl ToSql for SqliteValue {
         Ok(match self {
             SqliteValue::Null => ToSqlOutput::Owned(Value::Null),
             SqliteValue::Integer(i) => ToSqlOutput::Owned(Value::Integer(*i)),
-            SqliteValue::Real(f) => ToSqlOutput::Owned(Value::Real(*f)),
+            SqliteValue::Real(f) => ToSqlOutput::Owned(Value::Real(f.0)),
             SqliteValue::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
             SqliteValue::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b.as_slice())),
         })
@@ -353,7 +387,7 @@ where
         Ok(match u8::read_from(reader)? {
             0 => SqliteValue::Null,
             1 => SqliteValue::Integer(i64::read_from(reader)?),
-            2 => SqliteValue::Real(f64::read_from(reader)?),
+            2 => SqliteValue::Real(Real(f64::read_from(reader)?)),
             3 => {
                 let len = reader.read_u32()? as usize;
 
@@ -415,5 +449,105 @@ where
             SqliteValue::Text(s) => <[u8] as Writable<C>>::bytes_needed(s.as_bytes())?,
             SqliteValue::Blob(b) => <[u8] as Writable<C>>::bytes_needed(b.as_slice())?,
         })
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct TableName(pub CompactString);
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct ColumnName(pub CompactString);
+
+impl Deref for TableName {
+    type Target = CompactString;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<C> Writable<C> for TableName
+where
+    C: Context,
+{
+    #[inline]
+    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), <C as Context>::Error> {
+        self.0.as_str().write_to(writer)
+    }
+
+    #[inline]
+    fn bytes_needed(&self) -> Result<usize, <C as Context>::Error> {
+        Writable::<C>::bytes_needed(self.0.as_str())
+    }
+}
+
+impl<'a, C> Readable<'a, C> for TableName
+where
+    C: Context,
+{
+    #[inline]
+    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, <C as Context>::Error> {
+        let s: &'a str = Readable::<'a, C>::read_from(reader)?;
+        Ok(Self(CompactString::new(s)))
+    }
+}
+
+impl FromSql for TableName {
+    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        Ok(Self(CompactString::new(value.as_str()?)))
+    }
+}
+
+impl ToSql for TableName {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.as_str().to_sql()
+    }
+}
+
+impl Deref for ColumnName {
+    type Target = CompactString;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<C> Writable<C> for ColumnName
+where
+    C: Context,
+{
+    #[inline]
+    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), <C as Context>::Error> {
+        self.0.as_str().write_to(writer)
+    }
+
+    #[inline]
+    fn bytes_needed(&self) -> Result<usize, <C as Context>::Error> {
+        Writable::<C>::bytes_needed(self.0.as_str())
+    }
+}
+
+impl<'a, C> Readable<'a, C> for ColumnName
+where
+    C: Context,
+{
+    #[inline]
+    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, <C as Context>::Error> {
+        let s: &'a str = Readable::<'a, C>::read_from(reader)?;
+        Ok(Self(CompactString::new(s)))
+    }
+}
+
+impl FromSql for ColumnName {
+    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        Ok(Self(CompactString::new(value.as_str()?)))
+    }
+}
+
+impl ToSql for ColumnName {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.as_str().to_sql()
     }
 }

@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
+    hash::{Hash, Hasher},
     net::SocketAddr,
     ops::RangeInclusive,
     sync::{atomic::AtomicI64, Arc},
@@ -27,7 +28,7 @@ use corro_types::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeV1, Changeset, FocaInput,
         Timestamp, UniPayload, UniPayloadV1,
     },
-    change::Change,
+    change::{Change, SqliteValue},
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members},
     schema::init_schema,
@@ -74,6 +75,7 @@ use trust_dns_resolver::{
 const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(60); // 1 minute oughta be enough, we're constantly getting broadcasts randomly + targetted
 const RANDOM_NODES_CHOICES: usize = 10;
 const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(300);
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
 
 pub struct AgentOptions {
     actor_id: ActorId,
@@ -573,10 +575,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         let agent = agent.clone();
         let foca_tx = foca_tx.clone();
         async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            let mut boff = backoff::Backoff::new(10)
+                .timeout_range(Duration::from_secs(5), Duration::from_secs(120))
+                .iter();
+            let timer = tokio::time::sleep(Duration::new(0, 0));
+            tokio::pin!(timer);
 
             loop {
-                interval.tick().await;
+                timer.as_mut().await;
 
                 match generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),
@@ -600,6 +606,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         error!("could not find nodes to announce ourselves to: {e}");
                     }
                 }
+
+                let dur = boff.next().unwrap_or(ANNOUNCE_INTERVAL);
+                timer.as_mut().reset(tokio::time::Instant::now() + dur);
             }
         }
     });
@@ -647,12 +656,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
 
+                        let db_versions = versions.keys().copied().collect();
+
                         let to_clear = {
-                            match compact_booked_for_actor(&tx, &versions.keys().copied().collect())
-                            {
+                            match find_cleared_db_versions_for_actor(&tx, &db_versions) {
                                 Ok(to_clear) => {
                                     if to_clear.is_empty() {
-                                        return Ok(None);
+                                        return Ok(());
                                     }
                                     to_clear
                                 }
@@ -671,8 +681,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         let cleared_len = to_clear.len();
 
-                        for db_version in to_clear {
-                            if let Some(version) = versions.get(&db_version) {
+                        for db_version in to_clear.iter() {
+                            if let Some(version) = versions.get(db_version) {
                                 new_copy.insert(*version..=*version, KnownDbVersion::Cleared);
                             }
                         }
@@ -699,18 +709,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
-                        Ok::<_, eyre::Report>(Some((new_copy, cleared_len)))
+                        **bookedw.inner_mut() = new_copy;
+                        debug!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
+
+                        Ok::<_, eyre::Report>(())
                     });
 
-                    match res {
-                        Ok(Some((new_booked, cleared_len))) => {
-                            **bookedw.inner_mut() = new_booked;
-                            debug!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            error!("could not compact versions for actor {actor_id}: {e}");
-                        }
+                    if let Err(e) = res {
+                        error!("could not compact versions for actor {actor_id}: {e}");
                     }
                 }
 
@@ -870,7 +876,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             .inspect(|_| info!("corrosion agent sync loop is done")),
     );
 
-    let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
 
     tokio::spawn(handle_gossip_to_send(transport, to_send_rx));
@@ -880,6 +885,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         foca_tx.clone(),
         member_events_tx,
     ));
+    tokio::spawn(metrics_loop(agent.clone()));
 
     let gossip_chunker =
         ReceiverStream::new(bcast_rx).chunks_timeout(10, Duration::from_millis(500));
@@ -905,10 +911,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             },
             _ = db_cleanup_interval.tick() => {
                 tokio::spawn(handle_db_cleanup(agent.pool().clone()).preemptible(tripwire.clone()));
-            },
-            _ = metrics_interval.tick() => {
-                let agent = agent.clone();
-                tokio::spawn(async move { block_in_place(move || collect_metrics(agent)) });
             },
             _ = &mut tripwire => {
                 debug!("tripped corrosion");
@@ -943,16 +945,27 @@ async fn require_authz<B>(
     Ok(next.run(request).await)
 }
 
-fn collect_metrics(agent: Agent) {
+const CHECKSUM_SEEDS: [u64; 4] = [
+    0x16f11fe89b0d677c,
+    0xb480a793d8e6c86c,
+    0x6fe2e5aaf078ebc9,
+    0x14f994a4c5259381,
+];
+
+async fn metrics_loop(agent: Agent) {
+    let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
+
+    loop {
+        metrics_interval.tick().await;
+
+        block_in_place(|| collect_metrics(&agent));
+    }
+}
+
+fn collect_metrics(agent: &Agent) {
     agent.pool().emit_metrics();
 
-    let tables = agent
-        .schema()
-        .read()
-        .tables
-        .keys()
-        .cloned()
-        .collect::<Vec<String>>();
+    let schema = agent.schema().read();
 
     let conn = match agent.pool().read_blocking() {
         Ok(conn) => conn,
@@ -962,16 +975,68 @@ fn collect_metrics(agent: Agent) {
         }
     };
 
-    for table in tables {
-        match conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-            row.get::<_, i64>(0)
-        }) {
+    for table in schema.tables.keys() {
+        match conn
+            .prepare_cached(&format!("SELECT count(*) FROM {table}"))
+            .and_then(|mut prepped| prepped.query_row([], |row| row.get::<_, i64>(0)))
+        {
             Ok(count) => {
-                gauge!("corro.db.table.rows.total", count as f64, "table" => table);
+                gauge!("corro.db.table.rows.total", count as f64, "table" => table.clone());
             }
             Err(e) => {
                 error!("could not query count for table {table}: {e}");
                 continue;
+            }
+        }
+    }
+
+    match conn
+        .prepare_cached("SELECT actor_id, count(site_id) FROM __corro_members LEFT JOIN __corro_buffered_changes ON site_id = actor_id GROUP BY actor_id")
+        .and_then(|mut prepped| {
+            prepped
+                .query_map((), |row| {
+                    Ok((row.get::<_, ActorId>(0)?, row.get::<_, i64>(1)?))
+                })
+                .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
+        }) {
+        Ok(mapped) => {
+            for (actor_id, count) in mapped {
+                gauge!("corro.db.buffered.changes.rows.total", count as f64, "actor_id" => actor_id.to_string())
+            }
+        }
+        Err(e) => {
+            error!("could not query count for buffered changes: {e}");
+        }
+    }
+
+    for (name, table) in schema.tables.iter() {
+        let pks = table.pk.iter().cloned().collect::<Vec<String>>().join(",");
+
+        match conn
+            .prepare_cached(&format!("SELECT * FROM {name} ORDER BY {pks}"))
+            .and_then(|mut prepped| {
+                let col_count = prepped.column_count();
+                prepped.query(()).and_then(|mut rows| {
+                    let mut hasher = seahash::SeaHasher::with_seeds(
+                        CHECKSUM_SEEDS[0],
+                        CHECKSUM_SEEDS[1],
+                        CHECKSUM_SEEDS[2],
+                        CHECKSUM_SEEDS[3],
+                    );
+                    while let Ok(Some(row)) = rows.next() {
+                        for idx in 0..col_count {
+                            let v: SqliteValue = row.get(idx)?;
+                            v.hash(&mut hasher);
+                        }
+                    }
+                    Ok(hasher.finish())
+                })
+            }) {
+            Ok(hash) => {
+                gauge!("corro.db.table.checksum", hash as f64, "table" => name.clone());
+            }
+            Err(e) => {
+                error!("could not query clock table values for hashing {table}: {e}");
             }
         }
     }
@@ -1007,7 +1072,7 @@ pub async fn handle_change(
     }
 }
 
-fn compact_booked_for_actor(
+fn find_cleared_db_versions_for_actor(
     tx: &Transaction,
     versions: &BTreeSet<i64>,
 ) -> eyre::Result<BTreeSet<i64>> {
@@ -1396,26 +1461,6 @@ async fn process_fully_buffered_changes(
 
         let tx = conn.transaction()?;
 
-        let max_db_version: Option<i64> = tx
-            .prepare_cached(
-                "
-                SELECT MAX(db_version)
-                    FROM __corro_buffered_changes
-                        WHERE site_id = ?
-                            AND version = ?
-                        ",
-            )?
-            .query_row(params![actor_id.as_bytes(), version], |row| row.get(0))?;
-        debug!(actor = %agent.actor_id(), "max db_version from buffered rows: {max_db_version:?}");
-
-        let max_db_version = match max_db_version {
-            None => {
-                warn!("zero rows to move, aborting!");
-                return Ok(false);
-            }
-            Some(v) => v,
-        };
-
         info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
         let start = Instant::now();
@@ -1457,11 +1502,8 @@ async fn process_fully_buffered_changes(
         info!(actor = %agent.actor_id(), "rows impacted by changes: {rows_impacted}");
 
         let known_version = if rows_impacted > 0 {
-            let db_version: i64 = tx.query_row(
-                "SELECT MAX(?, crsql_db_version() + 1)",
-                [max_db_version],
-                |row| row.get(0),
-            )?;
+            let db_version: i64 =
+                tx.query_row("SELECT crsql_next_db_version()", [], |row| row.get(0))?;
             debug!("db version: {db_version}");
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
@@ -1662,12 +1704,13 @@ pub async fn process_single_version(
                 return Ok((changeset, None));
             }
 
-            let mut db_version: i64 =
-                tx.query_row("SELECT crsql_db_version() + 1", (), |row| row.get(0))?;
-
             let mut impactful_changeset = vec![];
 
             let mut last_rows_impacted = 0;
+
+            let changes_len = changes.len();
+
+            let mut changes_per_table = BTreeMap::new();
 
             for change in changes {
                 trace!("inserting change! {change:?}");
@@ -1696,24 +1739,33 @@ pub async fn process_single_version(
 
                 if rows_impacted > last_rows_impacted {
                     debug!(actor = %agent.actor_id(), "inserted a the change into crsql_changes");
-                    db_version = std::cmp::max(change.db_version, db_version);
                     impactful_changeset.push(change);
+                    if let Some(c) = impactful_changeset.last() {
+                        if let Some(counter) = changes_per_table.get_mut(&c.table) {
+                            *counter = *counter + 1;
+                        } else {
+                            changes_per_table.insert(c.table.clone(), 1);
+                        }
+                    }
                 }
                 last_rows_impacted = rows_impacted;
             }
 
-            debug!(
-                "inserting bookkeeping row for actor {}, version: {}, db_version: {:?}, ts: {:?}",
-                actor_id, version, db_version, ts
-            );
-
-            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
-
-            debug!("inserted bookkeeping row");
+            let db_version: i64 = tx
+                .prepare_cached("SELECT crsql_next_db_version()")?
+                .query_row((), |row| row.get(0))?;
 
             let (known_version, new_changeset, db_version) = if impactful_changeset.is_empty() {
+                debug!(
+                    "inserting CLEARED bookkeeping row for actor {actor_id}, version: {version}, db_version: {db_version}, ts: {ts:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
+                );
+                tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);")?.execute(params![actor_id, version, version])?;
                 (KnownDbVersion::Cleared, Changeset::Empty { versions }, None)
             } else {
+                debug!(
+                    "inserting bookkeeping row for actor {actor_id}, version: {version}, db_version: {db_version}, ts: {ts:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
+                );
+                tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
                 (
                     KnownDbVersion::Current {
                         db_version,
@@ -1731,7 +1783,13 @@ pub async fn process_single_version(
                 )
             };
 
+            debug!("inserted bookkeeping row");
+
             tx.commit()?;
+
+            for (table_name, count) in changes_per_table {
+                counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
+            }
 
             debug!("committed transaction");
 
@@ -1829,10 +1887,14 @@ pub enum SyncRecvError {
     Change(#[from] ChangeError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("unexpected sync message")]
-    UnexpectedSyncMessage,
+    #[error("expected sync state message, received something else")]
+    ExpectedSyncState,
     #[error("unexpected end of stream")]
     UnexpectedEndOfStream,
+    #[error("expected sync clock message, received something else")]
+    ExpectedClockMessage,
+    #[error("timed out waiting for sync message")]
+    TimedOut,
 }
 
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
@@ -1844,79 +1906,77 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
     }
 
-    loop {
-        let (actor_id, addr) = {
-            let candidates = {
-                let members = agent.members().read();
+    let (actor_id, addr) = {
+        let candidates = {
+            let members = agent.members().read();
 
-                members
-                    .states
-                    .iter()
-                    .filter(|(id, _state)| **id != agent.actor_id())
-                    .map(|(id, state)| (*id, state.addr))
-                    .collect::<Vec<(ActorId, SocketAddr)>>()
-            };
-
-            if candidates.is_empty() {
-                warn!("could not find any good candidate for sync");
-                return Err(SyncClientError::NoGoodCandidate);
-            }
-
-            let mut rng = StdRng::from_entropy();
-
-            let mut choices = candidates.into_iter().choose_multiple(&mut rng, 2);
-
-            choices.sort_by(|a, b| {
-                sync_state
-                    .need_len_for_actor(&b.0)
-                    .cmp(&sync_state.need_len_for_actor(&a.0))
-            });
-
-            if let Some(chosen) = choices.get(0).cloned() {
-                chosen
-            } else {
-                return Err(SyncClientError::NoGoodCandidate);
-            }
+            members
+                .states
+                .iter()
+                .filter(|(id, _state)| **id != agent.actor_id())
+                .map(|(id, state)| (*id, state.addr))
+                .collect::<Vec<(ActorId, SocketAddr)>>()
         };
 
-        debug!(
-            actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
-            actor_id,
-            sync_state.need_len(),
-        );
-
-        debug!(actor = %agent.actor_id(), "sync message: {sync_state:?}");
-
-        increment_counter!("corro.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
-
-        histogram!(
-            "corro.sync.client.request.operations.need.count",
-            sync_state.need.len() as f64
-        );
-
-        let (tx, rx) = transport
-            .open_bi(addr)
-            .await
-            .map_err(crate::transport::ConnectError::from)?;
-
-        increment_counter!("corro.sync.attempts.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
-
-        // FIXME: check if it's ok to sync (don't overload host)
-
-        let start = Instant::now();
-        let n = bidirectional_sync(&agent, sync_state, None, rx, tx).await?;
-
-        let elapsed = start.elapsed();
-        if n > 0 {
-            info!(
-                "synced {n} changes w/ {} in {}s @ {} changes/s",
-                actor_id,
-                elapsed.as_secs_f64(),
-                n as f64 / elapsed.as_secs_f64()
-            );
+        if candidates.is_empty() {
+            warn!("could not find any good candidate for sync");
+            return Err(SyncClientError::NoGoodCandidate);
         }
-        return Ok(());
+
+        let mut rng = StdRng::from_entropy();
+
+        let mut choices = candidates.into_iter().choose_multiple(&mut rng, 2);
+
+        choices.sort_by(|a, b| {
+            sync_state
+                .need_len_for_actor(&b.0)
+                .cmp(&sync_state.need_len_for_actor(&a.0))
+        });
+
+        if let Some(chosen) = choices.get(0).cloned() {
+            chosen
+        } else {
+            return Err(SyncClientError::NoGoodCandidate);
+        }
+    };
+
+    debug!(
+        actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
+        actor_id,
+        sync_state.need_len(),
+    );
+
+    debug!(actor = %agent.actor_id(), "sync message: {sync_state:?}");
+
+    increment_counter!("corro.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+
+    histogram!(
+        "corro.sync.client.request.operations.need.count",
+        sync_state.need.len() as f64
+    );
+
+    let (tx, rx) = transport
+        .open_bi(addr)
+        .await
+        .map_err(crate::transport::ConnectError::from)?;
+
+    increment_counter!("corro.sync.attempts.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+
+    // FIXME: check if it's ok to sync (don't overload host)
+
+    let start = Instant::now();
+    let n = bidirectional_sync(agent, sync_state, None, rx, tx).await?;
+
+    let elapsed = start.elapsed();
+    if n > 0 {
+        info!(
+            "synced {n} changes w/ {} in {}s @ {} changes/s",
+            actor_id,
+            elapsed.as_secs_f64(),
+            n as f64 / elapsed.as_secs_f64()
+        );
     }
+    Ok(())
 }
 
 async fn sync_loop(
@@ -2059,8 +2119,19 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 address TEXT NOT NULL,
             
                 state TEXT NOT NULL DEFAULT 'down',
-            
                 foca_state JSON
+            ) WITHOUT ROWID;
+
+            -- RTT for members
+            CREATE TABLE __corro_member_rtts (
+                actor_id BLOB PRIMARY KEY NOT NULL,
+
+                rtt_min REAL,
+                rtt_mean REAL,
+                rtt_max REAL,
+
+                last_recorded TEXT NOT NULL DEFAULT '[]' -- JSON
+
             ) WITHOUT ROWID;
 
             -- tracked corrosion schema
@@ -2552,32 +2623,32 @@ pub mod tests {
 
         let tx = conn.transaction()?;
 
-        let to_clear = compact_booked_for_actor(&tx, &[1].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &[1].into())?;
 
         assert!(to_clear.contains(&1));
         assert!(!to_clear.contains(&2));
 
-        let to_clear = compact_booked_for_actor(&tx, &[2].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &[2].into())?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = compact_booked_for_actor(&tx, &[2, 3].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &[2, 3].into())?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = compact_booked_for_actor(&tx, &[2, 3, 4].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &[2, 3, 4].into())?;
 
         assert!(to_clear.contains(&2));
         assert!(!to_clear.contains(&3));
         assert!(!to_clear.contains(&4));
 
-        let to_clear = compact_booked_for_actor(&tx, &[3, 4].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &[3, 4].into())?;
 
         assert!(to_clear.is_empty());
 
@@ -2649,7 +2720,7 @@ pub mod tests {
         )
         .await?;
 
-        sleep(Duration::from_secs(20)).await;
+        sleep(Duration::from_secs(10)).await;
 
         {
             let conn = ta2.agent.pool().read().await?;

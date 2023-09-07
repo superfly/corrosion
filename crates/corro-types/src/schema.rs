@@ -164,12 +164,12 @@ pub fn make_schema_inner(
     schema: &NormalizedSchema,
     new_schema: &NormalizedSchema,
 ) -> Result<(), SchemaError> {
-    // iterate over dropped tables
-    for name in schema
+    if let Some(name) = schema
         .tables
         .keys()
         .collect::<HashSet<_>>()
         .difference(&new_schema.tables.keys().collect::<HashSet<_>>())
+        .next()
     {
         // TODO: add options and check flag
         return Err(SchemaError::DropTableWithoutDestructiveFlag(
@@ -254,8 +254,7 @@ pub fn make_schema_inner(
 
         debug!("dropped cols: {dropped_cols:?}");
 
-        for col_name in dropped_cols {
-            // TODO: add options and check flag
+        if let Some(col_name) = dropped_cols.into_iter().next() {
             return Err(SchemaError::DropColumnWithoutDestructiveFlag(
                 name.clone(),
                 col_name.clone(),

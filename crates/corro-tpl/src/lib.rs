@@ -498,10 +498,10 @@ impl Engine {
                     v.as_int()
                         .map_err(|_e| Box::new(EvalAltResult::from("could not cast to i64")))?,
                 ),
-                "f64" => SqliteValue::Real(
+                "f64" => SqliteValue::Real(corro_types::api::Real(
                     v.as_float()
                         .map_err(|_e| Box::new(EvalAltResult::from("could not cast to f64")))?,
-                ),
+                )),
                 "bool" => {
                     if v.as_bool()
                         .map_err(|_e| Box::new(EvalAltResult::from("could not cast to bool")))?

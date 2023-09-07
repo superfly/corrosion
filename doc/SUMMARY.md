@@ -5,12 +5,15 @@
 # User guide
 - [Authorization]()
 - [Backup / Restore]()
+- [Consistency]()
 - [CRDTs](crdts.md)
 - [Encryption]()
 - [Gossip]()
 - [Schema](schema.md)
 - [Subscriptions]()
 - [Synchronization]()
+- [Telemetry](telemetry/README.md)
+    - [Prometheus](telemetry/prometheus.md)
 - [Templates]()
 
 # Reference

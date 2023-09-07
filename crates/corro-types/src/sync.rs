@@ -37,11 +37,18 @@ impl SyncStateV1 {
             .values()
             .flat_map(|v| v.iter().map(|range| (range.end() - range.start()) + 1))
             .sum::<i64>()
-            + self
-                .partial_need
-                .values()
-                .map(|partials| partials.len() as i64)
-                .sum::<i64>()
+            + (
+                self.partial_need
+                    .values()
+                    .flat_map(|partials| {
+                        partials.values().flat_map(|ranges| {
+                            ranges.iter().map(|range| (range.end() - range.start()) + 1)
+                        })
+                    })
+                    .sum::<i64>()
+                    / 50
+                // this is how many chunks we're looking at, kind of random...
+            )
     }
 
     pub fn need_len_for_actor(&self, actor_id: &ActorId) -> i64 {

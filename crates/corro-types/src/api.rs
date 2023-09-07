@@ -1,5 +1,5 @@
 use compact_str::CompactString;
-use corro_api_types::SqliteValue;
+pub use corro_api_types::{Real, SqliteValue};
 
 pub use corro_api_types::{QueryEvent, RqliteResponse, RqliteResult, Statement};
 

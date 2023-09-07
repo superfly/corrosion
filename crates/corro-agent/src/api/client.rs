@@ -1,4 +1,5 @@
 use std::{
+    iter::Peekable,
     ops::RangeInclusive,
     time::{Duration, Instant},
 };
@@ -15,6 +16,8 @@ use corro_types::{
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
+use itertools::Itertools;
+use metrics::counter;
 use rusqlite::{params, params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
@@ -35,8 +38,8 @@ use crate::agent::process_subs;
 
 pub const MAX_CHANGES_PER_MESSAGE: usize = 50;
 
-pub struct ChunkedChanges<I> {
-    iter: I,
+pub struct ChunkedChanges<I: Iterator> {
+    iter: Peekable<I>,
     changes: Vec<Change>,
     last_pushed_seq: i64,
     last_start_seq: i64,
@@ -45,10 +48,13 @@ pub struct ChunkedChanges<I> {
     done: bool,
 }
 
-impl<I> ChunkedChanges<I> {
+impl<I> ChunkedChanges<I>
+where
+    I: Iterator,
+{
     pub fn new(iter: I, start_seq: i64, last_seq: i64, chunk_size: usize) -> Self {
         Self {
-            iter,
+            iter: iter.peekable(),
             changes: vec![],
             last_pushed_seq: 0,
             last_start_seq: start_seq,
@@ -76,19 +82,28 @@ where
             match self.iter.next() {
                 Some(Ok(change)) => {
                     trace!("got change: {change:?}");
+
                     self.last_pushed_seq = change.seq;
+
                     self.changes.push(change);
 
                     if self.last_pushed_seq == self.last_seq {
                         // this was the last seq! break early
-                        self.done = true;
                         break;
                     }
 
                     if self.changes.len() >= self.chunk_size {
                         // chunking it up
                         let start_seq = self.last_start_seq;
+
+                        if self.iter.peek().is_none() {
+                            // no more rows, break early
+                            break;
+                        }
+
+                        // prepare for next round! we're not done...
                         self.last_start_seq = self.last_pushed_seq + 1;
+
                         return Some(Ok((
                             self.changes.drain(..).collect(),
                             start_seq..=self.last_pushed_seq,
@@ -96,14 +111,15 @@ where
                     }
                 }
                 None => {
-                    // marking as done for the next `next()` call
-                    self.done = true;
+                    // probably not going to happen since we peek at the next and end early
                     // break out of the loop, don't return, there might be buffered changes
                     break;
                 }
                 Some(Err(e)) => return Some(Err(e)),
             }
         }
+
+        self.done = true;
 
         // return buffered changes
         return Some(Ok((
@@ -141,7 +157,7 @@ where
         let ts = Timestamp::from(agent.clock().new_timestamp());
 
         let db_version: i64 = tx
-            .prepare_cached("SELECT crsql_db_version() + 1")?
+            .prepare_cached("SELECT crsql_next_db_version()")?
             .query_row((), |row| row.get(0))?;
 
         let has_changes: bool = tx
@@ -197,12 +213,24 @@ where
             let conn = agent.pool().read().await?;
 
             block_in_place(|| {
-                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#)?;
+                // TODO: make this more generic so both sync and local changes can use it.
+                let mut prepped = conn.prepare_cached(r#"
+                    SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl
+                        FROM crsql_changes
+                        WHERE site_id IS NULL
+                          AND db_version = ?
+                        ORDER BY seq ASC
+                "#)?;
                 let rows = prepped.query_map([db_version], row_to_change)?;
                 let mut chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_PER_MESSAGE);
                 while let Some(changes_seqs) = chunked.next() {
                     match changes_seqs {
                         Ok((changes, seqs)) => {
+                            for (table_name, count) in
+                                changes.iter().counts_by(|change| &change.table)
+                            {
+                                counter!("corro.changes.committed", count as u64, "table" => table_name.to_string(), "source" => "local");
+                            }
                             process_subs(&agent, &changes);
 
                             trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
@@ -247,7 +275,7 @@ where
 fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
     match stmt {
         Statement::Simple(q) => tx.execute(&q, []),
-        Statement::WithParams(q, params) => tx.execute(&q, params_from_iter(params.into_iter())),
+        Statement::WithParams(q, params) => tx.execute(&q, params_from_iter(params)),
         Statement::WithNamedParams(q, params) => tx.execute(
             &q,
             params
@@ -362,7 +390,7 @@ async fn build_query_rows_response(
             }
         };
 
-        let prepped_res = block_in_place(|| match stmt {
+        let prepped_res = block_in_place(|| match &stmt {
             Statement::Simple(q) => conn.prepare(q.as_str()),
             Statement::WithParams(q, _) => conn.prepare(q.as_str()),
             Statement::WithNamedParams(q, _) => conn.prepare(q.as_str()),
@@ -397,7 +425,19 @@ async fn build_query_rows_response(
 
             let start = Instant::now();
 
-            let mut rows = match prepped.query(()) {
+            let query = match stmt {
+                Statement::Simple(_) => prepped.query(()),
+                Statement::WithParams(_, params) => prepped.query(params_from_iter(params)),
+                Statement::WithNamedParams(_, params) => prepped.query(
+                    params
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
+                        .collect::<Vec<(&str, &dyn ToSql)>>()
+                        .as_slice(),
+                ),
+            };
+
+            let mut rows = match query {
                 Ok(rows) => rows,
                 Err(e) => {
                     _ = res_tx.send(Err((
@@ -989,22 +1029,21 @@ mod tests {
         assert_eq!(chunker.next(), Some(Ok((vec![], 0..=100))));
         assert_eq!(chunker.next(), None);
 
-        let seq_0 = Change {
-            seq: 0,
-            ..Default::default()
-        };
-        let seq_1 = Change {
-            seq: 1,
-            ..Default::default()
-        };
-        let seq_2 = Change {
-            seq: 2,
-            ..Default::default()
-        };
+        let changes: Vec<Change> = (0..100)
+            .map(|seq| Change {
+                seq,
+                ..Default::default()
+            })
+            .collect();
 
         // 2 iterations
         let mut chunker = ChunkedChanges::new(
-            vec![Ok(seq_0.clone()), Ok(seq_1.clone()), Ok(seq_2.clone())].into_iter(),
+            vec![
+                Ok(changes[0].clone()),
+                Ok(changes[1].clone()),
+                Ok(changes[2].clone()),
+            ]
+            .into_iter(),
             0,
             100,
             2,
@@ -1012,19 +1051,92 @@ mod tests {
 
         assert_eq!(
             chunker.next(),
-            Some(Ok((vec![seq_0.clone(), seq_1.clone()], 0..=1)))
+            Some(Ok((vec![changes[0].clone(), changes[1].clone()], 0..=1)))
         );
-        assert_eq!(chunker.next(), Some(Ok((vec![seq_2.clone()], 2..=100))));
+        assert_eq!(
+            chunker.next(),
+            Some(Ok((vec![changes[2].clone()], 2..=100)))
+        );
         assert_eq!(chunker.next(), None);
 
         let mut chunker = ChunkedChanges::new(
-            vec![Ok(seq_0.clone()), Ok(seq_1.clone())].into_iter(),
+            vec![Ok(changes[0].clone()), Ok(changes[1].clone())].into_iter(),
             0,
             0,
             1,
         );
 
-        assert_eq!(chunker.next(), Some(Ok((vec![seq_0.clone()], 0..=0))));
+        assert_eq!(chunker.next(), Some(Ok((vec![changes[0].clone()], 0..=0))));
+        assert_eq!(chunker.next(), None);
+
+        // gaps
+        let mut chunker = ChunkedChanges::new(
+            vec![Ok(changes[0].clone()), Ok(changes[2].clone())].into_iter(),
+            0,
+            100,
+            2,
+        );
+
+        assert_eq!(
+            chunker.next(),
+            Some(Ok((vec![changes[0].clone(), changes[2].clone()], 0..=100)))
+        );
+
+        assert_eq!(chunker.next(), None);
+
+        // gaps
+        let mut chunker = ChunkedChanges::new(
+            vec![
+                Ok(changes[2].clone()),
+                Ok(changes[4].clone()),
+                Ok(changes[7].clone()),
+                Ok(changes[8].clone()),
+            ]
+            .into_iter(),
+            0,
+            100,
+            50,
+        );
+
+        assert_eq!(
+            chunker.next(),
+            Some(Ok((
+                vec![
+                    changes[2].clone(),
+                    changes[4].clone(),
+                    changes[7].clone(),
+                    changes[8].clone()
+                ],
+                0..=100
+            )))
+        );
+
+        assert_eq!(chunker.next(), None);
+
+        // gaps
+        let mut chunker = ChunkedChanges::new(
+            vec![
+                Ok(changes[2].clone()),
+                Ok(changes[4].clone()),
+                Ok(changes[7].clone()),
+                Ok(changes[8].clone()),
+            ]
+            .into_iter(),
+            0,
+            10,
+            2,
+        );
+
+        assert_eq!(
+            chunker.next(),
+            Some(Ok((vec![changes[2].clone(), changes[4].clone(),], 0..=4)))
+        );
+
+        assert_eq!(
+            chunker.next(),
+            Some(Ok((vec![changes[7].clone(), changes[8].clone(),], 5..=10)))
+        );
+
         assert_eq!(chunker.next(), None);
     }
 }
