@@ -1,6 +1,6 @@
 ## POST /v1/queries
 
-Read from the Corrosion database. The `v1/queries` endpoint accepts a single SQL statement in JSON format.
+Read from the Corrosion database. The `/v1/queries` endpoint accepts a single SQL statement in JSON format.
 
 ### Sample request
 ```

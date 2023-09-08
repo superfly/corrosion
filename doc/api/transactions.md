@@ -1,6 +1,6 @@
 ## POST /v1/transactions
 
-Write changes to the Corrosion database for propagation through the cluster. The `v1/transactions` endpoint accepts a JSON list of SQL statements.
+Write changes to the Corrosion database for propagation through the cluster. The `/v1/transactions` endpoint accepts a JSON list of SQL statements.
 
 ### Sample request
 ```

@@ -1,6 +1,6 @@
 # POST /v1/subscriptions
 
-Start receiving updates for a desired SQL query. The `v1/subscriptions` endpoint accepts a single SQL statement in JSON format.
+Start receiving updates for a desired SQL query. The `/v1/subscriptions` endpoint accepts a single SQL statement in JSON format.
 The Corrosion agent responds with an HTML stream that notifies of any changes to the response to this query.
 
 ### Sample request
