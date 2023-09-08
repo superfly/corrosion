@@ -4,7 +4,7 @@ Read from the Corrosion database. The `v1/queries` endpoint accepts a single SQL
 
 ### Sample request
 ```
-curl http://top1.nearest.of.ccorrosion.internal:8080/v1/queries \ 
+curl http://localhost:8080/v1/queries \ 
  -H "content-type: application/json" \
  -d "\"SELECT sandwich FROM sandwiches\""
 ```

@@ -5,7 +5,7 @@ The Corrosion agent responds with an HTML stream that notifies of any changes to
 
 ### Sample request
 ```
-curl http://top1.nearest.of.ccorrosion.internal:8080/v1/subscriptions \
+curl http://localhost:8080/v1/subscriptions \
  -H "content-type: application/json" \
  -d "\"SELECT sandwich FROM sw\""
 ```
