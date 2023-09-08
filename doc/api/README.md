@@ -1,4 +1,4 @@
-## API
+# API
 
 Each running Corrosion agent hosts a RESTful HTTP API for interacting with the cluster's synchronized database. Endpoints accept SQL statements in a JSON body, for versatility.
 

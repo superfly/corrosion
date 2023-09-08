@@ -3,14 +3,14 @@
 Start receiving updates for a desired SQL query. The `/v1/subscriptions` endpoint accepts a single SQL statement in JSON format.
 The Corrosion agent responds with an HTML stream that notifies of any changes to the response to this query.
 
-### Sample request
+## Sample request
 ```
 curl http://localhost:8080/v1/subscriptions \
  -H "content-type: application/json" \
  -d "\"SELECT sandwich FROM sw\""
 ```
 
-### Sample response
+## Sample response
 
 ```json
 {"columns":["sandwich"]}
