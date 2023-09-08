@@ -17,10 +17,10 @@
 - [Templates]()
 
 # Reference
-- [API]()
-    - [POST /v1/exec]()
-    - [POST /v1/query]()
-    - [POST /v1/subscriptions]()
+- [API](api/README.md)
+    - [POST /v1/transactions](api/transactions.md)
+    - [POST /v1/queries](api/queries.md)
+    - [POST /v1/subscriptions](api/subscriptions.md)
 - [Command-line Interface](cli/README.md)
     - [agent]()
     - [backup](cli/backup.md)
