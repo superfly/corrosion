@@ -157,7 +157,7 @@ impl SyncMessage {
     }
 
     pub fn from_buf(buf: &mut BytesMut) -> Result<Self, SyncMessageDecodeError> {
-        Ok(Self::from_slice(&buf)?)
+        Ok(Self::from_slice(buf)?)
     }
 
     pub fn decode(

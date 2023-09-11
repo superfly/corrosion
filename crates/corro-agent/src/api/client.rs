@@ -65,7 +65,7 @@ where
     }
 }
 
-impl<'stmt, I> Iterator for ChunkedChanges<I>
+impl<I> Iterator for ChunkedChanges<I>
 where
     I: Iterator<Item = rusqlite::Result<Change>>,
 {
@@ -122,10 +122,10 @@ where
         self.done = true;
 
         // return buffered changes
-        return Some(Ok((
+        Some(Ok((
             self.changes.clone(),                // no need to drain here like before
             self.last_start_seq..=self.last_seq, // even if empty, this is all we have still applied
-        )));
+        )))
     }
 }
 
@@ -222,8 +222,8 @@ where
                         ORDER BY seq ASC
                 "#)?;
                 let rows = prepped.query_map([db_version], row_to_change)?;
-                let mut chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_PER_MESSAGE);
-                while let Some(changes_seqs) = chunked.next() {
+                let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_PER_MESSAGE);
+                for changes_seqs in chunked {
                     match changes_seqs {
                         Ok((changes, seqs)) => {
                             for (table_name, count) in
@@ -274,10 +274,10 @@ where
 
 fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
     match stmt {
-        Statement::Simple(q) => tx.execute(&q, []),
-        Statement::WithParams(q, params) => tx.execute(&q, params_from_iter(params)),
+        Statement::Simple(q) => tx.execute(q, []),
+        Statement::WithParams(q, params) => tx.execute(q, params_from_iter(params)),
         Statement::WithNamedParams(q, params) => tx.execute(
-            &q,
+            q,
             params
                 .iter()
                 .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
@@ -309,11 +309,11 @@ pub async fn api_v1_transactions(
 
         let results = statements
             .iter()
-            .filter_map(|stmt| {
+            .map(|stmt| {
                 let start = Instant::now();
-                let res = execute_statement(&tx, stmt);
+                let res = execute_statement(tx, stmt);
 
-                Some(match res {
+                match res {
                     Ok(rows_affected) => {
                         total_rows_affected += rows_affected;
                         RqliteResult::Execute {
@@ -324,7 +324,7 @@ pub async fn api_v1_transactions(
                     Err(e) => RqliteResult::Error {
                         error: e.to_string(),
                     },
-                })
+                }
             })
             .collect::<Vec<RqliteResult>>();
 
@@ -334,20 +334,18 @@ pub async fn api_v1_transactions(
 
     let (results, elapsed) = match res {
         Ok(res) => res,
-        Err(e) => match e {
-            e => {
-                error!("could not execute statement(s): {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::Json(RqliteResponse {
-                        results: vec![RqliteResult::Error {
-                            error: e.to_string(),
-                        }],
-                        time: None,
-                    }),
-                );
-            }
-        },
+        Err(e) => {
+            error!("could not execute statement(s): {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(RqliteResponse {
+                    results: vec![RqliteResult::Error {
+                        error: e.to_string(),
+                    }],
+                    time: None,
+                }),
+            );
+        }
     };
 
     (
@@ -391,9 +389,9 @@ async fn build_query_rows_response(
         };
 
         let prepped_res = block_in_place(|| match &stmt {
-            Statement::Simple(q) => conn.prepare(q.as_str()),
-            Statement::WithParams(q, _) => conn.prepare(q.as_str()),
-            Statement::WithNamedParams(q, _) => conn.prepare(q.as_str()),
+            Statement::Simple(q) => conn.prepare(q),
+            Statement::WithParams(q, _) => conn.prepare(q),
+            Statement::WithNamedParams(q, _) => conn.prepare(q),
         });
 
         let mut prepped = match prepped_res {
@@ -411,6 +409,7 @@ async fn build_query_rows_response(
 
         block_in_place(|| {
             let col_count = prepped.column_count();
+            trace!("inside block in place, col count: {col_count}");
 
             if let Err(e) = data_tx.blocking_send(QueryEvent::Columns(
                 prepped
@@ -458,9 +457,12 @@ async fn build_query_rows_response(
 
             let mut rowid = 1;
 
+            trace!("about to loop through rows!");
+
             loop {
                 match rows.next() {
                     Ok(Some(row)) => {
+                        trace!("got a row: {row:?}");
                         match (0..col_count)
                             .map(|i| row.get::<_, SqliteValue>(i))
                             .collect::<rusqlite::Result<Vec<_>>>()
@@ -546,14 +548,18 @@ pub async fn api_v1_queries(
         debug!("query body channel done");
     });
 
+    trace!("building query rows response...");
+
     match build_query_rows_response(&agent, data_tx, stmt).await {
         Ok(_) => {
+            #[allow(clippy::needless_return)]
             return hyper::Response::builder()
                 .status(StatusCode::OK)
                 .body(body)
                 .expect("could not build query response body");
         }
         Err((status, res)) => {
+            #[allow(clippy::needless_return)]
             return hyper::Response::builder()
                 .status(status)
                 .body(
@@ -845,6 +851,8 @@ mod tests {
 
         assert!(body.0.results.len() == 2);
 
+        println!("transaction body: {body:?}");
+
         let res = api_v1_queries(
             Extension(agent.clone()),
             axum::Json(Statement::Simple("select * from tests".into())),
@@ -962,14 +970,14 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert_eq!(id_col.nullable, true);
-            assert_eq!(id_col.primary_key, true);
+            assert!(id_col.nullable);
+            assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
             assert_eq!(foo_col.name, "foo");
             assert_eq!(foo_col.sql_type, SqliteType::Text);
-            assert_eq!(foo_col.nullable, true);
-            assert_eq!(foo_col.primary_key, false);
+            assert!(foo_col.nullable);
+            assert!(!foo_col.primary_key);
         }
 
         let (status_code, _body) = api_v1_db_schema(
@@ -992,14 +1000,14 @@ mod tests {
         let id_col = tests.columns.get("id").unwrap();
         assert_eq!(id_col.name, "id");
         assert_eq!(id_col.sql_type, SqliteType::Integer);
-        assert_eq!(id_col.nullable, true);
-        assert_eq!(id_col.primary_key, true);
+        assert!(id_col.nullable);
+        assert!(id_col.primary_key);
 
         let foo_col = tests.columns.get("foo").unwrap();
         assert_eq!(foo_col.name, "foo");
         assert_eq!(foo_col.sql_type, SqliteType::Text);
-        assert_eq!(foo_col.nullable, true);
-        assert_eq!(foo_col.primary_key, false);
+        assert!(foo_col.nullable);
+        assert!(!foo_col.primary_key);
 
         let tests = schema
             .tables
@@ -1009,14 +1017,14 @@ mod tests {
         let id_col = tests.columns.get("id").unwrap();
         assert_eq!(id_col.name, "id");
         assert_eq!(id_col.sql_type, SqliteType::Integer);
-        assert_eq!(id_col.nullable, true);
-        assert_eq!(id_col.primary_key, true);
+        assert!(id_col.nullable);
+        assert!(id_col.primary_key);
 
         let foo_col = tests.columns.get("foo").unwrap();
         assert_eq!(foo_col.name, "foo");
         assert_eq!(foo_col.sql_type, SqliteType::Text);
-        assert_eq!(foo_col.nullable, true);
-        assert_eq!(foo_col.primary_key, false);
+        assert!(foo_col.nullable);
+        assert!(!foo_col.primary_key);
 
         Ok(())
     }

@@ -24,7 +24,7 @@ impl QueryResultBuilder {
             ..Default::default()
         }
     }
-    pub fn add_row<'stmt>(&mut self, row: &rusqlite::Row<'stmt>) -> rusqlite::Result<()> {
+    pub fn add_row(&mut self, row: &rusqlite::Row) -> rusqlite::Result<()> {
         self.values.push(
             (0..self.columns.len())
                 .map(|idx| row.get(idx))

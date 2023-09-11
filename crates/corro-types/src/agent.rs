@@ -646,12 +646,10 @@ impl Bookie {
     }
 
     pub async fn add(&self, actor_id: ActorId, version: i64, db_version: KnownDbVersion) {
-        {
-            if let Some(booked) = self.0.read().await.get(&actor_id) {
-                booked.insert(version, db_version).await;
-                return;
-            }
-        };
+        if let Some(booked) = self.0.read().await.get(&actor_id) {
+            booked.insert(version, db_version).await;
+            return;
+        }
 
         let mut w = self.0.write().await;
         let booked = w.entry(actor_id).or_default();
@@ -678,7 +676,7 @@ impl Bookie {
     }
 
     pub async fn last(&self, actor_id: &ActorId) -> Option<i64> {
-        if let Some(booked) = self.0.read().await.get(&actor_id) {
+        if let Some(booked) = self.0.read().await.get(actor_id) {
             booked.last().await
         } else {
             None
