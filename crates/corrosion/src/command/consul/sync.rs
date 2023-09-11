@@ -159,7 +159,7 @@ async fn setup(
     ];
 
     for (name, kind) in expected_cols {
-        if !col_infos.iter().any(|info| info.name == name && kind.contains(&info.kind)) {
+        if col_infos.iter().find(|info| info.name == name && kind.contains(&info.kind) ).is_none() {
             eyre::bail!("expected a column consul_services.{name} w/ type {kind:?}");
         }
     }
@@ -178,7 +178,7 @@ async fn setup(
     ];
 
     for (name, kind) in expected_cols {
-        if !col_infos.iter().any(|info| info.name == name && kind.contains(&info.kind)) {
+        if col_infos.iter().find(|info| info.name == name && kind.contains(&info.kind) ).is_none() {
             eyre::bail!("expected a column consul_checks.{name} w/ type {kind:?}");
         }
     }
@@ -501,7 +501,7 @@ pub async fn update_consul(
                         start.elapsed().as_secs_f64()
                     );
                     match update_consul_services(
-                        corrosion,
+                        &corrosion,
                         services,
                         service_hashes,
                         node,
@@ -536,7 +536,7 @@ pub async fn update_consul(
                         start.elapsed().as_secs_f64()
                     );
                     match update_consul_checks(
-                        corrosion,
+                        &corrosion,
                         checks,
                         check_hashes,
                         node,

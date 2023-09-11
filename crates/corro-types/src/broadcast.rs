@@ -93,14 +93,6 @@ pub enum Changeset {
     },
 }
 
-pub struct ChangesetParts {
-    pub version: i64,
-    pub changes: Vec<Change>,
-    pub seqs: RangeInclusive<i64>,
-    pub last_seq: i64,
-    pub ts: Timestamp,
-}
-
 impl Changeset {
     pub fn versions(&self) -> RangeInclusive<i64> {
         match self {
@@ -141,13 +133,6 @@ impl Changeset {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        match self {
-            Changeset::Empty { .. } => true,
-            Changeset::Full { changes, .. } => changes.is_empty(),
-        }
-    }
-
     pub fn ts(&self) -> Option<Timestamp> {
         match self {
             Changeset::Empty { .. } => None,
@@ -158,11 +143,11 @@ impl Changeset {
     pub fn changes(&self) -> &[Change] {
         match self {
             Changeset::Empty { .. } => &[],
-            Changeset::Full { changes, .. } => changes,
+            Changeset::Full { changes, .. } => &changes,
         }
     }
 
-    pub fn into_parts(self) -> Option<ChangesetParts> {
+    pub fn into_parts(self) -> Option<(i64, Vec<Change>, RangeInclusive<i64>, i64, Timestamp)> {
         match self {
             Changeset::Empty { .. } => None,
             Changeset::Full {
@@ -171,13 +156,7 @@ impl Changeset {
                 seqs,
                 last_seq,
                 ts,
-            } => Some(ChangesetParts {
-                version,
-                changes,
-                seqs,
-                last_seq,
-                ts,
-            }),
+            } => Some((version, changes, seqs, last_seq, ts)),
         }
     }
 }

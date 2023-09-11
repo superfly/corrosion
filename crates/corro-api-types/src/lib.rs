@@ -171,7 +171,7 @@ impl ColumnType {
         })
     }
 
-    pub fn from_sqlite_name(s: &str) -> Option<Self> {
+    pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "INTEGER" => Self::Integer,
             "REAL" => Self::Float,
@@ -199,7 +199,6 @@ impl FromSql for ColumnType {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Hash)]
 #[serde(untagged)]
 pub enum SqliteValue {
@@ -230,7 +229,7 @@ impl Hash for Real {
 }
 
 fn integer_decode(val: f64) -> (u64, i16, i8) {
-    let bits: u64 = val.to_bits();
+    let bits: u64 = unsafe { std::mem::transmute(val) };
     let sign: i8 = if bits >> 63 == 0 { 1 } else { -1 };
     let mut exponent: i16 = ((bits >> 52) & 0x7ff) as i16;
     let mantissa = if exponent == 0 {
@@ -294,7 +293,7 @@ impl SqliteValue {
         }
     }
 
-    pub fn as_ref(&self) -> SqliteValueRef {
+    pub fn as_ref<'a>(&'a self) -> SqliteValueRef<'a> {
         match self {
             SqliteValue::Null => SqliteValueRef::Null,
             SqliteValue::Integer(i) => SqliteValueRef::Integer(*i),
@@ -342,7 +341,7 @@ impl FromSql for SqliteValue {
             ValueRef::Integer(i) => SqliteValue::Integer(i),
             ValueRef::Real(f) => SqliteValue::Real(Real(f)),
             ValueRef::Text(t) => SqliteValue::Text(
-                std::str::from_utf8(t)
+                std::str::from_utf8(t.into())
                     .map_err(|e| FromSqlError::Other(Box::new(e)))?
                     .into(),
             ),

@@ -358,7 +358,7 @@ async fn process_range(
                     version,
                     known_version,
                     vec![],
-                    sender,
+                    &sender,
                 )
                 .await?;
             }
@@ -411,26 +411,23 @@ async fn process_version(
                         row_to_change,
                     )?;
 
-                    let chunked =
+                    let mut chunked =
                         ChunkedChanges::new(rows, *start_seq, *end_seq, MAX_CHANGES_PER_MESSAGE);
-                    for changes_seqs in chunked {
+                    while let Some(changes_seqs) = chunked.next() {
                         match changes_seqs {
                             Ok((changes, seqs)) => {
-                                if sender
-                                    .blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(
-                                        ChangeV1 {
-                                            actor_id,
-                                            changeset: Changeset::Full {
-                                                version,
-                                                changes,
-                                                seqs,
-                                                last_seq: *last_seq,
-                                                ts: *ts,
-                                            },
+                                if let Err(_) = sender.blocking_send(SyncMessage::V1(
+                                    SyncMessageV1::Changeset(ChangeV1 {
+                                        actor_id,
+                                        changeset: Changeset::Full {
+                                            version,
+                                            changes,
+                                            seqs,
+                                            last_seq: *last_seq,
+                                            ts: *ts,
                                         },
-                                    )))
-                                    .is_err()
-                                {
+                                    }),
+                                )) {
                                     eyre::bail!("sync message sender channel is closed");
                                 }
                             }
@@ -474,13 +471,13 @@ async fn process_version(
                             row_to_change,
                         )?;
 
-                        let chunked = ChunkedChanges::new(
+                        let mut chunked = ChunkedChanges::new(
                             rows,
                             *start_seq,
                             *end_seq,
                             MAX_CHANGES_PER_MESSAGE,
                         );
-                        for changes_seqs in chunked {
+                        while let Some(changes_seqs) = chunked.next() {
                             match changes_seqs {
                                 Ok((changes, seqs)) => {
                                     if let Err(_e) = sender.blocking_send(SyncMessage::V1(

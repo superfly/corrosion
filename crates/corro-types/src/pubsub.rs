@@ -86,7 +86,7 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError
         }
         let column_type_and_maybe_intlen = buf.get_u8();
         let column_type = ColumnType::from_u8(column_type_and_maybe_intlen & 0x07);
-        let intlen = (column_type_and_maybe_intlen >> 3) as usize;
+        let intlen = (column_type_and_maybe_intlen >> 3 & 0xFF) as usize;
 
         match column_type {
             Some(ColumnType::Blob) => {
@@ -185,7 +185,7 @@ impl Matcher {
 
         let mut parser = Parser::new(sql.as_bytes());
 
-        let (mut stmt, parsed) = match parser.next()?.ok_or(MatcherError::StatementRequired)? {
+        let (stmt, parsed) = match parser.next()?.ok_or(MatcherError::StatementRequired)? {
             Cmd::Stmt(stmt) => {
                 let parsed = match stmt {
                     Stmt::Select(ref select) => extract_select_columns(select, schema)?,
@@ -208,6 +208,7 @@ impl Matcher {
 
         let mut pks = IndexMap::default();
 
+        let mut stmt = stmt.clone();
         match &mut stmt {
             Stmt::Select(select) => match &mut select.body.select {
                 OneSelect::Select { columns, .. } => {
@@ -263,26 +264,30 @@ impl Matcher {
                     .tables
                     .get(tbl_name)
                     .expect("this should not happen, missing table in schema"),
-                tbl_name,
+                &tbl_name,
                 id,
             )?;
 
             let mut stmt = stmt.clone();
 
-            if let Stmt::Select(select) = &mut stmt {
-                if let OneSelect::Select { where_clause, .. } = &mut select.body.select {
-                    *where_clause = if let Some(prev) = where_clause.take() {
-                        Some(Expr::Binary(Box::new(expr), Operator::And, Box::new(prev)))
-                    } else {
-                        Some(expr)
-                    };
-                }
+            match &mut stmt {
+                Stmt::Select(select) => match &mut select.body.select {
+                    OneSelect::Select { where_clause, .. } => {
+                        *where_clause = if let Some(prev) = where_clause.take() {
+                            Some(Expr::Binary(Box::new(expr), Operator::And, Box::new(prev)))
+                        } else {
+                            Some(expr)
+                        };
+                    }
+                    _ => {}
+                },
+                _ => {}
             }
 
             let mut new_query = Cmd::Stmt(stmt).to_string();
             new_query.pop();
 
-            let mut tmp_cols = pks.values().flatten().cloned().collect::<Vec<String>>();
+            let mut tmp_cols = pks.values().cloned().flatten().collect::<Vec<String>>();
             for i in 0..(parsed.columns.len()) {
                 tmp_cols.push(format!("col_{i}"));
             }
@@ -291,7 +296,9 @@ impl Matcher {
                 .get(tbl_name)
                 .cloned()
                 .ok_or(MatcherError::MissingPrimaryKeys)?
-                .to_vec()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
                 .join(",");
 
             statements.insert(
@@ -315,7 +322,7 @@ impl Matcher {
         let matcher = Self(Arc::new(InnerMatcher {
             id,
             query: stmt,
-            statements,
+            statements: statements,
             pks,
             parsed,
             qualified_table_name: format!("subscriptions.{query_table}"),
@@ -507,7 +514,7 @@ impl Matcher {
         &self.0.cmd_tx
     }
 
-    pub fn process_change(&self, changes: &[Change]) -> Result<(), MatcherError> {
+    pub fn process_change<'a>(&self, changes: &[Change]) -> Result<(), MatcherError> {
         // println!("{:?}", self.0.parsed);
 
         let mut candidates: HashMap<CompactString, Vec<Vec<SqliteValue>>> = HashMap::new();
@@ -565,7 +572,9 @@ impl Matcher {
                     .pks
                     .get(table.as_str())
                     .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
-                    .to_vec()
+                    .iter()
+                    .map(|s| s.clone())
+                    .collect::<Vec<_>>()
                     .join(",")
             ))?
             .execute(())?;
@@ -597,8 +606,8 @@ impl Matcher {
                 .0
                 .pks
                 .values()
-                .flatten()
                 .cloned()
+                .flatten()
                 .collect::<Vec<String>>();
             for i in 0..(self.0.parsed.columns.len()) {
                 let col_name = format!("col_{i}");
@@ -625,8 +634,8 @@ impl Matcher {
                 self.0
                     .pks
                     .values()
-                    .flatten()
                     .cloned()
+                    .flatten()
                     .collect::<Vec<String>>()
                     .join(","),
                 (0..(self.0.parsed.columns.len()))
@@ -652,15 +661,15 @@ impl Matcher {
                 self.0
                     .pks
                     .values()
-                    .flatten()
                     .cloned()
+                    .flatten()
                     .collect::<Vec<String>>()
                     .join(","),
                 self.0
                     .pks
                     .values()
-                    .flatten()
                     .cloned()
+                    .flatten()
                     .collect::<Vec<String>>()
                     .join(","),
                 stmt.temp_query,
@@ -749,7 +758,7 @@ pub struct ParsedSelect {
     table_columns: IndexMap<String, HashSet<String>>,
     aliases: HashMap<String, String>,
     pub columns: Vec<ResultColumn>,
-    children: Vec<ParsedSelect>,
+    children: Vec<Box<ParsedSelect>>,
 }
 
 fn extract_select_columns(
@@ -758,93 +767,97 @@ fn extract_select_columns(
 ) -> Result<ParsedSelect, MatcherError> {
     let mut parsed = ParsedSelect::default();
 
-    if let OneSelect::Select {
-        ref from,
-        ref columns,
-        ref where_clause,
-        ..
-    } = select.body.select
-    {
-        let from_table = match from {
-            Some(from) => {
-                let from_table = match &from.select {
-                    Some(table) => match table.as_ref() {
-                        SelectTable::Table(name, alias, _) => {
-                            if schema.tables.contains_key(name.name.0.as_str()) {
-                                if let Some(As::As(alias) | As::Elided(alias)) = alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
-                                } else if let Some(ref alias) = name.alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
-                                }
-                                parsed.table_columns.entry(name.name.0.clone()).or_default();
-                                Some(&name.name)
-                            } else {
-                                return Err(MatcherError::TableNotFound(name.name.0.clone()));
-                            }
-                        }
-                        // TODO: add support for:
-                        // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
-                        // Select(Select, Option<As>),
-                        // Sub(FromClause, Option<As>),
-                        t => {
-                            warn!("ignoring {t:?}");
-                            None
-                        }
-                    },
-                    _ => {
-                        // according to the sqlite3-parser docs, this can't really happen
-                        // ignore!
-                        unreachable!()
-                    }
-                };
-                if let Some(ref joins) = from.joins {
-                    for join in joins.iter() {
-                        // let mut tbl_name = None;
-                        let tbl_name = match &join.table {
+    match select.body.select {
+        OneSelect::Select {
+            ref from,
+            ref columns,
+            ref where_clause,
+            ..
+        } => {
+            let from_table = match from {
+                Some(from) => {
+                    let from_table = match &from.select {
+                        Some(table) => match table.as_ref() {
                             SelectTable::Table(name, alias, _) => {
-                                if let Some(As::As(alias) | As::Elided(alias)) = alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
-                                } else if let Some(ref alias) = name.alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                if schema.tables.contains_key(name.name.0.as_str()) {
+                                    if let Some(As::As(alias) | As::Elided(alias)) = alias {
+                                        parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    } else if let Some(ref alias) = name.alias {
+                                        parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    }
+                                    parsed.table_columns.entry(name.name.0.clone()).or_default();
+                                    Some(&name.name)
+                                } else {
+                                    return Err(MatcherError::TableNotFound(name.name.0.clone()));
                                 }
-                                parsed.table_columns.entry(name.name.0.clone()).or_default();
-                                &name.name
                             }
                             // TODO: add support for:
                             // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
                             // Select(Select, Option<As>),
                             // Sub(FromClause, Option<As>),
                             t => {
-                                warn!("ignoring JOIN's non-SelectTable::Table:  {t:?}");
-                                continue;
+                                warn!("ignoring {t:?}");
+                                None
                             }
-                        };
-                        // ON or USING
-                        if let Some(constraint) = &join.constraint {
-                            match constraint {
-                                JoinConstraint::On(expr) => {
-                                    extract_expr_columns(expr, schema, &mut parsed)?;
+                        },
+                        _ => {
+                            // according to the sqlite3-parser docs, this can't really happen
+                            // ignore!
+                            unreachable!()
+                        }
+                    };
+                    if let Some(ref joins) = from.joins {
+                        for join in joins.iter() {
+                            // let mut tbl_name = None;
+                            let tbl_name = match &join.table {
+                                SelectTable::Table(name, alias, _) => {
+                                    if let Some(As::As(alias) | As::Elided(alias)) = alias {
+                                        parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    } else if let Some(ref alias) = name.alias {
+                                        parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    }
+                                    parsed.table_columns.entry(name.name.0.clone()).or_default();
+                                    &name.name
                                 }
-                                JoinConstraint::Using(names) => {
-                                    let entry =
-                                        parsed.table_columns.entry(tbl_name.0.clone()).or_default();
-                                    for name in names.iter() {
-                                        entry.insert(name.0.clone());
+                                // TODO: add support for:
+                                // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
+                                // Select(Select, Option<As>),
+                                // Sub(FromClause, Option<As>),
+                                t => {
+                                    warn!("ignoring JOIN's non-SelectTable::Table:  {t:?}");
+                                    continue;
+                                }
+                            };
+                            // ON or USING
+                            if let Some(constraint) = &join.constraint {
+                                match constraint {
+                                    JoinConstraint::On(expr) => {
+                                        extract_expr_columns(expr, schema, &mut parsed)?;
+                                    }
+                                    JoinConstraint::Using(names) => {
+                                        let entry = parsed
+                                            .table_columns
+                                            .entry(tbl_name.0.clone())
+                                            .or_default();
+                                        for name in names.iter() {
+                                            entry.insert(name.0.clone());
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    if let Some(expr) = where_clause {
+                        extract_expr_columns(expr, schema, &mut parsed)?;
+                    }
+                    from_table
                 }
-                if let Some(expr) = where_clause {
-                    extract_expr_columns(expr, schema, &mut parsed)?;
-                }
-                from_table
-            }
-            _ => None,
-        };
+                _ => None,
+            };
 
-        extract_columns(columns.as_slice(), from_table, schema, &mut parsed)?;
+            extract_columns(columns.as_slice(), from_table, schema, &mut parsed)?;
+        }
+        _ => {}
     }
 
     Ok(parsed)
@@ -886,7 +899,7 @@ fn extract_expr_columns(
                     if tbl.columns.contains_key(&check_col_name) {
                         if found.is_some() {
                             return Err(MatcherError::QualificationRequired {
-                                col_name: check_col_name,
+                                col_name: check_col_name.clone(),
                             });
                         }
                         found = Some(tbl.name.as_str());
@@ -899,10 +912,10 @@ fn extract_expr_columns(
                     .table_columns
                     .entry(found.to_owned())
                     .or_default()
-                    .insert(check_col_name);
+                    .insert(check_col_name.clone());
             } else {
                 return Err(MatcherError::TableForColumnNotFound {
-                    col_name: check_col_name,
+                    col_name: check_col_name.clone(),
                 });
             }
         }
@@ -916,7 +929,7 @@ fn extract_expr_columns(
                     if tbl.columns.contains_key(&check_col_name) {
                         if found.is_some() {
                             return Err(MatcherError::QualificationRequired {
-                                col_name: check_col_name,
+                                col_name: check_col_name.clone(),
                             });
                         }
                         found = Some(tbl.name.as_str());
@@ -966,7 +979,7 @@ fn extract_expr_columns(
         Expr::Exists(select) => {
             parsed
                 .children
-                .push(extract_select_columns(select, schema)?);
+                .push(Box::new(extract_select_columns(select, schema)?));
         }
         Expr::FunctionCall { args, .. } => {
             if let Some(args) = args {
@@ -985,7 +998,9 @@ fn extract_expr_columns(
         }
         Expr::InSelect { lhs, rhs, .. } => {
             extract_expr_columns(lhs, schema, parsed)?;
-            parsed.children.push(extract_select_columns(rhs, schema)?);
+            parsed
+                .children
+                .push(Box::new(extract_select_columns(rhs, schema)?));
         }
         expr @ Expr::InTable { .. } => {
             return Err(MatcherError::UnsupportedExpr { expr: expr.clone() })
@@ -1009,7 +1024,7 @@ fn extract_expr_columns(
         Expr::Subquery(select) => {
             parsed
                 .children
-                .push(extract_select_columns(select, schema)?);
+                .push(Box::new(extract_select_columns(select, schema)?));
         }
         Expr::Unary(_, expr) => {
             extract_expr_columns(expr, schema, parsed)?;
@@ -1454,7 +1469,7 @@ mod tests {
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
-            assert_eq!(rx.recv().await.unwrap(), QueryEvent::Row(1, cells));
+            assert_eq!(rx.recv().await.unwrap(), QueryEvent::Row(1, cells).into());
             assert!(matches!(
                 rx.recv().await.unwrap(),
                 QueryEvent::EndOfQuery { .. }
@@ -1487,7 +1502,7 @@ mod tests {
                 changes
             };
 
-            matcher.process_change(changes.as_slice()).unwrap();
+            matcher.process_change(&changes.as_slice()).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
@@ -1518,7 +1533,7 @@ mod tests {
                 changes
             };
 
-            matcher.process_change(changes.as_slice()).unwrap();
+            matcher.process_change(&changes.as_slice()).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
@@ -1550,7 +1565,7 @@ mod tests {
                 changes
             };
 
-            matcher.process_change(changes.as_slice()).unwrap();
+            matcher.process_change(&changes.as_slice()).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 

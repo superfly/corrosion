@@ -61,7 +61,7 @@ pub fn generate_server_cert(
     params.subject_alt_names = vec![SanType::IpAddress(ip)];
 
     params.not_before = OffsetDateTime::now_utc();
-    params.not_after = OffsetDateTime::now_utc() + time::Duration::days(365);
+    params.not_after = OffsetDateTime::now_utc() + time::Duration::days(365 * 1);
 
     let cert = Certificate::from_params(params)?;
     let cert_signed = cert.serialize_pem_with_signer(&ca_cert)?;
@@ -92,7 +92,7 @@ pub fn generate_client_cert(
     params.distinguished_name = dn;
 
     params.not_before = OffsetDateTime::now_utc();
-    params.not_after = OffsetDateTime::now_utc() + time::Duration::days(365);
+    params.not_after = OffsetDateTime::now_utc() + time::Duration::days(365 * 1);
 
     let cert = Certificate::from_params(params)?;
     let cert_signed = cert.serialize_pem_with_signer(&ca_cert)?;

@@ -156,7 +156,7 @@ pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
         dump.push(';');
     }
 
-    parse_sql(dump.as_str())
+    Ok(parse_sql(dump.as_str())?)
 }
 
 pub fn make_schema_inner(
@@ -333,13 +333,13 @@ pub fn make_schema_inner(
             let primary_keys = table
                 .columns
                 .values()
-                .filter_map(|col| col.primary_key.then_some(&col.name))
+                .filter_map(|col| col.primary_key.then(|| &col.name))
                 .collect::<Vec<&String>>();
 
             let new_primary_keys = new_table
                 .columns
                 .values()
-                .filter_map(|col| col.primary_key.then_some(&col.name))
+                .filter_map(|col| col.primary_key.then(|| &col.name))
                 .collect::<Vec<&String>>();
 
             if primary_keys != new_primary_keys {
@@ -547,7 +547,7 @@ pub fn parse_sql(sql: &str) -> Result<NormalizedSchema, SchemaError> {
 fn prepare_index(
     name: &QualifiedName,
     tbl_name: &Name,
-    columns: &[SortedColumn],
+    columns: &Vec<SortedColumn>,
     where_clause: Option<&Expr>,
 ) -> Result<Option<NormalizedIndex>, SchemaError> {
     debug!("preparing index: {}", name.name.0);
@@ -561,14 +561,14 @@ fn prepare_index(
     Ok(Some(NormalizedIndex {
         name: name.name.0.clone(),
         tbl_name: tbl_name.0.clone(),
-        columns: columns.to_vec(),
+        columns: columns.clone(),
         where_clause: where_clause.cloned(),
     }))
 }
 
 fn prepare_table(
     tbl_name: &QualifiedName,
-    columns: &[ColumnDefinition],
+    columns: &Vec<ColumnDefinition>,
     constraints: Option<&Vec<NamedTableConstraint>>,
     options: &TableOptions,
 ) -> Result<Option<NormalizedTable>, SchemaError> {
@@ -714,9 +714,9 @@ fn prepare_table(
             .collect::<Result<IndexMap<_, _>, SchemaError>>()?,
         pk,
         raw: CreateTableBody::ColumnsAndConstraints {
-            columns: columns.to_vec(),
+            columns: columns.clone(),
             constraints: constraints.cloned(),
-            options: *options,
+            options: options.clone(),
         },
     }))
 }

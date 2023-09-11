@@ -59,6 +59,7 @@ impl TimerSpawner {
             .unwrap();
 
         std::thread::spawn({
+            let timer_tx = timer_tx.clone();
             move || {
                 let local = LocalSet::new();
 
@@ -92,7 +93,6 @@ impl TimerSpawner {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn runtime_loop(
     actor: Actor,
     agent: Agent,
@@ -625,9 +625,9 @@ pub fn runtime_loop(
                         .states
                         .iter()
                         .filter_map(|(member_id, state)| {
-                            (*member_id != actor_id).then_some(state.addr)
+                            (*member_id != actor_id).then(|| state.addr)
                         })
-                        .choose_multiple(&mut rng, member_count)
+                        .choose_multiple(&mut rng, member_count as usize)
                 };
 
                 for addr in broadcast_to {

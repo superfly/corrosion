@@ -29,9 +29,9 @@ impl ActorId {
     }
 }
 
-impl From<ActorId> for uhlc::ID {
-    fn from(val: ActorId) -> Self {
-        val.0.into()
+impl Into<uhlc::ID> for ActorId {
+    fn into(self) -> uhlc::ID {
+        self.0.into()
     }
 }
 

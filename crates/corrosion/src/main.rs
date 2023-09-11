@@ -33,8 +33,8 @@ pub mod command;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub static CONFIG: OnceCell<Config> = OnceCell::new();
-pub static API_CLIENT: OnceCell<CorrosionApiClient> = OnceCell::new();
+pub const CONFIG: OnceCell<Config> = OnceCell::new();
+pub const API_CLIENT: OnceCell<CorrosionApiClient> = OnceCell::new();
 
 build_info::build_info!(pub fn version);
 
@@ -142,7 +142,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             }
 
             let restored =
-                sqlite3_restore::restore(path, cli.config()?.db.path, Duration::from_secs(30))?;
+                sqlite3_restore::restore(&path, &cli.config()?.db.path, Duration::from_secs(30))?;
 
             info!(
                 "successfully restored! old size: {}, new size: {}",
@@ -170,7 +170,10 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             } else {
                 Statement::WithParams(
                     query.clone(),
-                    param.iter().map(|p| SqliteValue::Text(p.into())).collect(),
+                    param
+                        .into_iter()
+                        .map(|p| SqliteValue::Text(p.into()))
+                        .collect(),
                 )
             };
 
