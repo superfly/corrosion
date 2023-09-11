@@ -389,9 +389,9 @@ async fn build_query_rows_response(
         };
 
         let prepped_res = block_in_place(|| match &stmt {
-            Statement::Simple(q) => conn.prepare(q.as_str()),
-            Statement::WithParams(q, _) => conn.prepare(q.as_str()),
-            Statement::WithNamedParams(q, _) => conn.prepare(q.as_str()),
+            Statement::Simple(q) => conn.prepare(q),
+            Statement::WithParams(q, _) => conn.prepare(q),
+            Statement::WithNamedParams(q, _) => conn.prepare(q),
         });
 
         let mut prepped = match prepped_res {
@@ -409,6 +409,7 @@ async fn build_query_rows_response(
 
         block_in_place(|| {
             let col_count = prepped.column_count();
+            trace!("inside block in place, col count: {col_count}");
 
             if let Err(e) = data_tx.blocking_send(QueryEvent::Columns(
                 prepped
@@ -456,9 +457,12 @@ async fn build_query_rows_response(
 
             let mut rowid = 1;
 
+            trace!("about to loop through rows!");
+
             loop {
                 match rows.next() {
                     Ok(Some(row)) => {
+                        trace!("got a row: {row:?}");
                         match (0..col_count)
                             .map(|i| row.get::<_, SqliteValue>(i))
                             .collect::<rusqlite::Result<Vec<_>>>()
@@ -544,19 +548,25 @@ pub async fn api_v1_queries(
         debug!("query body channel done");
     });
 
+    trace!("building query rows response...");
+
     match build_query_rows_response(&agent, data_tx, stmt).await {
         Ok(_) => {
-            hyper::Response::builder()
+            #[allow(clippy::needless_return)]
+            return hyper::Response::builder()
                 .status(StatusCode::OK)
                 .body(body)
                 .expect("could not build query response body");
         }
         Err((status, res)) => {
-            hyper::Response::builder()
+            #[allow(clippy::needless_return)]
+            return hyper::Response::builder()
                 .status(status)
-                .body(hyper::Body::from(
-                    serde_json::to_vec(&res).expect("could not serialize query error response"),
-                ))
+                .body(
+                    serde_json::to_vec(&res)
+                        .expect("could not serialize query error response")
+                        .into(),
+                )
                 .expect("could not build query response body");
         }
     }
@@ -840,6 +850,8 @@ mod tests {
         assert_eq!(status_code, StatusCode::OK);
 
         assert!(body.0.results.len() == 2);
+
+        println!("transaction body: {body:?}");
 
         let res = api_v1_queries(
             Extension(agent.clone()),
