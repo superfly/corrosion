@@ -328,7 +328,7 @@ pub fn user_version(conn: &Connection) -> Result<usize, rusqlite::Error> {
 // Set user version field from the SQLite db
 pub fn set_user_version(conn: &Connection, v: usize) -> rusqlite::Result<()> {
     let v = v as u32;
-    conn.pragma_update(None, "user_version", &v)?;
+    conn.pragma_update(None, "user_version", v)?;
     Ok(())
 }
 
@@ -336,7 +336,7 @@ pub fn set_user_version(conn: &Connection, v: usize) -> rusqlite::Result<()> {
 pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> rusqlite::Result<()> {
     let target_version = migrations.len();
 
-    let current_version = user_version(&conn)?;
+    let current_version = user_version(conn)?;
     {
         let tx = conn.transaction()?;
         for (i, migration) in migrations.into_iter().enumerate() {

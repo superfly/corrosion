@@ -40,14 +40,14 @@ struct QueryResponse {
 }
 
 impl QueryResponse {
-    fn to_json(&mut self) -> SqlToJson {
+    fn to_json(&self) -> SqlToJson {
         SqlToJson {
             json_output: JsonOutput::default(),
             res: self.clone(),
         }
     }
 
-    fn to_json_w_options(&mut self, options: Map) -> SqlToJson {
+    fn to_json_w_options(&self, options: Map) -> SqlToJson {
         let json_output = {
             let pretty = options
                 .get("pretty")
@@ -70,7 +70,7 @@ impl QueryResponse {
         }
     }
 
-    fn to_csv(&mut self) -> SqlToCsv {
+    fn to_csv(&self) -> SqlToCsv {
         SqlToCsv { res: self.clone() }
     }
 }
@@ -93,7 +93,7 @@ impl IntoIterator for QueryResponse {
 
     fn into_iter(self) -> Self::IntoIter {
         QueryResponseIter {
-            query: self.query.clone(),
+            query: self.query,
             body: OnceCell::new(),
             handle: tokio::runtime::Handle::current(),
             done: false,
@@ -155,12 +155,12 @@ struct Cell {
 struct SqliteValueWrap(SqliteValue);
 
 impl SqliteValueWrap {
-    fn to_json(&mut self) -> String {
+    fn to_json(&self) -> String {
         match &self.0 {
             SqliteValue::Null => "null".into(),
             SqliteValue::Integer(i) => i.to_string(),
             SqliteValue::Real(f) => f.to_string(),
-            SqliteValue::Text(t) => enquote::enquote('"', &t),
+            SqliteValue::Text(t) => enquote::enquote('"', t),
             SqliteValue::Blob(b) => hex::encode(b.as_slice()),
         }
     }
@@ -321,7 +321,7 @@ fn write_sql_to_csv<W: Write>(
 
     let mut wrote_header = false;
 
-    while let Some(row) = rows.next() {
+    for row in rows.by_ref() {
         let row = row?;
         if !wrote_header {
             wtr.write_record(row.columns.as_slice())
@@ -390,16 +390,13 @@ async fn wait_for_rows(
             if let Err(_e) = tx.send(TemplateCommand::Render).await {
                 debug!("could not send back re-render command, channel must be closed!");
             }
-            return;
         }
         Some(Err(e)) => {
             // TODO: need to re-render possibly...
             warn!("error from upstream, returning... {e}");
-            return;
         }
         None => {
             debug!("sql stream is done");
-            return;
         }
     }
 }
@@ -526,7 +523,7 @@ impl Engine {
             move |query: &str, params: Vec<Dynamic>| -> Result<QueryResponse, Box<EvalAltResult>> {
                 let params = params
                     .into_iter()
-                    .map(|v| dyn_to_sql(v))
+                    .map(dyn_to_sql)
                     .collect::<Result<Vec<_>, _>>()?;
                 sql(&client, Statement::WithParams(query.into(), params))
             }
@@ -597,7 +594,7 @@ fn write_json_rows_as_object<W: Write, F: Formatter>(
     let mut seq = ser
         .serialize_seq(None)
         .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
-    while let Some(row_res) = rows.next() {
+    for row_res in rows.by_ref() {
         let row = row_res.map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
 
         // we have to collect here due to serde limitations (I think), but it's not a big deal...
@@ -623,7 +620,7 @@ fn write_json_rows_as_array<W: Write, F: Formatter>(
         .serialize_seq(None)
         .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
 
-    while let Some(row_res) = rows.next() {
+    for row_res in rows.by_ref() {
         let row = row_res.map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
         seq.serialize_element(&row.cells)
             .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
@@ -655,12 +652,12 @@ mod tests {
         let client = corro_client::CorrosionApiClient::new(ta.agent.api_addr());
 
         client
-            .schema(&vec![Statement::Simple(corro_tests::TEST_SCHEMA.into())])
+            .schema(&[Statement::Simple(corro_tests::TEST_SCHEMA.into())])
             .await
             .unwrap();
 
         client
-            .execute(&vec![
+            .execute(&[
                 Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id".into(), "service-name".into()],
@@ -708,7 +705,7 @@ mod tests {
             println!("output: {output}");
 
             client
-                .execute(&vec![Statement::WithParams(
+                .execute(&[Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-3".into(), "service-name-3".into()],
                 )])

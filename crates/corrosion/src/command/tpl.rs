@@ -87,7 +87,7 @@ pub async fn run(
         }
 
         // rejoin
-        let cmd = splitted.next().map(|s| shellwords::split(s)).transpose()?;
+        let cmd = splitted.next().map(shellwords::split).transpose()?;
 
         debug!("src: {src}, dst: {dst}, cmd: {cmd:?}");
 

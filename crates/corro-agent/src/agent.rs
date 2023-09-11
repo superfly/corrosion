@@ -25,8 +25,8 @@ use corro_types::{
         Agent, AgentConfig, Booked, BookedVersions, Bookie, ChangeError, KnownDbVersion, SplitPool,
     },
     broadcast::{
-        BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeV1, Changeset, FocaInput,
-        Timestamp, UniPayload, UniPayloadV1,
+        BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeV1, Changeset, ChangesetParts,
+        FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
     change::{Change, SqliteValue},
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
@@ -237,7 +237,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         gossip_addr,
         api_addr,
         members: RwLock::new(Members::default()),
-        clock: clock.clone(),
+        clock,
         bookie,
         tx_bcast,
         tx_apply,
@@ -1424,8 +1424,7 @@ fn store_empty_changeset(
         .execute(params![actor_id, version,])?;
     }
 
-    tx.commit()?;
-    return Ok(());
+    tx.commit()
 }
 
 async fn process_fully_buffered_changes(
@@ -1580,7 +1579,13 @@ pub async fn process_single_version(
             let tx = conn.transaction()?;
 
             let versions = changeset.versions();
-            let (version, changes, seqs, last_seq, ts) = match changeset.into_parts() {
+            let ChangesetParts {
+                version,
+                changes,
+                seqs,
+                last_seq,
+                ts,
+            } = match changeset.into_parts() {
                 None => {
                     store_empty_changeset(tx, actor_id, versions.clone())?;
                     booked_write.insert_many(versions.clone(), KnownDbVersion::Cleared);
@@ -1742,7 +1747,7 @@ pub async fn process_single_version(
                     impactful_changeset.push(change);
                     if let Some(c) = impactful_changeset.last() {
                         if let Some(counter) = changes_per_table.get_mut(&c.table) {
-                            *counter = *counter + 1;
+                            *counter += 1;
                         } else {
                             changes_per_table.insert(c.table.clone(), 1);
                         }
