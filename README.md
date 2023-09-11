@@ -26,8 +26,7 @@ In a nutshell, Corrosion:
 - Hosts a SQLite database on each node, for fast local reads and writes
 - Uses [CR-SQLite](https://github.com/vlcn-io/cr-sqlite) for conflict resolution with CRDTs
 - Uses [Foca](https://github.com/caio/foca) to manage cluster membership using a SWIM protocol
-- Gossips changes to the cluster
-- A line here, or under Features, about QUIC
+- Gossips changes from the local database throughout the cluster
 - Periodically synchronizes with a subset of other cluster nodes, to ensure consistency
 
 ## Features
@@ -38,6 +37,7 @@ In a nutshell, Corrosion:
 - Live population of configuration files from Corrosion state with user-defined [Rhai](https://rhai.rs/) templates
 - Storage and propagation of state from locally registered Consul services, replacing the central database with Corrosion's distributed state
 - Vanilla SQLite storage for host-local data
+- Secure peer-to-peer communication with the [QUIC](https://datatracker.ietf.org/doc/html/rfc9000) transport protocol (using [Quinn](https://github.com/quinn-rs/quinn))
 
 ## Usage overview
 
