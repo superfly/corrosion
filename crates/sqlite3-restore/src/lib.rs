@@ -177,6 +177,7 @@ fn lock_all<P: AsRef<Path>>(
     Ok(Locked::Wal(shm_file))
 }
 
+#[allow(clippy::unnecessary_cast)] // required for other platforms
 #[derive(Debug, Clone, Copy)]
 #[repr(i16)]
 enum LockType {

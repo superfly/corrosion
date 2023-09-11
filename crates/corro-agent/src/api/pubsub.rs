@@ -124,7 +124,7 @@ async fn sub_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
                 init_tx.blocking_send(QueryEvent::Row(rowid, cells))?;
             }
 
-            _ = init_tx.blocking_send(QueryEvent::EndOfQuery {
+            init_tx.blocking_send(QueryEvent::EndOfQuery {
                 time: elapsed.as_secs_f64(),
             })?;
 
@@ -181,7 +181,7 @@ async fn process_sub_channel(
                 }
             },
             _ = check_ready.tick() => {
-                if let Err(_) = poll_fn(|cx| tx.poll_ready(cx)).await {
+                if poll_fn(|cx| tx.poll_ready(cx)).await.is_err() {
                     break;
                 }
                 continue;

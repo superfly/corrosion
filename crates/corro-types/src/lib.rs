@@ -1,3 +1,4 @@
+#![allow(clippy::manual_slice_size_calculation, clippy::collapsible_match)]
 pub mod actor;
 pub mod agent;
 pub mod api;
