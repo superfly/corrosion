@@ -968,6 +968,7 @@ fn extract_expr_columns(
                 .children
                 .push(extract_select_columns(select, schema)?);
         }
+        #[allow(clippy::collapsible_match)]
         Expr::FunctionCall { args, .. } => {
             if let Some(args) = args {
                 for expr in args.iter() {
