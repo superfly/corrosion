@@ -5,7 +5,7 @@ Corrosion: Gossip-based service discovery (and more) for large distributed syste
 
 We built Corrosion specifically for service discovery across a large global network, replacing Consul’s central state database with eventually consistent state distributed across our hosts.
 
-We wanted:
+Our new tool needed to deliver the following:
 
 ### Fast reads and writes
 
@@ -41,11 +41,11 @@ In a nutshell, Corrosion:
 
 ## Usage overview
 
-Run Corrosion Agent on every node/host in the cluster. Other programs running on the node use [Corrosion's HTTP API](/doc/api/README.md) to query the local Corrosion SQLite database, add and update data, and subscribe to change notifications.
+Run the Corrosion agent on every node/host in the cluster. Other programs running on the node use [Corrosion's HTTP API](/doc/api/README.md) to query the local Corrosion SQLite database, add and update data, and subscribe to change notifications.
 
 The [Corrosion CLI](/doc/cli/README.md) provides commands for administration and access to database and features.
 
-See the [Corrosion documentation](/doc/) (WIP) for further details.
+See the WIP [Corrosion documentation](/doc/SUMMARY.md) for more details.
 
 ## Building Corrosion
 
