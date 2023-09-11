@@ -177,12 +177,13 @@ fn lock_all<P: AsRef<Path>>(
     Ok(Locked::Wal(shm_file))
 }
 
+#[allow(clippy::unnecessary_cast)] // required for other platforms
 #[derive(Debug, Clone, Copy)]
 #[repr(i16)]
 enum LockType {
-    Read = nix::libc::F_RDLCK,
-    Write = nix::libc::F_WRLCK,
-    Unlock = nix::libc::F_UNLCK,
+    Read = nix::libc::F_RDLCK as i16,
+    Write = nix::libc::F_WRLCK as i16,
+    Unlock = nix::libc::F_UNLCK as i16,
 }
 
 fn lock(f: &File, l_type: LockType, l_start: i64, timeout: Duration) -> Result<(), Error> {
