@@ -1,3 +1,5 @@
+#![allow(clippy::wrong_self_convention)]
+
 use std::collections::HashMap;
 use std::io;
 use std::io::Write;
@@ -40,14 +42,14 @@ struct QueryResponse {
 }
 
 impl QueryResponse {
-    fn to_json(&self) -> SqlToJson {
+    fn to_json(&mut self) -> SqlToJson {
         SqlToJson {
             json_output: JsonOutput::default(),
             res: self.clone(),
         }
     }
 
-    fn to_json_w_options(&self, options: Map) -> SqlToJson {
+    fn to_json_w_options(&mut self, options: Map) -> SqlToJson {
         let json_output = {
             let pretty = options
                 .get("pretty")
@@ -70,7 +72,7 @@ impl QueryResponse {
         }
     }
 
-    fn to_csv(&self) -> SqlToCsv {
+    fn to_csv(&mut self) -> SqlToCsv {
         SqlToCsv { res: self.clone() }
     }
 }
@@ -155,7 +157,7 @@ struct Cell {
 struct SqliteValueWrap(SqliteValue);
 
 impl SqliteValueWrap {
-    fn to_json(&self) -> String {
+    fn to_json(&mut self) -> String {
         match &self.0 {
             SqliteValue::Null => "null".into(),
             SqliteValue::Integer(i) => i.to_string(),
