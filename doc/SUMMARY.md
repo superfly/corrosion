@@ -26,7 +26,7 @@
     - [backup](cli/backup.md)
     - [consul]() (to come)
     - [exec](cli/exec.md)
-    - [query]() (to come)
+    - [query](cli/query.md)
     - [reload]() (to come)
     - [restore](cli/restore.md)
     - [sync]() (to come)
