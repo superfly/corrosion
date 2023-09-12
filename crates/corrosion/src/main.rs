@@ -15,6 +15,7 @@ use command::{
 use corro_api_types::SqliteValue;
 use corro_client::CorrosionApiClient;
 use corro_types::{
+    actor::ActorId,
     api::{QueryEvent, RqliteResult, Statement},
     config::{default_admin_path, Config, ConfigError, LogFormat},
 };
@@ -252,6 +253,9 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Sync(SyncCommand::With { actor_id }) => {
+            todo!()
+        }
         Command::Template { template, flags } => {
             command::tpl::run(cli.api_addr()?, template, flags).await?;
         }
@@ -415,6 +419,8 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
+    /// Synchronize with another node
+    With { actor_id: String },
 }
 
 #[derive(Subcommand)]
