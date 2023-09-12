@@ -30,7 +30,7 @@
     - [reload](cli/reload.md)
     - [restore](cli/restore.md)
     - [sync]() (to come)
-    - [template](cli/template)
+    - [template](cli/template.md)
     - [tls](cli/tls.md)
 - [Configuration](config/README.md)
     - [db](config/db.md)

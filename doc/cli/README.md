@@ -9,3 +9,6 @@ See the pages for each subcommand:
 - [`corrosion backup`](backup.md)
 - [`corrosion restore`](restore.md)
 - [`corrosion exec`](exec.md)
+- [`corrosion query`](query.md)
+- [`corrosion template`](template.md)
+- [`corrosion reload`](reload.md)
