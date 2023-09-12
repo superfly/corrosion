@@ -10,7 +10,7 @@ use camino::Utf8PathBuf;
 use compact_str::CompactString;
 use enquote::enquote;
 use once_cell::sync::Lazy;
-use rusqlite::{Connection, OpenFlags, ToSql, Transaction};
+use rusqlite::{params, Connection, OpenFlags, Transaction};
 use tempfile::TempDir;
 use tracing::{error, trace};
 
@@ -318,37 +318,43 @@ impl Migration for fn(&Transaction) -> rusqlite::Result<()> {
     }
 }
 
-// Read user version field from the SQLite db
-pub fn user_version(conn: &Connection) -> Result<usize, rusqlite::Error> {
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+// Read migration version field from the SQLite db
+pub fn migration_version(tx: &Transaction) -> Option<usize> {
     #[allow(deprecated)] // To keep compatibility with lower rusqlite versions
-    conn.query_row::<_, &[&dyn ToSql], _>("PRAGMA user_version", &[], |row| row.get(0))
-        .map(|v: i64| v as usize)
+    tx.query_row(
+        "SELECT value FROM __corro_state WHERE key = ?",
+        [SCHEMA_VERSION_KEY],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|v| v as usize)
+    .ok()
 }
 
 // Set user version field from the SQLite db
-pub fn set_user_version(conn: &Connection, v: usize) -> rusqlite::Result<()> {
-    let v = v as u32;
-    conn.pragma_update(None, "user_version", v)?;
-    Ok(())
+pub fn set_migration_version(tx: &Transaction, v: usize) -> rusqlite::Result<usize> {
+    tx.execute(
+        "INSERT OR REPLACE INTO __corro_state VALUES (?, ?)",
+        params![SCHEMA_VERSION_KEY, v],
+    )
 }
 
 // should be a noop if up to date!
 pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> rusqlite::Result<()> {
     let target_version = migrations.len();
 
-    let current_version = user_version(conn)?;
-    {
-        let tx = conn.transaction()?;
-        for (i, migration) in migrations.into_iter().enumerate() {
-            let new_version = i + 1;
-            if new_version <= current_version {
-                continue;
-            }
-            migration.migrate(&tx)?;
-        }
-        set_user_version(&tx, target_version)?;
-        tx.commit()?;
+    let tx = conn.transaction()?;
+
+    // determine how many migrations to skip (skip as many as we are at)
+    let skip_n = migration_version(&tx).unwrap_or_default();
+
+    for migration in migrations.into_iter().skip(skip_n) {
+        migration.migrate(&tx)?;
     }
+    set_migration_version(&tx, target_version)?;
+
+    tx.commit()?;
     Ok(())
 }
 

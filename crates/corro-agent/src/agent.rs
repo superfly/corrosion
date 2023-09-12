@@ -2068,6 +2068,9 @@ pub fn migrate(conn: &mut CrConn) -> rusqlite::Result<()> {
 fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         r#"
+            -- key/value for internal corrosion data (e.g. 'schema_version' => INT)
+            CREATE TABLE __corro_state (key TEXT NOT NULL PRIMARY KEY, value);
+
             -- internal bookkeeping
             CREATE TABLE __corro_bookkeeping (
                 actor_id BLOB NOT NULL,
