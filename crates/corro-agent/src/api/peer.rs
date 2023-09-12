@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -337,6 +337,8 @@ async fn process_range(
     };
 
     for (versions, known_version) in overlapping {
+        debug!("got overlapping range {versions:?} in {range:?}");
+
         // optimization, cleared versions can't be revived... sending a single batch!
         if let KnownDbVersion::Cleared = &known_version {
             sender
@@ -345,8 +347,10 @@ async fn process_range(
                     changeset: Changeset::Empty { versions },
                 })))
                 .await?;
-            return Ok(());
+            continue;
         }
+
+        let mut processed = BTreeSet::new();
 
         for version in versions {
             let bw = booked.write().await;
@@ -361,8 +365,11 @@ async fn process_range(
                     sender,
                 )
                 .await?;
+                processed.insert(version);
             }
         }
+
+        debug!("processed versions {processed:?}");
     }
 
     Ok(())
