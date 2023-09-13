@@ -1,55 +1,58 @@
 # Corrosion
+Corrosion: Gossip-based service discovery (and more) for large distributed systems, written in Rust.
 
-## Launching on Fly
+## Why we built Corrosion
+
+We built Corrosion specifically for service discovery across a large global network, replacing Consul’s central state database with eventually consistent state distributed across our hosts.
+
+Our new tool needed to deliver the following:
+
+### Fast reads and writes
+
+Getting state (data) from a central remote source can be incredibly expensive (at least 300ms for a round-trip to something on the other side of the world), but usually takes less than 1ms from a local source.
+
+### Fast consistency
+
+Strong consistency by RAFT consensus can be too slow. Eventual consistency works, if it's fast.
+
+### Flexibility
+
+Global state for a distributed system isn't one-size-fits-all. Flexible schemas and queries are essential.
+
+## How Corrosion works
+
+In a nutshell, Corrosion:
+
+- Hosts a SQLite database on each node, for fast local reads and writes
+- Uses [CR-SQLite](https://github.com/vlcn-io/cr-sqlite) for conflict resolution with CRDTs
+- Uses [Foca](https://github.com/caio/foca) to manage cluster membership using a SWIM protocol
+- Gossips changes from the local database throughout the cluster
+- Periodically synchronizes with a subset of other cluster nodes, to ensure consistency
+
+## Features
+
+- A flexible API to read from and write to Corrosion's store using SQL statements
+- File-based schemas with on-the-fly updates
+- HTTP streaming subscriptions based on SQL queries
+- Live population of configuration files from Corrosion state with user-defined [Rhai](https://rhai.rs/) templates
+- Storage and propagation of state from locally registered Consul services, replacing the central database with Corrosion's distributed state
+- Vanilla SQLite storage for host-local data
+- Secure peer-to-peer communication with the [QUIC](https://datatracker.ietf.org/doc/html/rfc9000) transport protocol (using [Quinn](https://github.com/quinn-rs/quinn))
+
+## Usage overview
+
+Run the Corrosion agent on every node/host in the cluster. Other programs running on the node use [Corrosion's HTTP API](/doc/api/README.md) to query the local Corrosion SQLite database, add and update data, and subscribe to change notifications.
+
+The [Corrosion CLI](/doc/cli/README.md) provides commands for administration and access to database and features.
+
+See the WIP [Corrosion documentation](/doc/SUMMARY.md) for more details.
+
+## Building Corrosion
+
+Clone [https://github.com/superfly/corrosion2.git](https://github.com/superfly/corrosion2.git).
+
+From within the repo directory:
 
 ```
-fly launch --no-deploy --org <org> --region <region> --copy-config --name <app-name>
-fly volumes create corro_data -y -s 10 -r <region> -a <app-name>
-fly deploy --dockerfile examples/fly/Dockerfile -a <app-name> -c examples/fly/fly.toml
-fly machine clone -a <app-name> --region <other region> --select
-fly machine clone -a <app-name> --region <yet another region> --select
+cargo build --release && mv target/release/corrosion ./
 ```
-
-## Reading data
-
-The readable API surface for Corrosion-produced data is to use SQLite and read directly from the database.
-
-Adding indexes either through the API or schema files is the way to go to improve read performance on application-specific queries.
-
-## Writing data
-
-The only way to write data that propagates through the Corrosion cluster is to go through its HTTP API.
-
-Corrosion's HTTP API is rqlite-compatible. This is both meant as a shortcut and to have ready-made clients for it.
-
-### POST /v1/transactions
-
-See: https://rqlite.io/docs/api/api/#writing-data
-
-Corrosion-specific limitations:
-- All requests are treated as if the `transaction` query param had been passed (everything runs in a transaction)
-- There's a limit to how many statements can be input at once to reduce changeset sizes (this shouldn't be the case for long)
-
-## Updating / migrating / changing the schema
-
-Corrosion migrates schema changes automatically without the need for manual migration files. Each schema SQL file is expected to contain SQLite-compatible statements that create resources (e.g. `CREATE TABLE` and `CREATE INDEX`). `ALTER` or `DROP` statements are not supported. Destructive actions are ignored.
-
-### File-based schemas
-
-Configuring Corrosion with `schema_paths` lets you define filesystem directories where `.sql` files can be found. These files should, as a whole, represent the schema for your data.
-
-You can add or modify schema files in known paths or even modify the `schema_paths` and then send a SIGHUP signal to Corrosion to apply schema changes, without a restart.
-
-### POST /v1/migrations
-
-This endpoint accepts the same type of body as the `/v1/transactions` endpoint, except it will mutate Corrosion's schema.
-
-## Subscribing to changes
-
-One of Corrosion's most powerful features is the ability to subscribe to changes as they are applied to the local node.
-
-This works via websockets for maximum compatibility.
-
-## Migrating data
-
-(WIP)
