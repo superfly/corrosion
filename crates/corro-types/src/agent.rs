@@ -35,14 +35,14 @@ use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, Timestamp},
     config::Config,
-    pubsub::Matcher,
+    pubsub::MatcherHandle,
     schema::NormalizedSchema,
     sqlite::{CrConnManager, RusqliteConnManager, SqlitePool, SqlitePoolError},
 };
 
 use super::members::Members;
 
-pub type Matchers = HashMap<uuid::Uuid, Matcher>;
+pub type Matchers = HashMap<uuid::Uuid, MatcherHandle>;
 
 #[derive(Clone)]
 pub struct Agent(Arc<AgentInner>);

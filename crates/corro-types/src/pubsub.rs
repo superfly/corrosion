@@ -22,7 +22,6 @@ use sqlite3_parser::{
     lexer::sql::Parser,
 };
 use tokio::{sync::mpsc, task::block_in_place};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -136,17 +135,67 @@ pub enum MatcherCmd {
     ProcessChange(HashMap<CompactString, Vec<Vec<SqliteValue>>>),
 }
 
-#[derive(Debug, Clone)]
-pub struct Matcher(pub Arc<InnerMatcher>);
+#[derive(Clone)]
+pub struct MatcherHandle(Arc<InnerMatcherHandle>);
 
-#[derive(Debug, Clone)]
-pub struct MatcherStmt {
-    new_query: String,
-    temp_query: String,
+struct InnerMatcherHandle {
+    cmd_tx: mpsc::Sender<MatcherCmd>,
+    parsed: ParsedSelect,
+    qualified_table_name: String,
+    col_names: Vec<CompactString>,
+}
+
+impl MatcherHandle {
+    pub fn process_change(&self, changes: &[Change]) -> Result<(), MatcherError> {
+        // println!("{:?}", self.0.parsed);
+
+        let mut candidates: HashMap<CompactString, Vec<Vec<SqliteValue>>> = HashMap::new();
+
+        let grouped = changes
+            .iter()
+            .filter(|change| {
+                self.0
+                    .parsed
+                    .table_columns
+                    .contains_key(change.table.as_str())
+            })
+            .group_by(|change| (change.table.as_str(), change.pk.as_slice()));
+
+        for ((table, pk), _) in grouped.into_iter() {
+            let pks = unpack_columns(pk)?
+                .into_iter()
+                .map(|v| v.to_owned())
+                .collect();
+            if let Some(v) = candidates.get_mut(table) {
+                v.push(pks);
+            } else {
+                candidates.insert(table.to_compact_string(), vec![pks]);
+            }
+        }
+
+        self.0
+            .cmd_tx
+            .try_send(MatcherCmd::ProcessChange(candidates))
+            .map_err(|_| MatcherError::ChangeQueueClosedOrFull)?;
+
+        Ok(())
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.0.qualified_table_name
+    }
+
+    pub fn parsed_columns(&self) -> &[ResultColumn] {
+        &self.0.parsed.columns
+    }
+
+    pub fn col_names(&self) -> &[CompactString] {
+        &self.0.col_names
+    }
 }
 
 #[derive(Debug)]
-pub struct InnerMatcher {
+pub struct Matcher {
     pub id: Uuid,
     pub query: Stmt,
     pub statements: HashMap<String, MatcherStmt>,
@@ -155,21 +204,24 @@ pub struct InnerMatcher {
     pub query_table: String,
     pub qualified_table_name: String,
     pub evt_tx: mpsc::Sender<QueryEvent>,
-    pub cmd_tx: mpsc::Sender<MatcherCmd>,
     pub col_names: Vec<CompactString>,
     pub last_rowid: Mutex<i64>,
-    pub cancel: CancellationToken,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatcherStmt {
+    new_query: String,
+    temp_query: String,
 }
 
 impl Matcher {
-    pub fn new(
+    pub fn create(
         id: Uuid,
         schema: &NormalizedSchema,
         mut conn: Connection,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
-        cancel: CancellationToken,
-    ) -> Result<Self, MatcherError> {
+    ) -> Result<MatcherHandle, MatcherError> {
         let col_names: Vec<CompactString> = {
             conn.prepare(sql)?
                 .column_names()
@@ -307,30 +359,36 @@ impl Matcher {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(512);
 
-        let matcher = Self(Arc::new(InnerMatcher {
+        let qualified_table_name = format!("subscriptions.{query_table}");
+
+        let handle = MatcherHandle(Arc::new(InnerMatcherHandle {
+            cmd_tx,
+            parsed: parsed.clone(),
+            qualified_table_name: qualified_table_name.clone(),
+            col_names: col_names.clone(),
+        }));
+
+        let matcher = Self {
             id,
             query: stmt,
             statements,
             pks,
             parsed,
-            qualified_table_name: format!("subscriptions.{query_table}"),
+            qualified_table_name,
             query_table,
             evt_tx: evt_tx.clone(),
-            cmd_tx,
             col_names: col_names.clone(),
-            cancel: cancel.clone(),
             last_rowid: Mutex::new(0),
-        }));
+        };
 
         let mut tmp_cols = matcher
-            .0
             .pks
             .values()
             .flatten()
             .cloned()
             .collect::<Vec<String>>();
 
-        for i in 0..(matcher.0.parsed.columns.len()) {
+        for i in 0..(matcher.parsed.columns.len()) {
             tmp_cols.push(format!("col_{i}"));
         }
 
@@ -338,12 +396,11 @@ impl Matcher {
             let create_temp_table = format!(
                 "CREATE TABLE {} (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {});
             CREATE UNIQUE INDEX subscriptions.index_{}_pk ON {} ({});",
-                matcher.0.qualified_table_name,
+                matcher.qualified_table_name,
                 tmp_cols.join(","),
-                matcher.0.id.as_simple(),
-                matcher.0.query_table,
+                matcher.id.as_simple(),
+                matcher.query_table,
                 matcher
-                    .0
                     .pks
                     .values()
                     .flatten()
@@ -356,29 +413,26 @@ impl Matcher {
         })?;
 
         tokio::spawn({
-            let matcher = matcher.clone();
             async move {
-                let _drop_guard = cancel.clone().drop_guard();
-
                 if let Err(e) = evt_tx.send(QueryEvent::Columns(col_names)).await {
                     error!("could not send back columns, probably means no receivers! {e}");
                     return;
                 }
 
                 let mut query_cols = vec![];
-                for i in 0..(matcher.0.parsed.columns.len()) {
+                for i in 0..(matcher.parsed.columns.len()) {
                     query_cols.push(format!("col_{i}"));
                 }
 
                 let res = block_in_place(|| {
                     let tx = conn.transaction()?;
 
-                    let mut stmt_str = Cmd::Stmt(matcher.0.query.clone()).to_string();
+                    let mut stmt_str = Cmd::Stmt(matcher.query.clone()).to_string();
                     stmt_str.pop();
 
                     let insert_into = format!(
                         "INSERT INTO {} ({}) {} RETURNING __corro_rowid,{}",
-                        matcher.0.qualified_table_name,
+                        matcher.qualified_table_name,
                         tmp_cols.join(","),
                         stmt_str,
                         query_cols.join(","),
@@ -424,7 +478,7 @@ impl Matcher {
 
                     tx.commit()?;
 
-                    *matcher.0.last_rowid.lock() = last_rowid;
+                    *matcher.last_rowid.lock() = last_rowid;
 
                     Ok::<_, MatcherError>(elapsed)
                 });
@@ -452,13 +506,7 @@ impl Matcher {
                     return;
                 }
 
-                loop {
-                    let req = tokio::select! {
-                        Some(req) = cmd_rx.recv() => req,
-                        _ = cancel.cancelled() => return,
-                        else => return,
-                    };
-
+                while let Some(req) = cmd_rx.recv().await {
                     match req {
                         MatcherCmd::ProcessChange(candidates) => {
                             if let Err(e) =
@@ -469,78 +517,27 @@ impl Matcher {
                                 }
                                 error!("could not handle change: {e}");
                             }
-                        } // MatcherCmd::Unsubscribe => {
-                          //     if matcher.0.change_tx.receiver_count() == 0 {
-                          //         info!(
-                          //             "matcher {} has no more subscribers, we're done!",
-                          //             matcher.0.id
-                          //         );
-                          //         break;
-                          //     }
-                          // }
+                        }
                     }
                 }
 
                 debug!(id = %id, "matcher loop is done");
 
                 if let Err(e) =
-                    conn.execute_batch(&format!("DROP TABLE {}", matcher.0.qualified_table_name))
+                    conn.execute_batch(&format!("DROP TABLE {}", matcher.qualified_table_name))
                 {
                     warn!(
                         "could not clean up temporary table {} => {e}",
-                        matcher.0.qualified_table_name
+                        matcher.qualified_table_name
                     );
                 }
             }
         });
 
-        Ok(matcher)
+        Ok(handle)
     }
 
-    pub fn cmd_tx(&self) -> &mpsc::Sender<MatcherCmd> {
-        &self.0.cmd_tx
-    }
-
-    pub fn process_change(&self, changes: &[Change]) -> Result<(), MatcherError> {
-        // println!("{:?}", self.0.parsed);
-
-        let mut candidates: HashMap<CompactString, Vec<Vec<SqliteValue>>> = HashMap::new();
-
-        let grouped = changes
-            .iter()
-            .filter(|change| {
-                self.0
-                    .parsed
-                    .table_columns
-                    .contains_key(change.table.as_str())
-            })
-            .group_by(|change| (change.table.as_str(), change.pk.as_slice()));
-
-        for ((table, pk), _) in grouped.into_iter() {
-            let pks = unpack_columns(pk)?
-                .into_iter()
-                .map(|v| v.to_owned())
-                .collect();
-            if let Some(v) = candidates.get_mut(table) {
-                v.push(pks);
-            } else {
-                candidates.insert(table.to_compact_string(), vec![pks]);
-            }
-        }
-
-        self.0
-            .cmd_tx
-            .try_send(MatcherCmd::ProcessChange(candidates))
-            .map_err(|_| MatcherError::ChangeQueueClosedOrFull)?;
-
-        Ok(())
-    }
-
-    pub fn table_name(&self) -> &str {
-        &self.0.qualified_table_name
-    }
-
-    pub fn handle_change(
+    fn handle_change(
         &self,
         conn: &mut Connection,
         candidates: HashMap<CompactString, Vec<Vec<SqliteValue>>>,
@@ -553,10 +550,9 @@ impl Matcher {
             // TODO: cache the statement string somewhere, it's always the same!
             tx.prepare_cached(&format!(
                 "CREATE TEMP TABLE subscription_{}_{} ({})",
-                self.0.id.as_simple(),
+                self.id.as_simple(),
                 table,
-                self.0
-                    .pks
+                self.pks
                     .get(table.as_str())
                     .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
                     .to_vec()
@@ -567,7 +563,7 @@ impl Matcher {
             for pks in pks {
                 tx.prepare_cached(&format!(
                     "INSERT INTO subscription_{}_{} VALUES ({})",
-                    self.0.id.as_simple(),
+                    self.id.as_simple(),
                     table,
                     (0..pks.len()).map(|_i| "?").collect::<Vec<_>>().join(",")
                 ))?
@@ -575,11 +571,11 @@ impl Matcher {
             }
         }
 
-        let last_rowid = { *self.0.last_rowid.lock() };
+        let last_rowid = { *self.last_rowid.lock() };
         let mut new_last_rowid = last_rowid;
 
         for table in tables.iter() {
-            let stmt = match self.0.statements.get(table.as_str()) {
+            let stmt = match self.statements.get(table.as_str()) {
                 Some(stmt) => stmt,
                 None => {
                     continue;
@@ -588,13 +584,12 @@ impl Matcher {
 
             let mut actual_cols = vec![];
             let mut tmp_cols = self
-                .0
                 .pks
                 .values()
                 .flatten()
                 .cloned()
                 .collect::<Vec<String>>();
-            for i in 0..(self.0.parsed.columns.len()) {
+            for i in 0..(self.parsed.columns.len()) {
                 let col_name = format!("col_{i}");
                 tmp_cols.push(col_name.clone());
                 actual_cols.push(col_name);
@@ -612,18 +607,17 @@ impl Matcher {
                                 {}
                         RETURNING __corro_rowid,{}",
                 // insert into
-                self.0.qualified_table_name,
+                self.qualified_table_name,
                 tmp_cols.join(","),
                 stmt.new_query,
                 stmt.temp_query,
-                self.0
-                    .pks
+                self.pks
                     .values()
                     .flatten()
                     .cloned()
                     .collect::<Vec<String>>()
                     .join(","),
-                (0..(self.0.parsed.columns.len()))
+                (0..(self.parsed.columns.len()))
                     .map(|i| format!("col_{i} = excluded.col_{i}"))
                     .collect::<Vec<_>>()
                     .join(","),
@@ -642,16 +636,14 @@ impl Matcher {
             {}
         )) RETURNING __corro_rowid,{}",
                 // delete from
-                self.0.qualified_table_name,
-                self.0
-                    .pks
+                self.qualified_table_name,
+                self.pks
                     .values()
                     .flatten()
                     .cloned()
                     .collect::<Vec<String>>()
                     .join(","),
-                self.0
-                    .pks
+                self.pks
                     .values()
                     .flatten()
                     .cloned()
@@ -690,7 +682,7 @@ impl Matcher {
                         .collect::<rusqlite::Result<Vec<_>>>()
                     {
                         Ok(cells) => {
-                            if let Err(e) = self.0.evt_tx.blocking_send(QueryEvent::Change(
+                            if let Err(e) = self.evt_tx.blocking_send(QueryEvent::Change(
                                 change_type,
                                 rowid,
                                 cells,
@@ -712,7 +704,7 @@ impl Matcher {
         for table in tables {
             tx.prepare_cached(&format!(
                 "DROP TABLE subscription_{}_{}",
-                self.0.id.as_simple(),
+                self.id.as_simple(),
                 table
             ))?
             .execute(())?;
@@ -720,25 +712,13 @@ impl Matcher {
 
         tx.commit()?;
 
-        *self.0.last_rowid.lock() = new_last_rowid;
+        *self.last_rowid.lock() = new_last_rowid;
 
         Ok(())
     }
-
-    // pub fn subscribe(&self) -> broadcast::Receiver<QueryEvent> {
-    //     self.0.change_tx.subscribe()
-    // }
-
-    // pub fn receiver_count(&self) -> usize {
-    //     self.0.change_tx.receiver_count()
-    // }
-
-    pub fn cancel(&self) -> CancellationToken {
-        self.0.cancel.clone()
-    }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ParsedSelect {
     table_columns: IndexMap<String, HashSet<String>>,
     aliases: HashMap<String, String>,
@@ -1170,7 +1150,6 @@ mod tests {
 
         let sql = "SELECT sandwich FROM sw WHERE pk=\"mad\"";
 
-        let cancel = CancellationToken::new();
         let id = Uuid::new_v4();
 
         let tmpdir = tempfile::tempdir()?;
@@ -1215,7 +1194,7 @@ mod tests {
         )?;
 
         let (tx, _rx) = mpsc::channel(1);
-        let _matcher = Matcher::new(id, &schema, matcher_conn, tx, sql, cancel)?;
+        let _matcher = Matcher::create(id, &schema, matcher_conn, tx, sql)?;
 
         Ok(())
     }
@@ -1417,7 +1396,6 @@ mod tests {
             }
         }
 
-        let cancel = CancellationToken::new();
         let id = Uuid::new_v4();
 
         let mut matcher_conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
@@ -1439,7 +1417,7 @@ mod tests {
 
         {
             let (tx, mut rx) = mpsc::channel(1);
-            let matcher = Matcher::new(id, &schema, matcher_conn, tx, sql, cancel).unwrap();
+            let matcher = Matcher::create(id, &schema, matcher_conn, tx, sql).unwrap();
 
             assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Columns(_)));
 

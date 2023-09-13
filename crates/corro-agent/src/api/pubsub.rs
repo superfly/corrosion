@@ -7,7 +7,7 @@ use corro_types::{
     agent::Agent,
     api::{QueryEvent, Statement},
     change::SqliteValue,
-    pubsub::{Matcher, MatcherError, NormalizeStatementError},
+    pubsub::{Matcher, MatcherError, MatcherHandle, NormalizeStatementError},
     sqlite::SqlitePoolError,
 };
 use futures::{future::poll_fn, ready};
@@ -16,7 +16,6 @@ use tokio::{
     sync::{broadcast, mpsc, RwLock as TokioRwLock},
     task::block_in_place,
 };
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -171,28 +170,14 @@ fn make_query_event_bytes(buf: &mut BytesMut, query_evt: QueryEvent) -> serde_js
 }
 
 async fn process_sub_channel(
+    agent: Agent,
+    id: Uuid,
     tx: broadcast::Sender<Bytes>,
     mut evt_rx: mpsc::Receiver<QueryEvent>,
-    cancel: CancellationToken,
 ) {
     let mut buf = BytesMut::new();
 
-    loop {
-        // either we get data we need to transmit
-        // or we check every 1s if the client is still ready to receive data
-        let query_evt = tokio::select! {
-            _ = cancel.cancelled() => {
-                debug!("canceled!");
-                break;
-            },
-            maybe_query_evt = evt_rx.recv() => match maybe_query_evt {
-                Some(query_evt) => query_evt,
-                None => {
-                    break;
-                }
-            }
-        };
-
+    while let Some(query_evt) = evt_rx.recv().await {
         let send_res = match make_query_event_bytes(&mut buf, query_evt) {
             Ok(b) => tx.send(b),
             Err(e) => {
@@ -208,6 +193,8 @@ async fn process_sub_channel(
     }
 
     debug!("subscription query channel done");
+
+    agent.matchers().write().remove(&id);
 }
 
 fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<Option<String>> {
@@ -311,7 +298,7 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
 
 pub async fn catch_up_sub(
     agent: Agent,
-    matcher: Matcher,
+    matcher: MatcherHandle,
     mut rx: broadcast::Receiver<Bytes>,
     tx: mpsc::Sender<Bytes>,
 ) -> eyre::Result<()> {
@@ -330,7 +317,7 @@ pub async fn catch_up_sub(
 
         let res = block_in_place(|| {
             let mut query_cols = vec![];
-            for i in 0..(matcher.0.parsed.columns.len()) {
+            for i in 0..(matcher.parsed_columns().len()) {
                 query_cols.push(format!("col_{i}"));
             }
             let mut prepped = conn.prepare_cached(&format!(
@@ -342,7 +329,7 @@ pub async fn catch_up_sub(
 
             tx.blocking_send(make_query_event_bytes(
                 &mut buf,
-                QueryEvent::Columns(matcher.0.col_names.clone()),
+                QueryEvent::Columns(matcher.col_names().to_vec()),
             )?)?;
 
             let start = Instant::now();
@@ -446,16 +433,8 @@ pub async fn upsert_sub(
     let (evt_tx, evt_rx) = mpsc::channel(512);
 
     let matcher_id = Uuid::new_v4();
-    let cancel = CancellationToken::new();
 
-    let matcher = Matcher::new(
-        matcher_id,
-        &agent.schema().read(),
-        conn,
-        evt_tx,
-        &stmt,
-        cancel.clone(),
-    )?;
+    let matcher = Matcher::create(matcher_id, &agent.schema().read(), conn, evt_tx, &stmt)?;
 
     let (sub_tx, mut sub_rx) = broadcast::channel(10240);
 
@@ -487,7 +466,12 @@ pub async fn upsert_sub(
         }
     });
 
-    tokio::spawn(process_sub_channel(sub_tx, evt_rx, cancel));
+    tokio::spawn(process_sub_channel(
+        agent.clone(),
+        matcher_id,
+        sub_tx,
+        evt_rx,
+    ));
 
     Ok(matcher_id)
 }
