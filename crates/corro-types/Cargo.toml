@@ -21,6 +21,7 @@ foca = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
+jsonpath-rust = { workspace = true }
 metrics = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
@@ -29,6 +30,8 @@ rangemap = { workspace = true }
 rcgen = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
 speedy = { workspace = true }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }

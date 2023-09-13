@@ -21,12 +21,9 @@ use sqlite3_parser::{
     },
     lexer::sql::Parser,
 };
-use tokio::{
-    sync::{broadcast, mpsc},
-    task::block_in_place,
-};
+use tokio::{sync::mpsc, task::block_in_place};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -137,7 +134,6 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError
 
 pub enum MatcherCmd {
     ProcessChange(HashMap<CompactString, Vec<Vec<SqliteValue>>>),
-    Unsubscribe,
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +154,7 @@ pub struct InnerMatcher {
     pub parsed: ParsedSelect,
     pub query_table: String,
     pub qualified_table_name: String,
-    pub change_tx: broadcast::Sender<QueryEvent>,
+    pub evt_tx: mpsc::Sender<QueryEvent>,
     pub cmd_tx: mpsc::Sender<MatcherCmd>,
     pub col_names: Vec<CompactString>,
     pub last_rowid: Mutex<i64>,
@@ -170,8 +166,7 @@ impl Matcher {
         id: Uuid,
         schema: &NormalizedSchema,
         mut conn: Connection,
-        init_tx: mpsc::Sender<QueryEvent>,
-        change_tx: broadcast::Sender<QueryEvent>,
+        evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
         cancel: CancellationToken,
     ) -> Result<Self, MatcherError> {
@@ -320,7 +315,7 @@ impl Matcher {
             parsed,
             qualified_table_name: format!("subscriptions.{query_table}"),
             query_table,
-            change_tx,
+            evt_tx: evt_tx.clone(),
             cmd_tx,
             col_names: col_names.clone(),
             cancel: cancel.clone(),
@@ -339,30 +334,33 @@ impl Matcher {
             tmp_cols.push(format!("col_{i}"));
         }
 
-        let create_temp_table = format!(
-            "CREATE TABLE {} (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {});
+        block_in_place(|| {
+            let create_temp_table = format!(
+                "CREATE TABLE {} (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {});
             CREATE UNIQUE INDEX subscriptions.index_{}_pk ON {} ({});",
-            matcher.0.qualified_table_name,
-            tmp_cols.join(","),
-            matcher.0.id.as_simple(),
-            matcher.0.query_table,
-            matcher
-                .0
-                .pks
-                .values()
-                .flatten()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(","),
-        );
+                matcher.0.qualified_table_name,
+                tmp_cols.join(","),
+                matcher.0.id.as_simple(),
+                matcher.0.query_table,
+                matcher
+                    .0
+                    .pks
+                    .values()
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
 
-        conn.execute_batch(&create_temp_table)?;
+            conn.execute_batch(&create_temp_table)
+        })?;
 
         tokio::spawn({
             let matcher = matcher.clone();
             async move {
                 let _drop_guard = cancel.clone().drop_guard();
-                if let Err(e) = init_tx.send(QueryEvent::Columns(col_names)).await {
+
+                if let Err(e) = evt_tx.send(QueryEvent::Columns(col_names)).await {
                     error!("could not send back columns, probably means no receivers! {e}");
                     return;
                 }
@@ -404,10 +402,10 @@ impl Matcher {
                                         .collect::<rusqlite::Result<Vec<_>>>()?;
 
                                     if let Err(e) =
-                                        init_tx.blocking_send(QueryEvent::Row(rowid, cells))
+                                        evt_tx.blocking_send(QueryEvent::Row(rowid, cells))
                                     {
                                         error!("could not send back row: {e}");
-                                        return Err(MatcherError::ChangeReceiverClosed);
+                                        return Err(MatcherError::EventReceiverClosed);
                                     }
 
                                     last_rowid = cmp::max(rowid, last_rowid);
@@ -433,7 +431,7 @@ impl Matcher {
 
                 match res {
                     Ok(elapsed) => {
-                        if let Err(e) = init_tx
+                        if let Err(e) = evt_tx
                             .send(QueryEvent::EndOfQuery {
                                 time: elapsed.as_secs_f64(),
                             })
@@ -444,17 +442,15 @@ impl Matcher {
                         }
                     }
                     Err(e) => {
-                        _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
+                        _ = evt_tx.send(QueryEvent::Error(e.to_compact_string())).await;
                         return;
                     }
                 }
 
                 if let Err(e) = res {
-                    _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
+                    _ = evt_tx.send(QueryEvent::Error(e.to_compact_string())).await;
                     return;
                 }
-
-                drop(init_tx);
 
                 loop {
                     let req = tokio::select! {
@@ -468,22 +464,20 @@ impl Matcher {
                             if let Err(e) =
                                 block_in_place(|| matcher.handle_change(&mut conn, candidates))
                             {
-                                if matches!(e, MatcherError::ChangeReceiverClosed) {
-                                    // break here...
-                                    continue;
+                                if matches!(e, MatcherError::EventReceiverClosed) {
+                                    break;
                                 }
                                 error!("could not handle change: {e}");
                             }
-                        }
-                        MatcherCmd::Unsubscribe => {
-                            if matcher.0.change_tx.receiver_count() == 0 {
-                                info!(
-                                    "matcher {} has no more subscribers, we're done!",
-                                    matcher.0.id
-                                );
-                                break;
-                            }
-                        }
+                        } // MatcherCmd::Unsubscribe => {
+                          //     if matcher.0.change_tx.receiver_count() == 0 {
+                          //         info!(
+                          //             "matcher {} has no more subscribers, we're done!",
+                          //             matcher.0.id
+                          //         );
+                          //         break;
+                          //     }
+                          // }
                     }
                 }
 
@@ -696,13 +690,13 @@ impl Matcher {
                         .collect::<rusqlite::Result<Vec<_>>>()
                     {
                         Ok(cells) => {
-                            if let Err(e) =
-                                self.0
-                                    .change_tx
-                                    .send(QueryEvent::Change(change_type, rowid, cells))
-                            {
+                            if let Err(e) = self.0.evt_tx.blocking_send(QueryEvent::Change(
+                                change_type,
+                                rowid,
+                                cells,
+                            )) {
                                 error!("could not send back row to matcher sub sender: {e}");
-                                return Err(MatcherError::ChangeReceiverClosed);
+                                return Err(MatcherError::EventReceiverClosed);
                             }
                         }
                         Err(e) => {
@@ -731,13 +725,13 @@ impl Matcher {
         Ok(())
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<QueryEvent> {
-        self.0.change_tx.subscribe()
-    }
+    // pub fn subscribe(&self) -> broadcast::Receiver<QueryEvent> {
+    //     self.0.change_tx.subscribe()
+    // }
 
-    pub fn receiver_count(&self) -> usize {
-        self.0.change_tx.receiver_count()
-    }
+    // pub fn receiver_count(&self) -> usize {
+    //     self.0.change_tx.receiver_count()
+    // }
 
     pub fn cancel(&self) -> CancellationToken {
         self.0.cancel.clone()
@@ -1152,7 +1146,7 @@ pub enum MatcherError {
     #[error("change queue has been closed or is full")]
     ChangeQueueClosedOrFull,
     #[error("change receiver is closed")]
-    ChangeReceiverClosed,
+    EventReceiverClosed,
     #[error(transparent)]
     Unpack(#[from] UnpackError),
 }
@@ -1221,8 +1215,7 @@ mod tests {
         )?;
 
         let (tx, _rx) = mpsc::channel(1);
-        let (change_tx, _change_rx) = broadcast::channel(1);
-        let _matcher = Matcher::new(id, &schema, matcher_conn, tx, change_tx, sql, cancel)?;
+        let _matcher = Matcher::new(id, &schema, matcher_conn, tx, sql, cancel)?;
 
         Ok(())
     }
@@ -1446,9 +1439,7 @@ mod tests {
 
         {
             let (tx, mut rx) = mpsc::channel(1);
-            let (change_tx, mut change_rx) = broadcast::channel(1);
-            let matcher =
-                Matcher::new(id, &schema, matcher_conn, tx, change_tx, sql, cancel).unwrap();
+            let matcher = Matcher::new(id, &schema, matcher_conn, tx, sql, cancel).unwrap();
 
             assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Columns(_)));
 
@@ -1492,7 +1483,7 @@ mod tests {
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
             assert_eq!(
-                change_rx.recv().await.unwrap(),
+                rx.recv().await.unwrap(),
                 QueryEvent::Change(ChangeType::Insert, 2, cells)
             );
 
@@ -1523,7 +1514,7 @@ mod tests {
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
             assert_eq!(
-                change_rx.recv().await.unwrap(),
+                rx.recv().await.unwrap(),
                 QueryEvent::Change(ChangeType::Delete, 1, cells)
             );
 
@@ -1555,7 +1546,7 @@ mod tests {
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
             assert_eq!(
-                change_rx.recv().await.unwrap(),
+                rx.recv().await.unwrap(),
                 QueryEvent::Change(ChangeType::Update, 2, cells)
             );
         }

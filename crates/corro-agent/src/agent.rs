@@ -12,7 +12,7 @@ use crate::{
     api::{
         client::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
         peer::{bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, SyncError},
-        pubsub::{api_v1_sub_by_id, api_v1_subs, MatcherCache},
+        pubsub::{api_v1_sub_by_id, api_v1_subs, MatcherBroadcastCache, MatcherIdCache},
     },
     broadcast::runtime_loop,
     transport::{ConnectError, Transport},
@@ -93,6 +93,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     if let Some(parent) = conf.db.path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+
+    // do this early to error earlier
+    let members = Members::new(conf.broadcast.priority_filter.as_deref())?;
 
     let actor_id = {
         let conn = CrConn::init(Connection::open(&conf.db.path)?)?;
@@ -233,10 +236,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let agent = Agent::new(AgentConfig {
         actor_id,
         pool,
-        config: ArcSwap::from_pointee(conf),
         gossip_addr,
         api_addr,
-        members: RwLock::new(Members::default()),
+        members: RwLock::new(members),
+        config: ArcSwap::from_pointee(conf),
         clock,
         bookie,
         tx_bcast,
@@ -848,7 +851,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
                 .layer(Extension(agent.clone()))
-                .layer(Extension(MatcherCache::default()))
+                .layer(Extension(MatcherIdCache::default()))
+                .layer(Extension(MatcherBroadcastCache::default()))
                 .layer(Extension(tripwire.clone())),
         )
         .layer(DefaultBodyLimit::disable())
@@ -2130,18 +2134,6 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 foca_state JSON
             ) WITHOUT ROWID;
 
-            -- RTT for members
-            CREATE TABLE __corro_member_rtts (
-                actor_id BLOB PRIMARY KEY NOT NULL,
-
-                rtt_min REAL,
-                rtt_mean REAL,
-                rtt_max REAL,
-
-                last_recorded TEXT NOT NULL DEFAULT '[]' -- JSON
-
-            ) WITHOUT ROWID;
-
             -- tracked corrosion schema
             CREATE TABLE __corro_schema (
                 tbl_name TEXT NOT NULL,
@@ -2153,6 +2145,15 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
             
                 PRIMARY KEY (tbl_name, type, name)
             ) WITHOUT ROWID;
+
+            -- Node meta
+            CREATE TABLE __corro_member_meta (
+                actor_id BLOB PRIMARY KEY NOT NULL,
+
+                meta JSON
+            ) WITHOUT ROWID;
+
+            SELECT crsql_as_crr('__corro_member_meta');
         "#,
     )?;
 
