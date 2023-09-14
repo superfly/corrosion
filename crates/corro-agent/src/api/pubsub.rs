@@ -38,10 +38,14 @@ async fn sub_by_id(
             .read()
             .get(&id)
             .cloned()
-            .map(|matcher| (matcher, tx.subscribe()))
+            .and_then(|matcher| (tx.receiver_count() > 0).then(|| (matcher, tx.subscribe())))
     }) {
         Some(matcher_rx) => matcher_rx,
         None => {
+            // ensure this goes!
+            bcast_cache.write().await.remove(&id);
+            agent.matchers().write().remove(&id);
+
             return hyper::Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(
@@ -51,7 +55,7 @@ async fn sub_by_id(
                     .expect("could not serialize queries stream error")
                     .into(),
                 )
-                .expect("could not build error response")
+                .expect("could not build error response");
         }
     };
 
@@ -62,91 +66,6 @@ async fn sub_by_id(
     let (tx, body) = hyper::Body::channel();
 
     tokio::spawn(forward_bytes_to_body_sender(evt_rx, tx));
-
-    // // TODO: timeout on data send instead of infinitely waiting for channel space.
-    // let (init_tx, init_rx) = mpsc::channel(512);
-    // let change_rx = matcher.subscribe();
-    // let cancel = matcher.cancel();
-
-    // tokio::spawn(process_sub_channel(
-    //     agent.clone(),
-    //     id,
-    //     tx,
-    //     init_rx,
-    //     change_rx,
-    //     matcher.cmd_tx().clone(),
-    //     cancel,
-    // ));
-
-    // let pool = agent.pool().dedicated_pool().clone();
-    // tokio::spawn(async move {
-    //     if let Err(_e) = init_tx
-    //         .send(QueryEvent::Columns(matcher.0.col_names.clone()))
-    //         .await
-    //     {
-    //         warn!("could not send back column names, client is probably gone. returning.");
-    //         return;
-    //     }
-
-    //     let conn = match pool.get().await {
-    //         Ok(conn) => conn,
-    //         Err(e) => {
-    //             _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
-    //             return;
-    //         }
-    //     };
-
-    //     #[derive(Debug, thiserror::Error)]
-    //     enum QueryTempError {
-    //         #[error(transparent)]
-    //         Sqlite(#[from] rusqlite::Error),
-    //         #[error(transparent)]
-    //         Send(#[from] mpsc::error::SendError<QueryEvent>),
-    //     }
-
-    //     let res = block_in_place(|| {
-    //         let mut query_cols = vec![];
-    //         for i in 0..(matcher.0.parsed.columns.len()) {
-    //             query_cols.push(format!("col_{i}"));
-    //         }
-    //         let mut prepped = conn.prepare_cached(&format!(
-    //             "SELECT __corro_rowid,{} FROM {}",
-    //             query_cols.join(","),
-    //             matcher.table_name()
-    //         ))?;
-    //         let col_count = prepped.column_count();
-
-    //         init_tx.blocking_send(QueryEvent::Columns(matcher.0.col_names.clone()))?;
-
-    //         let start = Instant::now();
-    //         let mut rows = prepped.query(())?;
-    //         let elapsed = start.elapsed();
-
-    //         loop {
-    //             let row = match rows.next()? {
-    //                 Some(row) => row,
-    //                 None => break,
-    //             };
-    //             let rowid = row.get(0)?;
-
-    //             let cells = (1..col_count)
-    //                 .map(|i| row.get::<_, SqliteValue>(i))
-    //                 .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    //             init_tx.blocking_send(QueryEvent::Row(rowid, cells))?;
-    //         }
-
-    //         init_tx.blocking_send(QueryEvent::EndOfQuery {
-    //             time: elapsed.as_secs_f64(),
-    //         })?;
-
-    //         Ok::<_, QueryTempError>(())
-    //     });
-
-    //     if let Err(QueryTempError::Sqlite(e)) = res {
-    //         _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
-    //     }
-    // });
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -415,16 +334,19 @@ pub async fn upsert_sub(
 
     let maybe_matcher = cache_write
         .get(&stmt)
-        .and_then(|id| bcast_write.get(id).map(|sender| (id, sender)));
+        .and_then(|id| bcast_write.get(id).map(|sender| (*id, sender)));
 
     if let Some((matcher_id, sender)) = maybe_matcher {
-        let maybe_matcher = { agent.matchers().read().get(matcher_id).cloned() };
+        let maybe_matcher = (sender.receiver_count() > 0)
+            .then(|| agent.matchers().read().get(&matcher_id).cloned())
+            .flatten();
         if let Some(matcher) = maybe_matcher {
             let rx = sender.subscribe();
             tokio::spawn(catch_up_sub(agent.clone(), matcher, rx, tx));
-            return Ok(*matcher_id);
+            return Ok(matcher_id);
         } else {
             cache_write.remove(&stmt);
+            bcast_write.remove(&matcher_id);
         }
     }
 

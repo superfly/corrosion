@@ -1,5 +1,6 @@
 use std::{fmt, hash::Hash, net::SocketAddr, ops::Deref};
 
+use corro_api_types::SqliteValue;
 use foca::Identity;
 use rusqlite::{
     types::{FromSql, ToSqlOutput},
@@ -50,6 +51,31 @@ impl fmt::Display for ActorId {
 }
 
 const UUID_SIZE: usize = 16;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SqliteValueToActorIdError {
+    #[error("sqlite value had wrong type")]
+    WrongType,
+    #[error("wrong number of bytes, requires exactly 16 bytes")]
+    WrongNumberOfBytes,
+}
+
+impl TryFrom<&SqliteValue> for ActorId {
+    type Error = SqliteValueToActorIdError;
+
+    fn try_from(value: &SqliteValue) -> Result<Self, Self::Error> {
+        match value.as_blob() {
+            Some(v) => {
+                if v.len() != UUID_SIZE {
+                    Err(SqliteValueToActorIdError::WrongNumberOfBytes)
+                } else {
+                    Ok(ActorId::from_bytes(v.try_into().unwrap()))
+                }
+            }
+            None => Err(SqliteValueToActorIdError::WrongType),
+        }
+    }
+}
 
 impl<'a, C> Readable<'a, C> for ActorId
 where

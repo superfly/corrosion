@@ -95,7 +95,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     }
 
     // do this early to error earlier
-    let members = Members::new(conf.broadcast.priority_filter.as_deref())?;
+    let members = Members::default();
 
     let actor_id = {
         let conn = CrConn::init(Connection::open(&conf.db.path)?)?;
@@ -2145,15 +2145,6 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
             
                 PRIMARY KEY (tbl_name, type, name)
             ) WITHOUT ROWID;
-
-            -- Node meta
-            CREATE TABLE __corro_member_meta (
-                actor_id BLOB PRIMARY KEY NOT NULL,
-
-                meta JSON
-            ) WITHOUT ROWID;
-
-            SELECT crsql_as_crr('__corro_member_meta');
         "#,
     )?;
 

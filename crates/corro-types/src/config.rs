@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::net::SocketAddr;
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
@@ -6,19 +6,11 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
 
-pub type NodeMeta = BTreeMap<String, serde_json::Value>;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub db: DbConfig,
     pub api: ApiConfig,
     pub gossip: GossipConfig,
-
-    #[serde(default)]
-    pub broadcast: BroadcastConfig,
-
-    #[serde(default)]
-    pub meta: NodeMeta,
 
     #[serde(default)]
     pub admin: AdminConfig,
@@ -30,12 +22,6 @@ pub struct Config {
     pub log: LogConfig,
     #[serde(default)]
     pub consul: Option<ConsulConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BroadcastConfig {
-    #[serde(default)]
-    pub priority_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,8 +157,6 @@ pub struct ConfigBuilder {
     pub db_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
     api_addr: Option<SocketAddr>,
-    broadcast: BroadcastConfig,
-    meta: NodeMeta,
     admin_path: Option<Utf8PathBuf>,
     metrics_addr: Option<SocketAddr>,
     bootstrap: Option<Vec<String>>,
@@ -196,20 +180,6 @@ impl ConfigBuilder {
 
     pub fn api_addr(mut self, addr: SocketAddr) -> Self {
         self.api_addr = Some(addr);
-        self
-    }
-
-    pub fn priority_filter(mut self, filter: String) -> Self {
-        self.broadcast.priority_filter = Some(filter);
-        self
-    }
-
-    pub fn insert_meta<S: Into<String>, V: Into<serde_json::Value>>(
-        mut self,
-        key: S,
-        value: V,
-    ) -> Self {
-        self.meta.insert(key.into(), value.into());
         self
     }
 
@@ -275,8 +245,6 @@ impl ConfigBuilder {
                 max_mtu: None, // TODO: add a builder function for it
                 disable_gso: false,
             },
-            broadcast: self.broadcast,
-            meta: self.meta,
             admin: AdminConfig {
                 uds_path: self.admin_path.unwrap_or_else(default_admin_path),
             },

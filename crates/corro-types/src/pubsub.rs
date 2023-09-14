@@ -132,7 +132,7 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError
 }
 
 pub enum MatcherCmd {
-    ProcessChange(HashMap<CompactString, Vec<Vec<SqliteValue>>>),
+    ProcessChange(IndexMap<CompactString, Vec<Vec<SqliteValue>>>),
 }
 
 #[derive(Clone)]
@@ -149,7 +149,7 @@ impl MatcherHandle {
     pub fn process_change(&self, changes: &[Change]) -> Result<(), MatcherError> {
         // println!("{:?}", self.0.parsed);
 
-        let mut candidates: HashMap<CompactString, Vec<Vec<SqliteValue>>> = HashMap::new();
+        let mut candidates: IndexMap<CompactString, Vec<Vec<SqliteValue>>> = IndexMap::new();
 
         let grouped = changes
             .iter()
@@ -540,24 +540,27 @@ impl Matcher {
     fn handle_change(
         &self,
         conn: &mut Connection,
-        candidates: HashMap<CompactString, Vec<Vec<SqliteValue>>>,
+        candidates: IndexMap<CompactString, Vec<Vec<SqliteValue>>>,
     ) -> Result<(), MatcherError> {
         let tx = conn.transaction()?;
 
         let tables = candidates.keys().cloned().collect::<Vec<_>>();
 
         for (table, pks) in candidates {
-            // TODO: cache the statement string somewhere, it's always the same!
-            tx.prepare_cached(&format!(
-                "CREATE TEMP TABLE subscription_{}_{} ({})",
-                self.id.as_simple(),
-                table,
-                self.pks
-                    .get(table.as_str())
-                    .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
-                    .to_vec()
-                    .join(",")
-            ))?
+            // create a temporary table to mix and match the data
+            tx.prepare_cached(
+                // TODO: cache the statement's string somewhere, it's always the same!
+                &format!(
+                    "CREATE TEMP TABLE subscription_{}_{} ({})",
+                    self.id.as_simple(),
+                    table,
+                    self.pks
+                        .get(table.as_str())
+                        .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
+                        .to_vec()
+                        .join(",")
+                ),
+            )?
             .execute(())?;
 
             for pks in pks {
@@ -630,11 +633,12 @@ impl Matcher {
 
             let sql = format!(
                 "
-        DELETE FROM {} WHERE ({}) in (SELECT {} FROM (
-            {}
-            EXCEPT
-            {}
-        )) RETURNING __corro_rowid,{}",
+                    DELETE FROM {} WHERE ({}) in (SELECT {} FROM (
+                        {}
+                        EXCEPT
+                        {}
+                    )) RETURNING __corro_rowid,{}
+                ",
                 // delete from
                 self.qualified_table_name,
                 self.pks
@@ -1133,6 +1137,8 @@ pub enum MatcherError {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use corro_api_types::row_to_change;
     use rusqlite::params;
 
@@ -1527,6 +1533,74 @@ mod tests {
                 rx.recv().await.unwrap(),
                 QueryEvent::Change(ChangeType::Update, 2, cells)
             );
+
+            // lots of operations
+
+            let range = 4u32..1000u32;
+
+            {
+                let tx = conn.transaction().unwrap();
+
+                for n in range.clone() {
+                    let svc_id = format!("service-{n}");
+                    let ip = Ipv4Addr::from(n).to_string();
+                    let port = n;
+                    let machine_id = format!("m-{n}");
+                    let mv = format!("mv-{n}");
+                    let meta =
+                        serde_json::json!({"path": format!("/path-{n}"), "machine_id": machine_id});
+                    tx.execute("
+                                    INSERT INTO consul_services (node, id, name, address, port, meta) VALUES ('test-hostname', ?, 'app-prometheus', ?, ?, ?);
+                                    ", params![svc_id, ip, port, meta]).unwrap();
+                    tx.execute(
+                        "
+                        INSERT INTO machines (id, machine_version_id) VALUES (?, ?);
+                        ",
+                        params![machine_id, mv],
+                    )
+                    .unwrap();
+
+                    tx.execute(
+                        "
+                        INSERT INTO machine_versions (machine_id, id) VALUES (?, ?);
+                        ",
+                        params![machine_id, mv],
+                    )
+                    .unwrap();
+
+                    tx.execute("
+                        INSERT INTO machine_version_statuses (machine_id, id, status) VALUES (?, ?, 'started');", params![machine_id, mv]).unwrap();
+                }
+
+                tx.commit().unwrap();
+            }
+
+            let changes = {
+                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
+                let rows = prepped.query_map([5], row_to_change).unwrap();
+
+                let mut changes = vec![];
+
+                for row in rows {
+                    changes.push(row.unwrap());
+                }
+                changes
+            };
+
+            matcher.process_change(changes.as_slice()).unwrap();
+
+            let start = Instant::now();
+            for _ in range {
+                assert!(rx.recv().await.is_some());
+                // FIXME: test ordering... it's actually not right!
+            }
+
+            println!("took: {:?}", start.elapsed());
         }
     }
+
+    // #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    // async fn test_some_load() {
+
+    // }
 }
