@@ -25,7 +25,7 @@ RUN --mount=type=cache,target=/usr/local/cargo,from=rust:latest,source=/usr/loca
     cargo build --release && mv target/release/corrosion ./
 
 # Runtime image
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 COPY --from=builder /usr/local/bin/nperf /usr/local/bin/nperf
 
