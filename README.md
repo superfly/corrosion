@@ -45,6 +45,12 @@ Run the Corrosion agent on every node/host in the cluster. Other programs runnin
 
 The [Corrosion CLI](/doc/cli/README.md) provides commands for administration and access to database and features.
 
+### Quick start
+
+- [Prepare the Corrosion configuration file](config/README.md)
+- [Specify the initial database schema](schema.md)
+- [Start the Corrosion agent](cli/agent.md)
+
 See the WIP [Corrosion documentation](/doc/SUMMARY.md) for more details.
 
 ## Building Corrosion
