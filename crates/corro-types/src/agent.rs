@@ -484,10 +484,6 @@ impl Booked {
         Self(inner)
     }
 
-    pub async fn insert(&self, version: i64, db_version: KnownDbVersion) {
-        self.0.write().await.insert(version..=version, db_version);
-    }
-
     pub async fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
         match seqs {
             Some(check_seqs) => {
@@ -643,17 +639,6 @@ pub struct Bookie(BookieInner);
 impl Bookie {
     pub fn new(inner: BookieInner) -> Self {
         Self(inner)
-    }
-
-    pub async fn add(&self, actor_id: ActorId, version: i64, db_version: KnownDbVersion) {
-        if let Some(booked) = self.0.read().await.get(&actor_id) {
-            booked.insert(version, db_version).await;
-            return;
-        }
-
-        let mut w = self.0.write().await;
-        let booked = w.entry(actor_id).or_default();
-        booked.insert(version, db_version).await;
     }
 
     pub async fn for_actor(&self, actor_id: ActorId) -> Booked {

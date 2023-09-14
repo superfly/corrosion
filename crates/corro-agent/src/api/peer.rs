@@ -339,6 +339,7 @@ async fn process_range(
     for (versions, known_version) in overlapping {
         debug!("got overlapping range {versions:?} in {range:?}");
 
+        let mut processed = BTreeSet::new();
         // optimization, cleared versions can't be revived... sending a single batch!
         if let KnownDbVersion::Cleared = &known_version {
             sender
@@ -350,20 +351,21 @@ async fn process_range(
             continue;
         }
 
-        let mut processed = BTreeSet::new();
-
         for version in versions {
-            process_version(
-                pool,
-                actor_id,
-                is_local,
-                version,
-                &known_version,
-                vec![],
-                sender,
-            )
-            .await?;
-            processed.insert(version);
+            let bw = booked.write().await;
+            if let Some(known_version) = bw.get(&version) {
+                process_version(
+                    pool,
+                    actor_id,
+                    is_local,
+                    version,
+                    known_version,
+                    vec![],
+                    sender,
+                )
+                .await?;
+                processed.insert(version);
+            }
         }
 
         debug!("processed versions {processed:?}");
@@ -564,17 +566,15 @@ async fn process_sync(
         // 2. process partial needs
         if let Some(partially_needed) = sync_state.partial_need.get(&actor_id) {
             for (version, seqs_needed) in partially_needed.iter() {
-                let known = {
-                    let bw = booked.write().await;
-                    bw.get(version).cloned()
-                };
+                let bw = booked.write().await;
+                let known = bw.get(version);
                 if let Some(known) = known {
                     process_version(
                         &pool,
                         actor_id,
                         is_local,
                         *version,
-                        &known,
+                        known,
                         seqs_needed.clone(),
                         &sender,
                     )
