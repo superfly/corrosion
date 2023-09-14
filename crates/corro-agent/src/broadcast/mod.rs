@@ -615,7 +615,7 @@ pub fn runtime_loop(
                             transmit_broadcast(payload.clone(), transport.clone(), addr);
                         }
 
-                        if local_bcast_buf.len() > BROADCAST_CUTOFF {
+                        if local_bcast_buf.len() >= BROADCAST_CUTOFF {
                             to_broadcast.push(PendingBroadcast::new_local(
                                 local_bcast_buf.split().freeze(),
                             ));
@@ -628,7 +628,7 @@ pub fn runtime_loop(
                             continue;
                         }
 
-                        if bcast_buf.len() > BROADCAST_CUTOFF {
+                        if bcast_buf.len() >= BROADCAST_CUTOFF {
                             to_broadcast.push(PendingBroadcast::new(bcast_buf.split().freeze()));
                         }
                     }
@@ -669,9 +669,12 @@ pub fn runtime_loop(
                         .states
                         .iter()
                         .filter_map(|(member_id, state)| {
-                            // don't broadcast to ourselves and don't broadcast to ring0
-                            (*member_id != actor_id && (pending.is_local && !state.is_ring0()))
-                                .then_some(state.addr)
+                            // don't broadcast to ourselves... or ring0 if local broadcast
+                            if *member_id == actor_id || (pending.is_local && state.is_ring0()) {
+                                None
+                            } else {
+                                Some(state.addr)
+                            }
                         })
                         .choose_multiple(&mut rng, member_count)
                 };
