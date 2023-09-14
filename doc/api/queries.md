@@ -1,15 +1,15 @@
-## POST /v1/queries
+# POST /v1/queries
 
 Read from the Corrosion database. The `/v1/queries` endpoint accepts a single SQL statement in JSON format.
 
-### Sample request
+## Sample request
 ```
 curl http://localhost:8080/v1/queries \ 
  -H "content-type: application/json" \
  -d "\"SELECT sandwich FROM sandwiches\""
 ```
 
-### Sample response
+## Sample response
 ```json
 {"columns":["sandwich"]}
 {"row":[1,["burger"]]}
