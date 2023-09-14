@@ -22,7 +22,7 @@ use sqlite3_parser::{
     lexer::sql::Parser,
 };
 use tokio::{sync::mpsc, task::block_in_place};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -414,121 +414,130 @@ impl Matcher {
 
         tokio::spawn({
             async move {
-                if let Err(e) = evt_tx.send(QueryEvent::Columns(col_names)).await {
-                    error!("could not send back columns, probably means no receivers! {e}");
-                    return;
-                }
+                async {
+                    if let Err(e) = evt_tx.send(QueryEvent::Columns(col_names)).await {
+                        error!("could not send back columns, probably means no receivers! {e}");
+                        return;
+                    }
 
-                let mut query_cols = vec![];
-                for i in 0..(matcher.parsed.columns.len()) {
-                    query_cols.push(format!("col_{i}"));
-                }
+                    let mut query_cols = vec![];
+                    for i in 0..(matcher.parsed.columns.len()) {
+                        query_cols.push(format!("col_{i}"));
+                    }
 
-                let res = block_in_place(|| {
-                    let tx = conn.transaction()?;
+                    let res = block_in_place(|| {
+                        let tx = conn.transaction()?;
 
-                    let mut stmt_str = Cmd::Stmt(matcher.query.clone()).to_string();
-                    stmt_str.pop();
+                        let mut stmt_str = Cmd::Stmt(matcher.query.clone()).to_string();
+                        stmt_str.pop();
 
-                    let insert_into = format!(
-                        "INSERT INTO {} ({}) {} RETURNING __corro_rowid,{}",
-                        matcher.qualified_table_name,
-                        tmp_cols.join(","),
-                        stmt_str,
-                        query_cols.join(","),
-                    );
+                        let insert_into = format!(
+                            "INSERT INTO {} ({}) {} RETURNING __corro_rowid,{}",
+                            matcher.qualified_table_name,
+                            tmp_cols.join(","),
+                            stmt_str,
+                            query_cols.join(","),
+                        );
 
-                    let mut last_rowid = 0;
+                        let mut last_rowid = 0;
 
-                    let elapsed = {
-                        let mut prepped = tx.prepare(&insert_into)?;
+                        let elapsed = {
+                            let mut prepped = tx.prepare(&insert_into)?;
 
-                        let start = Instant::now();
-                        let mut rows = prepped.query(())?;
-                        let elapsed = start.elapsed();
+                            let start = Instant::now();
+                            let mut rows = prepped.query(())?;
+                            let elapsed = start.elapsed();
 
-                        loop {
-                            match rows.next() {
-                                Ok(Some(row)) => {
-                                    let rowid: i64 = row.get(0)?;
-                                    let cells = (1..=query_cols.len())
-                                        .map(|i| row.get::<_, SqliteValue>(i))
-                                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                            loop {
+                                match rows.next() {
+                                    Ok(Some(row)) => {
+                                        let rowid: i64 = row.get(0)?;
+                                        let cells = (1..=query_cols.len())
+                                            .map(|i| row.get::<_, SqliteValue>(i))
+                                            .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                                    if let Err(e) =
-                                        evt_tx.blocking_send(QueryEvent::Row(rowid, cells))
-                                    {
-                                        error!("could not send back row: {e}");
-                                        return Err(MatcherError::EventReceiverClosed);
+                                        if let Err(e) =
+                                            evt_tx.blocking_send(QueryEvent::Row(rowid, cells))
+                                        {
+                                            error!("could not send back row: {e}");
+                                            return Err(MatcherError::EventReceiverClosed);
+                                        }
+
+                                        last_rowid = cmp::max(rowid, last_rowid);
                                     }
-
-                                    last_rowid = cmp::max(rowid, last_rowid);
-                                }
-                                Ok(None) => {
-                                    // done!
-                                    break;
-                                }
-                                Err(e) => {
-                                    return Err(e.into());
+                                    Ok(None) => {
+                                        // done!
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        return Err(e.into());
+                                    }
                                 }
                             }
+                            elapsed
+                        };
+
+                        tx.commit()?;
+
+                        *matcher.last_rowid.lock() = last_rowid;
+
+                        Ok::<_, MatcherError>(elapsed)
+                    });
+
+                    match res {
+                        Ok(elapsed) => {
+                            if let Err(e) = evt_tx
+                                .send(QueryEvent::EndOfQuery {
+                                    time: elapsed.as_secs_f64(),
+                                })
+                                .await
+                            {
+                                error!("could not return end of query event: {e}");
+                                return;
+                            }
                         }
-                        elapsed
-                    };
-
-                    tx.commit()?;
-
-                    *matcher.last_rowid.lock() = last_rowid;
-
-                    Ok::<_, MatcherError>(elapsed)
-                });
-
-                match res {
-                    Ok(elapsed) => {
-                        if let Err(e) = evt_tx
-                            .send(QueryEvent::EndOfQuery {
-                                time: elapsed.as_secs_f64(),
-                            })
-                            .await
-                        {
-                            error!("could not return end of query event: {e}");
+                        Err(e) => {
+                            _ = evt_tx.send(QueryEvent::Error(e.to_compact_string())).await;
                             return;
                         }
                     }
-                    Err(e) => {
+
+                    if let Err(e) = res {
                         _ = evt_tx.send(QueryEvent::Error(e.to_compact_string())).await;
                         return;
                     }
-                }
 
-                if let Err(e) = res {
-                    _ = evt_tx.send(QueryEvent::Error(e.to_compact_string())).await;
-                    return;
-                }
-
-                while let Some(req) = cmd_rx.recv().await {
-                    match req {
-                        MatcherCmd::ProcessChange(candidates) => {
-                            if let Err(e) =
-                                block_in_place(|| matcher.handle_change(&mut conn, candidates))
-                            {
-                                if matches!(e, MatcherError::EventReceiverClosed) {
-                                    break;
+                    while let Some(req) = cmd_rx.recv().await {
+                        match req {
+                            MatcherCmd::ProcessChange(candidates) => {
+                                if let Err(e) =
+                                    block_in_place(|| matcher.handle_change(&mut conn, candidates))
+                                {
+                                    if matches!(e, MatcherError::EventReceiverClosed) {
+                                        break;
+                                    }
+                                    error!("could not handle change: {e}");
                                 }
-                                error!("could not handle change: {e}");
                             }
                         }
                     }
                 }
+                .await;
 
                 debug!(id = %id, "matcher loop is done");
 
+                // TODO: make this run if anything fails after the table was created!
                 if let Err(e) =
                     conn.execute_batch(&format!("DROP TABLE {}", matcher.qualified_table_name))
                 {
                     warn!(
                         "could not clean up temporary table {} => {e}",
                         matcher.qualified_table_name
+                    );
+                } else {
+                    debug!(
+                        "cleaned up subscription table {}",
+                        matcher.qualified_table_name,
                     );
                 }
             }
@@ -691,7 +700,7 @@ impl Matcher {
                                 rowid,
                                 cells,
                             )) {
-                                error!("could not send back row to matcher sub sender: {e}");
+                                debug!("could not send back row to matcher sub sender: {e}");
                                 return Err(MatcherError::EventReceiverClosed);
                             }
                         }
@@ -707,11 +716,11 @@ impl Matcher {
         // clean up temporary tables immediately
         for table in tables {
             tx.prepare_cached(&format!(
-                "DROP TABLE subscription_{}_{}",
+                "DROP TABLE subscription_{}_{table}",
                 self.id.as_simple(),
-                table
             ))?
             .execute(())?;
+            trace!("cleaned up subscription_{}_{table}", self.id.as_simple());
         }
 
         tx.commit()?;

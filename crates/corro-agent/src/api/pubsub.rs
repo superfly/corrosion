@@ -1,4 +1,10 @@
-use std::{collections::HashMap, io::Write, sync::Arc, task::Poll, time::Instant};
+use std::{
+    collections::HashMap,
+    io::Write,
+    sync::Arc,
+    task::Poll,
+    time::{Duration, Instant},
+};
 
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -10,13 +16,15 @@ use corro_types::{
     pubsub::{Matcher, MatcherError, MatcherHandle, NormalizeStatementError},
     sqlite::SqlitePoolError,
 };
-use futures::{future::poll_fn, ready};
+use futures::{future::poll_fn, ready, Stream};
 use rusqlite::Connection;
 use tokio::{
     sync::{broadcast, mpsc, RwLock as TokioRwLock},
     task::block_in_place,
 };
-use tracing::{debug, error, warn};
+use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
+use tokio_util::sync::PollSender;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 pub async fn api_v1_sub_by_id(
@@ -218,7 +226,7 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
 pub async fn catch_up_sub(
     agent: Agent,
     matcher: MatcherHandle,
-    mut rx: broadcast::Receiver<Bytes>,
+    sub_rx: broadcast::Receiver<Bytes>,
     tx: mpsc::Sender<Bytes>,
 ) -> eyre::Result<()> {
     {
@@ -287,35 +295,7 @@ pub async fn catch_up_sub(
         }
     }
 
-    // FIXME: if this is a query watching a frequently changing dataset, it will
-    //        always lag! should explore receiving asynchronously before making the query.
-    //        It's also possible we've missed messages entirely or are sending dups?
-    loop {
-        match rx.recv().await {
-            Ok(query_evt) => {
-                if let Err(_e) = tx.send(query_evt).await {
-                    debug!("subscriber must be done, can't send back query event");
-                    break;
-                }
-            }
-            Err(e) => match e {
-                broadcast::error::RecvError::Closed => {
-                    warn!("broadcast is done, that's a little weird?");
-                    break;
-                }
-                broadcast::error::RecvError::Lagged(count) => {
-                    debug!("subscriber lagged, skipped {count} messages");
-                    let mut buf = BytesMut::new();
-                    tx.send(error_to_query_event_bytes(
-                        &mut buf,
-                        format!("too slow, skipped {count} messages"),
-                    ))
-                    .await?;
-                    break;
-                }
-            },
-        }
-    }
+    forward_sub_to_sender(sub_rx, tx).await;
 
     Ok(())
 }
@@ -358,7 +338,7 @@ pub async fn upsert_sub(
 
     let matcher = Matcher::create(matcher_id, &agent.schema().read(), conn, evt_tx, &stmt)?;
 
-    let (sub_tx, mut sub_rx) = broadcast::channel(10240);
+    let (sub_tx, sub_rx) = broadcast::channel(10240);
 
     cache_write.insert(stmt, matcher_id);
     bcast_write.insert(matcher_id, sub_tx.clone());
@@ -367,26 +347,7 @@ pub async fn upsert_sub(
         agent.matchers().write().insert(matcher_id, matcher);
     }
 
-    tokio::spawn(async move {
-        loop {
-            match sub_rx.recv().await {
-                Ok(b) => {
-                    if let Err(_e) = tx.send(b).await {
-                        error!("could not forward subscription query event to receiver, channel is closed!");
-                        return;
-                    }
-                }
-                Err(e) => {
-                    error!("could not receive subscription query event: {e}");
-                    let mut buf = BytesMut::new();
-                    if let Err(_e) = tx.send(error_to_query_event_bytes(&mut buf, e)).await {
-                        debug!("could not send back subscription receive error! channel is closed");
-                    }
-                    return;
-                }
-            }
-        }
-    });
+    tokio::spawn(forward_sub_to_sender(sub_rx, tx));
 
     tokio::spawn(process_sub_channel(
         agent.clone(),
@@ -405,7 +366,7 @@ pub async fn api_v1_subs(
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
     let (tx, body) = hyper::Body::channel();
-    let (forward_tx, forward_rx) = mpsc::channel(512);
+    let (forward_tx, forward_rx) = mpsc::channel(10240);
 
     let matcher_id = match upsert_sub(&agent, &sub_cache, &bcast_cache, stmt, forward_tx).await {
         Ok(id) => id,
@@ -419,6 +380,57 @@ pub async fn api_v1_subs(
         .header("corro-query-id", matcher_id.to_string())
         .body(body)
         .expect("could not generate ok http response for query request")
+}
+
+async fn forward_sub_to_sender(sub_rx: broadcast::Receiver<Bytes>, tx: mpsc::Sender<Bytes>) {
+    let chunker = tokio_stream::wrappers::BroadcastStream::new(sub_rx)
+        .chunks_timeout(10, Duration::from_millis(10));
+
+    tokio::pin!(chunker);
+
+    let mut buf = BytesMut::new();
+
+    let mut tx = PollSender::new(tx);
+
+    loop {
+        let res: Result<Option<Bytes>, BroadcastStreamRecvError> = poll_fn(|cx| {
+            if let Err(_e) = ready!(tx.poll_reserve(cx)) {
+                return Poll::Ready(Ok(None));
+            }
+            match ready!(chunker.as_mut().poll_next(cx)) {
+                Some(chunks) => {
+                    for chunk in chunks {
+                        buf.extend_from_slice(&chunk?);
+                    }
+                    Poll::Ready(Ok(Some(buf.split().freeze())))
+                }
+                None => Poll::Ready(Ok(None)),
+            }
+        })
+        .await;
+
+        match res {
+            Ok(Some(b)) => {
+                if let Err(_e) = tx.send_item(b) {
+                    error!("could not forward subscription query event to receiver, channel is closed!");
+                    return;
+                }
+            }
+            Ok(None) => {
+                debug!("finished w/ broadcast");
+                break;
+            }
+            Err(e) => {
+                error!("could not receive subscription query event: {e}");
+                buf.clear();
+                // should be safe to send because the poll to reserve succeeded
+                if let Err(_e) = tx.send_item(error_to_query_event_bytes(&mut buf, e)) {
+                    debug!("could not send back subscription receive error! channel is closed");
+                }
+                return;
+            }
+        }
+    }
 }
 
 async fn forward_bytes_to_body_sender(mut rx: mpsc::Receiver<Bytes>, mut tx: hyper::body::Sender) {
@@ -442,7 +454,7 @@ async fn forward_bytes_to_body_sender(mut rx: mpsc::Receiver<Bytes>, mut tx: hyp
                 break;
             }
             Err(e) => {
-                error!("body was not ready anymore: {e}");
+                debug!("body was not ready anymore: {e}");
                 break;
             }
         }

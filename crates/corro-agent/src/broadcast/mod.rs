@@ -684,7 +684,7 @@ pub fn runtime_loop(
 
                 pending.send_count = pending.send_count.wrapping_add(1);
 
-                debug!(
+                trace!(
                     "send_count: {}, max_transmissions: {max_transmissions}",
                     pending.send_count
                 );

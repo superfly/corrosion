@@ -237,7 +237,6 @@ impl QueryResponseIter {
                         return None;
                     }
                     QueryEvent::Row(rowid, cells) | QueryEvent::Change(_, rowid, cells) => {
-                        println!("got a row (rowid: {rowid}) or a change...");
                         match self.columns.as_ref() {
                             Some(columns) => {
                                 return Some(Ok(Row {

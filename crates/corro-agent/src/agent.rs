@@ -1962,9 +1962,10 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         };
 
         if candidates.is_empty() {
-            warn!("could not find any good candidate for sync");
             return Err(SyncClientError::NoGoodCandidate);
         }
+
+        debug!("found {} candidates to synchronize with", candidates.len());
 
         let mut rng = StdRng::from_entropy();
 
@@ -2072,7 +2073,6 @@ async fn sync_loop(
                     }
                     tripwire::Outcome::Completed(_res) => {}
                 }
-                debug!(actor_id = %agent.actor_id(), "actually done with sync!");
                 next_sync_at
                     .as_mut()
                     .reset(tokio::time::Instant::now() + sync_backoff.next().unwrap());
