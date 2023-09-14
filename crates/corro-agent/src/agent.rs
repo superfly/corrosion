@@ -30,7 +30,7 @@ use corro_types::{
     },
     change::{Change, SqliteValue},
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
-    members::{MemberEvent, Members},
+    members::{MemberEvent, Members, Rtt},
     schema::init_schema,
     sqlite::{CrConn, Migration, SqlitePoolError},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
@@ -84,6 +84,7 @@ pub struct AgentOptions {
     api_listener: TcpListener,
     rx_bcast: Receiver<BroadcastInput>,
     rx_apply: Receiver<(ActorId, i64)>,
+    rtt_rx: Receiver<(SocketAddr, Duration)>,
     tripwire: Tripwire,
 }
 
@@ -209,7 +210,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
     let gossip_client_endpoint = gossip_client_endpoint(&conf.gossip).await?;
-    let transport = Transport::new(gossip_client_endpoint);
+
+    let (rtt_tx, rtt_rx) = channel(128);
+
+    let transport = Transport::new(gossip_client_endpoint, rtt_tx);
 
     let api_listener = TcpListener::bind(conf.api.bind_addr).await?;
     let api_addr = api_listener.local_addr()?;
@@ -230,6 +234,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         api_listener,
         rx_bcast,
         rx_apply,
+        rtt_rx,
         tripwire: tripwire.clone(),
     };
 
@@ -268,6 +273,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         mut tripwire,
         rx_bcast,
         rx_apply,
+        mut rtt_rx,
     } = opts;
     info!("Current Actor ID: {}", actor_id);
 
@@ -294,6 +300,15 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         notifications_tx,
         tripwire.clone(),
     );
+
+    tokio::spawn({
+        let agent = agent.clone();
+        async move {
+            while let Some((addr, rtt)) = rtt_rx.recv().await {
+                agent.members().write().add_rtt(addr, rtt);
+            }
+        }
+    });
 
     let (process_uni_tx, mut process_uni_rx) = channel(10240);
 
@@ -732,39 +747,39 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     });
 
     let states = match agent.pool().read().await {
-        Ok(conn) => {
-            block_in_place(
-                || match conn.prepare("SELECT foca_state FROM __corro_members") {
-                    Ok(mut prepped) => {
-                        match prepped
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
+        Ok(conn) => block_in_place(|| {
+            match conn.prepare("SELECT address,foca_state,rtts FROM __corro_members") {
+                Ok(mut prepped) => {
+                    match prepped
+                    .query_map([], |row| Ok((
+                            row.get::<_, String>(0)?.parse().map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
+                            row.get::<_, String>(1)?,
+                            serde_json::from_str(&row.get::<_, String>(2)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?
+                        ))
+                    )
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<(SocketAddr, String, Vec<u64>)>>>())
                 {
-                    Ok(foca_states) => {
-                        foca_states.iter().filter_map(|state| match serde_json::from_str::<foca::Member<Actor>>(state.as_str()) {
-                            Ok(fs) => match fs.state() {
-                                foca::State::Suspect => None,
-                                _ => Some(fs)
-                            },
+                    Ok(members) => {
+                        members.into_iter().filter_map(|(address, state, rtts)| match serde_json::from_str::<foca::Member<Actor>>(state.as_str()) {
+                            Ok(fs) => Some((address, fs, rtts)),
                             Err(e) => {
                                 error!("could not deserialize foca member state: {e} (json: {state})");
                                 None
                             }
-                        }).collect::<Vec<Member<Actor>>>()
+                        }).collect::<Vec<(SocketAddr, Member<Actor>, Vec<u64>)>>()
                     }
                     Err(e) => {
                         error!("could not query for foca member states: {e}");
                         vec![]
                     },
                 }
-                    }
-                    Err(e) => {
-                        error!("could not prepare query for foca member states: {e}");
-                        vec![]
-                    }
-                },
-            )
-        }
+                }
+                Err(e) => {
+                    error!("could not prepare query for foca member states: {e}");
+                    vec![]
+                }
+            }
+        }),
         Err(e) => {
             error!("could not acquire conn for foca member states: {e}");
             vec![]
@@ -772,7 +787,26 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     };
 
     if !states.is_empty() {
-        foca_tx.send(FocaInput::ApplyMany(states)).await.ok();
+        let mut foca_states = Vec::with_capacity(states.len());
+
+        {
+            // block to drop the members write lock
+            let mut members = agent.members().write();
+            for (address, foca_state, rtts) in states {
+                let mut rtt = Rtt::default();
+                for v in rtts {
+                    rtt.buf.push_back(v);
+                }
+                members.rtts.insert(address, rtt);
+                members.by_addr.insert(address, foca_state.id().id());
+                if matches!(foca_state.state(), foca::State::Suspect) {
+                    continue;
+                }
+                foca_states.push(foca_state);
+            }
+        }
+
+        foca_tx.send(FocaInput::ApplyMany(foca_states)).await.ok();
     }
 
     let api = Router::new()
@@ -2131,7 +2165,9 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 address TEXT NOT NULL,
             
                 state TEXT NOT NULL DEFAULT 'down',
-                foca_state JSON
+                foca_state JSON,
+
+                rtts JSON DEFAULT '[]'
             ) WITHOUT ROWID;
 
             -- tracked corrosion schema

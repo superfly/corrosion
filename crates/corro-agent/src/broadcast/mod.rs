@@ -25,10 +25,7 @@ use tokio::{
     task::{block_in_place, LocalSet},
     time::interval,
 };
-use tokio_stream::{
-    wrappers::{errors::BroadcastStreamRecvError, ReceiverStream},
-    StreamExt,
-};
+use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
 use tracing::{debug, error, log::info, trace, warn};
 use tripwire::Tripwire;
@@ -36,9 +33,7 @@ use tripwire::Tripwire;
 use corro_types::{
     actor::Actor,
     agent::Agent,
-    broadcast::{
-        BroadcastInput, BroadcastV1, DispatchRuntime, FocaInput, UniPayload, UniPayloadV1,
-    },
+    broadcast::{BroadcastInput, DispatchRuntime, FocaInput, UniPayload, UniPayloadV1},
     members::MemberEvent,
 };
 
@@ -133,7 +128,7 @@ pub fn runtime_loop(
     });
 
     // foca SWIM operations loop.
-    // NOTE: every turn of that loop should be fast or else we risk being suspected of being down
+    // NOTE: every turn of that loop should be fast or else we risk being a down suspect
     spawn_counted({
         let config = config.clone();
         let agent = agent.clone();
@@ -210,6 +205,7 @@ pub fn runtime_loop(
 
                         let states: Vec<_> = {
                             let members = agent.members().read();
+
                             foca.iter_members()
                                 .filter_map(|member| {
                                     members.get(&member.id().id()).and_then(|state| {
@@ -219,6 +215,19 @@ pub fn runtime_loop(
                                                 state.addr,
                                                 "up",
                                                 foca_state,
+                                                serde_json::Value::Array(
+                                                    members
+                                                        .rtts
+                                                        .get(&state.addr)
+                                                        .map(|rtt| {
+                                                            rtt.buf
+                                                                .iter()
+                                                                .copied()
+                                                                .map(serde_json::Value::from)
+                                                                .collect::<Vec<serde_json::Value>>()
+                                                        })
+                                                        .unwrap_or(vec![]),
+                                                ),
                                             )),
                                             Err(e) => {
                                                 error!(
@@ -244,7 +253,7 @@ pub fn runtime_loop(
                             match agent.pool().write_priority().await {
                                 Ok(mut conn) => block_in_place(|| match conn.transaction() {
                                     Ok(tx) => {
-                                        for (id, address, state, foca_state) in states {
+                                        for (id, address, state, foca_state, rtts) in states {
                                             if let Err(e) = tx
                                                 .prepare_cached("DELETE FROM __corro_members;")
                                                 .and_then(|mut prepped| prepped.execute([]))
@@ -253,12 +262,13 @@ pub fn runtime_loop(
                                             }
                                             let db_res = tx.prepare_cached(
                                                     "
-                                                INSERT INTO __corro_members (actor_id, address, state, foca_state)
-                                                    VALUES (?, ?, ?, ?)
+                                                INSERT INTO __corro_members (actor_id, address, state, foca_state, rtts)
+                                                    VALUES (?, ?, ?, ?, ?)
                                                 ON CONFLICT (actor_id) DO UPDATE SET
                                                     address = excluded.address,
                                                     state = excluded.state,
-                                                    foca_state = excluded.foca_state;
+                                                    foca_state = excluded.foca_state,
+                                                    rtts = excluded.rtts;
                                             ",
                                                 )
                                                 .and_then(|mut prepped| {
@@ -266,7 +276,8 @@ pub fn runtime_loop(
                                                         id,
                                                         address.to_string(),
                                                         state,
-                                                        foca_state
+                                                        foca_state,
+                                                        rtts
                                                     ])
                                                 });
 
@@ -369,9 +380,9 @@ pub fn runtime_loop(
                             })
                             .collect();
 
-                        let pool = agent.pool().clone();
+                        let agent = agent.clone();
                         tokio::spawn(async move {
-                            let mut conn = match pool.write_low().await {
+                            let mut conn = match agent.pool().write_low().await {
                                 Ok(conn) => conn,
                                 Err(e) => {
                                     error!(
@@ -384,21 +395,40 @@ pub fn runtime_loop(
                             let res = block_in_place(|| {
                                 let tx = conn.transaction()?;
 
+                                let members = agent.members().read();
+
                                 for (id, address, state, foca_state) in splitted {
                                     trace!(
                                         "updating {id} {address} as {state} w/ state: {foca_state:?}",
                                     );
-                                    let upserted = tx.prepare_cached("INSERT INTO __corro_members (actor_id, address, state, foca_state)
-                                                VALUES (?, ?, ?, ?)
+
+                                    let rtts = serde_json::Value::Array(
+                                        members
+                                            .rtts
+                                            .get(&address)
+                                            .map(|rtt| {
+                                                rtt.buf
+                                                    .iter()
+                                                    .copied()
+                                                    .map(serde_json::Value::from)
+                                                    .collect::<Vec<serde_json::Value>>()
+                                            })
+                                            .unwrap_or(vec![]),
+                                    );
+
+                                    let upserted = tx.prepare_cached("INSERT INTO __corro_members (actor_id, address, state, foca_state, rtts)
+                                                VALUES (?, ?, ?, ?, ?)
                                             ON CONFLICT (actor_id) DO UPDATE SET
                                                 address = excluded.address,
                                                 state = excluded.state,
-                                                foca_state = excluded.foca_state;")?
+                                                foca_state = excluded.foca_state,
+                                                rtts = excluded.rtts;")?
                                     .execute(params![
                                         id,
                                         address.to_string(),
                                         state,
-                                        foca_state
+                                        foca_state,
+                                        rtts
                                     ])?;
 
                                     if upserted != 1 {
@@ -472,10 +502,13 @@ pub fn runtime_loop(
     });
 
     tokio::spawn(async move {
-        let (bcast_tx, bcast_rx) = channel::<BroadcastV1>(10240);
+        const BROADCAST_CUTOFF: usize = 64 * 1024;
+
+        let mut bcast_codec = LengthDelimitedCodec::new();
 
         let mut bcast_buf = BytesMut::new();
-        let mut bcast_codec = LengthDelimitedCodec::new();
+        let mut local_bcast_buf = BytesMut::new();
+        let mut single_bcast_buf = BytesMut::new();
 
         let mut metrics_interval = interval(Duration::from_secs(10));
 
@@ -485,13 +518,11 @@ pub fn runtime_loop(
             Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>,
         >::new();
 
-        let chunked_bcast =
-            ReceiverStream::new(bcast_rx).chunks_timeout(4, Duration::from_millis(100));
-        tokio::pin!(chunked_bcast);
+        let mut bcast_interval = interval(Duration::from_millis(500));
 
         enum Branch {
             Broadcast(BroadcastInput),
-            SendBroadcast(Vec<BroadcastV1>),
+            BroadcastTick,
             WokePendingBroadcast(PendingBroadcast),
             Tripped,
             Metrics,
@@ -499,6 +530,8 @@ pub fn runtime_loop(
 
         let mut tripped = false;
         let mut ser_buf = BytesMut::new();
+
+        let mut to_broadcast = vec![];
 
         loop {
             let branch = tokio::select! {
@@ -512,8 +545,8 @@ pub fn runtime_loop(
                         break;
                     }
                 },
-                Some(payloads) = chunked_bcast.next() => {
-                    Branch::SendBroadcast(payloads)
+                _ = bcast_interval.tick() => {
+                    Branch::BroadcastTick
                 },
                 maybe_woke = idle_pendings.next(), if !idle_pendings.is_terminated() => match maybe_woke {
                     Some(woke) => Branch::WokePendingBroadcast(woke),
@@ -533,68 +566,79 @@ pub fn runtime_loop(
                 }
             };
 
-            let mut to_broadcast = None;
-
             match branch {
                 Branch::Tripped => {
                     // nothing to here, yet!
                 }
-                Branch::Broadcast(input) => {
-                    trace!("handling Branch::Broadcast");
-                    match input {
-                        BroadcastInput::Rebroadcast(payload) => {
-                            let bcast_tx = bcast_tx.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = bcast_tx.send(payload).await {
-                                    error!("could not send broadcast to receiver: {e:?}");
-                                }
-                            });
-                        }
-                        BroadcastInput::AddBroadcast(payload) => {
-                            // queue this to be broadcasted normally..
-                            let bcast_tx = bcast_tx.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = bcast_tx.send(payload).await {
-                                    error!("could not send broadcast (from priority) to receiver: {e:?}");
-                                }
-                            });
-                            // }
-                        }
+                Branch::BroadcastTick => {
+                    if !bcast_buf.is_empty() {
+                        to_broadcast.push(PendingBroadcast::new(bcast_buf.split().freeze()));
+                    }
+                    if !local_bcast_buf.is_empty() {
+                        to_broadcast.push(PendingBroadcast::new_local(
+                            local_bcast_buf.split().freeze(),
+                        ));
                     }
                 }
-                Branch::SendBroadcast(broadcasts) => {
-                    trace!("handling Branch::SendBroadcast");
+                Branch::Broadcast(input) => {
+                    trace!("handling Branch::Broadcast");
+                    let (bcast, is_local) = match input {
+                        BroadcastInput::Rebroadcast(bcast) => (bcast, false),
+                        BroadcastInput::AddBroadcast(bcast) => (bcast, true),
+                    };
 
-                    for bcast in broadcasts {
-                        if let Err(e) = UniPayload::V1(UniPayloadV1::Broadcast(bcast))
-                            .write_to_stream((&mut ser_buf).writer())
+                    if let Err(e) = UniPayload::V1(UniPayloadV1::Broadcast(bcast.clone()))
+                        .write_to_stream((&mut ser_buf).writer())
+                    {
+                        error!("could not encode UniPayload::V1 Broadcast: {e}");
+                        ser_buf.clear();
+                        continue;
+                    }
+                    trace!("ser buf len: {}", ser_buf.len());
+
+                    if is_local {
+                        if let Err(e) =
+                            bcast_codec.encode(ser_buf.split().freeze(), &mut single_bcast_buf)
                         {
-                            error!("could not encode UniPayload::V1 Broadcast: {e}");
+                            error!("could not encode local broadcast: {e}");
+                            single_bcast_buf.clear();
                             continue;
                         }
-                        trace!("ser buf len: {}", ser_buf.len());
+
+                        let payload = single_bcast_buf.split().freeze();
+
+                        local_bcast_buf.extend_from_slice(&payload);
+
+                        let members = agent.members().read();
+                        for addr in members.ring0() {
+                            // this spawns, so we won't be holding onto the read lock for long
+                            transmit_broadcast(payload.clone(), transport.clone(), addr);
+                        }
+
+                        if local_bcast_buf.len() > BROADCAST_CUTOFF {
+                            to_broadcast.push(PendingBroadcast::new_local(
+                                local_bcast_buf.split().freeze(),
+                            ));
+                        }
+                    } else {
                         if let Err(e) = bcast_codec.encode(ser_buf.split().freeze(), &mut bcast_buf)
                         {
                             error!("could not encode broadcast: {e}");
+                            bcast_buf.clear();
                             continue;
                         }
-                        // bcast_buf.extend_from_slice(&ser_buf.split());
+
+                        if bcast_buf.len() > BROADCAST_CUTOFF {
+                            to_broadcast.push(PendingBroadcast::new(bcast_buf.split().freeze()));
+                        }
                     }
-
-                    trace!("bcast_buf len: {}", bcast_buf.len());
-
-                    to_broadcast = Some(PendingBroadcast::new(bcast_buf.split().freeze()));
                 }
                 Branch::WokePendingBroadcast(pending) => {
                     trace!("handling Branch::WokePendingBroadcast");
-                    to_broadcast = Some(pending)
+                    to_broadcast.push(pending);
                 }
                 Branch::Metrics => {
                     trace!("handling Branch::Metrics");
-                    gauge!(
-                        "corro.gossip.broadcast.channel.capacity",
-                        bcast_tx.capacity() as f64
-                    );
                     gauge!("corro.broadcast.pending.count", idle_pendings.len() as f64);
                     gauge!(
                         "corro.broadcast.buffer.capacity",
@@ -607,7 +651,7 @@ pub fn runtime_loop(
                 }
             }
 
-            if let Some(mut pending) = to_broadcast.take() {
+            for mut pending in to_broadcast.drain(..) {
                 trace!("{} to broadcast: {pending:?}", actor_id);
 
                 let (member_count, max_transmissions) = {
@@ -625,7 +669,9 @@ pub fn runtime_loop(
                         .states
                         .iter()
                         .filter_map(|(member_id, state)| {
-                            (*member_id != actor_id).then_some(state.addr)
+                            // don't broadcast to ourselves and don't broadcast to ring0
+                            (*member_id != actor_id && (pending.is_local && !state.is_ring0()))
+                                .then_some(state.addr)
                         })
                         .choose_multiple(&mut rng, member_count)
                 };
@@ -671,6 +717,7 @@ fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
 #[derive(Debug)]
 struct PendingBroadcast {
     payload: Bytes,
+    is_local: bool,
     send_count: u8,
 }
 
@@ -678,6 +725,15 @@ impl PendingBroadcast {
     pub fn new(payload: Bytes) -> Self {
         Self {
             payload,
+            is_local: false,
+            send_count: 0,
+        }
+    }
+
+    pub fn new_local(payload: Bytes) -> Self {
+        Self {
+            payload,
+            is_local: true,
             send_count: 0,
         }
     }

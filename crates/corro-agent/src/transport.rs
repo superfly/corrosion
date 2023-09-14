@@ -1,17 +1,21 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use quinn::{
     ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
     SendStream,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
-pub struct Transport {
+pub struct Transport(Arc<TransportInner>);
+
+#[derive(Debug)]
+struct TransportInner {
     endpoint: Endpoint,
-    conns: Arc<RwLock<HashMap<SocketAddr, Connection>>>,
+    conns: RwLock<HashMap<SocketAddr, Connection>>,
+    rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -25,11 +29,12 @@ pub enum ConnectError {
 }
 
 impl Transport {
-    pub fn new(endpoint: Endpoint) -> Self {
-        Self {
+    pub fn new(endpoint: Endpoint, rtt_tx: mpsc::Sender<(SocketAddr, Duration)>) -> Self {
+        Self(Arc::new(TransportInner {
             endpoint,
             conns: Default::default(),
-        }
+            rtt_tx,
+        }))
     }
 
     pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), ConnectError> {
@@ -96,23 +101,29 @@ impl Transport {
         let server_name = addr.ip().to_string();
 
         {
-            let r = self.conns.read().await;
+            let r = self.0.conns.read().await;
             if let Some(conn) = r.get(&addr).cloned() {
                 if test_conn(&conn) {
+                    if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
+                        warn!("could not send RTT for connection through sender: {e}");
+                    }
                     return Ok(conn);
                 }
             }
         }
 
         let conn = {
-            let mut w = self.conns.write().await;
+            let mut w = self.0.conns.write().await;
             if let Some(conn) = w.get(&addr).cloned() {
                 if test_conn(&conn) {
                     return Ok(conn);
                 }
             }
 
-            let conn = self.endpoint.connect(addr, server_name.as_str())?.await?;
+            let conn = self.0.endpoint.connect(addr, server_name.as_str())?.await?;
+            if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
+                warn!("could not send RTT for connection through sender: {e}");
+            }
             w.insert(addr, conn.clone());
             conn
         };

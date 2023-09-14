@@ -528,6 +528,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "circular-buffer"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49fb5c4da5d3ed977852daeb787f89091b5e11eeabc81fec4d1c24b695b78ab8"
+
+[[package]]
 name = "clap"
 version = "4.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -855,6 +861,7 @@ dependencies = [
  "bb8",
  "bytes",
  "camino",
+ "circular-buffer",
  "compact_str 0.7.0",
  "config",
  "consul-client",
