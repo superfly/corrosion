@@ -1471,15 +1471,18 @@ async fn process_fully_buffered_changes(
     version: i64,
 ) -> Result<bool, ChangeError> {
     let mut conn = agent.pool().write_normal().await?;
+    info!(actor_id = %actor_id, version = %version, "acquired write (normal) connection to process fully buffered changes");
 
     let booked = agent.bookie().for_actor(actor_id).await;
     let mut bookedw = booked.write().await;
+    info!(actor_id = %actor_id, version = %version, "acquired Booked write lock to process fully buffered changes");
 
     let inserted = block_in_place(|| {
         let (last_seq, ts) = {
             match bookedw.inner().get(&version) {
                 Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
                     if seqs.gaps(&(0..=*last_seq)).count() != 0 {
+                        error!(actor_id = %actor_id, version = %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(0..=*last_seq)).collect::<RangeInclusiveSet<i64>>());
                         // TODO: return an error here
                         return Ok(false);
                     }
@@ -1696,7 +1699,8 @@ pub async fn process_single_version(
                 // if we have no gaps, then we can schedule applying all these changes.
                 if gaps_count == 0 {
                     // no gaps
-                    // TODO: find a better way to figure out if we already applied partial changes
+                    // TODO: find a better way to figure out if we already
+                    //       submitted the message to apply partial changes
                     if inserted > 0 {
                         // inserted _some_ rows in buffered changes
                         let tx_apply = agent.tx_apply().clone();

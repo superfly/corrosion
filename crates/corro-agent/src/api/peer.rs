@@ -500,22 +500,33 @@ async fn process_version(
                         for changes_seqs in chunked {
                             match changes_seqs {
                                 Ok((changes, seqs)) => {
-                                    if changes.len() != ((seqs.end() - seqs.start()) + 1) as usize {
-                                        warn!(actor_id = %actor_id, version = %version, "empty partial changes send, not sending to prevent inconsistencies (full range: {start_seq}..={end_seq}, chunk range: {}..={}, chunked seqs: {:?})", seqs.start(), seqs.end(), changes.iter().map(|c| c.seq).collect::<Vec<_>>());
-                                        return Ok(());
-                                    }
-                                    if let Err(_e) = sender.blocking_send(SyncMessage::V1(
-                                        SyncMessageV1::Changeset(ChangeV1 {
-                                            actor_id,
-                                            changeset: Changeset::Full {
-                                                version,
-                                                changes,
-                                                seqs,
-                                                last_seq: *last_seq,
-                                                ts: *ts,
-                                            },
-                                        }),
-                                    )) {
+                                    // if changes.len() != ((seqs.end() - seqs.start()) + 1) as usize {
+                                    //     warn!(actor_id = %actor_id, version = %version, "empty partial changes send, not sending to prevent inconsistencies (full range: {start_seq}..={end_seq}, chunk range: {}..={}, chunked seqs: {:?})", seqs.start(), seqs.end(), changes.iter().map(|c| c.seq).collect::<Vec<_>>());
+                                    //     return Ok(());
+                                    // }
+                                    info!(actor_id = %actor_id, version = %version, "sending partially buffered changes {}..={} (len: {})", seqs.start(), seqs.end(), changes.len());
+                                    tokio::spawn({
+                                        let sender = sender.clone();
+                                        let last_seq = *last_seq;
+                                        let ts = *ts;
+                                        async move {
+                                            _ = sender
+                                                .send(SyncMessage::V1(SyncMessageV1::Changeset(
+                                                    ChangeV1 {
+                                                        actor_id,
+                                                        changeset: Changeset::Full {
+                                                            version,
+                                                            changes,
+                                                            seqs,
+                                                            last_seq,
+                                                            ts,
+                                                        },
+                                                    },
+                                                )))
+                                                .await;
+                                        }
+                                    });
+                                    if sender.is_closed() {
                                         eyre::bail!("sync message sender channel is closed");
                                     }
                                 }
