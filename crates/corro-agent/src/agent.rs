@@ -1714,24 +1714,6 @@ pub async fn process_single_version(
                     ])?;
                 }
 
-                // if we have no gaps, then we can schedule applying all these changes.
-                if gaps_count == 0 {
-                    // no gaps
-                    // TODO: find a better way to figure out if we already
-                    //       submitted the message to apply partial changes
-                    if inserted > 0 {
-                        // inserted _some_ rows in buffered changes
-                        let tx_apply = agent.tx_apply().clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = tx_apply.send((actor_id, version)).await {
-                                error!("could not send trigger for applying fully buffered changes later: {e}");
-                            }
-                        });
-                    }
-                } else {
-                    debug!(actor = %agent.actor_id(), "still have {gaps_count} gaps in partially buffered seqs");
-                }
-
                 tx.commit()?;
 
                 let changeset = Changeset::Full {
@@ -1750,6 +1732,24 @@ pub async fn process_single_version(
                         ts,
                     },
                 );
+
+                // if we have no gaps, then we can schedule applying all these changes.
+                if gaps_count == 0 {
+                    // no gaps
+                    // TODO: find a better way to figure out if we already
+                    //       submitted the message to apply partial changes
+                    if inserted > 0 {
+                        // inserted _some_ rows in buffered changes
+                        let tx_apply = agent.tx_apply().clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tx_apply.send((actor_id, version)).await {
+                                error!("could not send trigger for applying fully buffered changes later: {e}");
+                            }
+                        });
+                    }
+                } else {
+                    debug!(actor = %agent.actor_id(), "still have {gaps_count} gaps in partially buffered seqs");
+                }
 
                 return Ok((changeset, None));
             }
