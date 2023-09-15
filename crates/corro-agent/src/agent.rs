@@ -1694,7 +1694,25 @@ pub async fn process_single_version(
                 // figure out how many seq gaps we have between 0 and the last seq for this version
                 let gaps_count = seqs_recorded.gaps(&full_seqs_range).count();
 
-                debug!(actor = %agent.actor_id(), "still missing {gaps_count} seqs");
+                tx.prepare_cached(
+                    "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
+                )?
+                .execute(params![actor_id, version])?;
+
+                for range in seqs_recorded.iter() {
+                    tx.prepare_cached("INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                        ",
+                    )?
+                    .execute(params![
+                        actor_id,
+                        version,
+                        range.start(),
+                        range.end(),
+                        last_seq,
+                        ts
+                    ])?;
+                }
 
                 // if we have no gaps, then we can schedule applying all these changes.
                 if gaps_count == 0 {
@@ -1711,25 +1729,7 @@ pub async fn process_single_version(
                         });
                     }
                 } else {
-                    tx.prepare_cached(
-                        "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
-                    )?
-                    .execute(params![actor_id, version])?;
-
-                    for range in seqs_recorded.iter() {
-                        tx.prepare_cached("INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                            ",
-                        )?
-                        .execute(params![
-                            actor_id,
-                            version,
-                            range.start(),
-                            range.end(),
-                            last_seq,
-                            ts
-                        ])?;
-                    }
+                    debug!(actor = %agent.actor_id(), "still have {gaps_count} gaps in partially buffered seqs");
                 }
 
                 tx.commit()?;
