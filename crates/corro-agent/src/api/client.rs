@@ -136,15 +136,15 @@ pub async fn make_broadcastable_changes<F, T>(
 where
     F: Fn(&Transaction) -> Result<T, ChangeError>,
 {
+    trace!("getting conn...");
+    let mut conn = agent.pool().write_priority().await?;
+    trace!("got conn");
+
     let actor_id = agent.actor_id();
     let booked = agent.bookie().for_actor(actor_id).await;
     // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
     // so it probably doesn't matter too much, except for reads of internal state
     let mut book_writer = booked.write().await;
-
-    trace!("getting conn...");
-    let mut conn = agent.pool().write_priority().await?;
-    trace!("got conn");
 
     let start = Instant::now();
     block_in_place(move || {

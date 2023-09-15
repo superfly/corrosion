@@ -653,11 +653,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 for actor_id in to_check {
                     let booked = bookie.for_actor(actor_id).await;
 
-                    let mut bookedw = booked.write().await;
-                    let versions = bookedw.current_versions();
-
-                    if versions.is_empty() {
-                        continue;
+                    {
+                        if booked.read().await.current_versions().is_empty() {
+                            continue;
+                        }
                     }
 
                     let mut conn = match pool.write_low().await {
@@ -667,6 +666,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             continue;
                         }
                     };
+
+                    let mut bookedw = booked.write().await;
+                    let versions = bookedw.current_versions();
+
+                    if versions.is_empty() {
+                        continue;
+                    }
 
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
@@ -945,7 +951,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 }
             },
             _ = db_cleanup_interval.tick() => {
-                // tokio::spawn(handle_db_cleanup(agent.pool().clone()).preemptible(tripwire.clone()));
+                tokio::spawn(handle_db_cleanup(agent.pool().clone()).preemptible(tripwire.clone()));
             },
             _ = &mut tripwire => {
                 debug!("tripped corrosion");
@@ -1467,12 +1473,12 @@ async fn process_fully_buffered_changes(
     actor_id: ActorId,
     version: i64,
 ) -> Result<bool, ChangeError> {
+    let mut conn = agent.pool().write_normal().await?;
+    info!(actor_id = %actor_id, version = %version, "acquired write (normal) connection to process fully buffered changes");
+
     let booked = agent.bookie().for_actor(actor_id).await;
     let mut bookedw = booked.write().await;
     info!(actor_id = %actor_id, version = %version, "acquired Booked write lock to process fully buffered changes");
-
-    let mut conn = agent.pool().write_normal().await?;
-    info!(actor_id = %actor_id, version = %version, "acquired write (normal) connection to process fully buffered changes");
 
     let inserted = block_in_place(|| {
         let (last_seq, ts) = {
@@ -1604,14 +1610,14 @@ pub async fn process_single_version(
 
     let booked = bookie.for_actor(actor_id).await;
     let (db_version, changeset) = {
+        let mut conn = agent.pool().write_normal().await?;
+
         let mut booked_write = booked.write().await;
         // check again, might've changed since we acquired the lock
         if booked_write.contains_all(changeset.versions(), changeset.seqs()) {
             trace!("previously unknown versions are now deemed known, aborting inserts");
             return Ok(None);
         }
-
-        let mut conn = agent.pool().write_normal().await?;
 
         let (changeset, db_version) = block_in_place(move || {
             let tx = conn.transaction()?;
