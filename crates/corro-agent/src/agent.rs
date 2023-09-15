@@ -1501,7 +1501,7 @@ async fn process_fully_buffered_changes(
 
         let tx = conn.transaction()?;
 
-        info!(actor = %agent.actor_id(), "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+        info!(actor_id = %actor_id, version = %version, "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
         let start = Instant::now();
         // insert all buffered changes into crsql_changes directly from the buffered changes table
@@ -1517,7 +1517,7 @@ async fn process_fully_buffered_changes(
                             ",
             )?
             .execute(params![actor_id.as_bytes(), version])?;
-        info!(actor = %agent.actor_id(), "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+        info!(actor_id = %actor_id, version = %version, "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
 
         // remove all buffered changes for cleanup purposes
         let count = tx
@@ -1525,7 +1525,7 @@ async fn process_fully_buffered_changes(
                 "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
             )?
             .execute(params![actor_id.as_bytes(), version])?;
-        info!(actor = %agent.actor_id(), "deleted {count} buffered changes");
+        info!(actor_id = %actor_id, version = %version, "deleted {count} buffered changes");
 
         // delete all bookkept sequences for this version
         let count = tx
@@ -1533,13 +1533,13 @@ async fn process_fully_buffered_changes(
                 "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
             )?
             .execute(params![actor_id, version])?;
-        info!(actor = %agent.actor_id(), "deleted {count} sequences in bookkeeping");
+        info!(actor_id = %actor_id, version = %version, "deleted {count} sequences in bookkeeping");
 
         let rows_impacted: i64 = tx
             .prepare_cached("SELECT crsql_rows_impacted()")?
             .query_row((), |row| row.get(0))?;
 
-        info!(actor = %agent.actor_id(), "rows impacted by changes: {rows_impacted}");
+        info!(actor_id = %actor_id, version = %version, "rows impacted by changes: {rows_impacted}");
 
         let known_version = if rows_impacted > 0 {
             let db_version: i64 =
@@ -2085,16 +2085,16 @@ async fn sync_loop(
                     .reset(tokio::time::Instant::now() + sync_backoff.next().unwrap());
             }
             Branch::BackgroundApply { actor_id, version } => {
-                info!(actor_id = %agent.actor_id(), "picked up background apply for actor: {actor_id} v{version}");
+                info!(actor_id = %actor_id, version = %version, "picked up background apply of buffered changes");
                 match process_fully_buffered_changes(&agent, actor_id, version).await {
                     Ok(false) => {
-                        warn!("did not apply buffered changes");
+                        warn!(actor_id = %actor_id, version = %version, "did not apply buffered changes");
                     }
                     Ok(true) => {
-                        info!("succesfully applied buffered changes");
+                        info!(actor_id = %actor_id, version = %version, "succesfully applied buffered changes");
                     }
                     Err(e) => {
-                        error!("could not apply fully buffered changes: {e}");
+                        error!(actor_id = %actor_id, version = %version, "could not apply fully buffered changes: {e}");
                     }
                 }
             }

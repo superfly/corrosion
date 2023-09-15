@@ -18,8 +18,10 @@ use rusqlite::params;
 use speedy::Writable;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::block_in_place;
+use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
+use tripwire::{Outcome, TimeoutFutureExt};
 
 use crate::agent::{process_single_version, SyncRecvError};
 use crate::api::client::{ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
@@ -510,7 +512,7 @@ async fn process_version(
                                         let last_seq = *last_seq;
                                         let ts = *ts;
                                         async move {
-                                            _ = sender
+                                            if let Outcome::Preempted(_) = sender
                                                 .send(SyncMessage::V1(SyncMessageV1::Changeset(
                                                     ChangeV1 {
                                                         actor_id,
@@ -523,7 +525,11 @@ async fn process_version(
                                                         },
                                                     },
                                                 )))
-                                                .await;
+                                                .with_timeout(Duration::from_secs(2))
+                                                .await
+                                            {
+                                                error!("timed out sending chunk of changes");
+                                            }
                                         }
                                     });
                                     if sender.is_closed() {
