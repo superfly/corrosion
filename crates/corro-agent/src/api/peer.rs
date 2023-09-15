@@ -355,7 +355,8 @@ async fn process_range(
 
         for version in versions {
             let bw = booked.write().await;
-            if let Some(known_version) = bw.get(&version) {
+            let known = bw.get(&version);
+            if let Some(known_version) = known {
                 process_version(
                     pool,
                     actor_id,
@@ -542,6 +543,7 @@ async fn process_version(
                                 }
                             }
                         }
+                        info!(actor_id = %actor_id, version = %version, "done sending chunks of partial changes");
                     }
                 }
             }
