@@ -653,10 +653,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 for actor_id in to_check {
                     let booked = bookie.for_actor(actor_id).await;
 
-                    let versions = {
-                        let read = booked.read().await;
-                        read.current_versions()
-                    };
+                    let mut bookedw = booked.write().await;
+                    let versions = bookedw.current_versions();
 
                     if versions.is_empty() {
                         continue;
@@ -669,13 +667,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             continue;
                         }
                     };
-
-                    let mut bookedw = booked.write().await;
-                    let versions = bookedw.current_versions();
-
-                    if versions.is_empty() {
-                        continue;
-                    }
 
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
@@ -954,7 +945,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 }
             },
             _ = db_cleanup_interval.tick() => {
-                tokio::spawn(handle_db_cleanup(agent.pool().clone()).preemptible(tripwire.clone()));
+                // tokio::spawn(handle_db_cleanup(agent.pool().clone()).preemptible(tripwire.clone()));
             },
             _ = &mut tripwire => {
                 debug!("tripped corrosion");
