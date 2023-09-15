@@ -1476,12 +1476,12 @@ async fn process_fully_buffered_changes(
     actor_id: ActorId,
     version: i64,
 ) -> Result<bool, ChangeError> {
-    let mut conn = agent.pool().write_normal().await?;
-    info!(actor_id = %actor_id, version = %version, "acquired write (normal) connection to process fully buffered changes");
-
     let booked = agent.bookie().for_actor(actor_id).await;
     let mut bookedw = booked.write().await;
     info!(actor_id = %actor_id, version = %version, "acquired Booked write lock to process fully buffered changes");
+
+    let mut conn = agent.pool().write_normal().await?;
+    info!(actor_id = %actor_id, version = %version, "acquired write (normal) connection to process fully buffered changes");
 
     let inserted = block_in_place(|| {
         let (last_seq, ts) = {
@@ -1611,8 +1611,6 @@ pub async fn process_single_version(
         changeset.last_seq()
     );
 
-    let mut conn = agent.pool().write_normal().await?;
-
     let booked = bookie.for_actor(actor_id).await;
     let (db_version, changeset) = {
         let mut booked_write = booked.write().await;
@@ -1621,6 +1619,8 @@ pub async fn process_single_version(
             trace!("previously unknown versions are now deemed known, aborting inserts");
             return Ok(None);
         }
+
+        let mut conn = agent.pool().write_normal().await?;
 
         let (changeset, db_version) = block_in_place(move || {
             let tx = conn.transaction()?;

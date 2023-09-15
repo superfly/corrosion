@@ -350,10 +350,6 @@ impl SplitPool {
         self.write_inner(&self.0.low_tx, "low").await
     }
 
-    pub fn blocking_write_low(&self) -> Result<WriteConn<'static>, PoolError> {
-        Handle::current().block_on(self.write_inner_owned(&self.0.low_tx, "priority"))
-    }
-
     async fn write_inner(
         &self,
         chan: &Sender<oneshot::Sender<CancellationToken>>,
@@ -365,31 +361,6 @@ impl SplitPool {
         let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
         histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
         let conn = self.0.write.get().await?;
-
-        tokio::spawn(timeout_wait(
-            token.clone(),
-            conn.get_interrupt_handle(),
-            Duration::from_secs(30),
-            queue,
-        ));
-
-        Ok(WriteConn {
-            conn,
-            _drop_guard: token.drop_guard(),
-        })
-    }
-
-    async fn write_inner_owned(
-        &self,
-        chan: &Sender<oneshot::Sender<CancellationToken>>,
-        queue: &'static str,
-    ) -> Result<WriteConn<'static>, PoolError> {
-        let (tx, rx) = oneshot::channel();
-        chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
-        let start = Instant::now();
-        let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
-        histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
-        let conn = self.0.write.get_owned().await?;
 
         tokio::spawn(timeout_wait(
             token.clone(),
