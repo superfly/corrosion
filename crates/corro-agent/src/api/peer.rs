@@ -11,14 +11,15 @@ use corro_types::broadcast::{ChangeV1, Changeset};
 use corro_types::change::row_to_change;
 use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
-use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt};
+use futures::{Sink, SinkExt, Stream, TryFutureExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rusqlite::params;
 use speedy::Writable;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::block_in_place;
-use tokio::time::timeout;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, TimeoutFutureExt};
@@ -703,7 +704,7 @@ pub async fn bidirectional_sync(
     read: RecvStream,
     write: SendStream,
 ) -> Result<usize, SyncError> {
-    let (tx, mut rx) = channel::<SyncMessage>(256);
+    let (tx, rx) = channel::<SyncMessage>(256);
 
     let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
     let mut write = FramedWrite::new(write, LengthDelimitedCodec::new());
@@ -762,12 +763,18 @@ pub async fn bidirectional_sync(
     let (_sent_count, recv_count) = tokio::try_join!(
         async move {
             let mut count = 0;
-            while let Some(msg) = rx.recv().await {
-                if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
-                    count += change.len();
-                }
 
-                write_sync_msg(&mut send_buf, msg, &mut write).await?;
+            let chunker = ReceiverStream::new(rx).chunks_timeout(10, Duration::from_millis(20));
+            tokio::pin!(chunker);
+
+            while let Some(msgs) = chunker.next().await {
+                for msg in msgs {
+                    if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+                        count += change.len();
+                    }
+
+                    write_sync_msg(&mut send_buf, msg, &mut write).await?;
+                }
             }
 
             let mut send = write.into_inner();

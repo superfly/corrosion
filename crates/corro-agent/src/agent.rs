@@ -273,7 +273,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         mut tripwire,
         rx_bcast,
         rx_apply,
-        mut rtt_rx,
+        rtt_rx,
     } = opts;
     info!("Current Actor ID: {}", actor_id);
 
