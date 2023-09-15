@@ -304,8 +304,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     tokio::spawn({
         let agent = agent.clone();
         async move {
-            while let Some((addr, rtt)) = rtt_rx.recv().await {
-                agent.members().write().add_rtt(addr, rtt);
+            let stream = ReceiverStream::new(rtt_rx);
+            let chunker = stream.chunks_timeout(20, Duration::from_secs(1));
+            tokio::pin!(chunker);
+            while let Some(chunks) = chunker.next().await {
+                let mut members = agent.members().write();
+                for (addr, rtt) in chunks {
+                    members.add_rtt(addr, rtt);
+                }
             }
         }
     });
