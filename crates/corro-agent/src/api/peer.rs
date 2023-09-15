@@ -425,21 +425,32 @@ async fn process_version(
                     for changes_seqs in chunked {
                         match changes_seqs {
                             Ok((changes, seqs)) => {
-                                if sender
-                                    .blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(
-                                        ChangeV1 {
-                                            actor_id,
-                                            changeset: Changeset::Full {
-                                                version,
-                                                changes,
-                                                seqs,
-                                                last_seq: *last_seq,
-                                                ts: *ts,
-                                            },
-                                        },
-                                    )))
-                                    .is_err()
-                                {
+                                tokio::spawn({
+                                    let sender = sender.clone();
+                                    let last_seq = *last_seq;
+                                    let ts = *ts;
+                                    async move {
+                                        if let Outcome::Preempted(_) = sender
+                                            .send(SyncMessage::V1(SyncMessageV1::Changeset(
+                                                ChangeV1 {
+                                                    actor_id,
+                                                    changeset: Changeset::Full {
+                                                        version,
+                                                        changes,
+                                                        seqs,
+                                                        last_seq,
+                                                        ts,
+                                                    },
+                                                },
+                                            )))
+                                            .with_timeout(Duration::from_secs(2))
+                                            .await
+                                        {
+                                            error!("timed out sending chunk of changes");
+                                        }
+                                    }
+                                });
+                                if sender.is_closed() {
                                     eyre::bail!("sync message sender channel is closed");
                                 }
                             }
