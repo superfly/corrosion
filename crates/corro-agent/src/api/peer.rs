@@ -499,7 +499,8 @@ async fn process_version(
                                 FROM __corro_buffered_changes
                                 WHERE site_id = ?
                                   AND version = ?
-                                  AND seq >= ? AND seq <= ?"#,
+                                  AND seq >= ? AND seq <= ?
+                                  ORDER BY seq ASC"#,
                         )?;
 
                         let site_id: [u8; 16] = actor_id.to_bytes();
