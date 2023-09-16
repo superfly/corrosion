@@ -665,14 +665,25 @@ async fn process_sync(
     Ok(())
 }
 
+fn append_write_buf(buf: &mut BytesMut, msg: SyncMessage) -> Result<(), SyncSendError> {
+    msg.write_to_stream(buf.writer())
+        .map_err(SyncMessageEncodeError::from)?;
+    Ok(())
+}
+
 async fn write_sync_msg<W: Sink<Bytes, Error = std::io::Error> + Unpin>(
     buf: &mut BytesMut,
     msg: SyncMessage,
     write: &mut W,
 ) -> Result<(), SyncSendError> {
-    msg.write_to_stream(buf.writer())
-        .map_err(SyncMessageEncodeError::from)?;
+    append_write_buf(buf, msg)?;
+    send_sync_write_buffer(buf, write).await
+}
 
+async fn send_sync_write_buffer<W: Sink<Bytes, Error = std::io::Error> + Unpin>(
+    buf: &mut BytesMut,
+    write: &mut W,
+) -> Result<(), SyncSendError> {
     let buf_len = buf.len();
     write.send(buf.split().freeze()).await?;
 
@@ -704,7 +715,7 @@ pub async fn bidirectional_sync(
     read: RecvStream,
     write: SendStream,
 ) -> Result<usize, SyncError> {
-    let (tx, rx) = channel::<SyncMessage>(256);
+    let (tx, mut rx) = channel::<SyncMessage>(256);
 
     let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
     let mut write = FramedWrite::new(write, LengthDelimitedCodec::new());
@@ -764,17 +775,19 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
-            let chunker = ReceiverStream::new(rx).chunks_timeout(10, Duration::from_millis(20));
-            tokio::pin!(chunker);
-
-            while let Some(msgs) = chunker.next().await {
-                for msg in msgs {
-                    if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
-                        count += change.len();
-                    }
-
-                    write_sync_msg(&mut send_buf, msg, &mut write).await?;
+            while let Some(msg) = rx.recv().await {
+                if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+                    count += change.len();
                 }
+                append_write_buf(&mut send_buf, msg)?;
+
+                if send_buf.len() > 64 * 1024 {
+                    send_sync_write_buffer(&mut send_buf, &mut write).await?;
+                }
+            }
+
+            if !send_buf.is_empty() {
+                send_sync_write_buffer(&mut send_buf, &mut write).await?;
             }
 
             let mut send = write.into_inner();
