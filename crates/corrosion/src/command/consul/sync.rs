@@ -348,7 +348,7 @@ pub async fn update_consul_services(
             if let Some(svc) = services.remove(id) {
                 let hash = hash_service(&svc);
                 if skip_hash_check || *old_hash != hash {
-                    info!("upserting service '{id}'");
+                    info!("updating service '{id}'");
 
                     to_upsert.push((svc.id.clone(), hash));
 
@@ -364,7 +364,7 @@ pub async fn update_consul_services(
 
     // new services
     for (id, svc) in services {
-        info!("upserting service '{id}'");
+        info!("inserting service '{id}'");
 
         let hash = hash_service(&svc);
         to_upsert.push((svc.id.clone(), hash));
@@ -427,7 +427,7 @@ pub async fn update_consul_checks(
             if let Some(check) = checks.remove(id) {
                 let hash = hash_check(&check);
                 if skip_hash_check || *old_hash != hash {
-                    info!("upserting check '{id}'");
+                    info!("updating check '{id}'");
 
                     to_upsert.push((check.id.clone(), hash));
 
