@@ -1688,6 +1688,8 @@ pub async fn process_single_version(
                     })?
                     .collect::<rusqlite::Result<_>>()?;
 
+                let orig_seqs_recorded = seqs_recorded.clone();
+
                 // immediately add the new range to the recorded seqs ranges
                 seqs_recorded.insert(seqs.clone());
 
@@ -1722,7 +1724,7 @@ pub async fn process_single_version(
                 let changeset = Changeset::Full {
                     version,
                     changes,
-                    seqs,
+                    seqs: seqs.clone(),
                     last_seq,
                     ts,
                 };
@@ -1730,7 +1732,7 @@ pub async fn process_single_version(
                 booked_write.insert_many(
                     changeset.versions(),
                     KnownDbVersion::Partial {
-                        seqs: seqs_recorded,
+                        seqs: seqs_recorded.clone(),
                         last_seq,
                         ts,
                     },
@@ -1739,7 +1741,7 @@ pub async fn process_single_version(
                 // if we have no gaps, then we can schedule applying all these changes.
                 if gaps_count == 0 {
                     // no gaps
-
+                    info!(actor_id = %actor_id, version, "no gaps detected, notifying for apply! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}, computed seqs: {seqs_recorded:?} (original: {orig_seqs_recorded:?})");
                     let tx_apply = agent.tx_apply().clone();
                     tokio::spawn(async move {
                         if let Err(e) = tx_apply.send((actor_id, version)).await {
