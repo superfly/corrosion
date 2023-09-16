@@ -1576,6 +1576,21 @@ async fn process_fully_buffered_changes(
     Ok(inserted)
 }
 
+// pub async fn process_multiple_versions(agent: &Agent, changes: Vec<ChangeV1>) -> Vec<Result<Option<Changeset>, ChangeError>> {
+//     let mut res = Vec::with_capacity(changes.len());
+
+//     let bookie = agent.bookie();
+
+//     let mut conn = agent.pool().write_normal().await?;
+
+//     for (i, change) in changes.into_iter().enumerate() {
+//         let booked = bookie.for_actor(actor_id).await;
+//         let mut booked_write = booked.write().await;
+
+//     }
+
+// }
+
 pub async fn process_single_version(
     agent: &Agent,
     change: ChangeV1,
