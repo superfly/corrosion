@@ -16,8 +16,9 @@ use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rusqlite::params;
 use speedy::Writable;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{self, channel, Sender};
 use tokio::task::block_in_place;
+use tokio::time::interval;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -775,19 +776,38 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
-            while let Some(msg) = rx.recv().await {
-                if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
-                    count += change.len();
-                }
-                append_write_buf(&mut send_buf, msg)?;
+            let mut flush_interval = interval(Duration::from_millis(200));
 
-                if send_buf.len() > 64 * 1024 {
+            loop {
+                tokio::select! {
+                    maybe_msg = rx.recv() => match maybe_msg {
+                        Some(msg) => {
+                            if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+                                count += change.len();
+                            }
+                            append_write_buf(&mut send_buf, msg)?;
+                        },
+                        None => break,
+                    },
+                    _ = flush_interval.tick(), if !send_buf.is_empty() => {
+                        let buf_len = send_buf.len();
+                        send_sync_write_buffer(&mut send_buf, &mut write).await?;
+                        debug!("sent {buf_len} bytes after interval");
+                        continue;
+                    }
+                }
+
+                if send_buf.len() >= 2 * 1024 {
+                    let buf_len = send_buf.len();
                     send_sync_write_buffer(&mut send_buf, &mut write).await?;
+                    debug!("sent {buf_len} bytes during loop");
                 }
             }
 
             if !send_buf.is_empty() {
+                let buf_len = send_buf.len();
                 send_sync_write_buffer(&mut send_buf, &mut write).await?;
+                debug!("sent {buf_len} bytes after loop");
             }
 
             let mut send = write.into_inner();
@@ -804,23 +824,24 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
-            loop {
-                match read_sync_msg(&mut read).await {
-                    Ok(None) => {
-                        break;
-                    }
-                    Err(e) => {
-                        error!("sync recv error: {e}");
-                        break;
-                    }
-                    Ok(Some(msg)) => {
-                        let len = match msg {
+            let (msg_tx, msg_rx) = mpsc::channel(100);
+
+            tokio::spawn(async move {
+                loop {
+                    match read_sync_msg(&mut read).await {
+                        Ok(None) => {
+                            break;
+                        }
+                        Err(e) => {
+                            error!("sync recv error: {e}");
+                            break;
+                        }
+                        Ok(Some(msg)) => match msg {
                             SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
-                                let len = change.len();
-                                process_single_version(agent, change)
-                                    .await
-                                    .map_err(SyncRecvError::from)?;
-                                len
+                                if let Err(e) = msg_tx.send(change).await {
+                                    error!("could not send into msg channel: {e}");
+                                    break;
+                                }
                             }
                             SyncMessage::V1(SyncMessageV1::State(_)) => {
                                 warn!("received sync state message more than once, ignoring");
@@ -830,9 +851,23 @@ pub async fn bidirectional_sync(
                                 warn!("received sync clock message more than once, ignoring");
                                 continue;
                             }
-                        };
-                        count += len;
+                        },
                     }
+                }
+            });
+
+            let chunker =
+                ReceiverStream::new(msg_rx).chunks_timeout(10, Duration::from_millis(500));
+            tokio::pin!(chunker);
+
+            while let Some(changes) = chunker.next().await {
+                for change in changes {
+                    let len = change.len();
+                    // TODO: make a "process many versions" function that only needs 1 db conn
+                    process_single_version(agent, change)
+                        .await
+                        .map_err(SyncRecvError::from)?;
+                    count += len;
                 }
             }
 
