@@ -1655,6 +1655,7 @@ pub async fn process_single_version(
 
             // if not a full range!
             if !is_complete {
+                info!(%actor_id, version, "incomplete change, probably going to buffer seqs: {seqs:?}, last_seq: {last_seq:?}");
                 let mut inserted = 0;
                 for change in changes.iter() {
                     trace!("buffering change! {change:?}");
@@ -1769,6 +1770,8 @@ pub async fn process_single_version(
 
                 return Ok((changeset, None));
             }
+
+            info!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}");
 
             let mut impactful_changeset = vec![];
 

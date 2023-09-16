@@ -526,10 +526,6 @@ async fn process_version(
                                         warn!(actor_id = %actor_id, version = %version, "UH OH, was going to {}..={} and that's not allowed (end < start). full range: {start_seq}..={end_seq}, last_seq: {last_seq}", seqs.start(), seqs.end());
                                         return Ok(());
                                     }
-                                    // if changes.len() != ((seqs.end() - seqs.start()) + 1) as usize {
-                                    //     warn!(actor_id = %actor_id, version = %version, "empty partial changes send, not sending to prevent inconsistencies (full range: {start_seq}..={end_seq}, chunk range: {}..={}, chunked seqs: {:?})", seqs.start(), seqs.end(), changes.iter().map(|c| c.seq).collect::<Vec<_>>());
-                                    //     return Ok(());
-                                    // }
                                     info!(actor_id = %actor_id, version = %version, "sending partially buffered changes {}..={} (len: {})", seqs.start(), seqs.end(), changes.len());
                                     tokio::spawn({
                                         let sender = sender.clone();
