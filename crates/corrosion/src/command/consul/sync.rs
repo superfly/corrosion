@@ -386,6 +386,7 @@ pub async fn update_consul_services(
     }
 
     if !statements.is_empty() {
+        // FIXME: either remove this chunking or make it configurable
         for chunk in statements.chunks(50) {
             corrosion.execute(chunk).await?;
         }
@@ -465,6 +466,7 @@ pub async fn update_consul_checks(
     }
 
     if !statements.is_empty() {
+        // FIXME: either remove this chunking or make it configurable
         for chunk in statements.chunks(50) {
             corrosion.execute(chunk).await?;
         }
