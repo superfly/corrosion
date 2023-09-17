@@ -1474,18 +1474,18 @@ async fn process_fully_buffered_changes(
     version: i64,
 ) -> Result<bool, ChangeError> {
     let mut conn = agent.pool().write_normal().await?;
-    info!(actor_id = %actor_id, version = %version, "acquired write (normal) connection to process fully buffered changes");
+    info!(%actor_id, version, "acquired write (normal) connection to process fully buffered changes");
 
     let booked = agent.bookie().for_actor(actor_id).await;
     let mut bookedw = booked.write().await;
-    info!(actor_id = %actor_id, version = %version, "acquired Booked write lock to process fully buffered changes");
+    info!(%actor_id, version, "acquired Booked write lock to process fully buffered changes");
 
     let inserted = block_in_place(|| {
         let (last_seq, ts) = {
             match bookedw.inner().get(&version) {
                 Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
                     if seqs.gaps(&(0..=*last_seq)).count() != 0 {
-                        error!(actor_id = %actor_id, version = %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(0..=*last_seq)).collect::<RangeInclusiveSet<i64>>());
+                        error!(%actor_id, version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(0..=*last_seq)).collect::<RangeInclusiveSet<i64>>());
                         // TODO: return an error here
                         return Ok(false);
                     }
@@ -1504,7 +1504,32 @@ async fn process_fully_buffered_changes(
 
         let tx = conn.transaction()?;
 
-        info!(actor_id = %actor_id, version = %version, "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+        info!(%actor_id, version, "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+
+        {
+            // TODO: remove, this is for debugging purposes
+            let mut prepped = tx.prepare_cached(
+                "SELECT site_id, db_version, seq FROM __corro_buffered_changes
+        WHERE site_id = ?
+          AND version = ?
+        ORDER BY db_version ASC, seq ASC",
+            )?;
+            let mut mapped = prepped.query_map(params![actor_id.as_bytes(), version], |row| {
+                Ok((
+                    (row.get::<_, ActorId>(0)?, row.get::<_, i64>(1)?),
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut map: BTreeMap<_, RangeInclusiveSet<i64>> = BTreeMap::new();
+
+            while let Some(Ok(((actor_id, db_version), seq))) = mapped.next() {
+                map.entry((actor_id, db_version))
+                    .or_default()
+                    .insert(seq..=seq);
+            }
+
+            info!(%actor_id, version, "buffered changes contents: {map:?}");
+        }
 
         let start = Instant::now();
         // insert all buffered changes into crsql_changes directly from the buffered changes table
@@ -1520,7 +1545,7 @@ async fn process_fully_buffered_changes(
                             "#,
             )?
             .execute(params![actor_id.as_bytes(), version])?;
-        info!(actor_id = %actor_id, version = %version, "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+        info!(%actor_id, version, "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
 
         // remove all buffered changes for cleanup purposes
         let count = tx
@@ -1528,7 +1553,7 @@ async fn process_fully_buffered_changes(
                 "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
             )?
             .execute(params![actor_id.as_bytes(), version])?;
-        info!(actor_id = %actor_id, version = %version, "deleted {count} buffered changes");
+        info!(%actor_id, version, "deleted {count} buffered changes");
 
         // delete all bookkept sequences for this version
         let count = tx
@@ -1536,13 +1561,13 @@ async fn process_fully_buffered_changes(
                 "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
             )?
             .execute(params![actor_id, version])?;
-        info!(actor_id = %actor_id, version = %version, "deleted {count} sequences in bookkeeping");
+        info!(%actor_id, version, "deleted {count} sequences in bookkeeping");
 
         let rows_impacted: i64 = tx
             .prepare_cached("SELECT crsql_rows_impacted()")?
             .query_row((), |row| row.get(0))?;
 
-        info!(actor_id = %actor_id, version = %version, "rows impacted by changes: {rows_impacted}");
+        info!(%actor_id, version, "rows impacted by changes: {rows_impacted}");
 
         let known_version = if rows_impacted > 0 {
             let db_version: i64 =
@@ -2102,16 +2127,16 @@ async fn sync_loop(
                     .reset(tokio::time::Instant::now() + sync_backoff.next().unwrap());
             }
             Branch::BackgroundApply { actor_id, version } => {
-                info!(actor_id = %actor_id, version = %version, "picked up background apply of buffered changes");
+                info!(%actor_id, version, "picked up background apply of buffered changes");
                 match process_fully_buffered_changes(&agent, actor_id, version).await {
                     Ok(false) => {
-                        warn!(actor_id = %actor_id, version = %version, "did not apply buffered changes");
+                        warn!(%actor_id, version, "did not apply buffered changes");
                     }
                     Ok(true) => {
-                        info!(actor_id = %actor_id, version = %version, "succesfully applied buffered changes");
+                        info!(%actor_id, version, "succesfully applied buffered changes");
                     }
                     Err(e) => {
-                        error!(actor_id = %actor_id, version = %version, "could not apply fully buffered changes: {e}");
+                        error!(%actor_id, version, "could not apply fully buffered changes: {e}");
                     }
                 }
             }
