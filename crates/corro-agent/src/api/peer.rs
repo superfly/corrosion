@@ -11,15 +11,19 @@ use corro_types::broadcast::{ChangeV1, Changeset};
 use corro_types::change::row_to_change;
 use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
-use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt};
+use futures::{Sink, SinkExt, Stream, TryFutureExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rusqlite::params;
 use speedy::Writable;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{self, channel, Sender};
 use tokio::task::block_in_place;
+use tokio::time::interval;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
+use tripwire::{Outcome, TimeoutFutureExt};
 
 use crate::agent::{process_single_version, SyncRecvError};
 use crate::api::client::{ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
@@ -339,6 +343,7 @@ async fn process_range(
     for (versions, known_version) in overlapping {
         debug!("got overlapping range {versions:?} in {range:?}");
 
+        let mut processed = BTreeSet::new();
         // optimization, cleared versions can't be revived... sending a single batch!
         if let KnownDbVersion::Cleared = &known_version {
             sender
@@ -350,11 +355,10 @@ async fn process_range(
             continue;
         }
 
-        let mut processed = BTreeSet::new();
-
         for version in versions {
             let bw = booked.write().await;
-            if let Some(known_version) = bw.get(&version) {
+            let known = bw.get(&version);
+            if let Some(known_version) = known {
                 process_version(
                     pool,
                     actor_id,
@@ -423,21 +427,33 @@ async fn process_version(
                     for changes_seqs in chunked {
                         match changes_seqs {
                             Ok((changes, seqs)) => {
-                                if sender
-                                    .blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(
-                                        ChangeV1 {
-                                            actor_id,
-                                            changeset: Changeset::Full {
-                                                version,
-                                                changes,
-                                                seqs,
-                                                last_seq: *last_seq,
-                                                ts: *ts,
-                                            },
-                                        },
-                                    )))
-                                    .is_err()
-                                {
+                                debug!(%actor_id, version, "sending fully applied changes {}..={} (requested: {range_needed:?}) (len: {})", seqs.start(), seqs.end(), changes.len());
+                                tokio::spawn({
+                                    let sender = sender.clone();
+                                    let last_seq = *last_seq;
+                                    let ts = *ts;
+                                    async move {
+                                        if let Outcome::Preempted(_) = sender
+                                            .send(SyncMessage::V1(SyncMessageV1::Changeset(
+                                                ChangeV1 {
+                                                    actor_id,
+                                                    changeset: Changeset::Full {
+                                                        version,
+                                                        changes,
+                                                        seqs,
+                                                        last_seq,
+                                                        ts,
+                                                    },
+                                                },
+                                            )))
+                                            .with_timeout(Duration::from_secs(2))
+                                            .await
+                                        {
+                                            error!("timed out sending chunk of changes");
+                                        }
+                                    }
+                                });
+                                if sender.is_closed() {
                                     eyre::bail!("sync message sender channel is closed");
                                 }
                             }
@@ -449,9 +465,9 @@ async fn process_version(
                     }
                 }
             }
-            // TODO: find a way to make this safe...
-            // FIXME: there's a race here between getting this cached "known db version" and processing+clearing the rows in buffered changes
+            // NOTE: still not sure if this is safe, probably going to disable it.
             KnownDbVersion::Partial { seqs, last_seq, ts } => {
+                // return Ok(());
                 debug!("seqs needed: {seqs_needed:?}");
                 debug!("seqs we got: {seqs:?}");
                 if seqs_needed.is_empty() {
@@ -460,10 +476,21 @@ async fn process_version(
 
                 for range_needed in seqs_needed {
                     for range in seqs.overlapping(&range_needed) {
+                        // since there can be partial overlap, we need to only
+                        // send back the specific range we have or else we risk
+                        // sending bad data and creating inconsistencies
+
+                        // pick the biggest start
+                        // e.g. if 0..=10 is needed, and we have 2..=7 then
+                        //      we need to fetch from 2
                         let start_seq = cmp::max(range.start(), range_needed.start());
-                        debug!("start seq: {start_seq}");
+
+                        // pick the smallest end
+                        // e.g. if 0..=10 is needed, and we have 2..=7 then
+                        //      we need to stop at 7
                         let end_seq = cmp::min(range.end(), range_needed.end());
-                        debug!("end seq: {end_seq}");
+
+                        debug!("partial, effective range: {start_seq}..={end_seq}");
 
                         let mut prepped = conn.prepare_cached(
                             r#"
@@ -471,7 +498,8 @@ async fn process_version(
                                 FROM __corro_buffered_changes
                                 WHERE site_id = ?
                                   AND version = ?
-                                  AND seq >= ? AND seq <= ?"#,
+                                  AND seq >= ? AND seq <= ?
+                                  ORDER BY seq ASC"#,
                         )?;
 
                         let site_id: [u8; 16] = actor_id.to_bytes();
@@ -490,18 +518,37 @@ async fn process_version(
                         for changes_seqs in chunked {
                             match changes_seqs {
                                 Ok((changes, seqs)) => {
-                                    if let Err(_e) = sender.blocking_send(SyncMessage::V1(
-                                        SyncMessageV1::Changeset(ChangeV1 {
-                                            actor_id,
-                                            changeset: Changeset::Full {
-                                                version,
-                                                changes,
-                                                seqs,
-                                                last_seq: *last_seq,
-                                                ts: *ts,
-                                            },
-                                        }),
-                                    )) {
+                                    if seqs.end() < seqs.start() {
+                                        warn!(%actor_id, version, "UH OH, was going to {}..={} and that's not allowed (end < start). full range: {start_seq}..={end_seq}, last_seq: {last_seq}", seqs.start(), seqs.end());
+                                        return Ok(());
+                                    }
+                                    debug!(%actor_id, version, "sending partially buffered changes {}..={} (len: {})", seqs.start(), seqs.end(), changes.len());
+                                    tokio::spawn({
+                                        let sender = sender.clone();
+                                        let last_seq = *last_seq;
+                                        let ts = *ts;
+                                        async move {
+                                            if let Outcome::Preempted(_) = sender
+                                                .send(SyncMessage::V1(SyncMessageV1::Changeset(
+                                                    ChangeV1 {
+                                                        actor_id,
+                                                        changeset: Changeset::Full {
+                                                            version,
+                                                            changes,
+                                                            seqs,
+                                                            last_seq,
+                                                            ts,
+                                                        },
+                                                    },
+                                                )))
+                                                .with_timeout(Duration::from_secs(2))
+                                                .await
+                                            {
+                                                error!("timed out sending chunk of changes");
+                                            }
+                                        }
+                                    });
+                                    if sender.is_closed() {
                                         eyre::bail!("sync message sender channel is closed");
                                     }
                                 }
@@ -511,6 +558,7 @@ async fn process_version(
                                 }
                             }
                         }
+                        debug!(%actor_id, version, "done sending chunks of partial changes");
                     }
                 }
             }
@@ -611,14 +659,25 @@ async fn process_sync(
     Ok(())
 }
 
+fn append_write_buf(buf: &mut BytesMut, msg: SyncMessage) -> Result<(), SyncSendError> {
+    msg.write_to_stream(buf.writer())
+        .map_err(SyncMessageEncodeError::from)?;
+    Ok(())
+}
+
 async fn write_sync_msg<W: Sink<Bytes, Error = std::io::Error> + Unpin>(
     buf: &mut BytesMut,
     msg: SyncMessage,
     write: &mut W,
 ) -> Result<(), SyncSendError> {
-    msg.write_to_stream(buf.writer())
-        .map_err(SyncMessageEncodeError::from)?;
+    append_write_buf(buf, msg)?;
+    send_sync_write_buffer(buf, write).await
+}
 
+async fn send_sync_write_buffer<W: Sink<Bytes, Error = std::io::Error> + Unpin>(
+    buf: &mut BytesMut,
+    write: &mut W,
+) -> Result<(), SyncSendError> {
     let buf_len = buf.len();
     write.send(buf.split().freeze()).await?;
 
@@ -709,12 +768,39 @@ pub async fn bidirectional_sync(
     let (_sent_count, recv_count) = tokio::try_join!(
         async move {
             let mut count = 0;
-            while let Some(msg) = rx.recv().await {
-                if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
-                    count += change.len();
+
+            let mut flush_interval = interval(Duration::from_millis(200));
+
+            loop {
+                tokio::select! {
+                    maybe_msg = rx.recv() => match maybe_msg {
+                        Some(msg) => {
+                            if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+                                count += change.len();
+                            }
+                            append_write_buf(&mut send_buf, msg)?;
+                        },
+                        None => break,
+                    },
+                    _ = flush_interval.tick(), if !send_buf.is_empty() => {
+                        let buf_len = send_buf.len();
+                        send_sync_write_buffer(&mut send_buf, &mut write).await?;
+                        debug!("sent {buf_len} bytes after interval");
+                        continue;
+                    }
                 }
 
-                write_sync_msg(&mut send_buf, msg, &mut write).await?;
+                if send_buf.len() >= 2 * 1024 {
+                    let buf_len = send_buf.len();
+                    send_sync_write_buffer(&mut send_buf, &mut write).await?;
+                    debug!("sent {buf_len} bytes during loop");
+                }
+            }
+
+            if !send_buf.is_empty() {
+                let buf_len = send_buf.len();
+                send_sync_write_buffer(&mut send_buf, &mut write).await?;
+                debug!("sent {buf_len} bytes after loop");
             }
 
             let mut send = write.into_inner();
@@ -731,23 +817,24 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
-            loop {
-                match read_sync_msg(&mut read).await {
-                    Ok(None) => {
-                        break;
-                    }
-                    Err(e) => {
-                        error!("sync recv error: {e}");
-                        break;
-                    }
-                    Ok(Some(msg)) => {
-                        let len = match msg {
+            let (msg_tx, msg_rx) = mpsc::channel(100);
+
+            tokio::spawn(async move {
+                loop {
+                    match read_sync_msg(&mut read).await {
+                        Ok(None) => {
+                            break;
+                        }
+                        Err(e) => {
+                            error!("sync recv error: {e}");
+                            break;
+                        }
+                        Ok(Some(msg)) => match msg {
                             SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
-                                let len = change.len();
-                                process_single_version(agent, change)
-                                    .await
-                                    .map_err(SyncRecvError::from)?;
-                                len
+                                if let Err(e) = msg_tx.send(change).await {
+                                    error!("could not send into msg channel: {e}");
+                                    break;
+                                }
                             }
                             SyncMessage::V1(SyncMessageV1::State(_)) => {
                                 warn!("received sync state message more than once, ignoring");
@@ -757,9 +844,23 @@ pub async fn bidirectional_sync(
                                 warn!("received sync clock message more than once, ignoring");
                                 continue;
                             }
-                        };
-                        count += len;
+                        },
                     }
+                }
+            });
+
+            let chunker =
+                ReceiverStream::new(msg_rx).chunks_timeout(10, Duration::from_millis(500));
+            tokio::pin!(chunker);
+
+            while let Some(changes) = chunker.next().await {
+                for change in changes {
+                    let len = change.len();
+                    // TODO: make a "process many versions" function that only needs 1 db conn
+                    process_single_version(agent, change)
+                        .await
+                        .map_err(SyncRecvError::from)?;
+                    count += len;
                 }
             }
 

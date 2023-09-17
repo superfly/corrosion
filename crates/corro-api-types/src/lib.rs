@@ -40,6 +40,12 @@ pub enum Statement {
     WithNamedParams(String, HashMap<String, SqliteValue>),
 }
 
+impl From<&str> for Statement {
+    fn from(value: &str) -> Self {
+        Statement::Simple(value.into())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RqliteResponse {
     pub results: Vec<RqliteResult>,

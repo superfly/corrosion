@@ -2,40 +2,58 @@ use std::{
     collections::HashMap,
     io::Write,
     sync::Arc,
+    task::Poll,
     time::{Duration, Instant},
 };
 
 use axum::{http::StatusCode, response::IntoResponse, Extension};
-use bytes::{BufMut, BytesMut};
-use compact_str::{format_compact, CompactString, ToCompactString};
+use bytes::{BufMut, Bytes, BytesMut};
+use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::Agent,
     api::{QueryEvent, Statement},
     change::SqliteValue,
-    pubsub::{normalize_sql, Matcher, MatcherCmd},
+    pubsub::{Matcher, MatcherError, MatcherHandle, NormalizeStatementError},
+    sqlite::SqlitePoolError,
 };
-use futures::future::poll_fn;
+use futures::{future::poll_fn, ready, Stream};
 use rusqlite::Connection;
 use tokio::{
     sync::{broadcast, mpsc, RwLock as TokioRwLock},
     task::block_in_place,
-    time::interval,
 };
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
+use tokio_util::sync::PollSender;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 pub async fn api_v1_sub_by_id(
     Extension(agent): Extension<Agent>,
+    Extension(bcast_cache): Extension<MatcherBroadcastCache>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> impl IntoResponse {
-    sub_by_id(agent, id).await
+    sub_by_id(agent, id, &bcast_cache).await
 }
 
-async fn sub_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
-    let matcher = match { agent.matchers().read().get(&id).cloned() } {
-        Some(matcher) => matcher,
+async fn sub_by_id(
+    agent: Agent,
+    id: Uuid,
+    bcast_cache: &MatcherBroadcastCache,
+) -> hyper::Response<hyper::Body> {
+    let (matcher, rx) = match bcast_cache.read().await.get(&id).and_then(|tx| {
+        agent
+            .matchers()
+            .read()
+            .get(&id)
+            .cloned()
+            .and_then(|matcher| (tx.receiver_count() > 0).then(|| (matcher, tx.subscribe())))
+    }) {
+        Some(matcher_rx) => matcher_rx,
         None => {
+            // ensure this goes!
+            bcast_cache.write().await.remove(&id);
+            agent.matchers().write().remove(&id);
+
             return hyper::Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(
@@ -45,96 +63,17 @@ async fn sub_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
                     .expect("could not serialize queries stream error")
                     .into(),
                 )
-                .expect("could not build error response")
+                .expect("could not build error response");
         }
     };
 
+    let (evt_tx, evt_rx) = mpsc::channel(512);
+
+    tokio::spawn(catch_up_sub(agent, matcher, rx, evt_tx));
+
     let (tx, body) = hyper::Body::channel();
 
-    // TODO: timeout on data send instead of infinitely waiting for channel space.
-    let (init_tx, init_rx) = mpsc::channel(512);
-    let change_rx = matcher.subscribe();
-    let cancel = matcher.cancel();
-
-    tokio::spawn(process_sub_channel(
-        agent.clone(),
-        id,
-        tx,
-        init_rx,
-        change_rx,
-        matcher.cmd_tx().clone(),
-        cancel,
-    ));
-
-    let pool = agent.pool().dedicated_pool().clone();
-    tokio::spawn(async move {
-        if let Err(_e) = init_tx
-            .send(QueryEvent::Columns(matcher.0.col_names.clone()))
-            .await
-        {
-            warn!("could not send back column names, client is probably gone. returning.");
-            return;
-        }
-
-        let conn = match pool.get().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
-                return;
-            }
-        };
-
-        #[derive(Debug, thiserror::Error)]
-        enum QueryTempError {
-            #[error(transparent)]
-            Sqlite(#[from] rusqlite::Error),
-            #[error(transparent)]
-            Send(#[from] mpsc::error::SendError<QueryEvent>),
-        }
-
-        let res = block_in_place(|| {
-            let mut query_cols = vec![];
-            for i in 0..(matcher.0.parsed.columns.len()) {
-                query_cols.push(format!("col_{i}"));
-            }
-            let mut prepped = conn.prepare_cached(&format!(
-                "SELECT __corro_rowid,{} FROM {}",
-                query_cols.join(","),
-                matcher.table_name()
-            ))?;
-            let col_count = prepped.column_count();
-
-            init_tx.blocking_send(QueryEvent::Columns(matcher.0.col_names.clone()))?;
-
-            let start = Instant::now();
-            let mut rows = prepped.query(())?;
-            let elapsed = start.elapsed();
-
-            loop {
-                let row = match rows.next()? {
-                    Some(row) => row,
-                    None => break,
-                };
-                let rowid = row.get(0)?;
-
-                let cells = (1..col_count)
-                    .map(|i| row.get::<_, SqliteValue>(i))
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-
-                init_tx.blocking_send(QueryEvent::Row(rowid, cells))?;
-            }
-
-            init_tx.blocking_send(QueryEvent::EndOfQuery {
-                time: elapsed.as_secs_f64(),
-            })?;
-
-            Ok::<_, QueryTempError>(())
-        });
-
-        if let Err(QueryTempError::Sqlite(e)) = res {
-            _ = init_tx.send(QueryEvent::Error(e.to_compact_string())).await;
-        }
-    });
+    tokio::spawn(forward_bytes_to_body_sender(evt_rx, tx));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -143,179 +82,46 @@ async fn sub_by_id(agent: Agent, id: Uuid) -> hyper::Response<hyper::Body> {
         .expect("could not build query response body")
 }
 
+fn make_query_event_bytes(buf: &mut BytesMut, query_evt: QueryEvent) -> serde_json::Result<Bytes> {
+    {
+        let mut writer = buf.writer();
+        serde_json::to_writer(&mut writer, &query_evt)?;
+
+        // NOTE: I think that's infaillible...
+        writer
+            .write_all(b"\n")
+            .expect("could not write new line to BytesMut Writer");
+    }
+
+    Ok(buf.split().freeze())
+}
+
 async fn process_sub_channel(
     agent: Agent,
-    matcher_id: Uuid,
-    mut tx: hyper::body::Sender,
-    mut init_rx: mpsc::Receiver<QueryEvent>,
-    mut change_rx: broadcast::Receiver<QueryEvent>,
-    cmd_tx: mpsc::Sender<MatcherCmd>,
-    cancel: CancellationToken,
+    id: Uuid,
+    tx: broadcast::Sender<Bytes>,
+    mut evt_rx: mpsc::Receiver<QueryEvent>,
 ) {
     let mut buf = BytesMut::new();
 
-    let mut init_done = false;
-    let mut check_ready = interval(Duration::from_secs(1));
-    let mut cancelled = false;
-    loop {
-        // either we get data we need to transmit
-        // or we check every 1s if the client is still ready to receive data
-        let query_evt = tokio::select! {
-            _ = cancel.cancelled() => {
-                debug!("canceled!");
-                cancelled = true;
+    while let Some(query_evt) = evt_rx.recv().await {
+        let send_res = match make_query_event_bytes(&mut buf, query_evt) {
+            Ok(b) => tx.send(b),
+            Err(e) => {
+                _ = tx.send(error_to_query_event_bytes(&mut buf, e));
                 break;
-            },
-            maybe_query_evt = init_rx.recv(), if !init_done => match maybe_query_evt {
-                Some(query_evt) => query_evt,
-                None => {
-                    init_done = true;
-                    continue;
-                }
-            },
-            res = change_rx.recv(), if init_done => match res {
-                Ok(query_evt) => query_evt,
-                Err(e) => {
-                    warn!("could not receive change: {e}");
-                    break;
-                }
-            },
-            _ = check_ready.tick() => {
-                if poll_fn(|cx| tx.poll_ready(cx)).await.is_err() {
-                    break;
-                }
-                continue;
             }
         };
 
-        {
-            let mut writer = (&mut buf).writer();
-
-            let mut query_evt = query_evt;
-
-            loop {
-                if matches!(query_evt, QueryEvent::EndOfQuery { .. }) {
-                    init_done = true;
-                }
-
-                let mut recv = if init_done {
-                    TryReceiver::Broadcast(&mut change_rx)
-                } else {
-                    TryReceiver::Mpsc(&mut init_rx)
-                };
-
-                if let Err(e) = serde_json::to_writer(&mut writer, &query_evt) {
-                    _ = tx
-                        .send_data(
-                            serde_json::to_vec(&serde_json::json!(QueryEvent::Error(
-                                e.to_compact_string()
-                            )))
-                            .expect("could not serialize error json")
-                            .into(),
-                        )
-                        .await;
-                    return;
-                }
-
-                // NOTE: I think that's infaillible...
-                writer
-                    .write_all(b"\n")
-                    .expect("could not write new line to BytesMut Writer");
-
-                // accumulate up to ~64KB
-                // TODO: predict if we can fit one more in 64KB or not based on previous writes
-                if writer.get_ref().len() >= 64 * 1024 {
-                    break;
-                }
-
-                match recv.try_recv() {
-                    Ok(new) => query_evt = new,
-                    Err(e) => {
-                        match e {
-                            TryRecvError::Empty => break,
-                            TryRecvError::Closed => break,
-
-                            TryRecvError::Lagged(lagged) => {
-                                error!("change recv lagged by {lagged}, stopping subscription processing");
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Err(e) = tx.send_data(buf.split().freeze()).await {
-            error!("could not send data through body's channel: {e}");
-            return;
+        if let Err(_e) = send_res {
+            debug!("no more active receivers for subscription");
+            break;
         }
     }
-    debug!("query body channel done");
 
-    drop(change_rx);
+    debug!("subscription query channel done");
 
-    if cancelled {
-        // try to remove if it exists.
-        info!("matcher {matcher_id} was cancelled, removing");
-        agent.matchers().write().remove(&matcher_id);
-    } else {
-        _ = cmd_tx.send(MatcherCmd::Unsubscribe).await;
-        let mut matchers = agent.matchers().write();
-        let no_mo_receivers = matchers
-            .get(&matcher_id)
-            .map(|m| m.receiver_count() == 0)
-            .unwrap_or(false);
-        if no_mo_receivers {
-            info!("no more receivers for matcher {matcher_id}, removing");
-            matchers.remove(&matcher_id);
-        }
-    }
-}
-
-enum TryReceiver<'a, T> {
-    Mpsc(&'a mut mpsc::Receiver<T>),
-    Broadcast(&'a mut broadcast::Receiver<T>),
-}
-
-impl<'a, T> TryReceiver<'a, T>
-where
-    T: Clone,
-{
-    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        Ok(match self {
-            TryReceiver::Mpsc(r) => r.try_recv()?,
-            TryReceiver::Broadcast(b) => b.try_recv()?,
-        })
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-enum TryRecvError {
-    #[error("empty")]
-    Empty,
-    #[error("closed")]
-    Closed,
-    #[error("lagged by {0}")]
-    Lagged(u64),
-}
-
-impl From<broadcast::error::TryRecvError> for TryRecvError {
-    fn from(value: broadcast::error::TryRecvError) -> Self {
-        match value {
-            broadcast::error::TryRecvError::Empty => TryRecvError::Empty,
-            broadcast::error::TryRecvError::Closed => TryRecvError::Closed,
-            broadcast::error::TryRecvError::Lagged(lagged) => TryRecvError::Lagged(lagged),
-        }
-    }
-}
-
-impl From<mpsc::error::TryRecvError> for TryRecvError {
-    fn from(value: mpsc::error::TryRecvError) -> Self {
-        match value {
-            mpsc::error::TryRecvError::Empty => TryRecvError::Empty,
-            mpsc::error::TryRecvError::Disconnected => TryRecvError::Closed,
-        }
-    }
+    agent.matchers().write().remove(&id);
 }
 
 fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<Option<String>> {
@@ -342,126 +148,317 @@ fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<O
     })
 }
 
-async fn expand_sql(
-    agent: &Agent,
-    stmt: &Statement,
-) -> Result<String, (StatusCode, CompactString)> {
-    match agent.pool().read().await {
-        Ok(conn) => match expanded_statement(&conn, stmt) {
-            Ok(Some(stmt)) => match normalize_sql(&stmt) {
-                Ok(stmt) => Ok(stmt),
-                Err(e) => Err((StatusCode::BAD_REQUEST, e.to_compact_string())),
-            },
-            Ok(None) => Err((
-                StatusCode::BAD_REQUEST,
-                "could not expand statement's sql w/ params".into(),
-            )),
-            Err(e) => Err((StatusCode::BAD_REQUEST, e.to_compact_string())),
-        },
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_compact_string())),
+async fn expand_sql(agent: &Agent, stmt: &Statement) -> Result<String, MatcherUpsertError> {
+    let conn = agent.pool().read().await?;
+    expanded_statement(&conn, stmt)?.ok_or(MatcherUpsertError::CouldNotExpand)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MatcherUpsertError {
+    #[error(transparent)]
+    Pool(#[from] SqlitePoolError),
+    #[error(transparent)]
+    PoolDedicated(#[from] corro_types::sqlite::Error),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("could not expand sql statement")]
+    CouldNotExpand,
+    #[error(transparent)]
+    NormalizeStatement(#[from] NormalizeStatementError),
+    #[error(transparent)]
+    Matcher(#[from] MatcherError),
+}
+
+impl MatcherUpsertError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            MatcherUpsertError::Pool(_)
+            | MatcherUpsertError::PoolDedicated(_)
+            | MatcherUpsertError::CouldNotExpand => StatusCode::INTERNAL_SERVER_ERROR,
+            MatcherUpsertError::Sqlite(_)
+            | MatcherUpsertError::NormalizeStatement(_)
+            | MatcherUpsertError::Matcher(_) => StatusCode::BAD_REQUEST,
+        }
     }
 }
 
-pub type MatcherCache = Arc<TokioRwLock<HashMap<String, Uuid>>>;
+impl From<MatcherUpsertError> for hyper::Response<hyper::Body> {
+    fn from(value: MatcherUpsertError) -> Self {
+        hyper::Response::builder()
+            .status(value.status_code())
+            .body(
+                serde_json::to_vec(&QueryEvent::Error(value.to_compact_string()))
+                    .expect("could not serialize queries stream error")
+                    .into(),
+            )
+            .expect("could not build error response")
+    }
+}
 
-pub async fn api_v1_subs(
-    Extension(agent): Extension<Agent>,
-    Extension(subscription_cache): Extension<MatcherCache>,
-    axum::extract::Json(stmt): axum::extract::Json<Statement>,
-) -> impl IntoResponse {
-    let stmt = match expand_sql(&agent, &stmt).await {
-        Ok(stmt) => stmt,
-        Err((status, e)) => {
-            return hyper::Response::builder()
-                .status(status)
-                .body(
-                    serde_json::to_vec(&QueryEvent::Error(e))
-                        .expect("could not serialize queries stream error")
-                        .into(),
-                )
-                .expect("could not build error response");
-        }
-    };
+pub type MatcherIdCache = Arc<TokioRwLock<HashMap<String, Uuid>>>;
+pub type MatcherBroadcastCache = Arc<TokioRwLock<HashMap<Uuid, broadcast::Sender<Bytes>>>>;
 
-    let matcher_id = { subscription_cache.read().await.get(&stmt).cloned() };
+#[derive(Debug, thiserror::Error)]
+pub enum CatchUpError {
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Send(#[from] mpsc::error::SendError<Bytes>),
+    #[error(transparent)]
+    SerdeJson(#[from] serde_json::Error),
+}
 
-    if let Some(matcher_id) = matcher_id {
-        let contains = { agent.matchers().read().contains_key(&matcher_id) };
-        if contains {
-            info!("reusing matcher id {matcher_id}");
-            return sub_by_id(agent, matcher_id).await;
-        } else {
-            subscription_cache.write().await.remove(&stmt);
+fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> Bytes {
+    {
+        let mut writer = buf.writer();
+        serde_json::to_writer(&mut writer, &QueryEvent::Error(e.to_compact_string()))
+            .expect("could not write QueryEvent::Error to buffer");
+
+        // NOTE: I think that's infaillible...
+        writer
+            .write_all(b"\n")
+            .expect("could not write new line to BytesMut Writer");
+    }
+
+    buf.split().freeze()
+}
+
+pub async fn catch_up_sub(
+    agent: Agent,
+    matcher: MatcherHandle,
+    sub_rx: broadcast::Receiver<Bytes>,
+    tx: mpsc::Sender<Bytes>,
+) -> eyre::Result<()> {
+    {
+        let mut buf = BytesMut::new();
+
+        let pool = agent.pool().dedicated_pool();
+
+        let conn = match pool.get().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tx.send(error_to_query_event_bytes(&mut buf, e)).await?;
+                return Ok(());
+            }
+        };
+
+        let res = block_in_place(|| {
+            let mut query_cols = vec![];
+            for i in 0..(matcher.parsed_columns().len()) {
+                query_cols.push(format!("col_{i}"));
+            }
+            let mut prepped = conn.prepare_cached(&format!(
+                "SELECT __corro_rowid,{} FROM {}",
+                query_cols.join(","),
+                matcher.table_name()
+            ))?;
+            let col_count = prepped.column_count();
+
+            tx.blocking_send(make_query_event_bytes(
+                &mut buf,
+                QueryEvent::Columns(matcher.col_names().to_vec()),
+            )?)?;
+
+            let start = Instant::now();
+            let mut rows = prepped.query(())?;
+            let elapsed = start.elapsed();
+
+            loop {
+                let row = match rows.next()? {
+                    Some(row) => row,
+                    None => break,
+                };
+                let rowid = row.get(0)?;
+
+                let cells = (1..col_count)
+                    .map(|i| row.get::<_, SqliteValue>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                tx.blocking_send(make_query_event_bytes(
+                    &mut buf,
+                    QueryEvent::Row(rowid, cells),
+                )?)?;
+            }
+
+            tx.blocking_send(make_query_event_bytes(
+                &mut buf,
+                QueryEvent::EndOfQuery {
+                    time: elapsed.as_secs_f64(),
+                },
+            )?)?;
+
+            Ok::<_, CatchUpError>(())
+        });
+
+        if let Err(CatchUpError::Sqlite(e)) = res {
+            _ = tx.send(error_to_query_event_bytes(&mut buf, e)).await;
         }
     }
 
-    let conn = match agent.pool().dedicated().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            return hyper::Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(
-                    serde_json::to_vec(&QueryEvent::Error(e.to_compact_string()))
-                        .expect("could not serialize queries stream error")
-                        .into(),
-                )
-                .expect("could not build error response")
+    forward_sub_to_sender(sub_rx, tx).await;
+
+    Ok(())
+}
+
+pub async fn upsert_sub(
+    agent: &Agent,
+    cache: &MatcherIdCache,
+    bcast_cache: &MatcherBroadcastCache,
+    stmt: Statement,
+    tx: mpsc::Sender<Bytes>,
+) -> Result<Uuid, MatcherUpsertError> {
+    let stmt = expand_sql(agent, &stmt).await?;
+
+    let mut cache_write = cache.write().await;
+    let mut bcast_write = bcast_cache.write().await;
+
+    let maybe_matcher = cache_write
+        .get(&stmt)
+        .and_then(|id| bcast_write.get(id).map(|sender| (*id, sender)));
+
+    if let Some((matcher_id, sender)) = maybe_matcher {
+        let maybe_matcher = (sender.receiver_count() > 0)
+            .then(|| agent.matchers().read().get(&matcher_id).cloned())
+            .flatten();
+        if let Some(matcher) = maybe_matcher {
+            let rx = sender.subscribe();
+            tokio::spawn(catch_up_sub(agent.clone(), matcher, rx, tx));
+            return Ok(matcher_id);
+        } else {
+            cache_write.remove(&stmt);
+            bcast_write.remove(&matcher_id);
         }
-    };
+    }
 
-    let (tx, body) = hyper::Body::channel();
+    let conn = agent.pool().dedicated().await?;
 
-    // TODO: timeout on data send instead of infinitely waiting for channel space.
-    let (data_tx, data_rx) = mpsc::channel(512);
-    let (change_tx, change_rx) = broadcast::channel(10240);
+    let (evt_tx, evt_rx) = mpsc::channel(512);
 
     let matcher_id = Uuid::new_v4();
-    let cancel = CancellationToken::new();
 
-    let matcher = match block_in_place(|| {
-        Matcher::new(
-            matcher_id,
-            &agent.schema().read(),
-            conn,
-            data_tx.clone(),
-            change_tx,
-            &stmt,
-            cancel.clone(),
-        )
-    }) {
-        Ok(m) => m,
-        Err(e) => {
-            return hyper::Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(
-                    serde_json::to_vec(&QueryEvent::Error(e.to_compact_string()))
-                        .expect("could not serialize queries stream error")
-                        .into(),
-                )
-                .expect("could not build error response")
-        }
-    };
+    let matcher = Matcher::create(matcher_id, &agent.schema().read(), conn, evt_tx, &stmt)?;
+
+    let (sub_tx, sub_rx) = broadcast::channel(10240);
+
+    cache_write.insert(stmt, matcher_id);
+    bcast_write.insert(matcher_id, sub_tx.clone());
 
     {
-        agent.matchers().write().insert(matcher_id, matcher.clone());
-        subscription_cache.write().await.insert(stmt, matcher_id);
+        agent.matchers().write().insert(matcher_id, matcher);
     }
+
+    tokio::spawn(forward_sub_to_sender(sub_rx, tx));
 
     tokio::spawn(process_sub_channel(
         agent.clone(),
         matcher_id,
-        tx,
-        data_rx,
-        change_rx,
-        matcher.cmd_tx().clone(),
-        cancel.clone(),
+        sub_tx,
+        evt_rx,
     ));
+
+    Ok(matcher_id)
+}
+
+pub async fn api_v1_subs(
+    Extension(agent): Extension<Agent>,
+    Extension(sub_cache): Extension<MatcherIdCache>,
+    Extension(bcast_cache): Extension<MatcherBroadcastCache>,
+    axum::extract::Json(stmt): axum::extract::Json<Statement>,
+) -> impl IntoResponse {
+    let (tx, body) = hyper::Body::channel();
+    let (forward_tx, forward_rx) = mpsc::channel(10240);
+
+    let matcher_id = match upsert_sub(&agent, &sub_cache, &bcast_cache, stmt, forward_tx).await {
+        Ok(id) => id,
+        Err(e) => return hyper::Response::<hyper::Body>::from(e),
+    };
+
+    tokio::spawn(forward_bytes_to_body_sender(forward_rx, tx));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
         .header("corro-query-id", matcher_id.to_string())
         .body(body)
         .expect("could not generate ok http response for query request")
+}
+
+async fn forward_sub_to_sender(sub_rx: broadcast::Receiver<Bytes>, tx: mpsc::Sender<Bytes>) {
+    let chunker = tokio_stream::wrappers::BroadcastStream::new(sub_rx)
+        .chunks_timeout(10, Duration::from_millis(10));
+
+    tokio::pin!(chunker);
+
+    let mut buf = BytesMut::new();
+
+    let mut tx = PollSender::new(tx);
+
+    loop {
+        let res: Result<Option<Bytes>, BroadcastStreamRecvError> = poll_fn(|cx| {
+            if let Err(_e) = ready!(tx.poll_reserve(cx)) {
+                return Poll::Ready(Ok(None));
+            }
+            match ready!(chunker.as_mut().poll_next(cx)) {
+                Some(chunks) => {
+                    for chunk in chunks {
+                        buf.extend_from_slice(&chunk?);
+                    }
+                    Poll::Ready(Ok(Some(buf.split().freeze())))
+                }
+                None => Poll::Ready(Ok(None)),
+            }
+        })
+        .await;
+
+        match res {
+            Ok(Some(b)) => {
+                if let Err(_e) = tx.send_item(b) {
+                    error!("could not forward subscription query event to receiver, channel is closed!");
+                    return;
+                }
+            }
+            Ok(None) => {
+                debug!("finished w/ broadcast");
+                break;
+            }
+            Err(e) => {
+                error!("could not receive subscription query event: {e}");
+                buf.clear();
+                // should be safe to send because the poll to reserve succeeded
+                if let Err(_e) = tx.send_item(error_to_query_event_bytes(&mut buf, e)) {
+                    debug!("could not send back subscription receive error! channel is closed");
+                }
+                return;
+            }
+        }
+    }
+}
+
+async fn forward_bytes_to_body_sender(mut rx: mpsc::Receiver<Bytes>, mut tx: hyper::body::Sender) {
+    loop {
+        let res = {
+            poll_fn(|cx| {
+                ready!(tx.poll_ready(cx))?;
+                Poll::Ready(Ok::<_, hyper::Error>(ready!(rx.poll_recv(cx))))
+            })
+            .await
+        };
+        match res {
+            Ok(Some(b)) => {
+                if let Err(e) = tx.send_data(b).await {
+                    error!("could not send query event data through body: {e}");
+                    break;
+                }
+            }
+            Ok(None) => {
+                // done...
+                break;
+            }
+            Err(e) => {
+                debug!("body was not ready anymore: {e}");
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +550,7 @@ mod tests {
 
         let res = api_v1_subs(
             Extension(agent.clone()),
+            Extension(Default::default()),
             Extension(Default::default()),
             axum::Json(Statement::Simple("select * from tests".into())),
         )

@@ -35,14 +35,14 @@ use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, Timestamp},
     config::Config,
-    pubsub::Matcher,
+    pubsub::MatcherHandle,
     schema::NormalizedSchema,
     sqlite::{CrConnManager, RusqliteConnManager, SqlitePool, SqlitePoolError},
 };
 
 use super::members::Members;
 
-pub type Matchers = HashMap<uuid::Uuid, Matcher>;
+pub type Matchers = HashMap<uuid::Uuid, MatcherHandle>;
 
 #[derive(Clone)]
 pub struct Agent(Arc<AgentInner>);
@@ -350,10 +350,6 @@ impl SplitPool {
         self.write_inner(&self.0.low_tx, "low").await
     }
 
-    pub fn blocking_write_low(&self) -> Result<WriteConn<'static>, PoolError> {
-        Handle::current().block_on(self.write_inner_owned(&self.0.low_tx, "priority"))
-    }
-
     async fn write_inner(
         &self,
         chan: &Sender<oneshot::Sender<CancellationToken>>,
@@ -365,31 +361,6 @@ impl SplitPool {
         let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
         histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
         let conn = self.0.write.get().await?;
-
-        tokio::spawn(timeout_wait(
-            token.clone(),
-            conn.get_interrupt_handle(),
-            Duration::from_secs(30),
-            queue,
-        ));
-
-        Ok(WriteConn {
-            conn,
-            _drop_guard: token.drop_guard(),
-        })
-    }
-
-    async fn write_inner_owned(
-        &self,
-        chan: &Sender<oneshot::Sender<CancellationToken>>,
-        queue: &'static str,
-    ) -> Result<WriteConn<'static>, PoolError> {
-        let (tx, rx) = oneshot::channel();
-        chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
-        let start = Instant::now();
-        let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
-        histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
-        let conn = self.0.write.get_owned().await?;
 
         tokio::spawn(timeout_wait(
             token.clone(),
@@ -484,10 +455,6 @@ impl Booked {
         Self(inner)
     }
 
-    pub async fn insert(&self, version: i64, db_version: KnownDbVersion) {
-        self.0.write().await.insert(version..=version, db_version);
-    }
-
     pub async fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
         match seqs {
             Some(check_seqs) => {
@@ -516,6 +483,10 @@ impl Booked {
 
     pub async fn write(&self) -> BookWriter {
         BookWriter(self.0.write().await)
+    }
+
+    pub fn blocking_write(&self) -> BookWriter {
+        BookWriter(self.0.blocking_write())
     }
 }
 
@@ -645,19 +616,13 @@ impl Bookie {
         Self(inner)
     }
 
-    pub async fn add(&self, actor_id: ActorId, version: i64, db_version: KnownDbVersion) {
-        if let Some(booked) = self.0.read().await.get(&actor_id) {
-            booked.insert(version, db_version).await;
-            return;
-        }
-
-        let mut w = self.0.write().await;
-        let booked = w.entry(actor_id).or_default();
-        booked.insert(version, db_version).await;
-    }
-
     pub async fn for_actor(&self, actor_id: ActorId) -> Booked {
         let mut w = self.0.write().await;
+        w.entry(actor_id).or_default().clone()
+    }
+
+    pub fn for_actor_blocking(&self, actor_id: ActorId) -> Booked {
+        let mut w = self.0.blocking_write();
         w.entry(actor_id).or_default().clone()
     }
 

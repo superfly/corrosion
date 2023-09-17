@@ -18,7 +18,6 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
-use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 #[derive(Args)]
@@ -32,17 +31,6 @@ pub async fn run(
     template: &Vec<String>,
     flags: &TemplateFlags,
 ) -> eyre::Result<()> {
-    let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
-    println!("tracing-filter directives: {directives}");
-    let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
-    if let Some(diags) = diags {
-        eprintln!("While parsing env filters: {diags}, using default");
-    }
-    tracing_subscriber::registry::Registry::default()
-        .with(filter.layer())
-        .with(tracing_subscriber::fmt::Layer::new())
-        .init();
-
     let client = CorrosionApiClient::new(api_addr);
     let engine = corro_tpl::Engine::new::<std::fs::File>(client);
 

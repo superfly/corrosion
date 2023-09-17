@@ -87,7 +87,9 @@ pub enum Changeset {
     Full {
         version: i64,
         changes: Vec<Change>,
+        // cr-sqlite sequences contained in this changeset
         seqs: RangeInclusive<i64>,
+        // last cr-sqlite sequence for the complete changeset
         last_seq: i64,
         ts: Timestamp,
     },

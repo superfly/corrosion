@@ -141,7 +141,6 @@ where
     trace!("got conn");
 
     let actor_id = agent.actor_id();
-
     let booked = agent.bookie().for_actor(actor_id).await;
     // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
     // so it probably doesn't matter too much, except for reads of internal state
