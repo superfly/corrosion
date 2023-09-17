@@ -51,7 +51,7 @@ use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{named_params, params, Connection, Transaction};
 use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
@@ -1510,14 +1510,14 @@ async fn process_fully_buffered_changes(
         // insert all buffered changes into crsql_changes directly from the buffered changes table
         let count = tx
             .prepare_cached(
-                "
-                INSERT INTO crsql_changes (\"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
-                    SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
+                r#"
+                INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                    SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
-                                AND version = ?
+                              AND version = ?
                             ORDER BY db_version ASC, seq ASC
-                            ",
+                            "#,
             )?
             .execute(params![actor_id.as_bytes(), version])?;
         info!(actor_id = %actor_id, version = %version, "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
@@ -1666,31 +1666,31 @@ pub async fn process_single_version(
                             INSERT INTO __corro_buffered_changes
                                 ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, version)
                             VALUES
-                                (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?,   ?)
+                                (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq, :version)
                             ON CONFLICT (site_id, db_version, version, seq)
                                 DO NOTHING
                         "#,
                     )?
-                    .execute(params![
-                        change.table.as_str(),
-                        change.pk,
-                        change.cid.as_str(),
-                        &change.val,
-                        change.col_version,
-                        change.db_version,
-                        &change.site_id,
-                        change.cl,
-                        change.seq,
-                        version,
-                    ])?;
+                    .execute(named_params!{
+                        ":table": change.table.as_str(),
+                        ":pk": change.pk,
+                        ":cid": change.cid.as_str(),
+                        ":val": &change.val,
+                        ":col_version": change.col_version,
+                        ":db_version": change.db_version,
+                        ":site_id": &change.site_id,
+                        ":cl": change.cl,
+                        ":seq": change.seq,
+                        ":version": version,
+                    })?;
                 }
 
                 if changes.len() != inserted {
-                    debug!(actor = %agent.actor_id(), "did not insert as many changes... {inserted}");
+                    warn!(%actor_id, version, "did not insert as many changes... {inserted}");
                 }
 
                 // calculate all known sequences for the actor + version combo
-                let mut seqs_recorded: RangeInclusiveSet<i64> = tx
+                let mut seqs_in_bookkeeping: RangeInclusiveSet<i64> = tx
                     .prepare_cached(
                         "
                     SELECT start_seq, end_seq
@@ -1704,23 +1704,23 @@ pub async fn process_single_version(
                     })?
                     .collect::<rusqlite::Result<_>>()?;
 
-                let orig_seqs_recorded = seqs_recorded.clone();
+                let orig_seqs_in_bookkeeping = seqs_in_bookkeeping.clone();
 
                 // immediately add the new range to the recorded seqs ranges
-                seqs_recorded.insert(seqs.clone());
+                seqs_in_bookkeeping.insert(seqs.clone());
 
                 // all seq for this version (from 0 to the last seq, inclusively)
                 let full_seqs_range = 0..=last_seq;
 
                 // figure out how many seq gaps we have between 0 and the last seq for this version
-                let gaps_count = seqs_recorded.gaps(&full_seqs_range).count();
+                let gaps_count = seqs_in_bookkeeping.gaps(&full_seqs_range).count();
 
                 tx.prepare_cached(
                     "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
                 )?
                 .execute(params![actor_id, version])?;
 
-                for range in seqs_recorded.iter() {
+                for range in seqs_in_bookkeeping.iter() {
                     tx.prepare_cached("INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
                     VALUES (?, ?, ?, ?, ?, ?)
                         ",
@@ -1748,7 +1748,7 @@ pub async fn process_single_version(
                 booked_write.insert_many(
                     changeset.versions(),
                     KnownDbVersion::Partial {
-                        seqs: seqs_recorded.clone(),
+                        seqs: seqs_in_bookkeeping.clone(),
                         last_seq,
                         ts,
                     },
@@ -1757,7 +1757,7 @@ pub async fn process_single_version(
                 // if we have no gaps, then we can schedule applying all these changes.
                 if gaps_count == 0 {
                     // no gaps
-                    info!(actor_id = %actor_id, version, "no gaps detected, notifying for apply! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}, computed seqs: {seqs_recorded:?} (original: {orig_seqs_recorded:?})");
+                    info!(actor_id = %actor_id, version, "no gaps detected, notifying for apply! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}, computed seqs: {seqs_in_bookkeeping:?} (original: {orig_seqs_in_bookkeeping:?})");
                     let tx_apply = agent.tx_apply().clone();
                     tokio::spawn(async move {
                         if let Err(e) = tx_apply.send((actor_id, version)).await {
