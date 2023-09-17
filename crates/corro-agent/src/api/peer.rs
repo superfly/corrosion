@@ -427,11 +427,7 @@ async fn process_version(
                     for changes_seqs in chunked {
                         match changes_seqs {
                             Ok((changes, seqs)) => {
-                                if seqs.end() < seqs.start() {
-                                    warn!(actor_id = %actor_id, version = %version, "UH OH, was going to {}..={} and that's not allowed (end < start). full range: {start_seq}..={end_seq}, last_seq: {last_seq}", seqs.start(), seqs.end());
-                                    return Ok(());
-                                }
-                                info!(actor_id = %actor_id, version = %version, "sending fully applied changes {}..={} (requested: {range_needed:?}) (len: {})", seqs.start(), seqs.end(), changes.len());
+                                debug!(%actor_id, version, "sending fully applied changes {}..={} (requested: {range_needed:?}) (len: {})", seqs.start(), seqs.end(), changes.len());
                                 tokio::spawn({
                                     let sender = sender.clone();
                                     let last_seq = *last_seq;
@@ -523,10 +519,10 @@ async fn process_version(
                             match changes_seqs {
                                 Ok((changes, seqs)) => {
                                     if seqs.end() < seqs.start() {
-                                        warn!(actor_id = %actor_id, version = %version, "UH OH, was going to {}..={} and that's not allowed (end < start). full range: {start_seq}..={end_seq}, last_seq: {last_seq}", seqs.start(), seqs.end());
+                                        warn!(%actor_id, version, "UH OH, was going to {}..={} and that's not allowed (end < start). full range: {start_seq}..={end_seq}, last_seq: {last_seq}", seqs.start(), seqs.end());
                                         return Ok(());
                                     }
-                                    info!(actor_id = %actor_id, version = %version, "sending partially buffered changes {}..={} (len: {})", seqs.start(), seqs.end(), changes.len());
+                                    debug!(%actor_id, version, "sending partially buffered changes {}..={} (len: {})", seqs.start(), seqs.end(), changes.len());
                                     tokio::spawn({
                                         let sender = sender.clone();
                                         let last_seq = *last_seq;
@@ -562,7 +558,7 @@ async fn process_version(
                                 }
                             }
                         }
-                        info!(actor_id = %actor_id, version = %version, "done sending chunks of partial changes");
+                        debug!(%actor_id, version, "done sending chunks of partial changes");
                     }
                 }
             }

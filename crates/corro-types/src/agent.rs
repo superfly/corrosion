@@ -484,6 +484,10 @@ impl Booked {
     pub async fn write(&self) -> BookWriter {
         BookWriter(self.0.write().await)
     }
+
+    pub fn blocking_write(&self) -> BookWriter {
+        BookWriter(self.0.blocking_write())
+    }
 }
 
 pub struct BookReader<'a>(TokioRwLockReadGuard<'a, BookedVersions>);
@@ -614,6 +618,11 @@ impl Bookie {
 
     pub async fn for_actor(&self, actor_id: ActorId) -> Booked {
         let mut w = self.0.write().await;
+        w.entry(actor_id).or_default().clone()
+    }
+
+    pub fn for_actor_blocking(&self, actor_id: ActorId) -> Booked {
+        let mut w = self.0.blocking_write();
         w.entry(actor_id).or_default().clone()
     }
 

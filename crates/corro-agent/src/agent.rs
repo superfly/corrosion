@@ -183,7 +183,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         debug!("filling up partial known versions");
 
         for ((actor_id, version), (seqs, last_seq, ts)) in partials {
-            info!("looking at partials for {actor_id} v{version}, seq: {seqs:?}, last_seq: {last_seq}");
+            debug!(%actor_id, version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
             let ranges = bk.entry(actor_id).or_default();
             let gaps_count = seqs.gaps(&(0..=last_seq)).count();
             ranges.insert(
@@ -192,7 +192,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             );
 
             if gaps_count == 0 {
-                info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
+                info!(%actor_id, version, "found fully buffered, unapplied, changes! scheduling apply");
                 tx_apply.send((actor_id, version)).await?;
             }
         }
@@ -275,7 +275,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rx_apply,
         rtt_rx,
     } = opts;
-    info!("Current Actor ID: {}", actor_id);
 
     let (to_send_tx, to_send_rx) = channel(10240);
     let (notifications_tx, notifications_rx) = channel(10240);
@@ -1210,9 +1209,9 @@ async fn handle_notifications(
         match notification {
             Notification::MemberUp(actor) => {
                 let added = { agent.members().write().add_member(&actor) };
-                debug!("Member Up {actor:?} (added: {added})");
+                trace!("Member Up {actor:?} (added: {added})");
                 if added {
-                    info!("Member Up {actor:?}");
+                    debug!("Member Up {actor:?}");
                     increment_counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
                     // actually added a member
                     // notify of new cluster size
@@ -1228,9 +1227,9 @@ async fn handle_notifications(
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
-                debug!("Member Down {actor:?} (removed: {removed})");
+                trace!("Member Down {actor:?} (removed: {removed})");
                 if removed {
-                    info!("Member Down {actor:?}");
+                    debug!("Member Down {actor:?}");
                     increment_counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
                     // actually removed a member
                     // notify of new cluster size
@@ -1381,7 +1380,7 @@ async fn resolve_bootstrap(
                 debug!("using resolver: {dns_server}");
             }
             if let Some(hostname) = host_port.next() {
-                info!("Resolving '{hostname}' to an IP");
+                debug!("Resolving '{hostname}' to an IP");
                 match resolver
                     .as_ref()
                     .unwrap_or(&system_resolver)
@@ -1410,7 +1409,7 @@ async fn resolve_bootstrap(
                                 (SocketAddr::V4(our_ip), SocketAddr::V4(ip)) if our_ip != ip => {}
                                 (SocketAddr::V6(our_ip), SocketAddr::V6(ip)) if our_ip != ip => {}
                                 _ => {
-                                    info!("ignore node with addr: {addr}");
+                                    debug!("ignore node with addr: {addr}");
                                     continue;
                                 }
                             }
@@ -1474,11 +1473,11 @@ async fn process_fully_buffered_changes(
     version: i64,
 ) -> Result<bool, ChangeError> {
     let mut conn = agent.pool().write_normal().await?;
-    info!(%actor_id, version, "acquired write (normal) connection to process fully buffered changes");
+    debug!(%actor_id, version, "acquired write (normal) connection to process fully buffered changes");
 
     let booked = agent.bookie().for_actor(actor_id).await;
     let mut bookedw = booked.write().await;
-    info!(%actor_id, version, "acquired Booked write lock to process fully buffered changes");
+    debug!(%actor_id, version, "acquired Booked write lock to process fully buffered changes");
 
     let inserted = block_in_place(|| {
         let (last_seq, ts) = {
@@ -1504,7 +1503,7 @@ async fn process_fully_buffered_changes(
 
         let tx = conn.transaction()?;
 
-        info!(%actor_id, version, "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+        info!(%actor_id, version, "processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
         // {
         //     // TODO: remove, this is for debugging purposes
@@ -1560,7 +1559,7 @@ async fn process_fully_buffered_changes(
                 "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
             )?
             .execute(params![actor_id.as_bytes(), version])?;
-        info!(%actor_id, version, "deleted {count} buffered changes");
+        debug!(%actor_id, version, "deleted {count} buffered changes");
 
         // delete all bookkept sequences for this version
         let count = tx
@@ -1568,13 +1567,13 @@ async fn process_fully_buffered_changes(
                 "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
             )?
             .execute(params![actor_id, version])?;
-        info!(%actor_id, version, "deleted {count} sequences in bookkeeping");
+        debug!(%actor_id, version, "deleted {count} sequences in bookkeeping");
 
         let rows_impacted: i64 = tx
             .prepare_cached("SELECT crsql_rows_impacted()")?
             .query_row((), |row| row.get(0))?;
 
-        info!(%actor_id, version, "rows impacted by changes: {rows_impacted}");
+        info!(%actor_id, version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
         let known_version = if rows_impacted > 0 {
             let db_version: i64 =
@@ -1607,21 +1606,6 @@ async fn process_fully_buffered_changes(
 
     Ok(inserted)
 }
-
-// pub async fn process_multiple_versions(agent: &Agent, changes: Vec<ChangeV1>) -> Vec<Result<Option<Changeset>, ChangeError>> {
-//     let mut res = Vec::with_capacity(changes.len());
-
-//     let bookie = agent.bookie();
-
-//     let mut conn = agent.pool().write_normal().await?;
-
-//     for (i, change) in changes.into_iter().enumerate() {
-//         let booked = bookie.for_actor(actor_id).await;
-//         let mut booked_write = booked.write().await;
-
-//     }
-
-// }
 
 pub async fn process_single_version(
     agent: &Agent,
@@ -1687,7 +1671,7 @@ pub async fn process_single_version(
 
             // if not a full range!
             if !is_complete {
-                info!(%actor_id, version, "incomplete change, probably going to buffer seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
+                debug!(%actor_id, version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
                 let mut inserted = 0;
                 for change in changes.iter() {
                     trace!("buffering change! {change:?}");
@@ -1717,7 +1701,7 @@ pub async fn process_single_version(
                     })?;
                 }
 
-                info!(%actor_id, version, "buffered {inserted} changes");
+                debug!(%actor_id, version, "buffered {inserted} changes");
 
                 // calculate all known sequences for the actor + version combo
                 let mut seqs_in_bookkeeping: RangeInclusiveSet<i64> = tx
@@ -1787,7 +1771,7 @@ pub async fn process_single_version(
                 // if we have no gaps, then we can schedule applying all these changes.
                 if gaps_count == 0 {
                     // no gaps
-                    info!(actor_id = %actor_id, version, "no gaps detected, notifying for apply! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}, computed seqs: {seqs_in_bookkeeping:?} (original: {orig_seqs_in_bookkeeping:?})");
+                    info!(actor_id = %actor_id, version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}, computed seqs: {seqs_in_bookkeeping:?} (original: {orig_seqs_in_bookkeeping:?})");
                     let tx_apply = agent.tx_apply().clone();
                     tokio::spawn(async move {
                         if let Err(e) = tx_apply.send((actor_id, version)).await {
@@ -1801,7 +1785,7 @@ pub async fn process_single_version(
                 return Ok((changeset, None));
             }
 
-            info!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}");
+            debug!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}");
 
             let mut impactful_changeset = vec![];
 
