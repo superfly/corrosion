@@ -51,7 +51,7 @@ use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, params, Connection, Transaction};
+use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
 use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
@@ -1506,46 +1506,53 @@ async fn process_fully_buffered_changes(
 
         info!(%actor_id, version, "moving buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
-        {
-            // TODO: remove, this is for debugging purposes
-            let mut prepped = tx.prepare_cached(
-                "SELECT site_id, db_version, seq FROM __corro_buffered_changes
-        WHERE site_id = ?
-          AND version = ?
-        ORDER BY db_version ASC, seq ASC",
-            )?;
-            let mut mapped = prepped.query_map(params![actor_id.as_bytes(), version], |row| {
-                Ok((
-                    (row.get::<_, ActorId>(0)?, row.get::<_, i64>(1)?),
-                    row.get::<_, i64>(2)?,
-                ))
-            })?;
-            let mut map: BTreeMap<_, RangeInclusiveSet<i64>> = BTreeMap::new();
+        // {
+        //     // TODO: remove, this is for debugging purposes
+        //     let mut prepped = tx.prepare_cached(
+        //         "SELECT site_id, db_version, seq FROM __corro_buffered_changes
+        // WHERE site_id = ?
+        //   AND version = ?
+        // ORDER BY db_version ASC, seq ASC",
+        //     )?;
+        //     let mut mapped = prepped.query_map(params![actor_id.as_bytes(), version], |row| {
+        //         Ok((
+        //             (row.get::<_, ActorId>(0)?, row.get::<_, i64>(1)?),
+        //             row.get::<_, i64>(2)?,
+        //         ))
+        //     })?;
+        //     let mut map: BTreeMap<_, RangeInclusiveSet<i64>> = BTreeMap::new();
 
-            while let Some(Ok(((actor_id, db_version), seq))) = mapped.next() {
-                map.entry((actor_id, db_version))
-                    .or_default()
-                    .insert(seq..=seq);
-            }
+        //     while let Some(Ok(((actor_id, db_version), seq))) = mapped.next() {
+        //         map.entry((actor_id, db_version))
+        //             .or_default()
+        //             .insert(seq..=seq);
+        //     }
 
-            info!(%actor_id, version, "buffered changes contents: {map:?}");
-        }
+        //     info!(%actor_id, version, "buffered changes contents: {map:?}");
+        // }
+
+        let max_db_version: Option<i64> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional()?;
 
         let start = Instant::now();
-        // insert all buffered changes into crsql_changes directly from the buffered changes table
-        let count = tx
+
+        if let Some(max_db_version) = max_db_version {
+            // insert all buffered changes into crsql_changes directly from the buffered changes table
+            let count = tx
             .prepare_cached(
                 r#"
                 INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
-                    SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq
+                    SELECT                 "table", pk, cid, val, col_version, ? as db_version, site_id, cl, seq
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
                               AND version = ?
                             ORDER BY db_version ASC, seq ASC
                             "#,
             )?
-            .execute(params![actor_id.as_bytes(), version])?;
-        info!(%actor_id, version, "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+            .execute(params![max_db_version, actor_id.as_bytes(), version])?;
+            info!(%actor_id, version, "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+        } else {
+            info!(%actor_id, version, "no buffered rows, skipped insertion into crsql_changes");
+        }
 
         // remove all buffered changes for cleanup purposes
         let count = tx
