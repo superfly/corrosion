@@ -1655,7 +1655,7 @@ pub async fn process_single_version(
 
             // if not a full range!
             if !is_complete {
-                info!(%actor_id, version, "incomplete change, probably going to buffer seqs: {seqs:?}, last_seq: {last_seq:?}");
+                info!(%actor_id, version, "incomplete change, probably going to buffer seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
                 let mut inserted = 0;
                 for change in changes.iter() {
                     trace!("buffering change! {change:?}");
@@ -1685,9 +1685,7 @@ pub async fn process_single_version(
                     })?;
                 }
 
-                if changes.len() != inserted {
-                    warn!(%actor_id, version, "did not insert as many changes... {inserted}");
-                }
+                info!(%actor_id, version, "buffered {inserted} changes");
 
                 // calculate all known sequences for the actor + version combo
                 let mut seqs_in_bookkeeping: RangeInclusiveSet<i64> = tx
