@@ -2,7 +2,7 @@ use std::{error::Error as StdError, io, net::SocketAddr, ops::Deref, path::Path,
 
 use bytes::{Buf, BytesMut};
 use corro_api_types::{
-    sqlite::RusqliteConnManager, QueryEvent, RqliteResponse, RqliteResult, Statement,
+    sqlite::RusqliteConnManager, ExecResponse, ExecResult, QueryEvent, Statement,
 };
 use futures::{Stream, TryStreamExt};
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
@@ -43,7 +43,7 @@ impl CorrosionApiClient {
             match hyper::body::to_bytes(res.into_body()).await {
                 Ok(b) => match serde_json::from_slice(&b) {
                     Ok(res) => match res {
-                        RqliteResult::Error { error } => return Err(Error::ResponseError(error)),
+                        ExecResult::Error { error } => return Err(Error::ResponseError(error)),
                         res => return Err(Error::UnexpectedResult(res)),
                     },
                     Err(e) => {
@@ -119,7 +119,7 @@ impl CorrosionApiClient {
         Ok(subscription_stream(res.into_body()))
     }
 
-    pub async fn execute(&self, statements: &[Statement]) -> Result<RqliteResponse, Error> {
+    pub async fn execute(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(format!("http://{}/v1/transactions", self.api_addr))
@@ -138,7 +138,7 @@ impl CorrosionApiClient {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    pub async fn schema(&self, statements: &[Statement]) -> Result<RqliteResponse, Error> {
+    pub async fn schema(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(format!("http://{}/v1/migrations", self.api_addr))
@@ -160,7 +160,7 @@ impl CorrosionApiClient {
     pub async fn schema_from_paths<P: AsRef<Path>>(
         &self,
         schema_paths: &[P],
-    ) -> Result<RqliteResponse, Error> {
+    ) -> Result<ExecResponse, Error> {
         let mut statements = vec![];
 
         for schema_path in schema_paths.iter() {
@@ -424,7 +424,7 @@ pub enum Error {
     ResponseError(String),
 
     #[error("unexpected result: {0:?}")]
-    UnexpectedResult(RqliteResult),
+    UnexpectedResult(ExecResult),
 
     #[error("could not retrieve subscription id from headers")]
     ExpectedQueryId,

@@ -26,7 +26,7 @@ use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, TimeoutFutureExt};
 
 use crate::agent::{process_single_version, SyncRecvError};
-use crate::api::client::{ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
+use crate::api::public::{ChunkedChanges, MAX_CHANGES_PER_MESSAGE};
 
 use corro_types::{
     actor::ActorId,

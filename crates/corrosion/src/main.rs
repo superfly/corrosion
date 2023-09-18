@@ -15,7 +15,7 @@ use command::{
 use corro_api_types::SqliteValue;
 use corro_client::CorrosionApiClient;
 use corro_types::{
-    api::{QueryEvent, RqliteResult, Statement},
+    api::{ExecResult, QueryEvent, Statement},
     config::{default_admin_path, Config, ConfigError, LogFormat},
 };
 use futures::StreamExt;
@@ -226,7 +226,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
 
             for res in res.results {
                 match res {
-                    RqliteResult::Execute {
+                    ExecResult::Execute {
                         rows_affected,
                         time,
                     } => {
@@ -235,10 +235,9 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                             println!("Run Time: real {elapsed}");
                         }
                     }
-                    RqliteResult::Error { error } => {
+                    ExecResult::Error { error } => {
                         error!("{error}");
                     }
-                    _ => {}
                 }
             }
         }

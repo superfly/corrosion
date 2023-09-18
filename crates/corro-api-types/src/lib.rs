@@ -47,27 +47,16 @@ impl From<&str> for Statement {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct RqliteResponse {
-    pub results: Vec<RqliteResult>,
+pub struct ExecResponse {
+    pub results: Vec<ExecResult>,
     pub time: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum RqliteResult {
+pub enum ExecResult {
     Execute {
         rows_affected: usize,
-        time: Option<f64>,
-    },
-    Query {
-        columns: Vec<CompactString>,
-        types: Vec<Option<CompactString>>,
-        values: Vec<Vec<SqliteValue>>,
-        time: Option<f64>,
-    },
-    QueryAssociative {
-        types: HashMap<CompactString, Option<CompactString>>,
-        rows: Vec<HashMap<CompactString, SqliteValue>>,
         time: Option<f64>,
     },
     Error {

@@ -10,9 +10,11 @@ use std::{
 
 use crate::{
     api::{
-        client::{api_v1_db_schema, api_v1_queries, api_v1_transactions},
         peer::{bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, SyncError},
-        pubsub::{api_v1_sub_by_id, api_v1_subs, MatcherBroadcastCache, MatcherIdCache},
+        public::{
+            api_v1_db_schema, api_v1_queries, api_v1_transactions,
+            pubsub::{api_v1_sub_by_id, api_v1_subs, MatcherBroadcastCache, MatcherIdCache},
+        },
     },
     broadcast::runtime_loop,
     transport::{ConnectError, Transport},
@@ -2249,7 +2251,7 @@ pub mod tests {
 
     use super::*;
 
-    use corro_types::api::{RqliteResponse, RqliteResult, Statement};
+    use corro_types::api::{ExecResponse, ExecResult, Statement};
 
     use corro_tests::*;
 
@@ -2289,7 +2291,7 @@ pub mod tests {
         )
         .await??;
 
-        let body: RqliteResponse =
+        let body: ExecResponse =
             serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
 
         let db_version: i64 =
@@ -2353,7 +2355,7 @@ pub mod tests {
             )
             .await?;
 
-        let body: RqliteResponse =
+        let body: ExecResponse =
             serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
 
         println!("body: {body:?}");
@@ -2563,19 +2565,19 @@ pub mod tests {
                             eyre::bail!("unexpected status code: {}", res.status());
                         }
 
-                        let body: RqliteResponse =
+                        let body: ExecResponse =
                             serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
 
                         for (i, statement) in statements.iter().enumerate() {
                             if !matches!(
                                 body.results[i],
-                                RqliteResult::Execute {
+                                ExecResult::Execute {
                                     rows_affected: 1,
                                     ..
                                 }
                             ) {
                                 eyre::bail!(
-                                    "unexpected rqlite result for statement {i}: {statement:?}"
+                                    "unexpected exec result for statement {i}: {statement:?}"
                                 );
                             }
                         }
@@ -2756,7 +2758,7 @@ pub mod tests {
         )
         .await??;
 
-        let body: RqliteResponse =
+        let body: ExecResponse =
             serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
 
         println!("body: {body:?}");
@@ -2954,17 +2956,14 @@ pub mod tests {
                                 eyre::bail!("bad status code: {}", res.status());
                             }
 
-                            let body: RqliteResponse = serde_json::from_slice(
+                            let body: ExecResponse = serde_json::from_slice(
                                 &hyper::body::to_bytes(res.into_body()).await?,
                             )?;
 
                             match &body.results[0] {
-                                RqliteResult::Execute { .. } => {}
-                                RqliteResult::Error { error } => {
+                                ExecResult::Execute { .. } => {}
+                                ExecResult::Error { error } => {
                                     eyre::bail!("error: {error}");
-                                }
-                                res => {
-                                    eyre::bail!("unexpected response: {res:?}");
                                 }
                             }
 
