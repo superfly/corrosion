@@ -49,19 +49,14 @@ impl From<&str> for Statement {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecResponse {
     pub results: Vec<ExecResult>,
-    pub time: Option<f64>,
+    pub time: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExecResult {
-    Execute {
-        rows_affected: usize,
-        time: Option<f64>,
-    },
-    Error {
-        error: String,
-    },
+    Execute { rows_affected: usize, time: f64 },
+    Error { error: String },
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]

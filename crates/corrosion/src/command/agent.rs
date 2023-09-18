@@ -41,7 +41,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
             .await
         {
             Ok(res) => {
-                info!("Applied schema in {:?}s", res.time);
+                info!("Applied schema in {}s", res.time);
             }
             Err(e) => {
                 error!("could not apply schema: {e}");
