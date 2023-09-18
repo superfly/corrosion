@@ -1,5 +1,5 @@
 # Corrosion
-Corrosion: Gossip-based service discovery (and more) for large distributed systems, written in Rust.
+Gossip-based service discovery (and more) for large distributed systems.
 
 ## Why we built Corrosion
 
@@ -11,9 +11,9 @@ Our new tool needed to deliver the following:
 
 Getting state (data) from a central remote source can be incredibly expensive (at least 300ms for a round-trip to something on the other side of the world), but usually takes less than 1ms from a local source.
 
-### Fast consistency
+### Fast, eventual, consistency
 
-Strong consistency by RAFT consensus can be too slow. Eventual consistency works, if it's fast.
+Strong consistency by RAFT consensus can be too slow. Eventual consistency works for our use case, if it's fast.
 
 ### Flexibility
 
@@ -40,21 +40,21 @@ In a nutshell, Corrosion:
 
 ## Usage overview
 
-Run the Corrosion agent on every node/host in the cluster. Other programs running on the node use [Corrosion's HTTP API](/doc/api/README.md) to query the local Corrosion SQLite database, add and update data, and subscribe to change notifications.
+Run the Corrosion agent on every node/host in the cluster. Other programs running on the node use [Corrosion's HTTP API](https://superfly.github.io/corrosion/api/index.html) to query the local Corrosion SQLite database, add and update data, and subscribe to change notifications.
 
-The [Corrosion CLI](/doc/cli/README.md) provides commands for administration and access to database and features.
+The [Corrosion CLI](https://superfly.github.io/corrosion/cli/index.html) provides commands for administration and access to database and features.
 
 ### Quick start
 
-- [Prepare the Corrosion configuration file](config/README.md)
-- [Specify the initial database schema](schema.md)
-- [Start the Corrosion agent](cli/agent.md)
+- [Prepare the Corrosion configuration file](https://superfly.github.io/corrosion/config/)
+- [Specify the initial database schema](https://superfly.github.io/corrosion/schema.html)
+- [Start the Corrosion agent](https://superfly.github.io/corrosion/cli/agent.html)
 
-See the WIP [Corrosion documentation](/doc/SUMMARY.md) for more details.
+See the WIP [Corrosion documentation](https://superfly.github.io/corrosion/) for more details.
 
 ## Building Corrosion
 
-Clone [https://github.com/superfly/corrosion2.git](https://github.com/superfly/corrosion2.git).
+Clone [https://github.com/superfly/corrosion.git](https://github.com/superfly/corrosion.git).
 
 From within the repo directory:
 
