@@ -1,11 +1,13 @@
 #![allow(clippy::wrong_self_convention)]
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::io::Write;
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
 use compact_str::CompactString;
 use compact_str::ToCompactString;
@@ -16,7 +18,8 @@ use corro_types::change::SqliteValue;
 use futures::Stream;
 use futures::StreamExt;
 use indexmap::IndexMap;
-use rhai::Dynamic;
+pub use rhai::Dynamic;
+use rhai::NativeCallContext;
 use rhai::{EvalAltResult, Map};
 use rhai_tpl::TemplateWriter;
 use rhai_tpl::Writer;
@@ -24,7 +27,6 @@ use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
 use tokio::sync::OnceCell;
 use tokio::sync::{mpsc, RwLock as TokioRwLock};
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
@@ -108,8 +110,22 @@ impl IntoIterator for QueryResponse {
 struct Row {
     #[allow(dead_code)]
     id: i64,
-    columns: Arc<Vec<CompactString>>,
-    cells: Vec<SqliteValue>,
+    columns: Arc<IndexMap<CompactString, u16>>,
+    cells: Arc<Vec<SqliteValue>>,
+}
+
+impl Row {
+    fn get_cell_value(&mut self, col: String) -> Result<SqliteValueWrap, Box<EvalAltResult>> {
+        self.columns
+            .get(col.as_str())
+            .and_then(|index| {
+                self.cells
+                    .get(*index as usize)
+                    .cloned()
+                    .map(SqliteValueWrap)
+            })
+            .ok_or_else(|| Box::new(EvalAltResult::from(format!("no such column: {col}"))))
+    }
 }
 
 impl IntoIterator for Row {
@@ -118,15 +134,12 @@ impl IntoIterator for Row {
     type IntoIter = RowIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        RowIter {
-            pos: 0,
-            row: Arc::new(self),
-        }
+        RowIter { pos: 0, row: self }
     }
 }
 
 struct RowIter {
-    row: Arc<Row>,
+    row: Row,
     pos: usize,
 }
 
@@ -150,7 +163,29 @@ impl Iterator for RowIter {
 #[derive(Clone)]
 struct Cell {
     index: usize,
-    row: Arc<Row>,
+    row: Row,
+}
+
+impl Cell {
+    pub fn name(&mut self) -> Result<String, Box<EvalAltResult>> {
+        Ok(self
+            .row
+            .columns
+            .get_index(self.index)
+            .ok_or_else(|| Box::new(EvalAltResult::from("cell does not exist")))?
+            .0
+            .to_string())
+    }
+
+    pub fn value(&mut self) -> Result<SqliteValueWrap, Box<EvalAltResult>> {
+        Ok(SqliteValueWrap(
+            self.row
+                .cells
+                .get(self.index)
+                .ok_or_else(|| Box::new(EvalAltResult::from("cell does not exist")))?
+                .clone(),
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -166,26 +201,21 @@ impl SqliteValueWrap {
             SqliteValue::Blob(b) => hex::encode(b.as_slice()),
         }
     }
+
+    fn is_null(&mut self) -> bool {
+        matches!(&self.0, SqliteValue::Null)
+    }
 }
 
-impl Cell {
-    pub fn name(&mut self) -> Result<String, Box<EvalAltResult>> {
-        Ok(self
-            .row
-            .columns
-            .get(self.index)
-            .ok_or_else(|| Box::new(EvalAltResult::from("cell does not exist")))?
-            .to_string())
-    }
-
-    pub fn value(&mut self) -> Result<SqliteValueWrap, Box<EvalAltResult>> {
-        Ok(SqliteValueWrap(
-            self.row
-                .cells
-                .get(self.index)
-                .ok_or_else(|| Box::new(EvalAltResult::from("cell does not exist")))?
-                .clone(),
-        ))
+impl fmt::Display for SqliteValueWrap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            SqliteValue::Null => f.write_str(""),
+            SqliteValue::Integer(i) => i.fmt(f),
+            SqliteValue::Real(r) => r.fmt(f),
+            SqliteValue::Text(t) => t.fmt(f),
+            SqliteValue::Blob(b) => hex::encode(b.as_slice()).fmt(f),
+        }
     }
 }
 
@@ -194,7 +224,7 @@ struct QueryResponseIter {
     body: OnceCell<BoxedSubscriptionStream>,
     handle: tokio::runtime::Handle,
     done: bool,
-    columns: Option<Arc<Vec<CompactString>>>,
+    columns: Option<Arc<IndexMap<CompactString, u16>>>,
 }
 
 impl QueryResponseIter {
@@ -232,8 +262,33 @@ impl QueryResponseIter {
             };
             match res {
                 Some(Ok(evt)) => match evt {
-                    QueryEvent::Columns(cols) => self.columns = Some(Arc::new(cols)),
+                    QueryEvent::Columns(cols) => {
+                        self.columns = Some(Arc::new(
+                            cols.into_iter()
+                                .enumerate()
+                                .map(|(i, name)| (name, i as u16))
+                                .collect(),
+                        ))
+                    }
                     QueryEvent::EndOfQuery { .. } => {
+                        match self.body.take() {
+                            None => {
+                                self.done = true;
+                                return Some(Err(Box::new(EvalAltResult::from(
+                                    "could not take stream, this should not happen!",
+                                ))));
+                            }
+                            Some(rows) => {
+                                let qread = self.query.read().await;
+                                tokio::spawn(wait_for_rows(
+                                    rows,
+                                    qread.state.cmd_tx.clone(),
+                                    qread.state.cancel.clone(),
+                                ));
+                            }
+                        }
+
+                        self.done = true;
                         return None;
                     }
                     QueryEvent::Row(rowid, cells) | QueryEvent::Change(_, rowid, cells) => {
@@ -242,7 +297,7 @@ impl QueryResponseIter {
                                 return Some(Ok(Row {
                                     id: rowid,
                                     columns: columns.clone(),
-                                    cells,
+                                    cells: Arc::new(cells),
                                 }));
                             }
                             None => {
@@ -289,6 +344,7 @@ pub struct QueryHandle {
     id: Uuid,
     body: Option<BoxedSubscriptionStream>,
     client: CorrosionApiClient,
+    state: TemplateState,
 }
 
 impl QueryHandle {
@@ -325,7 +381,7 @@ fn write_sql_to_csv<W: Write>(
     for row in rows.by_ref() {
         let row = row?;
         if !wrote_header {
-            wtr.write_record(row.columns.as_slice())
+            wtr.write_record(row.columns.keys())
                 .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
             wrote_header = true;
         }
@@ -334,7 +390,7 @@ fn write_sql_to_csv<W: Write>(
     }
     if !wrote_header {
         if let Some(cols) = rows.columns.as_ref() {
-            wtr.write_record(cols.as_slice())
+            wtr.write_record(cols.keys())
                 .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
         }
     }
@@ -355,12 +411,12 @@ fn write_sql_to_json<W: Write>(
 }
 
 async fn wait_for_rows(
-    mut rows: QueryResponseIter,
+    mut rows: BoxedSubscriptionStream,
     tx: mpsc::Sender<TemplateCommand>,
     cancel: CancellationToken,
 ) {
     let row_recv = tokio::select! {
-        row_recv = rows.recv() => row_recv,
+        row_recv = rows.next() => row_recv,
         _ = cancel.cancelled() => {
             debug!("template cancellation trigger, returning from tokio task");
             return
@@ -368,29 +424,15 @@ async fn wait_for_rows(
     };
 
     match row_recv {
-        Some(Ok(row)) => {
-            trace!("got an updated row! {:?}", row.cells);
-
-            const DEBOUNCE_DEADLINE: Duration = Duration::from_millis(100);
-
-            let deadline = sleep(DEBOUNCE_DEADLINE);
-            tokio::pin!(deadline);
-            loop {
-                tokio::select! {
-                    None = rows.recv() => {
-                        debug!("end of iterator");
-                        break;
-                    },
-                    _ = &mut deadline => {
-                        debug!("deadline reached");
-                        break;
-                    }
-                }
-            }
+        Some(Ok(QueryEvent::Change(_, _, cells))) => {
+            trace!("got an updated row! {cells:?}");
 
             if let Err(_e) = tx.send(TemplateCommand::Render).await {
                 debug!("could not send back re-render command, channel must be closed!");
             }
+        }
+        Some(Ok(evt)) => {
+            warn!("unexpected event receive: {evt:?}")
         }
         Some(Err(e)) => {
             // TODO: need to re-render possibly...
@@ -402,9 +444,8 @@ async fn wait_for_rows(
     }
 }
 
-#[derive(Clone)]
 pub struct Engine {
-    engine: Arc<rhai_tpl::Engine>,
+    engine: rhai_tpl::Engine,
 }
 
 impl Engine {
@@ -416,13 +457,7 @@ impl Engine {
             move |tw: &mut TemplateWriter<W, TemplateState>,
                   json: SqlToJson|
                   -> Result<(), Box<EvalAltResult>> {
-                let rows = write_sql_to_json(tw, json)?;
-
-                tokio::spawn(wait_for_rows(
-                    rows,
-                    tw.state.cmd_tx.clone(),
-                    tw.state.cancel.clone(),
-                ));
+                write_sql_to_json(tw, json)?;
 
                 Ok(())
             }
@@ -433,15 +468,20 @@ impl Engine {
             |tw: &mut TemplateWriter<W, TemplateState>,
              csv: SqlToCsv|
              -> Result<(), Box<EvalAltResult>> {
-                let rows = write_sql_to_csv(tw, csv)?;
-
-                tokio::spawn(wait_for_rows(
-                    rows,
-                    tw.state.cmd_tx.clone(),
-                    tw.state.cancel.clone(),
-                ));
+                write_sql_to_csv(tw, csv)?;
 
                 Ok(())
+            },
+        );
+
+        engine.register_fn(
+            "write",
+            |tw: &mut TemplateWriter<W, TemplateState>,
+             sql_value: SqliteValueWrap|
+             -> Result<(), Box<EvalAltResult>> {
+                // TODO: make `write_str` public on TemplateWriter to use that
+                tw.write_all(sql_value.to_string().as_bytes())
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))
             },
         );
 
@@ -452,6 +492,7 @@ impl Engine {
         engine.register_fn("to_csv", QueryResponse::to_csv);
 
         engine.register_type_with_name::<Row>("Row");
+        engine.register_indexer_get(Row::get_cell_value);
         engine.register_iterator::<Row>();
 
         engine.register_type_with_name::<Cell>("Cell");
@@ -460,12 +501,20 @@ impl Engine {
 
         engine.register_type_with_name::<SqliteValueWrap>("SqliteValue");
         engine.register_fn("to_json", SqliteValueWrap::to_json);
-        engine.register_fn("to_string", SqliteValueWrap::to_json);
+        engine.register_fn("to_string", SqliteValueWrap::to_string);
+        engine.register_fn("is_null", SqliteValueWrap::is_null);
 
         fn sql(
+            cx: NativeCallContext,
             client: &CorrosionApiClient,
             stmt: Statement,
         ) -> Result<QueryResponse, Box<EvalAltResult>> {
+            let state: TemplateState = cx
+                .tag()
+                .ok_or_else(|| Box::new(EvalAltResult::from("missing engine tag!")))?
+                .clone()
+                .cast();
+
             debug!("sql function call {stmt:?}");
             let (query_id, body) = tokio::runtime::Handle::current()
                 .block_on(client.subscribe(&stmt))
@@ -477,6 +526,7 @@ impl Engine {
                 id: query_id,
                 body: Some(Box::pin(body)),
                 client: client.clone(),
+                state,
             }));
 
             Ok(QueryResponse { query: handle })
@@ -484,8 +534,8 @@ impl Engine {
 
         engine.register_fn("sql", {
             let client = client.clone();
-            move |query: &str| -> Result<QueryResponse, Box<EvalAltResult>> {
-                sql(&client, Statement::Simple(query.into()))
+            move |cx: NativeCallContext, query: &str| -> Result<QueryResponse, Box<EvalAltResult>> {
+                sql(cx, &client, Statement::Simple(query.into()))
             }
         });
 
@@ -521,23 +571,33 @@ impl Engine {
 
         engine.register_fn("sql", {
             let client = client.clone();
-            move |query: &str, params: Vec<Dynamic>| -> Result<QueryResponse, Box<EvalAltResult>> {
+            move |cx: NativeCallContext,
+                  query: &str,
+                  params: Vec<Dynamic>|
+                  -> Result<QueryResponse, Box<EvalAltResult>> {
                 let params = params
                     .into_iter()
                     .map(dyn_to_sql)
                     .collect::<Result<Vec<_>, _>>()?;
-                sql(&client, Statement::WithParams(query.into(), params))
+                sql(cx, &client, Statement::WithParams(query.into(), params))
             }
         });
 
         engine.register_fn(
             "sql",
-            move |query: &str, params: Map| -> Result<QueryResponse, Box<EvalAltResult>> {
+            move |cx: NativeCallContext,
+                  query: &str,
+                  params: Map|
+                  -> Result<QueryResponse, Box<EvalAltResult>> {
                 let params = params
                     .into_iter()
                     .map(|(k, v)| Ok::<_, Box<EvalAltResult>>((k.to_string(), dyn_to_sql(v)?)))
                     .collect::<Result<HashMap<_, _>, _>>()?;
-                sql(&client, Statement::WithNamedParams(query.into(), params))
+                sql(
+                    cx,
+                    &client,
+                    Statement::WithNamedParams(query.into(), params),
+                )
             },
         );
 
@@ -548,13 +608,21 @@ impl Engine {
                 .to_string())
         });
 
-        Self {
-            engine: Arc::new(engine),
-        }
+        Self { engine }
     }
+}
 
-    pub fn compile(&self, input: &str) -> Result<rhai_tpl::Template, rhai_tpl::CompileError> {
-        self.engine.compile(input)
+impl Deref for Engine {
+    type Target = rhai_tpl::Engine;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+impl DerefMut for Engine {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.engine
     }
 }
 
@@ -603,7 +671,7 @@ fn write_json_rows_as_object<W: Write, F: Formatter>(
             .columns
             .iter()
             .enumerate()
-            .filter_map(|(i, col)| row.cells.get(i).map(|value| (col, value)))
+            .filter_map(|(i, (col, _))| row.cells.get(i).map(|value| (col, value)))
             .collect::<IndexMap<&CompactString, &SqliteValue>>();
 
         seq.serialize_element(&map)
@@ -623,7 +691,7 @@ fn write_json_rows_as_array<W: Write, F: Formatter>(
 
     for row_res in rows.by_ref() {
         let row = row_res.map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
-        seq.serialize_element(&row.cells)
+        seq.serialize_element(row.cells.as_ref())
             .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
     }
 
@@ -682,7 +750,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(1);
 
-        let engine = Engine::new::<std::fs::File>(client.clone());
+        let mut engine = Engine::new::<std::fs::File>(client.clone());
 
         {
             let cancel = CancellationToken::new();
@@ -690,15 +758,14 @@ mod tests {
                 let input = r#"<%= sql("select * from tests").to_json(#{pretty: true}) %>
 <%= sql("select * from tests").to_json() %>"#;
 
-                let tpl = engine.compile(input).unwrap();
-                tpl.render(
-                    f,
-                    TemplateState {
-                        cmd_tx: tx.clone(),
-                        cancel: cancel.clone(),
-                    },
-                )
-                .unwrap();
+                let mut tpl = engine.compile_mut(input).unwrap();
+                let state = TemplateState {
+                    cmd_tx: tx.clone(),
+                    cancel: cancel.clone(),
+                };
+                tpl.evaluator_mut()
+                    .set_default_tag(Dynamic::from(state.clone()));
+                tpl.render(f, state).unwrap();
             });
 
             let output = std::fs::read_to_string(&filepath).unwrap();
@@ -734,15 +801,14 @@ mod tests {
             let input = r#"<%= sql("select * from tests").to_json(#{pretty: true}) %>
 <%= sql("select * from tests").to_json() %>"#;
 
-            let tpl = engine.compile(input).unwrap();
-            tpl.render(
-                f,
-                TemplateState {
-                    cmd_tx: tx,
-                    cancel: CancellationToken::new(),
-                },
-            )
-            .unwrap();
+            let mut tpl = engine.compile_mut(input).unwrap();
+            let state = TemplateState {
+                cmd_tx: tx,
+                cancel: CancellationToken::new(),
+            };
+            tpl.evaluator_mut()
+                .set_default_tag(Dynamic::from(state.clone()));
+            tpl.render(f, state).unwrap();
         });
 
         let output = std::fs::read_to_string(&filepath).unwrap();

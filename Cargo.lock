@@ -2786,9 +2786,9 @@ dependencies = [
 
 [[package]]
 name = "rhai-tpl"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26c23c1f619074d445c80d703917f82225b208f80655c84b19833d2a35807e7c"
+checksum = "4a89caf4ab562ca4b10f2c8cf78809e87628cd73f03e6303620557289c2c62da"
 dependencies = [
  "enquote",
  "logos",

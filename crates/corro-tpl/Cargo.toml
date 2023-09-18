@@ -14,7 +14,7 @@ hex = { workspace = true }
 hostname = { workspace = true }
 indexmap = { workspace = true }
 rhai = { workspace = true }
-rhai-tpl = { version = "0.1.0" }
+rhai-tpl = { version = "0.1.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true } 

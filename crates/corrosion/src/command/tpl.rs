@@ -8,7 +8,7 @@ use std::{
 use camino::Utf8PathBuf;
 use clap::Args;
 use corro_client::CorrosionApiClient;
-use corro_tpl::{TemplateCommand, TemplateState};
+use corro_tpl::{Dynamic, TemplateCommand, TemplateState};
 use futures::{stream::FuturesUnordered, StreamExt};
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
@@ -32,7 +32,6 @@ pub async fn run(
     flags: &TemplateFlags,
 ) -> eyre::Result<()> {
     let client = CorrosionApiClient::new(api_addr);
-    let engine = corro_tpl::Engine::new::<std::fs::File>(client);
 
     let mut filepaths = vec![];
 
@@ -83,15 +82,19 @@ pub async fn run(
 
         let dir = tempfile::tempdir()?;
 
-        let engine = engine.clone();
+        let client = client.clone();
 
         let once = flags.once;
 
         futs.push(async move {
             let mut checksum = crc32fast::hash(input.as_bytes());
 
-            let mut tpl = engine.compile(&input)?;
+            let mut engine = corro_tpl::Engine::new::<std::fs::File>(client.clone());
+
+            let mut tpl = engine.compile_mut(&input)?;
             let tmp_filepath = dir.path().join(Uuid::new_v4().as_simple().to_string());
+
+            info!("Watching and rendering {src} to {dst}");
 
             'outer: loop {
                 let f = tokio::fs::OpenOptions::new()
@@ -108,6 +111,9 @@ pub async fn run(
 
                 let _drop_cancel = cancel.clone().drop_guard();
                 let state = TemplateState { cmd_tx, cancel };
+
+                let rhai_engine = tpl.evaluator_mut();
+                rhai_engine.set_default_tag(Dynamic::from(state.clone()));
 
                 debug!("rendering template...");
 
@@ -145,18 +151,34 @@ pub async fn run(
                     break;
                 }
 
+                const DEBOUNCE_DEADLINE: Duration = Duration::from_millis(100);
+                let mut deadline = None;
+
                 loop {
                     enum Branch {
                         Recompile,
                         Render,
                     }
 
-                    let branch = tokio::select! {
-                        Some(_) = notify_rx.recv() => Branch::Recompile,
-                        Some(TemplateCommand::Render) = cmd_rx.recv() => Branch::Render,
-                        else => {
-                            warn!("template renderer is done");
-                            break 'outer;
+                    let branch = {
+                        let deadline_check = async {
+                            if let Some(sleep) = deadline.as_mut() {
+                                sleep.await
+                            } else {
+                                futures::future::pending().await
+                            }
+                        };
+                        tokio::select! {
+                            Some(_) = notify_rx.recv() => Branch::Recompile,
+                            Some(TemplateCommand::Render) = cmd_rx.recv() => Branch::Render,
+                            _ = deadline_check => {
+                                debug!("debounce deadline reached, re-rendering");
+                                break;
+                            },
+                            else => {
+                                warn!("template renderer is done");
+                                break 'outer;
+                            }
                         }
                     };
 
@@ -173,8 +195,10 @@ pub async fn run(
                                 let input = tokio::fs::read_to_string(&src).await?;
                                 let new_checksum = crc32fast::hash(input.as_bytes());
                                 if checksum != new_checksum {
-                                    info!("file at {src} changed, recompiling and rendering anew");
-                                    tpl = engine.compile(&input)?;
+                                    info!(
+                                        "Template at {src} changed, re-compiling and re-rendering"
+                                    );
+                                    tpl = engine.compile_mut(&input)?;
                                     checksum = new_checksum;
                                     // break from inner loop
                                     break;
@@ -186,8 +210,10 @@ pub async fn run(
                             }
                         }
                         Branch::Render => {
-                            debug!("re-rendering {src}");
-                            break;
+                            // debug!("re-rendering {src}");
+                            if deadline.is_none() {
+                                deadline = Some(Box::pin(tokio::time::sleep(DEBOUNCE_DEADLINE)));
+                            }
                         }
                     }
                 }
