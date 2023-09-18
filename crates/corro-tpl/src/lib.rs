@@ -750,7 +750,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(1);
 
-        let engine = Engine::new::<std::fs::File>(client.clone());
+        let mut engine = Engine::new::<std::fs::File>(client.clone());
 
         {
             let cancel = CancellationToken::new();
@@ -758,15 +758,14 @@ mod tests {
                 let input = r#"<%= sql("select * from tests").to_json(#{pretty: true}) %>
 <%= sql("select * from tests").to_json() %>"#;
 
-                let tpl = engine.compile(input).unwrap();
-                tpl.render(
-                    f,
-                    TemplateState {
-                        cmd_tx: tx.clone(),
-                        cancel: cancel.clone(),
-                    },
-                )
-                .unwrap();
+                let mut tpl = engine.compile_mut(input).unwrap();
+                let state = TemplateState {
+                    cmd_tx: tx.clone(),
+                    cancel: cancel.clone(),
+                };
+                tpl.evaluator_mut()
+                    .set_default_tag(Dynamic::from(state.clone()));
+                tpl.render(f, state).unwrap();
             });
 
             let output = std::fs::read_to_string(&filepath).unwrap();
@@ -802,15 +801,14 @@ mod tests {
             let input = r#"<%= sql("select * from tests").to_json(#{pretty: true}) %>
 <%= sql("select * from tests").to_json() %>"#;
 
-            let tpl = engine.compile(input).unwrap();
-            tpl.render(
-                f,
-                TemplateState {
-                    cmd_tx: tx,
-                    cancel: CancellationToken::new(),
-                },
-            )
-            .unwrap();
+            let mut tpl = engine.compile_mut(input).unwrap();
+            let state = TemplateState {
+                cmd_tx: tx,
+                cancel: CancellationToken::new(),
+            };
+            tpl.evaluator_mut()
+                .set_default_tag(Dynamic::from(state.clone()));
+            tpl.render(f, state).unwrap();
         });
 
         let output = std::fs::read_to_string(&filepath).unwrap();
