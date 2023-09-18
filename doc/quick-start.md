@@ -161,3 +161,68 @@ $ corrosion -c /etc/corrosion/config.toml query 'SELECT * FROM todos;'
 some-id|Write some Corrosion docs!|
 some-id-2|Show how broadcasts work|
 ```
+
+## Appendix: Templates
+
+### 1. Create a Corrosion template
+
+Corrosion templates are powered by Rhai w/ added functionality. On change, templates are re-rendered.
+
+```js
+<% for todo in sql("SELECT title, completed_at FROM todos") { %>
+[<% if todo.completed_at.is_null() { %> <% } else { %>X<% } %>] <%= todo.title %>
+<% } %>
+```
+
+### 2. Process the template
+
+```bash
+$ corrosion template "./todos.rhai:todos.txt"
+INFO corrosion::command::tpl: Watching and rendering ./todos.rhai to todos.txt
+```
+
+### 3. Watch the todos.txt file for change
+
+Uses `watch` in a different terminal to see updates when your todos change:
+
+```bash
+$ watch -n 0.5 cat todos.txt
+Every 0.5s: cat todos.txt
+
+[ ] Write some Corrosion docs!
+[ ] Show how broadcasts work
+```
+
+Add another todo:
+
+```bash
+$ corrosion -c /etc/corrosion-b/config.toml exec --param 'some-id-3' --param 'Hello from a template!' 'INSERT INTO todos (id, title) VALUES (?, ?)'
+INFO corrosion: Rows affected: 1
+```
+
+Your `watch` should have been update and should display:
+
+```bash
+$ watch -n 0.5 cat todos.txt
+Every 0.5s: cat todos.txt
+
+[ ] Write some Corrosion docs!
+[ ] Show how broadcasts work
+[ ] Hello from a template!
+```
+
+We did all those, so let's tick them off:
+
+```bash
+$ corrosion -c /etc/corrosion-b/config.toml exec 'UPDATE todos SET completed_at = 1234567890'
+INFO corrosion: Rows affected: 3
+```
+
+```bash
+$ watch -n 0.5 cat todos.txt
+Every 0.5s: cat todos.txt
+
+[X] Write some Corrosion docs!
+[X] Show how broadcasts work
+[X] Hello from a template!
+```
