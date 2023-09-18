@@ -9,7 +9,7 @@ use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
-    api::{QueryEvent, RqliteResponse, RqliteResult, Statement},
+    api::{ExecResponse, ExecResult, QueryEvent, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{row_to_change, SqliteValue},
     schema::{make_schema_inner, parse_sql},
@@ -35,6 +35,8 @@ use corro_types::{
 };
 
 use crate::agent::process_subs;
+
+pub mod pubsub;
 
 pub const MAX_CHANGES_PER_MESSAGE: usize = 50;
 
@@ -272,11 +274,16 @@ where
 }
 
 fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
+    let mut prepped = match &stmt {
+        Statement::Simple(q) => tx.prepare(q),
+        Statement::WithParams(q, _) => tx.prepare(q),
+        Statement::WithNamedParams(q, _) => tx.prepare(q),
+    }?;
+
     match stmt {
-        Statement::Simple(q) => tx.execute(q, []),
-        Statement::WithParams(q, params) => tx.execute(q, params_from_iter(params)),
-        Statement::WithNamedParams(q, params) => tx.execute(
-            q,
+        Statement::Simple(_) => prepped.execute([]),
+        Statement::WithParams(_, params) => prepped.execute(params_from_iter(params)),
+        Statement::WithNamedParams(_, params) => prepped.execute(
             params
                 .iter()
                 .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
@@ -290,12 +297,12 @@ pub async fn api_v1_transactions(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Extension(agent): Extension<Agent>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
-) -> (StatusCode, axum::Json<RqliteResponse>) {
+) -> (StatusCode, axum::Json<ExecResponse>) {
     if statements.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(RqliteResponse {
-                results: vec![RqliteResult::Error {
+            axum::Json(ExecResponse {
+                results: vec![ExecResult::Error {
                     error: "at least 1 statement is required".into(),
                 }],
                 time: None,
@@ -315,17 +322,17 @@ pub async fn api_v1_transactions(
                 match res {
                     Ok(rows_affected) => {
                         total_rows_affected += rows_affected;
-                        RqliteResult::Execute {
+                        ExecResult::Execute {
                             rows_affected,
                             time: Some(start.elapsed().as_secs_f64()),
                         }
                     }
-                    Err(e) => RqliteResult::Error {
+                    Err(e) => ExecResult::Error {
                         error: e.to_string(),
                     },
                 }
             })
-            .collect::<Vec<RqliteResult>>();
+            .collect::<Vec<ExecResult>>();
 
         Ok(results)
     })
@@ -337,8 +344,8 @@ pub async fn api_v1_transactions(
             error!("could not execute statement(s): {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(RqliteResponse {
-                    results: vec![RqliteResult::Error {
+                axum::Json(ExecResponse {
+                    results: vec![ExecResult::Error {
                         error: e.to_string(),
                     }],
                     time: None,
@@ -349,7 +356,7 @@ pub async fn api_v1_transactions(
 
     (
         StatusCode::OK,
-        axum::Json(RqliteResponse {
+        axum::Json(ExecResponse {
             results,
             time: Some(elapsed.as_secs_f64()),
         }),
@@ -368,7 +375,7 @@ async fn build_query_rows_response(
     agent: &Agent,
     data_tx: mpsc::Sender<QueryEvent>,
     stmt: Statement,
-) -> Result<(), (StatusCode, RqliteResult)> {
+) -> Result<(), (StatusCode, ExecResult)> {
     let (res_tx, res_rx) = oneshot::channel();
 
     let pool = agent.pool().clone();
@@ -379,7 +386,7 @@ async fn build_query_rows_response(
             Err(e) => {
                 _ = res_tx.send(Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    RqliteResult::Error {
+                    ExecResult::Error {
                         error: e.to_string(),
                     },
                 )));
@@ -398,13 +405,23 @@ async fn build_query_rows_response(
             Err(e) => {
                 _ = res_tx.send(Err((
                     StatusCode::BAD_REQUEST,
-                    RqliteResult::Error {
+                    ExecResult::Error {
                         error: e.to_string(),
                     },
                 )));
                 return;
             }
         };
+
+        if !prepped.readonly() {
+            _ = res_tx.send(Err((
+                StatusCode::BAD_REQUEST,
+                ExecResult::Error {
+                    error: "statement is not readonly".into(),
+                },
+            )));
+            return;
+        }
 
         block_in_place(|| {
             let col_count = prepped.column_count();
@@ -440,7 +457,7 @@ async fn build_query_rows_response(
                 Err(e) => {
                     _ = res_tx.send(Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        RqliteResult::Error {
+                        ExecResult::Error {
                             error: e.to_string(),
                         },
                     )));
@@ -501,7 +518,7 @@ async fn build_query_rows_response(
         Ok(res) => res,
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            RqliteResult::Error {
+            ExecResult::Error {
                 error: e.to_string(),
             },
         )),
@@ -616,12 +633,12 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 pub async fn api_v1_db_schema(
     Extension(agent): Extension<Agent>,
     axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
-) -> (StatusCode, axum::Json<RqliteResponse>) {
+) -> (StatusCode, axum::Json<ExecResponse>) {
     if statements.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(RqliteResponse {
-                results: vec![RqliteResult::Error {
+            axum::Json(ExecResponse {
+                results: vec![ExecResult::Error {
                     error: "at least 1 statement is required".into(),
                 }],
                 time: None,
@@ -635,8 +652,8 @@ pub async fn api_v1_db_schema(
         error!("could not merge schemas: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(RqliteResponse {
-                results: vec![RqliteResult::Error {
+            axum::Json(ExecResponse {
+                results: vec![ExecResult::Error {
                     error: e.to_string(),
                 }],
                 time: None,
@@ -646,7 +663,7 @@ pub async fn api_v1_db_schema(
 
     (
         StatusCode::OK,
-        axum::Json(RqliteResponse {
+        axum::Json(ExecResponse {
             results: vec![],
             time: Some(start.elapsed().as_secs_f64()),
         }),

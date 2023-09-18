@@ -471,7 +471,7 @@ mod tests {
 
     use crate::{
         agent::migrate,
-        api::client::{api_v1_db_schema, api_v1_transactions},
+        api::public::{api_v1_db_schema, api_v1_transactions},
     };
 
     use super::*;
