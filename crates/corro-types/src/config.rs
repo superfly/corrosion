@@ -126,8 +126,12 @@ pub fn default_admin_path() -> Utf8PathBuf {
 pub struct LogConfig {
     #[serde(default)]
     pub format: LogFormat,
-    #[serde(default)]
+    #[serde(default = "default_as_true")]
     pub colors: bool,
+}
+
+fn default_as_true() -> bool {
+    true
 }
 
 #[derive(Debug, thiserror::Error)]

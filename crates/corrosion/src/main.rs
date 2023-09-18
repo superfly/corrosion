@@ -46,7 +46,6 @@ fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
         let config = cli.config()?;
 
         let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
-        println!("tracing-filter directives: {directives}");
         let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
         if let Some(diags) = diags {
             eprintln!("While parsing env filters: {diags}, using default");
@@ -218,11 +217,21 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 }
             }
         }
-        Command::Exec { query, timer } => {
-            let res = cli
-                .api_client()?
-                .execute(&[Statement::Simple(query.clone())])
-                .await?;
+        Command::Exec {
+            query,
+            param,
+            timer,
+        } => {
+            let stmt = if param.is_empty() {
+                Statement::Simple(query.clone())
+            } else {
+                Statement::WithParams(
+                    query.clone(),
+                    param.iter().map(|p| SqliteValue::Text(p.into())).collect(),
+                )
+            };
+
+            let res = cli.api_client()?.execute(&[stmt]).await?;
 
             for res in res.results {
                 match res {
@@ -231,8 +240,8 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                         time,
                     } => {
                         info!("Rows affected: {rows_affected}");
-                        if let Some(elapsed) = timer.then_some(time).flatten() {
-                            println!("Run Time: real {elapsed}");
+                        if *timer {
+                            println!("Run Time: real {time}");
                         }
                     }
                     ExecResult::Error { error } => {
@@ -382,6 +391,8 @@ enum Command {
     /// Execute a SQL statement that mutates the state of Corrosion
     Exec {
         query: String,
+        #[arg(long)]
+        param: Vec<String>,
         #[arg(long, default_value = "false")]
         timer: bool,
     },

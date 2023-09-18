@@ -4,7 +4,7 @@ Writes to Corrosion's database, via the [`/v1/transactions/`](../api/transaction
 
 Use `corrosion exec` to mutate data within existing CR-SQLite-enabled Corrosion database tables, for propagation throughout the cluster.
 
-Corrosion does not sync schema changes made using this command. Use Corrosion's [schema files](/schema.md) to create and update the cluster's database schema.
+Corrosion does not sync schema changes made using this command. Use Corrosion's [schema files](../schema.md) to create and update the cluster's database schema.
 
 ```
 $ corrosion exec --help

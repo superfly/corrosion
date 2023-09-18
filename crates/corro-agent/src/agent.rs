@@ -284,8 +284,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     let (bcast_msg_tx, bcast_rx) = channel::<BroadcastV1>(10240);
 
     let gossip_addr = gossip_server_endpoint.local_addr()?;
-    // let udp_gossip = Arc::new(UdpSocket::bind(gossip_addr).await?);
-    info!("Started QUIC gossip listener on {gossip_addr}");
 
     let (foca_tx, foca_rx) = channel(10240);
     let (member_events_tx, member_events_rx) = tokio::sync::broadcast::channel::<MemberEvent>(512);
@@ -594,7 +592,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         }
     });
 
-    info!("Starting peer API on {gossip_addr} (QUIC)");
+    info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
     tokio::spawn({
         let agent = agent.clone();
@@ -897,7 +895,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         .layer(TraceLayer::new_for_http());
 
     let api_addr = api_listener.local_addr()?;
-    info!("Starting public API server on {api_addr}");
+    info!("Starting public API server on tcp/{api_addr}");
     spawn_counted(
         axum::Server::builder(AddrIncoming::from_listener(api_listener)?)
             .executor(CountedExecutor)

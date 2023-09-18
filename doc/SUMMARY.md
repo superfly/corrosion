@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](intro.md)
+[Quick start](quick-start.md)
 
 # User guide
 - [Authorization]() (to come)

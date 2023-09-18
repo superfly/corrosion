@@ -305,7 +305,7 @@ pub async fn api_v1_transactions(
                 results: vec![ExecResult::Error {
                     error: "at least 1 statement is required".into(),
                 }],
-                time: None,
+                time: 0.0,
             }),
         );
     }
@@ -324,7 +324,7 @@ pub async fn api_v1_transactions(
                         total_rows_affected += rows_affected;
                         ExecResult::Execute {
                             rows_affected,
-                            time: Some(start.elapsed().as_secs_f64()),
+                            time: start.elapsed().as_secs_f64(),
                         }
                     }
                     Err(e) => ExecResult::Error {
@@ -348,7 +348,7 @@ pub async fn api_v1_transactions(
                     results: vec![ExecResult::Error {
                         error: e.to_string(),
                     }],
-                    time: None,
+                    time: 0.0,
                 }),
             );
         }
@@ -358,7 +358,7 @@ pub async fn api_v1_transactions(
         StatusCode::OK,
         axum::Json(ExecResponse {
             results,
-            time: Some(elapsed.as_secs_f64()),
+            time: elapsed.as_secs_f64(),
         }),
     )
 }
@@ -641,7 +641,7 @@ pub async fn api_v1_db_schema(
                 results: vec![ExecResult::Error {
                     error: "at least 1 statement is required".into(),
                 }],
-                time: None,
+                time: 0.0,
             }),
         );
     }
@@ -656,7 +656,7 @@ pub async fn api_v1_db_schema(
                 results: vec![ExecResult::Error {
                     error: e.to_string(),
                 }],
-                time: None,
+                time: 0.0,
             }),
         );
     }
@@ -665,7 +665,7 @@ pub async fn api_v1_db_schema(
         StatusCode::OK,
         axum::Json(ExecResponse {
             results: vec![],
-            time: Some(start.elapsed().as_secs_f64()),
+            time: start.elapsed().as_secs_f64(),
         }),
     )
 }
