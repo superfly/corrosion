@@ -119,7 +119,7 @@ $ corrosion -c /etc/corrosion-b/config.toml agent
 2023-09-18T13:37:01.954585Z  INFO corro_agent::agent: synced 2 changes w/ b4fcbb65501f44f0802aba631508be9d in 0.012817167s @ 156.04072257153237 changes/s
 ```
 
-This last log shows that node B synchornized changes w/ node A.
+This last log shows that node B synchronized changes w/ node A.
 
 #### Why were `2 changes` synchronized? There's only 1 row!
 
