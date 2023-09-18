@@ -166,7 +166,7 @@ some-id-2|Show how broadcasts work|
 
 ### 1. Create a Corrosion template
 
-Corrosion templates are powered by Rhai w/ added functionality. On change, templates are re-rendered.
+Corrosion templates are powered by [Rhai](https://rhai.rs) w/ custom functions. On change, templates are re-rendered.
 
 ```js
 <% for todo in sql("SELECT title, completed_at FROM todos") { %>
