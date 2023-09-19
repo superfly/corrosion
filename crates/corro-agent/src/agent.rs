@@ -1607,6 +1607,7 @@ async fn process_fully_buffered_changes(
     Ok(inserted)
 }
 
+// TODO: create convenience function to process multiple changesets in a single transaction
 pub async fn process_single_change(
     agent: &Agent,
     change: ChangeV1,

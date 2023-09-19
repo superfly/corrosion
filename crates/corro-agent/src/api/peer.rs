@@ -458,6 +458,7 @@ fn handle_known_version(
                 'outer: loop {
                     let overlapping: Vec<RangeInclusive<i64>> =
                         partial_seqs.overlapping(&range_needed).cloned().collect();
+
                     for range in overlapping {
                         // since there can be partial overlap, we need to only
                         // send back the specific range we have or else we risk
@@ -480,9 +481,11 @@ fn handle_known_version(
                             Some(known) => match known {
                                 KnownDbVersion::Partial { seqs, .. } => {
                                     if seqs != &partial_seqs {
+                                        warn!(%actor_id, version, "different partial sequences, updating!");
                                         partial_seqs = seqs.clone();
                                         if let Some(new_start_seq) = last_sent_seq.take() {
-                                            range_needed = new_start_seq..=*range_needed.end();
+                                            range_needed =
+                                                (new_start_seq + 1)..=*range_needed.end();
                                         }
                                         continue 'outer;
                                     }
@@ -501,6 +504,7 @@ fn handle_known_version(
                         };
 
                         if let Some(db_version) = maybe_db_version {
+                            warn!(%actor_id, version, "switched from partial to current version");
                             drop(bw);
                             let mut seqs_needed: Vec<RangeInclusive<i64>> = seqs_iter.collect();
                             seqs_needed.insert(0, range_needed);

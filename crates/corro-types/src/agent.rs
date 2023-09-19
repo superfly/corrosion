@@ -445,9 +445,6 @@ pub enum KnownDbVersion {
 }
 
 impl KnownDbVersion {
-    pub fn is_current(&self) -> bool {
-        matches!(self, KnownDbVersion::Current { .. })
-    }
     pub fn is_cleared(&self) -> bool {
         matches!(self, KnownDbVersion::Cleared)
     }
