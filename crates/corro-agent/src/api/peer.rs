@@ -641,7 +641,7 @@ async fn process_sync(
         let their_last_version = sync_state.heads.get(&actor_id).copied().unwrap_or(0);
         let our_last_version = booked.last().await.unwrap_or(0);
 
-        debug!(actor_id = %local_actor_id, "their last version: {their_last_version} vs ours: {our_last_version}");
+        trace!(%actor_id, local_actor_id = %local_actor_id, "their last version: {their_last_version} vs ours: {our_last_version}");
 
         if their_last_version >= our_last_version {
             // nothing to teach the other node!
@@ -688,7 +688,7 @@ async fn send_sync_write_buffer<W: Sink<Bytes, Error = std::io::Error> + Unpin>(
 
     counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
 
-    debug!("sent {buf_len} bytes");
+    trace!("sent {buf_len} bytes");
 
     Ok(())
 }

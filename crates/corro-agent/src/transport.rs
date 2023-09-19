@@ -6,7 +6,7 @@ use quinn::{
     SendStream,
 };
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 #[derive(Debug, Clone)]
 pub struct Transport(Arc<TransportInner>);
@@ -42,7 +42,7 @@ impl Transport {
         debug!("connected to {addr}");
         match conn.send_datagram(data.clone()) {
             Ok(send) => {
-                debug!("sent datagram to {addr}");
+                trace!("sent datagram to {addr}");
                 return Ok(send);
             }
             Err(e @ SendDatagramError::ConnectionLost(ConnectionError::VersionMismatch)) => {

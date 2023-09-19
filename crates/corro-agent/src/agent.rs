@@ -359,7 +359,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                     increment_counter!("corro.peer.connection.accept.total");
 
-                    debug!("accepted a QUIC conn from {remote_addr}");
+                    trace!("accepted a QUIC conn from {remote_addr}");
 
                     tokio::spawn({
                         let conn = conn.clone();
@@ -380,7 +380,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                         }
                                     },
                                     _ = &mut tripwire => {
-                                        debug!("connection cancelled");
+                                        trace!("connection cancelled");
                                         return;
                                     }
                                 };
@@ -406,14 +406,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                         }
                                     },
                                     _ = &mut tripwire => {
-                                        debug!("connection cancelled");
+                                        trace!("connection cancelled");
                                         return;
                                     }
                                 };
 
                                 increment_counter!("corro.peer.stream.accept.total", "type" => "uni");
 
-                                debug!(
+                                trace!(
                                     "accepted a unidirectional stream from {}",
                                     conn.remote_address()
                                 );
@@ -511,14 +511,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                     }
                                 },
                                 _ = &mut tripwire => {
-                                    debug!("connection cancelled");
+                                    trace!("connection cancelled");
                                     return;
                                 }
                             };
 
                             increment_counter!("corro.peer.streams.accept.total", "type" => "bi");
 
-                            debug!(
+                            trace!(
                                 "accepted a bidirectional stream from {}",
                                 conn.remote_address()
                             );
@@ -1448,6 +1448,7 @@ fn store_empty_changeset(
         rusqlite::types::Null
     ])?;
 
+    // clean up any partially buffered versions
     for version in versions {
         tx.prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?
             .execute(params![actor_id, version,])?;
@@ -1690,17 +1691,6 @@ fn process_incomplete_version(
                     ])?;
     }
 
-    // tx.commit()?;
-
-    // booked_write.insert_many(
-    //     changeset.versions(),
-    //     KnownDbVersion::Partial {
-    //         seqs: seqs_in_bookkeeping.clone(),
-    //         last_seq,
-    //         ts,
-    //     },
-    // );
-
     // if we have no gaps, then we can schedule applying all these changes.
     if gaps_count == 0 {
         // no gaps
@@ -1725,7 +1715,7 @@ fn process_complete_version(
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
     parts: Option<ChangesetParts>,
-) -> rusqlite::Result<(KnownDbVersion, Changeset)> {
+) -> rusqlite::Result<Option<(KnownDbVersion, Changeset)>> {
     let ChangesetParts {
         version,
         changes,
@@ -1736,12 +1726,21 @@ fn process_complete_version(
         None => {
             store_empty_changeset(tx, actor_id, versions.clone())?;
             // booked_write.insert_many(versions.clone(), KnownDbVersion::Cleared);
-            return Ok((KnownDbVersion::Cleared, Changeset::Empty { versions }));
+            return Ok(Some((
+                KnownDbVersion::Cleared,
+                Changeset::Empty { versions },
+            )));
         }
         Some(parts) => parts,
     };
 
     debug!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}");
+
+    let exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_bookkeeping WHERE start_version <= ? AND end_version >= ?)")?.query_row([version, version], |row| row.get(0))?;
+
+    if exists {
+        return Ok(None);
+    }
 
     let mut impactful_changeset = vec![];
 
@@ -1777,7 +1776,7 @@ fn process_complete_version(
             .query_row((), |row| row.get(0))?;
 
         if rows_impacted > last_rows_impacted {
-            debug!("inserted a the change into crsql_changes");
+            trace!("inserted the change into crsql_changes");
             impactful_changeset.push(change);
             if let Some(c) = impactful_changeset.last() {
                 if let Some(counter) = changes_per_table.get_mut(&c.table) {
@@ -1795,15 +1794,16 @@ fn process_complete_version(
         .query_row((), |row| row.get(0))?;
 
     let (known_version, new_changeset) = if impactful_changeset.is_empty() {
-        debug!(
-                    "inserting CLEARED bookkeeping row for actor {actor_id}, version: {version}, db_version: {db_version}, ts: {ts:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
-                );
-        tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);")?.execute(params![actor_id, version, version])?;
+        debug!(%actor_id, version,
+            "inserting CLEARED bookkeeping row db_version: {db_version}, ts: {ts:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
+        );
+        tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);")?
+        .execute(params![actor_id, version, version])?;
         (KnownDbVersion::Cleared, Changeset::Empty { versions })
     } else {
-        debug!(
-                    "inserting bookkeeping row for actor {actor_id}, version: {version}, db_version: {db_version}, ts: {ts:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
-                );
+        debug!(%actor_id, version,
+            "inserting bookkeeping row db_version: {db_version}, ts: {ts:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
+        );
         tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
         (
             KnownDbVersion::Current {
@@ -1821,20 +1821,13 @@ fn process_complete_version(
         )
     };
 
-    debug!("inserted bookkeeping row");
-
-    // tx.commit()?;
+    debug!(%actor_id, version, "inserted bookkeeping row");
 
     for (table_name, count) in changes_per_table {
         counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
     }
 
-    debug!("committed transaction");
-
-    // booked_write.insert_many(new_changeset.versions(), known_version);
-    trace!("inserted into in-memory bookkeeping");
-
-    Ok::<_, rusqlite::Error>((known_version, new_changeset))
+    Ok::<_, rusqlite::Error>(Some((known_version, new_changeset)))
 }
 
 fn process_single_version(
@@ -1867,9 +1860,13 @@ fn process_single_version(
     }
 
     let (known, changeset) = if is_complete {
-        let (known, changeset) =
-            process_complete_version(tx, actor_id, versions.clone(), changeset.into_parts())?;
-        (known, changeset)
+        if let Some((known, changeset)) =
+            process_complete_version(tx, actor_id, versions.clone(), changeset.into_parts())?
+        {
+            (known, changeset)
+        } else {
+            return Ok(None);
+        }
     } else {
         let parts = changeset.into_parts().unwrap();
         let (version, known, is_fully_buffered) = process_incomplete_version(tx, actor_id, &parts)?;
@@ -1896,15 +1893,22 @@ pub async fn process_multiple_changes(
 ) -> Result<Vec<(ActorId, Changeset)>, ChangeError> {
     let bookie = agent.bookie();
 
-    let mut unknown_changes = vec![];
+    let mut unknown_changes = HashSet::new();
 
     for change in changes {
-        if !bookie
+        // dedup! we could be receiving the same change a bunch
+        if unknown_changes.contains(&change) {
+            continue;
+        }
+
+        // now check more expensive bookkeeping
+        if bookie
             .contains(&change.actor_id, change.versions(), change.seqs())
             .await
         {
-            unknown_changes.push(change);
+            continue;
         }
+        unknown_changes.insert(change);
     }
 
     if unknown_changes.is_empty() {

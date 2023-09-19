@@ -63,7 +63,7 @@ pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, Readable, Writable, Hash, PartialEq, Eq)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
     // internal version
@@ -79,7 +79,7 @@ impl Deref for ChangeV1 {
     }
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, Readable, Writable, PartialEq, Eq)]
 pub enum Changeset {
     Empty {
         versions: RangeInclusive<i64>,
@@ -93,6 +93,26 @@ pub enum Changeset {
         last_seq: i64,
         ts: Timestamp,
     },
+}
+
+impl std::hash::Hash for Changeset {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Changeset::Empty { versions } => {
+                state.write_u8(0);
+                for v in versions.clone() {
+                    state.write_i64(v);
+                }
+            }
+            Changeset::Full { version, seqs, .. } => {
+                state.write_u8(1);
+                state.write_i64(*version);
+                for seq in seqs.clone() {
+                    state.write_i64(seq);
+                }
+            }
+        }
+    }
 }
 
 pub struct ChangesetParts {

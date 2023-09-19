@@ -59,7 +59,7 @@ pub enum ExecResult {
     Error { error: String },
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq, Eq)]
 pub struct Change {
     pub table: TableName,
     pub pk: Vec<u8>,
@@ -208,7 +208,7 @@ impl FromSql for ColumnType {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Hash)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Hash, Eq)]
 #[serde(untagged)]
 pub enum SqliteValue {
     #[default]
@@ -236,6 +236,8 @@ impl Hash for Real {
         integer_decode(self.0).hash(state)
     }
 }
+
+impl Eq for Real {}
 
 fn integer_decode(val: f64) -> (u64, i16, i8) {
     let bits: u64 = val.to_bits();

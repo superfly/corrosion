@@ -680,7 +680,7 @@ pub fn runtime_loop(
                 };
 
                 for addr in broadcast_to {
-                    debug!(actor = %actor_id, "broadcasting {} bytes to: {addr} (send count: {})", pending.payload.len(), pending.send_count);
+                    trace!(actor = %actor_id, "broadcasting {} bytes to: {addr} (send count: {})", pending.payload.len(), pending.send_count);
 
                     transmit_broadcast(pending.payload.clone(), transport.clone(), addr);
                 }
@@ -693,7 +693,7 @@ pub fn runtime_loop(
                 );
 
                 if pending.send_count < max_transmissions {
-                    debug!("queueing for re-send");
+                    trace!("queueing for re-send");
                     idle_pendings.push(Box::pin(async move {
                         // FIXME: calculate sleep duration based on send count
                         tokio::time::sleep(Duration::from_millis(500)).await;
