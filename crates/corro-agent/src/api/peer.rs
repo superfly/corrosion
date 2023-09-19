@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
 use corro_types::broadcast::{ChangeV1, Changeset};
 use corro_types::change::row_to_change;
@@ -423,6 +423,8 @@ async fn process_version(
                         row_to_change,
                     )?;
 
+                    // FIXME: at this point, we don't need to lock anymore, I don't think!
+
                     let chunked = ChunkedChanges::new(
                         rows,
                         *start_seq,
@@ -676,7 +678,13 @@ async fn write_sync_msg<W: AsyncWrite + Unpin>(
 
     codec.encode(buf.split().freeze(), buf)?;
 
-    write.write_all_buf(buf).await?;
+    while buf.has_remaining() {
+        let n = write.write_buf(buf).await?;
+        if n == 0 {
+            break;
+        }
+        counter!("corro.sync.chunk.sent.bytes", n as u64);
+    }
 
     Ok(())
 }
