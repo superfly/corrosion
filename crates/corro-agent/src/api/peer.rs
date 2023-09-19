@@ -5,21 +5,22 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
 use corro_types::broadcast::{ChangeV1, Changeset};
 use corro_types::change::row_to_change;
 use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
-use futures::{Sink, SinkExt, Stream, TryFutureExt};
+use futures::{Stream, TryFutureExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rusqlite::params;
 use speedy::Writable;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::block_in_place;
 use tokio_stream::StreamExt;
-use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, TimeoutFutureExt};
 
@@ -426,6 +427,7 @@ async fn process_version(
                         rows,
                         *start_seq,
                         *end_seq,
+                        // TODO: make this adaptive based on how long it takes to send changes
                         MAX_CHANGES_BYTES_PER_MESSAGE,
                     );
                     for changes_seqs in chunked {
@@ -450,7 +452,7 @@ async fn process_version(
                                                     },
                                                 },
                                             )))
-                                            .with_timeout(Duration::from_secs(2))
+                                            .with_timeout(Duration::from_secs(5))
                                             .await
                                         {
                                             error!("timed out sending chunk of changes");
@@ -663,29 +665,18 @@ async fn process_sync(
     Ok(())
 }
 
-fn append_write_buf(buf: &mut BytesMut, msg: SyncMessage) -> Result<(), SyncSendError> {
-    msg.write_to_stream(buf.writer())
-        .map_err(SyncMessageEncodeError::from)?;
-    Ok(())
-}
-
-async fn write_sync_msg<W: Sink<Bytes, Error = std::io::Error> + Unpin>(
+async fn write_sync_msg<W: AsyncWrite + Unpin>(
+    codec: &mut LengthDelimitedCodec,
     buf: &mut BytesMut,
     msg: SyncMessage,
     write: &mut W,
 ) -> Result<(), SyncSendError> {
-    append_write_buf(buf, msg)?;
-    send_sync_write_buffer(buf, write).await
-}
+    msg.write_to_stream(buf.writer())
+        .map_err(SyncMessageEncodeError::from)?;
 
-async fn send_sync_write_buffer<W: Sink<Bytes, Error = std::io::Error> + Unpin>(
-    buf: &mut BytesMut,
-    write: &mut W,
-) -> Result<(), SyncSendError> {
-    let buf_len = buf.len();
-    write.feed(buf.split().freeze()).await?;
+    codec.encode(buf.split().freeze(), buf)?;
 
-    counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
+    write.write_all_buf(buf).await?;
 
     Ok(())
 }
@@ -714,16 +705,17 @@ pub async fn bidirectional_sync(
     our_sync_state: SyncStateV1,
     their_sync_state: Option<SyncStateV1>,
     read: RecvStream,
-    write: SendStream,
+    mut write: SendStream,
 ) -> Result<usize, SyncError> {
-    let (tx, mut rx) = channel::<SyncMessage>(256);
+    let (tx, mut rx) = channel::<SyncMessage>(128);
 
     let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
-    let mut write = FramedWrite::new(write, LengthDelimitedCodec::new());
 
+    let mut codec = LengthDelimitedCodec::new();
     let mut send_buf = BytesMut::new();
 
     write_sync_msg(
+        &mut codec,
         &mut send_buf,
         SyncMessage::V1(SyncMessageV1::State(our_sync_state)),
         &mut write,
@@ -743,6 +735,7 @@ pub async fn bidirectional_sync(
     let their_actor_id = their_sync_state.actor_id;
 
     write_sync_msg(
+        &mut codec,
         &mut send_buf,
         SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
         &mut write,
@@ -782,16 +775,10 @@ pub async fn bidirectional_sync(
                 if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
                     count += change.len();
                 }
-                write_sync_msg(&mut send_buf, msg, &mut write).await?;
+                write_sync_msg(&mut codec, &mut send_buf, msg, &mut write).await?;
             }
 
-            // final flushing
-            if let Err(e) = write.flush().await {
-                error!("could not flush the sync write sink: {e}");
-            }
-
-            let mut send = write.into_inner();
-            if let Err(e) = send.finish().await {
+            if let Err(e) = write.finish().await {
                 warn!("could not properly finish QUIC send stream: {e}");
             }
 
