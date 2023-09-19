@@ -44,7 +44,7 @@ pub struct ChunkedChanges<I: Iterator> {
     last_pushed_seq: i64,
     last_start_seq: i64,
     last_seq: i64,
-    max_byte_size: usize,
+    max_buf_size: usize,
     buffered_size: usize,
     done: bool,
 }
@@ -53,17 +53,25 @@ impl<I> ChunkedChanges<I>
 where
     I: Iterator,
 {
-    pub fn new(iter: I, start_seq: i64, last_seq: i64, max_byte_size: usize) -> Self {
+    pub fn new(iter: I, start_seq: i64, last_seq: i64, max_buf_size: usize) -> Self {
         Self {
             iter: iter.peekable(),
             changes: vec![],
             last_pushed_seq: 0,
             last_start_seq: start_seq,
             last_seq,
-            max_byte_size,
+            max_buf_size,
             buffered_size: 0,
             done: false,
         }
+    }
+
+    pub fn max_buf_size(&self) -> usize {
+        self.max_buf_size
+    }
+
+    pub fn set_max_buf_size(&mut self, size: usize) {
+        self.max_buf_size = size;
     }
 }
 
@@ -101,7 +109,7 @@ where
                         break;
                     }
 
-                    if self.buffered_size >= self.max_byte_size {
+                    if self.buffered_size >= self.max_buf_size {
                         // chunking it up
                         let start_seq = self.last_start_seq;
 
