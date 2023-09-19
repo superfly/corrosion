@@ -38,15 +38,14 @@ use crate::agent::process_subs;
 
 pub mod pubsub;
 
-pub const MAX_CHANGES_PER_MESSAGE: usize = 50;
-
 pub struct ChunkedChanges<I: Iterator> {
     iter: Peekable<I>,
     changes: Vec<Change>,
     last_pushed_seq: i64,
     last_start_seq: i64,
     last_seq: i64,
-    chunk_size: usize,
+    max_byte_size: usize,
+    buffered_size: usize,
     done: bool,
 }
 
@@ -54,14 +53,15 @@ impl<I> ChunkedChanges<I>
 where
     I: Iterator,
 {
-    pub fn new(iter: I, start_seq: i64, last_seq: i64, chunk_size: usize) -> Self {
+    pub fn new(iter: I, start_seq: i64, last_seq: i64, max_byte_size: usize) -> Self {
         Self {
             iter: iter.peekable(),
             changes: vec![],
             last_pushed_seq: 0,
             last_start_seq: start_seq,
             last_seq,
-            chunk_size,
+            max_byte_size,
+            buffered_size: 0,
             done: false,
         }
     }
@@ -79,6 +79,11 @@ where
             return None;
         }
 
+        debug_assert!(self.changes.is_empty());
+
+        // reset the buffered size
+        self.buffered_size = 0;
+
         loop {
             trace!("chunking through the rows iterator");
             match self.iter.next() {
@@ -87,6 +92,8 @@ where
 
                     self.last_pushed_seq = change.seq;
 
+                    self.buffered_size += change.estimated_byte_size();
+
                     self.changes.push(change);
 
                     if self.last_pushed_seq == self.last_seq {
@@ -94,7 +101,7 @@ where
                         break;
                     }
 
-                    if self.changes.len() >= self.chunk_size {
+                    if self.buffered_size >= self.max_byte_size {
                         // chunking it up
                         let start_seq = self.last_start_seq;
 
@@ -130,6 +137,8 @@ where
         )))
     }
 }
+
+const MAX_CHANGES_BYTE_SIZE: usize = 8 * 1024;
 
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
@@ -223,7 +232,7 @@ where
                         ORDER BY seq ASC
                 "#)?;
                 let rows = prepped.query_map([db_version], row_to_change)?;
-                let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_PER_MESSAGE);
+                let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_BYTE_SIZE);
                 for changes_seqs in chunked {
                     match changes_seqs {
                         Ok((changes, seqs)) => {
@@ -1070,7 +1079,7 @@ mod tests {
             .into_iter(),
             0,
             100,
-            2,
+            changes[0].estimated_byte_size() + changes[1].estimated_byte_size(),
         );
 
         assert_eq!(
@@ -1087,7 +1096,7 @@ mod tests {
             vec![Ok(changes[0].clone()), Ok(changes[1].clone())].into_iter(),
             0,
             0,
-            1,
+            changes[0].estimated_byte_size(),
         );
 
         assert_eq!(chunker.next(), Some(Ok((vec![changes[0].clone()], 0..=0))));
@@ -1098,7 +1107,7 @@ mod tests {
             vec![Ok(changes[0].clone()), Ok(changes[2].clone())].into_iter(),
             0,
             100,
-            2,
+            changes[0].estimated_byte_size() + changes[2].estimated_byte_size(),
         );
 
         assert_eq!(
@@ -1119,7 +1128,7 @@ mod tests {
             .into_iter(),
             0,
             100,
-            50,
+            100000, // just send them all!
         );
 
         assert_eq!(
@@ -1148,7 +1157,7 @@ mod tests {
             .into_iter(),
             0,
             10,
-            2,
+            changes[2].estimated_byte_size() + changes[4].estimated_byte_size(),
         );
 
         assert_eq!(
