@@ -14,7 +14,7 @@ use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, Sync
 use futures::{Stream, TryFutureExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use speedy::Writable;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{channel, Sender};
@@ -383,93 +383,82 @@ async fn process_range(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_version(
-    pool: &SplitPool,
+fn handle_known_version(
+    conn: &mut Connection,
     actor_id: ActorId,
     is_local: bool,
     version: i64,
-    known_version: KnownDbVersion,
+    init_known: KnownDbVersion,
     booked: &Booked,
-    mut seqs_needed: Vec<RangeInclusive<i64>>,
+    seqs_needed: Vec<RangeInclusive<i64>>,
+    last_seq: i64,
+    ts: Timestamp,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
-    let mut conn = pool.read().await?;
-
-    block_in_place(|| {
-        match &known_version {
-            KnownDbVersion::Current {
-                db_version,
-                last_seq,
-                ts,
-            } => {
-                if seqs_needed.is_empty() {
-                    seqs_needed = vec![(0..=*last_seq)];
-                }
-
-                for range_needed in seqs_needed {
-                    let start_seq = range_needed.start();
-                    let end_seq = range_needed.end();
-
-                    let bw = booked.blocking_write();
-                    if let Some(current_known) = bw.get(&version) {
-                        if current_known != &known_version {
-                            warn!(%actor_id, version, "in-memory bookkeeping changed from {known_version:?} to {current_known:?}!");
+    let mut seqs_iter = seqs_needed.into_iter();
+    while let Some(range_needed) = seqs_iter.by_ref().next() {
+        match &init_known {
+            KnownDbVersion::Current { db_version, .. } => {
+                let bw = booked.blocking_write();
+                match bw.get(&version) {
+                    Some(known) => {
+                        // a current version cannot go back to a partial version
+                        if known.is_cleared() {
+                            debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
                             break;
                         }
-                    } else {
-                        warn!(%actor_id, version, "in-memory bookkeeping vanished!");
+                    }
+                    None => {
+                        warn!(%actor_id, version, "in-memory bookkeeping vanished, aborting.");
                         break;
                     }
-
-                    // this is a read transaction!
-                    let tx = conn.transaction()?;
-
-                    let mut prepped = tx.prepare_cached(r#"
-                        SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl
-                            FROM crsql_changes
-                            WHERE site_id IS ?
-                              AND db_version = ?
-                              AND seq >= ? AND seq <= ?
-                            ORDER BY seq ASC
-                    "#)?;
-                    let site_id: Option<[u8; 16]> = (!is_local)
-                        .then_some(actor_id)
-                        .map(|actor_id| actor_id.to_bytes());
-
-                    let rows = prepped.query_map(
-                        params![site_id, db_version, start_seq, end_seq],
-                        row_to_change,
-                    )?;
-
-                    // drop write lock!
-                    drop(bw);
-
-                    send_change_chunks(
-                        sender,
-                        ChunkedChanges::new(
-                            rows,
-                            *start_seq,
-                            *end_seq,
-                            MAX_CHANGES_BYTES_PER_MESSAGE,
-                        ),
-                        actor_id,
-                        version,
-                        *last_seq,
-                        *ts,
-                    )?;
                 }
+
+                // this is a read transaction!
+                let tx = conn.transaction()?;
+
+                let mut prepped = tx.prepare_cached(r#"
+                    SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl
+                        FROM crsql_changes
+                        WHERE site_id IS ?
+                        AND db_version = ?
+                        AND seq >= ? AND seq <= ?
+                        ORDER BY seq ASC
+                "#)?;
+                let site_id: Option<[u8; 16]> = (!is_local)
+                    .then_some(actor_id)
+                    .map(|actor_id| actor_id.to_bytes());
+
+                let start_seq = range_needed.start();
+                let end_seq = range_needed.end();
+
+                let rows = prepped.query_map(
+                    params![site_id, db_version, start_seq, end_seq],
+                    row_to_change,
+                )?;
+
+                // drop write lock!
+                drop(bw);
+
+                send_change_chunks(
+                    sender,
+                    ChunkedChanges::new(rows, *start_seq, *end_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
+                    actor_id,
+                    version,
+                    last_seq,
+                    ts,
+                )?;
             }
-            // NOTE: still not sure if this is safe, probably going to disable it.
-            KnownDbVersion::Partial { seqs, last_seq, ts } => {
-                // return Ok(());
-                debug!("seqs needed: {seqs_needed:?}");
-                debug!("seqs we got: {seqs:?}");
-                if seqs_needed.is_empty() {
-                    seqs_needed = vec![(0..=*last_seq)];
-                }
+            KnownDbVersion::Partial { seqs, .. } => {
+                let mut partial_seqs = seqs.clone();
+                let mut range_needed = range_needed.clone();
 
-                for range_needed in seqs_needed {
-                    for range in seqs.overlapping(&range_needed) {
+                let mut last_sent_seq = None;
+
+                'outer: loop {
+                    let overlapping: Vec<RangeInclusive<i64>> =
+                        partial_seqs.overlapping(&range_needed).cloned().collect();
+                    for range in overlapping {
                         // since there can be partial overlap, we need to only
                         // send back the specific range we have or else we risk
                         // sending bad data and creating inconsistencies
@@ -487,14 +476,50 @@ async fn process_version(
                         debug!("partial, effective range: {start_seq}..={end_seq}");
 
                         let bw = booked.blocking_write();
-                        if let Some(current_known) = bw.get(&version) {
-                            if current_known != &known_version {
-                                warn!(%actor_id, version, "in-memory bookkeeping changed from {known_version:?} to {current_known:?}!");
+                        let maybe_db_version = match bw.get(&version) {
+                            Some(known) => match known {
+                                KnownDbVersion::Partial { seqs, .. } => {
+                                    if seqs != &partial_seqs {
+                                        partial_seqs = seqs.clone();
+                                        if let Some(new_start_seq) = last_sent_seq.take() {
+                                            range_needed = new_start_seq..=*range_needed.end();
+                                        }
+                                        continue 'outer;
+                                    }
+                                    None
+                                }
+                                KnownDbVersion::Current { db_version, .. } => Some(*db_version),
+                                KnownDbVersion::Cleared => {
+                                    debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
+                                    break;
+                                }
+                            },
+                            None => {
+                                warn!(%actor_id, version, "in-memory bookkeeping vanished!");
                                 break;
                             }
-                        } else {
-                            warn!(%actor_id, version, "in-memory bookkeeping vanished!");
-                            break;
+                        };
+
+                        if let Some(db_version) = maybe_db_version {
+                            drop(bw);
+                            let mut seqs_needed: Vec<RangeInclusive<i64>> = seqs_iter.collect();
+                            seqs_needed.insert(0, range_needed);
+                            return handle_known_version(
+                                conn,
+                                actor_id,
+                                is_local,
+                                version,
+                                KnownDbVersion::Current {
+                                    db_version,
+                                    last_seq,
+                                    ts,
+                                },
+                                booked,
+                                seqs_needed,
+                                last_seq,
+                                ts,
+                                sender,
+                            );
                         }
 
                         // this is a read transaction!
@@ -530,24 +555,63 @@ async fn process_version(
                             ),
                             actor_id,
                             version,
-                            *last_seq,
-                            *ts,
+                            last_seq,
+                            ts,
                         )?;
 
                         debug!(%actor_id, version, "done sending chunks of partial changes");
+
+                        last_sent_seq = Some(*end_seq);
                     }
+                    break;
                 }
             }
-            KnownDbVersion::Cleared => {
-                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Empty {
-                        versions: version..=version,
-                    },
-                })))?;
-            }
+            KnownDbVersion::Cleared => unreachable!(),
         }
-        Ok::<_, eyre::Report>(())
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_version(
+    pool: &SplitPool,
+    actor_id: ActorId,
+    is_local: bool,
+    version: i64,
+    known_version: KnownDbVersion,
+    booked: &Booked,
+    mut seqs_needed: Vec<RangeInclusive<i64>>,
+    sender: &Sender<SyncMessage>,
+) -> eyre::Result<()> {
+    let mut conn = pool.read().await?;
+
+    let (last_seq, ts) = {
+        let (last_seq, ts) = match &known_version {
+            KnownDbVersion::Current { last_seq, ts, .. } => (*last_seq, *ts),
+            KnownDbVersion::Partial { last_seq, ts, .. } => (*last_seq, *ts),
+            KnownDbVersion::Cleared => return Ok(()),
+        };
+        if seqs_needed.is_empty() {
+            seqs_needed = vec![(0..=last_seq)];
+        }
+
+        (last_seq, ts)
+    };
+
+    block_in_place(|| {
+        handle_known_version(
+            &mut conn,
+            actor_id,
+            is_local,
+            version,
+            known_version,
+            booked,
+            seqs_needed,
+            last_seq,
+            ts,
+            sender,
+        )
     })?;
 
     trace!("done processing version: {version} for actor_id: {actor_id}");
@@ -825,6 +889,9 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
+            // changes buffer
+            let mut buf = Vec::with_capacity(2);
+
             loop {
                 match read_sync_msg(&mut read).await {
                     Ok(None) => {
@@ -837,9 +904,7 @@ pub async fn bidirectional_sync(
                     Ok(Some(msg)) => match msg {
                         SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
                             let len = change.len();
-                            process_single_change(agent, change)
-                                .await
-                                .map_err(SyncRecvError::from)?;
+                            buf.push(change);
                             count += len;
                         }
                         SyncMessage::V1(SyncMessageV1::State(_)) => {
@@ -851,6 +916,14 @@ pub async fn bidirectional_sync(
                             continue;
                         }
                     },
+                }
+
+                if buf.len() >= 2 {
+                    for change in buf.drain(..) {
+                        process_single_change(agent, change)
+                            .await
+                            .map_err(SyncRecvError::from)?;
+                    }
                 }
             }
 

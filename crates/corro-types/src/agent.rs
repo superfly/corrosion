@@ -431,17 +431,26 @@ impl<'a> DerefMut for WriteConn<'a> {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum KnownDbVersion {
-    Current {
-        db_version: i64,
-        last_seq: i64,
-        ts: Timestamp,
-    },
     Partial {
         seqs: RangeInclusiveSet<i64>,
         last_seq: i64,
         ts: Timestamp,
     },
+    Current {
+        db_version: i64,
+        last_seq: i64,
+        ts: Timestamp,
+    },
     Cleared,
+}
+
+impl KnownDbVersion {
+    pub fn is_current(&self) -> bool {
+        matches!(self, KnownDbVersion::Current { .. })
+    }
+    pub fn is_cleared(&self) -> bool {
+        matches!(self, KnownDbVersion::Cleared)
+    }
 }
 
 pub type BookedVersions = RangeInclusiveMap<i64, KnownDbVersion>;
