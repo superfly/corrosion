@@ -1736,11 +1736,11 @@ fn process_complete_version(
 
     debug!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}");
 
-    let exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_bookkeeping WHERE start_version <= ? AND end_version >= ?)")?.query_row([version, version], |row| row.get(0))?;
+    // let exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_bookkeeping WHERE actor_id = ? AND start_version <= ? AND end_version >= ?)")?.query_row(params![actor_id, version, version], |row| row.get(0))?;
 
-    if exists {
-        return Ok(None);
-    }
+    // if exists {
+    //     return Ok(None);
+    // }
 
     let mut impactful_changeset = vec![];
 
@@ -1847,7 +1847,7 @@ fn process_single_version(
     let mut has_all_versions = true;
 
     for version in versions.clone() {
-        let exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_bookkeeping WHERE start_version <= ? AND end_version >= ?)")?.query_row([version, version], |row| row.get(0))?;
+        let exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_bookkeeping WHERE actor_id = ? AND start_version <= ? AND end_version >= ?)")?.query_row(params![actor_id, version, version], |row| row.get(0))?;
 
         if !exists {
             has_all_versions = false;
