@@ -72,6 +72,24 @@ pub struct Change {
     pub cl: i64,
 }
 
+impl Change {
+    // this is an ESTIMATE, it should give a rough idea of how many bytes will
+    // be required on the wire
+    pub fn estimated_byte_size(&self) -> usize {
+        self.table.len() + self.pk.len() + self.cid.len() + self.val.estimated_byte_size() +
+        // col_version
+        8 +
+        // db_version
+        8 +
+        // seq
+        8 +
+        // site_id
+        16 +
+        // cl
+        8
+    }
+}
+
 pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
     Ok(Change {
         table: row.get(0)?,
@@ -291,6 +309,16 @@ impl SqliteValue {
             SqliteValue::Real(r) => SqliteValueRef::Real(r.0),
             SqliteValue::Text(s) => SqliteValueRef::Text(s.as_str()),
             SqliteValue::Blob(v) => SqliteValueRef::Blob(v.as_slice()),
+        }
+    }
+
+    pub fn estimated_byte_size(&self) -> usize {
+        match self {
+            SqliteValue::Null => 1,
+            SqliteValue::Integer(_) => 8,
+            SqliteValue::Real(_) => 8,
+            SqliteValue::Text(t) => t.len(),
+            SqliteValue::Blob(v) => v.len(),
         }
     }
 }

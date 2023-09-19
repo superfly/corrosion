@@ -184,6 +184,18 @@ impl Changeset {
     }
 }
 
+impl From<ChangesetParts> for Changeset {
+    fn from(value: ChangesetParts) -> Self {
+        Changeset::Full {
+            version: value.version,
+            changes: value.changes,
+            seqs: value.seqs,
+            last_seq: value.last_seq,
+            ts: value.ts,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TimestampParseError {
     #[error("could not parse timestamp: {0:?}")]
