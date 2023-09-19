@@ -729,6 +729,7 @@ pub async fn bidirectional_sync(
         &mut write,
     )
     .await?;
+    write.flush().await.map_err(SyncSendError::from)?;
 
     let their_sync_state = match their_sync_state {
         Some(state) => state,
@@ -747,6 +748,7 @@ pub async fn bidirectional_sync(
         &mut write,
     )
     .await?;
+    write.flush().await.map_err(SyncSendError::from)?;
 
     match read_sync_msg(&mut read).await? {
         Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => {
@@ -780,12 +782,12 @@ pub async fn bidirectional_sync(
                 if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
                     count += change.len();
                 }
-                append_write_buf(&mut send_buf, msg)?;
-                send_sync_write_buffer(&mut send_buf, &mut write).await?;
+                write_sync_msg(&mut send_buf, msg, &mut write).await?;
             }
 
-            if let Err(e) = write.close().await {
-                error!("could not close the sync write sink: {e}");
+            // final flushing
+            if let Err(e) = write.flush().await {
+                error!("could not flush the sync write sink: {e}");
             }
 
             let mut send = write.into_inner();
