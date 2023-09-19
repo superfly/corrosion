@@ -1607,7 +1607,7 @@ async fn process_fully_buffered_changes(
     Ok(inserted)
 }
 
-pub async fn process_single_version(
+pub async fn process_single_change(
     agent: &Agent,
     change: ChangeV1,
 ) -> Result<Option<Changeset>, ChangeError> {
@@ -1900,7 +1900,7 @@ async fn process_msg(
     Ok(match bcast {
         BroadcastV1::Change(change) => {
             let actor_id = change.actor_id;
-            let changeset = process_single_version(agent, change).await?;
+            let changeset = process_single_change(agent, change).await?;
 
             changeset.map(|changeset| {
                 BroadcastV1::Change(ChangeV1 {
