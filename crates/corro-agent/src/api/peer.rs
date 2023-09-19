@@ -318,7 +318,7 @@ impl rustls::client::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-const MAX_CHANGES_BYTES_PER_MESSAGE: usize = 128 * 1024;
+const MAX_CHANGES_BYTES_PER_MESSAGE: usize = 64 * 1024;
 
 async fn process_range(
     booked: &Booked,
@@ -683,7 +683,7 @@ async fn send_sync_write_buffer<W: Sink<Bytes, Error = std::io::Error> + Unpin>(
     write: &mut W,
 ) -> Result<(), SyncSendError> {
     let buf_len = buf.len();
-    write.send(buf.split().freeze()).await?;
+    write.feed(buf.split().freeze()).await?;
 
     counter!("corro.sync.chunk.sent.bytes", buf_len as u64);
 
@@ -782,6 +782,10 @@ pub async fn bidirectional_sync(
                 }
                 append_write_buf(&mut send_buf, msg)?;
                 send_sync_write_buffer(&mut send_buf, &mut write).await?;
+            }
+
+            if let Err(e) = write.close().await {
+                error!("could not close the sync write sink: {e}");
             }
 
             let mut send = write.into_inner();
