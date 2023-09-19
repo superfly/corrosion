@@ -318,7 +318,7 @@ impl rustls::client::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-const MAX_CHANGES_BYTES_PER_MESSAGE: usize = 32 * 1024;
+const MAX_CHANGES_BYTES_PER_MESSAGE: usize = 128 * 1024;
 
 async fn process_range(
     booked: &Booked,
