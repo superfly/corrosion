@@ -1644,6 +1644,7 @@ pub async fn process_multiple_changes(
             let mut booked_write = booked.blocking_write();
 
             let tx = conn.transaction()?;
+
             let mut knowns = vec![];
             let mut changesets = vec![];
             for change in changes {
@@ -1670,7 +1671,7 @@ pub async fn process_multiple_changes(
 
             for (versions, known) in knowns {
                 if let KnownDbVersion::Partial { seqs, last_seq, .. } = &known {
-                    let full_seqs_range = 1..=*last_seq;
+                    let full_seqs_range = 0..=*last_seq;
                     let gaps_count = seqs.gaps(&full_seqs_range).count();
                     let version = *versions.start();
                     if gaps_count == 0 {

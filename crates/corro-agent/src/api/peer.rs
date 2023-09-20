@@ -507,6 +507,9 @@ fn handle_known_version(
                             warn!(%actor_id, version, "switched from partial to current version");
                             drop(bw);
                             let mut seqs_needed: Vec<RangeInclusive<i64>> = seqs_iter.collect();
+                            if let Some(new_start_seq) = last_sent_seq.take() {
+                                range_needed = (new_start_seq + 1)..=*range_needed.end();
+                            }
                             seqs_needed.insert(0, range_needed);
                             return handle_known_version(
                                 conn,
