@@ -455,122 +455,123 @@ fn handle_known_version(
 
                 let mut last_sent_seq = None;
 
-                // 'outer: loop {
-                let overlapping: Vec<RangeInclusive<i64>> =
-                    partial_seqs.overlapping(&range_needed).cloned().collect();
+                'outer: loop {
+                    let overlapping: Vec<RangeInclusive<i64>> =
+                        partial_seqs.overlapping(&range_needed).cloned().collect();
 
-                for range in overlapping {
-                    // since there can be partial overlap, we need to only
-                    // send back the specific range we have or else we risk
-                    // sending bad data and creating inconsistencies
+                    for range in overlapping {
+                        // since there can be partial overlap, we need to only
+                        // send back the specific range we have or else we risk
+                        // sending bad data and creating inconsistencies
 
-                    // pick the biggest start
-                    // e.g. if 0..=10 is needed, and we have 2..=7 then
-                    //      we need to fetch from 2
-                    let start_seq = cmp::max(range.start(), range_needed.start());
+                        // pick the biggest start
+                        // e.g. if 0..=10 is needed, and we have 2..=7 then
+                        //      we need to fetch from 2
+                        let start_seq = cmp::max(range.start(), range_needed.start());
 
-                    // pick the smallest end
-                    // e.g. if 0..=10 is needed, and we have 2..=7 then
-                    //      we need to stop at 7
-                    let end_seq = cmp::min(range.end(), range_needed.end());
+                        // pick the smallest end
+                        // e.g. if 0..=10 is needed, and we have 2..=7 then
+                        //      we need to stop at 7
+                        let end_seq = cmp::min(range.end(), range_needed.end());
 
-                    debug!("partial, effective range: {start_seq}..={end_seq}");
+                        debug!("partial, effective range: {start_seq}..={end_seq}");
 
-                    let bw = booked.blocking_write();
-                    let maybe_db_version = match bw.get(&version) {
-                        Some(known) => match known {
-                            KnownDbVersion::Partial { seqs, .. } => {
-                                if seqs != &partial_seqs {
-                                    // info!(%actor_id, version, "different partial sequences, updating! range_needed: {range_needed:?}");
-                                    // partial_seqs = seqs.clone();
-                                    // if let Some(new_start_seq) = last_sent_seq.take() {
-                                    //     range_needed =
-                                    //         (new_start_seq + 1)..=*range_needed.end();
-                                    // }
-                                    // continue 'outer;
+                        let bw = booked.blocking_write();
+                        let maybe_db_version = match bw.get(&version) {
+                            Some(known) => match known {
+                                KnownDbVersion::Partial { seqs, .. } => {
+                                    if seqs != &partial_seqs {
+                                        info!(%actor_id, version, "different partial sequences, updating! range_needed: {range_needed:?}");
+                                        partial_seqs = seqs.clone();
+                                        if let Some(new_start_seq) = last_sent_seq.take() {
+                                            range_needed =
+                                                (new_start_seq + 1)..=*range_needed.end();
+                                        }
+                                        continue 'outer;
+                                    }
+                                    None
                                 }
-                                None
-                            }
-                            KnownDbVersion::Current { db_version, .. } => Some(*db_version),
-                            KnownDbVersion::Cleared => {
-                                debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
+                                KnownDbVersion::Current { db_version, .. } => Some(*db_version),
+                                KnownDbVersion::Cleared => {
+                                    debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
+                                    break;
+                                }
+                            },
+                            None => {
+                                warn!(%actor_id, version, "in-memory bookkeeping vanished!");
                                 break;
                             }
-                        },
-                        None => {
-                            warn!(%actor_id, version, "in-memory bookkeeping vanished!");
-                            break;
-                        }
-                    };
+                        };
 
-                    if let Some(db_version) = maybe_db_version {
-                        break;
-                        info!(%actor_id, version, "switched from partial to current version");
-                        drop(bw);
-                        let mut seqs_needed: Vec<RangeInclusive<i64>> = seqs_iter.collect();
-                        if let Some(new_start_seq) = last_sent_seq.take() {
-                            range_needed = (new_start_seq + 1)..=*range_needed.end();
-                        }
-                        seqs_needed.insert(0, range_needed);
-                        return handle_known_version(
-                            conn,
-                            actor_id,
-                            is_local,
-                            version,
-                            KnownDbVersion::Current {
-                                db_version,
+                        if let Some(db_version) = maybe_db_version {
+                            info!(%actor_id, version, "switched from partial to current version");
+                            drop(bw);
+                            let mut seqs_needed: Vec<RangeInclusive<i64>> = seqs_iter.collect();
+                            if let Some(new_start_seq) = last_sent_seq.take() {
+                                range_needed = (new_start_seq + 1)..=*range_needed.end();
+                            }
+                            seqs_needed.insert(0, range_needed);
+                            return handle_known_version(
+                                conn,
+                                actor_id,
+                                is_local,
+                                version,
+                                KnownDbVersion::Current {
+                                    db_version,
+                                    last_seq,
+                                    ts,
+                                },
+                                booked,
+                                seqs_needed,
                                 last_seq,
                                 ts,
-                            },
-                            booked,
-                            seqs_needed,
-                            last_seq,
-                            ts,
-                            sender,
-                        );
-                    }
+                                sender,
+                            );
+                        }
 
-                    // this is a read transaction!
-                    let tx = conn.transaction()?;
+                        // this is a read transaction!
+                        let tx = conn.transaction()?;
 
-                    let mut prepped = tx.prepare_cached(
-                        r#"
+                        let mut prepped = tx.prepare_cached(
+                            r#"
                             SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                                 FROM __corro_buffered_changes
                                 WHERE site_id = ?
                                   AND version = ?
                                   AND seq >= ? AND seq <= ?
                                   ORDER BY seq ASC"#,
-                    )?;
+                        )?;
 
-                    let site_id: [u8; 16] = actor_id.to_bytes();
+                        let site_id: [u8; 16] = actor_id.to_bytes();
 
-                    let rows = prepped
-                        .query_map(params![site_id, version, start_seq, end_seq], row_to_change)?;
+                        let rows = prepped.query_map(
+                            params![site_id, version, start_seq, end_seq],
+                            row_to_change,
+                        )?;
 
-                    // drop write lock!
-                    drop(bw);
+                        // drop write lock!
+                        drop(bw);
 
-                    send_change_chunks(
-                        sender,
-                        ChunkedChanges::new(
-                            rows,
-                            *start_seq,
-                            *end_seq,
-                            MAX_CHANGES_BYTES_PER_MESSAGE,
-                        ),
-                        actor_id,
-                        version,
-                        last_seq,
-                        ts,
-                    )?;
+                        send_change_chunks(
+                            sender,
+                            ChunkedChanges::new(
+                                rows,
+                                *start_seq,
+                                *end_seq,
+                                MAX_CHANGES_BYTES_PER_MESSAGE,
+                            ),
+                            actor_id,
+                            version,
+                            last_seq,
+                            ts,
+                        )?;
 
-                    debug!(%actor_id, version, "done sending chunks of partial changes");
+                        debug!(%actor_id, version, "done sending chunks of partial changes");
 
-                    last_sent_seq = Some(*end_seq);
+                        last_sent_seq = Some(*end_seq);
+                    }
+                    break;
                 }
-                //     break;
-                // }
             }
             KnownDbVersion::Cleared => unreachable!(),
         }

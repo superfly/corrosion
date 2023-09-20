@@ -53,8 +53,8 @@ use itertools::Itertools;
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
-use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, params, Connection, OptionalExtension, Savepoint, Transaction};
+use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
+use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
 use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
@@ -1647,7 +1647,10 @@ pub async fn process_multiple_changes(
                 let booked = bookie.for_actor_blocking(actor_id);
                 let mut booked_write = booked.blocking_write();
 
+                let mut seen = RangeInclusiveMap::new();
+
                 for change in changes {
+                    let seqs = change.seqs();
                     if booked_write.contains_all(change.versions(), change.seqs()) {
                         trace!(
                             "previously unknown versions are now deemed known, aborting inserts"
@@ -1656,19 +1659,36 @@ pub async fn process_multiple_changes(
                     }
 
                     let versions = change.versions();
-                    let actor_id = change.actor_id;
+
+                    // check if we've seen this version here...
+                    if versions.clone().all(|version| match seqs {
+                        Some(check_seqs) => match seen.get(&version) {
+                            Some(known) => match known {
+                                KnownDbVersion::Partial { seqs, .. } => {
+                                    check_seqs.clone().all(|seq| seqs.contains(&seq))
+                                }
+                                KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
+                            },
+                            None => false,
+                        },
+                        None => seen.contains_key(&version),
+                    }) {
+                        continue;
+                    }
 
                     let tx = conn.transaction()?;
 
                     let (known, changeset) = match process_single_version(&tx, change) {
                         Ok(res) => res,
                         Err(e) => {
-                            error!(%actor_id, "could not process single change: {e}");
+                            error!(%actor_id, ?versions, "could not process single change: {e}");
                             continue;
                         }
                     };
 
                     tx.commit()?;
+
+                    seen.insert(versions.clone(), known.clone());
 
                     changesets.push((actor_id, changeset));
                     knowns.push((versions, known));
