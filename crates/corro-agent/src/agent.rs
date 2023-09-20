@@ -1655,16 +1655,12 @@ pub async fn process_multiple_changes(
                 let versions = change.versions();
                 let actor_id = change.actor_id;
 
-                match process_single_version(&tx, change) {
-                    Ok(Some((known, changeset))) => {
+                match process_single_version(&tx, change)? {
+                    Some((known, changeset)) => {
                         changesets.push((actor_id, changeset));
                         knowns.push((versions, known));
                     }
-                    Ok(None) => {
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("could not process single change: {e}");
+                    None => {
                         continue;
                     }
                 }
