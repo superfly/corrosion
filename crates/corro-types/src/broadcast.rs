@@ -95,6 +95,18 @@ pub enum Changeset {
     },
 }
 
+impl From<ChangesetParts> for Changeset {
+    fn from(value: ChangesetParts) -> Self {
+        Changeset::Full {
+            version: value.version,
+            changes: value.changes,
+            seqs: value.seqs,
+            last_seq: value.last_seq,
+            ts: value.ts,
+        }
+    }
+}
+
 pub struct ChangesetParts {
     pub version: i64,
     pub changes: Vec<Change>,

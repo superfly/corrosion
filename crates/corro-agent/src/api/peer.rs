@@ -23,7 +23,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::agent::{process_single_change, SyncRecvError};
+use crate::agent::{process_multiple_changes, SyncRecvError};
 use crate::api::public::ChunkedChanges;
 
 use corro_types::{
@@ -894,7 +894,7 @@ pub async fn bidirectional_sync(
             let mut count = 0;
 
             // changes buffer
-            let mut buf = Vec::with_capacity(2);
+            let mut buf = Vec::with_capacity(4);
 
             loop {
                 match read_sync_msg(&mut read).await {
@@ -922,14 +922,16 @@ pub async fn bidirectional_sync(
                     },
                 }
 
-                if buf.len() >= 2 {
-                    for change in buf.drain(..) {
-                        process_single_change(agent, change)
-                            .await
-                            .map_err(SyncRecvError::from)?;
-                    }
+                if buf.len() == buf.capacity() {
+                    process_multiple_changes(agent, buf.drain(..).collect())
+                        .await
+                        .map_err(SyncRecvError::from)?;
                 }
             }
+
+            process_multiple_changes(agent, buf.drain(..).collect())
+                .await
+                .map_err(SyncRecvError::from)?;
 
             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
 
