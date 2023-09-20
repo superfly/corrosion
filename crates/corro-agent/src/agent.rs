@@ -1430,7 +1430,7 @@ async fn resolve_bootstrap(
 }
 
 fn store_empty_changeset(
-    tx: &Savepoint,
+    tx: &Transaction,
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
 ) -> Result<(), rusqlite::Error> {
@@ -1640,64 +1640,61 @@ pub async fn process_multiple_changes(
         .into_iter()
     {
         block_in_place(|| {
-            let booked = bookie.for_actor_blocking(actor_id);
-            let mut booked_write = booked.blocking_write();
-
-            let mut tx = conn.transaction()?;
-
             let mut knowns = vec![];
             let mut changesets = vec![];
 
-            for change in changes {
-                if booked_write.contains_all(change.versions(), change.seqs()) {
-                    trace!("previously unknown versions are now deemed known, aborting inserts");
-                    continue;
-                }
+            {
+                let booked = bookie.for_actor_blocking(actor_id);
+                let mut booked_write = booked.blocking_write();
 
-                let versions = change.versions();
-                let actor_id = change.actor_id;
-
-                let sp = tx.savepoint()?;
-
-                let (known, changeset) = match process_single_version(&sp, change) {
-                    Ok(Some(res)) => res,
-                    Ok(None) => {
+                for change in changes {
+                    if booked_write.contains_all(change.versions(), change.seqs()) {
+                        trace!(
+                            "previously unknown versions are now deemed known, aborting inserts"
+                        );
                         continue;
                     }
-                    Err(e) => {
-                        error!(%actor_id, "could not process single change: {e}");
-                        continue;
-                    }
-                };
-                sp.commit()?;
 
-                changesets.push((actor_id, changeset));
-                knowns.push((versions, known));
-            }
+                    let versions = change.versions();
+                    let actor_id = change.actor_id;
 
-            tx.commit()?;
+                    let tx = conn.transaction()?;
 
-            for (versions, known) in knowns {
-                if let KnownDbVersion::Partial { seqs, last_seq, .. } = &known {
-                    let full_seqs_range = 0..=*last_seq;
-                    let gaps_count = seqs.gaps(&full_seqs_range).count();
-                    let version = *versions.start();
-                    if gaps_count == 0 {
-                        // if we have no gaps, then we can schedule applying all these changes.
-                        info!(%actor_id, version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
-                        let tx_apply = agent.tx_apply().clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = tx_apply.send((actor_id, version)).await {
-                                error!("could not send trigger for applying fully buffered changes later: {e}");
-                            }
-                        });
-                    } else {
-                        debug!(%actor_id, version, "still have {gaps_count} gaps in partially buffered seqs");
-                    }
+                    let (known, changeset) = match process_single_version(&tx, change) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            error!(%actor_id, "could not process single change: {e}");
+                            continue;
+                        }
+                    };
+
+                    tx.commit()?;
+
+                    changesets.push((actor_id, changeset));
+                    knowns.push((versions, known));
                 }
-                booked_write.insert_many(versions, known);
+
+                for (versions, known) in knowns {
+                    if let KnownDbVersion::Partial { seqs, last_seq, .. } = &known {
+                        let full_seqs_range = 0..=*last_seq;
+                        let gaps_count = seqs.gaps(&full_seqs_range).count();
+                        let version = *versions.start();
+                        if gaps_count == 0 {
+                            // if we have no gaps, then we can schedule applying all these changes.
+                            info!(%actor_id, version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
+                            let tx_apply = agent.tx_apply().clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tx_apply.send((actor_id, version)).await {
+                                    error!("could not send trigger for applying fully buffered changes later: {e}");
+                                }
+                            });
+                        } else {
+                            debug!(%actor_id, version, "still have {gaps_count} gaps in partially buffered seqs");
+                        }
+                    }
+                    booked_write.insert_many(versions, known);
+                }
             }
-            drop(booked_write);
 
             for (actor_id, changeset) in changesets {
                 process_subs(agent, changeset.changes());
@@ -1712,7 +1709,7 @@ pub async fn process_multiple_changes(
 }
 
 fn process_incomplete_version(
-    tx: &Savepoint,
+    tx: &Transaction,
     actor_id: ActorId,
     parts: &ChangesetParts,
 ) -> rusqlite::Result<KnownDbVersion> {
@@ -1800,11 +1797,11 @@ fn process_incomplete_version(
 }
 
 fn process_complete_version(
-    tx: &Savepoint,
+    tx: &Transaction,
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
     parts: Option<ChangesetParts>,
-) -> rusqlite::Result<Option<(KnownDbVersion, Changeset)>> {
+) -> rusqlite::Result<(KnownDbVersion, Changeset)> {
     let ChangesetParts {
         version,
         changes,
@@ -1815,10 +1812,7 @@ fn process_complete_version(
         None => {
             store_empty_changeset(tx, actor_id, versions.clone())?;
             // booked_write.insert_many(versions.clone(), KnownDbVersion::Cleared);
-            return Ok(Some((
-                KnownDbVersion::Cleared,
-                Changeset::Empty { versions },
-            )));
+            return Ok((KnownDbVersion::Cleared, Changeset::Empty { versions }));
         }
         Some(parts) => parts,
     };
@@ -1910,15 +1904,13 @@ fn process_complete_version(
         counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
     }
 
-    Ok::<_, rusqlite::Error>(Some((known_version, new_changeset)))
+    Ok::<_, rusqlite::Error>((known_version, new_changeset))
 }
 
 fn process_single_version(
-    tx: &Savepoint,
+    tx: &Transaction,
     change: ChangeV1,
-) -> rusqlite::Result<Option<(KnownDbVersion, Changeset)>> {
-    let is_complete = change.is_complete();
-
+) -> rusqlite::Result<(KnownDbVersion, Changeset)> {
     let ChangeV1 {
         actor_id,
         changeset,
@@ -1926,14 +1918,8 @@ fn process_single_version(
 
     let versions = changeset.versions();
 
-    let (known, changeset) = if is_complete {
-        if let Some((known, changeset)) =
-            process_complete_version(tx, actor_id, versions, changeset.into_parts())?
-        {
-            (known, changeset)
-        } else {
-            return Ok(None);
-        }
+    let (known, changeset) = if changeset.is_complete() {
+        process_complete_version(tx, actor_id, versions, changeset.into_parts())?
     } else {
         let parts = changeset.into_parts().unwrap();
         let known = process_incomplete_version(tx, actor_id, &parts)?;
@@ -1941,7 +1927,7 @@ fn process_single_version(
         (known, parts.into())
     };
 
-    Ok(Some((known, changeset)))
+    Ok((known, changeset))
 }
 
 async fn process_messages(
