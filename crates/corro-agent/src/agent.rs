@@ -1578,6 +1578,8 @@ async fn process_fully_buffered_changes(
 
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?, ?, ?, ?, ?);")?.execute(params![actor_id, version, db_version, last_seq, ts])?;
 
+            info!(%actor_id, version, "inserted bookkeeping row after buffered insert");
+
             Some(KnownDbVersion::Current {
                 db_version,
                 last_seq,
@@ -1585,6 +1587,9 @@ async fn process_fully_buffered_changes(
             })
         } else {
             tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, last_seq, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, last_seq, ts])?;
+
+            info!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
+
             Some(KnownDbVersion::Cleared)
         };
 
@@ -1795,18 +1800,20 @@ fn process_incomplete_version(
         .execute(params![actor_id, version])?;
 
     for range in seqs_in_bookkeeping.iter() {
-        tx.prepare_cached("INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                        ",
-                    )?
-                    .execute(params![
-                        actor_id,
-                        version,
-                        range.start(),
-                        range.end(),
-                        last_seq,
-                        ts
-                    ])?;
+        tx.prepare_cached(
+            "
+            INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
+                VALUES (?, ?, ?, ?, ?, ?)
+        ",
+        )?
+        .execute(params![
+            actor_id,
+            version,
+            range.start(),
+            range.end(),
+            last_seq,
+            ts
+        ])?;
     }
 
     Ok(KnownDbVersion::Partial {
