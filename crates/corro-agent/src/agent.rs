@@ -305,7 +305,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         let agent = agent.clone();
         async move {
             let stream = ReceiverStream::new(rtt_rx);
-            let chunker = stream.chunks_timeout(20, Duration::from_secs(1));
+            // we can handle a lot of them I think...
+            let chunker = stream.chunks_timeout(1024, Duration::from_secs(1));
             tokio::pin!(chunker);
             while let Some(chunks) = chunker.next().await {
                 let mut members = agent.members().write();
@@ -1608,14 +1609,21 @@ pub async fn process_multiple_changes(
 ) -> Result<Vec<(ActorId, Changeset)>, ChangeError> {
     let bookie = agent.bookie();
 
+    let mut seen = HashSet::new();
     let mut unknown_changes = Vec::with_capacity(changes.len());
     for change in changes {
+        let versions = change.versions();
+        let seqs = change.seqs();
+        if !seen.insert((change.actor_id, versions, seqs.cloned())) {
+            continue;
+        }
         if bookie
             .contains(&change.actor_id, change.versions(), change.seqs())
             .await
         {
             continue;
         }
+
         unknown_changes.push(change);
     }
 

@@ -105,7 +105,7 @@ impl Transport {
             if let Some(conn) = r.get(&addr).cloned() {
                 if test_conn(&conn) {
                     if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
-                        warn!("could not send RTT for connection through sender: {e}");
+                        debug!("could not send RTT for connection through sender: {e}");
                     }
                     return Ok(conn);
                 }
@@ -122,7 +122,7 @@ impl Transport {
 
             let conn = self.0.endpoint.connect(addr, server_name.as_str())?.await?;
             if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
-                warn!("could not send RTT for connection through sender: {e}");
+                debug!("could not send RTT for connection through sender: {e}");
             }
             w.insert(addr, conn.clone());
             conn
