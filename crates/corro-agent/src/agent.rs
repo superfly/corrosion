@@ -188,6 +188,16 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         for ((actor_id, version), (seqs, last_seq, ts)) in partials {
             debug!(%actor_id, version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
             let ranges = bk.entry(actor_id).or_default();
+
+            if let Some(known) = ranges.get(&version) {
+                warn!(%actor_id, version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
+
+                let mut conn = pool.write_priority().await?;
+                let tx = conn.transaction()?;
+                clear_buffered_meta(&tx, actor_id, version)?;
+                tx.commit()?;
+            }
+
             let gaps_count = seqs.gaps(&(0..=last_seq)).count();
             ranges.insert(
                 version..=version,
@@ -1463,6 +1473,22 @@ fn store_empty_changeset(
     Ok(())
 }
 
+fn clear_buffered_meta(tx: &Transaction, actor_id: ActorId, version: i64) -> rusqlite::Result<()> {
+    // remove all buffered changes for cleanup purposes
+    let count = tx
+        .prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?
+        .execute(params![actor_id.as_bytes(), version])?;
+    debug!(%actor_id, version, "deleted {count} buffered changes");
+
+    // delete all bookkept sequences for this version
+    let count = tx
+        .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?
+        .execute(params![actor_id, version])?;
+    debug!(%actor_id, version, "deleted {count} sequences in bookkeeping");
+
+    Ok(())
+}
+
 async fn process_fully_buffered_changes(
     agent: &Agent,
     actor_id: ActorId,
@@ -1549,21 +1575,7 @@ async fn process_fully_buffered_changes(
             info!(%actor_id, version, "no buffered rows, skipped insertion into crsql_changes");
         }
 
-        // remove all buffered changes for cleanup purposes
-        let count = tx
-            .prepare_cached(
-                "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
-            )?
-            .execute(params![actor_id.as_bytes(), version])?;
-        debug!(%actor_id, version, "deleted {count} buffered changes");
-
-        // delete all bookkept sequences for this version
-        let count = tx
-            .prepare_cached(
-                "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
-            )?
-            .execute(params![actor_id, version])?;
-        debug!(%actor_id, version, "deleted {count} sequences in bookkeeping");
+        clear_buffered_meta(&tx, actor_id, version)?;
 
         let rows_impacted: i64 = tx
             .prepare_cached("SELECT crsql_rows_impacted()")?
@@ -1586,10 +1598,17 @@ async fn process_fully_buffered_changes(
                 ts,
             })
         } else {
-            tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, last_seq, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, last_seq, ts])?;
+            let _inserted = tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, last_seq, ts) VALUES (?, ?, ?, ?);")?.execute(params![actor_id, version, last_seq, ts])?;
+
+            // if inserted > 0 {
+            //     info!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
+            //     Some(KnownDbVersion::Cleared)
+            // } else {
+            //     warn!(%actor_id, version, "bookkeeping row already existed, it shouldn't matter but it would be nice to fix this issue");
+            //     None
+            // }
 
             info!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
-
             Some(KnownDbVersion::Cleared)
         };
 
