@@ -196,6 +196,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 let tx = conn.transaction()?;
                 clear_buffered_meta(&tx, actor_id, version)?;
                 tx.commit()?;
+                continue;
             }
 
             let gaps_count = seqs.gaps(&(0..=last_seq)).count();
@@ -1477,7 +1478,7 @@ fn clear_buffered_meta(tx: &Transaction, actor_id: ActorId, version: i64) -> rus
     // remove all buffered changes for cleanup purposes
     let count = tx
         .prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?
-        .execute(params![actor_id.as_bytes(), version])?;
+        .execute(params![actor_id, version])?;
     debug!(%actor_id, version, "deleted {count} buffered changes");
 
     // delete all bookkept sequences for this version
