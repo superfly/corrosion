@@ -191,6 +191,8 @@ pub enum SplitPoolCreateError {
     Pool(#[from] crate::sqlite::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    Rusqlite(#[from] rusqlite::Error),
 }
 
 impl SplitPool {
@@ -220,6 +222,17 @@ impl SplitPool {
 
         if let Some(parent) = subscriptions_db_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
+        }
+
+        {
+            // open database and set its journal to WAL
+            let conn = rusqlite::Connection::open(&subscriptions_db_path)?;
+            conn.execute_batch(
+                r#"
+                    PRAGMA journal_mode = WAL;
+                    PRAGMA synchronous = NORMAL;
+                "#,
+            )?;
         }
 
         let dedicated_pool = bb8::Pool::builder()
