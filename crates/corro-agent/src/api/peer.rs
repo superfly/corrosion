@@ -488,7 +488,6 @@ fn handle_known_version(
                                     //         (new_start_seq + 1)..=*range_needed.end();
                                     // }
                                     // continue 'outer;
-                                    break;
                                 }
                                 None
                             }
