@@ -1462,13 +1462,7 @@ fn store_empty_changeset(
     ])?;
 
     for version in versions {
-        tx.prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?
-            .execute(params![actor_id, version,])?;
-
-        tx.prepare_cached(
-            "DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?",
-        )?
-        .execute(params![actor_id, version,])?;
+        clear_buffered_meta(tx, actor_id, version)?;
     }
 
     Ok(())
@@ -1858,13 +1852,14 @@ fn process_complete_version(
     } = match parts {
         None => {
             store_empty_changeset(tx, actor_id, versions.clone())?;
+            info!(%actor_id, ?versions, "cleared empty versions range");
             // booked_write.insert_many(versions.clone(), KnownDbVersion::Cleared);
             return Ok((KnownDbVersion::Cleared, Changeset::Empty { versions }));
         }
         Some(parts) => parts,
     };
 
-    debug!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}");
+    info!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}");
 
     let mut impactful_changeset = vec![];
 
@@ -1946,6 +1941,9 @@ fn process_complete_version(
     };
 
     debug!(%actor_id, version, "inserted bookkeeping row");
+
+    // in case we got both buffered data and a complete set of changes
+    clear_buffered_meta(tx, actor_id, version)?;
 
     for (table_name, count) in changes_per_table {
         counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
