@@ -3,18 +3,18 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, BufMut, BytesMut};
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
-use corro_types::broadcast::{ChangeV1, Changeset};
-use corro_types::change::row_to_change;
+use corro_types::broadcast::{ChangeV1, Changeset, Timestamp};
+use corro_types::change::{row_to_change, Change};
 use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
 use futures::{Stream, TryFutureExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use speedy::Writable;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{channel, Sender};
@@ -22,9 +22,8 @@ use tokio::task::block_in_place;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
-use tripwire::{Outcome, TimeoutFutureExt};
 
-use crate::agent::{process_single_change, SyncRecvError};
+use crate::agent::{process_multiple_changes, SyncRecvError};
 use crate::api::public::ChunkedChanges;
 
 use corro_types::{
@@ -320,6 +319,9 @@ impl rustls::client::ServerCertVerifier for SkipServerVerification {
 }
 
 const MAX_CHANGES_BYTES_PER_MESSAGE: usize = 64 * 1024;
+const MIN_CHANGES_BYTES_PER_MESSAGE: usize = 2 * 1024;
+
+const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
 
 async fn process_range(
     booked: &Booked,
@@ -357,8 +359,7 @@ async fn process_range(
         }
 
         for version in versions {
-            let bw = booked.write().await;
-            let known = bw.get(&version);
+            let known = { booked.read().await.get(&version).cloned() };
             if let Some(known_version) = known {
                 process_version(
                     pool,
@@ -366,6 +367,7 @@ async fn process_range(
                     is_local,
                     version,
                     known_version,
+                    booked,
                     vec![],
                     sender,
                 )
@@ -380,110 +382,84 @@ async fn process_range(
     Ok(())
 }
 
-async fn process_version(
-    pool: &SplitPool,
+#[allow(clippy::too_many_arguments)]
+fn handle_known_version(
+    conn: &mut Connection,
     actor_id: ActorId,
     is_local: bool,
     version: i64,
-    known_version: &KnownDbVersion,
-    mut seqs_needed: Vec<RangeInclusive<i64>>,
+    init_known: KnownDbVersion,
+    booked: &Booked,
+    seqs_needed: Vec<RangeInclusive<i64>>,
+    last_seq: i64,
+    ts: Timestamp,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
-    let conn = pool.read().await?;
-
-    block_in_place(|| {
-        match known_version {
-            KnownDbVersion::Current {
-                db_version,
-                last_seq,
-                ts,
-            } => {
-                if seqs_needed.is_empty() {
-                    seqs_needed = vec![(0..=*last_seq)];
-                }
-
-                for range_needed in seqs_needed {
-                    let start_seq = range_needed.start();
-                    let end_seq = range_needed.end();
-
-                    let mut prepped = conn.prepare_cached(r#"
-                        SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl
-                            FROM crsql_changes
-                            WHERE site_id IS ?
-                              AND db_version = ?
-                              AND seq >= ? AND seq <= ?
-                            ORDER BY seq ASC
-                    "#)?;
-                    let site_id: Option<[u8; 16]> = (!is_local)
-                        .then_some(actor_id)
-                        .map(|actor_id| actor_id.to_bytes());
-
-                    let rows = prepped.query_map(
-                        params![site_id, db_version, start_seq, end_seq],
-                        row_to_change,
-                    )?;
-
-                    // FIXME: at this point, we don't need to lock anymore, I don't think!
-
-                    let chunked = ChunkedChanges::new(
-                        rows,
-                        *start_seq,
-                        *end_seq,
-                        // TODO: make this adaptive based on how long it takes to send changes
-                        MAX_CHANGES_BYTES_PER_MESSAGE,
-                    );
-                    for changes_seqs in chunked {
-                        match changes_seqs {
-                            Ok((changes, seqs)) => {
-                                debug!(%actor_id, version, "sending fully applied changes {}..={} (requested: {range_needed:?}) (len: {})", seqs.start(), seqs.end(), changes.len());
-                                tokio::spawn({
-                                    let sender = sender.clone();
-                                    let last_seq = *last_seq;
-                                    let ts = *ts;
-                                    async move {
-                                        if let Outcome::Preempted(_) = sender
-                                            .send(SyncMessage::V1(SyncMessageV1::Changeset(
-                                                ChangeV1 {
-                                                    actor_id,
-                                                    changeset: Changeset::Full {
-                                                        version,
-                                                        changes,
-                                                        seqs,
-                                                        last_seq,
-                                                        ts,
-                                                    },
-                                                },
-                                            )))
-                                            .with_timeout(Duration::from_secs(5))
-                                            .await
-                                        {
-                                            error!("timed out sending chunk of changes");
-                                        }
-                                    }
-                                });
-                                if sender.is_closed() {
-                                    eyre::bail!("sync message sender channel is closed");
-                                }
-                            }
-                            Err(e) => {
-                                error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                                break;
-                            }
+    let mut seqs_iter = seqs_needed.into_iter();
+    while let Some(range_needed) = seqs_iter.by_ref().next() {
+        match &init_known {
+            KnownDbVersion::Current { db_version, .. } => {
+                let bw = booked.blocking_write();
+                match bw.get(&version) {
+                    Some(known) => {
+                        // a current version cannot go back to a partial version
+                        if known.is_cleared() {
+                            debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
+                            break;
                         }
                     }
-                }
-            }
-            // NOTE: still not sure if this is safe, probably going to disable it.
-            KnownDbVersion::Partial { seqs, last_seq, ts } => {
-                // return Ok(());
-                debug!("seqs needed: {seqs_needed:?}");
-                debug!("seqs we got: {seqs:?}");
-                if seqs_needed.is_empty() {
-                    seqs_needed = vec![(0..=*last_seq)];
+                    None => {
+                        warn!(%actor_id, version, "in-memory bookkeeping vanished, aborting.");
+                        break;
+                    }
                 }
 
-                for range_needed in seqs_needed {
-                    for range in seqs.overlapping(&range_needed) {
+                // this is a read transaction!
+                let tx = conn.transaction()?;
+
+                let mut prepped = tx.prepare_cached(r#"
+                    SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl
+                        FROM crsql_changes
+                        WHERE site_id IS ?
+                        AND db_version = ?
+                        AND seq >= ? AND seq <= ?
+                        ORDER BY seq ASC
+                "#)?;
+                let site_id: Option<[u8; 16]> = (!is_local)
+                    .then_some(actor_id)
+                    .map(|actor_id| actor_id.to_bytes());
+
+                let start_seq = range_needed.start();
+                let end_seq = range_needed.end();
+
+                let rows = prepped.query_map(
+                    params![site_id, db_version, start_seq, end_seq],
+                    row_to_change,
+                )?;
+
+                // drop write lock!
+                drop(bw);
+
+                send_change_chunks(
+                    sender,
+                    ChunkedChanges::new(rows, *start_seq, *end_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
+                    actor_id,
+                    version,
+                    last_seq,
+                    ts,
+                )?;
+            }
+            KnownDbVersion::Partial { seqs, .. } => {
+                let mut partial_seqs = seqs.clone();
+                let mut range_needed = range_needed.clone();
+
+                let mut last_sent_seq = None;
+
+                'outer: loop {
+                    let overlapping: Vec<RangeInclusive<i64>> =
+                        partial_seqs.overlapping(&range_needed).cloned().collect();
+
+                    for range in overlapping {
                         // since there can be partial overlap, we need to only
                         // send back the specific range we have or else we risk
                         // sending bad data and creating inconsistencies
@@ -500,7 +476,63 @@ async fn process_version(
 
                         debug!("partial, effective range: {start_seq}..={end_seq}");
 
-                        let mut prepped = conn.prepare_cached(
+                        let bw = booked.blocking_write();
+                        let maybe_db_version = match bw.get(&version) {
+                            Some(known) => match known {
+                                KnownDbVersion::Partial { seqs, .. } => {
+                                    if seqs != &partial_seqs {
+                                        info!(%actor_id, version, "different partial sequences, updating! range_needed: {range_needed:?}");
+                                        partial_seqs = seqs.clone();
+                                        if let Some(new_start_seq) = last_sent_seq.take() {
+                                            range_needed =
+                                                (new_start_seq + 1)..=*range_needed.end();
+                                        }
+                                        continue 'outer;
+                                    }
+                                    None
+                                }
+                                KnownDbVersion::Current { db_version, .. } => Some(*db_version),
+                                KnownDbVersion::Cleared => {
+                                    debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
+                                    break;
+                                }
+                            },
+                            None => {
+                                warn!(%actor_id, version, "in-memory bookkeeping vanished!");
+                                break;
+                            }
+                        };
+
+                        if let Some(db_version) = maybe_db_version {
+                            info!(%actor_id, version, "switched from partial to current version");
+                            drop(bw);
+                            let mut seqs_needed: Vec<RangeInclusive<i64>> = seqs_iter.collect();
+                            if let Some(new_start_seq) = last_sent_seq.take() {
+                                range_needed = (new_start_seq + 1)..=*range_needed.end();
+                            }
+                            seqs_needed.insert(0, range_needed);
+                            return handle_known_version(
+                                conn,
+                                actor_id,
+                                is_local,
+                                version,
+                                KnownDbVersion::Current {
+                                    db_version,
+                                    last_seq,
+                                    ts,
+                                },
+                                booked,
+                                seqs_needed,
+                                last_seq,
+                                ts,
+                                sender,
+                            );
+                        }
+
+                        // this is a read transaction!
+                        let tx = conn.transaction()?;
+
+                        let mut prepped = tx.prepare_cached(
                             r#"
                             SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                                 FROM __corro_buffered_changes
@@ -517,72 +549,137 @@ async fn process_version(
                             row_to_change,
                         )?;
 
-                        let chunked = ChunkedChanges::new(
-                            rows,
-                            *start_seq,
-                            *end_seq,
-                            MAX_CHANGES_BYTES_PER_MESSAGE,
-                        );
-                        for changes_seqs in chunked {
-                            match changes_seqs {
-                                Ok((changes, seqs)) => {
-                                    if seqs.end() < seqs.start() {
-                                        warn!(%actor_id, version, "UH OH, was going to {}..={} and that's not allowed (end < start). full range: {start_seq}..={end_seq}, last_seq: {last_seq}", seqs.start(), seqs.end());
-                                        return Ok(());
-                                    }
-                                    debug!(%actor_id, version, "sending partially buffered changes {}..={} (len: {})", seqs.start(), seqs.end(), changes.len());
-                                    tokio::spawn({
-                                        let sender = sender.clone();
-                                        let last_seq = *last_seq;
-                                        let ts = *ts;
-                                        async move {
-                                            if let Outcome::Preempted(_) = sender
-                                                .send(SyncMessage::V1(SyncMessageV1::Changeset(
-                                                    ChangeV1 {
-                                                        actor_id,
-                                                        changeset: Changeset::Full {
-                                                            version,
-                                                            changes,
-                                                            seqs,
-                                                            last_seq,
-                                                            ts,
-                                                        },
-                                                    },
-                                                )))
-                                                .with_timeout(Duration::from_secs(2))
-                                                .await
-                                            {
-                                                error!("timed out sending chunk of changes");
-                                            }
-                                        }
-                                    });
-                                    if sender.is_closed() {
-                                        eyre::bail!("sync message sender channel is closed");
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("could not process buffered crsql change (version: {version}) for broadcast: {e}");
-                                    break;
-                                }
-                            }
-                        }
+                        // drop write lock!
+                        drop(bw);
+
+                        send_change_chunks(
+                            sender,
+                            ChunkedChanges::new(
+                                rows,
+                                *start_seq,
+                                *end_seq,
+                                MAX_CHANGES_BYTES_PER_MESSAGE,
+                            ),
+                            actor_id,
+                            version,
+                            last_seq,
+                            ts,
+                        )?;
+
                         debug!(%actor_id, version, "done sending chunks of partial changes");
+
+                        last_sent_seq = Some(*end_seq);
                     }
+                    break;
                 }
             }
-            KnownDbVersion::Cleared => {
-                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Empty {
-                        versions: version..=version,
-                    },
-                })))?;
-            }
+            KnownDbVersion::Cleared => unreachable!(),
         }
-        Ok(())
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_version(
+    pool: &SplitPool,
+    actor_id: ActorId,
+    is_local: bool,
+    version: i64,
+    known_version: KnownDbVersion,
+    booked: &Booked,
+    mut seqs_needed: Vec<RangeInclusive<i64>>,
+    sender: &Sender<SyncMessage>,
+) -> eyre::Result<()> {
+    let mut conn = pool.read().await?;
+
+    let (last_seq, ts) = {
+        let (last_seq, ts) = match &known_version {
+            KnownDbVersion::Current { last_seq, ts, .. } => (*last_seq, *ts),
+            KnownDbVersion::Partial { last_seq, ts, .. } => (*last_seq, *ts),
+            KnownDbVersion::Cleared => return Ok(()),
+        };
+        if seqs_needed.is_empty() {
+            seqs_needed = vec![(0..=last_seq)];
+        }
+
+        (last_seq, ts)
+    };
+
+    block_in_place(|| {
+        handle_known_version(
+            &mut conn,
+            actor_id,
+            is_local,
+            version,
+            known_version,
+            booked,
+            seqs_needed,
+            last_seq,
+            ts,
+            sender,
+        )
     })?;
 
     trace!("done processing version: {version} for actor_id: {actor_id}");
+
+    Ok(())
+}
+
+fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
+    sender: &Sender<SyncMessage>,
+    mut chunked: ChunkedChanges<I>,
+    actor_id: ActorId,
+    version: i64,
+    last_seq: i64,
+    ts: Timestamp,
+) -> eyre::Result<()> {
+    let mut max_buf_size = chunked.max_buf_size();
+    loop {
+        if sender.is_closed() {
+            eyre::bail!("sync message sender channel is closed");
+        }
+        match chunked.next() {
+            Some(Ok((changes, seqs))) => {
+                let start = Instant::now();
+
+                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version,
+                        changes,
+                        seqs,
+                        last_seq,
+                        ts,
+                    },
+                })))?;
+
+                let elapsed = start.elapsed();
+
+                if elapsed > Duration::from_secs(5) {
+                    eyre::bail!("time out: peer is too slow");
+                }
+
+                if elapsed > ADAPT_CHUNK_SIZE_THRESHOLD {
+                    if max_buf_size <= MIN_CHANGES_BYTES_PER_MESSAGE {
+                        eyre::bail!("time out: peer is too slow even after reducing throughput");
+                    }
+
+                    max_buf_size /= 2;
+                    debug!("adapting max chunk size to {max_buf_size} bytes");
+
+                    chunked.set_max_buf_size(max_buf_size);
+                }
+            }
+            Some(Err(e)) => {
+                error!(%actor_id, version, "could not process changes to send via sync: {e}");
+                break;
+            }
+            None => {
+                break;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -623,8 +720,7 @@ async fn process_sync(
         // 2. process partial needs
         if let Some(partially_needed) = sync_state.partial_need.get(&actor_id) {
             for (version, seqs_needed) in partially_needed.iter() {
-                let bw = booked.write().await;
-                let known = bw.get(version);
+                let known = { booked.read().await.get(version).cloned() };
                 if let Some(known) = known {
                     process_version(
                         &pool,
@@ -632,6 +728,7 @@ async fn process_sync(
                         is_local,
                         *version,
                         known,
+                        &booked,
                         seqs_needed.clone(),
                         &sender,
                     )
@@ -799,6 +896,9 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
+            // changes buffer
+            let mut buf = Vec::with_capacity(4);
+
             loop {
                 match read_sync_msg(&mut read).await {
                     Ok(None) => {
@@ -811,9 +911,7 @@ pub async fn bidirectional_sync(
                     Ok(Some(msg)) => match msg {
                         SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
                             let len = change.len();
-                            process_single_change(agent, change)
-                                .await
-                                .map_err(SyncRecvError::from)?;
+                            buf.push(change);
                             count += len;
                         }
                         SyncMessage::V1(SyncMessageV1::State(_)) => {
@@ -826,7 +924,17 @@ pub async fn bidirectional_sync(
                         }
                     },
                 }
+
+                if buf.len() == buf.capacity() {
+                    process_multiple_changes(agent, buf.drain(..).collect())
+                        .await
+                        .map_err(SyncRecvError::from)?;
+                }
             }
+
+            process_multiple_changes(agent, buf.drain(..).collect())
+                .await
+                .map_err(SyncRecvError::from)?;
 
             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
 
