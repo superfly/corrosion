@@ -484,7 +484,12 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
+        let pool = SplitPool::create(
+            dir.path().join("./test.sqlite"),
+            dir.path().join("./subs.sqlite"),
+            tripwire.clone(),
+        )
+        .await?;
 
         {
             let mut conn = pool.write_priority().await?;

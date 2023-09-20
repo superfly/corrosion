@@ -52,6 +52,8 @@ pub struct DbConfig {
     pub path: Utf8PathBuf,
     #[serde(default)]
     pub schema_paths: Vec<Utf8PathBuf>,
+    #[serde(default)]
+    pub subscriptions_path: Option<Utf8PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +235,7 @@ impl ConfigBuilder {
             db: DbConfig {
                 path: db_path,
                 schema_paths: self.schema_paths,
+                subscriptions_path: None,
             },
             api: ApiConfig {
                 bind_addr: self.api_addr.ok_or(ConfigBuilderError::ApiAddrRequired)?,

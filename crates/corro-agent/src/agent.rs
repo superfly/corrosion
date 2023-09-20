@@ -110,7 +110,20 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     info!("Actor ID: {}", actor_id);
 
-    let pool = SplitPool::create(&conf.db.path, tripwire.clone()).await?;
+    let subscriptions_db_path = conf
+        .db
+        .subscriptions_path
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| {
+            conf.db
+                .path
+                .parent()
+                .map(|parent| parent.join("subscriptions.db"))
+                .unwrap_or_else(|| "/subscriptions.db".into())
+        });
+
+    let pool = SplitPool::create(&conf.db.path, subscriptions_db_path, tripwire.clone()).await?;
 
     let schema = {
         let mut conn = pool.write_priority().await?;

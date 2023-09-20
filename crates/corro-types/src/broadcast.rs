@@ -63,11 +63,10 @@ pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
+// TODO: shrink this by mapping primary keys to integers instead of repeating them
 #[derive(Debug, Clone, Readable, Writable)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
-    // internal version
-    // pub version: i64,
     pub changeset: Changeset,
 }
 

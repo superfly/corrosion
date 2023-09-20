@@ -15,7 +15,6 @@ use metrics::{gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{Connection, InterruptHandle};
-use tempfile::TempDir;
 use tokio::sync::{
     RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
     RwLockWriteGuard as TokioRwLockWriteGuard,
@@ -163,10 +162,6 @@ struct SplitPoolInner {
 
     dedicated_pool: bb8::Pool<RusqliteConnManager>,
 
-    // need to keep this for the life of the pool!
-    #[allow(dead_code)]
-    tmp_db_dir: TempDir,
-
     priority_tx: Sender<oneshot::Sender<CancellationToken>>,
     normal_tx: Sender<oneshot::Sender<CancellationToken>>,
     low_tx: Sender<oneshot::Sender<CancellationToken>>,
@@ -199,8 +194,9 @@ pub enum SplitPoolCreateError {
 }
 
 impl SplitPool {
-    pub async fn create<P: AsRef<Path>>(
+    pub async fn create<P: AsRef<Path>, P2: AsRef<Path>>(
         path: P,
+        subscriptions_db_path: P2,
         tripwire: Tripwire,
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = bb8::Builder::new()
@@ -219,39 +215,28 @@ impl SplitPool {
             .await?;
         debug!("built RO pool");
 
-        let tmp_db_dir = match path.as_ref().parent() {
-            Some(parent) => tempfile::tempdir_in(parent)?,
-            None => tempfile::tempdir()?,
-        };
+        let subscriptions_db_path: Utf8PathBuf =
+            subscriptions_db_path.as_ref().display().to_string().into();
+
+        if let Some(parent) = subscriptions_db_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
 
         let dedicated_pool = bb8::Pool::builder()
             .max_size(100)
             .build(
-                RusqliteConnManager::new(path.as_ref()).attach(
-                    tmp_db_dir
-                        .path()
-                        .join("subscriptions.db")
-                        .display()
-                        .to_string(),
-                    "subscriptions",
-                ),
+                RusqliteConnManager::new(path.as_ref())
+                    .attach(&subscriptions_db_path, "subscriptions"),
             )
             .await?;
 
-        Ok(Self::new(
-            ro_pool,
-            rw_pool,
-            dedicated_pool,
-            tmp_db_dir,
-            tripwire,
-        ))
+        Ok(Self::new(ro_pool, rw_pool, dedicated_pool, tripwire))
     }
 
     pub fn new(
         read: SqlitePool,
         write: SqlitePool,
         dedicated_pool: bb8::Pool<RusqliteConnManager>,
-        tmp_db_dir: TempDir,
         mut tripwire: Tripwire,
     ) -> Self {
         let (priority_tx, mut priority_rx) = channel(256);
@@ -289,7 +274,6 @@ impl SplitPool {
             read,
             write,
             dedicated_pool,
-            tmp_db_dir,
             priority_tx,
             normal_tx,
             low_tx,
