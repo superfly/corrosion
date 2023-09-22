@@ -41,7 +41,7 @@ use crate::{
 
 use super::members::Members;
 
-pub type Matchers = HashMap<uuid::Uuid, MatcherHandle>;
+pub type Subs = BTreeMap<uuid::Uuid, MatcherHandle>;
 
 #[derive(Clone)]
 pub struct Agent(Arc<AgentInner>);
@@ -71,14 +71,14 @@ pub struct AgentInner {
     members: RwLock<Members>,
     clock: Arc<uhlc::HLC>,
     bookie: Bookie,
-    matchers: RwLock<Matchers>,
+    subs: RwLock<Subs>,
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
     schema: RwLock<NormalizedSchema>,
 }
 
 impl Agent {
-    pub fn new(config: AgentConfig) -> Self {
+    pub fn new_w_subs(config: AgentConfig, subs: Subs) -> Self {
         Self(Arc::new(AgentInner {
             actor_id: config.actor_id,
             pool: config.pool,
@@ -88,11 +88,15 @@ impl Agent {
             members: config.members,
             clock: config.clock,
             bookie: config.bookie,
-            matchers: RwLock::new(HashMap::new()),
+            subs: RwLock::new(subs),
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             schema: config.schema,
         }))
+    }
+
+    pub fn new(config: AgentConfig) -> Self {
+        Self::new_w_subs(config, Default::default())
     }
 
     /// Return a borrowed [SqlitePool]
@@ -135,8 +139,8 @@ impl Agent {
         &self.0.schema
     }
 
-    pub fn matchers(&self) -> &RwLock<Matchers> {
-        &self.0.matchers
+    pub fn matchers(&self) -> &RwLock<Subs> {
+        &self.0.subs
     }
 
     pub fn db_path(&self) -> Utf8PathBuf {
@@ -196,7 +200,7 @@ pub enum SplitPoolCreateError {
 }
 
 impl SplitPool {
-    pub async fn create<P: AsRef<Path>, P2: AsRef<Path>>(
+    pub async fn create<P: AsRef<Path>, P2: Into<Utf8PathBuf>>(
         path: P,
         subscriptions_db_path: P2,
         tripwire: Tripwire,
@@ -217,36 +221,18 @@ impl SplitPool {
             .await?;
         debug!("built RO pool");
 
-        let subscriptions_db_path: Utf8PathBuf =
-            subscriptions_db_path.as_ref().display().to_string().into();
-
-        if let Some(parent) = subscriptions_db_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        {
-            // open database and set its journal to WAL
-            let conn = rusqlite::Connection::open(&subscriptions_db_path)?;
-            conn.execute_batch(
-                r#"
-                    PRAGMA journal_mode = WAL;
-                    PRAGMA synchronous = NORMAL;
-                "#,
-            )?;
-        }
-
         let dedicated_pool = bb8::Pool::builder()
             .max_size(100)
             .build(
                 RusqliteConnManager::new(path.as_ref())
-                    .attach(&subscriptions_db_path, "subscriptions"),
+                    .attach(subscriptions_db_path, "subscriptions"),
             )
             .await?;
 
         Ok(Self::new(ro_pool, rw_pool, dedicated_pool, tripwire))
     }
 
-    pub fn new(
+    fn new(
         read: SqlitePool,
         write: SqlitePool,
         dedicated_pool: bb8::Pool<RusqliteConnManager>,

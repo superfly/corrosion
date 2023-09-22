@@ -215,6 +215,15 @@ pub struct MatcherStmt {
 }
 
 impl Matcher {
+    pub fn restore(
+        id: Uuid,
+        schema: &NormalizedSchema,
+        mut conn: Connection,
+        sql: &str,
+    ) -> Result<MatcherHandle, MatcherError> {
+        todo!()
+    }
+
     pub fn create(
         id: Uuid,
         schema: &NormalizedSchema,
@@ -357,9 +366,9 @@ impl Matcher {
             );
         }
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(512);
-
         let qualified_table_name = format!("subscriptions.{query_table}");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(512);
 
         let handle = MatcherHandle(Arc::new(InnerMatcherHandle {
             cmd_tx,
@@ -394,8 +403,8 @@ impl Matcher {
 
         block_in_place(|| {
             let create_temp_table = format!(
-                "CREATE TABLE {} (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {});
-            CREATE UNIQUE INDEX subscriptions.index_{}_pk ON {} ({});",
+                "CREATE TABLE IF NOT EXISTS {} (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {});
+                 CREATE UNIQUE INDEX IF NOT EXISTS subscriptions.index_{}_pk ON {} ({});",
                 matcher.qualified_table_name,
                 tmp_cols.join(","),
                 matcher.id.as_simple(),

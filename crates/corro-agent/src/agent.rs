@@ -25,6 +25,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{
         Agent, AgentConfig, Booked, BookedVersions, Bookie, ChangeError, KnownDbVersion, SplitPool,
+        Subs,
     },
     broadcast::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeV1, Changeset, ChangesetParts,
@@ -123,12 +124,36 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 .unwrap_or_else(|| "/subscriptions.db".into())
         });
 
-    let pool = SplitPool::create(&conf.db.path, subscriptions_db_path, tripwire.clone()).await?;
+    if let Some(parent) = subscriptions_db_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let pool = SplitPool::create(&conf.db.path, &subscriptions_db_path, tripwire.clone()).await?;
 
     let schema = {
         let mut conn = pool.write_priority().await?;
         migrate(&mut conn)?;
         init_schema(&conn)?
+    };
+
+    let subs = {
+        // open database and set its journal to WAL
+        let mut conn = rusqlite::Connection::open(&subscriptions_db_path)?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+        "#,
+        )?;
+
+        migrate_subs(&mut conn)?;
+
+        let rows = conn
+            .prepare("SELECT id, sql FROM subs")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(uuid::Uuid, String)>>>()?;
+
+        todo!()
     };
 
     let (tx_apply, rx_apply) = channel(10240);
@@ -2234,7 +2259,7 @@ async fn sync_loop(
     }
 }
 
-pub fn migrate(conn: &mut CrConn) -> rusqlite::Result<()> {
+pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
         init_migration as fn(&Transaction) -> rusqlite::Result<()>,
     )];
@@ -2320,6 +2345,33 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
             
                 PRIMARY KEY (tbl_name, type, name)
             ) WITHOUT ROWID;
+        "#,
+    )?;
+
+    Ok(())
+}
+
+pub fn migrate_subs(conn: &mut Connection) -> rusqlite::Result<()> {
+    let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
+        init_subs_migration as fn(&Transaction) -> rusqlite::Result<()>,
+    )];
+
+    corro_types::sqlite::migrate(conn, migrations)
+}
+
+fn init_subs_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+            -- key/value for internal corrosion data (e.g. 'schema_version' => INT)
+            CREATE TABLE __corro_state (key TEXT NOT NULL PRIMARY KEY, value);
+
+            -- where subscriptions are stored
+            CREATE TABLE subs (
+                id BLOB PRIMARY KEY NOT NULL,
+                sql TEXT NOT NULL
+            ) WITHOUT ROWID;
+
+            CREATE INDEX subs_sql ON subs (sql);
         "#,
     )?;
 
