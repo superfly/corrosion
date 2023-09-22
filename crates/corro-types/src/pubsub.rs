@@ -1161,7 +1161,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_matcher() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         let schema_sql = "CREATE TABLE sw (pk TEXT primary key, sandwich TEXT);";
-        let schema = parse_sql(schema_sql)?;
+        let mut schema = parse_sql(schema_sql)?;
 
         let sql = "SELECT sandwich FROM sw WHERE pk=\"mad\"";
 
@@ -1188,7 +1188,7 @@ mod tests {
 
         {
             let tx = conn.transaction()?;
-            make_schema_inner(&tx, &NormalizedSchema::default(), &schema)?;
+            make_schema_inner(&tx, &NormalizedSchema::default(), &mut schema)?;
             tx.commit()?;
         }
 
@@ -1291,7 +1291,7 @@ mod tests {
           );
           ";
 
-        let schema = parse_sql(schema_sql).unwrap();
+        let mut schema = parse_sql(schema_sql).unwrap();
 
         let tmpdir = tempfile::tempdir().unwrap();
         let db_path = tmpdir.path().join("test.db");
@@ -1317,7 +1317,7 @@ mod tests {
 
         {
             let tx = conn.transaction().unwrap();
-            make_schema_inner(&tx, &NormalizedSchema::default(), &schema).unwrap();
+            make_schema_inner(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
             tx.commit().unwrap();
         }
 
@@ -1368,7 +1368,7 @@ mod tests {
 
             {
                 let tx = conn2.transaction().unwrap();
-                make_schema_inner(&tx, &NormalizedSchema::default(), &schema).unwrap();
+                make_schema_inner(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
                 tx.commit().unwrap();
             }
 
