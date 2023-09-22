@@ -12,6 +12,10 @@ Corrosion uses the [`cr-sqlite` SQLite extension](https://github.com/vlcn-io/cr-
 
 `cr-sqlite` provides functions to mark tables, in a SQLite database, as backed by CRDTs. These include Causal-Length ([pdf paper](https://dl.acm.org/doi/pdf/10.1145/3380787.3393678)) and Last-Write-Wins (LWW).
 
+As of cr-sqlite 0.15, the CRDT for an existing row being update is this:
+1. Biggest `col_version` wins
+2. In case of a tie, the "biggest" value is used.
+
 ### Basics
 
 With the extension loaded, writes to CRDT-backed tables will trigger insertions in internal tables for each column in a row.
