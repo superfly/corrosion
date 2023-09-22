@@ -27,22 +27,23 @@ RUN --mount=type=cache,target=/usr/local/cargo,from=rust:latest,source=/usr/loca
 # Runtime image
 FROM debian:bookworm-slim
 
+RUN apt update && apt install -y sqlite3 && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/nperf /usr/local/bin/nperf
 
 # Run as "corrosion" user
 RUN useradd -ms /bin/bash corrosion
 
-COPY examples/fly/entrypoint.sh /entrypoint
+COPY examples/fly/entrypoint.sh /entrypoint.sh
 
-USER corrosion
-WORKDIR /app
+# USER corrosion
+# WORKDIR /app
 
-COPY examples/fly/config.toml /app/config.toml
-COPY examples/fly/schemas /app/schemas
+COPY examples/fly/config.toml /etc/corrosion/config.toml
+COPY examples/fly/schemas /etc/corrosion/schemas
 
 # Get compiled binaries from builder's cargo install directory
-COPY --from=builder /usr/src/app/corrosion /app/corrosion
+COPY --from=builder /usr/src/app/corrosion /usr/bin/corrosion
 
-ENTRYPOINT ["/entrypoint"]
+ENTRYPOINT ["/entrypoint.sh"]
 # Run the app
-CMD ["/app/corrosion", "agent", "-c", "/app/config.toml"]
+CMD ["corrosion", "agent"]
