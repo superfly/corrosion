@@ -13,7 +13,7 @@ Getting state (data) from a central remote source can be incredibly expensive (a
 
 ### Fast, eventual, consistency
 
-Strong consistency by RAFT consensus can be too slow. Eventual consistency works for our use case, if it's fast.
+Many use cases can cope with eventual consistency, especially if a consistent state is attained sooner than later. Raft fell short for some use cases at Fly.io where round-trips to a centralized location are too expensive.
 
 ### Flexibility
 
