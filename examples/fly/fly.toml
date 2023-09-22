@@ -1,4 +1,4 @@
-app = "corrosion2"
+app = "corrosion"
 
 [env]
 RUST_BACKTRACE="1"
