@@ -1,7 +1,7 @@
 [db]
 path = "/var/lib/corrosion/state.db"
-schema_paths = ["/app/schemas"]
-
+schema_paths = ["/etc/corrosion/schemas"]
+    
 [gossip]
 # addr and bootstrap for Fly.io deployment example are written 
 # on startup by entrypoint script

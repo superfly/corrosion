@@ -616,7 +616,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     let mut schema_write = agent.schema().write();
 
     // clone the previous schema and apply
-    let new_schema = {
+    let mut new_schema = {
         let mut schema = schema_write.clone();
         for (name, def) in partial_schema.tables.iter() {
             // overwrite table because users are expected to return a full table def
@@ -628,7 +628,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     block_in_place(|| {
         let tx = conn.transaction()?;
 
-        make_schema_inner(&tx, &schema_write, &new_schema)?;
+        make_schema_inner(&tx, &schema_write, &mut new_schema)?;
 
         for tbl_name in partial_schema.tables.keys() {
             tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
@@ -960,13 +960,10 @@ mod tests {
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
 
         let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("./test.sqlite");
 
-        let pool = SplitPool::create(
-            dir.path().join("./test.sqlite"),
-            dir.path().join("./subs.sqlite"),
-            tripwire.clone(),
-        )
-        .await?;
+        let pool =
+            SplitPool::create(&db_path, dir.path().join("./subs.sqlite"), tripwire.clone()).await?;
 
         {
             let mut conn = pool.write_priority().await?;
@@ -1039,40 +1036,134 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
 
-        let schema = agent.schema().read();
-        let tests = schema
-            .tables
-            .get("tests")
-            .expect("no tests table in schema");
+        {
+            let schema = agent.schema().read();
+            let tests = schema
+                .tables
+                .get("tests")
+                .expect("no tests table in schema");
 
-        let id_col = tests.columns.get("id").unwrap();
-        assert_eq!(id_col.name, "id");
-        assert_eq!(id_col.sql_type, SqliteType::Integer);
-        assert!(id_col.nullable);
-        assert!(id_col.primary_key);
+            let id_col = tests.columns.get("id").unwrap();
+            assert_eq!(id_col.name, "id");
+            assert_eq!(id_col.sql_type, SqliteType::Integer);
+            assert!(id_col.nullable);
+            assert!(id_col.primary_key);
 
-        let foo_col = tests.columns.get("foo").unwrap();
-        assert_eq!(foo_col.name, "foo");
-        assert_eq!(foo_col.sql_type, SqliteType::Text);
-        assert!(foo_col.nullable);
-        assert!(!foo_col.primary_key);
+            let foo_col = tests.columns.get("foo").unwrap();
+            assert_eq!(foo_col.name, "foo");
+            assert_eq!(foo_col.sql_type, SqliteType::Text);
+            assert!(foo_col.nullable);
+            assert!(!foo_col.primary_key);
 
-        let tests = schema
-            .tables
-            .get("tests2")
-            .expect("no tests2 table in schema");
+            let tests = schema
+                .tables
+                .get("tests2")
+                .expect("no tests2 table in schema");
 
-        let id_col = tests.columns.get("id").unwrap();
-        assert_eq!(id_col.name, "id");
-        assert_eq!(id_col.sql_type, SqliteType::Integer);
-        assert!(id_col.nullable);
-        assert!(id_col.primary_key);
+            let id_col = tests.columns.get("id").unwrap();
+            assert_eq!(id_col.name, "id");
+            assert_eq!(id_col.sql_type, SqliteType::Integer);
+            assert!(id_col.nullable);
+            assert!(id_col.primary_key);
 
-        let foo_col = tests.columns.get("foo").unwrap();
-        assert_eq!(foo_col.name, "foo");
-        assert_eq!(foo_col.sql_type, SqliteType::Text);
-        assert!(foo_col.nullable);
-        assert!(!foo_col.primary_key);
+            let foo_col = tests.columns.get("foo").unwrap();
+            assert_eq!(foo_col.name, "foo");
+            assert_eq!(foo_col.sql_type, SqliteType::Text);
+            assert!(foo_col.nullable);
+            assert!(!foo_col.primary_key);
+        }
+
+        // w/ existing table!
+
+        let create_stmt = "CREATE TABLE tests3 (id BIGINT PRIMARY KEY, foo TEXT, updated_at INTEGER NOT NULL DEFAULT 0);";
+
+        {
+            // adding the table and an index
+            let conn = agent.pool().write_priority().await?;
+            conn.execute_batch(create_stmt)?;
+            conn.execute_batch("CREATE INDEX tests3_updated_at ON tests3 (updated_at);")?;
+            assert_eq!(
+                conn.execute(
+                    "INSERT INTO tests3 VALUES (123, 'some foo text', 123456789);",
+                    ()
+                )?,
+                1
+            );
+            assert_eq!(
+                conn.execute(
+                    "INSERT INTO tests3 VALUES (1234, 'some foo text 2', 1234567890);",
+                    ()
+                )?,
+                1
+            );
+        }
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![create_stmt.into()]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        {
+            let schema = agent.schema().read();
+
+            // check that the tests table is still there!
+            let tests = schema
+                .tables
+                .get("tests")
+                .expect("no tests table in schema");
+
+            let id_col = tests.columns.get("id").unwrap();
+            assert_eq!(id_col.name, "id");
+            assert_eq!(id_col.sql_type, SqliteType::Integer);
+            assert!(id_col.nullable);
+            assert!(id_col.primary_key);
+
+            let foo_col = tests.columns.get("foo").unwrap();
+            assert_eq!(foo_col.name, "foo");
+            assert_eq!(foo_col.sql_type, SqliteType::Text);
+            assert!(foo_col.nullable);
+            assert!(!foo_col.primary_key);
+
+            let tests = schema
+                .tables
+                .get("tests3")
+                .expect("no tests3 table in schema");
+
+            let id_col = tests.columns.get("id").unwrap();
+            assert_eq!(id_col.name, "id");
+            assert_eq!(id_col.sql_type, SqliteType::Integer);
+            assert!(id_col.nullable);
+            assert!(id_col.primary_key);
+
+            let foo_col = tests.columns.get("foo").unwrap();
+            assert_eq!(foo_col.name, "foo");
+            assert_eq!(foo_col.sql_type, SqliteType::Text);
+            assert!(foo_col.nullable);
+            assert!(!foo_col.primary_key);
+
+            let updated_at_col = tests.columns.get("updated_at").unwrap();
+            assert_eq!(updated_at_col.name, "updated_at");
+            assert_eq!(updated_at_col.sql_type, SqliteType::Integer);
+            assert!(!updated_at_col.nullable);
+            assert!(!updated_at_col.primary_key);
+
+            let updated_at_idx = tests.indexes.get("tests3_updated_at").unwrap();
+            assert_eq!(updated_at_idx.name, "tests3_updated_at");
+            assert_eq!(updated_at_idx.tbl_name, "tests3");
+            assert_eq!(updated_at_idx.columns.len(), 1);
+            assert!(updated_at_idx.where_clause.is_none());
+        }
+
+        let conn = agent.pool().read().await?;
+        let count: usize =
+            conn.query_row("SELECT COUNT(*) FROM tests3__crsql_clock;", (), |row| {
+                row.get(0)
+            })?;
+        // should've created a specific qty of clock table rows, just a sanity check!
+        assert_eq!(count, 4);
 
         Ok(())
     }

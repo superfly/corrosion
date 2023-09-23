@@ -127,8 +127,26 @@ pub enum SchemaError {
     AddPrimaryKey(String, String),
     #[error("can't modify primary keys (table: '{0}')")]
     ModifyPrimaryKeys(String),
+
+    #[error("tried importing an existing schema for table '{0}' due to a failed CREATE TABLE but didn't find anything (this should never happen)")]
+    ImportedSchemaNotFound(String),
+
+    #[error("existing schema for table '{tbl_name}' primary keys mismatched, expected: {expected:?}, got: {got:?}")]
+    ImportedSchemaPkMismatch {
+        tbl_name: String,
+        expected: IndexSet<String>,
+        got: IndexSet<String>,
+    },
+
+    #[error("existing schema for table '{tbl_name}' columns mismatched, expected: {expected:?}, got: {got:?}")]
+    ImportedSchemaColumnsMismatch {
+        tbl_name: String,
+        expected: IndexMap<String, NormalizedColumn>,
+        got: IndexMap<String, NormalizedColumn>,
+    },
 }
 
+#[allow(clippy::result_large_err)]
 pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
     let mut dump = String::new();
 
@@ -159,10 +177,11 @@ pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
     parse_sql(dump.as_str())
 }
 
+#[allow(clippy::result_large_err)]
 pub fn make_schema_inner(
     tx: &Transaction,
     schema: &NormalizedSchema,
-    new_schema: &NormalizedSchema,
+    new_schema: &mut NormalizedSchema,
 ) -> Result<(), SchemaError> {
     if let Some(name) = schema
         .tables
@@ -177,49 +196,102 @@ pub fn make_schema_inner(
         ));
     }
 
-    let new_table_names = new_schema
-        .tables
-        .keys()
-        .collect::<HashSet<_>>()
-        .difference(&schema.tables.keys().collect::<HashSet<_>>())
-        .cloned()
-        .collect::<HashSet<_>>();
+    let mut schema_to_merge = NormalizedSchema::default();
 
-    debug!("new table names: {new_table_names:?}");
+    {
+        let new_table_names = new_schema
+            .tables
+            .keys()
+            .collect::<HashSet<_>>()
+            .difference(&schema.tables.keys().collect::<HashSet<_>>())
+            .cloned()
+            .collect::<HashSet<_>>();
 
-    let new_tables_iter = new_schema
-        .tables
-        .iter()
-        .filter(|(table, _)| new_table_names.contains(table));
+        debug!("new table names: {new_table_names:?}");
 
-    for (name, table) in new_tables_iter {
-        info!("creating table '{name}'");
-        tx.execute_batch(
-            &Cmd::Stmt(Stmt::CreateTable {
-                temporary: false,
-                if_not_exists: false,
-                tbl_name: QualifiedName::single(Name(name.clone())),
-                body: table.raw.clone(),
-            })
-            .to_string(),
-        )?;
+        let new_tables_iter = new_schema
+            .tables
+            .iter()
+            .filter(|(table, _)| new_table_names.contains(table));
 
-        tx.execute_batch(&format!("SELECT crsql_as_crr('{name}');"))?;
-
-        for (idx_name, index) in table.indexes.iter() {
-            info!("creating index '{idx_name}'");
-            tx.execute_batch(
-                &Cmd::Stmt(Stmt::CreateIndex {
-                    unique: false,
+        for (name, table) in new_tables_iter {
+            info!("creating table '{name}'");
+            let create_table_res = tx.execute_batch(
+                &Cmd::Stmt(Stmt::CreateTable {
+                    temporary: false,
                     if_not_exists: false,
-                    idx_name: QualifiedName::single(Name(idx_name.clone())),
-                    tbl_name: Name(index.tbl_name.clone()),
-                    columns: index.columns.clone(),
-                    where_clause: index.where_clause.clone(),
+                    tbl_name: QualifiedName::single(Name(name.clone())),
+                    body: table.raw.clone(),
                 })
                 .to_string(),
-            )?;
+            );
+
+            if let Err(e) = create_table_res {
+                debug!("could not create table '{name}', trying to reconcile schema if table already exists");
+                let sql: Vec<String> = tx
+                .prepare(
+                    "SELECT sql FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL AND sql IS NOT NULL")?.query_map(
+                    [name],
+                    |row| row.get(0),
+                )?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+                if sql.is_empty() {
+                    return Err(e.into());
+                }
+
+                let sql = sql.join(";");
+                info!("found existing schema for '{name}'");
+
+                let parsed_table = parse_sql(&sql)?
+                    .tables
+                    .remove(name)
+                    .ok_or_else(|| SchemaError::ImportedSchemaNotFound(name.clone()))?;
+
+                if parsed_table.pk != table.pk {
+                    return Err(SchemaError::ImportedSchemaPkMismatch {
+                        tbl_name: name.clone(),
+                        expected: table.pk.clone(),
+                        got: parsed_table.pk,
+                    });
+                }
+
+                if parsed_table.columns != table.columns {
+                    return Err(SchemaError::ImportedSchemaColumnsMismatch {
+                        tbl_name: name.clone(),
+                        expected: table.columns.clone(),
+                        got: parsed_table.columns,
+                    });
+                }
+
+                schema_to_merge.tables.insert(name.clone(), parsed_table);
+            }
+
+            tx.execute_batch(&format!("SELECT crsql_as_crr('{name}');"))?;
+
+            if schema_to_merge.tables.contains_key(name) {
+                // just merged!
+                continue;
+            }
+
+            for (idx_name, index) in table.indexes.iter() {
+                info!("creating index '{idx_name}'");
+                tx.execute_batch(
+                    &Cmd::Stmt(Stmt::CreateIndex {
+                        unique: false,
+                        if_not_exists: false,
+                        idx_name: QualifiedName::single(Name(idx_name.clone())),
+                        tbl_name: Name(index.tbl_name.clone()),
+                        columns: index.columns.clone(),
+                        where_clause: index.where_clause.clone(),
+                    })
+                    .to_string(),
+                )?;
+            }
         }
+    }
+
+    for (name, table) in schema_to_merge.tables {
+        new_schema.tables.insert(name, table);
     }
 
     // iterate intersecting tables
@@ -464,6 +536,7 @@ pub fn make_schema_inner(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 pub fn parse_sql_to_schema(schema: &mut NormalizedSchema, sql: &str) -> Result<(), SchemaError> {
     debug!("parsing {sql}");
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
@@ -536,6 +609,7 @@ pub fn parse_sql_to_schema(schema: &mut NormalizedSchema, sql: &str) -> Result<(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 pub fn parse_sql(sql: &str) -> Result<NormalizedSchema, SchemaError> {
     let mut schema = NormalizedSchema::default();
 
@@ -544,6 +618,7 @@ pub fn parse_sql(sql: &str) -> Result<NormalizedSchema, SchemaError> {
     Ok(schema)
 }
 
+#[allow(clippy::result_large_err)]
 fn prepare_index(
     name: &QualifiedName,
     tbl_name: &Name,
@@ -566,6 +641,7 @@ fn prepare_index(
     }))
 }
 
+#[allow(clippy::result_large_err)]
 fn prepare_table(
     tbl_name: &QualifiedName,
     columns: &[ColumnDefinition],

@@ -200,7 +200,7 @@ pub enum SplitPoolCreateError {
 }
 
 impl SplitPool {
-    pub async fn create<P: AsRef<Path>, P2: Into<Utf8PathBuf>>(
+    pub async fn create<P: AsRef<Path>, P2: AsRef<Path>>(
         path: P,
         subscriptions_db_path: P2,
         tripwire: Tripwire,
@@ -223,10 +223,10 @@ impl SplitPool {
 
         let dedicated_pool = bb8::Pool::builder()
             .max_size(100)
-            .build(
-                RusqliteConnManager::new(path.as_ref())
-                    .attach(subscriptions_db_path, "subscriptions"),
-            )
+            .build(RusqliteConnManager::new(path.as_ref()).attach(
+                subscriptions_db_path.as_ref().display().to_string(),
+                "subscriptions",
+            ))
             .await?;
 
         Ok(Self::new(ro_pool, rw_pool, dedicated_pool, tripwire))
