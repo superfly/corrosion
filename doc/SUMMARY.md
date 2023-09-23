@@ -2,6 +2,7 @@
 
 [Introduction](intro.md)
 [Quick start](quick-start.md)
+[Deploy on Fly.io](deploy-on-fly.md)
 
 # User guide
 - [Authorization]() (to come)
