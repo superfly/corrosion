@@ -636,10 +636,7 @@ async fn forward_bytes_to_body_sender(mut rx: mpsc::Receiver<Bytes>, mut tx: hyp
 
 #[cfg(test)]
 mod tests {
-    use arc_swap::ArcSwap;
     use corro_types::{
-        actor::ActorId,
-        agent::SplitPool,
         api::{ChangeId, RowId},
         config::Config,
         pubsub::ChangeType,
@@ -649,7 +646,7 @@ mod tests {
     use tripwire::Tripwire;
 
     use crate::{
-        agent::{migrate, setup},
+        agent::setup,
         api::public::{api_v1_db_schema, api_v1_transactions},
     };
 
