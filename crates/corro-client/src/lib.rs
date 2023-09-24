@@ -80,9 +80,9 @@ impl CorrosionApiClient {
         Error,
     > {
         let p_and_q: PathAndQuery = if let Some(change_id) = from {
-            format!("/subscriptions?from={}", change_id.0).try_into()?
+            format!("/v1/subscriptions?from={}", change_id.0).try_into()?
         } else {
-            PathAndQuery::from_static("/subscriptions")
+            PathAndQuery::from_static("/v1/subscriptions")
         };
         let url = hyper::Uri::builder()
             .scheme("http")
