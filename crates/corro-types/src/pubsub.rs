@@ -1796,9 +1796,4 @@ mod tests {
             }
         }
     }
-
-    // #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    // async fn test_some_load() {
-
-    // }
 }
