@@ -11,34 +11,43 @@ use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::Agent,
-    api::{QueryEvent, Statement},
+    api::{ChangeId, QueryEvent, Statement},
     change::SqliteValue,
     pubsub::{Matcher, MatcherError, MatcherHandle, NormalizeStatementError},
     sqlite::SqlitePoolError,
 };
 use futures::{future::poll_fn, ready, Stream};
 use rusqlite::Connection;
+use serde::Deserialize;
 use tokio::{
-    sync::{broadcast, mpsc, RwLock as TokioRwLock},
+    sync::{broadcast, mpsc, oneshot, RwLock as TokioRwLock},
     task::block_in_place,
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
 use tokio_util::sync::PollSender;
-use tracing::{debug, error};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+#[derive(Default, Deserialize)]
+pub struct SubParams {
+    #[serde(default)]
+    from: Option<ChangeId>,
+}
 
 pub async fn api_v1_sub_by_id(
     Extension(agent): Extension<Agent>,
-    Extension(bcast_cache): Extension<MatcherBroadcastCache>,
+    Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
-    sub_by_id(agent, id, &bcast_cache).await
+    sub_by_id(agent, id, params.from, &bcast_cache).await
 }
 
 async fn sub_by_id(
     agent: Agent,
     id: Uuid,
-    bcast_cache: &MatcherBroadcastCache,
+    from: Option<ChangeId>,
+    bcast_cache: &SharedMatcherBroadcastCache,
 ) -> hyper::Response<hyper::Body> {
     let (matcher, rx) = match bcast_cache.read().await.get(&id).and_then(|tx| {
         agent
@@ -69,7 +78,7 @@ async fn sub_by_id(
 
     let (evt_tx, evt_rx) = mpsc::channel(512);
 
-    tokio::spawn(catch_up_sub(agent, matcher, rx, evt_tx));
+    tokio::spawn(catch_up_sub(agent, matcher, from, rx, evt_tx));
 
     let (tx, body) = hyper::Body::channel();
 
@@ -96,7 +105,9 @@ fn make_query_event_bytes(buf: &mut BytesMut, query_evt: QueryEvent) -> serde_js
     Ok(buf.split().freeze())
 }
 
-async fn process_sub_channel(
+const MAX_UNSUB_TIME: Duration = Duration::from_secs(300);
+
+pub async fn process_sub_channel(
     agent: Agent,
     id: Uuid,
     tx: broadcast::Sender<Bytes>,
@@ -104,24 +115,68 @@ async fn process_sub_channel(
 ) {
     let mut buf = BytesMut::new();
 
-    while let Some(query_evt) = evt_rx.recv().await {
-        let send_res = match make_query_event_bytes(&mut buf, query_evt) {
-            Ok(b) => tx.send(b),
+    let mut deadline = None;
+
+    loop {
+        let deadline_check = async {
+            if let Some(sleep) = deadline.as_mut() {
+                sleep.await
+            } else {
+                futures::future::pending().await
+            }
+        };
+
+        let query_evt = tokio::select! {
+            biased;
+            Some(query_evt) = evt_rx.recv() => query_evt,
+            _ = deadline_check => {
+                info!("all subscribers for {id} are gone and didn't come back within {MAX_UNSUB_TIME:?}");
+                break;
+            },
+            else => {
+                break;
+            }
+        };
+
+        let is_still_active = match make_query_event_bytes(&mut buf, query_evt) {
+            Ok(b) => tx.send(b).is_ok(),
             Err(e) => {
                 _ = tx.send(error_to_query_event_bytes(&mut buf, e));
                 break;
             }
         };
 
-        if let Err(_e) = send_res {
-            debug!("no more active receivers for subscription");
-            break;
+        if is_still_active {
+            deadline = None;
+        } else {
+            debug!("no active subscribers");
+            if deadline.is_none() {
+                deadline = Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)));
+            }
         }
     }
 
     debug!("subscription query channel done");
 
-    agent.matchers().write().remove(&id);
+    let handle = match agent.matchers().write().remove(&id) {
+        Some(h) => h,
+        None => {
+            warn!("subscription handle was already gone. odd!");
+            return;
+        }
+    };
+
+    let conn = match agent.pool().dedicated().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("could not acquire dedicated connection for subscription cleanup: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = handle.cleanup(conn) {
+        error!("could not properly cleanup subscription: {e}");
+    }
 }
 
 fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<Option<String>> {
@@ -167,6 +222,8 @@ pub enum MatcherUpsertError {
     NormalizeStatement(#[from] NormalizeStatementError),
     #[error(transparent)]
     Matcher(#[from] MatcherError),
+    #[error("a `from` query param was supplied, but no existing subscription found")]
+    SubFromWithoutMatcher,
 }
 
 impl MatcherUpsertError {
@@ -177,7 +234,8 @@ impl MatcherUpsertError {
             | MatcherUpsertError::CouldNotExpand => StatusCode::INTERNAL_SERVER_ERROR,
             MatcherUpsertError::Sqlite(_)
             | MatcherUpsertError::NormalizeStatement(_)
-            | MatcherUpsertError::Matcher(_) => StatusCode::BAD_REQUEST,
+            | MatcherUpsertError::Matcher(_)
+            | MatcherUpsertError::SubFromWithoutMatcher => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -194,9 +252,10 @@ impl From<MatcherUpsertError> for hyper::Response<hyper::Body> {
             .expect("could not build error response")
     }
 }
-
-pub type MatcherIdCache = Arc<TokioRwLock<HashMap<String, Uuid>>>;
-pub type MatcherBroadcastCache = Arc<TokioRwLock<HashMap<Uuid, broadcast::Sender<Bytes>>>>;
+pub type MatcherIdCache = HashMap<String, Uuid>;
+pub type SharedMatcherIdCache = Arc<TokioRwLock<MatcherIdCache>>;
+pub type MatcherBroadcastCache = HashMap<Uuid, broadcast::Sender<Bytes>>;
+pub type SharedMatcherBroadcastCache = Arc<TokioRwLock<MatcherBroadcastCache>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatchUpError {
@@ -223,12 +282,110 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
     buf.split().freeze()
 }
 
+fn catch_up_sub_anew(
+    conn: &Connection,
+    matcher: MatcherHandle,
+    buf: &mut BytesMut,
+    tx: mpsc::Sender<Bytes>,
+) -> Result<(), CatchUpError> {
+    let mut query_cols = vec![];
+    for i in 0..(matcher.parsed_columns().len()) {
+        query_cols.push(format!("col_{i}"));
+    }
+    let mut prepped = conn.prepare_cached(&format!(
+        "SELECT __corro_rowid,{} FROM {}",
+        query_cols.join(","),
+        matcher.table_name()
+    ))?;
+    let col_count = prepped.column_count();
+
+    tx.blocking_send(make_query_event_bytes(
+        buf,
+        QueryEvent::Columns(matcher.col_names().to_vec()),
+    )?)?;
+
+    let start = Instant::now();
+    let mut rows = prepped.query(())?;
+    let elapsed = start.elapsed();
+
+    loop {
+        let row = match rows.next()? {
+            Some(row) => row,
+            None => break,
+        };
+        let rowid = row.get(0)?;
+
+        let cells = (1..col_count)
+            .map(|i| row.get::<_, SqliteValue>(i))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        tx.blocking_send(make_query_event_bytes(buf, QueryEvent::Row(rowid, cells))?)?;
+    }
+
+    tx.blocking_send(make_query_event_bytes(
+        buf,
+        QueryEvent::EndOfQuery {
+            time: elapsed.as_secs_f64(),
+        },
+    )?)?;
+
+    Ok(())
+}
+
+fn catch_up_sub_from(
+    conn: &Connection,
+    matcher: MatcherHandle,
+    from: ChangeId,
+    buf: &mut BytesMut,
+    tx: mpsc::Sender<Bytes>,
+) -> Result<(), CatchUpError> {
+    let mut query_cols = vec![];
+    for i in 0..(matcher.parsed_columns().len()) {
+        query_cols.push(format!("col_{i}"));
+    }
+
+    let mut prepped = conn.prepare_cached(&format!(
+        "SELECT id, type, __corro_rowid, {} FROM {} WHERE id > ?",
+        query_cols.join(","),
+        matcher.changes_table_name()
+    ))?;
+
+    let col_count = prepped.column_count();
+
+    let mut rows = prepped.query([from])?;
+
+    loop {
+        let row = match rows.next()? {
+            Some(row) => row,
+            None => break,
+        };
+        let id = row.get(0)?;
+        let change_type = row.get(1)?;
+        let rowid = row.get(2)?;
+
+        let cells = (3..col_count)
+            .map(|i| row.get::<_, SqliteValue>(i))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        tx.blocking_send(make_query_event_bytes(
+            buf,
+            QueryEvent::Change(change_type, rowid, cells, id),
+        )?)?;
+    }
+
+    Ok(())
+}
+
 pub async fn catch_up_sub(
     agent: Agent,
     matcher: MatcherHandle,
+    from: Option<ChangeId>,
     sub_rx: broadcast::Receiver<Bytes>,
     tx: mpsc::Sender<Bytes>,
 ) -> eyre::Result<()> {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let forward_task = tokio::spawn(forward_sub_to_sender(Some(ready_rx), sub_rx, tx.clone()));
+
     {
         let mut buf = BytesMut::new();
 
@@ -242,52 +399,9 @@ pub async fn catch_up_sub(
             }
         };
 
-        let res = block_in_place(|| {
-            let mut query_cols = vec![];
-            for i in 0..(matcher.parsed_columns().len()) {
-                query_cols.push(format!("col_{i}"));
-            }
-            let mut prepped = conn.prepare_cached(&format!(
-                "SELECT __corro_rowid,{} FROM {}",
-                query_cols.join(","),
-                matcher.table_name()
-            ))?;
-            let col_count = prepped.column_count();
-
-            tx.blocking_send(make_query_event_bytes(
-                &mut buf,
-                QueryEvent::Columns(matcher.col_names().to_vec()),
-            )?)?;
-
-            let start = Instant::now();
-            let mut rows = prepped.query(())?;
-            let elapsed = start.elapsed();
-
-            loop {
-                let row = match rows.next()? {
-                    Some(row) => row,
-                    None => break,
-                };
-                let rowid = row.get(0)?;
-
-                let cells = (1..col_count)
-                    .map(|i| row.get::<_, SqliteValue>(i))
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-
-                tx.blocking_send(make_query_event_bytes(
-                    &mut buf,
-                    QueryEvent::Row(rowid, cells),
-                )?)?;
-            }
-
-            tx.blocking_send(make_query_event_bytes(
-                &mut buf,
-                QueryEvent::EndOfQuery {
-                    time: elapsed.as_secs_f64(),
-                },
-            )?)?;
-
-            Ok::<_, CatchUpError>(())
+        let res = block_in_place(|| match from {
+            Some(from) => catch_up_sub_from(&conn, matcher, from, &mut buf, tx.clone()),
+            None => catch_up_sub_anew(&conn, matcher, &mut buf, tx.clone()),
         });
 
         if let Err(CatchUpError::Sqlite(e)) = res {
@@ -295,16 +409,23 @@ pub async fn catch_up_sub(
         }
     }
 
-    forward_sub_to_sender(sub_rx, tx).await;
+    if let Err(_e) = ready_tx.send(()) {
+        warn!("subscriber catch up readiness receiver was gone, aborting...");
+        return Ok(());
+    }
+
+    // TODO: handle this spawn error?
+    _ = forward_task.await;
 
     Ok(())
 }
 
 pub async fn upsert_sub(
     agent: &Agent,
-    cache: &MatcherIdCache,
-    bcast_cache: &MatcherBroadcastCache,
+    cache: &SharedMatcherIdCache,
+    bcast_cache: &SharedMatcherBroadcastCache,
     stmt: Statement,
+    from: Option<ChangeId>,
     tx: mpsc::Sender<Bytes>,
 ) -> Result<Uuid, MatcherUpsertError> {
     let stmt = expand_sql(agent, &stmt).await?;
@@ -322,12 +443,16 @@ pub async fn upsert_sub(
             .flatten();
         if let Some(matcher) = maybe_matcher {
             let rx = sender.subscribe();
-            tokio::spawn(catch_up_sub(agent.clone(), matcher, rx, tx));
+            tokio::spawn(catch_up_sub(agent.clone(), matcher, from, rx, tx));
             return Ok(matcher_id);
         } else {
             cache_write.remove(&stmt);
             bcast_write.remove(&matcher_id);
         }
+    }
+
+    if from.is_some() {
+        return Err(MatcherUpsertError::SubFromWithoutMatcher);
     }
 
     let conn = agent.pool().dedicated().await?;
@@ -347,7 +472,7 @@ pub async fn upsert_sub(
         agent.matchers().write().insert(matcher_id, matcher);
     }
 
-    tokio::spawn(forward_sub_to_sender(sub_rx, tx));
+    tokio::spawn(forward_sub_to_sender(None, sub_rx, tx));
 
     tokio::spawn(process_sub_channel(
         agent.clone(),
@@ -361,14 +486,24 @@ pub async fn upsert_sub(
 
 pub async fn api_v1_subs(
     Extension(agent): Extension<Agent>,
-    Extension(sub_cache): Extension<MatcherIdCache>,
-    Extension(bcast_cache): Extension<MatcherBroadcastCache>,
+    Extension(sub_cache): Extension<SharedMatcherIdCache>,
+    Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
+    axum::extract::Query(params): axum::extract::Query<SubParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
     let (tx, body) = hyper::Body::channel();
     let (forward_tx, forward_rx) = mpsc::channel(10240);
 
-    let matcher_id = match upsert_sub(&agent, &sub_cache, &bcast_cache, stmt, forward_tx).await {
+    let matcher_id = match upsert_sub(
+        &agent,
+        &sub_cache,
+        &bcast_cache,
+        stmt,
+        params.from,
+        forward_tx,
+    )
+    .await
+    {
         Ok(id) => id,
         Err(e) => return hyper::Response::<hyper::Body>::from(e),
     };
@@ -382,13 +517,51 @@ pub async fn api_v1_subs(
         .expect("could not generate ok http response for query request")
 }
 
-async fn forward_sub_to_sender(sub_rx: broadcast::Receiver<Bytes>, tx: mpsc::Sender<Bytes>) {
+async fn forward_sub_to_sender(
+    ready: Option<oneshot::Receiver<()>>,
+    mut sub_rx: broadcast::Receiver<Bytes>,
+    tx: mpsc::Sender<Bytes>,
+) {
+    let mut buf = BytesMut::new();
+    if let Some(mut ready) = ready {
+        let mut events_buf = vec![];
+
+        loop {
+            tokio::select! {
+                biased;
+                ready_res = &mut ready => match ready_res {
+                    Ok(_) => {
+                        break;
+                    },
+                    Err(_e) => {
+                        _ = tx.send(error_to_query_event_bytes(&mut buf, "sub ready channel closed")).await;
+                        return;
+                    }
+                },
+                query_evt_res = sub_rx.recv() => match query_evt_res {
+                    Ok(query_evt) => {
+                        events_buf.push(query_evt);
+                    },
+                    Err(e) => {
+                        _ = tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                        return;
+                    }
+                },
+            }
+        }
+
+        for bytes in events_buf {
+            if let Err(_e) = tx.send(bytes).await {
+                warn!("could not send buffered events to subscriber, receiver must be gone!");
+                return;
+            }
+        }
+    }
+
     let chunker = tokio_stream::wrappers::BroadcastStream::new(sub_rx)
         .chunks_timeout(10, Duration::from_millis(10));
 
     tokio::pin!(chunker);
-
-    let mut buf = BytesMut::new();
 
     let mut tx = PollSender::new(tx);
 
@@ -464,7 +637,13 @@ async fn forward_bytes_to_body_sender(mut rx: mpsc::Receiver<Bytes>, mut tx: hyp
 #[cfg(test)]
 mod tests {
     use arc_swap::ArcSwap;
-    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, pubsub::ChangeType};
+    use corro_types::{
+        actor::ActorId,
+        agent::SplitPool,
+        api::{ChangeId, RowId},
+        config::Config,
+        pubsub::ChangeType,
+    };
     use http_body::Body;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
@@ -557,6 +736,7 @@ mod tests {
             Extension(agent.clone()),
             Extension(Default::default()),
             Extension(Default::default()),
+            axum::extract::Query(SubParams::default()),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await
@@ -589,12 +769,15 @@ mod tests {
 
         assert_eq!(
             rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Row(1, vec!["service-id".into(), "service-name".into()])
+            QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
         );
 
         assert_eq!(
             rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Row(2, vec!["service-id-2".into(), "service-name-2".into()])
+            QueryEvent::Row(
+                RowId(2),
+                vec!["service-id-2".into(), "service-name-2".into()]
+            )
         );
 
         assert!(matches!(
@@ -606,8 +789,9 @@ mod tests {
             rows.recv().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
-                3,
-                vec!["service-id-3".into(), "service-name-3".into()]
+                RowId(3),
+                vec!["service-id-3".into(), "service-name-3".into()],
+                ChangeId(1)
             )
         );
 
@@ -626,8 +810,9 @@ mod tests {
             rows.recv().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
-                4,
-                vec!["service-id-4".into(), "service-name-4".into()]
+                RowId(4),
+                vec!["service-id-4".into(), "service-name-4".into()],
+                ChangeId(2)
             )
         );
 

@@ -13,7 +13,10 @@ use crate::{
         peer::{bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, SyncError},
         public::{
             api_v1_db_schema, api_v1_queries, api_v1_transactions,
-            pubsub::{api_v1_sub_by_id, api_v1_subs, MatcherBroadcastCache, MatcherIdCache},
+            pubsub::{
+                api_v1_sub_by_id, api_v1_subs, process_sub_channel, MatcherBroadcastCache,
+                MatcherIdCache,
+            },
         },
     },
     broadcast::runtime_loop,
@@ -25,7 +28,6 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{
         Agent, AgentConfig, Booked, BookedVersions, Bookie, ChangeError, KnownDbVersion, SplitPool,
-        Subs,
     },
     broadcast::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeV1, Changeset, ChangesetParts,
@@ -34,6 +36,7 @@ use corro_types::{
     change::{Change, SqliteValue},
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members, Rtt},
+    pubsub::Matcher,
     schema::init_schema,
     sqlite::{CrConn, Migration, SqlitePoolError},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
@@ -111,18 +114,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     info!("Actor ID: {}", actor_id);
 
-    let subscriptions_db_path = conf
-        .db
-        .subscriptions_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| {
-            conf.db
-                .path
-                .parent()
-                .map(|parent| parent.join("subscriptions.db"))
-                .unwrap_or_else(|| "/subscriptions.db".into())
-        });
+    let subscriptions_db_path = conf.db.subscriptions_db_path();
 
     if let Some(parent) = subscriptions_db_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -134,26 +126,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         let mut conn = pool.write_priority().await?;
         migrate(&mut conn)?;
         init_schema(&conn)?
-    };
-
-    let subs = {
-        // open database and set its journal to WAL
-        let mut conn = rusqlite::Connection::open(&subscriptions_db_path)?;
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-        "#,
-        )?;
-
-        migrate_subs(&mut conn)?;
-
-        let rows = conn
-            .prepare("SELECT id, sql FROM subs")?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<(uuid::Uuid, String)>>>()?;
-
-        todo!()
     };
 
     let (tx_apply, rx_apply) = channel(10240);
@@ -327,6 +299,59 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rx_apply,
         rtt_rx,
     } = opts;
+
+    let mut matcher_id_cache = MatcherIdCache::default();
+    let mut matcher_bcast_cache = MatcherBroadcastCache::default();
+
+    {
+        // open database and set its journal to WAL
+        let rows = {
+            let subscriptions_db_path = agent.config().db.subscriptions_db_path();
+            let mut conn = rusqlite::Connection::open(&subscriptions_db_path)?;
+            conn.execute_batch(
+                r#"
+                    PRAGMA journal_mode = WAL;
+                    PRAGMA synchronous = NORMAL;
+                "#,
+            )?;
+
+            migrate_subs(&mut conn)?;
+
+            let res = conn
+                .prepare("SELECT id, sql FROM subs")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<(uuid::Uuid, String)>>>()?;
+
+            // the let is required or else we get a lifetime error
+            #[allow(clippy::let_and_return)]
+            res
+        };
+
+        for (id, sql) in rows {
+            let conn = agent.pool().dedicated().await?;
+            let (evt_tx, evt_rx) = channel(512);
+            match Matcher::restore(id, &agent.schema().read(), conn, evt_tx, &sql) {
+                Ok(handle) => {
+                    agent.matchers().write().insert(id, handle);
+                    let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
+                    tokio::spawn(process_sub_channel(
+                        agent.clone(),
+                        id,
+                        sub_tx.clone(),
+                        evt_rx,
+                    ));
+                    matcher_id_cache.insert(sql, id);
+                    matcher_bcast_cache.insert(id, sub_tx);
+                }
+                Err(e) => {
+                    error!("could not restore subscription {id}: {e}");
+                }
+            }
+        }
+    };
+
+    let matcher_id_cache = Arc::new(tokio::sync::RwLock::new(matcher_id_cache));
+    let matcher_bcast_cache = Arc::new(tokio::sync::RwLock::new(matcher_bcast_cache));
 
     let (to_send_tx, to_send_rx) = channel(10240);
     let (notifications_tx, notifications_rx) = channel(10240);
@@ -938,8 +963,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
                 .layer(Extension(agent.clone()))
-                .layer(Extension(MatcherIdCache::default()))
-                .layer(Extension(MatcherBroadcastCache::default()))
+                .layer(Extension(matcher_id_cache))
+                .layer(Extension(matcher_bcast_cache))
                 .layer(Extension(tripwire.clone())),
         )
         .layer(DefaultBodyLimit::disable())
@@ -2058,6 +2083,7 @@ pub fn process_subs(agent: &Agent, changeset: &[Change]) {
             }
         }
     }
+
     for id in matchers_to_delete {
         agent.matchers().write().remove(&id);
     }

@@ -291,11 +291,11 @@ impl QueryResponseIter {
                         self.done = true;
                         return None;
                     }
-                    QueryEvent::Row(rowid, cells) | QueryEvent::Change(_, rowid, cells) => {
+                    QueryEvent::Row(rowid, cells) | QueryEvent::Change(_, rowid, cells, _) => {
                         match self.columns.as_ref() {
                             Some(columns) => {
                                 return Some(Ok(Row {
-                                    id: rowid,
+                                    id: rowid.0,
                                     columns: columns.clone(),
                                     cells: Arc::new(cells),
                                 }));
@@ -424,7 +424,7 @@ async fn wait_for_rows(
     };
 
     match row_recv {
-        Some(Ok(QueryEvent::Change(_, _, cells))) => {
+        Some(Ok(QueryEvent::Change(_, _, cells, _))) => {
             trace!("got an updated row! {cells:?}");
 
             if let Err(_e) = tx.send(TemplateCommand::Render).await {

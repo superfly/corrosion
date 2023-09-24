@@ -56,6 +56,20 @@ pub struct DbConfig {
     pub subscriptions_path: Option<Utf8PathBuf>,
 }
 
+impl DbConfig {
+    pub fn subscriptions_db_path(&self) -> Utf8PathBuf {
+        self.subscriptions_path
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| {
+                self.path
+                    .parent()
+                    .map(|parent| parent.join("subscriptions.db"))
+                    .unwrap_or_else(|| "/subscriptions.db".into())
+            })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     #[serde(alias = "addr")]
