@@ -12,7 +12,7 @@ use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::IndexMap;
 use itertools::Itertools;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction};
 use sqlite3_parser::{
     ast::{
         As, Cmd, Expr, JoinConstraint, Name, OneSelect, Operator, QualifiedName, ResultColumn,
@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::{
     api::QueryEvent,
     schema::{NormalizedSchema, NormalizedTable},
+    sqlite::Migration,
 };
 
 pub use corro_api_types::sqlite::ChangeType;
@@ -470,7 +471,7 @@ impl Matcher {
                 );
             ",
                 qualified_table_name = matcher.qualified_table_name,
-                qualified_changes_table_name = matcher.qualified_table_name,
+                qualified_changes_table_name = matcher.qualified_changes_table_name,
                 columns = tmp_cols.join(","),
                 id = id.as_simple(),
                 unqualified_table_table = matcher.query_table,
@@ -485,10 +486,14 @@ impl Matcher {
 
             tx.execute_batch(&create_temp_table)?;
 
-            tx.execute(
-                "INSERT INTO subcriptions.subs (id, sql) VALUES (?, ?);",
+            let inserted = tx.execute(
+                "INSERT INTO subscriptions.subs (id, sql) VALUES (?, ?);",
                 params![id, sql],
-            )
+            )?;
+
+            tx.commit()?;
+
+            Ok::<_, rusqlite::Error>(inserted)
         })?;
 
         if n != 1 {
@@ -784,8 +789,7 @@ impl Matcher {
 
             let delete_prepped = tx.prepare_cached(&sql)?;
 
-            // println!("making changes insert statement...");
-            let mut change_insert_prepped = tx.prepare_cached(&format!(
+            let mut change_insert_stmt = tx.prepare_cached(&format!(
                 "INSERT INTO {} (__corro_rowid, {CHANGE_TYPE_COL}, {}) VALUES (?, ?, {}) RETURNING {CHANGE_ID_COL}",
                 self.qualified_changes_table_name,
                 actual_cols.join(","),
@@ -794,8 +798,6 @@ impl Matcher {
                     .collect::<Vec<_>>()
                     .join(",")
             ))?;
-
-            // println!("made changes insert statement");
 
             for (mut change_type, mut prepped) in [
                 (None, insert_prepped),
@@ -827,14 +829,16 @@ impl Matcher {
                         Ok(cells) => {
                             let mut changes_cells: Vec<&dyn ToSql> = vec![&rowid, &change_type_u8];
                             for cell in cells.iter() {
-                                // println!("inserting event cell: {cell:?}");
+                                trace!("inserting event cell: {cell:?}");
                                 changes_cells.push(cell);
                             }
-                            // println!("inserting changes... cols: {}", changes_cells.len());
-                            let change_id: ChangeId = change_insert_prepped
+                            trace!("inserting changes... cols: {}", changes_cells.len());
+
+                            let change_id: ChangeId = change_insert_stmt
                                 .query_row(params_from_iter(changes_cells), |row| row.get(0))?;
 
-                            // println!("inserted changes: {inserted}");
+                            trace!("got change id: {change_id}");
+
                             if let Err(e) = self.evt_tx.blocking_send(QueryEvent::Change(
                                 change_type,
                                 rowid,
@@ -1288,10 +1292,38 @@ pub enum MatcherError {
     InsertSub,
 }
 
+pub fn migrate_subs(conn: &mut Connection) -> rusqlite::Result<()> {
+    let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
+        init_subs_migration as fn(&Transaction) -> rusqlite::Result<()>,
+    )];
+
+    crate::sqlite::migrate(conn, migrations)
+}
+
+fn init_subs_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+            -- key/value for internal corrosion data (e.g. 'schema_version' => INT)
+            CREATE TABLE __corro_state (key TEXT NOT NULL PRIMARY KEY, value);
+
+            -- where subscriptions are stored
+            CREATE TABLE subs (
+                id BLOB PRIMARY KEY NOT NULL,
+                sql TEXT NOT NULL
+            ) WITHOUT ROWID;
+
+            CREATE INDEX subs_sql ON subs (sql);
+        "#,
+    )?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
 
+    use camino::Utf8PathBuf;
     use corro_api_types::row_to_change;
     use rusqlite::params;
 
@@ -1313,21 +1345,23 @@ mod tests {
 
         let tmpdir = tempfile::tempdir()?;
         let db_path = tmpdir.path().join("test.db");
+        let subscriptions_db_path: Utf8PathBuf = tmpdir
+            .path()
+            .join("subscriptions.db")
+            .display()
+            .to_string()
+            .into();
+
+        {
+            let mut conn = Connection::open(&subscriptions_db_path)?;
+            migrate_subs(&mut conn)?;
+        }
 
         let mut conn = CrConn::init(rusqlite::Connection::open(&db_path)?)?;
 
         setup_conn(
             &mut conn,
-            &[(
-                tmpdir
-                    .path()
-                    .join("subscriptions.db")
-                    .display()
-                    .to_string()
-                    .into(),
-                "subscriptions".into(),
-            )]
-            .into(),
+            &[(subscriptions_db_path.clone(), "subscriptions".into())].into(),
         )?;
 
         {
@@ -1340,16 +1374,7 @@ mod tests {
 
         setup_conn(
             &mut matcher_conn,
-            &[(
-                tmpdir
-                    .path()
-                    .join("subscriptions.db")
-                    .display()
-                    .to_string()
-                    .into(),
-                "subscriptions".into(),
-            )]
-            .into(),
+            &[(subscriptions_db_path, "subscriptions".into())].into(),
         )?;
 
         let (tx, _rx) = mpsc::channel(1);
@@ -1444,18 +1469,21 @@ mod tests {
             CrConn::init(rusqlite::Connection::open(&db_path).expect("could not open conn"))
                 .expect("could not init crsql");
 
+        let subscriptions_db_path: Utf8PathBuf = tmpdir
+            .path()
+            .join("subscriptions.db")
+            .display()
+            .to_string()
+            .into();
+
+        {
+            let mut conn = Connection::open(&subscriptions_db_path).unwrap();
+            migrate_subs(&mut conn).unwrap();
+        }
+
         setup_conn(
             &mut conn,
-            &[(
-                tmpdir
-                    .path()
-                    .join("subscriptions.db")
-                    .display()
-                    .to_string()
-                    .into(),
-                "subscriptions".into(),
-            )]
-            .into(),
+            &[(subscriptions_db_path.clone(), "subscriptions".into())].into(),
         )
         .unwrap();
 
@@ -1497,16 +1525,7 @@ mod tests {
 
             setup_conn(
                 &mut conn2,
-                &[(
-                    tmpdir
-                        .path()
-                        .join("subscriptions.db")
-                        .display()
-                        .to_string()
-                        .into(),
-                    "subscriptions".into(),
-                )]
-                .into(),
+                &[(subscriptions_db_path.clone(), "subscriptions".into())].into(),
             )
             .unwrap();
 
@@ -1561,16 +1580,7 @@ mod tests {
 
         setup_conn(
             &mut matcher_conn,
-            &[(
-                tmpdir
-                    .path()
-                    .join("subscriptions.db")
-                    .display()
-                    .to_string()
-                    .into(),
-                "subscriptions".into(),
-            )]
-            .into(),
+            &[(subscriptions_db_path.clone(), "subscriptions".into())].into(),
         )
         .unwrap();
 
@@ -1578,7 +1588,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(1);
             let matcher = Matcher::create(id, &schema, matcher_conn, tx, sql).unwrap();
 
-            println!("matcher created");
+            println!("matcher created w/ id: {}", id.as_simple());
 
             assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Columns(_)));
 

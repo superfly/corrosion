@@ -353,7 +353,10 @@ impl QueryHandle {
             return Ok((body, true));
         }
 
-        Ok((Box::pin(self.client.subscription(self.id).await?), false))
+        Ok((
+            Box::pin(self.client.subscription(self.id, None).await?),
+            false,
+        ))
     }
 }
 
@@ -517,7 +520,7 @@ impl Engine {
 
             debug!("sql function call {stmt:?}");
             let (query_id, body) = tokio::runtime::Handle::current()
-                .block_on(client.subscribe(&stmt))
+                .block_on(client.subscribe(&stmt, None))
                 .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
 
             debug!("got res w/ id: {query_id}");

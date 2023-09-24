@@ -34,6 +34,13 @@ pub enum QueryEvent {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
 #[serde(transparent)]
 pub struct RowId(pub i64);
+
+impl fmt::Display for RowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl From<i64> for RowId {
     fn from(value: i64) -> Self {
         Self(value)
@@ -59,6 +66,13 @@ impl ToSql for RowId {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
 #[serde(transparent)]
 pub struct ChangeId(pub i64);
+
+impl fmt::Display for ChangeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl From<i64> for ChangeId {
     fn from(value: i64) -> Self {
         Self(value)

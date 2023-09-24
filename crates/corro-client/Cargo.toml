@@ -12,6 +12,7 @@ bb8 = { workspace = true }
 bytes = { workspace = true }
 corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
 futures = { workspace = true }
+http = { workspace = true }
 hyper = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

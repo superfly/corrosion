@@ -2,9 +2,10 @@ use std::{error::Error as StdError, io, net::SocketAddr, ops::Deref, path::Path,
 
 use bytes::{Buf, BytesMut};
 use corro_api_types::{
-    sqlite::RusqliteConnManager, ExecResponse, ExecResult, QueryEvent, Statement,
+    sqlite::RusqliteConnManager, ChangeId, ExecResponse, ExecResult, QueryEvent, Statement,
 };
 use futures::{Stream, TryStreamExt};
+use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use tokio_serde::{formats::SymmetricalJson, SymmetricallyFramed};
 use tokio_util::{
@@ -70,6 +71,7 @@ impl CorrosionApiClient {
     pub async fn subscribe(
         &self,
         statement: &Statement,
+        from: Option<ChangeId>,
     ) -> Result<
         (
             Uuid,
@@ -77,9 +79,20 @@ impl CorrosionApiClient {
         ),
         Error,
     > {
+        let p_and_q: PathAndQuery = if let Some(change_id) = from {
+            format!("/subscriptions?from={}", change_id.0).try_into()?
+        } else {
+            PathAndQuery::from_static("/subscriptions")
+        };
+        let url = hyper::Uri::builder()
+            .scheme("http")
+            .authority(self.api_addr.to_string())
+            .path_and_query(p_and_q)
+            .build()?;
+
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/v1/subscriptions", self.api_addr))
+            .uri(url)
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statement)?))?;
@@ -103,10 +116,22 @@ impl CorrosionApiClient {
     pub async fn subscription(
         &self,
         id: Uuid,
+        from: Option<ChangeId>,
     ) -> Result<impl Stream<Item = io::Result<QueryEvent>> + Send + Sync + 'static, Error> {
+        let p_and_q: PathAndQuery = if let Some(change_id) = from {
+            format!("/subscriptions/{id}?from={}", change_id.0).try_into()?
+        } else {
+            format!("/subscriptions/{id}").try_into()?
+        };
+        let url = hyper::Uri::builder()
+            .scheme("http")
+            .authority(self.api_addr.to_string())
+            .path_and_query(p_and_q)
+            .build()?;
+
         let req = hyper::Request::builder()
             .method(hyper::Method::GET)
-            .uri(format!("http://{}/v1/subscriptions/{}", self.api_addr, id))
+            .uri(url)
             .header(hyper::header::ACCEPT, "application/json")
             .body(hyper::Body::empty())?;
 
@@ -412,6 +437,8 @@ impl Deref for CorrosionClient {
 pub enum Error {
     #[error(transparent)]
     Hyper(#[from] hyper::Error),
+    #[error(transparent)]
+    InvalidUri(#[from] http::uri::InvalidUri),
     #[error(transparent)]
     Http(#[from] hyper::http::Error),
     #[error(transparent)]
