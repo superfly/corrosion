@@ -678,8 +678,6 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
 
-        println!("schema done");
-
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
             axum::Json(vec![
@@ -695,19 +693,239 @@ mod tests {
         )
         .await;
 
-        println!("tx 1 done");
-
-        // println!("{body:?}");
-
         assert_eq!(status_code, StatusCode::OK);
 
         assert!(body.0.results.len() == 2);
 
+        let cache: SharedMatcherIdCache = Default::default();
+        let bcast_cache: SharedMatcherBroadcastCache = Default::default();
+
+        {
+            let mut res = api_v1_subs(
+                Extension(agent.clone()),
+                Extension(cache.clone()),
+                Extension(bcast_cache.clone()),
+                axum::extract::Query(SubParams::default()),
+                axum::Json(Statement::Simple("select * from tests".into())),
+            )
+            .await
+            .into_response();
+
+            if !res.status().is_success() {
+                let b = res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(res.status(), StatusCode::OK);
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-3".into(), "service-name-3".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            let mut rows = RowsIter {
+                body: res.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Columns(vec!["id".into(), "text".into()])
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(2),
+                    vec!["service-id-2".into(), "service-name-2".into()]
+                )
+            );
+
+            assert!(matches!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::EndOfQuery { .. }
+            ));
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Change(
+                    ChangeType::Insert,
+                    RowId(3),
+                    vec!["service-id-3".into(), "service-name-3".into()],
+                    ChangeId(1)
+                )
+            );
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-4".into(), "service-name-4".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Change(
+                    ChangeType::Insert,
+                    RowId(4),
+                    vec!["service-id-4".into(), "service-name-4".into()],
+                    ChangeId(2)
+                )
+            );
+
+            let mut res = api_v1_subs(
+                Extension(agent.clone()),
+                Extension(cache.clone()),
+                Extension(bcast_cache.clone()),
+                axum::extract::Query(SubParams {
+                    from: Some(1.into()),
+                }),
+                axum::Json(Statement::Simple("select * from tests".into())),
+            )
+            .await
+            .into_response();
+
+            if !res.status().is_success() {
+                let b = res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(res.status(), StatusCode::OK);
+
+            let mut rows_from = RowsIter {
+                body: res.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
+            assert_eq!(
+                rows_from.recv().await.unwrap().unwrap(),
+                QueryEvent::Change(
+                    ChangeType::Insert,
+                    RowId(4),
+                    vec!["service-id-4".into(), "service-name-4".into()],
+                    ChangeId(2)
+                )
+            );
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-5".into(), "service-name-5".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            let query_evt = QueryEvent::Change(
+                ChangeType::Insert,
+                RowId(5),
+                vec!["service-id-5".into(), "service-name-5".into()],
+                ChangeId(3),
+            );
+
+            assert_eq!(rows.recv().await.unwrap().unwrap(), query_evt);
+
+            assert_eq!(rows_from.recv().await.unwrap().unwrap(), query_evt);
+
+            // subscriber who arrives later!
+
+            let mut res = api_v1_subs(
+                Extension(agent.clone()),
+                Extension(cache.clone()),
+                Extension(bcast_cache.clone()),
+                axum::extract::Query(SubParams::default()),
+                axum::Json(Statement::Simple("select * from tests".into())),
+            )
+            .await
+            .into_response();
+
+            if !res.status().is_success() {
+                let b = res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(res.status(), StatusCode::OK);
+
+            let mut rows = RowsIter {
+                body: res.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Columns(vec!["id".into(), "text".into()])
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(2),
+                    vec!["service-id-2".into(), "service-name-2".into()]
+                )
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(3),
+                    vec!["service-id-3".into(), "service-name-3".into()],
+                )
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(4),
+                    vec!["service-id-4".into(), "service-name-4".into()],
+                )
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(5),
+                    vec!["service-id-5".into(), "service-name-5".into()]
+                )
+            );
+        }
+
+        // previous subs have been dropped.
+
         let mut res = api_v1_subs(
             Extension(agent.clone()),
-            Extension(Default::default()),
-            Extension(Default::default()),
-            axum::extract::Query(SubParams::default()),
+            Extension(cache.clone()),
+            Extension(bcast_cache.clone()),
+            axum::extract::Query(SubParams {
+                from: Some(1.into()),
+            }),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await
@@ -720,18 +938,7 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
 
-        let (status_code, _) = api_v1_transactions(
-            Extension(agent.clone()),
-            axum::Json(vec![Statement::WithParams(
-                "insert into tests (id, text) values (?,?)".into(),
-                vec!["service-id-3".into(), "service-name-3".into()],
-            )]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
-
-        let mut rows = RowsIter {
+        let mut rows_from = RowsIter {
             body: res.into_body(),
             codec: LinesCodec::new(),
             buf: BytesMut::new(),
@@ -739,56 +946,22 @@ mod tests {
         };
 
         assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Columns(vec!["id".into(), "text".into()])
-        );
-
-        assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
-        );
-
-        assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Row(
-                RowId(2),
-                vec!["service-id-2".into(), "service-name-2".into()]
-            )
-        );
-
-        assert!(matches!(
-            rows.recv().await.unwrap().unwrap(),
-            QueryEvent::EndOfQuery { .. }
-        ));
-
-        assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Change(
-                ChangeType::Insert,
-                RowId(3),
-                vec!["service-id-3".into(), "service-name-3".into()],
-                ChangeId(1)
-            )
-        );
-
-        let (status_code, _) = api_v1_transactions(
-            Extension(agent.clone()),
-            axum::Json(vec![Statement::WithParams(
-                "insert into tests (id, text) values (?,?)".into(),
-                vec!["service-id-4".into(), "service-name-4".into()],
-            )]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
-
-        assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
+            rows_from.recv().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(4),
                 vec!["service-id-4".into(), "service-name-4".into()],
                 ChangeId(2)
+            )
+        );
+
+        assert_eq!(
+            rows_from.recv().await.unwrap().unwrap(),
+            QueryEvent::Change(
+                ChangeType::Insert,
+                RowId(5),
+                vec!["service-id-5".into(), "service-name-5".into()],
+                ChangeId(3),
             )
         );
 

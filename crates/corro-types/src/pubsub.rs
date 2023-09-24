@@ -149,8 +149,6 @@ struct InnerMatcherHandle {
 
 impl MatcherHandle {
     pub fn process_change(&self, changes: &[Change]) -> Result<(), MatcherError> {
-        // println!("{:?}", self.0.parsed);
-
         let mut candidates: IndexMap<CompactString, Vec<Vec<SqliteValue>>> = IndexMap::new();
 
         let grouped = changes
@@ -212,9 +210,6 @@ impl MatcherHandle {
             .execute([self.0.id])?;
         Ok(())
     }
-
-    // TODO: cleanup!
-    //       DROP sub table, DROP changes table, DELETE FROM subs
 }
 
 #[derive(Debug)]
