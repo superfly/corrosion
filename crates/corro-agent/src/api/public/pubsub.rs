@@ -109,6 +109,7 @@ fn make_query_event_bytes(
 }
 
 const MAX_UNSUB_TIME: Duration = Duration::from_secs(300);
+// this should be a fraction of the MAX_UNSUB_TIME
 const RECEIVERS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 pub async fn process_sub_channel(
@@ -126,7 +127,6 @@ pub async fn process_sub_channel(
     let mut subs_check = tokio::time::interval(RECEIVERS_CHECK_INTERVAL);
 
     loop {
-        let has_deadline = deadline.is_some();
         let deadline_check = async {
             if let Some(sleep) = deadline.as_mut() {
                 sleep.await
@@ -142,10 +142,12 @@ pub async fn process_sub_channel(
                 info!("all subscribers for {id} are gone and didn't come back within {MAX_UNSUB_TIME:?}");
                 break;
             },
-            _ = subs_check.tick(), if !has_deadline => {
-                if tx.receiver_count() == 0 {
-                    deadline = Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)));
-                }
+            _ = subs_check.tick() => {
+                deadline = if tx.receiver_count() == 0 {
+                    Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)))
+                } else {
+                    None
+                };
                 continue;
             },
             else => {
