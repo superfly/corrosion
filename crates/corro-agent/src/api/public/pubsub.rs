@@ -11,34 +11,43 @@ use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::Agent,
-    api::{QueryEvent, Statement},
+    api::{ChangeId, QueryEvent, QueryEventMeta, RowId, Statement},
     change::SqliteValue,
     pubsub::{Matcher, MatcherError, MatcherHandle, NormalizeStatementError},
     sqlite::SqlitePoolError,
 };
 use futures::{future::poll_fn, ready, Stream};
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
+use serde::Deserialize;
 use tokio::{
-    sync::{broadcast, mpsc, RwLock as TokioRwLock},
+    sync::{broadcast, mpsc, oneshot, RwLock as TokioRwLock},
     task::block_in_place,
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
 use tokio_util::sync::PollSender;
-use tracing::{debug, error};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+#[derive(Default, Deserialize)]
+pub struct SubParams {
+    #[serde(default)]
+    from: Option<ChangeId>,
+}
 
 pub async fn api_v1_sub_by_id(
     Extension(agent): Extension<Agent>,
-    Extension(bcast_cache): Extension<MatcherBroadcastCache>,
+    Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
-    sub_by_id(agent, id, &bcast_cache).await
+    sub_by_id(agent, id, params.from, &bcast_cache).await
 }
 
 async fn sub_by_id(
     agent: Agent,
     id: Uuid,
-    bcast_cache: &MatcherBroadcastCache,
+    from: Option<ChangeId>,
+    bcast_cache: &SharedMatcherBroadcastCache,
 ) -> hyper::Response<hyper::Body> {
     let (matcher, rx) = match bcast_cache.read().await.get(&id).and_then(|tx| {
         agent
@@ -69,7 +78,7 @@ async fn sub_by_id(
 
     let (evt_tx, evt_rx) = mpsc::channel(512);
 
-    tokio::spawn(catch_up_sub(agent, matcher, rx, evt_tx));
+    tokio::spawn(catch_up_sub(agent, matcher, from, rx, evt_tx));
 
     let (tx, body) = hyper::Body::channel();
 
@@ -82,7 +91,10 @@ async fn sub_by_id(
         .expect("could not build query response body")
 }
 
-fn make_query_event_bytes(buf: &mut BytesMut, query_evt: QueryEvent) -> serde_json::Result<Bytes> {
+fn make_query_event_bytes(
+    buf: &mut BytesMut,
+    query_evt: QueryEvent,
+) -> serde_json::Result<(Bytes, QueryEventMeta)> {
     {
         let mut writer = buf.writer();
         serde_json::to_writer(&mut writer, &query_evt)?;
@@ -93,35 +105,101 @@ fn make_query_event_bytes(buf: &mut BytesMut, query_evt: QueryEvent) -> serde_js
             .expect("could not write new line to BytesMut Writer");
     }
 
-    Ok(buf.split().freeze())
+    Ok((buf.split().freeze(), query_evt.meta()))
 }
 
-async fn process_sub_channel(
+const MAX_UNSUB_TIME: Duration = Duration::from_secs(300);
+// this should be a fraction of the MAX_UNSUB_TIME
+const RECEIVERS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+pub async fn process_sub_channel(
     agent: Agent,
     id: Uuid,
-    tx: broadcast::Sender<Bytes>,
+    tx: broadcast::Sender<(Bytes, QueryEventMeta)>,
     mut evt_rx: mpsc::Receiver<QueryEvent>,
 ) {
     let mut buf = BytesMut::new();
 
-    while let Some(query_evt) = evt_rx.recv().await {
-        let send_res = match make_query_event_bytes(&mut buf, query_evt) {
-            Ok(b) => tx.send(b),
-            Err(e) => {
-                _ = tx.send(error_to_query_event_bytes(&mut buf, e));
+    let mut deadline = None;
+
+    // even if there are no more subscribers
+    // useful for queries that don't change often so we can cleanup...
+    let mut subs_check = tokio::time::interval(RECEIVERS_CHECK_INTERVAL);
+
+    loop {
+        let deadline_check = async {
+            if let Some(sleep) = deadline.as_mut() {
+                sleep.await
+            } else {
+                futures::future::pending().await
+            }
+        };
+
+        let query_evt = tokio::select! {
+            biased;
+            Some(query_evt) = evt_rx.recv() => query_evt,
+            _ = deadline_check => {
+                info!("all subscribers for {id} are gone and didn't come back within {MAX_UNSUB_TIME:?}");
+                break;
+            },
+            _ = subs_check.tick() => {
+                deadline = if tx.receiver_count() == 0 {
+                    Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)))
+                } else {
+                    None
+                };
+                continue;
+            },
+            else => {
                 break;
             }
         };
 
-        if let Err(_e) = send_res {
-            debug!("no more active receivers for subscription");
-            break;
+        let is_still_active = match make_query_event_bytes(&mut buf, query_evt) {
+            Ok(b) => tx.send(b).is_ok(),
+            Err(e) => {
+                _ = tx.send((
+                    error_to_query_event_bytes(&mut buf, e),
+                    QueryEventMeta::Error,
+                ));
+                break;
+            }
+        };
+
+        if is_still_active {
+            deadline = None;
+        } else {
+            debug!("no active subscribers");
+            if deadline.is_none() {
+                deadline = Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)));
+            }
         }
     }
 
     debug!("subscription query channel done");
 
-    agent.matchers().write().remove(&id);
+    // remove and get handle from the agent's "matchers"
+    let handle = match agent.matchers().write().remove(&id) {
+        Some(h) => h,
+        None => {
+            warn!("subscription handle was already gone. odd!");
+            return;
+        }
+    };
+
+    // get a dedicated connection
+    let conn = match agent.pool().dedicated().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("could not acquire dedicated connection for subscription cleanup: {e}");
+            return;
+        }
+    };
+
+    // clean up the subscription
+    if let Err(e) = handle.cleanup(conn) {
+        error!("could not properly cleanup subscription: {e}");
+    }
 }
 
 fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<Option<String>> {
@@ -167,6 +245,8 @@ pub enum MatcherUpsertError {
     NormalizeStatement(#[from] NormalizeStatementError),
     #[error(transparent)]
     Matcher(#[from] MatcherError),
+    #[error("a `from` query param was supplied, but no existing subscription found")]
+    SubFromWithoutMatcher,
 }
 
 impl MatcherUpsertError {
@@ -177,7 +257,8 @@ impl MatcherUpsertError {
             | MatcherUpsertError::CouldNotExpand => StatusCode::INTERNAL_SERVER_ERROR,
             MatcherUpsertError::Sqlite(_)
             | MatcherUpsertError::NormalizeStatement(_)
-            | MatcherUpsertError::Matcher(_) => StatusCode::BAD_REQUEST,
+            | MatcherUpsertError::Matcher(_)
+            | MatcherUpsertError::SubFromWithoutMatcher => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -194,9 +275,10 @@ impl From<MatcherUpsertError> for hyper::Response<hyper::Body> {
             .expect("could not build error response")
     }
 }
-
-pub type MatcherIdCache = Arc<TokioRwLock<HashMap<String, Uuid>>>;
-pub type MatcherBroadcastCache = Arc<TokioRwLock<HashMap<Uuid, broadcast::Sender<Bytes>>>>;
+pub type MatcherIdCache = HashMap<String, Uuid>;
+pub type SharedMatcherIdCache = Arc<TokioRwLock<MatcherIdCache>>;
+pub type MatcherBroadcastCache = HashMap<Uuid, broadcast::Sender<(Bytes, QueryEventMeta)>>;
+pub type SharedMatcherBroadcastCache = Arc<TokioRwLock<MatcherBroadcastCache>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatchUpError {
@@ -223,88 +305,198 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
     buf.split().freeze()
 }
 
+fn catch_up_sub_anew(
+    tx: &Transaction,
+    matcher: MatcherHandle,
+    buf: &mut BytesMut,
+    evt_tx: &mpsc::Sender<Bytes>,
+) -> Result<(), CatchUpError> {
+    let mut query_cols = vec![];
+    for i in 0..(matcher.parsed_columns().len()) {
+        query_cols.push(format!("col_{i}"));
+    }
+    let mut prepped = tx.prepare_cached(&format!(
+        "SELECT __corro_rowid,{} FROM {}",
+        query_cols.join(","),
+        matcher.table_name()
+    ))?;
+    let col_count = prepped.column_count();
+
+    evt_tx.blocking_send(
+        make_query_event_bytes(buf, QueryEvent::Columns(matcher.col_names().to_vec()))?.0,
+    )?;
+
+    let start = Instant::now();
+    let mut rows = prepped.query(())?;
+    let elapsed = start.elapsed();
+
+    loop {
+        let row = match rows.next()? {
+            Some(row) => row,
+            None => break,
+        };
+        let rowid = row.get(0)?;
+
+        let cells = (1..col_count)
+            .map(|i| row.get::<_, SqliteValue>(i))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        evt_tx.blocking_send(make_query_event_bytes(buf, QueryEvent::Row(rowid, cells))?.0)?;
+    }
+
+    evt_tx.blocking_send(
+        make_query_event_bytes(
+            buf,
+            QueryEvent::EndOfQuery {
+                time: elapsed.as_secs_f64(),
+            },
+        )?
+        .0,
+    )?;
+
+    Ok(())
+}
+
+fn catch_up_sub_from(
+    tx: &Transaction, // read transaction
+    matcher: MatcherHandle,
+    from: ChangeId,
+    buf: &mut BytesMut,
+    evt_tx: &mpsc::Sender<Bytes>,
+) -> Result<(), CatchUpError> {
+    let mut query_cols = vec![];
+    for i in 0..(matcher.parsed_columns().len()) {
+        query_cols.push(format!("col_{i}"));
+    }
+
+    let mut prepped = tx.prepare_cached(&format!(
+        "SELECT id, type, __corro_rowid, {} FROM {} WHERE id > ?",
+        query_cols.join(","),
+        matcher.changes_table_name()
+    ))?;
+
+    let col_count = prepped.column_count();
+
+    let mut rows = prepped.query([from])?;
+
+    loop {
+        let row = match rows.next()? {
+            Some(row) => row,
+            None => break,
+        };
+        let id = row.get(0)?;
+        let change_type = row.get(1)?;
+        let rowid = row.get(2)?;
+
+        let cells = (3..col_count)
+            .map(|i| row.get::<_, SqliteValue>(i))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        evt_tx.blocking_send(
+            make_query_event_bytes(buf, QueryEvent::Change(change_type, rowid, cells, id))?.0,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum LastQueryEvent {
+    Row(RowId),
+    Change(ChangeId),
+}
+
 pub async fn catch_up_sub(
     agent: Agent,
     matcher: MatcherHandle,
-    sub_rx: broadcast::Receiver<Bytes>,
-    tx: mpsc::Sender<Bytes>,
+    from: Option<ChangeId>,
+    sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
+    evt_tx: mpsc::Sender<Bytes>,
 ) -> eyre::Result<()> {
-    {
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let forward_task = tokio::spawn(forward_sub_to_sender(
+        Some(ready_rx),
+        sub_rx,
+        evt_tx.clone(),
+    ));
+
+    let last_query_event = {
         let mut buf = BytesMut::new();
 
         let pool = agent.pool().dedicated_pool();
 
-        let conn = match pool.get().await {
+        let mut conn = match pool.get().await {
             Ok(conn) => conn,
             Err(e) => {
-                tx.send(error_to_query_event_bytes(&mut buf, e)).await?;
+                evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await?;
                 return Ok(());
             }
         };
 
         let res = block_in_place(|| {
-            let mut query_cols = vec![];
-            for i in 0..(matcher.parsed_columns().len()) {
-                query_cols.push(format!("col_{i}"));
-            }
-            let mut prepped = conn.prepare_cached(&format!(
-                "SELECT __corro_rowid,{} FROM {}",
-                query_cols.join(","),
-                matcher.table_name()
-            ))?;
-            let col_count = prepped.column_count();
-
-            tx.blocking_send(make_query_event_bytes(
-                &mut buf,
-                QueryEvent::Columns(matcher.col_names().to_vec()),
-            )?)?;
-
-            let start = Instant::now();
-            let mut rows = prepped.query(())?;
-            let elapsed = start.elapsed();
-
-            loop {
-                let row = match rows.next()? {
-                    Some(row) => row,
-                    None => break,
-                };
-                let rowid = row.get(0)?;
-
-                let cells = (1..col_count)
-                    .map(|i| row.get::<_, SqliteValue>(i))
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-
-                tx.blocking_send(make_query_event_bytes(
-                    &mut buf,
-                    QueryEvent::Row(rowid, cells),
-                )?)?;
-            }
-
-            tx.blocking_send(make_query_event_bytes(
-                &mut buf,
-                QueryEvent::EndOfQuery {
-                    time: elapsed.as_secs_f64(),
-                },
-            )?)?;
-
-            Ok::<_, CatchUpError>(())
+            let tx = conn.transaction()?; // read transaction
+            let last_query_event = match from {
+                Some(from) => {
+                    let max_change_id: ChangeId = tx
+                        .prepare(&format!(
+                            "SELECT MAX(id) FROM {}",
+                            matcher.changes_table_name()
+                        ))?
+                        .query_row([], |row| row.get(0))?;
+                    catch_up_sub_from(&tx, matcher, from, &mut buf, &evt_tx)?;
+                    LastQueryEvent::Change(max_change_id)
+                }
+                None => {
+                    let max_row_id: RowId = tx
+                        .prepare(&format!(
+                            "SELECT MAX(__corro_rowid) FROM {}",
+                            matcher.table_name()
+                        ))?
+                        .query_row([], |row| row.get(0))?;
+                    catch_up_sub_anew(&tx, matcher, &mut buf, &evt_tx)?;
+                    LastQueryEvent::Row(max_row_id)
+                }
+            };
+            Ok(last_query_event)
         });
 
-        if let Err(CatchUpError::Sqlite(e)) = res {
-            _ = tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+        match res {
+            Ok(last_query_event) => last_query_event,
+            Err(e) => {
+                match e {
+                    CatchUpError::Sqlite(e) => {
+                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                    }
+                    CatchUpError::SerdeJson(e) => {
+                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                    }
+                    CatchUpError::Send(_) => {
+                        // can't send
+                    }
+                }
+                return Ok(());
+            }
         }
+    };
+
+    if let Err(_e) = ready_tx.send(last_query_event) {
+        warn!("subscriber catch up readiness receiver was gone, aborting...");
+        return Ok(());
     }
 
-    forward_sub_to_sender(sub_rx, tx).await;
+    // TODO: handle this spawn error?
+    _ = forward_task.await;
 
     Ok(())
 }
 
 pub async fn upsert_sub(
     agent: &Agent,
-    cache: &MatcherIdCache,
-    bcast_cache: &MatcherBroadcastCache,
+    cache: &SharedMatcherIdCache,
+    bcast_cache: &SharedMatcherBroadcastCache,
     stmt: Statement,
+    from: Option<ChangeId>,
     tx: mpsc::Sender<Bytes>,
 ) -> Result<Uuid, MatcherUpsertError> {
     let stmt = expand_sql(agent, &stmt).await?;
@@ -322,12 +514,16 @@ pub async fn upsert_sub(
             .flatten();
         if let Some(matcher) = maybe_matcher {
             let rx = sender.subscribe();
-            tokio::spawn(catch_up_sub(agent.clone(), matcher, rx, tx));
+            tokio::spawn(catch_up_sub(agent.clone(), matcher, from, rx, tx));
             return Ok(matcher_id);
         } else {
             cache_write.remove(&stmt);
             bcast_write.remove(&matcher_id);
         }
+    }
+
+    if from.is_some() {
+        return Err(MatcherUpsertError::SubFromWithoutMatcher);
     }
 
     let conn = agent.pool().dedicated().await?;
@@ -347,7 +543,7 @@ pub async fn upsert_sub(
         agent.matchers().write().insert(matcher_id, matcher);
     }
 
-    tokio::spawn(forward_sub_to_sender(sub_rx, tx));
+    tokio::spawn(forward_sub_to_sender(None, sub_rx, tx));
 
     tokio::spawn(process_sub_channel(
         agent.clone(),
@@ -361,14 +557,24 @@ pub async fn upsert_sub(
 
 pub async fn api_v1_subs(
     Extension(agent): Extension<Agent>,
-    Extension(sub_cache): Extension<MatcherIdCache>,
-    Extension(bcast_cache): Extension<MatcherBroadcastCache>,
+    Extension(sub_cache): Extension<SharedMatcherIdCache>,
+    Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
+    axum::extract::Query(params): axum::extract::Query<SubParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
     let (tx, body) = hyper::Body::channel();
     let (forward_tx, forward_rx) = mpsc::channel(10240);
 
-    let matcher_id = match upsert_sub(&agent, &sub_cache, &bcast_cache, stmt, forward_tx).await {
+    let matcher_id = match upsert_sub(
+        &agent,
+        &sub_cache,
+        &bcast_cache,
+        stmt,
+        params.from,
+        forward_tx,
+    )
+    .await
+    {
         Ok(id) => id,
         Err(e) => return hyper::Response::<hyper::Body>::from(e),
     };
@@ -382,13 +588,83 @@ pub async fn api_v1_subs(
         .expect("could not generate ok http response for query request")
 }
 
-async fn forward_sub_to_sender(sub_rx: broadcast::Receiver<Bytes>, tx: mpsc::Sender<Bytes>) {
+const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
+
+async fn forward_sub_to_sender(
+    ready: Option<oneshot::Receiver<LastQueryEvent>>,
+    mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
+    tx: mpsc::Sender<Bytes>,
+) {
+    let mut buf = BytesMut::new();
+    if let Some(mut ready) = ready {
+        let mut events_buf = vec![];
+
+        let last_query_event = loop {
+            tokio::select! {
+                biased;
+                ready_res = &mut ready => match ready_res {
+                    Ok(last_query_event) => {
+                        break last_query_event;
+                    },
+                    Err(_e) => {
+                        _ = tx.send(error_to_query_event_bytes(&mut buf, "sub ready channel closed")).await;
+                        return;
+                    }
+                },
+                query_evt_res = sub_rx.recv() => match query_evt_res {
+                    Ok(query_evt) => {
+                        events_buf.push(query_evt);
+                    },
+                    Err(e) => {
+                        _ = tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                        return;
+                    }
+                },
+            }
+
+            if events_buf.len() > MAX_EVENTS_BUFFER_SIZE {
+                error!("subscriber could not catch up in time, buffered over {MAX_EVENTS_BUFFER_SIZE} events and bailed");
+                _ = tx.send(error_to_query_event_bytes(&mut buf, format!("catching up too slowly, gave up after buffering {MAX_EVENTS_BUFFER_SIZE} events"))).await;
+                return;
+            }
+        };
+
+        for (bytes, meta) in events_buf {
+            // prevent sending duplicate query events by comparing the last sent event
+            // w/ buffered events
+            match (meta, last_query_event) {
+                // already sent this change!
+                (QueryEventMeta::Change(change_id), LastQueryEvent::Change(last_change_id))
+                    if last_change_id >= change_id =>
+                {
+                    continue;
+                }
+                // already sent this row!
+                (QueryEventMeta::Row(row_id), LastQueryEvent::Row(last_row_id))
+                    if last_row_id >= row_id =>
+                {
+                    continue;
+                }
+                // buffered a row, which is slightly unexpected,
+                // but we shouldn't send rows if we're expecting changes only
+                (QueryEventMeta::Row(_), LastQueryEvent::Change(_)) => {
+                    continue;
+                }
+                _ => {
+                    // nothing to do.
+                }
+            }
+            if let Err(_e) = tx.send(bytes).await {
+                warn!("could not send buffered events to subscriber, receiver must be gone!");
+                return;
+            }
+        }
+    }
+
     let chunker = tokio_stream::wrappers::BroadcastStream::new(sub_rx)
         .chunks_timeout(10, Duration::from_millis(10));
 
     tokio::pin!(chunker);
-
-    let mut buf = BytesMut::new();
 
     let mut tx = PollSender::new(tx);
 
@@ -399,8 +675,9 @@ async fn forward_sub_to_sender(sub_rx: broadcast::Receiver<Bytes>, tx: mpsc::Sen
             }
             match ready!(chunker.as_mut().poll_next(cx)) {
                 Some(chunks) => {
-                    for chunk in chunks {
-                        buf.extend_from_slice(&chunk?);
+                    for chunk_res in chunks {
+                        let (chunk, _) = chunk_res?;
+                        buf.extend_from_slice(&chunk);
                     }
                     Poll::Ready(Ok(Some(buf.split().freeze())))
                 }
@@ -463,14 +740,17 @@ async fn forward_bytes_to_body_sender(mut rx: mpsc::Receiver<Bytes>, mut tx: hyp
 
 #[cfg(test)]
 mod tests {
-    use arc_swap::ArcSwap;
-    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, pubsub::ChangeType};
+    use corro_types::{
+        api::{ChangeId, RowId},
+        config::Config,
+        pubsub::ChangeType,
+    };
     use http_body::Body;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
 
     use crate::{
-        agent::migrate,
+        agent::setup,
         api::public::{api_v1_db_schema, api_v1_transactions},
     };
 
@@ -484,36 +764,15 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
-
-        {
-            let mut conn = pool.write_priority().await?;
-            migrate(&mut conn)?;
-        }
-
-        let (tx_bcast, _rx_bcast) = mpsc::channel(1);
-        let (tx_apply, _rx_apply) = mpsc::channel(1);
-
-        let agent = Agent::new(corro_types::agent::AgentConfig {
-            actor_id: ActorId(Uuid::new_v4()),
-            pool,
-            config: ArcSwap::from_pointee(
-                Config::builder()
-                    .db_path(dir.path().join("corrosion.db").display().to_string())
-                    .gossip_addr("127.0.0.1:1234".parse()?)
-                    .api_addr("127.0.0.1:8080".parse()?)
-                    .build()?,
-            ),
-            gossip_addr: "127.0.0.1:0".parse().unwrap(),
-            api_addr: "127.0.0.1:0".parse().unwrap(),
-            members: Default::default(),
-            clock: Default::default(),
-            bookie: Default::default(),
-            tx_bcast,
-            tx_apply,
-            schema: Default::default(),
+        let (agent, _agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
             tripwire,
-        });
+        )
+        .await?;
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
@@ -522,8 +781,6 @@ mod tests {
         .await;
 
         assert_eq!(status_code, StatusCode::OK);
-
-        println!("schema done");
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
@@ -540,37 +797,252 @@ mod tests {
         )
         .await;
 
-        println!("tx 1 done");
-
-        // println!("{body:?}");
-
         assert_eq!(status_code, StatusCode::OK);
 
         assert!(body.0.results.len() == 2);
 
-        let res = api_v1_subs(
+        let cache: SharedMatcherIdCache = Default::default();
+        let bcast_cache: SharedMatcherBroadcastCache = Default::default();
+
+        {
+            let mut res = api_v1_subs(
+                Extension(agent.clone()),
+                Extension(cache.clone()),
+                Extension(bcast_cache.clone()),
+                axum::extract::Query(SubParams::default()),
+                axum::Json(Statement::Simple("select * from tests".into())),
+            )
+            .await
+            .into_response();
+
+            if !res.status().is_success() {
+                let b = res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(res.status(), StatusCode::OK);
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-3".into(), "service-name-3".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            let mut rows = RowsIter {
+                body: res.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Columns(vec!["id".into(), "text".into()])
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(2),
+                    vec!["service-id-2".into(), "service-name-2".into()]
+                )
+            );
+
+            assert!(matches!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::EndOfQuery { .. }
+            ));
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Change(
+                    ChangeType::Insert,
+                    RowId(3),
+                    vec!["service-id-3".into(), "service-name-3".into()],
+                    ChangeId(1)
+                )
+            );
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-4".into(), "service-name-4".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Change(
+                    ChangeType::Insert,
+                    RowId(4),
+                    vec!["service-id-4".into(), "service-name-4".into()],
+                    ChangeId(2)
+                )
+            );
+
+            let mut res = api_v1_subs(
+                Extension(agent.clone()),
+                Extension(cache.clone()),
+                Extension(bcast_cache.clone()),
+                axum::extract::Query(SubParams {
+                    from: Some(1.into()),
+                }),
+                axum::Json(Statement::Simple("select * from tests".into())),
+            )
+            .await
+            .into_response();
+
+            if !res.status().is_success() {
+                let b = res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(res.status(), StatusCode::OK);
+
+            let mut rows_from = RowsIter {
+                body: res.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
+            assert_eq!(
+                rows_from.recv().await.unwrap().unwrap(),
+                QueryEvent::Change(
+                    ChangeType::Insert,
+                    RowId(4),
+                    vec!["service-id-4".into(), "service-name-4".into()],
+                    ChangeId(2)
+                )
+            );
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-5".into(), "service-name-5".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            let query_evt = QueryEvent::Change(
+                ChangeType::Insert,
+                RowId(5),
+                vec!["service-id-5".into(), "service-name-5".into()],
+                ChangeId(3),
+            );
+
+            assert_eq!(rows.recv().await.unwrap().unwrap(), query_evt);
+
+            assert_eq!(rows_from.recv().await.unwrap().unwrap(), query_evt);
+
+            // subscriber who arrives later!
+
+            let mut res = api_v1_subs(
+                Extension(agent.clone()),
+                Extension(cache.clone()),
+                Extension(bcast_cache.clone()),
+                axum::extract::Query(SubParams::default()),
+                axum::Json(Statement::Simple("select * from tests".into())),
+            )
+            .await
+            .into_response();
+
+            if !res.status().is_success() {
+                let b = res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(res.status(), StatusCode::OK);
+
+            let mut rows = RowsIter {
+                body: res.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Columns(vec!["id".into(), "text".into()])
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(2),
+                    vec!["service-id-2".into(), "service-name-2".into()]
+                )
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(3),
+                    vec!["service-id-3".into(), "service-name-3".into()],
+                )
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(4),
+                    vec!["service-id-4".into(), "service-name-4".into()],
+                )
+            );
+
+            assert_eq!(
+                rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(5),
+                    vec!["service-id-5".into(), "service-name-5".into()]
+                )
+            );
+        }
+
+        // previous subs have been dropped.
+
+        let mut res = api_v1_subs(
             Extension(agent.clone()),
-            Extension(Default::default()),
-            Extension(Default::default()),
+            Extension(cache.clone()),
+            Extension(bcast_cache.clone()),
+            axum::extract::Query(SubParams {
+                from: Some(1.into()),
+            }),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await
         .into_response();
 
+        if !res.status().is_success() {
+            let b = res.body_mut().data().await.unwrap().unwrap();
+            println!("body: {}", String::from_utf8_lossy(&b));
+        }
+
         assert_eq!(res.status(), StatusCode::OK);
 
-        let (status_code, _) = api_v1_transactions(
-            Extension(agent.clone()),
-            axum::Json(vec![Statement::WithParams(
-                "insert into tests (id, text) values (?,?)".into(),
-                vec!["service-id-3".into(), "service-name-3".into()],
-            )]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
-
-        let mut rows = RowsIter {
+        let mut rows_from = RowsIter {
             body: res.into_body(),
             codec: LinesCodec::new(),
             buf: BytesMut::new(),
@@ -578,51 +1050,22 @@ mod tests {
         };
 
         assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Columns(vec!["id".into(), "text".into()])
-        );
-
-        assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Row(1, vec!["service-id".into(), "service-name".into()])
-        );
-
-        assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
-            QueryEvent::Row(2, vec!["service-id-2".into(), "service-name-2".into()])
-        );
-
-        assert!(matches!(
-            rows.recv().await.unwrap().unwrap(),
-            QueryEvent::EndOfQuery { .. }
-        ));
-
-        assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
+            rows_from.recv().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
-                3,
-                vec!["service-id-3".into(), "service-name-3".into()]
+                RowId(4),
+                vec!["service-id-4".into(), "service-name-4".into()],
+                ChangeId(2)
             )
         );
 
-        let (status_code, _) = api_v1_transactions(
-            Extension(agent.clone()),
-            axum::Json(vec![Statement::WithParams(
-                "insert into tests (id, text) values (?,?)".into(),
-                vec!["service-id-4".into(), "service-name-4".into()],
-            )]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
-
         assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
+            rows_from.recv().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
-                4,
-                vec!["service-id-4".into(), "service-name-4".into()]
+                RowId(5),
+                vec!["service-id-5".into(), "service-name-5".into()],
+                ChangeId(3),
             )
         );
 

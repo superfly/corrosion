@@ -15,7 +15,6 @@ use metrics::{gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{Connection, InterruptHandle};
-use tempfile::TempDir;
 use tokio::sync::{
     RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
     RwLockWriteGuard as TokioRwLockWriteGuard,
@@ -42,7 +41,7 @@ use crate::{
 
 use super::members::Members;
 
-pub type Matchers = HashMap<uuid::Uuid, MatcherHandle>;
+pub type Subs = BTreeMap<uuid::Uuid, MatcherHandle>;
 
 #[derive(Clone)]
 pub struct Agent(Arc<AgentInner>);
@@ -72,14 +71,14 @@ pub struct AgentInner {
     members: RwLock<Members>,
     clock: Arc<uhlc::HLC>,
     bookie: Bookie,
-    matchers: RwLock<Matchers>,
+    subs: RwLock<Subs>,
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
     schema: RwLock<NormalizedSchema>,
 }
 
 impl Agent {
-    pub fn new(config: AgentConfig) -> Self {
+    pub fn new_w_subs(config: AgentConfig, subs: Subs) -> Self {
         Self(Arc::new(AgentInner {
             actor_id: config.actor_id,
             pool: config.pool,
@@ -89,11 +88,15 @@ impl Agent {
             members: config.members,
             clock: config.clock,
             bookie: config.bookie,
-            matchers: RwLock::new(HashMap::new()),
+            subs: RwLock::new(subs),
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             schema: config.schema,
         }))
+    }
+
+    pub fn new(config: AgentConfig) -> Self {
+        Self::new_w_subs(config, Default::default())
     }
 
     /// Return a borrowed [SqlitePool]
@@ -136,8 +139,8 @@ impl Agent {
         &self.0.schema
     }
 
-    pub fn matchers(&self) -> &RwLock<Matchers> {
-        &self.0.matchers
+    pub fn matchers(&self) -> &RwLock<Subs> {
+        &self.0.subs
     }
 
     pub fn db_path(&self) -> Utf8PathBuf {
@@ -162,10 +165,6 @@ struct SplitPoolInner {
     write: SqlitePool,
 
     dedicated_pool: bb8::Pool<RusqliteConnManager>,
-
-    // need to keep this for the life of the pool!
-    #[allow(dead_code)]
-    tmp_db_dir: TempDir,
 
     priority_tx: Sender<oneshot::Sender<CancellationToken>>,
     normal_tx: Sender<oneshot::Sender<CancellationToken>>,
@@ -196,11 +195,14 @@ pub enum SplitPoolCreateError {
     Pool(#[from] crate::sqlite::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    Rusqlite(#[from] rusqlite::Error),
 }
 
 impl SplitPool {
-    pub async fn create<P: AsRef<Path>>(
+    pub async fn create<P: AsRef<Path>, P2: AsRef<Path>>(
         path: P,
+        subscriptions_db_path: P2,
         tripwire: Tripwire,
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = bb8::Builder::new()
@@ -219,39 +221,21 @@ impl SplitPool {
             .await?;
         debug!("built RO pool");
 
-        let tmp_db_dir = match path.as_ref().parent() {
-            Some(parent) => tempfile::tempdir_in(parent)?,
-            None => tempfile::tempdir()?,
-        };
-
         let dedicated_pool = bb8::Pool::builder()
             .max_size(100)
-            .build(
-                RusqliteConnManager::new(path.as_ref()).attach(
-                    tmp_db_dir
-                        .path()
-                        .join("subscriptions.db")
-                        .display()
-                        .to_string(),
-                    "subscriptions",
-                ),
-            )
+            .build(RusqliteConnManager::new(path.as_ref()).attach(
+                subscriptions_db_path.as_ref().display().to_string(),
+                "subscriptions",
+            ))
             .await?;
 
-        Ok(Self::new(
-            ro_pool,
-            rw_pool,
-            dedicated_pool,
-            tmp_db_dir,
-            tripwire,
-        ))
+        Ok(Self::new(ro_pool, rw_pool, dedicated_pool, tripwire))
     }
 
-    pub fn new(
+    fn new(
         read: SqlitePool,
         write: SqlitePool,
         dedicated_pool: bb8::Pool<RusqliteConnManager>,
-        tmp_db_dir: TempDir,
         mut tripwire: Tripwire,
     ) -> Self {
         let (priority_tx, mut priority_rx) = channel(256);
@@ -289,7 +273,6 @@ impl SplitPool {
             read,
             write,
             dedicated_pool,
-            tmp_db_dir,
             priority_tx,
             normal_tx,
             low_tx,

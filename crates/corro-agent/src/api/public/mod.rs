@@ -501,7 +501,8 @@ async fn build_query_rows_response(
                             .collect::<rusqlite::Result<Vec<_>>>()
                         {
                             Ok(cells) => {
-                                if let Err(e) = data_tx.blocking_send(QueryEvent::Row(rowid, cells))
+                                if let Err(e) =
+                                    data_tx.blocking_send(QueryEvent::Row(rowid.into(), cells))
                                 {
                                     error!("could not send back row: {e}");
                                     return;
@@ -691,7 +692,7 @@ pub async fn api_v1_db_schema(
 mod tests {
     use arc_swap::ArcSwap;
     use bytes::Bytes;
-    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, schema::SqliteType};
+    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, schema::SqliteType, api::RowId};
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
     use tokio::sync::mpsc::{channel, error::TryRecvError};
@@ -724,7 +725,12 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
+        let pool = SplitPool::create(
+            dir.path().join("./test.sqlite"),
+            dir.path().join("./subs.sqlite"),
+            tripwire.clone(),
+        )
+        .await?;
 
         {
             let mut conn = pool.write_priority().await?;
@@ -824,7 +830,12 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
+        let pool = SplitPool::create(
+            dir.path().join("./test.sqlite"),
+            dir.path().join("./subs.sqlite"),
+            tripwire.clone(),
+        )
+        .await?;
 
         {
             let mut conn = pool.write_priority().await?;
@@ -917,7 +928,7 @@ mod tests {
 
         assert_eq!(
             row,
-            QueryEvent::Row(1, vec!["service-id".into(), "service-name".into()])
+            QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
         );
 
         buf.extend_from_slice(&body.data().await.unwrap()?);
@@ -928,7 +939,10 @@ mod tests {
 
         assert_eq!(
             row,
-            QueryEvent::Row(2, vec!["service-id-2".into(), "service-name-2".into()])
+            QueryEvent::Row(
+                RowId(2),
+                vec!["service-id-2".into(), "service-name-2".into()]
+            )
         );
 
         buf.extend_from_slice(&body.data().await.unwrap()?);
@@ -952,7 +966,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("./test.sqlite");
 
-        let pool = SplitPool::create(&db_path, tripwire.clone()).await?;
+        let pool =
+            SplitPool::create(&db_path, dir.path().join("./subs.sqlite"), tripwire.clone()).await?;
 
         {
             let mut conn = pool.write_priority().await?;

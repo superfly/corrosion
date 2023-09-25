@@ -208,7 +208,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                             println!("time: {time}s");
                         }
                     }
-                    QueryEvent::Change(_, _, _) => {
+                    QueryEvent::Change(_, _, _, _) => {
                         break;
                     }
                     QueryEvent::Error(e) => {
