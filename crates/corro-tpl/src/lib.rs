@@ -2,20 +2,18 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io;
 use std::io::Write;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use compact_str::CompactString;
 use compact_str::ToCompactString;
+use corro_client::sub::SubscriptionStream;
 use corro_client::CorrosionApiClient;
 use corro_types::api::QueryEvent;
 use corro_types::api::Statement;
 use corro_types::change::SqliteValue;
-use futures::Stream;
 use futures::StreamExt;
 use indexmap::IndexMap;
 pub use rhai::Dynamic;
@@ -221,14 +219,14 @@ impl fmt::Display for SqliteValueWrap {
 
 struct QueryResponseIter {
     query: Arc<TokioRwLock<QueryHandle>>,
-    body: OnceCell<BoxedSubscriptionStream>,
+    body: OnceCell<SubscriptionStream>,
     handle: tokio::runtime::Handle,
     done: bool,
     columns: Option<Arc<IndexMap<CompactString, u16>>>,
 }
 
 impl QueryResponseIter {
-    pub async fn body(&mut self) -> Result<&mut BoxedSubscriptionStream, Box<EvalAltResult>> {
+    pub async fn body(&mut self) -> Result<&mut SubscriptionStream, Box<EvalAltResult>> {
         self.body
             .get_or_try_init(|| async {
                 match self.query.write().await.body().await {
@@ -337,26 +335,20 @@ impl Iterator for QueryResponseIter {
     }
 }
 
-pub type BoxedSubscriptionStream =
-    Pin<Box<dyn Stream<Item = io::Result<QueryEvent>> + Send + Sync + 'static>>;
-
 pub struct QueryHandle {
     id: Uuid,
-    body: Option<BoxedSubscriptionStream>,
+    stream: Option<SubscriptionStream>,
     client: CorrosionApiClient,
     state: TemplateState,
 }
 
 impl QueryHandle {
-    async fn body(&mut self) -> Result<(BoxedSubscriptionStream, bool), corro_client::Error> {
-        if let Some(body) = self.body.take() {
+    async fn body(&mut self) -> Result<(SubscriptionStream, bool), corro_client::Error> {
+        if let Some(body) = self.stream.take() {
             return Ok((body, true));
         }
 
-        Ok((
-            Box::pin(self.client.subscription(self.id, None).await?),
-            false,
-        ))
+        Ok((self.client.subscription(self.id, None).await?, false))
     }
 }
 
@@ -414,7 +406,7 @@ fn write_sql_to_json<W: Write>(
 }
 
 async fn wait_for_rows(
-    mut rows: BoxedSubscriptionStream,
+    mut rows: SubscriptionStream,
     tx: mpsc::Sender<TemplateCommand>,
     cancel: CancellationToken,
 ) {
@@ -519,15 +511,17 @@ impl Engine {
                 .cast();
 
             debug!("sql function call {stmt:?}");
-            let (query_id, body) = tokio::runtime::Handle::current()
+            let stream = tokio::runtime::Handle::current()
                 .block_on(client.subscribe(&stmt, None))
                 .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
 
-            debug!("got res w/ id: {query_id}");
+            let id = stream.id();
+
+            debug!("got res w/ id: {id}");
 
             let handle = Arc::new(TokioRwLock::new(QueryHandle {
-                id: query_id,
-                body: Some(Box::pin(body)),
+                id,
+                stream: Some(stream),
                 client: client.clone(),
                 state,
             }));

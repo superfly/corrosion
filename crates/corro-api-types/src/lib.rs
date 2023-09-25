@@ -84,7 +84,7 @@ impl ToSql for RowId {
 }
 
 /// ChangeId newtype to differentiate from RowId
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
 #[serde(transparent)]
 pub struct ChangeId(pub i64);
 
