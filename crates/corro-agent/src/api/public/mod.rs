@@ -528,6 +528,7 @@ async fn build_query_rows_response(
 
             _ = data_tx.blocking_send(QueryEvent::EndOfQuery {
                 time: elapsed.as_secs_f64(),
+                change_id: None,
             });
         });
     });
@@ -692,7 +693,9 @@ pub async fn api_v1_db_schema(
 mod tests {
     use arc_swap::ArcSwap;
     use bytes::Bytes;
-    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, schema::SqliteType, api::RowId};
+    use corro_types::{
+        actor::ActorId, agent::SplitPool, api::RowId, config::Config, schema::SqliteType,
+    };
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
     use tokio::sync::mpsc::{channel, error::TryRecvError};

@@ -181,6 +181,10 @@ impl MatcherHandle {
         Ok(())
     }
 
+    pub fn id(&self) -> Uuid {
+        self.0.id
+    }
+
     pub fn table_name(&self) -> &str {
         &self.0.qualified_table_name
     }
@@ -562,7 +566,7 @@ impl Matcher {
 
                         let deleted = tx
                             .prepare_cached(&format!(
-                                "DELETE FROM {} WHERE id < (SELECT MAX(id) - 500 FROM {})",
+                                "DELETE FROM {} WHERE id < (SELECT COALESCE(MAX(id),0) - 500 FROM {})",
                                 self.qualified_changes_table_name,
                                 self.qualified_changes_table_name
                             ))?
@@ -680,6 +684,7 @@ impl Matcher {
                     .evt_tx
                     .send(QueryEvent::EndOfQuery {
                         time: elapsed.as_secs_f64(),
+                        change_id: Some(ChangeId(0)),
                     })
                     .await
                 {

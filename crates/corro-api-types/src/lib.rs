@@ -25,6 +25,8 @@ pub enum QueryEvent {
     #[serde(rename = "eoq")]
     EndOfQuery {
         time: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        change_id: Option<ChangeId>,
     },
     Change(ChangeType, RowId, Vec<SqliteValue>, ChangeId),
     Error(CompactString),

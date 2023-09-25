@@ -50,12 +50,10 @@ async fn sub_by_id(
     bcast_cache: &SharedMatcherBroadcastCache,
 ) -> hyper::Response<hyper::Body> {
     let (matcher, rx) = match bcast_cache.read().await.get(&id).and_then(|tx| {
-        agent
-            .matchers()
-            .read()
-            .get(&id)
-            .cloned()
-            .and_then(|matcher| (tx.receiver_count() > 0).then(|| (matcher, tx.subscribe())))
+        agent.matchers().read().get(&id).cloned().map(|matcher| {
+            debug!("found matcher by id {id}");
+            (matcher, tx.subscribe())
+        })
     }) {
         Some(matcher_rx) => matcher_rx,
         None => {
@@ -349,6 +347,13 @@ fn catch_up_sub_anew(
             buf,
             QueryEvent::EndOfQuery {
                 time: elapsed.as_secs_f64(),
+                change_id: Some(
+                    tx.prepare(&format!(
+                        "SELECT COALESCE(MAX(id),0) FROM {}",
+                        matcher.changes_table_name()
+                    ))?
+                    .query_row([], |row| row.get(0))?,
+                ),
             },
         )?
         .0,
@@ -413,6 +418,7 @@ pub async fn catch_up_sub(
     sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     evt_tx: mpsc::Sender<Bytes>,
 ) -> eyre::Result<()> {
+    debug!("catching up sub {} from: {from:?}", matcher.id());
     let (ready_tx, ready_rx) = oneshot::channel();
 
     let forward_task = tokio::spawn(forward_sub_to_sender(
@@ -440,11 +446,12 @@ pub async fn catch_up_sub(
                 Some(from) => {
                     let max_change_id: ChangeId = tx
                         .prepare(&format!(
-                            "SELECT MAX(id) FROM {}",
+                            "SELECT COALESCE(MAX(id), 0) FROM {}",
                             matcher.changes_table_name()
                         ))?
                         .query_row([], |row| row.get(0))?;
                     catch_up_sub_from(&tx, matcher, from, &mut buf, &evt_tx)?;
+                    debug!("sub caught up to their 'from' of {from:?}");
                     LastQueryEvent::Change(max_change_id)
                 }
                 None => {
@@ -455,6 +462,7 @@ pub async fn catch_up_sub(
                         ))?
                         .query_row([], |row| row.get(0))?;
                     catch_up_sub_anew(&tx, matcher, &mut buf, &evt_tx)?;
+                    debug!("sub caught up from scratch");
                     LastQueryEvent::Row(max_row_id)
                 }
             };
@@ -509,10 +517,12 @@ pub async fn upsert_sub(
         .and_then(|id| bcast_write.get(id).map(|sender| (*id, sender)));
 
     if let Some((matcher_id, sender)) = maybe_matcher {
+        debug!("found matcher id {matcher_id} w/ sender");
         let maybe_matcher = (sender.receiver_count() > 0)
             .then(|| agent.matchers().read().get(&matcher_id).cloned())
             .flatten();
         if let Some(matcher) = maybe_matcher {
+            debug!("found matcher handle");
             let rx = sender.subscribe();
             tokio::spawn(catch_up_sub(agent.clone(), matcher, from, rx, tx));
             return Ok(matcher_id);
@@ -629,6 +639,9 @@ async fn forward_sub_to_sender(
             }
         };
 
+        let mut skipped = 0;
+        let mut sent = 0;
+
         for (bytes, meta) in events_buf {
             // prevent sending duplicate query events by comparing the last sent event
             // w/ buffered events
@@ -637,17 +650,20 @@ async fn forward_sub_to_sender(
                 (QueryEventMeta::Change(change_id), LastQueryEvent::Change(last_change_id))
                     if last_change_id >= change_id =>
                 {
+                    skipped += 1;
                     continue;
                 }
                 // already sent this row!
                 (QueryEventMeta::Row(row_id), LastQueryEvent::Row(last_row_id))
                     if last_row_id >= row_id =>
                 {
+                    skipped += 1;
                     continue;
                 }
                 // buffered a row, which is slightly unexpected,
                 // but we shouldn't send rows if we're expecting changes only
                 (QueryEventMeta::Row(_), LastQueryEvent::Change(_)) => {
+                    skipped += 1;
                     continue;
                 }
                 _ => {
@@ -658,7 +674,10 @@ async fn forward_sub_to_sender(
                 warn!("could not send buffered events to subscriber, receiver must be gone!");
                 return;
             }
+            sent += 0;
         }
+
+        debug!("sent {sent} buffered events, skipped: {skipped}");
     }
 
     let chunker = tokio_stream::wrappers::BroadcastStream::new(sub_rx)

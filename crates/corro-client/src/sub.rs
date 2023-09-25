@@ -133,8 +133,11 @@ impl SubscriptionStream {
         match res {
             Some(Ok(b)) => match serde_json::from_slice(&b) {
                 Ok(evt) => {
-                    if let QueryEvent::EndOfQuery { .. } = &evt {
+                    if let QueryEvent::EndOfQuery { change_id, .. } = &evt {
                         self.observed_eoq = true;
+                        if let Some(change_id) = change_id {
+                            self.last_change_id = *change_id;
+                        }
                     }
                     if let QueryEvent::Change(_, _, _, change_id) = &evt {
                         if self.last_change_id.0 + 1 != change_id.0 {

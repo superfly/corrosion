@@ -203,7 +203,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                                 .join("|")
                         );
                     }
-                    QueryEvent::EndOfQuery { time } => {
+                    QueryEvent::EndOfQuery { time, .. } => {
                         if *timer {
                             println!("time: {time}s");
                         }
