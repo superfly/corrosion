@@ -1,8 +1,8 @@
 # Deploy on Fly.io
 
-This is an example of deploying a 2-node Corrosion cluster on [Fly Machines](https://fly.io/docs/machines/) VMs, using the example files included in the Corrosion repository. The two nodes communicate with each other over your Fly.io organization's [private WireGuard network](https://fly.io/docs/reference/private-networking/).
+This example deploys a 2-node Corrosion cluster on [Fly Machines](https://fly.io/docs/machines/) VMs, using the example files included in the Corrosion repository. The two nodes communicate with each other over your Fly.io organization's [private WireGuard network](https://fly.io/docs/reference/private-networking/).
 
-This example provisions two `shared-cpu-1x` Machines and two 1GB [Fly Volumes](https://fly.io/docs/reference/volumes/) storage volumes. See the [Fly.io resource pricing](https://fly.io/pricing/) for cost information.
+You'll be provisioning two `shared-cpu-1x` Machines and two 1GB [Fly Volumes](https://fly.io/docs/reference/volumes/) storage volumes. See the [Fly.io resource pricing](https://fly.io/pricing/) for cost information.
 
 ## Launch on Fly.io
 
@@ -10,14 +10,14 @@ From the repository root:
 
 Copy the example `fly.toml` to the working directory.
 
-```
-cp examples/fly/fly.toml .
+```bash
+$ cp examples/fly/fly.toml .
 ```
 
 Launch a new app on Fly.io and follow the prompts.
 
-```
-fly launch --dockerfile examples/fly/Dockerfile
+```bash
+$ fly launch --dockerfile examples/fly/Dockerfile
 ```
 
 Confirm that you would like to copy the configuration from this file to the new app. You don't need any other databases for this exercise.
@@ -27,8 +27,8 @@ Once deployment is complete, you can check that all is well with `fly status` an
 
 Add the second node, in [another part of the world](https://fly.io/docs/reference/regions/) if you like:
 
-```
-fly scale count 1 --region <second-fly-region>
+```bash
+$ fly scale count 1 --region <second-fly-region>
 ```
 
 `fly scale count` provisions a new Machine with an empty volume attached. Once the new node joins the cluster, Corrosion populates its local database on this volume with the latest data from the cluster.
@@ -37,8 +37,8 @@ Once the second Machine is running, you should be able to see log messages from 
 
 To get a shell session on a Fly Machine, from any directory: 
 
-```
-fly ssh console --pty --app <your-app-name> --select
+```bash
+$ fly ssh console --pty --app <your-app-name> --select
 ```
 
 On each node, Corrosion's local database is at `/var/lib/corrosion/state.db`. At this point it contains no data, but the `todos` table has been created according to the schema file `/etc/corrosion/schemas/todo.sql`.
@@ -51,14 +51,6 @@ cid  name          type     notnull  dflt_value  pk
 1    title         TEXT     1        ''          0 
 2    completed_at  INTEGER  0                    0 
 ```
-
-## What next?
-
-You can test out the Corrosion functionality demonstrated in [Quick start](./quick-start.md), with minor adaptations, by shelling into each Machine in a separate terminal.
-
-Corrosion is designed to run alongside any programs that use it, on the same node. On Fly.io, that means deploying an app from a Docker image that runs both your code and Corrosion.
-
-It's also possible for your other apps on the same Fly.io private network to read from and write to their nearest Corrosion node via [API](api/). This puts some network between your app and the database, losing some of the advantage that comes with running Corrosion on the same host.
 
 ## Example files
 
@@ -142,3 +134,82 @@ colors = false
 ```
 
 The network settings are tailored for communication over your Fly.io private IPv6 WireGuard network.
+
+
+
+
+## Have a play
+
+We'll write some data 
+
+Shell into both Corrosion nodes, in separate terminals, with `fly ssh console --pty --app <your-app-name> --select`
+
+
+```js
+/* /etc/corrosion/templates/todos.rhai */
+
+<% for todo in sql("SELECT title, completed_at FROM todos") { %>
+[<% if todo.completed_at.is_null() { %> <% } else { %>X<% } %>] <%= todo.title %>
+<% } %>
+```
+
+On one Machine (we'll call it Node A), start processing the template. Whenever there's an update to the results of the template's query (or queries), `corrosion template` re-renders the output file.
+
+```bash
+# corrosion template "/etc/corrosion/templates/todos.rhai:todos.txt" &
+[1] 354
+root@4d8964eb9d9487:/#  INFO corrosion::command::tpl: Watching and rendering /etc/corrosion/templates/todos.rhai to todos.txt
+```
+
+Now watch the output file.
+
+```bash
+# watch -n 0.5 cat todos.txt
+Every 0.5s: cat todos.txt
+
+/* Template for todo checklist */
+```
+
+
+On the other Machine (Node B), insert some data.
+
+```bash
+$ corrosion exec --param 'some-id' --param 'Write some Corrosion docs!' 'INSERT INTO todos (id, title) VALUES (?, ?)'
+INFO corrosion: Rows affected: 1
+```
+
+The new todo item gets propagated back to Node A, and your watch should look like this:
+
+```
+Every 0.5s: cat todos.txt
+
+/* Template for todo checklist */
+
+[ ] Write some Corrosion docs!
+```
+
+Check the contents of the todos table (on either node):
+
+```
+# corrosion query 'SELECT * FROM todos;' --columns
+id|title|completed_at
+some-id|Write some Corrosion docs!|
+```
+
+Add another task
+
+On Node B, mark all tasks as completed
+
+
+
+```
+
+
+## What next?
+
+You can test out the Corrosion functionality demonstrated in [Quick start](./quick-start.md), with minor adaptations, by shelling into each Machine in a separate terminal.
+
+Corrosion is designed to run alongside any programs that use it, on the same node. On Fly.io, that means deploying an app from a Docker image that runs both your code and Corrosion.
+
+It's also possible for your other apps on the same Fly.io private network to read from and write to their nearest Corrosion node via [API](api/). This puts some network between your app and the database, losing some of the advantage that comes with running Corrosion on the same host.
+
