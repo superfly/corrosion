@@ -30,6 +30,27 @@ pub enum QueryEvent {
     Error(CompactString),
 }
 
+impl QueryEvent {
+    pub fn meta(&self) -> QueryEventMeta {
+        match self {
+            QueryEvent::Columns(_) => QueryEventMeta::Columns,
+            QueryEvent::Row(rowid, _) => QueryEventMeta::Row(*rowid),
+            QueryEvent::EndOfQuery { .. } => QueryEventMeta::EndOfQuery,
+            QueryEvent::Change(_, _, _, id) => QueryEventMeta::Change(*id),
+            QueryEvent::Error(_) => QueryEventMeta::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum QueryEventMeta {
+    Columns,
+    Row(RowId),
+    EndOfQuery,
+    Change(ChangeId),
+    Error,
+}
+
 /// RowId newtype to differentiate from ChangeId
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
 #[serde(transparent)]

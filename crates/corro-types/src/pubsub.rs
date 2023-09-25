@@ -2,7 +2,7 @@ use std::{
     cmp,
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::Buf;
@@ -21,7 +21,7 @@ use sqlite3_parser::{
     lexer::sql::Parser,
 };
 use tokio::{sync::mpsc, task::block_in_place};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -528,14 +528,57 @@ impl Matcher {
     }
 
     async fn cmd_loop(mut self, mut conn: Connection) {
-        while let Some(req) = self.cmd_rx.recv().await {
-            match req {
-                MatcherCmd::ProcessChange(candidates) => {
-                    if let Err(e) = block_in_place(|| self.handle_change(&mut conn, candidates)) {
-                        if matches!(e, MatcherError::EventReceiverClosed) {
-                            break;
+        let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            enum Branch {
+                Cmd(MatcherCmd),
+                PurgeOldChanges,
+            }
+
+            let branch = tokio::select! {
+                biased;
+                Some(req) = self.cmd_rx.recv() => Branch::Cmd(req),
+                _ = purge_changes_interval.tick() => Branch::PurgeOldChanges,
+                else => {
+                    break;
+                }
+            };
+
+            match branch {
+                Branch::Cmd(req) => match req {
+                    MatcherCmd::ProcessChange(candidates) => {
+                        if let Err(e) = block_in_place(|| self.handle_change(&mut conn, candidates))
+                        {
+                            if matches!(e, MatcherError::EventReceiverClosed) {
+                                break;
+                            }
+                            error!("could not handle change: {e}");
                         }
-                        error!("could not handle change: {e}");
+                    }
+                },
+                Branch::PurgeOldChanges => {
+                    let res = block_in_place(|| {
+                        let tx = conn.transaction()?;
+
+                        let deleted = tx
+                            .prepare_cached(&format!(
+                                "DELETE FROM {} WHERE id < (SELECT MAX(id) - 500 FROM {})",
+                                self.qualified_changes_table_name,
+                                self.qualified_changes_table_name
+                            ))?
+                            .execute([])?;
+
+                        tx.commit().map(|_| deleted)
+                    });
+
+                    match res {
+                        Ok(deleted) => info!(
+                            "deleted {deleted} old changes row for subscription {}",
+                            self.id.as_simple()
+                        ),
+                        Err(e) => {
+                            error!("could not delete old changes: {e}");
+                        }
                     }
                 }
             }
@@ -1369,11 +1412,20 @@ mod tests {
 
         setup_conn(
             &mut matcher_conn,
-            &[(subscriptions_db_path, "subscriptions".into())].into(),
+            &[(subscriptions_db_path.clone(), "subscriptions".into())].into(),
         )?;
 
         let (tx, _rx) = mpsc::channel(1);
-        let _matcher = Matcher::create(id, &schema, matcher_conn, tx, sql)?;
+        let handle = Matcher::create(id, &schema, matcher_conn, tx, sql)?;
+
+        let mut cleanup_conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
+
+        setup_conn(
+            &mut cleanup_conn,
+            &[(subscriptions_db_path, "subscriptions".into())].into(),
+        )?;
+
+        handle.cleanup(cleanup_conn)?;
 
         Ok(())
     }
