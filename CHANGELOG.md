@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Support existing tables being added to the schema ([#64](p64))
-- (**BREAKING**) Persist subscriptions across reboots, including many reliability improvements ([#69](p69))
+- (**BREAKING**) Persist subscriptions across reboots, including many reliability improvements (#69)
+- Support existing tables being added to the schema (#64)
 
 ## v0.1.0
 
