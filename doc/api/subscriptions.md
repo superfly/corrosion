@@ -169,10 +169,18 @@ It is encouraged to provide a seamless experience in the event of network errors
 
 Retrying in a loop w/ a backoff is encouraged, as long as the client gives up after a while and return an error actionable by programs or users.
 
-# Integration guide
+# Usage guide
 
 ## Reactivity
 
 Mapping data by row ID (often referred to as `rowid`) is ideal. When receiving changes, they refer to the affected rowid so a consumer can proceed with modifying data with minimal memory usage.
 
 In many cases, it may not be necessary to store each row's cells and instead just a reference to their position in a document or a cheap-to-clone type.
+
+## Caveats
+
+### Row ordering is not preserved
+
+Root-level ORDER BY won't be honored for changes. Meaning new rows will be out of order relative to previously returned rows. Ordering is only kept for a full set of changes (equivalent to creating a transaction).
+
+"Inner" ordering should work just fine as each query result is re-computed when there are changes. That means if you have a a subquery in your query, its ordering will be honored.
