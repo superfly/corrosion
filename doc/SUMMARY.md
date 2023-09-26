@@ -2,7 +2,6 @@
 
 [Introduction](intro.md)
 [Quick start](quick-start.md)
-[Deploy on Fly.io](deploy-on-fly.md)
 
 # User guide
 - [Authorization]() (to come)
@@ -17,6 +16,9 @@
 - [Telemetry](telemetry/README.md)
     - [Prometheus](telemetry/prometheus.md)
 - [Templates]() (to come)
+- [Deploy on Fly.io](deploy-on-fly/README.md)
+  - [Launch a Corrosion Cluster](deploy-on-fly/launch.md)
+  - [Demo](deploy-on-fly/demo.md)
 
 # Reference
 - [API](api/README.md)
