@@ -5,7 +5,6 @@ use std::{net::SocketAddr, ops::Deref, path::Path};
 use corro_api_types::{ChangeId, ExecResponse, ExecResult, Statement};
 use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
-use sqlite_pool::{Hook, HookError};
 use sub::SubscriptionStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -277,17 +276,8 @@ impl CorrosionClient {
         Self {
             api_client: CorrosionApiClient::new(api_addr),
             pool: sqlite_pool::Config::new(db_path.as_ref())
-                .read_only()
-                .builder(sqlite_pool::noop_transform)
-                .expect("making pool builder failed, this can't really happen")
                 .max_size(5)
-                .post_create(Hook::sync_fn(
-                    |conn: &mut sqlite_pool::rusqlite::Connection, _| {
-                        conn.execute_batch("PRAGMA query_only = 1;")
-                            .map_err(HookError::Backend)
-                    },
-                ))
-                .build()
+                .create_pool()
                 .expect("could not build pool, this can't fail because we specified a runtime"),
         }
     }
