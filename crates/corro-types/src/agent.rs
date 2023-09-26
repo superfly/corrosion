@@ -3,28 +3,30 @@ use std::{
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
-use bb8::PooledConnection;
 use camino::Utf8PathBuf;
 use metrics::{gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{Connection, InterruptHandle};
-use tokio::sync::{
-    RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
-    RwLockWriteGuard as TokioRwLockWriteGuard,
-};
 use tokio::{
     runtime::Handle,
     sync::{
         mpsc::{channel, Sender},
         oneshot,
     },
+};
+use tokio::{
+    sync::{
+        RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
+        RwLockWriteGuard as TokioRwLockWriteGuard,
+    },
+    task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, trace, warn};
@@ -36,7 +38,7 @@ use crate::{
     config::Config,
     pubsub::MatcherHandle,
     schema::NormalizedSchema,
-    sqlite::{CrConnManager, RusqliteConnManager, SqlitePool, SqlitePoolError},
+    sqlite::{rusqlite_to_crsqlite, setup_conn, AttachMap, CrConn, SqlitePool, SqlitePoolError},
 };
 
 use super::members::Members;
@@ -161,10 +163,11 @@ pub struct SplitPool(Arc<SplitPoolInner>);
 
 #[derive(Debug)]
 struct SplitPoolInner {
+    path: PathBuf,
+    attachments: HashMap<Utf8PathBuf, compact_str::CompactString>,
+
     read: SqlitePool,
     write: SqlitePool,
-
-    dedicated_pool: bb8::Pool<RusqliteConnManager>,
 
     priority_tx: Sender<oneshot::Sender<CancellationToken>>,
     normal_tx: Sender<oneshot::Sender<CancellationToken>>,
@@ -192,7 +195,7 @@ pub enum ChangeError {
 #[derive(Debug, thiserror::Error)]
 pub enum SplitPoolCreateError {
     #[error(transparent)]
-    Pool(#[from] crate::sqlite::Error),
+    Pool(#[from] sqlite_pool::CreatePoolError),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -202,40 +205,40 @@ pub enum SplitPoolCreateError {
 impl SplitPool {
     pub async fn create<P: AsRef<Path>, P2: AsRef<Path>>(
         path: P,
-        subscriptions_db_path: P2,
+        subscriptions_path: P2,
         tripwire: Tripwire,
     ) -> Result<Self, SplitPoolCreateError> {
-        let rw_pool = bb8::Builder::new()
+        let rw_pool = sqlite_pool::Config::new(path.as_ref())
             .max_size(1)
-            .min_idle(Some(1)) // create one right away and keep it idle
-            .build(CrConnManager::new(path.as_ref()))
-            .await?;
+            .create_pool_transform(rusqlite_to_crsqlite)?;
 
         debug!("built RW pool");
 
-        let ro_pool = bb8::Builder::new()
-            .max_size(10)
-            .min_idle(Some(5)) // keep a few idling
-            .max_lifetime(Some(Duration::from_secs(30)))
-            .build(CrConnManager::new_read_only(path.as_ref()))
-            .await?;
+        let ro_pool = sqlite_pool::Config::new(path.as_ref())
+            .read_only()
+            .max_size(20)
+            .create_pool_transform(rusqlite_to_crsqlite)?;
         debug!("built RO pool");
 
-        let dedicated_pool = bb8::Pool::builder()
-            .max_size(100)
-            .build(RusqliteConnManager::new(path.as_ref()).attach(
-                subscriptions_db_path.as_ref().display().to_string(),
-                "subscriptions",
-            ))
-            .await?;
-
-        Ok(Self::new(ro_pool, rw_pool, dedicated_pool, tripwire))
+        Ok(Self::new(
+            path.as_ref().to_owned(),
+            vec![(
+                subscriptions_path.as_ref().display().to_string().into(),
+                "subscriptions".into(),
+            )]
+            .into_iter()
+            .collect(),
+            ro_pool,
+            rw_pool,
+            tripwire,
+        ))
     }
 
     fn new(
+        path: PathBuf,
+        attachments: AttachMap,
         read: SqlitePool,
         write: SqlitePool,
-        dedicated_pool: bb8::Pool<RusqliteConnManager>,
         mut tripwire: Tripwire,
     ) -> Self {
         let (priority_tx, mut priority_rx) = channel(256);
@@ -270,9 +273,10 @@ impl SplitPool {
         });
 
         Self(Arc::new(SplitPoolInner {
+            path,
+            attachments,
             read,
             write,
-            dedicated_pool,
             priority_tx,
             normal_tx,
             low_tx,
@@ -280,42 +284,47 @@ impl SplitPool {
     }
 
     pub fn emit_metrics(&self) {
-        let read_state = self.0.read.state();
+        let read_state = self.0.read.status();
+        gauge!("corro.sqlite.pool.read.connections", read_state.size as f64);
         gauge!(
-            "corro.sqlite.pool.read.connections",
-            read_state.connections as f64
+            "corro.sqlite.pool.read.connections.available",
+            read_state.available as f64
         );
         gauge!(
-            "corro.sqlite.pool.read.connections.idle",
-            read_state.idle_connections as f64
+            "corro.sqlite.pool.read.connections.waiting",
+            read_state.waiting as f64
         );
 
-        let write_state = self.0.write.state();
+        let write_state = self.0.write.status();
         gauge!(
             "corro.sqlite.pool.write.connections",
-            write_state.connections as f64
+            write_state.size as f64
         );
         gauge!(
-            "corro.sqlite.pool.write.connections.idle",
-            write_state.idle_connections as f64
+            "corro.sqlite.pool.write.connections.available",
+            write_state.available as f64
+        );
+        gauge!(
+            "corro.sqlite.pool.write.connections.waiting",
+            write_state.waiting as f64
         );
     }
 
     // get a read-only connection
-    pub async fn read(&self) -> Result<PooledConnection<CrConnManager>, SqlitePoolError> {
+    pub async fn read(&self) -> Result<sqlite_pool::Connection<CrConn>, SqlitePoolError> {
         self.0.read.get().await
     }
 
-    pub fn read_blocking(&self) -> Result<PooledConnection<CrConnManager>, SqlitePoolError> {
-        Handle::current().block_on(self.0.read.get_owned())
+    pub fn read_blocking(&self) -> Result<sqlite_pool::Connection<CrConn>, SqlitePoolError> {
+        Handle::current().block_on(self.0.read.get())
     }
 
-    pub async fn dedicated(&self) -> Result<Connection, crate::sqlite::Error> {
-        self.0.dedicated_pool.dedicated_connection().await
-    }
-
-    pub fn dedicated_pool(&self) -> &bb8::Pool<RusqliteConnManager> {
-        &self.0.dedicated_pool
+    pub async fn dedicated(&self) -> rusqlite::Result<Connection> {
+        block_in_place(|| {
+            let mut conn = rusqlite::Connection::open(&self.0.path)?;
+            setup_conn(&mut conn, &self.0.attachments)?;
+            Ok(conn)
+        })
     }
 
     // get a high priority write connection (e.g. client input)
@@ -393,20 +402,20 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
     cancel.cancelled().await
 }
 
-pub struct WriteConn<'a> {
-    conn: PooledConnection<'a, CrConnManager>,
+pub struct WriteConn {
+    conn: sqlite_pool::Connection<CrConn>,
     _drop_guard: DropGuard,
 }
 
-impl<'a> Deref for WriteConn<'a> {
-    type Target = PooledConnection<'a, CrConnManager>;
+impl Deref for WriteConn {
+    type Target = sqlite_pool::Connection<CrConn>;
 
     fn deref(&self) -> &Self::Target {
         &self.conn
     }
 }
 
-impl<'a> DerefMut for WriteConn<'a> {
+impl DerefMut for WriteConn {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn
     }

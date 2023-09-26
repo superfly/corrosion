@@ -234,8 +234,6 @@ pub enum MatcherUpsertError {
     #[error(transparent)]
     Pool(#[from] SqlitePoolError),
     #[error(transparent)]
-    PoolDedicated(#[from] corro_types::sqlite::Error),
-    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error("could not expand sql statement")]
     CouldNotExpand,
@@ -250,9 +248,9 @@ pub enum MatcherUpsertError {
 impl MatcherUpsertError {
     fn status_code(&self) -> StatusCode {
         match self {
-            MatcherUpsertError::Pool(_)
-            | MatcherUpsertError::PoolDedicated(_)
-            | MatcherUpsertError::CouldNotExpand => StatusCode::INTERNAL_SERVER_ERROR,
+            MatcherUpsertError::Pool(_) | MatcherUpsertError::CouldNotExpand => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             MatcherUpsertError::Sqlite(_)
             | MatcherUpsertError::NormalizeStatement(_)
             | MatcherUpsertError::Matcher(_)
@@ -430,9 +428,7 @@ pub async fn catch_up_sub(
     let last_query_event = {
         let mut buf = BytesMut::new();
 
-        let pool = agent.pool().dedicated_pool();
-
-        let mut conn = match pool.get().await {
+        let mut conn = match agent.pool().dedicated().await {
             Ok(conn) => conn,
             Err(e) => {
                 evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await?;

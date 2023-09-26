@@ -130,6 +130,12 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     {
         let mut conn = rusqlite::Connection::open(&subscriptions_db_path)?;
+        conn.execute_batch(
+            r#"
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+            "#,
+        )?;
         migrate_subs(&mut conn)?;
     }
 
