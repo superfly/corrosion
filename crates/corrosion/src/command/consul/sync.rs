@@ -84,19 +84,20 @@ pub async fn run<P: AsRef<Path>>(
         loop {
             tokio::select! {
                 _ = pull_interval.tick() => {
-                    let results = update_consul(&consul, node, &corrosion, &mut consul_services, &mut consul_checks, false).await;
-                    debug!("got results: {results:?}");
-                    for (kind, res) in results {
-                        match res {
-                            Ok(stats) if stats.upserted > 0 || stats.deleted > 0 => {
-                                info!("updated consul {kind}: {stats:?}");
-                            },
-                            Err(e) => {
-                                error!("could not update consul {kind}: {e}");
-                            },
-                            _ => {
-                                debug!("nothing to update");
+                    let res = update_consul(&consul, node, &corrosion, &mut consul_services, &mut consul_checks, false).await;
+                    debug!("got results: {res:?}");
+
+                    match res {
+                        Ok((svc_stats, check_stats)) => {
+                            if !svc_stats.is_zero() {
+                                info!("updated consul services: {svc_stats:?}");    
                             }
+                            if !check_stats.is_zero() {
+                                info!("updated consul checks: {check_stats:?}");    
+                            }
+                        }
+                        Err(e) => {
+                            error!("could not update consul: {e}");
                         }
                     }
                 },
@@ -204,6 +205,12 @@ pub struct ApplyStats {
     pub deleted: usize,
 }
 
+impl ApplyStats {
+    fn is_zero(&self) -> bool {
+        self.upserted == 0 && self.deleted == 0
+    }
+}
+
 pub fn hash_service(svc: &AgentService) -> u64 {
     let mut hasher = seahash::SeaHasher::new();
     svc.hash(&mut hasher);
@@ -238,13 +245,13 @@ pub fn hash_check(check: &AgentCheck) -> u64 {
     hasher.finish()
 }
 
-pub fn upsert_service_statements(
+fn append_upsert_service_statements(
     statements: &mut Vec<Statement>,
     node: &'static str,
     svc: AgentService,
     hash: u64,
     updated_at: i64,
-) -> eyre::Result<()> {
+) {
     // run this by corrosion so it's part of the same transaction
     statements.push(Statement::WithParams("INSERT INTO __corro_consul_services ( id, hash )
     VALUES (?, ?)
@@ -271,23 +278,21 @@ pub fn upsert_service_statements(
         node.into(),
         svc.id.into(),
         svc.name.into(),
-        serde_json::to_string(&svc.tags)?.into(),
-        serde_json::to_string(&svc.meta)?.into(),
+        serde_json::to_string(&svc.tags).unwrap_or_else(|_| "[]".to_string()).into(),
+        serde_json::to_string(&svc.meta).unwrap_or_else(|_| "{}".to_string()).into(),
         svc.port.into(),
         svc.address.into(),
         updated_at.into(),
     ]));
-
-    Ok(())
 }
 
-pub fn upsert_check_statements(
+fn append_upsert_check_statements(
     statements: &mut Vec<Statement>,
     node: &'static str,
     check: AgentCheck,
     hash: u64,
     updated_at: i64,
-) -> eyre::Result<()> {
+) {
     // run this by corrosion so it's part of the same transaction
     statements.push(Statement::WithParams("INSERT INTO __corro_consul_checks ( id, hash )
     VALUES (?, ?)
@@ -321,27 +326,24 @@ pub fn upsert_check_statements(
         updated_at.into(),
     ]));
 
-    Ok(())
 }
 
-pub async fn update_consul_services(
-    corrosion: &CorrosionClient,
+enum ConsulServiceOp {
+    Upsert { svc: AgentService, hash: u64 },
+    Delete { id: String },
+}
+
+enum ConsulCheckOp {
+    Upsert { check: AgentCheck, hash: u64 },
+    Delete { id: String }
+}
+
+fn update_services(
     mut services: HashMap<String, AgentService>,
-    hashes: &mut HashMap<String, u64>,
-    node: &'static str,
+    hashes: &HashMap<String, u64>,
     skip_hash_check: bool,
-) -> eyre::Result<ApplyStats> {
-    let updated_at = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("could not get system time")
-        .as_millis() as i64;
-
-    let mut to_upsert = vec![];
-    let mut to_delete = vec![];
-
-    let mut statements = vec![];
-
-    let mut stats = ApplyStats::default();
+) -> Vec<ConsulServiceOp> {
+    let mut ops = vec![];
 
     {
         for (id, old_hash) in hashes.iter() {
@@ -350,14 +352,11 @@ pub async fn update_consul_services(
                 if skip_hash_check || *old_hash != hash {
                     info!("updating service '{id}'");
 
-                    to_upsert.push((svc.id.clone(), hash));
-
-                    upsert_service_statements(&mut statements, node, svc, hash, updated_at)?;
-                    stats.upserted += 1;
+                    ops.push(ConsulServiceOp::Upsert { svc, hash });
                 }
             } else {
                 info!("deleting service: {id}");
-                to_delete.push(id.clone());
+                ops.push(ConsulServiceOp::Delete { id: id.clone() });
             }
         }
     }
@@ -367,58 +366,18 @@ pub async fn update_consul_services(
         info!("inserting service '{id}'");
 
         let hash = hash_service(&svc);
-        to_upsert.push((svc.id.clone(), hash));
-        upsert_service_statements(&mut statements, node, svc, hash, updated_at)?;
-        stats.upserted += 1;
+        ops.push(ConsulServiceOp::Upsert { svc, hash });
     }
 
-    for id in to_delete.iter() {
-        statements.push(Statement::WithParams("DELETE FROM __corro_consul_services WHERE id = ?;".into(),vec![
-            
-            (*id).clone().into(),
-        ]));
-        statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),vec![
-            
-            node.into(),
-            (*id).clone().into(),
-        ]));
-        stats.deleted += 1;
-    }
-
-    if !statements.is_empty() {
-        corrosion.execute(&statements).await?;
-        info!("updated consul services");
-    }
-
-    for (id, hash) in to_upsert {
-        hashes.insert(id, hash);
-    }
-
-    for id in to_delete {
-        hashes.remove(id.as_str());
-    }
-
-    Ok(stats)
+    ops
 }
 
-pub async fn update_consul_checks(
-    corrosion: &CorrosionClient,
+fn update_checks(
     mut checks: HashMap<String, AgentCheck>,
-    hashes: &mut HashMap<String, u64>,
-    node: &'static str,
+    hashes: &HashMap<String, u64>,
     skip_hash_check: bool,
-) -> eyre::Result<ApplyStats> {
-    let updated_at = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("could not get system time")
-        .as_millis() as i64;
-
-    let mut to_upsert = vec![];
-    let mut to_delete = vec![];
-
-    let mut statements = vec![];
-
-    let mut stats = ApplyStats::default();
+) -> Vec<ConsulCheckOp> {
+    let mut ops = vec![];
 
     {
         for (id, old_hash) in hashes.iter() {
@@ -427,14 +386,11 @@ pub async fn update_consul_checks(
                 if skip_hash_check || *old_hash != hash {
                     info!("updating check '{id}'");
 
-                    to_upsert.push((check.id.clone(), hash));
-
-                    upsert_check_statements(&mut statements, node, check, hash, updated_at)?;
-                    stats.upserted += 1;
+                    ops.push(ConsulCheckOp::Upsert { check, hash });
                 }
             } else {
                 info!("deleting check: {id}");
-                to_delete.push(id.clone());
+                ops.push(ConsulCheckOp::Delete { id: id.clone() });
             }
         }
     }
@@ -442,42 +398,11 @@ pub async fn update_consul_checks(
     // new checks
     for (id, check) in checks {
         info!("upserting check '{id}'");
-
         let hash = hash_check(&check);
-        to_upsert.push((check.id.clone(), hash));
-        upsert_check_statements(&mut statements, node, check, hash, updated_at)?;
-        stats.upserted += 1;
+        ops.push(ConsulCheckOp::Upsert { check, hash });
     }
-
-    for id in to_delete.iter() {
-        statements.push(Statement::WithParams("DELETE FROM __corro_consul_checks WHERE id = ?;".into(),vec![
-            
-            (*id).clone().into(),
-        ]));
-        statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),vec![
-            
-            node.into(),
-            (*id).clone().into(),
-        ]));
-        stats.deleted += 1;
-    }
-
-    if !statements.is_empty() {
-        
-            corrosion.execute(&statements).await?;
-        
-        info!("updated consul checks");
-    }
-
-    for (id, hash) in to_upsert {
-        hashes.insert(id, hash);
-    }
-
-    for id in to_delete {
-        hashes.remove(id.as_str());
-    }
-
-    Ok(stats)
+    
+    ops
 }
 
 pub async fn update_consul(
@@ -487,29 +412,16 @@ pub async fn update_consul(
     service_hashes: &mut HashMap<String, u64>,
     check_hashes: &mut HashMap<String, u64>,
     skip_hash_check: bool,
-) -> [(&'static str, eyre::Result<ApplyStats>); 2] {
-    let fut_services = async move {
+) -> eyre::Result<(ApplyStats, ApplyStats)> {
+    let fut_services = async {
         let start = Instant::now();
-        (
-            "services",
             match timeout(Duration::from_secs(5), consul.agent_services()).await {
                 Ok(Ok(services)) => {
                     histogram!(
                         "corro_consul.consul.response.time.seconds",
                         start.elapsed().as_secs_f64()
                     );
-                    match update_consul_services(
-                        corrosion,
-                        services,
-                        service_hashes,
-                        node,
-                        skip_hash_check,
-                    )
-                    .await
-                    {
-                        Ok(stats) => Ok(stats),
-                        Err(e) => Err(e),
-                    }
+                    Ok::<_, eyre::Report>(update_services(services, service_hashes, skip_hash_check))
                 }
                 Ok(Err(e)) => {
                     increment_counter!("corro_consul.consul.response.errors", "error" => e.to_string(), "type" => "services");
@@ -519,32 +431,19 @@ pub async fn update_consul(
                     increment_counter!("corro_consul.consul.response.errors", "error" => "timed out", "type" => "services");
                     Err(e.into())
                 }
-            },
-        )
+            }
+        
     };
 
-    let fut_checks = async move {
+    let fut_checks = async {
         let start = Instant::now();
-        (
-            "checks",
             match timeout(Duration::from_secs(5), consul.agent_checks()).await {
                 Ok(Ok(checks)) => {
                     histogram!(
                         "corro_consul.consul.response.time.seconds",
                         start.elapsed().as_secs_f64()
                     );
-                    match update_consul_checks(
-                        corrosion,
-                        checks,
-                        check_hashes,
-                        node,
-                        skip_hash_check,
-                    )
-                    .await
-                    {
-                        Ok(stats) => Ok(stats),
-                        Err(e) => Err(e),
-                    }
+                    Ok::<_, eyre::Report>(update_checks(checks, check_hashes, skip_hash_check))
                 }
                 Ok(Err(e)) => {
                     increment_counter!("corro_consul.consul.response.errors", "error" => e.to_string(), "type" => "checks");
@@ -554,12 +453,108 @@ pub async fn update_consul(
                     increment_counter!("corro_consul.consul.response.errors", "error" => "timed out", "type" => "checks");
                     Err(e.into())
                 }
-            },
-        )
+            }
     };
 
-    let (svcs, checks) = tokio::join!(fut_services, fut_checks);
-    [svcs, checks]
+    let (svcs, checks) = tokio::try_join!(fut_services, fut_checks)?;
+
+    execute(node, corrosion, svcs, service_hashes, checks, check_hashes).await
+}
+
+async fn execute(
+    node: &'static str,
+    corrosion: &CorrosionClient,
+    svcs: Vec<ConsulServiceOp>,
+    service_hashes: &mut HashMap<String, u64>,
+    checks: Vec<ConsulCheckOp>,
+    check_hashes: &mut HashMap<String, u64>,
+    ) -> eyre::Result<(ApplyStats, ApplyStats)> {
+        let updated_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("could not get system time")
+        .as_millis() as i64;
+
+    let mut statements = Vec::with_capacity(svcs.len() + checks.len());
+
+    let mut svc_to_upsert = vec![];
+    let mut svc_to_delete = vec![];
+
+        for op in svcs {
+            match op {
+                ConsulServiceOp::Upsert { svc, hash } => {
+                    svc_to_upsert.push((svc.id.clone(), hash));
+                    append_upsert_service_statements(&mut statements, node, svc, hash, updated_at);
+                },
+                ConsulServiceOp::Delete { id } => {
+                    svc_to_delete.push(id.clone());
+
+                    statements.push(Statement::WithParams("DELETE FROM __corro_consul_services WHERE id = ?;".into(),vec![
+            
+            id.clone().into(),
+        ]));
+        statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),vec![
+            
+            node.into(),
+            id.into(),
+        ]));
+                },
+            }
+        }
+    
+
+    let mut check_to_upsert = vec![];
+    let mut check_to_delete = vec![];
+
+        for op in checks {
+            match op {
+                ConsulCheckOp::Upsert { check, hash } => {
+                    check_to_upsert.push((check.id.clone(), hash));
+                    append_upsert_check_statements(&mut statements, node, check, hash, updated_at);
+                },
+                ConsulCheckOp::Delete { id } => {
+                    check_to_delete.push(id.clone());
+                    statements.push(Statement::WithParams("DELETE FROM __corro_consul_checks WHERE id = ?;".into(),vec![
+            
+            id.clone().into(),
+        ]));
+        statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),vec![
+            
+            node.into(),
+            id.into(),
+        ]));
+                },
+            }
+        }
+    
+
+    if !statements.is_empty() {
+        corrosion.execute(&statements).await?;
+        info!("updated consul services");
+    }
+
+    let mut svc_stats = ApplyStats::default();
+
+    for (id, hash) in svc_to_upsert {
+        service_hashes.insert(id, hash);
+        svc_stats.upserted +=1 ;
+    }
+    for id in svc_to_delete {
+        service_hashes.remove(&id);
+        svc_stats.deleted += 1;
+    }
+
+    let mut check_stats = ApplyStats::default();
+
+    for (id, hash) in check_to_upsert {
+        check_hashes.insert(id, hash);
+        check_stats.upserted +=1 ;
+    }
+    for id in check_to_delete {
+        check_hashes.remove(&id);
+        check_stats.deleted += 1;
+    }
+
+    Ok((svc_stats, check_stats))
 }
 
 #[cfg(test)]
@@ -637,18 +632,19 @@ mod tests {
 
         services.insert("service-id".into(), svc.clone());
 
-        let mut hashes = HashMap::new();
+        let mut svc_hashes = HashMap::new();
+        let mut check_hashes = HashMap::new();
 
-        let applied =
-            update_consul_services(&ta1_client, services.clone(), &mut hashes, "node-1", false)
-                .await?;
+        let (applied, check_applied) = execute("node-1", &ta1_client, update_services(services.clone(), &svc_hashes, false), &mut svc_hashes, Default::default(), &mut check_hashes).await?;
+
+        assert!(check_applied.is_zero());
 
         assert_eq!(applied.upserted, 1);
         assert_eq!(applied.deleted, 0);
 
         let svc_hash = hash_service(&svc);
 
-        assert_eq!(hashes.get("service-id"), Some(&svc_hash));
+        assert_eq!(svc_hashes.get("service-id"), Some(&svc_hash));
 
         {
             let conn = ta1_client.pool().get().await?;
@@ -662,13 +658,14 @@ mod tests {
             assert_eq!(svc_hash, hash);
         }
 
-        let applied =
-            update_consul_services(&ta1_client, services, &mut hashes, "node-1", false).await?;
+        let (applied, _check_applied) = execute("node-1", &ta1_client, update_services(services, &svc_hashes, false), &mut svc_hashes, Default::default(), &mut check_hashes).await?;
+
+        assert!(check_applied.is_zero());
 
         assert_eq!(applied.upserted, 0);
         assert_eq!(applied.deleted, 0);
 
-        assert_eq!(hashes.get("service-id"), Some(&hash_service(&svc)));
+        assert_eq!(svc_hashes.get("service-id"), Some(&hash_service(&svc)));
 
         let ta2_client = CorrosionClient::new(ta2.agent.api_addr(), ta2.agent.db_path());
 
@@ -688,14 +685,14 @@ mod tests {
             assert_eq!(app_id, 123);
         }
 
-        let applied =
-            update_consul_services(&ta1_client, HashMap::new(), &mut hashes, "node-1", false)
-                .await?;
+        let (applied, _check_applied) = execute("node-1", &ta1_client, update_services(HashMap::new(), &svc_hashes, false), &mut svc_hashes, Default::default(), &mut check_hashes).await?;
+
+        assert!(check_applied.is_zero());
 
         assert_eq!(applied.upserted, 0);
         assert_eq!(applied.deleted, 1);
 
-        assert_eq!(hashes.get("service-id"), None);
+        assert_eq!(svc_hashes.get("service-id"), None);
 
         {
             let conn = ta1_client.pool().get().await?;
