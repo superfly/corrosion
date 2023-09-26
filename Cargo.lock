@@ -320,19 +320,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4a4ddaa51a5bc52a6948f74c06d20aaaddb71924eab79b8c97a8c556e942d6a"
 
 [[package]]
-name = "bb8"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1627eccf3aa91405435ba240be23513eeca466b5dc33866422672264de061582"
-dependencies = [
- "async-trait",
- "futures-channel",
- "futures-util",
- "parking_lot",
- "tokio",
-]
-
-[[package]]
 name = "beef"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -768,10 +755,10 @@ name = "corro-api-types"
 version = "0.1.0-alpha.1"
 dependencies = [
  "async-trait",
- "bb8",
  "camino",
  "compact_str 0.7.0",
  "corro-speedy",
+ "deadpool",
  "hex",
  "rusqlite",
  "serde",
@@ -785,7 +772,6 @@ dependencies = [
 name = "corro-client"
 version = "0.1.0-alpha.1"
 dependencies = [
- "bb8",
  "bytes",
  "corro-api-types",
  "futures",
@@ -793,6 +779,7 @@ dependencies = [
  "hyper",
  "pin-project-lite",
  "serde_json",
+ "sqlite-pool",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -859,7 +846,6 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "arc-swap",
  "async-trait",
- "bb8",
  "bytes",
  "camino",
  "circular-buffer",
@@ -868,6 +854,7 @@ dependencies = [
  "consul-client",
  "corro-api-types",
  "corro-speedy",
+ "deadpool",
  "enquote",
  "fallible-iterator",
  "foca",
@@ -884,6 +871,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "sqlite-pool",
  "sqlite3-parser",
  "tempfile",
  "thiserror",
@@ -1115,6 +1103,27 @@ name = "data-encoding"
 version = "2.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23d8666cb01533c39dde32bcbab8e227b4ed6679b2c925eba05feabea39508fb"
+
+[[package]]
+name = "deadpool"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb84100978c1c7b37f09ed3ce3e5f843af02c2a2c431bae5b19230dad2c1b490"
+dependencies = [
+ "async-trait",
+ "deadpool-runtime",
+ "num_cpus",
+ "tokio",
+]
+
+[[package]]
+name = "deadpool-runtime"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63dfa964fe2a66f3fde91fc70b267fe193d822c7e603e2a675a49a7f46ad3f49"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "defmt"
@@ -3237,6 +3246,15 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+
+[[package]]
+name = "sqlite-pool"
+version = "0.1.0"
+dependencies = [
+ "deadpool",
+ "rusqlite",
+ "tokio",
+]
 
 [[package]]
 name = "sqlite3-parser"

@@ -1,21 +1,20 @@
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
-    sync::Arc,
 };
 
-use bb8::ManageConnection;
+// use bb8::ManageConnection;
 use camino::Utf8PathBuf;
 use compact_str::CompactString;
 use enquote::enquote;
 use once_cell::sync::Lazy;
-use rusqlite::{params, Connection, OpenFlags, Transaction};
+use rusqlite::{params, Connection, Transaction};
+use sqlite_pool::SqliteConn;
 use tempfile::TempDir;
 use tracing::{error, trace};
 
-pub type SqlitePool = bb8::Pool<CrConnManager>;
-pub type SqlitePoolError = bb8::RunError<Error>;
+pub type SqlitePool = sqlite_pool::Pool<CrConn>;
+pub type SqlitePoolError = sqlite_pool::PoolError;
 
 const CRSQL_EXT_GENERIC_NAME: &str = "crsqlite";
 
@@ -43,97 +42,10 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
     dir
 });
 
-#[derive(Debug, Clone)]
-struct ConnectionOptions {
-    mode: OpenMode,
-    path: PathBuf,
-    attach: HashMap<Utf8PathBuf, CompactString>,
-}
-
-#[derive(Debug, Clone)]
-enum OpenMode {
-    Plain,
-    WithFlags { flags: rusqlite::OpenFlags },
-}
-
-pub struct CrConnManager(Arc<ConnectionOptions>);
-
-impl CrConnManager {
-    pub fn new<P>(path: P) -> Self
-    where
-        P: AsRef<Path>,
-    {
-        Self(Arc::new(ConnectionOptions {
-            mode: OpenMode::Plain,
-            path: path.as_ref().into(),
-            attach: Default::default(),
-        }))
-    }
-
-    pub fn new_read_only<P>(path: P) -> Self
-    where
-        P: AsRef<Path>,
-    {
-        Self::new_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-    }
-
-    pub fn new_with_flags<P>(path: P, flags: OpenFlags) -> Self
-    where
-        P: AsRef<Path>,
-    {
-        Self(Arc::new(ConnectionOptions {
-            mode: OpenMode::WithFlags { flags },
-            path: path.as_ref().into(),
-            attach: Default::default(),
-        }))
-    }
-
-    pub fn with_flags(self, flags: OpenFlags) -> Self {
-        let mut opts = self.0.as_ref().clone();
-        opts.mode = OpenMode::WithFlags { flags };
-        Self(Arc::new(opts))
-    }
-}
-
-#[async_trait::async_trait]
-impl ManageConnection for CrConnManager {
-    type Connection = CrConn;
-
-    type Error = Error;
-
-    /// Attempts to create a new connection.
-    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        let options = self.0.clone();
-
-        // Technically, we don't need to use spawn_blocking() here, but doing so
-        // means we won't inadvertantly block this task for any length of time,
-        // since rusqlite is inherently synchronous.
-        let mut conn = tokio::task::spawn_blocking(move || match &options.mode {
-            OpenMode::Plain => rusqlite::Connection::open(&options.path),
-            OpenMode::WithFlags { flags } => {
-                rusqlite::Connection::open_with_flags(&options.path, *flags)
-            }
-        })
-        .await??;
-
-        init_cr_conn(&mut conn)?;
-        setup_conn(&mut conn, &self.0.attach)?;
-        Ok(CrConn(conn))
-    }
-
-    #[inline]
-    async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        // no real need for this I don't think.
-        Ok(())
-    }
-
-    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
-        // no concept of broken conns for sqlite afaik
-        false
-    }
+pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+    init_cr_conn(&mut conn)?;
+    setup_conn(&mut conn, &HashMap::new())?;
+    Ok(CrConn(conn))
 }
 
 #[derive(Debug)]
@@ -148,6 +60,12 @@ impl CrConn {
     pub fn transaction(&mut self) -> rusqlite::Result<Transaction> {
         self.0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+    }
+}
+
+impl SqliteConn for CrConn {
+    fn conn(&self) -> &rusqlite::Connection {
+        &self.0
     }
 }
 
@@ -193,10 +111,9 @@ fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-pub(crate) fn setup_conn(
-    conn: &mut Connection,
-    attach: &HashMap<Utf8PathBuf, CompactString>,
-) -> Result<(), rusqlite::Error> {
+pub type AttachMap = HashMap<Utf8PathBuf, CompactString>;
+
+pub(crate) fn setup_conn(conn: &mut Connection, attach: &AttachMap) -> Result<(), rusqlite::Error> {
     // WAL journal mode and synchronous NORMAL for best performance / crash resilience compromise
     conn.execute_batch(
         r#"
@@ -215,97 +132,6 @@ pub(crate) fn setup_conn(
     }
 
     Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// A rusqlite error.
-    #[error("rusqlite error: {0}")]
-    Rusqlite(#[from] rusqlite::Error),
-
-    /// A tokio join handle error.
-    #[error("tokio join error")]
-    TokioJoin(#[from] tokio::task::JoinError),
-}
-
-#[derive(Debug, Clone)]
-pub struct RusqliteConnManager(Arc<ConnectionOptions>);
-
-impl RusqliteConnManager {
-    pub fn new<P>(path: P) -> Self
-    where
-        P: AsRef<Path>,
-    {
-        Self(Arc::new(ConnectionOptions {
-            mode: OpenMode::Plain,
-            path: path.as_ref().into(),
-            attach: Default::default(),
-        }))
-    }
-
-    pub fn new_read_only<P>(path: P) -> Self
-    where
-        P: AsRef<Path>,
-    {
-        Self::new_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-    }
-
-    pub fn new_with_flags<P>(path: P, flags: OpenFlags) -> Self
-    where
-        P: AsRef<Path>,
-    {
-        Self(Arc::new(ConnectionOptions {
-            mode: OpenMode::WithFlags { flags },
-            path: path.as_ref().into(),
-            attach: Default::default(),
-        }))
-    }
-
-    pub fn attach<P: Into<Utf8PathBuf>, S: Into<CompactString>>(self, path: P, name: S) -> Self {
-        let mut opts = self.0.as_ref().clone();
-        opts.attach.insert(path.into(), name.into());
-        Self(Arc::new(opts))
-    }
-}
-
-#[async_trait::async_trait]
-impl ManageConnection for RusqliteConnManager {
-    type Connection = Connection;
-
-    type Error = Error;
-
-    /// Attempts to create a new connection.
-    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        let options = self.0.clone();
-
-        // Technically, we don't need to use spawn_blocking() here, but doing so
-        // means we won't inadvertantly block this task for any length of time,
-        // since rusqlite is inherently synchronous.
-        let mut conn = tokio::task::spawn_blocking(move || match &options.mode {
-            OpenMode::Plain => rusqlite::Connection::open(&options.path),
-            OpenMode::WithFlags { flags } => {
-                rusqlite::Connection::open_with_flags(&options.path, *flags)
-            }
-        })
-        .await??;
-
-        setup_conn(&mut conn, &self.0.attach)?;
-        Ok(conn)
-    }
-
-    #[inline]
-    async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        // no real need for this I don't think.
-        Ok(())
-    }
-
-    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
-        // no concept of broken conns for sqlite afaik
-        false
-    }
 }
 
 pub trait Migration {
@@ -369,11 +195,9 @@ mod tests {
     async fn concurrent_writes() -> Result<(), Box<dyn std::error::Error>> {
         let tmpdir = tempfile::TempDir::new()?;
 
-        let pool = bb8::Builder::new()
+        let pool = sqlite_pool::Config::new(tmpdir.path().join("test.db"))
             .max_size(1)
-            .min_idle(Some(1)) // create one right away and keep it idle
-            .build(CrConnManager::new(tmpdir.path().join("test.db")))
-            .await?;
+            .create_pool_transform(rusqlite_to_crsqlite)?;
 
         {
             let conn = pool.get().await?;

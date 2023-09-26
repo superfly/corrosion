@@ -1,10 +1,11 @@
 pub mod sub;
 
-use std::{net::SocketAddr, ops::Deref, path::Path, time::Duration};
+use std::{net::SocketAddr, ops::Deref, path::Path};
 
-use corro_api_types::{sqlite::RusqliteConnManager, ChangeId, ExecResponse, ExecResult, Statement};
+use corro_api_types::{ChangeId, ExecResponse, ExecResult, Statement};
 use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
+use sqlite_pool::{Hook, HookError};
 use sub::SubscriptionStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -268,21 +269,30 @@ impl CorrosionApiClient {
 #[derive(Clone)]
 pub struct CorrosionClient {
     api_client: CorrosionApiClient,
-    pool: bb8::Pool<RusqliteConnManager>,
+    pool: sqlite_pool::RusqlitePool,
 }
 
 impl CorrosionClient {
     pub fn new<P: AsRef<Path>>(api_addr: SocketAddr, db_path: P) -> Self {
         Self {
             api_client: CorrosionApiClient::new(api_addr),
-            pool: bb8::Pool::builder()
+            pool: sqlite_pool::Config::new(db_path.as_ref())
+                .read_only()
+                .builder(sqlite_pool::noop_transform)
+                .expect("making pool builder failed, this can't really happen")
                 .max_size(5)
-                .max_lifetime(Some(Duration::from_secs(30)))
-                .build_unchecked(RusqliteConnManager::new(&db_path)),
+                .post_create(Hook::sync_fn(
+                    |conn: &mut sqlite_pool::rusqlite::Connection, _| {
+                        conn.execute_batch("PRAGMA query_only = 1;")
+                            .map_err(HookError::Backend)
+                    },
+                ))
+                .build()
+                .expect("could not build pool, this can't fail because we specified a runtime"),
         }
     }
 
-    pub fn pool(&self) -> &bb8::Pool<RusqliteConnManager> {
+    pub fn pool(&self) -> &sqlite_pool::RusqlitePool {
         &self.pool
     }
 }

@@ -1,0 +1,13 @@
+[package]
+name = "sqlite-pool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+deadpool = { workspace = true }
+
+[features]
+default = ["rt_tokio_1"]
+rt_tokio_1 = ["deadpool/rt_tokio_1"]
