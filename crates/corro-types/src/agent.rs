@@ -216,7 +216,7 @@ impl SplitPool {
 
         let ro_pool = sqlite_pool::Config::new(path.as_ref())
             .read_only()
-            .max_size(10)
+            .max_size(20)
             .create_pool_transform(rusqlite_to_crsqlite)?;
         debug!("built RO pool");
 
