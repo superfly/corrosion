@@ -1,5 +1,6 @@
-use std::{convert::Infallible, path::PathBuf};
+use std::{convert::Infallible, path::PathBuf, time::Duration};
 
+use deadpool::managed::{QueueMode, Timeouts};
 use rusqlite::OpenFlags;
 
 use crate::{
@@ -47,7 +48,7 @@ pub struct Config {
     pub open_flags: OpenFlags,
 
     /// [`Pool`] configuration.
-    pub pool: Option<PoolConfig>,
+    pub pool: PoolConfig,
 }
 
 impl Config {
@@ -57,7 +58,14 @@ impl Config {
         Self {
             path: path.into(),
             open_flags: OpenFlags::default(),
-            pool: None,
+            pool: PoolConfig {
+                max_size: 20,
+                timeouts: Timeouts {
+                    wait: Some(Duration::from_secs(30)),
+                    ..Default::default()
+                },
+                queue_mode: QueueMode::default(),
+            },
         }
     }
 
@@ -68,7 +76,7 @@ impl Config {
     }
 
     pub fn max_size(mut self, value: usize) -> Self {
-        self.pool.get_or_insert_with(Default::default).max_size = value;
+        self.pool.max_size = value;
         self
     }
 
@@ -110,7 +118,7 @@ impl Config {
     /// a [`deadpool::managed::Pool`] instance.
     #[must_use]
     pub fn get_pool_config(&self) -> PoolConfig {
-        self.pool.unwrap_or_default()
+        self.pool
     }
 }
 
