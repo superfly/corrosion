@@ -375,19 +375,21 @@ async fn timeout_wait(
     queue: &'static str,
 ) {
     let start = Instant::now();
-    tokio::select! {
-        biased;
-        _ = token.cancelled() => {
-            trace!("conn dropped before timeout");
-            histogram!("corro.sqlite.pool.execution.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
-            return;
-        },
-        _ = tokio::time::sleep(timeout) => {
-            warn!("conn execution timed out, interrupting!");
-        }
-    }
-    handle.interrupt();
-    increment_counter!("corro.sqlite.pool.execution.timeout");
+    token.cancelled().await;
+    histogram!("corro.sqlite.pool.execution.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
+    // tokio::select! {
+    //     biased;
+    //     _ = token.cancelled() => {
+    //         trace!("conn dropped before timeout");
+    //         histogram!("corro.sqlite.pool.execution.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
+    //         return;
+    //     },
+    //     _ = tokio::time::sleep(timeout) => {
+    //         warn!("conn execution timed out, interrupting!");
+    //     }
+    // }
+    // handle.interrupt();
+    // increment_counter!("corro.sqlite.pool.execution.timeout");
     // FIXME: do we need to cancel the token?
 }
 
