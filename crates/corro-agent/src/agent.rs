@@ -789,16 +789,17 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
 
+                        let db_versions = *versions.first_key_value().unwrap().0
+                            ..=*versions.last_key_value().unwrap().0;
+
                         // smaller queries...
-                        for db_versions in versions.keys().chunks(500).into_iter().map(|chunk| {
-                            chunk
-                                .copied()
-                                .filter(|v| bookedw.contains_current(v))
-                                .collect()
-                        }) {
+                        for db_versions_range in chunk_range(db_versions, 500) {
                             let new_to_clear = {
-                                match find_cleared_db_versions_for_actor(&tx, &tables, &db_versions)
-                                {
+                                match find_cleared_db_versions_for_actor(
+                                    &tx,
+                                    &tables,
+                                    &BTreeSet::from_iter(db_versions_range.clone()),
+                                ) {
                                     Ok(to_clear) => {
                                         if to_clear.is_empty() {
                                             return Ok(());
@@ -811,6 +812,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                     }
                                 }
                             };
+
+                            info!(%actor_id, "have {} versions to clear in range: {db_versions_range:?}", new_to_clear.len());
 
                             to_clear.extend(new_to_clear);
                         }
@@ -1328,6 +1331,19 @@ pub async fn handle_change(
             }
         }
     }
+}
+
+fn chunk_range(
+    range: RangeInclusive<i64>,
+    chunk_size: i64,
+) -> impl Iterator<Item = RangeInclusive<i64>> {
+    range
+        .clone()
+        .step_by(chunk_size as usize)
+        .map(move |block_start| {
+            let block_end = (block_start + chunk_size).min(*range.end());
+            block_start..=block_end
+        })
 }
 
 fn find_cleared_db_versions_for_actor(
