@@ -772,7 +772,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     };
 
     if !states.is_empty() {
-        let mut foca_states = Vec::with_capacity(states.len());
+        // let mut foca_states = Vec::with_capacity(states.len());
 
         {
             // block to drop the members write lock
@@ -787,11 +787,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 if matches!(foca_state.state(), foca::State::Suspect) {
                     continue;
                 }
-                foca_states.push(foca_state);
+                // foca_states.push(foca_state);
             }
         }
 
-        foca_tx.send(FocaInput::ApplyMany(foca_states)).await.ok();
+        // foca_tx.send(FocaInput::ApplyMany(foca_states)).await.ok();
     }
 
     let api = Router::new()
