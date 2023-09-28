@@ -1040,7 +1040,7 @@ async fn clear_overwritten_versions(agent: Agent) {
 
                     let mut bookedw = booked.write().await;
 
-                    let db_versions: Vec<i64> = chunked_db_version.iter().copied().filter(|v|bookedw.contains_current(v)).collect();
+                    let db_versions: Vec<i64> = chunked_db_version.iter().copied().filter(|db_v| versions.get(db_v).map(|v| bookedw.contains_current(v)).unwrap_or(false)).collect();
                     if db_versions.is_empty() {
                         info!(%actor_id, "no versions in range {chunked_db_version:?}, skipping!");
                         return Ok(delta);
