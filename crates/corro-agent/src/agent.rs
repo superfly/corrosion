@@ -737,7 +737,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             loop {
                 sleep(COMPACT_BOOKED_INTERVAL).await;
 
-                let mut to_check: Vec<(ActorId, Arc<BTreeMap<i64, i64>>)> = vec![];
+                info!("starting compaction...");
+
+                let mut to_check: Vec<(ActorId, BTreeMap<i64, i64>)> = vec![];
 
                 {
                     let booked = bookie.read().await;
@@ -748,11 +750,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         if versions.is_empty() {
                             continue;
                         }
-                        to_check.push((actor_id, Arc::new(versions)));
+                        to_check.push((actor_id, versions));
                     }
                 }
 
-                let tables = Arc::new({
+                let tables = {
                     match pool.read().await {
                         Ok(conn) => match conn.prepare_cached("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'").and_then(|mut prepped| prepped.query_map([], |row| row.get(0)).and_then(|mapped| mapped.collect::<Result<BTreeSet<String>, _>>())) {
                             Ok(tables) => tables,
@@ -766,12 +768,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                             continue;
                         }
                     }
-                });
+                };
 
                 let mut inserted = 0;
                 let mut deleted = 0;
 
                 for (actor_id, versions) in to_check {
+                    info!(%actor_id, "compacting actor... versions count: {}", versions.len());
                     let booked = bookie.for_actor(actor_id).await;
 
                     let mut to_clear: BTreeSet<i64> = BTreeSet::new();
@@ -791,6 +794,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                         let db_versions = *versions.first_key_value().unwrap().0
                             ..=*versions.last_key_value().unwrap().0;
+
+                        info!(%actor_id, "range of versions to check: {db_versions:?}");
 
                         // smaller queries...
                         for db_versions_range in chunk_range(db_versions, 500) {
