@@ -57,9 +57,7 @@ use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{
-    named_params, params, params_from_iter, Connection, OptionalExtension, Transaction,
-};
+use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
 use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
@@ -1017,10 +1015,9 @@ async fn clear_overwritten_versions(agent: Agent) {
             debug!(%actor_id, "compacting actor... versions count: {}", versions.len());
             let booked = bookie.for_actor(actor_id).await;
 
-            let db_versions =
-                *versions.first_key_value().unwrap().0..=*versions.last_key_value().unwrap().0;
+            let db_versions = versions.keys().copied().collect::<Vec<i64>>();
 
-            let res = futures::stream::iter(chunk_range(db_versions, 1000).map(Ok)).try_fold(0, |delta, db_versions_range| {
+            let res = futures::stream::iter(db_versions.chunks(20).map(Ok)).try_fold(0, |delta, chunked_db_version| {
                 let pool = pool.clone();
                 let tables = tables.clone();
                 let versions = versions.clone();
@@ -1036,12 +1033,11 @@ async fn clear_overwritten_versions(agent: Agent) {
 
                     let mut bookedw = booked.write().await;
 
-                    let db_versions = BTreeSet::from_iter(db_versions_range.clone().filter(|v|bookedw.contains_current(v)));
+                    let db_versions: Vec<i64> = chunked_db_version.iter().copied().filter(|v|bookedw.contains_current(v)).collect();
                     if db_versions.is_empty() {
+                        info!(%actor_id, "no versions in range {chunked_db_version:?}, skipping!");
                         return Ok(delta);
                     }
-
-                    let still_current_range = *db_versions.first().unwrap()..=*db_versions.last().unwrap();
 
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
@@ -1054,8 +1050,8 @@ async fn clear_overwritten_versions(agent: Agent) {
 
                         // delete only the versions in range
                         let deleted = tx
-                            .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND version >= ? AND version <= ?")?
-                            .execute(params![actor_id, still_current_range.start(), still_current_range.end()])?;
+                            .prepare(&format!("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND db_version IN ({})", to_clear.iter().map(|v|v.to_string()).collect::<Vec<String>>().join(",")))?
+                            .execute(params![actor_id])?;
 
                         let mut new_copy = bookedw.clone();
 
@@ -1069,15 +1065,8 @@ async fn clear_overwritten_versions(agent: Agent) {
 
                         let mut inserted = 0;
 
-                        for (range, known) in new_copy.overlapping(&still_current_range) {
+                        for (range, known) in to_clear.iter().filter_map(|db_v| versions.get(db_v).and_then(|v| new_copy.get_key_value(v))).dedup() {
                             match known {
-                                KnownDbVersion::Current {
-                                    db_version,
-                                    last_seq,
-                                    ts,
-                                } => {
-                                    inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?,?,?,?,?)")?.execute(params![actor_id, range.start(), db_version, last_seq, ts])?;
-                                }
                                 KnownDbVersion::Cleared => {
                                     inserted += tx.prepare_cached("
                                         INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version)
@@ -1089,8 +1078,8 @@ async fn clear_overwritten_versions(agent: Agent) {
                                                 ts = NULL
                                             ")?.execute(params![actor_id, range.start(), range.end()])?;
                                 }
-                                KnownDbVersion::Partial { .. } => {
-                                    // do nothing, not stored in that table!
+                                known => {
+                                    warn!(%actor_id, "unexpected known db version when attempting to clear: {known:?}");
                                 }
                             }
                         }
@@ -1266,33 +1255,30 @@ pub async fn handle_change(
     }
 }
 
-fn chunk_range(
-    range: RangeInclusive<i64>,
-    chunk_size: i64,
-) -> impl Iterator<Item = RangeInclusive<i64>> {
-    range
-        .clone()
-        .step_by(chunk_size as usize)
-        .map(move |block_start| {
-            let block_end = (block_start + chunk_size).min(*range.end());
-            block_start..=block_end
-        })
-}
+// fn chunk_range(
+//     range: RangeInclusive<i64>,
+//     chunk_size: i64,
+// ) -> impl Iterator<Item = RangeInclusive<i64>> {
+//     range
+//         .clone()
+//         .step_by(chunk_size as usize)
+//         .map(move |block_start| {
+//             let block_end = (block_start + chunk_size).min(*range.end());
+//             block_start..=block_end
+//         })
+// }
 
 fn find_cleared_db_versions_for_actor(
     tx: &Transaction,
     tables: &BTreeSet<String>,
-    versions: &BTreeSet<i64>,
+    versions: &[i64],
 ) -> rusqlite::Result<BTreeSet<i64>> {
-    // NOTE: unwrapping should be safe here
-    let (first, last) = (*versions.first().unwrap(), *versions.last().unwrap());
-
     let still_live: BTreeSet<i64> = tx
-        .prepare_cached(&format!(
+        .prepare(&format!(
             "SELECT db_version FROM ({});",
-            tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table} WHERE db_version >= ? AND db_version <= ?")).collect::<Vec<_>>().join(" UNION ")
+            tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table} WHERE db_version IN ({})", versions.iter().map(|v|v.to_string()).collect::<Vec<String>>().join(","))).collect::<Vec<_>>().join(" UNION ")
         ))?
-        .query_map(params_from_iter((0..tables.len()).flat_map(|_| [first, last])),
+        .query_map([],
             |row| row.get(0),
         )?
         .collect::<rusqlite::Result<_>>()?;
@@ -2936,32 +2922,32 @@ pub mod tests {
         let tx = conn.transaction()?;
         let tables = tx.prepare_cached("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'").and_then(|mut prepped| prepped.query_map([], |row| row.get(0)).and_then(|mapped| mapped.collect::<Result<BTreeSet<String>, _>>()))?;
 
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[1].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[1])?;
 
         assert!(to_clear.contains(&1));
         assert!(!to_clear.contains(&2));
 
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2])?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2, 3].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2, 3])?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2, 3, 4].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2, 3, 4])?;
 
         assert!(to_clear.contains(&2));
         assert!(!to_clear.contains(&3));
         assert!(!to_clear.contains(&4));
 
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[3, 4].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[3, 4])?;
 
         assert!(to_clear.is_empty());
 
