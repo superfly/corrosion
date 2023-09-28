@@ -57,7 +57,9 @@ use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    named_params, params, params_from_iter, Connection, OptionalExtension, Transaction,
+};
 use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
@@ -1341,7 +1343,7 @@ fn find_cleared_db_versions_for_actor(
             "SELECT db_version FROM ({});",
             tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table} WHERE db_version >= ? AND db_version <= ?")).collect::<Vec<_>>().join(" UNION ")
         ))?
-        .query_map((first, last),
+        .query_map(params_from_iter((0..tables.len()).flat_map(|_| [first, last])),
             |row| row.get(0),
         )?
         .collect::<rusqlite::Result<_>>()?;
