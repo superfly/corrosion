@@ -969,8 +969,15 @@ async fn require_authz<B>(
 async fn clear_overwritten_versions(agent: Agent) {
     let pool = agent.pool();
     let bookie = agent.bookie();
+
+    let mut interval = Duration::new(0, 0);
+
     loop {
-        sleep(COMPACT_BOOKED_INTERVAL).await;
+        sleep(interval).await;
+
+        if interval != COMPACT_BOOKED_INTERVAL {
+            interval = COMPACT_BOOKED_INTERVAL;
+        }
 
         info!("starting compaction...");
 
