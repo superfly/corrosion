@@ -1103,7 +1103,7 @@ async fn clear_overwritten_versions(agent: Agent) {
 
                     if res.is_ok() {
                         // give it a break...
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
 
                     res
