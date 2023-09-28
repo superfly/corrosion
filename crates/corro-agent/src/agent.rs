@@ -743,32 +743,36 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                 {
                     let booked = bookie.read().await;
-                    let actors = booked.keys().copied();
-                    for actor_id in actors {
-                        let booked = bookie.for_actor(actor_id).await;
+                    for (actor_id, booked) in booked.iter() {
                         let versions = booked.read().await.current_versions();
                         if versions.is_empty() {
                             continue;
                         }
-                        to_check.push((actor_id, versions));
+                        to_check.push((*actor_id, versions));
                     }
                 }
+                info!("got actors and their versions");
 
                 let tables = {
                     match pool.read().await {
-                        Ok(conn) => match conn.prepare_cached("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'").and_then(|mut prepped| prepped.query_map([], |row| row.get(0)).and_then(|mapped| mapped.collect::<Result<BTreeSet<String>, _>>())) {
+                        Ok(conn) => {
+                            info!("got read connection to pull tables");
+                            match conn.prepare_cached("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'").and_then(|mut prepped| prepped.query_map([], |row| row.get(0)).and_then(|mapped| mapped.collect::<Result<BTreeSet<String>, _>>())) {
                             Ok(tables) => tables,
                             Err(e) => {
                                 error!("could not get cr-sqlite backed table names: {e}");
                                 continue;
                             }
-                        },
+                        }
+                        }
                         Err(e) => {
                             error!("could not get read connection: {e}");
                             continue;
                         }
                     }
                 };
+
+                info!("got tables {tables:?}");
 
                 let mut inserted = 0;
                 let mut deleted = 0;
