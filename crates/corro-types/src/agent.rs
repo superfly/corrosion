@@ -10,7 +10,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
-use metrics::{gauge, histogram, increment_counter};
+use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{Connection, InterruptHandle};
@@ -29,7 +29,7 @@ use tokio::{
     task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info};
 use tripwire::Tripwire;
 
 use crate::{
@@ -370,8 +370,8 @@ impl SplitPool {
 
 async fn timeout_wait(
     token: CancellationToken,
-    handle: InterruptHandle,
-    timeout: Duration,
+    _handle: InterruptHandle,
+    _timeout: Duration,
     queue: &'static str,
 ) {
     let start = Instant::now();
@@ -562,6 +562,10 @@ impl<'a> BookWriter<'a> {
             },
             None => self.0.contains_key(&version),
         }
+    }
+
+    pub fn contains_current(&self, version: &i64) -> bool {
+        matches!(self.0.get(version), Some(KnownDbVersion::Current { .. }))
     }
 
     pub fn contains_all(

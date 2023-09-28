@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
-    hash::{Hash, Hasher},
     net::SocketAddr,
     ops::RangeInclusive,
     sync::{atomic::AtomicI64, Arc},
@@ -33,7 +32,7 @@ use corro_types::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeV1, Changeset, ChangesetParts,
         FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
-    change::{Change, SqliteValue},
+    change::Change,
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members, Rtt},
     pubsub::{migrate_subs, Matcher},
@@ -51,7 +50,7 @@ use axum::{
 };
 use bytes::{Bytes, BytesMut};
 use foca::{Member, Notification};
-use futures::{FutureExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt, StreamExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use itertools::Itertools;
 use metrics::{counter, gauge, histogram, increment_counter};
@@ -68,7 +67,7 @@ use tokio::{
     task::block_in_place,
     time::{sleep, timeout},
 };
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
 use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
@@ -393,7 +392,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             // we can handle a lot of them I think...
             let chunker = stream.chunks_timeout(1024, Duration::from_secs(1));
             tokio::pin!(chunker);
-            while let Some(chunks) = chunker.next().await {
+            while let Some(chunks) = StreamExt::next(&mut chunker).await {
                 let mut members = agent.members().write();
                 for (addr, rtt) in chunks {
                     members.add_rtt(addr, rtt);
@@ -618,7 +617,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                         FramedRead::new(rx, LengthDelimitedCodec::new());
 
                                     loop {
-                                        match timeout(Duration::from_secs(5), framed.next()).await {
+                                        match timeout(Duration::from_secs(5), StreamExt::next(&mut framed)).await {
                                             Err(_e) => {
                                                 warn!("timed out receiving bidirectional frame");
                                                 return;
@@ -731,100 +730,128 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             loop {
                 sleep(COMPACT_BOOKED_INTERVAL).await;
 
-                let to_check: Vec<ActorId> = { bookie.read().await.keys().copied().collect() };
+                let mut to_check: Vec<(ActorId, Arc<BTreeMap<i64,i64>>)> = vec![];
+
+                {
+                    let booked = bookie.read().await;
+                    let actors = booked.keys().copied();
+                    for actor_id in actors {
+                        let booked = bookie.for_actor(actor_id).await;
+                        let versions = booked.read().await.current_versions();
+                        if versions.is_empty() {
+                            continue;
+                        }
+                        to_check.push((actor_id, Arc::new(versions)));
+                    }
+                }
+
+                let tables = Arc::new({
+                    match pool.read().await {
+                        Ok(conn) => match conn.prepare_cached("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'").and_then(|mut prepped| prepped.query_map([], |row| row.get(0)).and_then(|mapped| mapped.collect::<Result<BTreeSet<String>, _>>())) {
+                            Ok(tables) => tables,
+                            Err(e) => {
+                                error!("could not get cr-sqlite backed table names: {e}");
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            error!("could not get read connection: {e}");
+                            continue;
+                        }
+                    }
+                });
 
                 let mut inserted = 0;
                 let mut deleted = 0;
 
-                for actor_id in to_check {
+                for (actor_id, versions) in to_check {
+                    let chunked_db_versions = versions.keys().chunks(20).into_iter().map(|chunk|{ chunk.copied().collect() }).collect::<Vec<Vec<i64>>>();
+
                     let booked = bookie.for_actor(actor_id).await;
 
-                    {
-                        if booked.read().await.current_versions().is_empty() {
-                            continue;
-                        }
-                    }
-
-                    let mut conn = match pool.write_low().await {
-                        Ok(conn) => conn,
-                        Err(e) => {
-                            error!("could not acquire low priority write connection for compaction: {e}");
-                            continue;
-                        }
-                    };
-
-                    let mut bookedw = booked.write().await;
-                    let versions = bookedw.current_versions();
-
-                    if versions.is_empty() {
-                        continue;
-                    }
-
-                    let res = block_in_place(|| {
-                        let tx = conn.transaction()?;
-
-                        let db_versions = versions.keys().copied().collect();
-
-                        let to_clear = {
-                            match find_cleared_db_versions_for_actor(&tx, &db_versions) {
-                                Ok(to_clear) => {
-                                    if to_clear.is_empty() {
-                                        return Ok(());
-                                    }
-                                    to_clear
-                                }
-                                Err(e) => {
-                                    error!("could not compute difference between known live and still alive versions for actor {actor_id}: {e}");
-                                    return Err(e);
-                                }
+                    futures::stream::iter(chunked_db_versions).for_each(|db_versions| {
+                        let pool = pool.clone();
+                        let tables = tables.clone();
+                        let versions = versions.clone();
+                        let booked = booked.clone();
+                        async move {
+                        let mut conn = match pool.write_low().await {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                error!("could not acquire low priority write connection for compaction: {e}");
+                                return;
                             }
                         };
+    
+                        let mut bookedw = booked.write().await;
 
-                        deleted += tx
-                            .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ?")?
-                            .execute([actor_id])?;
+                        let db_versions: Vec<i64> = db_versions.into_iter().filter(|v|bookedw.contains_current(v)).collect();
 
-                        let mut new_copy = bookedw.clone();
-
-                        let cleared_len = to_clear.len();
-
-                        for db_version in to_clear.iter() {
-                            if let Some(version) = versions.get(db_version) {
-                                new_copy.insert(*version..=*version, KnownDbVersion::Cleared);
+                        let res = block_in_place(|| {
+                            let tx = conn.transaction()?;
+    
+                            let to_clear = {
+                                match find_cleared_db_versions_for_actor(&tx, &tables, &db_versions) {
+                                    Ok(to_clear) => {
+                                        if to_clear.is_empty() {
+                                            return Ok(());
+                                        }
+                                        to_clear
+                                    }
+                                    Err(e) => {
+                                        error!("could not compute difference between known live and still alive versions for actor {actor_id}: {e}");
+                                        return Err(e);
+                                    }
+                                }
+                            };
+    
+                            deleted += tx
+                                .prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ?")?
+                                .execute([actor_id])?;
+    
+                            let mut new_copy = bookedw.clone();
+    
+                            let cleared_len = to_clear.len();
+    
+                            for db_version in to_clear.iter() {
+                                if let Some(version) = versions.get(db_version) {
+                                    new_copy.insert(*version..=*version, KnownDbVersion::Cleared);
+                                }
                             }
-                        }
-
-                        for (range, known) in new_copy.iter() {
-                            match known {
-                                KnownDbVersion::Current {
-                                    db_version,
-                                    last_seq,
-                                    ts,
-                                } => {
-                                    inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?,?,?,?,?)")?.execute(params![actor_id, range.start(), db_version, last_seq, ts])?;
-                                }
-                                KnownDbVersion::Cleared => {
-                                    inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?,?,?)")?.execute(params![actor_id, range.start(), range.end()])?;
-                                }
-                                KnownDbVersion::Partial { .. } => {
-                                    // do nothing, not stored in that table!
+    
+                            for (range, known) in new_copy.iter() {
+                                match known {
+                                    KnownDbVersion::Current {
+                                        db_version,
+                                        last_seq,
+                                        ts,
+                                    } => {
+                                        inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts) VALUES (?,?,?,?,?)")?.execute(params![actor_id, range.start(), db_version, last_seq, ts])?;
+                                    }
+                                    KnownDbVersion::Cleared => {
+                                        inserted += tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?,?,?)")?.execute(params![actor_id, range.start(), range.end()])?;
+                                    }
+                                    KnownDbVersion::Partial { .. } => {
+                                        // do nothing, not stored in that table!
+                                    }
                                 }
                             }
+    
+                            tx.commit()?;
+    
+                            debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
+    
+                            **bookedw.inner_mut() = new_copy;
+                            debug!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
+    
+                            Ok::<_, eyre::Report>(())
+                        });
+    
+                        if let Err(e) = res {
+                            error!("could not compact versions for actor {actor_id}: {e}");
                         }
-
-                        tx.commit()?;
-
-                        debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
-
-                        **bookedw.inner_mut() = new_copy;
-                        debug!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
-
-                        Ok::<_, eyre::Report>(())
-                    });
-
-                    if let Err(e) = res {
-                        error!("could not compact versions for actor {actor_id}: {e}");
-                    }
+                    }}).await;
+                    
                 }
 
                 info!(
@@ -1021,7 +1048,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     loop {
         tokio::select! {
             biased;
-            msg = gossip_chunker.next() => match msg {
+            msg = StreamExt::next(&mut gossip_chunker) => match msg {
                 Some(msg) => {
                     spawn_counted(
                         handle_gossip(agent.clone(), msg, false)
@@ -1072,12 +1099,12 @@ async fn require_authz<B>(
     Ok(next.run(request).await)
 }
 
-const CHECKSUM_SEEDS: [u64; 4] = [
-    0x16f11fe89b0d677c,
-    0xb480a793d8e6c86c,
-    0x6fe2e5aaf078ebc9,
-    0x14f994a4c5259381,
-];
+// const CHECKSUM_SEEDS: [u64; 4] = [
+//     0x16f11fe89b0d677c,
+//     0xb480a793d8e6c86c,
+//     0x6fe2e5aaf078ebc9,
+//     0x14f994a4c5259381,
+// ];
 
 async fn metrics_loop(agent: Agent) {
     let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
@@ -1089,7 +1116,7 @@ async fn metrics_loop(agent: Agent) {
     }
 }
 
-const MAX_COUNT_TO_HASH: i64 = 500_000;
+// const MAX_COUNT_TO_HASH: i64 = 500_000;
 
 fn collect_metrics(agent: &Agent) {
     agent.pool().emit_metrics();
@@ -1209,31 +1236,20 @@ pub async fn handle_change(
 
 fn find_cleared_db_versions_for_actor(
     tx: &Transaction,
-    versions: &BTreeSet<i64>,
+    tables: &BTreeSet<String>,
+    versions: &[i64],
 ) -> eyre::Result<BTreeSet<i64>> {
-    let (first, last) = match (versions.first().copied(), versions.last().copied()) {
-        (Some(first), Some(last)) => (first, last),
-        _ => return Ok(BTreeSet::new()),
-    };
-
-    let tables = tx
-        .prepare_cached(
-            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'",
-        )?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<Vec<String>, _>>()?;
-
     let still_live: BTreeSet<i64> = tx
         .prepare(&format!(
             "SELECT db_version FROM ({});",
-            tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table} WHERE db_version >= {first} AND db_version <= {last}")).collect::<Vec<_>>().join(" UNION ")
+            tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table} WHERE db_version IN ({})", versions.iter().map(|v| v.to_string()).collect::<Vec<String>>().join(","))).collect::<Vec<_>>().join(" UNION ")
         ))?
         .query_map([],
             |row| row.get(0),
         )?
         .collect::<rusqlite::Result<_>>()?;
 
-    Ok(versions.difference(&still_live).copied().collect())
+    Ok(BTreeSet::from_iter(versions.iter().copied()).difference(&still_live).copied().collect())
 }
 
 async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Bytes)>) {
@@ -2867,33 +2883,34 @@ pub mod tests {
         assert_eq!(db_version, 2);
 
         let tx = conn.transaction()?;
+        let tables = tx.prepare_cached("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'").and_then(|mut prepped| prepped.query_map([], |row| row.get(0)).and_then(|mapped| mapped.collect::<Result<BTreeSet<String>, _>>()))?;
 
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &[1].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[1])?;
 
         assert!(to_clear.contains(&1));
         assert!(!to_clear.contains(&2));
 
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &[2].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2])?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &[2, 3].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2, 3])?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &[2, 3, 4].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2, 3, 4])?;
 
         assert!(to_clear.contains(&2));
         assert!(!to_clear.contains(&3));
         assert!(!to_clear.contains(&4));
 
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &[3, 4].into())?;
+        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[3, 4])?;
 
         assert!(to_clear.is_empty());
 
@@ -3038,9 +3055,8 @@ pub mod tests {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
-        let agents = futures::stream::iter(0..10)
-            .chunks(50)
-            .fold(vec![], {
+        let agents = futures::StreamExt::fold(futures::stream::iter(0..10)
+            .chunks(50), vec![], {
                 let tripwire = tripwire.clone();
                 move |mut agents: Vec<TestAgent>, to_launch| {
                     let tripwire = tripwire.clone();
