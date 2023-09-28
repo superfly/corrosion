@@ -50,7 +50,7 @@ use axum::{
 };
 use bytes::{Bytes, BytesMut};
 use foca::{Member, Notification};
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use itertools::Itertools;
 use metrics::{counter, gauge, histogram, increment_counter};
@@ -980,8 +980,9 @@ async fn clear_overwritten_versions(agent: Agent) {
         }
 
         info!("starting compaction...");
+        let start = Instant::now();
 
-        let mut to_check: Vec<(ActorId, Arc<BTreeMap<i64, i64>>)> = vec![];
+        let mut to_check: BTreeMap<i64, (ActorId, i64)> = BTreeMap::new();
 
         {
             let booked = bookie.read().await;
@@ -990,140 +991,127 @@ async fn clear_overwritten_versions(agent: Agent) {
                 if versions.is_empty() {
                     continue;
                 }
-                to_check.push((*actor_id, Arc::new(versions)));
+                for (db_v, v) in versions {
+                    to_check.insert(db_v, (*actor_id, v));
+                }
             }
         }
+
         info!("got actors and their versions");
 
-        let tables = Arc::new({
+        let cleared_versions: BTreeSet<i64> = {
             match pool.read().await {
-                Ok(conn) => {
-                    info!("got read connection to pull tables");
-                    match conn.prepare_cached("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'").and_then(|mut prepped| prepped.query_map([], |row| row.get(0)).and_then(|mapped| mapped.collect::<Result<BTreeSet<String>, _>>())) {
-                            Ok(tables) => tables,
-                            Err(e) => {
-                                error!("could not get cr-sqlite backed table names: {e}");
-                                continue;
-                            }
+                Ok(mut conn) => {
+                    let res = block_in_place(|| {
+                        let tx = conn.transaction()?;
+                        find_cleared_db_versions(&tx)
+                    });
+                    match res {
+                        Ok(cleared) => cleared,
+                        Err(e) => {
+                            error!("could not get cleared versions: {e}");
+                            continue;
                         }
+                    }
                 }
                 Err(e) => {
                     error!("could not get read connection: {e}");
                     continue;
                 }
             }
-        });
+        };
 
-        info!("got tables {tables:?}");
+        let mut to_clear_by_actor: BTreeMap<ActorId, Vec<(i64, i64)>> = BTreeMap::new();
 
-        let mut total_delta = 0;
-
-        for (actor_id, versions) in to_check {
-            debug!(%actor_id, "compacting actor... versions count: {}", versions.len());
-            let booked = bookie.for_actor(actor_id).await;
-
-            let db_versions = versions.keys().copied().collect::<Vec<i64>>();
-
-            let res = futures::stream::iter(db_versions.chunks(20).map(Ok)).try_fold(0, |delta, chunked_db_version| {
-                let pool = pool.clone();
-                let tables = tables.clone();
-                let versions = versions.clone();
-                let booked = booked.clone();
-                async move {
-                    let mut conn = match pool.write_low().await {
-                        Ok(conn) => conn,
-                        Err(e) => {
-                            error!("could not acquire low priority write connection: {e}");
-                            return Ok(delta);
-                        }
-                    };
-
-                    let mut bookedw = booked.write().await;
-
-                    let db_versions: Vec<i64> = chunked_db_version.iter().copied().filter(|db_v| versions.get(db_v).map(|v| bookedw.contains_current(v)).unwrap_or(false)).collect();
-                    if db_versions.is_empty() {
-                        info!(%actor_id, "no versions in range {chunked_db_version:?}, skipping!");
-                        return Ok(delta);
-                    }
-
-                    let res = block_in_place(|| {
-                        let tx = conn.transaction()?;
-
-                        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &db_versions)?;
-
-                        if to_clear.is_empty() {
-                            return Ok(delta);
-                        }
-
-                        // delete only the versions in range
-                        let deleted = tx
-                            .prepare(&format!("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND db_version IN ({})", to_clear.iter().map(|v|v.to_string()).collect::<Vec<String>>().join(",")))?
-                            .execute(params![actor_id])?;
-
-                        let mut new_copy = bookedw.clone();
-
-                        let cleared_len = to_clear.len();
-
-                        for db_version in to_clear.iter() {
-                            if let Some(version) = versions.get(db_version) {
-                                new_copy.insert(*version..=*version, KnownDbVersion::Cleared);
-                            }
-                        }
-
-                        let mut inserted = 0;
-
-                        for (range, known) in to_clear.iter().filter_map(|db_v| versions.get(db_v).and_then(|v| new_copy.get_key_value(v))).dedup() {
-                            match known {
-                                KnownDbVersion::Cleared => {
-                                    inserted += tx.prepare_cached("
-                                        INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version)
-                                            VALUES (?,?,?)
-                                            ON CONFLICT (actor_id, start_version) DO UPDATE SET
-                                                end_version = excluded.end_version,
-                                                db_version = NULL,
-                                                last_seq = NULL,
-                                                ts = NULL
-                                            ")?.execute(params![actor_id, range.start(), range.end()])?;
-                                }
-                                known => {
-                                    warn!(%actor_id, "unexpected known db version when attempting to clear: {known:?}");
-                                }
-                            }
-                        }
-
-                        tx.commit()?;
-
-                        debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
-
-                        **bookedw.inner_mut() = new_copy;
-                        debug!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
-
-                        Ok::<_, rusqlite::Error>(delta + (deleted - inserted))
-                    });
-
-                    if res.is_ok() {
-                        // give it a break...
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-
-                    res
-                }
-            }).await;
-
-            match res {
-                Ok(delta) => {
-                    if delta > 0 {
-                        info!(%actor_id, "compacted {delta} versions");
-                    }
-                    total_delta += delta;
-                }
-                Err(e) => {
-                    error!(%actor_id, "could not compact versions for actor: {e}");
-                }
+        for db_v in cleared_versions {
+            if let Some((actor_id, v)) = to_check.remove(&db_v) {
+                to_clear_by_actor
+                    .entry(actor_id)
+                    .or_default()
+                    .push((db_v, v));
             }
         }
 
-        info!("compaction done, cleared {total_delta} db bookkeeping table rows");
+        let mut deleted = 0;
+        let mut inserted = 0;
+
+        for (actor_id, to_clear) in to_clear_by_actor {
+            info!(%actor_id, "clearing actor {} versions", to_clear.len());
+            let booked = bookie.for_actor(actor_id).await;
+
+            let mut conn = match pool.write_low().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!("could not acquire low priority write connection: {e}");
+                    continue;
+                }
+            };
+
+            let mut bookedw = booked.write().await;
+
+            let res = block_in_place(|| {
+                let tx = conn.transaction()?;
+
+                let mut new_copy = bookedw.clone();
+
+                for (db_v, v) in to_clear
+                    .iter()
+                    .filter(|(_db_v, v)| bookedw.contains_current(v))
+                {
+                    deleted += tx
+                        .prepare_cached("DELETE FROM __corro_bookkeeping WHERE db_version = ?")?
+                        .execute([db_v])?;
+                    new_copy.insert(*v..=*v, KnownDbVersion::Cleared);
+                }
+
+                for (range, known) in to_clear
+                    .iter()
+                    .filter_map(|(_, v)| new_copy.get_key_value(v))
+                    .dedup()
+                {
+                    match known {
+                        KnownDbVersion::Cleared => {
+                            inserted += tx
+                                .prepare_cached(
+                                    "
+                            INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version)
+                                VALUES (?,?,?)
+                                ON CONFLICT (actor_id, start_version) DO UPDATE SET
+                                    end_version = excluded.end_version,
+                                    db_version = NULL,
+                                    last_seq = NULL,
+                                    ts = NULL
+                                WHERE end_version != excluded.end_version
+                            ",
+                                )?
+                                .execute(params![actor_id, range.start(), range.end()])?;
+                        }
+                        known => {
+                            warn!(%actor_id, "unexpected known db version when attempting to clear: {known:?}");
+                        }
+                    }
+                }
+
+                tx.commit()?;
+
+                debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
+
+                **bookedw.inner_mut() = new_copy;
+                debug!("compacted in-memory cache by clearing db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
+
+                Ok::<_, rusqlite::Error>(())
+            });
+
+            if let Err(e) = res {
+                error!(%actor_id, "could not compact bookkeeping: {e}");
+            }
+        }
+
+        info!(
+            "compaction done, cleared {} db bookkeeping table rows in {:?}",
+            deleted - inserted,
+            start.elapsed()
+        );
     }
 }
 
@@ -1275,25 +1263,30 @@ pub async fn handle_change(
 //         })
 // }
 
-fn find_cleared_db_versions_for_actor(
-    tx: &Transaction,
-    tables: &BTreeSet<String>,
-    versions: &[i64],
-) -> rusqlite::Result<BTreeSet<i64>> {
-    let still_live: BTreeSet<i64> = tx
-        .prepare(&format!(
-            "SELECT db_version FROM ({});",
-            tables.iter().map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table} WHERE db_version IN ({})", versions.iter().map(|v|v.to_string()).collect::<Vec<String>>().join(","))).collect::<Vec<_>>().join(" UNION ")
-        ))?
-        .query_map([],
-            |row| row.get(0),
+fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>> {
+    let tables = tx
+        .prepare_cached(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'",
         )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<BTreeSet<String>, _>>()?;
+
+    let to_clear_query = format!(
+        "SELECT DISTINCT(db_version) FROM __corro_bookkeeping WHERE db_version IS NOT NULL
+            EXCEPT SELECT db_version FROM ({});",
+        tables
+            .iter()
+            .map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ")
+    );
+
+    let cleared_db_version = tx
+        .prepare_cached(&to_clear_query)?
+        .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
 
-    Ok(BTreeSet::from_iter(versions.iter().copied())
-        .difference(&still_live)
-        .copied()
-        .collect())
+    Ok(cleared_db_version)
 }
 
 async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Bytes)>) {
@@ -2370,9 +2363,10 @@ async fn sync_loop(
 }
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
-    let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
-        init_migration as fn(&Transaction) -> rusqlite::Result<()>,
-    )];
+    let migrations: Vec<Box<dyn Migration>> = vec![
+        Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(v0_2_0_migration as fn(&Transaction) -> rusqlite::Result<()>),
+    ];
 
     corro_types::sqlite::migrate(conn, migrations)
 }
@@ -2459,6 +2453,12 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
     )?;
 
     Ok(())
+}
+
+fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version)",
+    )
 }
 
 #[cfg(test)]
@@ -2912,6 +2912,8 @@ pub mod tests {
     fn test_in_memory_versions_compaction() -> eyre::Result<()> {
         let mut conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
 
+        migrate(&mut conn)?;
+
         conn.execute_batch(
             "
             CREATE TABLE foo (a INTEGER PRIMARY KEY, b INTEGER);
@@ -2924,42 +2926,80 @@ pub mod tests {
 
         // db version 1
         conn.execute("INSERT INTO foo (a) VALUES (1)", ())?;
+
+        // invalid, but whatever
+        conn.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version) SELECT crsql_site_id(), 1, crsql_db_version()", [])?;
+
         // db version 2
         conn.execute("DELETE FROM foo;", ())?;
+
+        // invalid, but whatever
+        conn.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version) SELECT crsql_site_id(), 2, crsql_db_version()", [])?;
 
         let db_version: i64 = conn.query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
 
         assert_eq!(db_version, 2);
 
-        let tx = conn.transaction()?;
-        let tables = tx.prepare_cached("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'").and_then(|mut prepped| prepped.query_map([], |row| row.get(0)).and_then(|mapped| mapped.collect::<Result<BTreeSet<String>, _>>()))?;
+        {
+            let mut prepped = conn.prepare("SELECT * FROM __corro_bookkeeping")?;
+            let mut rows = prepped.query([])?;
 
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[1])?;
+            while let Ok(Some(row)) = rows.next() {
+                println!("row: {row:?}");
+            }
+        }
+
+        {
+            let mut prepped = conn.prepare("SELECT DISTINCT(__crsql_db_version) AS db_version FROM foo2__crsql_clock UNION SELECT DISTINCT(__crsql_db_version) AS db_version FROM foo__crsql_clock;")?;
+            let mut rows = prepped.query([])?;
+
+            while let Ok(Some(row)) = rows.next() {
+                println!("row: {row:?}");
+            }
+        }
+
+        let tx = conn.transaction()?;
+
+        let to_clear = find_cleared_db_versions(&tx)?;
+
+        println!("to_clear: {to_clear:?}");
 
         assert!(to_clear.contains(&1));
         assert!(!to_clear.contains(&2));
 
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2])?;
+        tx.execute("DELETE FROM __corro_bookkeeping WHERE db_version = 1", [])?;
+        tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) SELECT crsql_site_id(), 1, 1", [])?;
+
+        let to_clear = find_cleared_db_versions(&tx)?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
+
+        // invalid, but whatever
+        tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version) SELECT crsql_site_id(), 3, crsql_db_version()", [])?;
+
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2, 3])?;
+        let to_clear = find_cleared_db_versions(&tx)?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[2, 3, 4])?;
+        let to_clear = find_cleared_db_versions(&tx)?;
 
         assert!(to_clear.contains(&2));
         assert!(!to_clear.contains(&3));
         assert!(!to_clear.contains(&4));
 
-        let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &[3, 4])?;
+        tx.execute("DELETE FROM __corro_bookkeeping WHERE db_version = 2", [])?;
+        tx.execute(
+            "UPDATE __corro_bookkeeping SET end_version = 2 WHERE start_version = 1;",
+            [],
+        )?;
+        let to_clear = find_cleared_db_versions(&tx)?;
 
         assert!(to_clear.is_empty());
 
