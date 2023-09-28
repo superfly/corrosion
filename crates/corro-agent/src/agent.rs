@@ -2340,7 +2340,12 @@ async fn sync_loop(
                         warn!("aborted sync by tripwire");
                         break;
                     }
-                    tripwire::Outcome::Completed(_res) => {}
+                    tripwire::Outcome::Completed(res) => {
+                        if res.is_err() {
+                            // keep syncing until we successfully sync
+                            continue;
+                        }
+                    }
                 }
                 next_sync_at
                     .as_mut()
