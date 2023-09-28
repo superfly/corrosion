@@ -1014,13 +1014,13 @@ async fn clear_overwritten_versions(agent: Agent) {
         let mut total_delta = 0;
 
         for (actor_id, versions) in to_check {
-            info!(%actor_id, "compacting actor... versions count: {}", versions.len());
+            debug!(%actor_id, "compacting actor... versions count: {}", versions.len());
             let booked = bookie.for_actor(actor_id).await;
 
             let db_versions =
                 *versions.first_key_value().unwrap().0..=*versions.last_key_value().unwrap().0;
 
-            let res = futures::stream::iter(chunk_range(db_versions, 500).map(Ok)).try_fold(0, |delta, db_versions_range| {
+            let res = futures::stream::iter(chunk_range(db_versions, 1000).map(Ok)).try_fold(0, |delta, db_versions_range| {
                 let pool = pool.clone();
                 let tables = tables.clone();
                 let versions = versions.clone();
@@ -1043,7 +1043,7 @@ async fn clear_overwritten_versions(agent: Agent) {
 
                     let still_current_range = *db_versions.first().unwrap()..=*db_versions.last().unwrap();
 
-                    block_in_place(|| {
+                    let res = block_in_place(|| {
                         let tx = conn.transaction()?;
 
                         let to_clear = find_cleared_db_versions_for_actor(&tx, &tables, &db_versions)?;
@@ -1051,8 +1051,6 @@ async fn clear_overwritten_versions(agent: Agent) {
                         if to_clear.is_empty() {
                             return Ok(delta);
                         }
-
-
 
                         // delete only the versions in range
                         let deleted = tx
@@ -1105,7 +1103,14 @@ async fn clear_overwritten_versions(agent: Agent) {
                         debug!("compacted in-memory cache by clearing {cleared_len} db versions for actor {actor_id}, new total: {}", bookedw.inner().len());
 
                         Ok::<_, rusqlite::Error>(delta + (deleted - inserted))
-                    })
+                    });
+
+                    if res.is_ok() {
+                        // give it a break...
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+
+                    res
                 }
             }).await;
 
