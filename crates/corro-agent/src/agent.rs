@@ -1271,6 +1271,10 @@ fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>>
         .query_map([], |row| row.get(0))?
         .collect::<Result<BTreeSet<String>, _>>()?;
 
+    if tables.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
     let to_clear_query = format!(
         "SELECT DISTINCT(db_version) FROM __corro_bookkeeping WHERE db_version IS NOT NULL
             EXCEPT SELECT db_version FROM ({});",

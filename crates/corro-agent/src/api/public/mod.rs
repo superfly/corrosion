@@ -1022,7 +1022,7 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert!(id_col.nullable);
+            assert!(!id_col.nullable);
             assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
@@ -1053,7 +1053,7 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert!(id_col.nullable);
+            assert!(!id_col.nullable);
             assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
@@ -1070,7 +1070,7 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert!(id_col.nullable);
+            assert!(!id_col.nullable);
             assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
@@ -1125,7 +1125,7 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert!(id_col.nullable);
+            assert!(!id_col.nullable);
             assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
@@ -1142,7 +1142,7 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert!(id_col.nullable);
+            assert!(!id_col.nullable);
             assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
