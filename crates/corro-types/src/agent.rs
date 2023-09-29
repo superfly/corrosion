@@ -57,8 +57,10 @@ pub struct AgentConfig {
     pub members: RwLock<Members>,
     pub clock: Arc<uhlc::HLC>,
     pub bookie: Bookie,
+
     pub tx_bcast: Sender<BroadcastInput>,
     pub tx_apply: Sender<(ActorId, i64)>,
+    pub tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
 
     pub schema: RwLock<NormalizedSchema>,
     pub tripwire: Tripwire,
@@ -76,6 +78,7 @@ pub struct AgentInner {
     subs: RwLock<Subs>,
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
+    tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     schema: RwLock<NormalizedSchema>,
 }
 
@@ -93,6 +96,7 @@ impl Agent {
             subs: RwLock::new(subs),
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
+            tx_empty: config.tx_empty,
             schema: config.schema,
         }))
     }
@@ -127,6 +131,10 @@ impl Agent {
 
     pub fn tx_apply(&self) -> &Sender<(ActorId, i64)> {
         &self.0.tx_apply
+    }
+
+    pub fn tx_empty(&self) -> &Sender<(ActorId, RangeInclusive<i64>)> {
+        &self.0.tx_empty
     }
 
     pub fn bookie(&self) -> &Bookie {

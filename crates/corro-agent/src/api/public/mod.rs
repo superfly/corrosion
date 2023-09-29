@@ -691,21 +691,17 @@ pub async fn api_v1_db_schema(
 
 #[cfg(test)]
 mod tests {
-    use arc_swap::ArcSwap;
     use bytes::Bytes;
-    use corro_types::{
-        actor::ActorId, agent::SplitPool, api::RowId, config::Config, schema::SqliteType,
-    };
+    use corro_types::{api::RowId, config::Config, schema::SqliteType};
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
-    use tokio::sync::mpsc::{channel, error::TryRecvError};
+    use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
-    use uuid::Uuid;
 
     use super::*;
 
-    use crate::agent::migrate;
+    use crate::agent::setup;
 
     struct UnsyncBodyStream(std::pin::Pin<Box<UnsyncBoxBody<Bytes, axum::Error>>>);
 
@@ -728,41 +724,17 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let pool = SplitPool::create(
-            dir.path().join("./test.sqlite"),
-            dir.path().join("./subs.sqlite"),
-            tripwire.clone(),
+        let (agent, mut agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire,
         )
         .await?;
 
-        {
-            let mut conn = pool.write_priority().await?;
-            migrate(&mut conn)?;
-        }
-
-        let (tx_bcast, mut rx_bcast) = channel(1);
-        let (tx_apply, _rx_apply) = channel(1);
-
-        let agent = Agent::new(corro_types::agent::AgentConfig {
-            actor_id: ActorId(Uuid::new_v4()),
-            pool,
-            config: ArcSwap::from_pointee(
-                Config::builder()
-                    .db_path(dir.path().join("corrosion.db").display().to_string())
-                    .gossip_addr("127.0.0.1:1234".parse()?)
-                    .api_addr("127.0.0.1:8080".parse()?)
-                    .build()?,
-            ),
-            gossip_addr: "127.0.0.1:0".parse().unwrap(),
-            api_addr: "127.0.0.1:0".parse().unwrap(),
-            members: Default::default(),
-            clock: Default::default(),
-            bookie: Default::default(),
-            tx_bcast,
-            tx_apply,
-            schema: Default::default(),
-            tripwire,
-        });
+        let rx_bcast = &mut agent_options.rx_bcast;
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
@@ -833,41 +805,15 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let pool = SplitPool::create(
-            dir.path().join("./test.sqlite"),
-            dir.path().join("./subs.sqlite"),
-            tripwire.clone(),
+        let (agent, _agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire,
         )
         .await?;
-
-        {
-            let mut conn = pool.write_priority().await?;
-            migrate(&mut conn)?;
-        }
-
-        let (tx_bcast, _rx_bcast) = channel(1);
-        let (tx_apply, _rx_apply) = channel(1);
-
-        let agent = Agent::new(corro_types::agent::AgentConfig {
-            actor_id: ActorId(Uuid::new_v4()),
-            pool,
-            config: ArcSwap::from_pointee(
-                Config::builder()
-                    .db_path(dir.path().join("corrosion.db").display().to_string())
-                    .gossip_addr("127.0.0.1:1234".parse()?)
-                    .api_addr("127.0.0.1:8080".parse()?)
-                    .build()?,
-            ),
-            gossip_addr: "127.0.0.1:0".parse().unwrap(),
-            api_addr: "127.0.0.1:0".parse().unwrap(),
-            members: Default::default(),
-            clock: Default::default(),
-            bookie: Default::default(),
-            tx_bcast,
-            tx_apply,
-            schema: Default::default(),
-            tripwire,
-        });
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
@@ -967,39 +913,16 @@ mod tests {
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
 
         let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("./test.sqlite");
 
-        let pool =
-            SplitPool::create(&db_path, dir.path().join("./subs.sqlite"), tripwire.clone()).await?;
-
-        {
-            let mut conn = pool.write_priority().await?;
-            migrate(&mut conn)?;
-        }
-
-        let (tx_bcast, _rx_bcast) = channel(1);
-        let (tx_apply, _rx_apply) = channel(1);
-
-        let agent = Agent::new(corro_types::agent::AgentConfig {
-            actor_id: ActorId(Uuid::new_v4()),
-            pool,
-            config: ArcSwap::from_pointee(
-                Config::builder()
-                    .db_path(dir.path().join("corrosion.db").display().to_string())
-                    .gossip_addr("127.0.0.1:1234".parse()?)
-                    .api_addr("127.0.0.1:8080".parse()?)
-                    .build()?,
-            ),
-            gossip_addr: "127.0.0.1:0".parse().unwrap(),
-            api_addr: "127.0.0.1:0".parse().unwrap(),
-            members: Default::default(),
-            clock: Default::default(),
-            bookie: Default::default(),
-            tx_bcast,
-            tx_apply,
-            schema: Default::default(),
+        let (agent, _agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
             tripwire,
-        });
+        )
+        .await?;
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),

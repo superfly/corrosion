@@ -84,14 +84,15 @@ const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(300);
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
 
 pub struct AgentOptions {
-    actor_id: ActorId,
-    gossip_server_endpoint: quinn::Endpoint,
-    transport: Transport,
-    api_listener: TcpListener,
-    rx_bcast: Receiver<BroadcastInput>,
-    rx_apply: Receiver<(ActorId, i64)>,
-    rtt_rx: Receiver<(SocketAddr, Duration)>,
-    tripwire: Tripwire,
+    pub actor_id: ActorId,
+    pub gossip_server_endpoint: quinn::Endpoint,
+    pub transport: Transport,
+    pub api_listener: TcpListener,
+    pub rx_bcast: Receiver<BroadcastInput>,
+    pub rx_apply: Receiver<(ActorId, i64)>,
+    pub rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
+    pub rtt_rx: Receiver<(SocketAddr, Duration)>,
+    pub tripwire: Tripwire,
 }
 
 pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, AgentOptions)> {
@@ -261,6 +262,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let (tx_bcast, rx_bcast) = channel(10240);
 
+    let (tx_empty, rx_empty) = channel(10240);
+
     let opts = AgentOptions {
         actor_id,
         gossip_server_endpoint,
@@ -268,6 +271,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         api_listener,
         rx_bcast,
         rx_apply,
+        rx_empty,
         rtt_rx,
         tripwire: tripwire.clone(),
     };
@@ -283,6 +287,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         bookie,
         tx_bcast,
         tx_apply,
+        tx_empty,
         schema: RwLock::new(schema),
         tripwire,
     });
@@ -307,6 +312,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         mut tripwire,
         rx_bcast,
         rx_apply,
+        rx_empty,
         rtt_rx,
     } = opts;
 
@@ -893,8 +899,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     );
 
     spawn_counted(
-        sync_loop(agent.clone(), transport.clone(), rx_apply, tripwire.clone())
-            .inspect(|_| info!("corrosion agent sync loop is done")),
+        sync_loop(
+            agent.clone(),
+            transport.clone(),
+            rx_apply,
+            rx_empty,
+            tripwire.clone(),
+        )
+        .inspect(|_| info!("corrosion agent sync loop is done")),
     );
 
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
@@ -1081,7 +1093,7 @@ async fn clear_overwritten_versions(agent: Agent) {
                                     db_version = NULL,
                                     last_seq = NULL,
                                     ts = NULL
-                                WHERE end_version != excluded.end_version
+                                WHERE end_version < excluded.end_version
                             ",
                                 )?
                                 .execute(params![actor_id, range.start(), range.end()])?;
@@ -1589,7 +1601,12 @@ fn store_empty_changeset(
         "
         INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, ts)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (actor_id, start_version) DO NOTHING;
+            ON CONFLICT (actor_id, start_version) DO UPDATE SET
+                end_version = excluded.end_version,
+                db_version = NULL,
+                last_seq = NULL,
+                ts = NULL
+            WHERE end_version < excluded.end_version;
     ",
     )?
     .execute(params![
@@ -1834,17 +1851,36 @@ pub async fn process_multiple_changes(
                         continue;
                     }
 
-                    let tx = conn.transaction()?;
-
-                    let (known, changeset) = match process_single_version(&tx, change) {
-                        Ok(res) => res,
-                        Err(e) => {
-                            error!(%actor_id, ?versions, "could not process single change: {e}");
-                            continue;
+                    // optimizing this, insert later!
+                    let (known, changeset) = if change.is_complete() && change.is_empty() {
+                        // insert into in-memory bookkeeping right away
+                        booked_write.insert_many(change.versions(), KnownDbVersion::Cleared);
+                        if let Err(e) = agent
+                            .tx_empty()
+                            .blocking_send((actor_id, change.versions()))
+                        {
+                            error!("could not send empty changed versions into channel: {e}");
                         }
-                    };
+                        (
+                            KnownDbVersion::Cleared,
+                            Changeset::Empty {
+                                versions: change.versions(),
+                            },
+                        )
+                    } else {
+                        let tx = conn.transaction()?;
 
-                    tx.commit()?;
+                        let (known, changeset) = match process_single_version(&tx, change) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                error!(%actor_id, ?versions, "could not process single change: {e}");
+                                continue;
+                            }
+                        };
+
+                        tx.commit()?;
+                        (known, changeset)
+                    };
 
                     seen.insert(versions.clone(), known.clone());
 
@@ -1980,7 +2016,7 @@ fn process_complete_version(
     tx: &Transaction,
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
-    parts: Option<ChangesetParts>,
+    parts: ChangesetParts,
 ) -> rusqlite::Result<(KnownDbVersion, Changeset)> {
     let ChangesetParts {
         version,
@@ -1988,15 +2024,7 @@ fn process_complete_version(
         seqs,
         last_seq,
         ts,
-    } = match parts {
-        None => {
-            store_empty_changeset(tx, actor_id, versions.clone())?;
-            info!(%actor_id, ?versions, "cleared empty versions range");
-            // booked_write.insert_many(versions.clone(), KnownDbVersion::Cleared);
-            return Ok((KnownDbVersion::Cleared, Changeset::Empty { versions }));
-        }
-        Some(parts) => parts,
-    };
+    } = parts;
 
     info!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}");
 
@@ -2103,7 +2131,14 @@ fn process_single_version(
     let versions = changeset.versions();
 
     let (known, changeset) = if changeset.is_complete() {
-        process_complete_version(tx, actor_id, versions, changeset.into_parts())?
+        process_complete_version(
+            tx,
+            actor_id,
+            versions,
+            changeset
+                .into_parts()
+                .expect("no changeset parts, this shouldn't be happening!"),
+        )?
     } else {
         let parts = changeset.into_parts().unwrap();
         let known = process_incomplete_version(tx, actor_id, &parts)?;
@@ -2289,10 +2324,13 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
     Ok(())
 }
 
+const CHECK_EMPTIES_TO_INSERT_AFTER: Duration = Duration::from_secs(120);
+
 async fn sync_loop(
     agent: Agent,
     transport: Transport,
     mut rx_apply: Receiver<(ActorId, i64)>,
+    mut rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
     mut tripwire: Tripwire,
 ) {
     let mut sync_backoff = backoff::Backoff::new(0)
@@ -2301,14 +2339,38 @@ async fn sync_loop(
     let next_sync_at = tokio::time::sleep(sync_backoff.next().unwrap());
     tokio::pin!(next_sync_at);
 
+    let mut inserted_empties = 0;
+    let mut empties: BTreeMap<ActorId, Vec<RangeInclusive<i64>>> = BTreeMap::new();
+
+    let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
+    tokio::pin!(next_empties_check);
+
     loop {
         enum Branch {
             Tick,
             BackgroundApply { actor_id: ActorId, version: i64 },
+            ProcessEmpties,
         }
 
         let branch = tokio::select! {
             biased;
+
+            maybe_empty = rx_empty.recv() => match maybe_empty {
+                Some((actor_id, versions)) => {
+                    empties.entry(actor_id).or_default().push(versions);
+                    inserted_empties += 1;
+
+                    if inserted_empties < 1000 {
+                        continue;
+                    }
+
+                    Branch::ProcessEmpties
+                },
+                None => {
+                    debug!("empties queue is done");
+                    break;
+                }
+            },
 
             maybe_item = rx_apply.recv() => match maybe_item {
                 Some((actor_id, version)) => Branch::BackgroundApply{actor_id, version},
@@ -2316,6 +2378,14 @@ async fn sync_loop(
                     debug!("background applies queue is closed, breaking out of loop");
                     break;
                 }
+            },
+
+            _ = &mut next_empties_check => {
+                next_empties_check.as_mut().reset(tokio::time::Instant::now() + CHECK_EMPTIES_TO_INSERT_AFTER);
+                if empties.is_empty() {
+                    continue;
+                }
+                Branch::ProcessEmpties
             },
 
             _ = &mut next_sync_at => {
@@ -2362,8 +2432,53 @@ async fn sync_loop(
                     }
                 }
             }
+            Branch::ProcessEmpties => {
+                if let Err(e) = process_completed_empties(&agent, &mut empties).await {
+                    error!("could not process empties: {e}");
+                }
+            }
         }
     }
+
+    info!("Draining empty versions to process...");
+    // drain empties channel
+    while let Ok((actor_id, versions)) = rx_empty.try_recv() {
+        empties.entry(actor_id).or_default().push(versions);
+    }
+
+    if !empties.is_empty() {
+        info!("inserting last unprocessed empties before shut down");
+        if let Err(e) = process_completed_empties(&agent, &mut empties).await {
+            error!("could not process empties: {e}");
+        }
+    }
+}
+
+async fn process_completed_empties(
+    agent: &Agent,
+    empties: &mut BTreeMap<ActorId, Vec<RangeInclusive<i64>>>,
+) -> eyre::Result<()> {
+    let mut conn = agent.pool().write_normal().await?;
+
+    block_in_place(|| {
+        let tx = conn.transaction()?;
+        while let Some((actor_id, empties)) = empties.pop_first() {
+            let booked = agent.bookie().for_actor_blocking(actor_id);
+            let bookedw = booked.blocking_write();
+
+            for (range, _) in empties
+                .iter()
+                .filter_map(|range| bookedw.get_key_value(range.start()))
+                .dedup()
+            {
+                store_empty_changeset(&tx, actor_id, range.clone())?;
+            }
+        }
+
+        tx.commit()?;
+
+        Ok(())
+    })
 }
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
