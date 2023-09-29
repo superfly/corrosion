@@ -1276,7 +1276,7 @@ fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>>
             EXCEPT SELECT db_version FROM ({});",
         tables
             .iter()
-            .map(|table| format!("SELECT DISTINCT(__crsql_db_version) AS db_version FROM {table}"))
+            .map(|table| format!("SELECT DISTINCT(db_version) FROM {table}"))
             .collect::<Vec<_>>()
             .join(" UNION ")
     );
@@ -2916,10 +2916,10 @@ pub mod tests {
 
         conn.execute_batch(
             "
-            CREATE TABLE foo (a INTEGER PRIMARY KEY, b INTEGER);
+            CREATE TABLE foo (a INTEGER NOT NULL PRIMARY KEY, b INTEGER);
             SELECT crsql_as_crr('foo');
 
-            CREATE TABLE foo2 (a INTEGER PRIMARY KEY, b INTEGER);
+            CREATE TABLE foo2 (a INTEGER NOT NULL PRIMARY KEY, b INTEGER);
             SELECT crsql_as_crr('foo2');
             ",
         )?;
@@ -2950,7 +2950,7 @@ pub mod tests {
         }
 
         {
-            let mut prepped = conn.prepare("SELECT DISTINCT(__crsql_db_version) AS db_version FROM foo2__crsql_clock UNION SELECT DISTINCT(__crsql_db_version) AS db_version FROM foo__crsql_clock;")?;
+            let mut prepped = conn.prepare("SELECT DISTINCT(db_version) FROM foo2__crsql_clock UNION SELECT DISTINCT(db_version) FROM foo__crsql_clock;")?;
             let mut rows = prepped.query([])?;
 
             while let Ok(Some(row)) = rows.next() {

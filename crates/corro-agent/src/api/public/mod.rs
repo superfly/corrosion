@@ -1004,7 +1004,7 @@ mod tests {
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
             axum::Json(vec![
-                "CREATE TABLE tests (id BIGINT PRIMARY KEY, foo TEXT);".into(),
+                "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
             ]),
         )
         .await;
@@ -1035,8 +1035,8 @@ mod tests {
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
             axum::Json(vec![
-                "CREATE TABLE tests2 (id BIGINT PRIMARY KEY, foo TEXT);".into(),
-                "CREATE TABLE tests (id BIGINT PRIMARY KEY, foo TEXT);".into(),
+                "CREATE TABLE tests2 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
+                "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
             ]),
         )
         .await;
@@ -1082,7 +1082,7 @@ mod tests {
 
         // w/ existing table!
 
-        let create_stmt = "CREATE TABLE tests3 (id BIGINT PRIMARY KEY, foo TEXT, updated_at INTEGER NOT NULL DEFAULT 0);";
+        let create_stmt = "CREATE TABLE tests3 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT, updated_at INTEGER NOT NULL DEFAULT 0);";
 
         {
             // adding the table and an index
