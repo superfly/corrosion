@@ -1861,14 +1861,14 @@ pub async fn process_multiple_changes(
 
                     // optimizing this, insert later!
                     let (known, changeset) = if change.is_complete() && change.is_empty() {
-                        // insert into in-memory bookkeeping right away
-                        booked_write.insert_many(change.versions(), KnownDbVersion::Cleared);
                         if let Err(e) = agent
                             .tx_empty()
                             .blocking_send((actor_id, change.versions()))
                         {
                             error!("could not send empty changed versions into channel: {e}");
                         }
+                        // insert into in-memory bookkeeping right away
+                        booked_write.insert_many(change.versions(), KnownDbVersion::Cleared);
                         (
                             KnownDbVersion::Cleared,
                             Changeset::Empty {
@@ -2347,38 +2347,70 @@ async fn sync_loop(
     let next_sync_at = tokio::time::sleep(sync_backoff.next().unwrap());
     tokio::pin!(next_sync_at);
 
-    let mut inserted_empties = 0;
-    let mut empties: BTreeMap<ActorId, Vec<RangeInclusive<i64>>> = BTreeMap::new();
+    spawn_counted({
+        let mut tripwire = tripwire.clone();
+        let agent = agent.clone();
+        async move {
+            let mut inserted_empties = 0;
+            let mut empties: BTreeMap<ActorId, Vec<RangeInclusive<i64>>> = BTreeMap::new();
 
-    let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
-    tokio::pin!(next_empties_check);
+            let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
+            tokio::pin!(next_empties_check);
+
+            loop {
+                tokio::select! {
+                    maybe_empty = rx_empty.recv() => match maybe_empty {
+                        Some((actor_id, versions)) => {
+                            empties.entry(actor_id).or_default().push(versions);
+                            inserted_empties += 1;
+
+                            if inserted_empties < 1000 {
+                                continue;
+                            }
+                        },
+                        None => {
+                            debug!("empties queue is done");
+                            break;
+                        }
+                    },
+                    _ = &mut next_empties_check => {
+                        next_empties_check.as_mut().reset(tokio::time::Instant::now() + CHECK_EMPTIES_TO_INSERT_AFTER);
+                        if empties.is_empty() {
+                            continue;
+                        }
+                    },
+                    _ = &mut tripwire => break
+                }
+
+                inserted_empties = 0;
+
+                if let Err(e) = process_completed_empties(&agent, &mut empties).await {
+                    error!("could not process empties: {e}");
+                }
+            }
+            info!("Draining empty versions to process...");
+            // drain empties channel
+            while let Ok((actor_id, versions)) = rx_empty.try_recv() {
+                empties.entry(actor_id).or_default().push(versions);
+            }
+
+            if !empties.is_empty() {
+                info!("inserting last unprocessed empties before shut down");
+                if let Err(e) = process_completed_empties(&agent, &mut empties).await {
+                    error!("could not process empties: {e}");
+                }
+            }
+        }
+    });
 
     loop {
         enum Branch {
             Tick,
             BackgroundApply { actor_id: ActorId, version: i64 },
-            ProcessEmpties,
         }
 
         let branch = tokio::select! {
             biased;
-
-            maybe_empty = rx_empty.recv() => match maybe_empty {
-                Some((actor_id, versions)) => {
-                    empties.entry(actor_id).or_default().push(versions);
-                    inserted_empties += 1;
-
-                    if inserted_empties < 1000 {
-                        continue;
-                    }
-
-                    Branch::ProcessEmpties
-                },
-                None => {
-                    debug!("empties queue is done");
-                    break;
-                }
-            },
 
             maybe_item = rx_apply.recv() => match maybe_item {
                 Some((actor_id, version)) => Branch::BackgroundApply{actor_id, version},
@@ -2386,14 +2418,6 @@ async fn sync_loop(
                     debug!("background applies queue is closed, breaking out of loop");
                     break;
                 }
-            },
-
-            _ = &mut next_empties_check => {
-                next_empties_check.as_mut().reset(tokio::time::Instant::now() + CHECK_EMPTIES_TO_INSERT_AFTER);
-                if empties.is_empty() {
-                    continue;
-                }
-                Branch::ProcessEmpties
             },
 
             _ = &mut next_sync_at => {
@@ -2440,24 +2464,6 @@ async fn sync_loop(
                     }
                 }
             }
-            Branch::ProcessEmpties => {
-                if let Err(e) = process_completed_empties(&agent, &mut empties).await {
-                    error!("could not process empties: {e}");
-                }
-            }
-        }
-    }
-
-    info!("Draining empty versions to process...");
-    // drain empties channel
-    while let Ok((actor_id, versions)) = rx_empty.try_recv() {
-        empties.entry(actor_id).or_default().push(versions);
-    }
-
-    if !empties.is_empty() {
-        info!("inserting last unprocessed empties before shut down");
-        if let Err(e) = process_completed_empties(&agent, &mut empties).await {
-            error!("could not process empties: {e}");
         }
     }
 }
