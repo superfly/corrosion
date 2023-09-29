@@ -901,22 +901,27 @@ pub async fn bidirectional_sync(
 
             loop {
                 tokio::select! {
-                    Some(msg) = rx.recv() => {
-                        if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
-                            count += change.len();
-                        }
-                        encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
+                    maybe_msg = rx.recv() => match maybe_msg {
+                        Some(msg) => {
+                            if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+                                count += change.len();
+                            }
+                            encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
 
-                        if send_buf.len() >= 16 * 1024 {
-                            write_sync_buf(&mut send_buf, &mut write).await?;
+                            if send_buf.len() >= 16 * 1024 {
+                                write_sync_buf(&mut send_buf, &mut write).await?;
+                            }
+                        },
+                        None => {
+                            break;
                         }
                     },
                     _ = check_buf.tick() => {
+                        println!("checking if buf is not empty and sending if necessary, len: {}", send_buf.len());
                         if !send_buf.is_empty() {
                             write_sync_buf(&mut send_buf, &mut write).await?;
                         }
                     }
-                    else => break,
                 }
             }
 
