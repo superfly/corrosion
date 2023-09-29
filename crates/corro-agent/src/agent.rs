@@ -999,7 +999,13 @@ async fn clear_overwritten_versions(agent: Agent) {
         {
             let booked = bookie.read().await;
             for (actor_id, booked) in booked.iter() {
-                let versions = booked.read().await.current_versions();
+                let versions = match timeout(Duration::from_secs(1), booked.read()).await {
+                    Ok(booked) => booked,
+                    Err(_) => {
+                        info!(%actor_id, "timed out acquiring read lock on bookkeeping, skipping for now");
+                        continue;
+                    }
+                }.current_versions();
                 if versions.is_empty() {
                     continue;
                 }
