@@ -554,27 +554,19 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                     }
                                                 }
                                             }
-                                            match timeout(
-                                                Duration::from_secs(5),
-                                                rx.read_buf(&mut buf),
-                                            )
-                                            .await
-                                            {
-                                                Ok(Ok(0)) => {
+
+                                            match rx.read_buf(&mut buf).await {
+                                                Ok(0) => {
                                                     stream_ended = true;
                                                     break;
                                                 }
-                                                Ok(Ok(n)) => {
+                                                Ok(n) => {
                                                     counter!("corro.peer.stream.bytes.recv.total", n as u64, "type" => "uni");
                                                     trace!("read {n} bytes");
                                                 }
-                                                Ok(Err(e)) => {
+                                                Err(e) => {
                                                     error!("error reading bytes into buffer: {e}");
                                                     stream_ended = true;
-                                                    break;
-                                                }
-                                                Err(_e) => {
-                                                    warn!("timed out reading from unidirectional stream");
                                                     break;
                                                 }
                                             }
@@ -1324,16 +1316,9 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
 
         spawn_counted(async move {
             let len = data.len();
-            match timeout(Duration::from_secs(5), transport.send_datagram(addr, data)).await {
-                Err(_e) => {
-                    warn!("timed out writing gossip as datagram {addr}");
-                    return;
-                }
-                Ok(Err(e)) => {
-                    error!("could not write datagram {addr}: {e}");
-                    return;
-                }
-                _ => {}
+            if let Err(e) = transport.send_datagram(addr, data).await {
+                error!("could not write datagram {addr}: {e}");
+                return;
             }
             increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor.id().to_string());
             counter!("corro.peer.datagram.bytes.sent.total", len as u64);
@@ -1603,10 +1588,11 @@ fn store_empty_changeset(
     tx: &Transaction,
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
-) -> Result<(), rusqlite::Error> {
+) -> Result<usize, rusqlite::Error> {
     // TODO: make sure this makes sense
-    tx.prepare_cached(
-        "
+    let inserted = tx
+        .prepare_cached(
+            "
         INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, ts)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT (actor_id, start_version) DO UPDATE SET
@@ -1616,20 +1602,20 @@ fn store_empty_changeset(
                 ts = NULL
             WHERE end_version < excluded.end_version;
     ",
-    )?
-    .execute(params![
-        actor_id,
-        versions.start(),
-        versions.end(),
-        rusqlite::types::Null,
-        rusqlite::types::Null
-    ])?;
+        )?
+        .execute(params![
+            actor_id,
+            versions.start(),
+            versions.end(),
+            rusqlite::types::Null,
+            rusqlite::types::Null
+        ])?;
 
     for version in versions {
         clear_buffered_meta(tx, actor_id, version)?;
     }
 
-    Ok(())
+    Ok(inserted)
 }
 
 fn clear_buffered_meta(tx: &Transaction, actor_id: ActorId, version: i64) -> rusqlite::Result<()> {
@@ -2472,10 +2458,16 @@ async fn process_completed_empties(
     agent: &Agent,
     empties: &mut BTreeMap<ActorId, Vec<RangeInclusive<i64>>>,
 ) -> eyre::Result<()> {
+    info!(
+        "processing empty versions (count: {})",
+        empties.values().map(Vec::len).sum::<usize>()
+    );
     let mut conn = agent.pool().write_normal().await?;
 
     block_in_place(|| {
         let tx = conn.transaction()?;
+
+        let mut inserted = 0;
         while let Some((actor_id, empties)) = empties.pop_first() {
             let booked = agent.bookie().for_actor_blocking(actor_id);
             let bookedw = booked.blocking_write();
@@ -2485,11 +2477,13 @@ async fn process_completed_empties(
                 .filter_map(|range| bookedw.get_key_value(range.start()))
                 .dedup()
             {
-                store_empty_changeset(&tx, actor_id, range.clone())?;
+                inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
             }
         }
 
         tx.commit()?;
+
+        info!("upserted {inserted} empty versions");
 
         Ok(())
     })

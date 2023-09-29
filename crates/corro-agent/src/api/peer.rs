@@ -917,7 +917,6 @@ pub async fn bidirectional_sync(
                         }
                     },
                     _ = check_buf.tick() => {
-                        println!("checking if buf is not empty and sending if necessary, len: {}", send_buf.len());
                         if !send_buf.is_empty() {
                             write_sync_buf(&mut send_buf, &mut write).await?;
                         }
