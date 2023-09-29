@@ -204,7 +204,7 @@ mod tests {
 
             conn.execute_batch(
                 "
-                CREATE TABLE foo (a INTEGER PRIMARY KEY, b INTEGER);
+                CREATE TABLE foo (a INTEGER NOT NULL PRIMARY KEY, b INTEGER);
                 SELECT crsql_as_crr('foo');
             ",
             )?;

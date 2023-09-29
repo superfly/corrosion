@@ -764,19 +764,37 @@ async fn process_sync(
     Ok(())
 }
 
-async fn write_sync_msg<W: AsyncWrite + Unpin>(
+fn encode_sync_msg(
     codec: &mut LengthDelimitedCodec,
-    buf: &mut BytesMut,
+    encode_buf: &mut BytesMut,
+    send_buf: &mut BytesMut,
+    msg: SyncMessage,
+) -> Result<(), SyncSendError> {
+    msg.write_to_stream(encode_buf.writer())
+        .map_err(SyncMessageEncodeError::from)?;
+
+    codec.encode(encode_buf.split().freeze(), send_buf)?;
+    Ok(())
+}
+
+async fn encode_write_sync_msg<W: AsyncWrite + Unpin>(
+    codec: &mut LengthDelimitedCodec,
+    encode_buf: &mut BytesMut,
+    send_buf: &mut BytesMut,
     msg: SyncMessage,
     write: &mut W,
 ) -> Result<(), SyncSendError> {
-    msg.write_to_stream(buf.writer())
-        .map_err(SyncMessageEncodeError::from)?;
+    encode_sync_msg(codec, encode_buf, send_buf, msg)?;
 
-    codec.encode(buf.split().freeze(), buf)?;
+    write_sync_buf(send_buf, write).await
+}
 
-    while buf.has_remaining() {
-        let n = write.write_buf(buf).await?;
+async fn write_sync_buf<W: AsyncWrite + Unpin>(
+    send_buf: &mut BytesMut,
+    write: &mut W,
+) -> Result<(), SyncSendError> {
+    while send_buf.has_remaining() {
+        let n = write.write_buf(send_buf).await?;
         if n == 0 {
             break;
         }
@@ -812,15 +830,17 @@ pub async fn bidirectional_sync(
     read: RecvStream,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
-    let (tx, mut rx) = channel::<SyncMessage>(128);
+    let (tx, mut rx) = channel::<SyncMessage>(256);
 
     let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
 
     let mut codec = LengthDelimitedCodec::new();
     let mut send_buf = BytesMut::new();
+    let mut encode_buf = BytesMut::new();
 
-    write_sync_msg(
+    encode_write_sync_msg(
         &mut codec,
+        &mut encode_buf,
         &mut send_buf,
         SyncMessage::V1(SyncMessageV1::State(our_sync_state)),
         &mut write,
@@ -839,8 +859,9 @@ pub async fn bidirectional_sync(
 
     let their_actor_id = their_sync_state.actor_id;
 
-    write_sync_msg(
+    encode_write_sync_msg(
         &mut codec,
+        &mut encode_buf,
         &mut send_buf,
         SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
         &mut write,
@@ -876,11 +897,36 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
-            while let Some(msg) = rx.recv().await {
-                if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
-                    count += change.len();
+            let mut check_buf = tokio::time::interval(Duration::from_secs(1));
+
+            loop {
+                tokio::select! {
+                    maybe_msg = rx.recv() => match maybe_msg {
+                        Some(msg) => {
+                            if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+                                count += change.len();
+                            }
+                            encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
+
+                            if send_buf.len() >= 16 * 1024 {
+                                write_sync_buf(&mut send_buf, &mut write).await?;
+                            }
+                        },
+                        None => {
+                            break;
+                        }
+                    },
+                    _ = check_buf.tick() => {
+                        println!("checking if buf is not empty and sending if necessary, len: {}", send_buf.len());
+                        if !send_buf.is_empty() {
+                            write_sync_buf(&mut send_buf, &mut write).await?;
+                        }
+                    }
                 }
-                write_sync_msg(&mut codec, &mut send_buf, msg, &mut write).await?;
+            }
+
+            if !send_buf.is_empty() {
+                write_sync_buf(&mut send_buf, &mut write).await?;
             }
 
             if let Err(e) = write.finish().await {

@@ -129,10 +129,10 @@ cr-sqlite creates 1 change per column "changed" in a row. It's possible to inspe
 $ sqlite3 data-b/corrosion.db
 sqlite> .mode column
 sqlite> select * from todos__crsql_clock;
-id         __crsql_col_name  __crsql_col_version  __crsql_db_version  __crsql_site_id  __crsql_seq
----------  ----------------  -------------------  ------------------  ---------------  -----------
-some-id    title             1                    1                   1                0
-some-id    completed_at      1                    1                   1                1
+key  col_name      col_version  db_version  site_id  seq
+---  ------------  -----------  ----------  -------  ---
+1    title         1            1           1        0
+2    completed_at  1            1           1        1
 ```
 
 ### 4. Query for the just-synchronized data

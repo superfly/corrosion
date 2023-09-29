@@ -1379,7 +1379,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_matcher() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-        let schema_sql = "CREATE TABLE sw (pk TEXT primary key, sandwich TEXT);";
+        let schema_sql = "CREATE TABLE sw (pk TEXT NOT NULL PRIMARY KEY, sandwich TEXT);";
         let mut schema = parse_sql(schema_sql)?;
 
         let sql = "SELECT sandwich FROM sw WHERE pk=\"mad\"";
