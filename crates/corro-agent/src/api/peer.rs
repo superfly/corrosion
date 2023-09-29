@@ -897,14 +897,26 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
-            while let Some(msg) = rx.recv().await {
-                if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
-                    count += change.len();
-                }
-                encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
+            let mut check_buf = tokio::time::interval(Duration::from_secs(1));
 
-                if send_buf.len() >= 16 * 1024 {
-                    write_sync_buf(&mut send_buf, &mut write).await?;
+            loop {
+                tokio::select! {
+                    Some(msg) = rx.recv() => {
+                        if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+                            count += change.len();
+                        }
+                        encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
+
+                        if send_buf.len() >= 16 * 1024 {
+                            write_sync_buf(&mut send_buf, &mut write).await?;
+                        }
+                    },
+                    _ = check_buf.tick() => {
+                        if !send_buf.is_empty() {
+                            write_sync_buf(&mut send_buf, &mut write).await?;
+                        }
+                    }
+                    else => break,
                 }
             }
 
