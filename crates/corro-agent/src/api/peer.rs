@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, BufMut, BytesMut};
+use compact_str::format_compact;
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
 use corro_types::broadcast::{ChangeV1, Changeset, Timestamp};
 use corro_types::change::{row_to_change, Change};
@@ -336,7 +337,10 @@ async fn process_range(
 
     let overlapping: Vec<(_, KnownDbVersion)> = {
         booked
-            .read()
+            .read(format!(
+                "process_range(overlapping):{}",
+                actor_id.as_simple()
+            ))
             .await
             .overlapping(range)
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -359,7 +363,13 @@ async fn process_range(
         }
 
         for version in versions {
-            let known = { booked.read().await.get(&version).cloned() };
+            let known = {
+                booked
+                    .read(format!("process_range[{version}]:{}", actor_id.as_simple()))
+                    .await
+                    .get(&version)
+                    .cloned()
+            };
             if let Some(known_version) = known {
                 process_version(
                     pool,
@@ -399,7 +409,10 @@ fn handle_known_version(
     while let Some(range_needed) = seqs_iter.by_ref().next() {
         match &init_known {
             KnownDbVersion::Current { db_version, .. } => {
-                let bw = booked.blocking_write();
+                let bw = booked.blocking_write(format_compact!(
+                    "sync_handle_known[{version}]:{}",
+                    actor_id.as_simple()
+                ));
                 match bw.get(&version) {
                     Some(known) => {
                         // a current version cannot go back to a partial version
@@ -476,7 +489,10 @@ fn handle_known_version(
 
                         debug!("partial, effective range: {start_seq}..={end_seq}");
 
-                        let bw = booked.blocking_write();
+                        let bw = booked.blocking_write(format_compact!(
+                            "sync_handle_known(partial)[{version}]:{}",
+                            actor_id.as_simple()
+                        ));
                         let maybe_db_version = match bw.get(&version) {
                             Some(known) => match known {
                                 KnownDbVersion::Partial { seqs, .. } => {
@@ -693,7 +709,7 @@ async fn process_sync(
 ) -> eyre::Result<()> {
     let booked_actors: HashMap<ActorId, Booked> = {
         bookie
-            .read()
+            .read("process_sync")
             .await
             .iter()
             .map(|(k, v)| (*k, v.clone()))
@@ -720,7 +736,13 @@ async fn process_sync(
         // 2. process partial needs
         if let Some(partially_needed) = sync_state.partial_need.get(&actor_id) {
             for (version, seqs_needed) in partially_needed.iter() {
-                let known = { booked.read().await.get(version).cloned() };
+                let known = {
+                    booked
+                        .read(format!("process_sync(partials)[{version}]"))
+                        .await
+                        .get(version)
+                        .cloned()
+                };
                 if let Some(known) = known {
                     process_version(
                         &pool,
@@ -739,7 +761,14 @@ async fn process_sync(
 
         // 3. process newer-than-heads
         let their_last_version = sync_state.heads.get(&actor_id).copied().unwrap_or(0);
-        let our_last_version = booked.last().await.unwrap_or(0);
+        let our_last_version = booked
+            .read(format!(
+                "process_sync(our_last_version):{}",
+                actor_id.as_simple()
+            ))
+            .await
+            .last()
+            .unwrap_or(0);
 
         debug!(actor_id = %local_actor_id, "their last version: {their_last_version} vs ours: {our_last_version}");
 

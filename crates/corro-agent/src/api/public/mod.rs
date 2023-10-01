@@ -160,10 +160,18 @@ where
     trace!("got conn");
 
     let actor_id = agent.actor_id();
-    let booked = agent.bookie().for_actor(actor_id).await;
+    let booked = {
+        agent
+            .bookie()
+            .write("make_broadcastable_changes(for_actor)")
+            .await
+            .for_actor(actor_id)
+    };
     // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
     // so it probably doesn't matter too much, except for reads of internal state
-    let mut book_writer = booked.write().await;
+    let mut book_writer = booked
+        .write("make_broadcastable_changes(booked writer)")
+        .await;
 
     let start = Instant::now();
     block_in_place(move || {
@@ -772,7 +780,17 @@ mod tests {
             }))
         ));
 
-        assert_eq!(agent.bookie().last(&agent.actor_id()).await, Some(1));
+        assert_eq!(
+            agent
+                .bookie()
+                .write("test")
+                .await
+                .for_actor(agent.actor_id())
+                .read("test")
+                .await
+                .last(),
+            Some(1)
+        );
 
         println!("second req...");
 

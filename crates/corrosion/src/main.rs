@@ -320,6 +320,11 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Locks { top } => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Locks { top: *top })
+                .await?;
+        }
         Command::Template { template, flags } => {
             command::tpl::run(cli.api_addr()?, template, flags).await?;
         }
@@ -427,7 +432,9 @@ enum Command {
     Agent,
 
     /// Backup the Corrosion DB
-    Backup { path: String },
+    Backup {
+        path: String,
+    },
 
     /// Restore the Corrosion DB from a backup
     Restore {
@@ -467,6 +474,10 @@ enum Command {
     /// Sync-related commands
     #[command(subcommand)]
     Sync(SyncCommand),
+
+    Locks {
+        top: usize,
+    },
 
     Template {
         template: Vec<String>,

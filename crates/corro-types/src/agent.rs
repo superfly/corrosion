@@ -4,16 +4,22 @@ use std::{
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
+use compact_str::CompactString;
+use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{Connection, InterruptHandle};
+use serde::{Deserialize, Serialize};
 use tokio::{
     runtime::Handle,
     sync::{
@@ -397,7 +403,7 @@ async fn timeout_wait(
     //     }
     // }
     // handle.interrupt();
-    // increment_counter!("corro.sqlite.pool.execution.timeout");
+    // increment_tracker!("corro.sqlite.pool.execution.timeout");
     // FIXME: do we need to cancel the token?
 }
 
@@ -452,55 +458,216 @@ impl KnownDbVersion {
     }
 }
 
-pub type BookedVersions = RangeInclusiveMap<i64, KnownDbVersion>;
-pub type BookedInner = Arc<TokioRwLock<BookedVersions>>;
+pub struct CountedTokioRwLock<T> {
+    registry: LockRegistry,
+    lock: TokioRwLock<T>,
+}
 
-#[derive(Default, Clone)]
-pub struct Booked(BookedInner);
-
-impl Booked {
-    pub fn new(inner: BookedInner) -> Self {
-        Self(inner)
-    }
-
-    pub async fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
-        match seqs {
-            Some(check_seqs) => {
-                let read = self.0.read().await;
-                match read.get(&version) {
-                    Some(known) => match known {
-                        KnownDbVersion::Partial { seqs, .. } => {
-                            check_seqs.clone().all(|seq| seqs.contains(&seq))
-                        }
-                        KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
-                    },
-                    None => false,
-                }
-            }
-            None => self.0.read().await.contains_key(&version),
+impl<T> CountedTokioRwLock<T> {
+    fn new(registry: LockRegistry, value: T) -> Self {
+        Self {
+            registry,
+            lock: TokioRwLock::new(value),
         }
     }
 
-    pub async fn last(&self) -> Option<i64> {
-        self.0.read().await.iter().map(|(k, _v)| *k.end()).max()
+    pub async fn write<C: Into<CompactString>>(
+        &self,
+        label: C,
+    ) -> CountedTokioRwLockWriteGuard<'_, T> {
+        self.registry.acquire_write(label, &self.lock).await
     }
 
-    pub async fn read(&self) -> BookReader {
-        BookReader(self.0.read().await)
+    pub fn blocking_write<C: Into<CompactString>>(
+        &self,
+        label: C,
+    ) -> CountedTokioRwLockWriteGuard<'_, T> {
+        self.registry.acquire_blocking_write(label, &self.lock)
     }
 
-    pub async fn write(&self) -> BookWriter {
-        BookWriter(self.0.write().await)
-    }
-
-    pub fn blocking_write(&self) -> BookWriter {
-        BookWriter(self.0.blocking_write())
+    pub async fn read<C: Into<CompactString>>(
+        &self,
+        label: C,
+    ) -> CountedTokioRwLockReadGuard<'_, T> {
+        self.registry.acquire_read(label, &self.lock).await
     }
 }
 
-pub struct BookReader<'a>(TokioRwLockReadGuard<'a, BookedVersions>);
+pub struct CountedTokioRwLockWriteGuard<'a, T> {
+    lock: TokioRwLockWriteGuard<'a, T>,
+    _tracker: LockTracker,
+}
 
-impl<'a> BookReader<'a> {
+impl<'a, T> Deref for CountedTokioRwLockWriteGuard<'a, T> {
+    type Target = TokioRwLockWriteGuard<'a, T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
+impl<'a, T> DerefMut for CountedTokioRwLockWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lock
+    }
+}
+
+pub struct CountedTokioRwLockReadGuard<'a, T> {
+    lock: TokioRwLockReadGuard<'a, T>,
+    _tracker: LockTracker,
+}
+
+impl<'a, T> Deref for CountedTokioRwLockReadGuard<'a, T> {
+    type Target = TokioRwLockReadGuard<'a, T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
+impl<'a, T> DerefMut for CountedTokioRwLockReadGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lock
+    }
+}
+
+type LockId = usize;
+
+#[derive(Debug, Clone)]
+pub struct LockMeta {
+    pub label: CompactString,
+    pub kind: LockKind,
+    pub state: LockState,
+    pub started_at: Instant,
+}
+
+#[derive(Default, Clone)]
+pub struct LockRegistry {
+    id_gen: Arc<AtomicUsize>,
+    pub map: Arc<RwLock<IndexMap<LockId, LockMeta>>>,
+}
+
+impl LockRegistry {
+    fn remove(&self, id: &LockId) {
+        self.map.write().remove(id);
+    }
+
+    async fn acquire_write<'a, T, C: Into<CompactString>>(
+        &self,
+        label: C,
+        lock: &'a TokioRwLock<T>,
+    ) -> CountedTokioRwLockWriteGuard<'a, T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label: label.into(),
+                kind: LockKind::Write,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = lock.write().await;
+        self.set_lock_state(&id, LockState::Locked);
+        CountedTokioRwLockWriteGuard { lock: w, _tracker }
+    }
+
+    fn acquire_blocking_write<'a, T, C: Into<CompactString>>(
+        &self,
+        label: C,
+        lock: &'a TokioRwLock<T>,
+    ) -> CountedTokioRwLockWriteGuard<'a, T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label: label.into(),
+                kind: LockKind::Write,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = lock.blocking_write();
+        self.set_lock_state(&id, LockState::Locked);
+        CountedTokioRwLockWriteGuard { lock: w, _tracker }
+    }
+
+    async fn acquire_read<'a, T, C: Into<CompactString>>(
+        &self,
+        label: C,
+        lock: &'a TokioRwLock<T>,
+    ) -> CountedTokioRwLockReadGuard<'a, T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label: label.into(),
+                kind: LockKind::Read,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = lock.read().await;
+        self.set_lock_state(&id, LockState::Locked);
+        CountedTokioRwLockReadGuard { lock: w, _tracker }
+    }
+
+    fn set_lock_state(&self, id: &LockId, state: LockState) {
+        if let Some(meta) = self.map.write().get_mut(id) {
+            meta.state = state
+        }
+    }
+
+    fn insert_lock(&self, id: LockId, meta: LockMeta) {
+        self.map.write().insert(id, meta);
+    }
+
+    fn gen_id(&self) -> LockId {
+        self.id_gen.fetch_add(1, Ordering::Release) + 1
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockState {
+    Acquiring,
+    Locked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockKind {
+    Read,
+    Write,
+}
+
+struct LockTracker {
+    id: LockId,
+    registry: LockRegistry,
+}
+
+impl Drop for LockTracker {
+    fn drop(&mut self) {
+        self.registry.remove(&self.id)
+    }
+}
+
+#[derive(Default)]
+pub struct BookedVersions(pub RangeInclusiveMap<i64, KnownDbVersion>);
+
+impl BookedVersions {
     pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
         match seqs {
             Some(check_seqs) => match self.0.get(&version) {
@@ -524,6 +691,10 @@ impl<'a> BookReader<'a> {
         versions.all(|version| self.contains(version, seqs))
     }
 
+    pub fn contains_current(&self, version: &i64) -> bool {
+        matches!(self.0.get(version), Some(KnownDbVersion::Current { .. }))
+    }
+
     pub fn current_versions(&self) -> BTreeMap<i64, i64> {
         self.0
             .iter()
@@ -536,19 +707,11 @@ impl<'a> BookReader<'a> {
             })
             .collect()
     }
-}
 
-impl<'a> Deref for BookReader<'a> {
-    type Target = TokioRwLockReadGuard<'a, BookedVersions>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    pub fn last(&self) -> Option<i64> {
+        self.0.iter().map(|(k, _v)| *k.end()).max()
     }
-}
 
-pub struct BookWriter<'a>(TokioRwLockWriteGuard<'a, BookedVersions>);
-
-impl<'a> BookWriter<'a> {
     pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
         self.insert_many(version..=version, known_version);
     }
@@ -556,111 +719,116 @@ impl<'a> BookWriter<'a> {
     pub fn insert_many(&mut self, versions: RangeInclusive<i64>, known_version: KnownDbVersion) {
         self.0.insert(versions, known_version);
     }
-
-    pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
-        match seqs {
-            Some(check_seqs) => match self.0.get(&version) {
-                Some(known) => match known {
-                    KnownDbVersion::Partial { seqs, .. } => {
-                        check_seqs.clone().all(|seq| seqs.contains(&seq))
-                    }
-                    KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
-                },
-                None => false,
-            },
-            None => self.0.contains_key(&version),
-        }
-    }
-
-    pub fn contains_current(&self, version: &i64) -> bool {
-        matches!(self.0.get(version), Some(KnownDbVersion::Current { .. }))
-    }
-
-    pub fn contains_all(
-        &self,
-        mut versions: RangeInclusive<i64>,
-        seqs: Option<&RangeInclusive<i64>>,
-    ) -> bool {
-        versions.all(|version| self.contains(version, seqs))
-    }
-
-    pub fn last(&self) -> Option<i64> {
-        self.0.iter().map(|(k, _v)| *k.end()).max()
-    }
-
-    pub fn current_versions(&self) -> BTreeMap<i64, i64> {
-        self.0
-            .iter()
-            .filter_map(|(range, known)| {
-                if let KnownDbVersion::Current { db_version, .. } = known {
-                    Some((*db_version, *range.start()))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn inner(&self) -> &TokioRwLockWriteGuard<'a, BookedVersions> {
-        &self.0
-    }
-
-    pub fn inner_mut(&mut self) -> &mut TokioRwLockWriteGuard<'a, BookedVersions> {
-        &mut self.0
-    }
 }
 
-impl<'a> Deref for BookWriter<'a> {
-    type Target = TokioRwLockWriteGuard<'a, BookedVersions>;
+impl Deref for BookedVersions {
+    type Target = RangeInclusiveMap<i64, KnownDbVersion>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-pub type BookieInner = Arc<TokioRwLock<HashMap<ActorId, Booked>>>;
+pub type BookedInner = Arc<CountedTokioRwLock<BookedVersions>>;
 
-#[derive(Default, Clone)]
-pub struct Bookie(BookieInner);
+#[derive(Clone)]
+pub struct Booked(BookedInner);
+
+impl Booked {
+    fn new(versions: BookedVersions, registry: LockRegistry) -> Self {
+        Self(Arc::new(CountedTokioRwLock::new(registry, versions)))
+    }
+
+    pub async fn read<L: Into<CompactString>>(
+        &self,
+        label: L,
+    ) -> CountedTokioRwLockReadGuard<'_, BookedVersions> {
+        self.0.read(label).await
+    }
+
+    pub async fn write<L: Into<CompactString>>(
+        &self,
+        label: L,
+    ) -> CountedTokioRwLockWriteGuard<'_, BookedVersions> {
+        self.0.write(label).await
+    }
+
+    pub fn blocking_write<L: Into<CompactString>>(
+        &self,
+        label: L,
+    ) -> CountedTokioRwLockWriteGuard<'_, BookedVersions> {
+        self.0.blocking_write(label)
+    }
+}
+
+#[derive(Default)]
+pub struct BookieInner {
+    map: HashMap<ActorId, Booked>,
+    registry: LockRegistry,
+}
+
+impl BookieInner {
+    pub fn for_actor(&mut self, actor_id: ActorId) -> Booked {
+        self.map
+            .entry(actor_id)
+            .or_insert_with(|| {
+                Booked(Arc::new(CountedTokioRwLock::new(
+                    self.registry.clone(),
+                    Default::default(),
+                )))
+            })
+            .clone()
+    }
+
+    pub fn registry(&self) -> &LockRegistry {
+        &self.registry
+    }
+}
+
+impl Deref for BookieInner {
+    type Target = HashMap<ActorId, Booked>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+#[derive(Clone)]
+pub struct Bookie(Arc<CountedTokioRwLock<BookieInner>>);
 
 impl Bookie {
-    pub fn new(inner: BookieInner) -> Self {
-        Self(inner)
+    pub fn new(map: HashMap<ActorId, BookedVersions>) -> Self {
+        let registry = LockRegistry::default();
+        Self(Arc::new(CountedTokioRwLock::new(
+            registry.clone(),
+            BookieInner {
+                map: map
+                    .into_iter()
+                    .map(|(k, v)| (k, Booked::new(v, registry.clone())))
+                    .collect(),
+                registry,
+            },
+        )))
     }
 
-    pub async fn for_actor(&self, actor_id: ActorId) -> Booked {
-        let mut w = self.0.write().await;
-        w.entry(actor_id).or_default().clone()
-    }
-
-    pub fn for_actor_blocking(&self, actor_id: ActorId) -> Booked {
-        let mut w = self.0.blocking_write();
-        w.entry(actor_id).or_default().clone()
-    }
-
-    pub async fn contains(
+    pub async fn read<L: Into<CompactString>>(
         &self,
-        actor_id: &ActorId,
-        mut versions: RangeInclusive<i64>,
-        seqs: Option<&RangeInclusive<i64>>,
-    ) -> bool {
-        if let Some(booked) = self.0.read().await.get(actor_id) {
-            let read = booked.read().await;
-            versions.all(|v| read.contains(v, seqs))
-        } else {
-            false
-        }
+        label: L,
+    ) -> CountedTokioRwLockReadGuard<BookieInner> {
+        self.0.read(label).await
     }
 
-    pub async fn last(&self, actor_id: &ActorId) -> Option<i64> {
-        if let Some(booked) = self.0.read().await.get(actor_id) {
-            booked.last().await
-        } else {
-            None
-        }
+    pub async fn write<L: Into<CompactString>>(
+        &self,
+        label: L,
+    ) -> CountedTokioRwLockWriteGuard<BookieInner> {
+        self.0.write(label).await
     }
 
-    pub async fn read(&self) -> TokioRwLockReadGuard<HashMap<ActorId, Booked>> {
-        self.0.read().await
+    pub fn blocking_write<L: Into<CompactString>>(
+        &self,
+        label: L,
+    ) -> CountedTokioRwLockWriteGuard<BookieInner> {
+        self.0.blocking_write(label)
     }
 }

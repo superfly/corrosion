@@ -1,7 +1,11 @@
 use std::{fmt::Display, time::Duration};
 
 use camino::Utf8PathBuf;
-use corro_types::{agent::Agent, sqlite::SqlitePoolError, sync::generate_sync};
+use corro_types::{
+    agent::{Agent, LockKind, LockMeta, LockState},
+    sqlite::SqlitePoolError,
+    sync::generate_sync,
+};
 use futures::{SinkExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
@@ -75,6 +79,7 @@ pub fn start_server(
 pub enum Command {
     Ping,
     Sync(SyncCommand),
+    Locks { top: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +130,25 @@ type FramedStream = Framed<
     Json<Command, Response>,
 >;
 
+#[derive(Serialize, Deserialize)]
+pub struct LockMetaElapsed {
+    pub label: String,
+    pub kind: LockKind,
+    pub state: LockState,
+    pub duration: Duration,
+}
+
+impl From<LockMeta> for LockMetaElapsed {
+    fn from(value: LockMeta) -> Self {
+        LockMetaElapsed {
+            label: value.label.into(),
+            kind: value.kind,
+            state: value.state,
+            duration: value.started_at.elapsed(),
+        }
+    }
+}
+
 async fn handle_conn(
     agent: Agent,
     _config: AdminConfig,
@@ -144,6 +168,33 @@ async fn handle_conn(
                     info_log(&mut stream, "generating sync...").await;
                     let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
                     match serde_json::to_value(&sync_state) {
+                        Ok(json) => send(&mut stream, Response::Json(json)).await,
+                        Err(e) => send_error(&mut stream, e).await,
+                    }
+                }
+                Command::Locks { top } => {
+                    info_log(&mut stream, "gathering top locks").await;
+                    let registry = {
+                        agent
+                            .bookie()
+                            .read("admin:registry")
+                            .await
+                            .registry()
+                            .clone()
+                    };
+
+                    let topn: Vec<LockMetaElapsed> = {
+                        registry
+                            .map
+                            .read()
+                            .values()
+                            .take(top)
+                            .cloned()
+                            .map(LockMetaElapsed::from)
+                            .collect()
+                    };
+
+                    match serde_json::to_value(&topn) {
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,
                     }
