@@ -72,7 +72,7 @@ use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
-use tripwire::{PreemptibleFutureExt, Tripwire};
+use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 use trust_dns_resolver::{
     error::ResolveErrorKind,
     proto::rr::{RData, RecordType},
@@ -426,12 +426,22 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         }
     });
 
-    tokio::spawn({
+    spawn_counted({
         let agent = agent.clone();
-        let tripwire = tripwire.clone();
+        let mut tripwire = tripwire.clone();
         let foca_tx = foca_tx.clone();
         async move {
-            while let Some(connecting) = gossip_server_endpoint.accept().await {
+            loop {
+                let connecting = match gossip_server_endpoint
+                    .accept()
+                    .preemptible(&mut tripwire)
+                    .await
+                {
+                    Outcome::Completed(Some(connecting)) => connecting,
+                    Outcome::Completed(None) => return,
+                    Outcome::Preempted(_) => break,
+                };
+
                 let process_uni_tx = process_uni_tx.clone();
                 let agent = agent.clone();
                 let tripwire = tripwire.clone();
@@ -678,6 +688,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     });
                 });
             }
+
+            // graceful shutdown
+            gossip_server_endpoint.reject_new_connections();
+            _ = gossip_server_endpoint
+                .wait_idle()
+                .with_timeout(Duration::from_secs(5))
+                .await;
+            gossip_server_endpoint.close(0u32.into(), b"shutting down");
         }
     });
 
