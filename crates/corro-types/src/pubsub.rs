@@ -1367,7 +1367,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use camino::Utf8PathBuf;
-    use corro_api_types::row_to_change;
+    use corro_api_types::{row_to_change, row_to_change_no_sub};
     use rusqlite::params;
 
     use crate::{
@@ -1589,7 +1589,7 @@ mod tests {
 
             let changes = {
                 let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
-                let rows = prepped.query_map([1], row_to_change).unwrap();
+                let rows = prepped.query_map([1], row_to_change_no_sub).unwrap();
 
                 let mut changes = vec![];
 
@@ -1671,7 +1671,7 @@ mod tests {
 
             let changes = {
                 let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
-                let rows = prepped.query_map([2], row_to_change).unwrap();
+                let rows = prepped.query_map([2], row_to_change_no_sub).unwrap();
 
                 let mut changes = vec![];
 
@@ -1705,7 +1705,7 @@ mod tests {
 
             let changes = {
                 let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
-                let rows = prepped.query_map([3], row_to_change).unwrap();
+                let rows = prepped.query_map([3], row_to_change_no_sub).unwrap();
 
                 let mut changes = vec![];
 
@@ -1737,7 +1737,7 @@ mod tests {
 
             let changes = {
                 let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
-                let rows = prepped.query_map([4], row_to_change).unwrap();
+                let rows = prepped.query_map([4], row_to_change_no_sub).unwrap();
 
                 let mut changes = vec![];
 
@@ -1800,7 +1800,7 @@ mod tests {
 
             let changes = {
                 let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
-                let rows = prepped.query_map([5], row_to_change).unwrap();
+                let rows = prepped.query_map([5], row_to_change_no_sub).unwrap();
 
                 let mut changes = vec![];
 

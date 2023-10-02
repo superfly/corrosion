@@ -29,8 +29,8 @@ use tokio::{
 };
 use tokio::{
     sync::{
-        RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
-        RwLockWriteGuard as TokioRwLockWriteGuard,
+        OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, RwLock as TokioRwLock,
+        RwLockReadGuard as TokioRwLockReadGuard, RwLockWriteGuard as TokioRwLockWriteGuard,
     },
     task::block_in_place,
 };
@@ -440,13 +440,23 @@ impl DerefMut for WriteConn {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum KnownDbVersion {
     Partial {
+        // range of sequences recorded
         seqs: RangeInclusiveSet<i64>,
+        // actual last sequence originally produced
         last_seq: i64,
+        // timestamp when the change was produced by the source
         ts: Timestamp,
     },
     Current {
+        // cr-sqlite db version
         db_version: i64,
+        // start sequence, can be > 0 if we inserted the change w/ others
+        start_seq: i64,
+        // end sequence, can be different than last_seq
+        end_seq: i64,
+        // actual last sequence originally produced
         last_seq: i64,
+        // timestamp when the change was produced by the source
         ts: Timestamp,
     },
     Cleared,
@@ -460,14 +470,14 @@ impl KnownDbVersion {
 
 pub struct CountedTokioRwLock<T> {
     registry: LockRegistry,
-    lock: TokioRwLock<T>,
+    lock: Arc<TokioRwLock<T>>,
 }
 
 impl<T> CountedTokioRwLock<T> {
     fn new(registry: LockRegistry, value: T) -> Self {
         Self {
             registry,
-            lock: TokioRwLock::new(value),
+            lock: Arc::new(TokioRwLock::new(value)),
         }
     }
 
@@ -483,6 +493,14 @@ impl<T> CountedTokioRwLock<T> {
         label: C,
     ) -> CountedTokioRwLockWriteGuard<'_, T> {
         self.registry.acquire_blocking_write(label, &self.lock)
+    }
+
+    pub fn blocking_write_owned<C: Into<CompactString>>(
+        &self,
+        label: C,
+    ) -> CountedOwnedTokioRwLockWriteGuard<T> {
+        self.registry
+            .acquire_blocking_write_owned(label, self.lock.clone())
     }
 
     pub async fn read<C: Into<CompactString>>(
@@ -507,6 +525,25 @@ impl<'a, T> Deref for CountedTokioRwLockWriteGuard<'a, T> {
 }
 
 impl<'a, T> DerefMut for CountedTokioRwLockWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lock
+    }
+}
+
+pub struct CountedOwnedTokioRwLockWriteGuard<T> {
+    lock: OwnedTokioRwLockWriteGuard<T>,
+    _tracker: LockTracker,
+}
+
+impl<'a, T> Deref for CountedOwnedTokioRwLockWriteGuard<T> {
+    type Target = OwnedTokioRwLockWriteGuard<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
+impl<T> DerefMut for CountedOwnedTokioRwLockWriteGuard<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.lock
     }
@@ -598,6 +635,36 @@ impl LockRegistry {
         let w = lock.blocking_write();
         self.set_lock_state(&id, LockState::Locked);
         CountedTokioRwLockWriteGuard { lock: w, _tracker }
+    }
+
+    fn acquire_blocking_write_owned<T, C: Into<CompactString>>(
+        &self,
+        label: C,
+        lock: Arc<TokioRwLock<T>>,
+    ) -> CountedOwnedTokioRwLockWriteGuard<T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label: label.into(),
+                kind: LockKind::Write,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = loop {
+            if let Ok(w) = lock.clone().try_write_owned() {
+                break w;
+            }
+            // don't instantly loop
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        self.set_lock_state(&id, LockState::Locked);
+        CountedOwnedTokioRwLockWriteGuard { lock: w, _tracker }
     }
 
     async fn acquire_read<'a, T, C: Into<CompactString>>(
@@ -758,6 +825,13 @@ impl Booked {
         label: L,
     ) -> CountedTokioRwLockWriteGuard<'_, BookedVersions> {
         self.0.blocking_write(label)
+    }
+
+    pub fn blocking_write_owned<L: Into<CompactString>>(
+        &self,
+        label: L,
+    ) -> CountedOwnedTokioRwLockWriteGuard<BookedVersions> {
+        self.0.blocking_write_owned(label)
     }
 }
 

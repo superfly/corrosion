@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::{Buf, BufMut, BytesMut};
 use compact_str::format_compact;
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
+use corro_types::api::row_to_change_no_sub;
 use corro_types::broadcast::{ChangeV1, Changeset, Timestamp};
 use corro_types::change::{row_to_change, Change};
 use corro_types::config::{GossipConfig, TlsClientConfig};
@@ -408,7 +409,12 @@ fn handle_known_version(
     let mut seqs_iter = seqs_needed.into_iter();
     while let Some(range_needed) = seqs_iter.by_ref().next() {
         match &init_known {
-            KnownDbVersion::Current { db_version, .. } => {
+            KnownDbVersion::Current {
+                db_version,
+                start_seq,
+                end_seq,
+                ..
+            } => {
                 let bw = booked.blocking_write(format_compact!(
                     "sync_handle_known[{version}]:{}",
                     actor_id.as_simple()
@@ -442,12 +448,14 @@ fn handle_known_version(
                     .then_some(actor_id)
                     .map(|actor_id| actor_id.to_bytes());
 
-                let start_seq = range_needed.start();
-                let end_seq = range_needed.end();
+                // don't go under the start seq we have stored
+                let actual_start_seq = cmp::max(*range_needed.start() + start_seq, *start_seq);
+                // don't go over the end seq we have stored here!
+                let actual_end_seq = cmp::min(*range_needed.end() + start_seq, *end_seq);
 
                 let rows = prepped.query_map(
-                    params![site_id, db_version, start_seq, end_seq],
-                    row_to_change,
+                    params![site_id, db_version, actual_start_seq, actual_end_seq],
+                    |row| row_to_change(row, *start_seq),
                 )?;
 
                 // drop write lock!
@@ -455,7 +463,12 @@ fn handle_known_version(
 
                 send_change_chunks(
                     sender,
-                    ChunkedChanges::new(rows, *start_seq, *end_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
+                    ChunkedChanges::new(
+                        rows,
+                        actual_start_seq,
+                        last_seq + *start_seq,
+                        MAX_CHANGES_BYTES_PER_MESSAGE,
+                    ),
                     actor_id,
                     version,
                     last_seq,
@@ -493,7 +506,7 @@ fn handle_known_version(
                             "sync_handle_known(partial)[{version}]:{}",
                             actor_id.as_simple()
                         ));
-                        let maybe_db_version = match bw.get(&version) {
+                        let maybe_current_version = match bw.get(&version) {
                             Some(known) => match known {
                                 KnownDbVersion::Partial { seqs, .. } => {
                                     if seqs != &partial_seqs {
@@ -507,7 +520,7 @@ fn handle_known_version(
                                     }
                                     None
                                 }
-                                KnownDbVersion::Current { db_version, .. } => Some(*db_version),
+                                known @ KnownDbVersion::Current { .. } => Some(known.clone()),
                                 KnownDbVersion::Cleared => {
                                     debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
                                     break;
@@ -519,24 +532,25 @@ fn handle_known_version(
                             }
                         };
 
-                        if let Some(db_version) = maybe_db_version {
+                        if let Some(known) = maybe_current_version {
                             info!(%actor_id, version, "switched from partial to current version");
+
+                            // drop write lock
                             drop(bw);
+
+                            // restart the seqs_needed here!
                             let mut seqs_needed: Vec<RangeInclusive<i64>> = seqs_iter.collect();
                             if let Some(new_start_seq) = last_sent_seq.take() {
                                 range_needed = (new_start_seq + 1)..=*range_needed.end();
                             }
                             seqs_needed.insert(0, range_needed);
+
                             return handle_known_version(
                                 conn,
                                 actor_id,
                                 is_local,
                                 version,
-                                KnownDbVersion::Current {
-                                    db_version,
-                                    last_seq,
-                                    ts,
-                                },
+                                known,
                                 booked,
                                 seqs_needed,
                                 last_seq,
@@ -562,7 +576,7 @@ fn handle_known_version(
 
                         let rows = prepped.query_map(
                             params![site_id, version, start_seq, end_seq],
-                            row_to_change,
+                            row_to_change_no_sub,
                         )?;
 
                         // drop write lock!

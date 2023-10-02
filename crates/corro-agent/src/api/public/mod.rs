@@ -9,9 +9,9 @@ use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
-    api::{ExecResponse, ExecResult, QueryEvent, Statement},
+    api::{row_to_change_no_sub, ExecResponse, ExecResult, QueryEvent, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
-    change::{row_to_change, SqliteValue},
+    change::SqliteValue,
     schema::{make_schema_inner, parse_sql},
     sqlite::SqlitePoolError,
 };
@@ -197,37 +197,39 @@ where
             return Ok((ret, start.elapsed()));
         }
 
-        let last_seq: i64 = tx
-            .prepare_cached(
-                "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
-            )?
-            .query_row([db_version], |row| row.get(0))?;
-
         let last_version = book_writer.last().unwrap_or(0);
         trace!("last_version: {last_version}");
         let version = last_version + 1;
         trace!("version: {version}");
 
+        let end_seq: i64 = tx
+            .prepare_cached(
+                "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
+            )?
+            .query_row([db_version], |row| row.get(0))?;
+
         let elapsed = {
             tx.prepare_cached(
                 r#"
-                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
-                    VALUES (?, ?, ?, ?, ?);
+                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts)
+                    VALUES (?, ?, ?, 0, ?, ?, ?);
             "#,
             )?
-            .execute(params![actor_id, version, db_version, last_seq, ts])?;
+            .execute(params![actor_id, version, db_version, end_seq, end_seq, ts])?;
 
             tx.commit()?;
             start.elapsed()
         };
 
-        trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
+        trace!("committed tx, db_version: {db_version}, end_seq: {end_seq:?}");
 
         book_writer.insert(
             version,
             KnownDbVersion::Current {
                 db_version,
-                last_seq,
+                start_seq: 0,
+                end_seq,
+                last_seq: end_seq, // local, so same as end_seq
                 ts,
             },
         );
@@ -247,8 +249,8 @@ where
                           AND db_version = ?
                         ORDER BY seq ASC
                 "#)?;
-                let rows = prepped.query_map([db_version], row_to_change)?;
-                let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_BYTE_SIZE);
+                let rows = prepped.query_map([db_version], row_to_change_no_sub)?;
+                let chunked = ChunkedChanges::new(rows, 0, end_seq, MAX_CHANGES_BYTE_SIZE);
                 for changes_seqs in chunked {
                     match changes_seqs {
                         Ok((changes, seqs)) => {
@@ -271,7 +273,7 @@ where
                                                 version,
                                                 changes,
                                                 seqs,
-                                                last_seq,
+                                                last_seq: end_seq,
                                                 ts,
                                             },
                                         },

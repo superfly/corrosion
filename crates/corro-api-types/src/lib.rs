@@ -175,7 +175,7 @@ impl Change {
     }
 }
 
-pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
+pub fn row_to_change_no_sub(row: &Row) -> Result<Change, rusqlite::Error> {
     Ok(Change {
         table: row.get(0)?,
         pk: row.get(1)?,
@@ -186,6 +186,13 @@ pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
         seq: row.get(6)?,
         site_id: row.get(7)?,
         cl: row.get(8)?,
+    })
+}
+
+pub fn row_to_change(row: &Row, sub: i64) -> Result<Change, rusqlite::Error> {
+    row_to_change_no_sub(row).map(|mut change| {
+        change.seq -= sub;
+        change
     })
 }
 
