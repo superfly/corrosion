@@ -1272,21 +1272,20 @@ pub async fn handle_change(
 
             trace!("handling {} changes", change.len());
 
-            if {
-                bookie
-                    .write(format!(
-                        "handle_change(for_actor):{}",
-                        change.actor_id.as_simple()
-                    ))
-                    .await
-                    .for_actor(change.actor_id)
-                    .read(format!(
-                        "handle_change(contains?):{}",
-                        change.actor_id.as_simple()
-                    ))
-                    .await
-                    .contains_all(change.versions(), change.seqs())
-            } {
+            if bookie
+                .write(format!(
+                    "handle_change(for_actor):{}",
+                    change.actor_id.as_simple()
+                ))
+                .await
+                .for_actor(change.actor_id)
+                .read(format!(
+                    "handle_change(contains?):{}",
+                    change.actor_id.as_simple()
+                ))
+                .await
+                .contains_all(change.versions(), change.seqs())
+            {
                 trace!("already seen, stop disseminating");
                 return;
             }
@@ -1628,7 +1627,6 @@ fn store_empty_changeset(
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
 ) -> Result<usize, rusqlite::Error> {
-    // TODO: make sure this makes sense
     let inserted = tx
         .prepare_cached(
             "
@@ -1782,7 +1780,24 @@ async fn process_fully_buffered_changes(
                 tx.query_row("SELECT crsql_next_db_version()", [], |row| row.get(0))?;
             debug!("db version: {db_version}");
 
-            let end_seq = tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts) VALUES (?, ?, ?, 0, (SELECT MAX(seq) FROM crsql_changes WHERE db_version = crsql_next_db_version()), ?, ?) RETURNING end_seq;")?.query_row(params![actor_id, version, db_version, last_seq, ts], |row| row.get(0))?;
+            let end_seq = tx.prepare_cached("
+                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts)
+                    VALUES (
+                        :actor_id,
+                        :version,
+                        :db_version,
+                        0,
+                        (SELECT MAX(seq) FROM crsql_changes WHERE db_version = crsql_next_db_version()),
+                        :last_seq,
+                        :ts
+                    ) RETURNING end_seq;")?
+                    .query_row(named_params!{
+                        ":actor_id": actor_id,
+                        ":version": version,
+                        ":db_version": db_version,
+                        ":last_seq": last_seq,
+                        ":ts": ts
+                    }, |row| row.get(0))?;
 
             info!(%actor_id, version, "inserted bookkeeping row after buffered insert");
 
@@ -1941,6 +1956,7 @@ pub async fn process_multiple_changes(
                             Ok((known, changeset)) => {
                                 if let KnownDbVersion::Current { end_seq, .. } = &known {
                                     // the next start_seq will be the end_seq from the last inserted change + 1
+                                    // only changes when we've applied a change completely
                                     start_seq = *end_seq + 1
                                 }
                                 (known, changeset)
@@ -1958,6 +1974,57 @@ pub async fn process_multiple_changes(
                     changesets.push((actor_id, changeset));
                     knowns.entry(actor_id).or_default().push((versions, known));
                 }
+            }
+        }
+
+        let next_db_version: i64 = tx
+            .prepare_cached("SELECT crsql_next_db_version()")?
+            .query_row((), |row| row.get(0))?;
+
+        for (actor_id, knowns) in knowns.iter_mut() {
+            for (versions, known) in knowns.iter_mut() {
+                match known {
+                    KnownDbVersion::Partial { .. } => {
+                        continue;
+                    }
+                    KnownDbVersion::Current {
+                        db_version,
+                        start_seq,
+                        end_seq,
+                        last_seq,
+                        ts,
+                    } => {
+                        // First, rectify the db version here
+                        *db_version = next_db_version;
+                        let version = versions.start();
+                        debug!(%actor_id, version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
+                        tx.prepare_cached("
+                            INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts)
+                                VALUES (
+                                    :actor_id,
+                                    :version,
+                                    :db_version,
+                                    :start_seq,
+                                    :end_seq,
+                                    :last_seq,
+                                    :ts
+                                );")?
+                            .execute(named_params!{
+                                ":actor_id": actor_id,
+                                ":version": *version,
+                                ":db_version": *db_version,
+                                ":start_seq": *start_seq,
+                                ":start_seq": *end_seq,
+                                ":last_seq": *last_seq,
+                                ":ts": *ts
+                            })?;
+                    }
+                    KnownDbVersion::Cleared => {
+                        debug!(%actor_id, ?versions, "inserting CLEARED bookkeeping");
+                        store_empty_changeset(&tx, *actor_id, versions.clone())?;
+                    }
+                }
+                debug!(%actor_id, ?versions, "inserted bookkeeping row");
             }
         }
 
@@ -2121,8 +2188,6 @@ fn process_complete_version(
 
     let mut last_rows_impacted = 0;
 
-    let changes_len = changes.len();
-
     let mut changes_per_table = BTreeMap::new();
 
     for change in changes {
@@ -2144,7 +2209,8 @@ fn process_complete_version(
             change.db_version,
             &change.site_id,
             change.cl,
-            change.seq,
+            // increment the seq by the start_seq or else we'll have multiple change rows with the same seq
+            change.seq + start_seq,
         ])?;
         let rows_impacted: i64 = tx
             .prepare_cached("SELECT crsql_rows_impacted()")?
@@ -2169,19 +2235,13 @@ fn process_complete_version(
         .query_row((), |row| row.get(0))?;
 
     let (known_version, new_changeset) = if impactful_changeset.is_empty() {
-        debug!(%actor_id, version,
-            "inserting CLEARED bookkeeping row db_version: {db_version}, ts: {ts:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
-        );
-        tx.prepare_cached("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?);")?
-        .execute(params![actor_id, version, version])?;
         (KnownDbVersion::Cleared, Changeset::Empty { versions })
     } else {
-        debug!(%actor_id, version,
-            "inserting bookkeeping row db_version: {db_version}, ts: {ts:?} (recv changes: {changes_len}, rows impacted: {last_rows_impacted})",
-        );
-        let end_seq: i64 = tx.prepare_cached("
-            INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts)
-                VALUES (?, ?, ?, ?, (SELECT MAX(seq) FROM crsql_changes WHERE db_version = crsql_next_db_version()), ?, ?) RETURNING end_seq;")?.query_row(params![actor_id, version, db_version, start_seq, last_seq, ts], |row| row.get(0))?;
+        let end_seq: i64 = tx
+            .prepare_cached(
+                "SELECT MAX(seq) FROM crsql_changes WHERE db_version = crsql_next_db_version()",
+            )?
+            .query_row((), |row| row.get(0))?;
         (
             KnownDbVersion::Current {
                 db_version,
@@ -2199,8 +2259,6 @@ fn process_complete_version(
             },
         )
     };
-
-    debug!(%actor_id, version, "inserted bookkeeping row");
 
     // in case we got both buffered data and a complete set of changes
     clear_buffered_meta(tx, actor_id, version)?;

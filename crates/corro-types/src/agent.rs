@@ -535,7 +535,7 @@ pub struct CountedOwnedTokioRwLockWriteGuard<T> {
     _tracker: LockTracker,
 }
 
-impl<'a, T> Deref for CountedOwnedTokioRwLockWriteGuard<T> {
+impl<T> Deref for CountedOwnedTokioRwLockWriteGuard<T> {
     type Target = OwnedTokioRwLockWriteGuard<T>;
 
     fn deref(&self) -> &Self::Target {

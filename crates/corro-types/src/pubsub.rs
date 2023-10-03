@@ -1367,7 +1367,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use camino::Utf8PathBuf;
-    use corro_api_types::{row_to_change, row_to_change_no_sub};
+    use corro_api_types::row_to_change_no_sub;
     use rusqlite::params;
 
     use crate::{
