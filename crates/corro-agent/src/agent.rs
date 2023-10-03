@@ -1745,10 +1745,8 @@ async fn process_fully_buffered_changes(
             debug!("db version: {db_version}");
 
             let end_seq: i64 = tx
-                .prepare_cached(
-                    "SELECT MAX(seq) FROM crsql_changes WHERE db_version = crsql_next_db_version()",
-                )?
-                .query_row((), |row| row.get(0))?;
+                .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
+                .query_row([db_version], |row| row.get(0))?;
 
             tx.prepare_cached("
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts)
@@ -2220,10 +2218,8 @@ fn process_complete_version(
         (KnownDbVersion::Cleared, Changeset::Empty { versions })
     } else {
         let end_seq: i64 = tx
-            .prepare_cached(
-                "SELECT MAX(seq) FROM crsql_changes WHERE db_version = crsql_next_db_version()",
-            )?
-            .query_row((), |row| row.get(0))?;
+            .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
+            .query_row([db_version], |row| row.get(0))?;
         (
             KnownDbVersion::Current {
                 db_version,
