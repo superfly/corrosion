@@ -1781,14 +1781,6 @@ async fn process_fully_buffered_changes(
         } else {
             store_empty_changeset(&tx, actor_id, version..=version)?;
 
-            // if inserted > 0 {
-            //     info!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
-            //     Some(KnownDbVersion::Cleared)
-            // } else {
-            //     warn!(%actor_id, version, "bookkeeping row already existed, it shouldn't matter but it would be nice to fix this issue");
-            //     None
-            // }
-
             info!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
             Some(KnownDbVersion::Cleared)
         };
@@ -1977,22 +1969,14 @@ pub async fn process_multiple_changes(
                         let version = versions.start();
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
                         tx.prepare_cached("
-                            INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts)
-                                VALUES (
-                                    :actor_id,
-                                    :version,
-                                    :db_version,
-                                    :start_seq,
-                                    :end_seq,
-                                    :last_seq,
-                                    :ts
-                                );")?
+                            INSERT INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  start_seq,  end_seq,  last_seq,  ts)
+                                                    VALUES  (:actor_id, :start_version, :db_version, :start_seq, :end_seq, :last_seq, :ts);")?
                             .execute(named_params!{
                                 ":actor_id": actor_id,
-                                ":version": *version,
+                                ":start_version": *version,
                                 ":db_version": *db_version,
                                 ":start_seq": *start_seq,
-                                ":start_seq": *end_seq,
+                                ":end_seq": *end_seq,
                                 ":last_seq": *last_seq,
                                 ":ts": *ts
                             })?;
