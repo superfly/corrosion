@@ -1109,22 +1109,11 @@ async fn clear_overwritten_versions(agent: Agent) {
                 {
                     match known {
                         KnownDbVersion::Cleared => {
-                            inserted += tx
-                                .prepare_cached(
-                                    "
-                            INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version)
-                                VALUES (?,?,?)
-                                ON CONFLICT (actor_id, start_version) DO UPDATE SET
-                                    end_version = excluded.end_version,
-                                    db_version = NULL,
-                                    start_seq = NULL,
-                                    end_seq = NULL,
-                                    last_seq = NULL,
-                                    ts = NULL
-                                WHERE end_version < excluded.end_version
-                            ",
-                                )?
-                                .execute(params![actor_id, range.start(), range.end()])?;
+                            inserted += store_empty_changeset(
+                                &tx,
+                                actor_id,
+                                *range.start()..=*range.end(),
+                            )?;
                         }
                         known => {
                             warn!(%actor_id, "unexpected known db version when attempting to clear: {known:?}");
@@ -1719,31 +1708,6 @@ async fn process_fully_buffered_changes(
 
         info!(%actor_id, version, "processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
-        // {
-        //     // TODO: remove, this is for debugging purposes
-        //     let mut prepped = tx.prepare_cached(
-        //         "SELECT site_id, db_version, seq FROM __corro_buffered_changes
-        // WHERE site_id = ?
-        //   AND version = ?
-        // ORDER BY db_version ASC, seq ASC",
-        //     )?;
-        //     let mut mapped = prepped.query_map(params![actor_id.as_bytes(), version], |row| {
-        //         Ok((
-        //             (row.get::<_, ActorId>(0)?, row.get::<_, i64>(1)?),
-        //             row.get::<_, i64>(2)?,
-        //         ))
-        //     })?;
-        //     let mut map: BTreeMap<_, RangeInclusiveSet<i64>> = BTreeMap::new();
-
-        //     while let Some(Ok(((actor_id, db_version), seq))) = mapped.next() {
-        //         map.entry((actor_id, db_version))
-        //             .or_default()
-        //             .insert(seq..=seq);
-        //     }
-
-        //     info!(%actor_id, version, "buffered changes contents: {map:?}");
-        // }
-
         let max_db_version: Option<i64> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional()?;
 
         let start = Instant::now();
@@ -1780,24 +1744,32 @@ async fn process_fully_buffered_changes(
                 tx.query_row("SELECT crsql_next_db_version()", [], |row| row.get(0))?;
             debug!("db version: {db_version}");
 
-            let end_seq = tx.prepare_cached("
+            let end_seq: i64 = tx
+                .prepare_cached(
+                    "SELECT MAX(seq) FROM crsql_changes WHERE db_version = crsql_next_db_version()",
+                )?
+                .query_row((), |row| row.get(0))?;
+
+            tx.prepare_cached("
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts)
                     VALUES (
                         :actor_id,
                         :version,
                         :db_version,
                         0,
-                        (SELECT MAX(seq) FROM crsql_changes WHERE db_version = crsql_next_db_version()),
+                        :end_seq,
                         :last_seq,
                         :ts
-                    ) RETURNING end_seq;")?
-                    .query_row(named_params!{
+                    );")?
+                    .execute(named_params!{
                         ":actor_id": actor_id,
                         ":version": version,
                         ":db_version": db_version,
+                     // ":start_version": 0,
+                        ":end_seq": end_seq,
                         ":last_seq": last_seq,
                         ":ts": ts
-                    }, |row| row.get(0))?;
+                    })?;
 
             info!(%actor_id, version, "inserted bookkeeping row after buffered insert");
 
@@ -2764,10 +2736,8 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
 
 fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
-        "CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version)",
-    )?;
-    tx.execute_batch(
         "
+        CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version);
         ALTER TABLE __corro_bookkeeping ADD start_seq INTEGER;
         ALTER TABLE __corro_bookkeeping ADD end_seq INTEGER;
         UPDATE __corro_bookkeeping SET start_seq = 0, end_seq = last_seq WHERE db_version IS NOT NULL;
