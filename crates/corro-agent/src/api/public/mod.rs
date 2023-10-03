@@ -18,7 +18,7 @@ use corro_types::{
 use hyper::StatusCode;
 use itertools::Itertools;
 use metrics::counter;
-use rusqlite::{params, params_from_iter, ToSql, Transaction};
+use rusqlite::{named_params, params, params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
     sync::{
@@ -212,10 +212,19 @@ where
             tx.prepare_cached(
                 r#"
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts)
-                    VALUES (?, ?, ?, 0, ?, ?, ?);
+                    VALUES (:actor_id, :start_version, :db_version, 0, :end_seq, :last_seq, :ts);
             "#,
             )?
-            .execute(params![actor_id, version, db_version, end_seq, end_seq, ts])?;
+            .execute(named_params!{
+                ":actor_id": actor_id,
+                ":start_version": version,
+                ":db_version": db_version,
+                ":end_seq": end_seq,
+                ":last_seq": end_seq,
+                ":ts": ts
+            })?;
+
+            debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
             tx.commit()?;
             start.elapsed()

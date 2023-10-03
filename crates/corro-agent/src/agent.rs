@@ -1977,11 +1977,12 @@ pub async fn process_multiple_changes(
             }
         }
 
-        let next_db_version: i64 = tx
-            .prepare_cached("SELECT crsql_next_db_version()")?
-            .query_row((), |row| row.get(0))?;
+        let mut next_db_version = 0i64;
+
+        let mut count = 0;
 
         for (actor_id, knowns) in knowns.iter_mut() {
+            debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} knowns", knowns.len());
             for (versions, known) in knowns.iter_mut() {
                 match known {
                     KnownDbVersion::Partial { .. } => {
@@ -1994,10 +1995,17 @@ pub async fn process_multiple_changes(
                         last_seq,
                         ts,
                     } => {
+                        if next_db_version == 0 {
+                            next_db_version = tx
+                                .prepare_cached("SELECT crsql_next_db_version()")?
+                                .query_row((), |row| row.get(0))?;
+                        }
+                        count += 1;
+                        debug!( self_actor_id = %agent.actor_id(), "swapping {db_version} for {next_db_version}");
                         // First, rectify the db version here
                         *db_version = next_db_version;
                         let version = versions.start();
-                        debug!(%actor_id, version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
+                        debug!(%actor_id, self_actor_id = %agent.actor_id(), version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
                         tx.prepare_cached("
                             INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts)
                                 VALUES (
@@ -2020,13 +2028,15 @@ pub async fn process_multiple_changes(
                             })?;
                     }
                     KnownDbVersion::Cleared => {
-                        debug!(%actor_id, ?versions, "inserting CLEARED bookkeeping");
+                        debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
                         store_empty_changeset(&tx, *actor_id, versions.clone())?;
                     }
                 }
-                debug!(%actor_id, ?versions, "inserted bookkeeping row");
+                debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserted bookkeeping row");
             }
         }
+
+        debug!("inserted {count} new changesets");
 
         tx.commit()?;
 
@@ -2896,24 +2906,31 @@ pub mod tests {
 
         println!("body: {body:?}");
 
-        let bk: Vec<(ActorId, i64, i64)> = ta1
+        let bk: Vec<(ActorId, i64, Option<i64>, i64, Option<i64>, Option<i64>, Option<i64>)> = ta1
             .agent
             .pool()
             .read()
             .await?
-            .prepare("SELECT actor_id, start_version, db_version FROM __corro_bookkeeping")?
+            .prepare("SELECT actor_id, start_version, end_version, db_version, start_seq, end_seq, last_seq FROM __corro_bookkeeping")?
             .query_map((), |row| {
                 Ok((
                     row.get::<_, ActorId>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
 
         assert_eq!(
             bk,
-            vec![(ta1.agent.actor_id(), 1, 1), (ta1.agent.actor_id(), 2, 2)]
+            vec![
+                (ta1.agent.actor_id(), 1, None, 1, Some(0), Some(0), Some(0)),
+                (ta1.agent.actor_id(), 2, None, 2, Some(0), Some(0), Some(0))
+            ]
         );
 
         let svc: TestRecord = ta1.agent.pool().read().await?.query_row(
