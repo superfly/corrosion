@@ -978,8 +978,9 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
+            let mut buf_count = 0;
             // changes buffer
-            let mut buf = Vec::with_capacity(4);
+            let mut buf = vec![];
 
             loop {
                 match read_sync_msg(&mut read).await {
@@ -995,6 +996,7 @@ pub async fn bidirectional_sync(
                             let len = change.len();
                             buf.push(change);
                             count += len;
+                            buf_count += std::cmp::max(len, 1); // empty changes have a len of 0, but we still count them
                         }
                         SyncMessage::V1(SyncMessageV1::State(_)) => {
                             warn!("received sync state message more than once, ignoring");
@@ -1007,10 +1009,11 @@ pub async fn bidirectional_sync(
                     },
                 }
 
-                if buf.len() == buf.capacity() {
+                if buf_count >= 30 {
                     process_multiple_changes(agent, buf.drain(..).collect())
                         .await
                         .map_err(SyncRecvError::from)?;
+                    buf_count = 0;
                 }
             }
 

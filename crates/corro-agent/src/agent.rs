@@ -926,7 +926,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     tokio::spawn(metrics_loop(agent.clone()));
 
     let gossip_chunker =
-        ReceiverStream::new(bcast_rx).chunks_timeout(10, Duration::from_millis(500));
+        ReceiverStream::new(bcast_rx).chunks_timeout(50, Duration::from_millis(500));
     tokio::pin!(gossip_chunker);
 
     loop {
