@@ -1825,6 +1825,8 @@ pub async fn process_multiple_changes(
         let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
 
+        let mut last_db_version = None;
+
         for (actor_id, changes) in unknown_changes
             .into_iter()
             .group_by(|(change, src)| change.actor_id)
@@ -1889,8 +1891,17 @@ pub async fn process_multiple_changes(
                             },
                         )
                     } else {
-                        let (known, changeset) = match process_single_version(&tx, change) {
-                            Ok(res) => res,
+                        let (known, changeset) = match process_single_version(
+                            &tx,
+                            last_db_version,
+                            change,
+                        ) {
+                            Ok((known, changeset)) => {
+                                if let KnownDbVersion::Current { db_version, .. } = &known {
+                                    last_db_version = Some(*db_version);
+                                }
+                                (known, changeset)
+                            }
                             Err(e) => {
                                 error!(%actor_id, ?versions, "could not process single change: {e}");
                                 continue;
@@ -2100,6 +2111,7 @@ fn process_incomplete_version(
 fn process_complete_version(
     tx: &Transaction,
     actor_id: ActorId,
+    last_db_version: Option<i64>,
     versions: RangeInclusive<i64>,
     parts: ChangesetParts,
 ) -> rusqlite::Result<(KnownDbVersion, Changeset)> {
@@ -2125,11 +2137,10 @@ fn process_complete_version(
 
     let mut changes_per_table = BTreeMap::new();
 
-    let db_version: i64 = tx
-        .prepare_cached("SELECT CASE WHEN crsql_db_version() >= ? THEN crsql_next_db_version(crsql_next_db_version() + 1) ELSE crsql_next_db_version() END")?
-        .query_row([max_db_version], |row| row.get(0))?;
-
-    let db_version = std::cmp::max(max_db_version, db_version);
+    // we need to manually increment the next db version for each changeset
+    tx
+        .prepare_cached("SELECT CASE WHEN COALESCE(?, crsql_db_version()) >= ? THEN crsql_next_db_version(crsql_next_db_version() + 1) END")?
+        .query_row(params![last_db_version, max_db_version], |_row| Ok(()))?;
 
     for change in changes {
         trace!("inserting change! {change:?}");
@@ -2175,6 +2186,10 @@ fn process_complete_version(
     let (known_version, new_changeset) = if impactful_changeset.is_empty() {
         (KnownDbVersion::Cleared, Changeset::Empty { versions })
     } else {
+        // TODO: find a way to avoid this...
+        let db_version: i64 = tx
+            .prepare_cached("SELECT crsql_next_db_version()")?
+            .query_row([], |row| row.get(0))?;
         (
             KnownDbVersion::Current {
                 db_version,
@@ -2203,6 +2218,7 @@ fn process_complete_version(
 
 fn process_single_version(
     tx: &Transaction,
+    last_db_version: Option<i64>,
     change: ChangeV1,
 ) -> rusqlite::Result<(KnownDbVersion, Changeset)> {
     let ChangeV1 {
@@ -2216,6 +2232,7 @@ fn process_single_version(
         process_complete_version(
             tx,
             actor_id,
+            last_db_version,
             versions,
             changeset
                 .into_parts()
