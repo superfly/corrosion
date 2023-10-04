@@ -1911,6 +1911,7 @@ pub async fn process_multiple_changes(
                                 continue;
                             }
                         };
+                        debug!(%actor_id, self_actor_id = %agent.actor_id(), versions = ?changeset.versions(), "got known to insert: {known:?}");
                         (known, changeset)
                     };
 
@@ -2114,7 +2115,13 @@ fn process_complete_version(
         ts,
     } = parts;
 
-    info!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}");
+    let len = changes.len();
+
+    let max_db_version = changes.iter().map(|c| c.db_version).max().unwrap_or(0);
+
+    info!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
+
+    debug_assert!(len <= (seqs.end() - seqs.start() + 1) as usize);
 
     let mut impactful_changeset = vec![];
 
@@ -2122,8 +2129,15 @@ fn process_complete_version(
 
     let mut changes_per_table = BTreeMap::new();
 
+    let db_version: i64 = tx
+        .prepare_cached("SELECT CASE WHEN crsql_db_version() >= ? THEN crsql_next_db_version(crsql_next_db_version() + 1) ELSE crsql_next_db_version() END")?
+        .query_row([max_db_version], |row| row.get(0))?;
+
+    let db_version = std::cmp::max(max_db_version, db_version);
+
     for change in changes {
         trace!("inserting change! {change:?}");
+
         tx.prepare_cached(
             r#"
                 INSERT INTO crsql_changes
@@ -2165,9 +2179,6 @@ fn process_complete_version(
     let (known_version, new_changeset) = if impactful_changeset.is_empty() {
         (KnownDbVersion::Cleared, Changeset::Empty { versions })
     } else {
-        let db_version: i64 = tx
-            .prepare_cached("SELECT crsql_next_db_version()")?
-            .query_row((), |row| row.get(0))?;
         (
             KnownDbVersion::Current {
                 db_version,
@@ -3080,15 +3091,15 @@ pub mod tests {
                     })?
                     .collect::<rusqlite::Result<_>>()?;
 
-                info!("versions count: {counts:?}");
+                debug!("versions count: {counts:?}");
 
                 let actual_count: i64 =
                     conn.query_row("SELECT count(*) FROM crsql_changes;", (), |row| row.get(0))?;
-                debug!("actual count: {actual_count}");
+                info!("actual count: {actual_count}");
 
                 let bookie = ta.agent.bookie();
 
-                debug!(
+                info!(
                     "last version: {:?}",
                     bookie
                         .write("test")
@@ -3103,7 +3114,7 @@ pub mod tests {
                 let needed = sync.need_len();
 
                 debug!("generated sync: {sync:?}");
-                debug!("needed: {needed}");
+                info!("needed: {needed}");
 
                 v.push((counts.values().sum::<i64>(), needed));
             }

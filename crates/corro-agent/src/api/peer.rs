@@ -406,7 +406,7 @@ fn handle_known_version(
     ts: Timestamp,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
-    trace!(%actor_id, %version, "handle known version! known: {init_known:?}, seqs_needed: {seqs_needed:?}");
+    debug!(%actor_id, %version, "handle known version! known: {init_known:?}, seqs_needed: {seqs_needed:?}");
     let mut seqs_iter = seqs_needed.into_iter();
     while let Some(range_needed) = seqs_iter.by_ref().next() {
         match &init_known {
@@ -773,7 +773,7 @@ async fn process_sync(
             .last()
             .unwrap_or(0);
 
-        debug!(actor_id = %local_actor_id, "their last version: {their_last_version} vs ours: {our_last_version}");
+        trace!(actor_id = %local_actor_id, "their last version: {their_last_version} vs ours: {our_last_version}");
 
         if their_last_version >= our_last_version {
             // nothing to teach the other node!
