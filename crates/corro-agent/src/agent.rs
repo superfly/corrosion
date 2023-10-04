@@ -2814,12 +2814,12 @@ pub mod tests {
         println!("body: {body:?}");
 
         #[allow(clippy::type_complexity)]
-        let bk: Vec<(ActorId, i64, Option<i64>, i64, Option<i64>, Option<i64>, Option<i64>)> = ta1
+        let bk: Vec<(ActorId, i64, Option<i64>, i64, Option<i64>)> = ta1
             .agent
             .pool()
             .read()
             .await?
-            .prepare("SELECT actor_id, start_version, end_version, db_version, start_seq, end_seq, last_seq FROM __corro_bookkeeping")?
+            .prepare("SELECT actor_id, start_version, end_version, db_version, last_seq FROM __corro_bookkeeping")?
             .query_map((), |row| {
                 Ok((
                     row.get::<_, ActorId>(0)?,
@@ -2827,8 +2827,6 @@ pub mod tests {
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -2836,8 +2834,8 @@ pub mod tests {
         assert_eq!(
             bk,
             vec![
-                (ta1.agent.actor_id(), 1, None, 1, Some(0), Some(0), Some(0)),
-                (ta1.agent.actor_id(), 2, None, 2, Some(0), Some(0), Some(0))
+                (ta1.agent.actor_id(), 1, None, 1, Some(0)),
+                (ta1.agent.actor_id(), 2, None, 2, Some(0))
             ]
         );
 
