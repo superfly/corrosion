@@ -1,25 +1,27 @@
 use std::{collections::BTreeMap, net::SocketAddr, ops::Range, time::Duration};
 
 use circular_buffer::CircularBuffer;
-use tracing::trace;
+use tracing::{debug, trace, warn};
 
-use crate::actor::{Actor, ActorId};
+use crate::{
+    actor::{Actor, ActorId},
+    broadcast::Timestamp,
+};
 
 #[derive(Clone, Debug)]
 pub struct MemberState {
     pub addr: SocketAddr,
+    pub ts: Timestamp,
 
     pub ring: Option<u8>,
-
-    counter: u8,
 }
 
 impl MemberState {
-    pub fn new(addr: SocketAddr) -> Self {
+    pub fn new(addr: SocketAddr, ts: Timestamp) -> Self {
         Self {
             addr,
+            ts,
             ring: None,
-            counter: 0,
         }
     }
 
@@ -52,35 +54,40 @@ impl Members {
         let member = self
             .states
             .entry(actor_id)
-            .or_insert_with(|| MemberState::new(actor.addr()));
-
-        member.addr = actor.addr();
+            .or_insert_with(|| MemberState::new(actor.addr(), actor.ts()));
 
         trace!("member: {member:?}");
 
-        member.counter += 1;
-        let inserted = member.counter == 1;
+        if actor.ts() < member.ts {
+            debug!("older timestamp, ignoring");
+            return false;
+        }
 
-        if inserted {
+        let newer = actor.ts() > member.ts;
+
+        if newer {
+            member.addr = actor.addr();
+            member.ts = actor.ts();
+
             self.by_addr.insert(actor.addr(), actor.id());
             self.recalculate_rings(actor.addr());
         }
 
-        inserted
+        newer
     }
 
     // A result of `true` means that the effective list of
     // cluster member addresses has changed
     pub fn remove_member(&mut self, actor: &Actor) -> bool {
-        let effectively_down = if let Some(member) = self.states.get_mut(&actor.id()) {
-            member.counter -= 1;
-            member.counter == 0
+        let effectively_down = if let Some(member) = self.states.get(&actor.id()) {
+            member.ts == actor.ts()
         } else {
             // Shouldn't happen
             false
         };
 
         if effectively_down {
+            self.by_addr.remove(&actor.addr());
             self.states.remove(&actor.id());
         }
 

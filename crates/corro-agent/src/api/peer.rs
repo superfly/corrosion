@@ -916,14 +916,19 @@ pub async fn bidirectional_sync(
     write.flush().await.map_err(SyncSendError::from)?;
 
     match read_sync_msg(&mut read).await? {
-        Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => {
-            if let Err(e) = agent
-                .clock()
-                .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), their_actor_id.into()))
-            {
-                warn!("could not update clock from actor {their_actor_id}: {e}");
+        Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match their_actor_id.try_into() {
+            Ok(id) => {
+                if let Err(e) = agent
+                    .clock()
+                    .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), id))
+                {
+                    warn!("could not update clock from actor {their_actor_id}: {e}");
+                }
             }
-        }
+            Err(e) => {
+                error!("could not convert ActorId to uhlc ID: {e}");
+            }
+        },
         Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
         None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
     }

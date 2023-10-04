@@ -248,7 +248,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let clock = Arc::new(
         uhlc::HLCBuilder::default()
-            .with_id(actor_id.into())
+            .with_id(actor_id.try_into().unwrap())
             .with_max_delta(Duration::from_millis(300))
             .build(),
     );
@@ -373,7 +373,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     let (member_events_tx, member_events_rx) = tokio::sync::broadcast::channel::<MemberEvent>(512);
 
     runtime_loop(
-        Actor::new(actor_id, agent.gossip_addr()),
+        Actor::new(
+            actor_id,
+            agent.gossip_addr(),
+            agent.clock().new_timestamp().into(),
+        ),
         agent.clone(),
         transport.clone(),
         foca_rx,

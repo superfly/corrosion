@@ -206,37 +206,39 @@ pub fn runtime_loop(
                         let states: Vec<_> = {
                             let members = agent.members().read();
 
-                            foca.iter_members()
+                            foca.iter_membership_state()
                                 .filter_map(|member| {
-                                    members.get(&member.id().id()).and_then(|state| {
-                                        match serde_json::to_string(member) {
-                                            Ok(foca_state) => Some((
-                                                member.id().id(),
-                                                state.addr,
-                                                "up",
-                                                foca_state,
-                                                serde_json::Value::Array(
-                                                    members
-                                                        .rtts
-                                                        .get(&state.addr)
-                                                        .map(|rtt| {
-                                                            rtt.buf
-                                                                .iter()
-                                                                .copied()
-                                                                .map(serde_json::Value::from)
-                                                                .collect::<Vec<serde_json::Value>>()
-                                                        })
-                                                        .unwrap_or(vec![]),
-                                                ),
-                                            )),
-                                            Err(e) => {
-                                                error!(
-                                                    "could not serialize foca member state: {e}"
-                                                );
-                                                None
-                                            }
+                                    let id = member.id().id();
+                                    let addr = member.id().addr();
+                                    match serde_json::to_string(member) {
+                                        Ok(foca_state) => Some((
+                                            id,
+                                            addr,
+                                            if members.get(&id).is_some() {
+                                                "up"
+                                            } else {
+                                                "down"
+                                            },
+                                            foca_state,
+                                            serde_json::Value::Array(
+                                                members
+                                                    .rtts
+                                                    .get(&addr)
+                                                    .map(|rtt| {
+                                                        rtt.buf
+                                                            .iter()
+                                                            .copied()
+                                                            .map(serde_json::Value::from)
+                                                            .collect::<Vec<serde_json::Value>>()
+                                                    })
+                                                    .unwrap_or(vec![]),
+                                            ),
+                                        )),
+                                        Err(e) => {
+                                            error!("could not serialize foca member state: {e}");
+                                            None
                                         }
-                                    })
+                                    }
                                 })
                                 .collect()
                         };

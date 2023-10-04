@@ -202,7 +202,17 @@ pub enum TimestampParseError {
 }
 
 #[derive(
-    Debug, Default, Clone, Copy, Serialize, Deserialize, Readable, Writable, PartialEq, Eq,
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    Readable,
+    Writable,
+    PartialEq,
+    Eq,
+    PartialOrd,
 )]
 #[serde(transparent)]
 pub struct Timestamp(pub u64);
@@ -228,6 +238,12 @@ impl fmt::Display for Timestamp {
 impl From<uhlc::Timestamp> for Timestamp {
     fn from(ts: uhlc::Timestamp) -> Self {
         Self(ts.get_time().as_u64())
+    }
+}
+
+impl From<NTP64> for Timestamp {
+    fn from(ntp64: NTP64) -> Self {
+        Self(ntp64.as_u64())
     }
 }
 
