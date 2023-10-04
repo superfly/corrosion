@@ -178,7 +178,7 @@ pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
 }
 
 #[allow(clippy::result_large_err)]
-pub fn make_schema_inner(
+pub fn apply_schema(
     tx: &Transaction,
     schema: &NormalizedSchema,
     new_schema: &mut NormalizedSchema,

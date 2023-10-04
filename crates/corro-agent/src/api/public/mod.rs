@@ -12,7 +12,7 @@ use corro_types::{
     api::{row_to_change, ExecResponse, ExecResult, QueryEvent, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::SqliteValue,
-    schema::{make_schema_inner, parse_sql},
+    schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
@@ -646,7 +646,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     block_in_place(|| {
         let tx = conn.transaction()?;
 
-        make_schema_inner(&tx, &schema_write, &mut new_schema)?;
+        apply_schema(&tx, &schema_write, &mut new_schema)?;
 
         for tbl_name in partial_schema.tables.keys() {
             tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;

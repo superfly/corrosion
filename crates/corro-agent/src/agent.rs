@@ -48,7 +48,7 @@ use axum::{
 };
 use bytes::{Bytes, BytesMut};
 use foca::{Member, Notification};
-use futures::{FutureExt, StreamExt, TryFutureExt};
+use futures::{FutureExt, StreamExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use itertools::Itertools;
 use metrics::{counter, gauge, histogram, increment_counter};
@@ -525,9 +525,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                         let mut codec = LengthDelimitedCodec::new();
                                         let mut buf = BytesMut::new();
 
-                                        let mut stream_ended = false;
-
-                                        loop {
+                                        let stream_ended = loop {
                                             loop {
                                                 match codec.decode(&mut buf) {
                                                     Ok(Some(b)) => {
@@ -566,8 +564,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
                                             match rx.read_buf(&mut buf).await {
                                                 Ok(0) => {
-                                                    stream_ended = true;
-                                                    break;
+                                                    break true;
                                                 }
                                                 Ok(n) => {
                                                     counter!("corro.peer.stream.bytes.recv.total", n as u64, "type" => "uni");
@@ -575,11 +572,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                 }
                                                 Err(e) => {
                                                     error!("error reading bytes into buffer: {e}");
-                                                    stream_ended = true;
-                                                    break;
+                                                    break true;
                                                 }
                                             }
-                                        }
+                                        };
 
                                         if !stream_ended {
                                             if let Err(e) = rx.stop(0u32.into()) {
@@ -1815,7 +1811,7 @@ pub async fn process_multiple_changes(
         unknown_changes.push((change, src));
     }
 
-    unknown_changes.sort_by_key(|(change, src)| change.actor_id);
+    unknown_changes.sort_by_key(|(change, _src)| change.actor_id);
 
     let mut conn = agent.pool().write_normal().await?;
 
@@ -1829,7 +1825,7 @@ pub async fn process_multiple_changes(
 
         for (actor_id, changes) in unknown_changes
             .into_iter()
-            .group_by(|(change, src)| change.actor_id)
+            .group_by(|(change, _src)| change.actor_id)
             .into_iter()
         {
             // get a lock on the actor id's booked writer if we didn't already

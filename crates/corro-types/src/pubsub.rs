@@ -1461,7 +1461,7 @@ mod tests {
     use rusqlite::params;
 
     use crate::{
-        schema::{make_schema_inner, parse_sql},
+        schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
     };
 
@@ -1499,7 +1499,7 @@ mod tests {
 
         {
             let tx = conn.transaction()?;
-            make_schema_inner(&tx, &NormalizedSchema::default(), &mut schema)?;
+            apply_schema(&tx, &NormalizedSchema::default(), &mut schema)?;
             tx.commit()?;
         }
 
@@ -1631,7 +1631,7 @@ mod tests {
 
         {
             let tx = conn.transaction().unwrap();
-            make_schema_inner(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
+            apply_schema(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
             tx.commit().unwrap();
         }
 
@@ -1673,7 +1673,7 @@ mod tests {
 
             {
                 let tx = conn2.transaction().unwrap();
-                make_schema_inner(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
+                apply_schema(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
                 tx.commit().unwrap();
             }
 
