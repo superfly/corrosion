@@ -450,10 +450,6 @@ pub enum KnownDbVersion {
     Current {
         // cr-sqlite db version
         db_version: i64,
-        // start sequence, can be > 0 if we inserted the change w/ others
-        start_seq: i64,
-        // end sequence, can be different than last_seq
-        end_seq: i64,
         // actual last sequence originally produced
         last_seq: i64,
         // timestamp when the change was produced by the source

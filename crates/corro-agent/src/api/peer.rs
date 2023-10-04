@@ -406,15 +406,11 @@ fn handle_known_version(
     ts: Timestamp,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
+    trace!(%actor_id, %version, "handle known version! known: {init_known:?}, seqs_needed: {seqs_needed:?}");
     let mut seqs_iter = seqs_needed.into_iter();
     while let Some(range_needed) = seqs_iter.by_ref().next() {
         match &init_known {
-            KnownDbVersion::Current {
-                db_version,
-                start_seq,
-                end_seq,
-                ..
-            } => {
+            KnownDbVersion::Current { db_version, .. } => {
                 let bw = booked.blocking_write(format_compact!(
                     "sync_handle_known[{version}]:{}",
                     actor_id.as_simple()
@@ -448,14 +444,12 @@ fn handle_known_version(
                     .then_some(actor_id)
                     .map(|actor_id| actor_id.to_bytes());
 
-                // don't go under the start seq we have stored
-                let actual_start_seq = cmp::max(*range_needed.start() + start_seq, *start_seq);
-                // don't go over the end seq we have stored here!
-                let actual_end_seq = cmp::min(*range_needed.end() + start_seq, *end_seq);
+                let start_seq = range_needed.start();
+                let end_seq = range_needed.end();
 
                 let rows = prepped.query_map(
-                    params![site_id, db_version, actual_start_seq, actual_end_seq],
-                    |row| row_to_change(row, *start_seq),
+                    params![site_id, db_version, start_seq, end_seq],
+                    row_to_change_no_sub,
                 )?;
 
                 // drop write lock!
@@ -463,13 +457,7 @@ fn handle_known_version(
 
                 send_change_chunks(
                     sender,
-                    *start_seq,
-                    ChunkedChanges::new(
-                        rows,
-                        actual_start_seq,
-                        last_seq + *start_seq,
-                        MAX_CHANGES_BYTES_PER_MESSAGE,
-                    ),
+                    ChunkedChanges::new(rows, *start_seq, *end_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
                     actor_id,
                     version,
                     last_seq,
@@ -585,7 +573,6 @@ fn handle_known_version(
 
                         send_change_chunks(
                             sender,
-                            *start_seq,
                             ChunkedChanges::new(
                                 rows,
                                 *start_seq,
@@ -660,7 +647,6 @@ async fn process_version(
 
 fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     sender: &Sender<SyncMessage>,
-    start_seq: i64,
     mut chunked: ChunkedChanges<I>,
     actor_id: ActorId,
     version: i64,
@@ -681,7 +667,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
                     changeset: Changeset::Full {
                         version,
                         changes,
-                        seqs: (*seqs.start() - start_seq)..=(*seqs.end() - start_seq),
+                        seqs,
                         last_seq,
                         ts,
                     },
@@ -1093,6 +1079,30 @@ mod tests {
 
         let ts = agent.clock().new_timestamp().into();
 
+        let change1 = Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![1i64.into()])?,
+            cid: ColumnName("text".into()),
+            val: "one".into(),
+            col_version: 1,
+            db_version: 1,
+            seq: 0,
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        let change2 = Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![2i64.into()])?,
+            cid: ColumnName("text".into()),
+            val: "two".into(),
+            col_version: 1,
+            db_version: 2,
+            seq: 0,
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
         process_multiple_changes(
             &agent,
             vec![
@@ -1100,17 +1110,7 @@ mod tests {
                     actor_id,
                     changeset: Changeset::Full {
                         version: 1,
-                        changes: vec![Change {
-                            table: TableName("tests".into()),
-                            pk: pack_columns(&vec![1i64.into()])?,
-                            cid: ColumnName("text".into()),
-                            val: "one".into(),
-                            col_version: 1,
-                            db_version: 1,
-                            seq: 0,
-                            site_id: actor_id.to_bytes(),
-                            cl: 1,
-                        }],
+                        changes: vec![change1.clone()],
                         seqs: 0..=0,
                         last_seq: 0,
                         ts,
@@ -1120,17 +1120,7 @@ mod tests {
                     actor_id,
                     changeset: Changeset::Full {
                         version: 2,
-                        changes: vec![Change {
-                            table: TableName("tests".into()),
-                            pk: pack_columns(&vec![2i64.into()])?,
-                            cid: ColumnName("text".into()),
-                            val: "two".into(),
-                            col_version: 1,
-                            db_version: 2,
-                            seq: 0,
-                            site_id: actor_id.to_bytes(),
-                            cl: 1,
-                        }],
+                        changes: vec![change2.clone()],
                         seqs: 0..=0,
                         last_seq: 0,
                         ts,
@@ -1140,10 +1130,14 @@ mod tests {
         )
         .await?;
 
+        let known1 = KnownDbVersion::Current {
+            db_version: 1,
+            last_seq: 0,
+            ts,
+        };
+
         let known2 = KnownDbVersion::Current {
             db_version: 2,
-            start_seq: 1,
-            end_seq: 1,
             last_seq: 0, // original last seq
             ts,
         };
@@ -1159,22 +1153,57 @@ mod tests {
         {
             let read = booked.read("test").await;
 
-            assert_eq!(
-                read.get(&1).unwrap().clone(),
-                KnownDbVersion::Current {
-                    db_version: 2,
-                    start_seq: 0,
-                    end_seq: 0,
-                    last_seq: 0,
-                    ts
-                }
-            );
+            assert_eq!(read.get(&1).unwrap().clone(), known1);
             assert_eq!(read.get(&2).unwrap().clone(), known2);
         }
 
         {
             let (tx, mut rx) = mpsc::channel(5);
             let mut conn = agent.pool().read().await?;
+
+            {
+                let mut prepped = conn.prepare("SELECT * FROM crsql_changes;")?;
+                let mut rows = prepped.query([])?;
+
+                loop {
+                    let row = rows.next()?;
+                    if row.is_none() {
+                        break;
+                    }
+
+                    println!("ROW: {row:?}");
+                }
+            }
+
+            block_in_place(|| {
+                handle_known_version(
+                    &mut conn,
+                    actor_id,
+                    false,
+                    1,
+                    known1,
+                    &booked,
+                    vec![0..=0],
+                    0,
+                    ts,
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: 1,
+                        changes: vec![change1],
+                        seqs: 0..=0,
+                        last_seq: 0,
+                        ts,
+                    }
+                }))
+            );
 
             block_in_place(|| {
                 handle_known_version(
@@ -1198,23 +1227,13 @@ mod tests {
                     actor_id,
                     changeset: Changeset::Full {
                         version: 2,
-                        changes: vec![Change {
-                            table: TableName("tests".into()),
-                            pk: pack_columns(&vec![2i64.into()])?,
-                            cid: ColumnName("text".into()),
-                            val: "two".into(),
-                            col_version: 1,
-                            db_version: 2,
-                            seq: 0,
-                            site_id: actor_id.to_bytes(),
-                            cl: 1,
-                        }],
+                        changes: vec![change2],
                         seqs: 0..=0,
                         last_seq: 0,
                         ts,
                     }
                 }))
-            )
+            );
         }
 
         // make_broadcastable_change(&agent, |tx| {

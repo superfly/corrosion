@@ -419,12 +419,12 @@ pub fn runtime_loop(
                                     );
 
                                     let upserted = tx.prepare_cached("INSERT INTO __corro_members (actor_id, address, state, foca_state, rtts)
-                                                VALUES (?, ?, ?, ?, ?)
-                                            ON CONFLICT (actor_id) DO UPDATE SET
-                                                address = excluded.address,
-                                                state = excluded.state,
-                                                foca_state = excluded.foca_state,
-                                                rtts = excluded.rtts;")?
+                                            VALUES (?, ?, ?, ?, ?)
+                                        ON CONFLICT (actor_id) DO UPDATE SET
+                                            address = excluded.address,
+                                            state = excluded.state,
+                                            foca_state = excluded.foca_state,
+                                            rtts = excluded.rtts;")?
                                     .execute(params![
                                         id,
                                         address.to_string(),

@@ -202,7 +202,7 @@ where
         let version = last_version + 1;
         trace!("version: {version}");
 
-        let end_seq: i64 = tx
+        let last_seq: i64 = tx
             .prepare_cached(
                 "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
             )?
@@ -211,16 +211,15 @@ where
         let elapsed = {
             tx.prepare_cached(
                 r#"
-                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, start_seq, end_seq, last_seq, ts)
-                    VALUES (:actor_id, :start_version, :db_version, 0, :end_seq, :last_seq, :ts);
+                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
+                    VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
             "#,
             )?
-            .execute(named_params!{
+            .execute(named_params! {
                 ":actor_id": actor_id,
                 ":start_version": version,
                 ":db_version": db_version,
-                ":end_seq": end_seq,
-                ":last_seq": end_seq,
+                ":last_seq": last_seq,
                 ":ts": ts
             })?;
 
@@ -230,15 +229,13 @@ where
             start.elapsed()
         };
 
-        trace!("committed tx, db_version: {db_version}, end_seq: {end_seq:?}");
+        trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
         book_writer.insert(
             version,
             KnownDbVersion::Current {
                 db_version,
-                start_seq: 0,
-                end_seq,
-                last_seq: end_seq, // local, so same as end_seq
+                last_seq,
                 ts,
             },
         );
@@ -259,7 +256,7 @@ where
                         ORDER BY seq ASC
                 "#)?;
                 let rows = prepped.query_map([db_version], row_to_change_no_sub)?;
-                let chunked = ChunkedChanges::new(rows, 0, end_seq, MAX_CHANGES_BYTE_SIZE);
+                let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_BYTE_SIZE);
                 for changes_seqs in chunked {
                     match changes_seqs {
                         Ok((changes, seqs)) => {
@@ -282,7 +279,7 @@ where
                                                 version,
                                                 changes,
                                                 seqs,
-                                                last_seq: end_seq,
+                                                last_seq,
                                                 ts,
                                             },
                                         },
