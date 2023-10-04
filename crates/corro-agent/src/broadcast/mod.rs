@@ -363,7 +363,7 @@ pub fn runtime_loop(
                                 let foca_state = {
                                     // need to bind this...
                                     let foca_state = foca
-                                        .iter_members()
+                                        .iter_membership_state()
                                         .find(|member| member.id().id() == actor.id())
                                         .and_then(|member| match serde_json::to_string(member) {
                                             Ok(foca_state) => Some(foca_state),
