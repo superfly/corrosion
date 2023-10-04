@@ -463,6 +463,7 @@ fn handle_known_version(
 
                 send_change_chunks(
                     sender,
+                    *start_seq,
                     ChunkedChanges::new(
                         rows,
                         actual_start_seq,
@@ -584,6 +585,7 @@ fn handle_known_version(
 
                         send_change_chunks(
                             sender,
+                            *start_seq,
                             ChunkedChanges::new(
                                 rows,
                                 *start_seq,
@@ -658,6 +660,7 @@ async fn process_version(
 
 fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     sender: &Sender<SyncMessage>,
+    start_seq: i64,
     mut chunked: ChunkedChanges<I>,
     actor_id: ActorId,
     version: i64,
@@ -678,7 +681,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
                     changeset: Changeset::Full {
                         version,
                         changes,
-                        seqs,
+                        seqs: (*seqs.start() - start_seq)..=(*seqs.end() - start_seq),
                         last_seq,
                         ts,
                     },
@@ -1037,14 +1040,188 @@ pub async fn bidirectional_sync(
 
 #[cfg(test)]
 mod tests {
+    use axum::{Extension, Json};
     use camino::Utf8PathBuf;
+    use corro_tests::TEST_SCHEMA;
     use corro_types::{
-        config::TlsConfig,
+        api::{ColumnName, TableName},
+        config::{Config, TlsConfig},
+        pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
+    use hyper::StatusCode;
     use tempfile::TempDir;
+    use tokio::sync::mpsc;
+    use tripwire::Tripwire;
+
+    use crate::{
+        agent::setup,
+        api::public::{api_v1_db_schema, make_broadcastable_changes},
+    };
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_known_version() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
+        let dir = tempfile::tempdir()?;
+
+        let (agent, _agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire,
+        )
+        .await?;
+
+        let (status_code, _res) =
+            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+
+        let ts = agent.clock().new_timestamp().into();
+
+        process_multiple_changes(
+            &agent,
+            vec![
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: 1,
+                        changes: vec![Change {
+                            table: TableName("tests".into()),
+                            pk: pack_columns(&vec![1i64.into()])?,
+                            cid: ColumnName("text".into()),
+                            val: "one".into(),
+                            col_version: 1,
+                            db_version: 1,
+                            seq: 0,
+                            site_id: actor_id.to_bytes(),
+                            cl: 1,
+                        }],
+                        seqs: 0..=0,
+                        last_seq: 0,
+                        ts,
+                    },
+                },
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: 2,
+                        changes: vec![Change {
+                            table: TableName("tests".into()),
+                            pk: pack_columns(&vec![2i64.into()])?,
+                            cid: ColumnName("text".into()),
+                            val: "two".into(),
+                            col_version: 1,
+                            db_version: 2,
+                            seq: 0,
+                            site_id: actor_id.to_bytes(),
+                            cl: 1,
+                        }],
+                        seqs: 0..=0,
+                        last_seq: 0,
+                        ts,
+                    },
+                },
+            ],
+        )
+        .await?;
+
+        let known2 = KnownDbVersion::Current {
+            db_version: 2,
+            start_seq: 1,
+            end_seq: 1,
+            last_seq: 0, // original last seq
+            ts,
+        };
+
+        let booked = agent
+            .bookie()
+            .read("test")
+            .await
+            .get(&actor_id)
+            .cloned()
+            .unwrap();
+
+        {
+            let read = booked.read("test").await;
+
+            assert_eq!(
+                read.get(&1).unwrap().clone(),
+                KnownDbVersion::Current {
+                    db_version: 2,
+                    start_seq: 0,
+                    end_seq: 0,
+                    last_seq: 0,
+                    ts
+                }
+            );
+            assert_eq!(read.get(&2).unwrap().clone(), known2);
+        }
+
+        {
+            let (tx, mut rx) = mpsc::channel(5);
+            let mut conn = agent.pool().read().await?;
+
+            block_in_place(|| {
+                handle_known_version(
+                    &mut conn,
+                    actor_id,
+                    false,
+                    2,
+                    known2,
+                    &booked,
+                    vec![0..=0],
+                    0,
+                    ts,
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: 2,
+                        changes: vec![Change {
+                            table: TableName("tests".into()),
+                            pk: pack_columns(&vec![2i64.into()])?,
+                            cid: ColumnName("text".into()),
+                            val: "two".into(),
+                            col_version: 1,
+                            db_version: 2,
+                            seq: 0,
+                            site_id: actor_id.to_bytes(),
+                            cl: 1,
+                        }],
+                        seqs: 0..=0,
+                        last_seq: 0,
+                        ts,
+                    }
+                }))
+            )
+        }
+
+        // make_broadcastable_change(&agent, |tx| {
+        //     tx.execute("INSERT INTO test (id, text) VALUES (1, \"one\")", [])
+        // })?;
+
+        // make_broadcastable_change(&agent, |tx| {
+        //     tx.execute("INSERT INTO test (id, text) VALUES (2, \"two\")", [])
+        // })?;
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_mutual_tls() -> eyre::Result<()> {

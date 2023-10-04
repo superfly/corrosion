@@ -2194,13 +2194,12 @@ fn process_complete_version(
         last_rows_impacted = rows_impacted;
     }
 
-    let db_version: i64 = tx
-        .prepare_cached("SELECT crsql_next_db_version()")?
-        .query_row((), |row| row.get(0))?;
-
     let (known_version, new_changeset) = if impactful_changeset.is_empty() {
         (KnownDbVersion::Cleared, Changeset::Empty { versions })
     } else {
+        let db_version: i64 = tx
+            .prepare_cached("SELECT crsql_next_db_version()")?
+            .query_row((), |row| row.get(0))?;
         let end_seq: i64 = tx
             .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
             .query_row([db_version], |row| row.get(0))?;
@@ -2856,6 +2855,7 @@ pub mod tests {
 
         println!("body: {body:?}");
 
+        #[allow(clippy::type_complexity)]
         let bk: Vec<(ActorId, i64, Option<i64>, i64, Option<i64>, Option<i64>, Option<i64>)> = ta1
             .agent
             .pool()

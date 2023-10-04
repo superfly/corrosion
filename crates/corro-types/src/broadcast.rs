@@ -64,7 +64,7 @@ pub enum BroadcastV1 {
 }
 
 // TODO: shrink this by mapping primary keys to integers instead of repeating them
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
     pub changeset: Changeset,
@@ -78,7 +78,7 @@ impl Deref for ChangeV1 {
     }
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum Changeset {
     Empty {
         versions: RangeInclusive<i64>,

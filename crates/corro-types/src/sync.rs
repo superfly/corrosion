@@ -11,19 +11,19 @@ use crate::{
     broadcast::{ChangeV1, Timestamp},
 };
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum SyncMessage {
     V1(SyncMessageV1),
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum SyncMessageV1 {
     State(SyncStateV1),
     Changeset(ChangeV1),
     Clock(Timestamp),
 }
 
-#[derive(Debug, Default, Clone, Readable, Writable, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Readable, Writable, Serialize, Deserialize)]
 pub struct SyncStateV1 {
     pub actor_id: ActorId,
     pub heads: HashMap<ActorId, i64>,
