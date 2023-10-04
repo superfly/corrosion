@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, net::SocketAddr, ops::Range, time::Duration};
 
 use circular_buffer::CircularBuffer;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use crate::{
     actor::{Actor, ActorId},

@@ -9,7 +9,7 @@ use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
-    api::{row_to_change_no_sub, ExecResponse, ExecResult, QueryEvent, Statement},
+    api::{row_to_change, ExecResponse, ExecResult, QueryEvent, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::SqliteValue,
     schema::{make_schema_inner, parse_sql},
@@ -18,7 +18,7 @@ use corro_types::{
 use hyper::StatusCode;
 use itertools::Itertools;
 use metrics::counter;
-use rusqlite::{named_params, params, params_from_iter, ToSql, Transaction};
+use rusqlite::{named_params, params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
     sync::{
@@ -255,7 +255,7 @@ where
                           AND db_version = ?
                         ORDER BY seq ASC
                 "#)?;
-                let rows = prepped.query_map([db_version], row_to_change_no_sub)?;
+                let rows = prepped.query_map([db_version], row_to_change)?;
                 let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_BYTE_SIZE);
                 for changes_seqs in chunked {
                     match changes_seqs {

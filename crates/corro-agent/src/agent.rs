@@ -27,8 +27,8 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion, SplitPool},
     broadcast::{
-        BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeV1, Changeset, ChangesetParts,
-        FocaInput, Timestamp, UniPayload, UniPayloadV1,
+        BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset,
+        ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
     change::Change,
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
@@ -89,6 +89,7 @@ pub struct AgentOptions {
     pub rx_bcast: Receiver<BroadcastInput>,
     pub rx_apply: Receiver<(ActorId, i64)>,
     pub rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
+    pub rx_changes: Receiver<(ChangeV1, ChangeSource)>,
     pub rtt_rx: Receiver<(SocketAddr, Duration)>,
     pub tripwire: Tripwire,
 }
@@ -252,8 +253,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     );
 
     let (tx_bcast, rx_bcast) = channel(10240);
-
     let (tx_empty, rx_empty) = channel(10240);
+    let (tx_changes, rx_changes) = channel(10240);
 
     let opts = AgentOptions {
         actor_id,
@@ -263,6 +264,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         rx_bcast,
         rx_apply,
         rx_empty,
+        rx_changes,
         rtt_rx,
         tripwire: tripwire.clone(),
     };
@@ -279,6 +281,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_bcast,
         tx_apply,
         tx_empty,
+        tx_changes,
         schema: RwLock::new(schema),
         tripwire,
     });
@@ -304,6 +307,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rx_bcast,
         rx_apply,
         rx_empty,
+        rx_changes,
         rtt_rx,
     } = opts;
 
@@ -903,6 +907,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             .inspect(|_| info!("corrosion api is done")),
     );
 
+    spawn_counted(handle_changes(agent.clone(), rx_changes, tripwire.clone()));
+
     spawn_counted(
         sync_loop(
             agent.clone(),
@@ -925,28 +931,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     ));
     tokio::spawn(metrics_loop(agent.clone()));
 
-    let gossip_chunker =
-        ReceiverStream::new(bcast_rx).chunks_timeout(50, Duration::from_millis(500));
-    tokio::pin!(gossip_chunker);
+    tokio::spawn(handle_broadcasts(agent.clone(), bcast_rx));
+
+    // tokio::spawn
 
     loop {
         tokio::select! {
             biased;
-            msg = StreamExt::next(&mut gossip_chunker) => match msg {
-                Some(msg) => {
-                    spawn_counted(
-                        handle_gossip(agent.clone(), msg, false)
-                            .inspect_err(|e| error!("error handling gossip: {e}")).preemptible(tripwire.clone()).complete_or_else(|_| {
-                                warn!("preempted a gossip");
-                                eyre::eyre!("preempted a gossip")
-                            })
-                    );
-                },
-                None => {
-                    error!("NO MORE PARSED MESSAGES");
-                    break;
-                }
-            },
             _ = db_cleanup_interval.tick() => {
                 tokio::spawn(handle_db_cleanup(agent.pool().clone()).preemptible(tripwire.clone()));
             },
@@ -1355,27 +1346,22 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
     }
 }
 
-async fn handle_gossip(
-    agent: Agent,
-    messages: Vec<BroadcastV1>,
-    high_priority: bool,
-) -> eyre::Result<()> {
-    let priority_label = if high_priority { "high" } else { "normal" };
-    counter!("corro.broadcast.recv.count", messages.len() as u64, "priority" => priority_label);
-
-    let rebroadcast = process_messages(&agent, messages).await?;
-
-    for msg in rebroadcast {
-        if let Err(e) = agent
-            .tx_bcast()
-            .send(BroadcastInput::Rebroadcast(msg))
-            .await
-        {
-            error!("could not send message rebroadcast: {e}");
+async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>) {
+    while let Some(bcast) = bcast_rx.recv().await {
+        increment_counter!("corro.broadcast.recv.count");
+        match bcast {
+            BroadcastV1::Change(change) => {
+                if let Err(_e) = agent
+                    .tx_changes()
+                    .send((change, ChangeSource::Broadcast))
+                    .await
+                {
+                    error!("changes channel is closed");
+                    break;
+                }
+            }
         }
     }
-
-    Ok(())
 }
 
 async fn handle_notifications(
@@ -1795,13 +1781,15 @@ async fn process_fully_buffered_changes(
 
 pub async fn process_multiple_changes(
     agent: &Agent,
-    changes: Vec<ChangeV1>,
-) -> Result<Vec<(ActorId, Changeset)>, ChangeError> {
+    changes: Vec<(ChangeV1, ChangeSource)>,
+) -> Result<(), ChangeError> {
+    info!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.len());
+
     let bookie = agent.bookie();
 
     let mut seen = HashSet::new();
     let mut unknown_changes = Vec::with_capacity(changes.len());
-    for change in changes {
+    for (change, src) in changes {
         let versions = change.versions();
         let seqs = change.seqs();
         if !seen.insert((change.actor_id, versions, seqs.cloned())) {
@@ -1824,13 +1812,10 @@ pub async fn process_multiple_changes(
             continue;
         }
 
-        unknown_changes.push(change);
+        unknown_changes.push((change, src));
     }
 
-    // NOTE: should we use `Vec::with_capacity(unknown_changes.len())?`
-    let mut res = vec![];
-
-    unknown_changes.sort_by_key(|change| change.actor_id);
+    unknown_changes.sort_by_key(|(change, src)| change.actor_id);
 
     let mut conn = agent.pool().write_normal().await?;
 
@@ -1842,7 +1827,7 @@ pub async fn process_multiple_changes(
 
         for (actor_id, changes) in unknown_changes
             .into_iter()
-            .group_by(|change| change.actor_id)
+            .group_by(|(change, src)| change.actor_id)
             .into_iter()
         {
             // get a lock on the actor id's booked writer if we didn't already
@@ -1862,7 +1847,7 @@ pub async fn process_multiple_changes(
 
                 let mut seen = RangeInclusiveMap::new();
 
-                for change in changes {
+                for (change, src) in changes {
                     let seqs = change.seqs();
                     if booked_write.contains_all(change.versions(), change.seqs()) {
                         trace!(
@@ -1917,7 +1902,7 @@ pub async fn process_multiple_changes(
 
                     seen.insert(versions.clone(), known.clone());
 
-                    changesets.push((actor_id, changeset));
+                    changesets.push((actor_id, changeset, src));
                     knowns.entry(actor_id).or_default().push((versions, known));
                 }
             }
@@ -2000,15 +1985,26 @@ pub async fn process_multiple_changes(
             }
         }
 
-        for (actor_id, changeset) in changesets {
+        for (actor_id, changeset, src) in changesets {
             process_subs(agent, changeset.changes());
-            res.push((actor_id, changeset));
+            if matches!(src, ChangeSource::Broadcast) && !changeset.is_empty() {
+                if let Err(_e) =
+                    agent
+                        .tx_bcast()
+                        .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
+                            actor_id,
+                            changeset,
+                        })))
+                {
+                    debug!("broadcasts are full or done!");
+                }
+            }
         }
 
         Ok::<_, ChangeError>(())
     })?;
 
-    Ok(res)
+    Ok(())
 }
 
 fn process_incomplete_version(
@@ -2235,29 +2231,6 @@ fn process_single_version(
     Ok((known, changeset))
 }
 
-async fn process_messages(
-    agent: &Agent,
-    bcast: Vec<BroadcastV1>,
-) -> Result<Vec<BroadcastV1>, ChangeError> {
-    let changes = bcast
-        .into_iter()
-        .map(|bcast| match bcast {
-            BroadcastV1::Change(change) => change,
-        })
-        .collect();
-
-    Ok(process_multiple_changes(agent, changes)
-        .await?
-        .into_iter()
-        .map(|(actor_id, changeset)| {
-            BroadcastV1::Change(ChangeV1 {
-                actor_id,
-                changeset,
-            })
-        })
-        .collect())
-}
-
 pub fn process_subs(agent: &Agent, changeset: &[Change]) {
     trace!("process subs...");
 
@@ -2325,6 +2298,8 @@ pub enum SyncRecvError {
     ExpectedClockMessage,
     #[error("timed out waiting for sync message")]
     TimedOut,
+    #[error("changes channel is closed")]
+    ChangesChannelClosed,
 }
 
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
@@ -2408,6 +2383,73 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         );
     }
     Ok(())
+}
+
+const MIN_CHANGES_CHUNK: usize = 1000;
+
+async fn handle_changes(
+    agent: Agent,
+    mut rx_changes: Receiver<(ChangeV1, ChangeSource)>,
+    mut tripwire: Tripwire,
+) {
+    let mut buf = vec![];
+    let mut count = 0;
+
+    let mut max_wait = tokio::time::interval(Duration::from_millis(500));
+
+    loop {
+        tokio::select! {
+            Some((change, src)) = rx_changes.recv() => {
+                count += std::cmp::max(change.len(), 1);
+                buf.push((change, src));
+                if count < MIN_CHANGES_CHUNK {
+                    continue;
+                }
+            },
+            _ = max_wait.tick() => {
+                // got a wait interval tick...
+                if buf.is_empty() {
+                    continue;
+                }
+            },
+            _ = &mut tripwire => {
+                break;
+            }
+            else => {
+                break;
+            }
+        }
+
+        // drain and process current changes!
+        if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect()).await {
+            error!("could not process multiple changes: {e}");
+        }
+
+        // reset count
+        count = 0;
+    }
+
+    info!("draining changes receiver...");
+
+    // drain!
+    while let Ok((change, src)) = rx_changes.try_recv() {
+        count += std::cmp::max(change.len(), 1);
+        buf.push((change, src));
+        if count >= MIN_CHANGES_CHUNK {
+            // drain and process current changes!
+            if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect()).await {
+                error!("could not process multiple changes: {e}");
+            }
+
+            // reset count
+            count = 0;
+        }
+    }
+
+    // process the last changes we got!
+    if let Err(e) = process_multiple_changes(&agent, buf).await {
+        error!("could not process multiple changes: {e}");
+    }
 }
 
 const CHECK_EMPTIES_TO_INSERT_AFTER: Duration = Duration::from_secs(120);

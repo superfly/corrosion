@@ -40,7 +40,7 @@ use tripwire::Tripwire;
 
 use crate::{
     actor::ActorId,
-    broadcast::{BroadcastInput, Timestamp},
+    broadcast::{BroadcastInput, ChangeSource, ChangeV1, Timestamp},
     config::Config,
     pubsub::MatcherHandle,
     schema::NormalizedSchema,
@@ -67,6 +67,7 @@ pub struct AgentConfig {
     pub tx_bcast: Sender<BroadcastInput>,
     pub tx_apply: Sender<(ActorId, i64)>,
     pub tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
+    pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
 
     pub schema: RwLock<NormalizedSchema>,
     pub tripwire: Tripwire,
@@ -85,6 +86,7 @@ pub struct AgentInner {
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
+    tx_changes: Sender<(ChangeV1, ChangeSource)>,
     schema: RwLock<NormalizedSchema>,
 }
 
@@ -103,6 +105,7 @@ impl Agent {
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             tx_empty: config.tx_empty,
+            tx_changes: config.tx_changes,
             schema: config.schema,
         }))
     }
@@ -137,6 +140,10 @@ impl Agent {
 
     pub fn tx_apply(&self) -> &Sender<(ActorId, i64)> {
         &self.0.tx_apply
+    }
+
+    pub fn tx_changes(&self) -> &Sender<(ChangeV1, ChangeSource)> {
+        &self.0.tx_changes
     }
 
     pub fn tx_empty(&self) -> &Sender<(ActorId, RangeInclusive<i64>)> {

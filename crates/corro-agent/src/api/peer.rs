@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::{Buf, BufMut, BytesMut};
 use compact_str::format_compact;
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
-use corro_types::api::row_to_change_no_sub;
-use corro_types::broadcast::{ChangeV1, Changeset, Timestamp};
+use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset, Timestamp};
 use corro_types::change::{row_to_change, Change};
 use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
@@ -25,7 +24,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::agent::{process_multiple_changes, SyncRecvError};
+use crate::agent::SyncRecvError;
 use crate::api::public::ChunkedChanges;
 
 use corro_types::{
@@ -449,7 +448,7 @@ fn handle_known_version(
 
                 let rows = prepped.query_map(
                     params![site_id, db_version, start_seq, end_seq],
-                    row_to_change_no_sub,
+                    row_to_change,
                 )?;
 
                 // drop write lock!
@@ -565,7 +564,7 @@ fn handle_known_version(
 
                         let rows = prepped.query_map(
                             params![site_id, version, start_seq, end_seq],
-                            row_to_change_no_sub,
+                            row_to_change,
                         )?;
 
                         // drop write lock!
@@ -930,6 +929,8 @@ pub async fn bidirectional_sync(
         .inspect_err(|e| error!("could not process sync request: {e}")),
     );
 
+    let tx_changes = agent.tx_changes().clone();
+
     let (_sent_count, recv_count) = tokio::try_join!(
         async move {
             let mut count = 0;
@@ -978,10 +979,6 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
-            let mut buf_count = 0;
-            // changes buffer
-            let mut buf = vec![];
-
             loop {
                 match read_sync_msg(&mut read).await {
                     Ok(None) => {
@@ -993,10 +990,11 @@ pub async fn bidirectional_sync(
                     }
                     Ok(Some(msg)) => match msg {
                         SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
-                            let len = change.len();
-                            buf.push(change);
-                            count += len;
-                            buf_count += std::cmp::max(len, 1); // empty changes have a len of 0, but we still count them
+                            count += change.len();
+                            tx_changes
+                                .send((change, ChangeSource::Sync))
+                                .await
+                                .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
                         }
                         SyncMessage::V1(SyncMessageV1::State(_)) => {
                             warn!("received sync state message more than once, ignoring");
@@ -1008,18 +1006,7 @@ pub async fn bidirectional_sync(
                         }
                     },
                 }
-
-                if buf_count >= 30 {
-                    process_multiple_changes(agent, buf.drain(..).collect())
-                        .await
-                        .map_err(SyncRecvError::from)?;
-                    buf_count = 0;
-                }
             }
-
-            process_multiple_changes(agent, buf.drain(..).collect())
-                .await
-                .map_err(SyncRecvError::from)?;
 
             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
 
@@ -1049,8 +1036,8 @@ mod tests {
     use tripwire::Tripwire;
 
     use crate::{
-        agent::setup,
-        api::public::{api_v1_db_schema, make_broadcastable_changes},
+        agent::{process_multiple_changes, setup},
+        api::public::api_v1_db_schema,
     };
 
     use super::*;
@@ -1109,26 +1096,32 @@ mod tests {
         process_multiple_changes(
             &agent,
             vec![
-                ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Full {
-                        version: 1,
-                        changes: vec![change1.clone()],
-                        seqs: 0..=0,
-                        last_seq: 0,
-                        ts,
+                (
+                    ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Full {
+                            version: 1,
+                            changes: vec![change1.clone()],
+                            seqs: 0..=0,
+                            last_seq: 0,
+                            ts,
+                        },
                     },
-                },
-                ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Full {
-                        version: 2,
-                        changes: vec![change2.clone()],
-                        seqs: 0..=0,
-                        last_seq: 0,
-                        ts,
+                    ChangeSource::Sync,
+                ),
+                (
+                    ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Full {
+                            version: 2,
+                            changes: vec![change2.clone()],
+                            seqs: 0..=0,
+                            last_seq: 0,
+                            ts,
+                        },
                     },
-                },
+                    ChangeSource::Sync,
+                ),
             ],
         )
         .await?;

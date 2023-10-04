@@ -116,7 +116,7 @@ pub fn pack_columns(args: &[SqliteValue]) -> Result<Vec<u8>, PackError> {
                     let type_byte = num_bytes_for_len << 3 | (ColumnType::Blob as u8);
                     buf.put_u8(type_byte);
                     buf.put_int(len as i64, num_bytes_for_len as usize);
-                    buf.put_slice(&value);
+                    buf.put_slice(value);
                 }
             }
         }
@@ -128,29 +128,29 @@ pub fn pack_columns(args: &[SqliteValue]) -> Result<Vec<u8>, PackError> {
 
 fn num_bytes_needed_i64(val: i64) -> u8 {
     if val & 0xFF00000000000000u64 as i64 != 0 {
-        return 8;
+        8
     } else if val & 0x00FF000000000000 != 0 {
-        return 7;
+        7
     } else if val & 0x0000FF0000000000 != 0 {
-        return 6;
+        6
     } else if val & 0x000000FF00000000 != 0 {
-        return 5;
+        5
     } else {
-        return num_bytes_needed_i32(val as i32);
+        num_bytes_needed_i32(val as i32)
     }
 }
 
 fn num_bytes_needed_i32(val: i32) -> u8 {
     if val & 0xFF000000u32 as i32 != 0 {
-        return 4;
+        4
     } else if val & 0x00FF0000 != 0 {
-        return 3;
+        3
     } else if val & 0x0000FF00 != 0 {
-        return 2;
+        2
     } else if val * 0x000000FF != 0 {
-        return 1;
+        1
     } else {
-        return 0;
+        0
     }
 }
 
@@ -1457,7 +1457,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use camino::Utf8PathBuf;
-    use corro_api_types::row_to_change_no_sub;
+    use corro_api_types::row_to_change;
     use rusqlite::params;
 
     use crate::{
@@ -1679,7 +1679,7 @@ mod tests {
 
             let changes = {
                 let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
-                let rows = prepped.query_map([1], row_to_change_no_sub).unwrap();
+                let rows = prepped.query_map([1], row_to_change).unwrap();
 
                 let mut changes = vec![];
 
@@ -1761,7 +1761,7 @@ mod tests {
 
             let changes = {
                 let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
-                let rows = prepped.query_map([2], row_to_change_no_sub).unwrap();
+                let rows = prepped.query_map([2], row_to_change).unwrap();
 
                 let mut changes = vec![];
 
@@ -1795,7 +1795,7 @@ mod tests {
 
             let changes = {
                 let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
-                let rows = prepped.query_map([3], row_to_change_no_sub).unwrap();
+                let rows = prepped.query_map([3], row_to_change).unwrap();
 
                 let mut changes = vec![];
 
@@ -1827,7 +1827,7 @@ mod tests {
 
             let changes = {
                 let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
-                let rows = prepped.query_map([4], row_to_change_no_sub).unwrap();
+                let rows = prepped.query_map([4], row_to_change).unwrap();
 
                 let mut changes = vec![];
 
@@ -1890,7 +1890,7 @@ mod tests {
 
             let changes = {
                 let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS NULL AND db_version = ? ORDER BY seq ASC"#).unwrap();
-                let rows = prepped.query_map([5], row_to_change_no_sub).unwrap();
+                let rows = prepped.query_map([5], row_to_change).unwrap();
 
                 let mut changes = vec![];
 

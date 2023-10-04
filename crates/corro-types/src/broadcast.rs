@@ -63,6 +63,12 @@ pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ChangeSource {
+    Broadcast,
+    Sync,
+}
+
 // TODO: shrink this by mapping primary keys to integers instead of repeating them
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub struct ChangeV1 {
