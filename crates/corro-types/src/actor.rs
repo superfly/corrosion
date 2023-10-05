@@ -162,7 +162,7 @@ impl Actor {
 
 impl From<SocketAddr> for Actor {
     fn from(value: SocketAddr) -> Self {
-        Self::new(ActorId(Uuid::nil()), value, Timestamp(0))
+        Self::new(ActorId(Uuid::nil()), value, Timestamp::zero())
     }
 }
 

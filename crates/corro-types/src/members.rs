@@ -58,7 +58,7 @@ impl Members {
 
         trace!("member: {member:?}");
 
-        if actor.ts() < member.ts {
+        if actor.ts().to_time() < member.ts.to_time() {
             debug!("older timestamp, ignoring");
             return false;
         }
