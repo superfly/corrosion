@@ -14,7 +14,7 @@ use rusqlite::{
     ToSql,
 };
 use serde::{Deserialize, Serialize};
-use speedy::{Readable, Writable};
+use speedy::{Context, Readable, Reader, Writable, Writer};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
 use tracing::{error, trace};
@@ -63,8 +63,14 @@ pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ChangeSource {
+    Broadcast,
+    Sync,
+}
+
 // TODO: shrink this by mapping primary keys to integers instead of repeating them
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
     pub changeset: Changeset,
@@ -78,7 +84,7 @@ impl Deref for ChangeV1 {
     }
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum Changeset {
     Empty {
         versions: RangeInclusive<i64>,
@@ -201,33 +207,48 @@ pub enum TimestampParseError {
     Parse(ParseNTP64Error),
 }
 
-#[derive(
-    Debug, Default, Clone, Copy, Serialize, Deserialize, Readable, Writable, PartialEq, Eq,
-)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd)]
 #[serde(transparent)]
-pub struct Timestamp(pub u64);
+pub struct Timestamp(pub NTP64);
 
 impl Timestamp {
     pub fn to_time(&self) -> OffsetDateTime {
-        let t = NTP64(self.0);
-        OffsetDateTime::from_unix_timestamp(t.as_secs() as i64).unwrap()
-            + time::Duration::nanoseconds(t.subsec_nanos() as i64)
+        OffsetDateTime::from_unix_timestamp(self.0.as_secs() as i64).unwrap()
+            + time::Duration::nanoseconds(self.0.subsec_nanos() as i64)
     }
 
     pub fn to_ntp64(&self) -> NTP64 {
-        NTP64(self.0)
+        self.0
+    }
+
+    pub fn zero() -> Self {
+        Timestamp(NTP64(0))
+    }
+}
+
+impl Deref for Timestamp {
+    type Target = NTP64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        NTP64(self.0).fmt(f)
+        self.0.fmt(f)
     }
 }
 
 impl From<uhlc::Timestamp> for Timestamp {
     fn from(ts: uhlc::Timestamp) -> Self {
-        Self(ts.get_time().as_u64())
+        Self(*ts.get_time())
+    }
+}
+
+impl From<NTP64> for Timestamp {
+    fn from(ntp64: NTP64) -> Self {
+        Self(ntp64)
     }
 }
 
@@ -236,7 +257,7 @@ impl FromSql for Timestamp {
         match value {
             rusqlite::types::ValueRef::Text(b) => match std::str::from_utf8(b) {
                 Ok(s) => match s.parse::<NTP64>() {
-                    Ok(ntp) => Ok(Timestamp(ntp.as_u64())),
+                    Ok(ntp) => Ok(Timestamp(ntp)),
                     Err(e) => Err(FromSqlError::Other(Box::new(TimestampParseError::Parse(e)))),
                 },
                 Err(e) => Err(FromSqlError::Other(Box::new(e))),
@@ -249,8 +270,38 @@ impl FromSql for Timestamp {
 impl ToSql for Timestamp {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         Ok(rusqlite::types::ToSqlOutput::Owned(
-            rusqlite::types::Value::Text(NTP64(self.0).to_string()),
+            rusqlite::types::Value::Text(self.0.to_string()),
         ))
+    }
+}
+
+impl<'a, C> Readable<'a, C> for Timestamp
+where
+    C: Context,
+{
+    #[inline]
+    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+        Ok(Timestamp(NTP64(u64::read_from(reader)?)))
+    }
+
+    #[inline]
+    fn minimum_bytes_needed() -> usize {
+        std::mem::size_of::<u64>()
+    }
+}
+
+impl<C> Writable<C> for Timestamp
+where
+    C: Context,
+{
+    #[inline]
+    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
+        self.0 .0.write_to(writer)
+    }
+
+    #[inline]
+    fn bytes_needed(&self) -> Result<usize, C::Error> {
+        <u64 as speedy::Writable<C>>::bytes_needed(&self.0 .0)
     }
 }
 

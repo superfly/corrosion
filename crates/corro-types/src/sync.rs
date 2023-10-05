@@ -11,19 +11,19 @@ use crate::{
     broadcast::{ChangeV1, Timestamp},
 };
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum SyncMessage {
     V1(SyncMessageV1),
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum SyncMessageV1 {
     State(SyncStateV1),
     Changeset(ChangeV1),
     Clock(Timestamp),
 }
 
-#[derive(Debug, Default, Clone, Readable, Writable, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Readable, Writable, Serialize, Deserialize)]
 pub struct SyncStateV1 {
     pub actor_id: ActorId,
     pub heads: HashMap<ActorId, i64>,
@@ -83,7 +83,7 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
 
     let actors: Vec<(ActorId, Booked)> = {
         bookie
-            .read()
+            .read("generate_sync")
             .await
             .iter()
             .map(|(k, v)| (*k, v.clone()))
@@ -91,19 +91,32 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
     };
 
     for (actor_id, booked) in actors {
-        let last_version = match booked.last().await {
+        let last_version = match {
+            booked
+                .read(format!("generate_sync(last):{}", actor_id.as_simple()))
+                .await
+                .last()
+        } {
             Some(v) => v,
             None => continue,
         };
 
-        let need: Vec<_> = { booked.read().await.gaps(&(1..=last_version)).collect() };
+        let need: Vec<_> = {
+            booked
+                .read(format!("generate_sync(need):{}", actor_id.as_simple()))
+                .await
+                .gaps(&(1..=last_version))
+                .collect()
+        };
 
         if !need.is_empty() {
             state.need.insert(actor_id, need);
         }
 
         {
-            let read = booked.read().await;
+            let read = booked
+                .read(format!("generate_sync(partials):{}", actor_id.as_simple()))
+                .await;
             for (range, known) in read.iter() {
                 if let KnownDbVersion::Partial { seqs, last_seq, .. } = known {
                     if seqs.gaps(&(0..=*last_seq)).count() == 0 {

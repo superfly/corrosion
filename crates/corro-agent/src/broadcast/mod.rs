@@ -206,37 +206,39 @@ pub fn runtime_loop(
                         let states: Vec<_> = {
                             let members = agent.members().read();
 
-                            foca.iter_members()
+                            foca.iter_membership_state()
                                 .filter_map(|member| {
-                                    members.get(&member.id().id()).and_then(|state| {
-                                        match serde_json::to_string(member) {
-                                            Ok(foca_state) => Some((
-                                                member.id().id(),
-                                                state.addr,
-                                                "up",
-                                                foca_state,
-                                                serde_json::Value::Array(
-                                                    members
-                                                        .rtts
-                                                        .get(&state.addr)
-                                                        .map(|rtt| {
-                                                            rtt.buf
-                                                                .iter()
-                                                                .copied()
-                                                                .map(serde_json::Value::from)
-                                                                .collect::<Vec<serde_json::Value>>()
-                                                        })
-                                                        .unwrap_or(vec![]),
-                                                ),
-                                            )),
-                                            Err(e) => {
-                                                error!(
-                                                    "could not serialize foca member state: {e}"
-                                                );
-                                                None
-                                            }
+                                    let id = member.id().id();
+                                    let addr = member.id().addr();
+                                    match serde_json::to_string(member) {
+                                        Ok(foca_state) => Some((
+                                            id,
+                                            addr,
+                                            if members.get(&id).is_some() {
+                                                "up"
+                                            } else {
+                                                "down"
+                                            },
+                                            foca_state,
+                                            serde_json::Value::Array(
+                                                members
+                                                    .rtts
+                                                    .get(&addr)
+                                                    .map(|rtt| {
+                                                        rtt.buf
+                                                            .iter()
+                                                            .copied()
+                                                            .map(serde_json::Value::from)
+                                                            .collect::<Vec<serde_json::Value>>()
+                                                    })
+                                                    .unwrap_or(vec![]),
+                                            ),
+                                        )),
+                                        Err(e) => {
+                                            error!("could not serialize foca member state: {e}");
+                                            None
                                         }
-                                    })
+                                    }
                                 })
                                 .collect()
                         };
@@ -361,7 +363,7 @@ pub fn runtime_loop(
                                 let foca_state = {
                                     // need to bind this...
                                     let foca_state = foca
-                                        .iter_members()
+                                        .iter_membership_state()
                                         .find(|member| member.id().id() == actor.id())
                                         .and_then(|member| match serde_json::to_string(member) {
                                             Ok(foca_state) => Some(foca_state),
@@ -417,12 +419,12 @@ pub fn runtime_loop(
                                     );
 
                                     let upserted = tx.prepare_cached("INSERT INTO __corro_members (actor_id, address, state, foca_state, rtts)
-                                                VALUES (?, ?, ?, ?, ?)
-                                            ON CONFLICT (actor_id) DO UPDATE SET
-                                                address = excluded.address,
-                                                state = excluded.state,
-                                                foca_state = excluded.foca_state,
-                                                rtts = excluded.rtts;")?
+                                            VALUES (?, ?, ?, ?, ?)
+                                        ON CONFLICT (actor_id) DO UPDATE SET
+                                            address = excluded.address,
+                                            state = excluded.state,
+                                            foca_state = excluded.foca_state,
+                                            rtts = excluded.rtts;")?
                                     .execute(params![
                                         id,
                                         address.to_string(),

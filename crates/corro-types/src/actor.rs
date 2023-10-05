@@ -1,4 +1,10 @@
-use std::{fmt, hash::Hash, net::SocketAddr, ops::Deref};
+use std::{
+    fmt,
+    hash::Hash,
+    net::SocketAddr,
+    ops::Deref,
+    time::{Duration, SystemTime},
+};
 
 use corro_api_types::SqliteValue;
 use foca::Identity;
@@ -8,7 +14,10 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
+use uhlc::NTP64;
 use uuid::Uuid;
+
+use crate::broadcast::Timestamp;
 
 #[derive(
     Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
@@ -30,9 +39,11 @@ impl ActorId {
     }
 }
 
-impl From<ActorId> for uhlc::ID {
-    fn from(val: ActorId) -> Self {
-        val.0.into()
+impl TryFrom<ActorId> for uhlc::ID {
+    type Error = uhlc::SizeError;
+
+    fn try_from(value: ActorId) -> Result<Self, Self::Error> {
+        value.as_bytes().try_into()
     }
 }
 
@@ -123,8 +134,7 @@ impl FromSql for ActorId {
 pub struct Actor {
     id: ActorId,
     addr: SocketAddr,
-    // An extra field to allow fast rejoin
-    bump: u16,
+    ts: Timestamp,
 }
 
 impl Hash for Actor {
@@ -135,12 +145,8 @@ impl Hash for Actor {
 }
 
 impl Actor {
-    pub fn new(id: ActorId, addr: SocketAddr) -> Self {
-        Self {
-            id,
-            addr,
-            bump: rand::random(),
-        }
+    pub fn new(id: ActorId, addr: SocketAddr, ts: Timestamp) -> Self {
+        Self { id, addr, ts }
     }
 
     pub fn id(&self) -> ActorId {
@@ -149,11 +155,14 @@ impl Actor {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+    pub fn ts(&self) -> Timestamp {
+        self.ts
+    }
 }
 
 impl From<SocketAddr> for Actor {
     fn from(value: SocketAddr) -> Self {
-        Self::new(ActorId(Uuid::nil()), value)
+        Self::new(ActorId(Uuid::nil()), value, Timestamp::zero())
     }
 }
 
@@ -179,7 +188,13 @@ impl Identity for Actor {
         Some(Self {
             id: self.id,
             addr: self.addr,
-            bump: self.bump.wrapping_add(1),
+            ts: NTP64::from(duration_since_epoch()).into(),
         })
     }
+}
+
+fn duration_since_epoch() -> Duration {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("could not generate duration since unix epoch")
 }

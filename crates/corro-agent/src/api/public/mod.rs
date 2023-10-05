@@ -9,16 +9,16 @@ use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
-    api::{ExecResponse, ExecResult, QueryEvent, Statement},
+    api::{row_to_change, ExecResponse, ExecResult, QueryEvent, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
-    change::{row_to_change, SqliteValue},
-    schema::{make_schema_inner, parse_sql},
+    change::SqliteValue,
+    schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
 use itertools::Itertools;
 use metrics::counter;
-use rusqlite::{params, params_from_iter, ToSql, Transaction};
+use rusqlite::{named_params, params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
     sync::{
@@ -160,10 +160,18 @@ where
     trace!("got conn");
 
     let actor_id = agent.actor_id();
-    let booked = agent.bookie().for_actor(actor_id).await;
+    let booked = {
+        agent
+            .bookie()
+            .write("make_broadcastable_changes(for_actor)")
+            .await
+            .for_actor(actor_id)
+    };
     // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
     // so it probably doesn't matter too much, except for reads of internal state
-    let mut book_writer = booked.write().await;
+    let mut book_writer = booked
+        .write("make_broadcastable_changes(booked writer)")
+        .await;
 
     let start = Instant::now();
     block_in_place(move || {
@@ -189,25 +197,33 @@ where
             return Ok((ret, start.elapsed()));
         }
 
+        let last_version = book_writer.last().unwrap_or(0);
+        trace!("last_version: {last_version}");
+        let version = last_version + 1;
+        trace!("version: {version}");
+
         let last_seq: i64 = tx
             .prepare_cached(
                 "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
             )?
             .query_row([db_version], |row| row.get(0))?;
 
-        let last_version = book_writer.last().unwrap_or(0);
-        trace!("last_version: {last_version}");
-        let version = last_version + 1;
-        trace!("version: {version}");
-
         let elapsed = {
             tx.prepare_cached(
                 r#"
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
-                    VALUES (?, ?, ?, ?, ?);
+                    VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
             "#,
             )?
-            .execute(params![actor_id, version, db_version, last_seq, ts])?;
+            .execute(named_params! {
+                ":actor_id": actor_id,
+                ":start_version": version,
+                ":db_version": db_version,
+                ":last_seq": last_seq,
+                ":ts": ts
+            })?;
+
+            debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
             tx.commit()?;
             start.elapsed()
@@ -630,7 +646,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     block_in_place(|| {
         let tx = conn.transaction()?;
 
-        make_schema_inner(&tx, &schema_write, &mut new_schema)?;
+        apply_schema(&tx, &schema_write, &mut new_schema)?;
 
         for tbl_name in partial_schema.tables.keys() {
             tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
@@ -772,7 +788,17 @@ mod tests {
             }))
         ));
 
-        assert_eq!(agent.bookie().last(&agent.actor_id()).await, Some(1));
+        assert_eq!(
+            agent
+                .bookie()
+                .write("test")
+                .await
+                .for_actor(agent.actor_id())
+                .read("test")
+                .await
+                .last(),
+            Some(1)
+        );
 
         println!("second req...");
 

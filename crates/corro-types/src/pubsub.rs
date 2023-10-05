@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Buf;
+use bytes::{Buf, BufMut};
 use compact_str::{CompactString, ToCompactString};
 use corro_api_types::{Change, ChangeId, ColumnType, RowId, SqliteValue, SqliteValueRef};
 use enquote::unquote;
@@ -62,6 +62,96 @@ pub fn normalize_sql(sql: &str) -> Result<String, NormalizeStatementError> {
     }
 
     Ok(Cmd::Stmt(stmt).to_string())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PackError {
+    #[error("abort")]
+    Abort,
+}
+
+pub fn pack_columns(args: &[SqliteValue]) -> Result<Vec<u8>, PackError> {
+    let mut buf = vec![];
+    /*
+     * Format:
+     * [num_columns:u8,...[(type(0-3),num_bytes?(3-7)):u8, length?:i32, ...bytes:u8[]]]
+     *
+     * The byte used for column type also encodes the number of bytes used for the integer.
+     * e.g.: (type(0-3),num_bytes?(3-7)):u8
+     * first 3 bits are type
+     * last 5 encode how long the following integer, if there is a following integer, is. 1, 2, 3, ... 8 bytes.
+     *
+     * Not packing an integer into the minimal number of bytes required is rather wasteful.
+     * E.g., the number `0` would take 8 bytes rather than 1 byte.
+     */
+    let len_result: Result<u8, _> = args.len().try_into();
+    if let Ok(len) = len_result {
+        buf.put_u8(len);
+        for value in args {
+            match value {
+                SqliteValue::Null => {
+                    buf.put_u8(ColumnType::Null as u8);
+                }
+                SqliteValue::Integer(val) => {
+                    let num_bytes_for_int = num_bytes_needed_i64(*val);
+                    let type_byte = num_bytes_for_int << 3 | (ColumnType::Integer as u8);
+                    buf.put_u8(type_byte);
+                    buf.put_int(*val, num_bytes_for_int as usize);
+                }
+                SqliteValue::Real(v) => {
+                    buf.put_u8(ColumnType::Float as u8);
+                    buf.put_f64(v.0);
+                }
+                SqliteValue::Text(value) => {
+                    let len = value.len() as i32;
+                    let num_bytes_for_len = num_bytes_needed_i32(len);
+                    let type_byte = num_bytes_for_len << 3 | (ColumnType::Text as u8);
+                    buf.put_u8(type_byte);
+                    buf.put_int(len as i64, num_bytes_for_len as usize);
+                    buf.put_slice(value.as_bytes());
+                }
+                SqliteValue::Blob(value) => {
+                    let len = value.len() as i32;
+                    let num_bytes_for_len = num_bytes_needed_i32(len);
+                    let type_byte = num_bytes_for_len << 3 | (ColumnType::Blob as u8);
+                    buf.put_u8(type_byte);
+                    buf.put_int(len as i64, num_bytes_for_len as usize);
+                    buf.put_slice(value);
+                }
+            }
+        }
+        Ok(buf)
+    } else {
+        Err(PackError::Abort)
+    }
+}
+
+fn num_bytes_needed_i64(val: i64) -> u8 {
+    if val & 0xFF00000000000000u64 as i64 != 0 {
+        8
+    } else if val & 0x00FF000000000000 != 0 {
+        7
+    } else if val & 0x0000FF0000000000 != 0 {
+        6
+    } else if val & 0x000000FF00000000 != 0 {
+        5
+    } else {
+        num_bytes_needed_i32(val as i32)
+    }
+}
+
+fn num_bytes_needed_i32(val: i32) -> u8 {
+    if val & 0xFF000000u32 as i32 != 0 {
+        4
+    } else if val & 0x00FF0000 != 0 {
+        3
+    } else if val & 0x0000FF00 != 0 {
+        2
+    } else if val * 0x000000FF != 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1371,7 +1461,7 @@ mod tests {
     use rusqlite::params;
 
     use crate::{
-        schema::{make_schema_inner, parse_sql},
+        schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
     };
 
@@ -1409,7 +1499,7 @@ mod tests {
 
         {
             let tx = conn.transaction()?;
-            make_schema_inner(&tx, &NormalizedSchema::default(), &mut schema)?;
+            apply_schema(&tx, &NormalizedSchema::default(), &mut schema)?;
             tx.commit()?;
         }
 
@@ -1541,7 +1631,7 @@ mod tests {
 
         {
             let tx = conn.transaction().unwrap();
-            make_schema_inner(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
+            apply_schema(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
             tx.commit().unwrap();
         }
 
@@ -1583,7 +1673,7 @@ mod tests {
 
             {
                 let tx = conn2.transaction().unwrap();
-                make_schema_inner(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
+                apply_schema(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
                 tx.commit().unwrap();
             }
 

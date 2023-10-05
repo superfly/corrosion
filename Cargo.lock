@@ -1360,9 +1360,9 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foca"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73879bd4f1b8e2a1a39886488ac24641b20ade95238726325d516ae98d1ed00a"
+checksum = "1ae5801563a919f58548b626bbf37ab589cfbf8c18007ddae589207338abd05e"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3877,18 +3877,17 @@ checksum = "497961ef93d974e23eb6f433eb5fe1b7930b659f06d12dec6fc44a8f554c0bba"
 
 [[package]]
 name = "uhlc"
-version = "0.5.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d291a7454d390b753ef68df8145da18367e32883ec2fa863959f0aefb915cdb"
+checksum = "d1eadef1fa26cbbae1276c46781e8f4d888bdda434779c18ae6c2a0e69991885"
 dependencies = [
  "defmt",
- "hex",
  "humantime",
  "lazy_static",
  "log",
+ "rand",
  "serde",
  "spin 0.9.8",
- "uuid",
 ]
 
 [[package]]
