@@ -34,7 +34,7 @@ use corro_types::{
     change::Change,
 };
 
-use crate::agent::process_subs;
+use crate::agent::process_after_changes;
 
 pub mod pubsub;
 
@@ -265,7 +265,7 @@ where
                             {
                                 counter!("corro.changes.committed", count as u64, "table" => table_name.to_string(), "source" => "local");
                             }
-                            process_subs(&agent, &changes);
+                            process_after_changes(&agent, &changes);
 
                             trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 

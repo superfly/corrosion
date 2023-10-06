@@ -1,17 +1,22 @@
 use std::{
     collections::HashMap,
+    hash::{Hash, Hasher},
     ops::{Deref, DerefMut},
 };
 
 // use bb8::ManageConnection;
 use camino::Utf8PathBuf;
 use compact_str::CompactString;
+use corro_api_types::integer_decode;
 use enquote::enquote;
 use once_cell::sync::Lazy;
 use rusqlite::{params, Connection, Transaction};
+use seahash::SeaHasher;
 use sqlite_pool::SqliteConn;
 use tempfile::TempDir;
-use tracing::{error, trace};
+use tracing::{error, info, trace};
+
+use crate::schema::NormalizedTable;
 
 pub type SqlitePool = sqlite_pool::Pool<CrConn>;
 pub type SqlitePoolError = sqlite_pool::PoolError;
@@ -184,12 +189,371 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
     Ok(())
 }
 
+const CHECKSUM_SEEDS: [u64; 4] = [
+    0x16f11fe89b0d677c,
+    0xb480a793d8e6c86c,
+    0x6fe2e5aaf078ebc9,
+    0x14f994a4c5259381,
+];
+
+pub fn register_seahash_aggregate(conn: &Connection) -> rusqlite::Result<()> {
+    conn.create_aggregate_function(
+        "seahash_concat",
+        -1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        SeahashAggregate,
+    )
+}
+
+pub fn register_xor_aggregate(conn: &Connection) -> rusqlite::Result<()> {
+    conn.create_aggregate_function(
+        "xor",
+        -1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        XorAggregate,
+    )
+}
+
+struct XorAggregate;
+
+impl rusqlite::functions::Aggregate<i64, Option<i64>> for XorAggregate {
+    fn init(&self, _: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<i64> {
+        Ok(0)
+    }
+
+    fn step(
+        &self,
+        ctx: &mut rusqlite::functions::Context<'_>,
+        xor: &mut i64,
+    ) -> rusqlite::Result<()> {
+        let param_count = ctx.len();
+        if param_count == 0 {
+            return Err(rusqlite::Error::InvalidParameterCount(param_count, 1));
+        }
+
+        for idx in 0..param_count {
+            match ctx.get_raw(idx) {
+                rusqlite::types::ValueRef::Text(_v) => Err(
+                    rusqlite::Error::InvalidFunctionParameterType(idx, rusqlite::types::Type::Text),
+                )?,
+                rusqlite::types::ValueRef::Blob(_v) => Err(
+                    rusqlite::Error::InvalidFunctionParameterType(idx, rusqlite::types::Type::Blob),
+                )?,
+                rusqlite::types::ValueRef::Null => {
+                    // do nothing
+                }
+                rusqlite::types::ValueRef::Integer(i) => {
+                    println!("xoring {i}");
+                    *xor ^= i;
+                }
+                rusqlite::types::ValueRef::Real(_f) => Err(
+                    rusqlite::Error::InvalidFunctionParameterType(idx, rusqlite::types::Type::Real),
+                )?,
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _: &mut rusqlite::functions::Context<'_>,
+        xor: Option<i64>,
+    ) -> rusqlite::Result<Option<i64>> {
+        Ok(xor)
+    }
+}
+
+struct SeahashAggregate;
+
+impl rusqlite::functions::Aggregate<SeaHasher, Option<i64>> for SeahashAggregate {
+    fn init(&self, _: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<SeaHasher> {
+        Ok(SeaHasher::with_seeds(
+            CHECKSUM_SEEDS[0],
+            CHECKSUM_SEEDS[1],
+            CHECKSUM_SEEDS[2],
+            CHECKSUM_SEEDS[3],
+        ))
+    }
+
+    fn step(
+        &self,
+        ctx: &mut rusqlite::functions::Context<'_>,
+        hasher: &mut SeaHasher,
+    ) -> rusqlite::Result<()> {
+        let param_count = ctx.len();
+        if param_count == 0 {
+            return Err(rusqlite::Error::InvalidParameterCount(param_count, 1));
+        }
+        for idx in 0..param_count {
+            match ctx.get_raw(idx) {
+                rusqlite::types::ValueRef::Text(v) | rusqlite::types::ValueRef::Blob(v) => {
+                    v.hash(hasher)
+                }
+                rusqlite::types::ValueRef::Null => {}
+                rusqlite::types::ValueRef::Integer(i) => i.hash(hasher),
+                rusqlite::types::ValueRef::Real(f) => integer_decode(f).hash(hasher),
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &mut rusqlite::functions::Context<'_>,
+        hasher: Option<SeaHasher>,
+    ) -> rusqlite::Result<Option<i64>> {
+        Ok(hasher.map(|hasher| 0i64.wrapping_add_unsigned(hasher.finish())))
+    }
+}
+
+const BUCKET_SIZE: u64 = 10240;
+
+pub fn queue_full_table_hash(conn: &Connection, table: &NormalizedTable) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!(
+        "DELETE FROM {table_name}__corro_buckets",
+        table_name = &table.name
+    ))?;
+
+    let pks_list = table
+        .pk
+        .iter()
+        .map(|pk| format!("pks.{pk}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let ins = conn.execute(&format!("INSERT INTO {table_name}__corro_buckets SELECT __crsql_key as key, seahash_concat({pks_list}) - (seahash_concat({pks_list}) % ?) AS bucket FROM {table_name}__crsql_pks AS pks GROUP BY __crsql_key", table_name = &table.name), [BUCKET_SIZE])?;
+
+    info!(
+        "inserted {ins} rows into {table_name}__corro_buckets",
+        table_name = &table.name
+    );
+
+    Ok(())
+}
+
+pub fn hash_bucket(
+    conn: &Connection,
+    table: &NormalizedTable,
+    bucket: i64,
+) -> rusqlite::Result<()> {
+    register_seahash_aggregate(conn)?;
+
+    let mut cols = table.pk.clone();
+
+    for (col, _) in table.columns.iter() {
+        cols.insert(col.clone());
+    }
+
+    let cols_list = cols
+        .iter()
+        .map(|col| format!("tbl.{col}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {table_name}__corro_hashes
+                SELECT buckets.bucket, seahash_concat({cols_list}) AS hash
+                    FROM {table_name}__corro_buckets AS buckets
+                    LEFT JOIN {table_name}__crsql_pks AS pks ON __crsql_key = buckets.key
+                    LEFT JOIN {table_name} AS tbl ON {pks_where}
+                    WHERE buckets.bucket = ?
+            ",
+            table_name = &table.name,
+            pks_where = table
+                .pk
+                .iter()
+                .map(|pk| format!("pks.{pk} = tbl.{pk}"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        ),
+        [bucket],
+    )?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use futures::{stream::FuturesUnordered, TryStreamExt};
+    use seahash::SeaHasher;
     use tokio::task::block_in_place;
 
+    use crate::schema::{apply_schema, parse_sql, NormalizedSchema};
+
     use super::*;
+
+    #[test]
+    fn test_full_table_hash() -> Result<(), Box<dyn std::error::Error>> {
+        let create_table =
+            "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER, c TEXT, d BLOB, e REAL);";
+        let mut new_schema = parse_sql(create_table)?;
+
+        let mut conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
+
+        conn.execute_batch(create_table)?;
+
+        conn.execute_batch(
+            "INSERT INTO foo VALUES (1, 1, \"one\", x'01', 1.0), (2, 2, \"two\", x'02', 2.0), (3, NULL, \"three\", x'03', 3.3);",
+        )?;
+
+        {
+            let tx = conn.transaction()?;
+            apply_schema(&tx, &NormalizedSchema::default(), &mut new_schema)?;
+
+            let tbl = new_schema.tables.get("foo").unwrap();
+
+            // change 2 rows to put them in the same bucket
+            tx.execute_batch(
+                "
+                UPDATE foo__corro_buckets SET bucket = 123456 WHERE key = 1 OR key = 3;
+            ",
+            )?;
+
+            hash_bucket(&tx, tbl, 123456)?;
+
+            tx.commit()?;
+        }
+
+        let mut prepped = conn.prepare("SELECT * FROM foo__corro_buckets")?;
+        let mut rows = prepped.query([])?;
+
+        loop {
+            let row = rows.next()?;
+            if row.is_none() {
+                break;
+            }
+
+            println!("BUCKET ROW: {row:?}");
+        }
+
+        let mut prepped = conn.prepare("SELECT * FROM foo__corro_hashes")?;
+        let mut rows = prepped.query([])?;
+
+        loop {
+            let row = rows.next()?;
+            if row.is_none() {
+                break;
+            }
+
+            println!("HASH ROW: {row:?}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_seahash_concat() -> Result<(), Box<dyn std::error::Error>> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+
+        register_seahash_aggregate(&conn)?;
+
+        conn.execute_batch(
+            "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER, c TEXT, d BLOB, e REAL);",
+        )?;
+
+        conn.execute_batch(
+            "INSERT INTO foo VALUES (1, 1, \"one\", x'01', 1.0), (2, 2, \"two\", x'02', 2.0), (3, NULL, \"three\", x'03', 3.3);",
+        )?;
+
+        let hash: i64 =
+            conn.query_row("SELECT seahash_concat(a,b,c,d,e) FROM foo;", [], |row| {
+                row.get(0)
+            })?;
+
+        println!("HASH: {hash}");
+
+        let mut hasher = SeaHasher::with_seeds(
+            CHECKSUM_SEEDS[0],
+            CHECKSUM_SEEDS[1],
+            CHECKSUM_SEEDS[2],
+            CHECKSUM_SEEDS[3],
+        );
+
+        1i64.hash(&mut hasher);
+        1i64.hash(&mut hasher);
+        b"one".hash(&mut hasher);
+        [1u8].hash(&mut hasher);
+        integer_decode(1.0).hash(&mut hasher);
+
+        2i64.hash(&mut hasher);
+        2i64.hash(&mut hasher);
+        b"two".hash(&mut hasher);
+        [2u8].hash(&mut hasher);
+        integer_decode(2.0).hash(&mut hasher);
+
+        3i64.hash(&mut hasher);
+        b"three".hash(&mut hasher);
+        [3u8].hash(&mut hasher);
+        integer_decode(3.3).hash(&mut hasher);
+
+        let expected_hash = hasher.finish();
+
+        assert_eq!(hash, 0i64.wrapping_add_unsigned(expected_hash));
+
+        assert_eq!(hash.to_ne_bytes(), expected_hash.to_ne_bytes());
+
+        let hashes: Vec<(i64, i64)> = conn
+            .prepare("SELECT a, seahash_concat(a,b,c,d,e) FROM foo GROUP BY a;")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?;
+
+        let mut hasher = SeaHasher::with_seeds(
+            CHECKSUM_SEEDS[0],
+            CHECKSUM_SEEDS[1],
+            CHECKSUM_SEEDS[2],
+            CHECKSUM_SEEDS[3],
+        );
+
+        1i64.hash(&mut hasher);
+        1i64.hash(&mut hasher);
+        b"one".hash(&mut hasher);
+        [1u8].hash(&mut hasher);
+        integer_decode(1.0).hash(&mut hasher);
+
+        let expected_hash_1 = hasher.finish();
+
+        assert_eq!(hashes[0].1, 0i64.wrapping_add_unsigned(expected_hash_1));
+        assert_eq!(hashes[0].1, -3801874191463215300);
+
+        let mut hasher = SeaHasher::with_seeds(
+            CHECKSUM_SEEDS[0],
+            CHECKSUM_SEEDS[1],
+            CHECKSUM_SEEDS[2],
+            CHECKSUM_SEEDS[3],
+        );
+
+        2i64.hash(&mut hasher);
+        2i64.hash(&mut hasher);
+        b"two".hash(&mut hasher);
+        [2u8].hash(&mut hasher);
+        integer_decode(2.0).hash(&mut hasher);
+
+        let expected_hash_2 = hasher.finish();
+
+        assert_eq!(hashes[1].1, 0i64.wrapping_add_unsigned(expected_hash_2));
+
+        register_xor_aggregate(&conn)?;
+
+        let xored: i64 = conn.query_row(
+            "SELECT xor(hash) FROM (SELECT seahash_concat(a,b,c,d,e) as hash FROM foo GROUP BY a ORDER BY a ASC);",
+            [],
+            |row| row.get(0),
+        )?;
+
+        println!("xor: {xored}");
+
+        let xored2: i64 = conn.query_row(
+            "SELECT xor(hash) FROM (SELECT seahash_concat(a,b,c,d,e) as hash FROM foo GROUP BY a ORDER BY a DESC);",
+            [],
+            |row| row.get(0),
+        )?;
+
+        println!("xor2: {xored2}");
+
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writes() -> Result<(), Box<dyn std::error::Error>> {

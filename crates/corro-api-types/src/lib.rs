@@ -243,6 +243,18 @@ impl<'a> SqliteValueRef<'a> {
     }
 }
 
+impl ToSql for SqliteValueRef<'_> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(match self {
+            SqliteValueRef::Null => ToSqlOutput::Owned(Value::Null),
+            SqliteValueRef::Integer(i) => ToSqlOutput::Owned(Value::Integer(*i)),
+            SqliteValueRef::Real(f) => ToSqlOutput::Owned(Value::Real(*f)),
+            SqliteValueRef::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
+            SqliteValueRef::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b)),
+        })
+    }
+}
+
 #[derive(PartialEq, Debug)]
 pub enum ColumnType {
     Integer = 1,
@@ -293,7 +305,7 @@ impl FromSql for ColumnType {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Hash)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd)]
 #[serde(untagged)]
 pub enum SqliteValue {
     #[default]
@@ -304,9 +316,11 @@ pub enum SqliteValue {
     Blob(SmallVec<[u8; 512]>),
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, PartialOrd)]
 #[serde(transparent)]
 pub struct Real(pub f64);
+
+impl Eq for Real {}
 
 impl Deref for Real {
     type Target = f64;
@@ -322,7 +336,22 @@ impl Hash for Real {
     }
 }
 
-fn integer_decode(val: f64) -> (u64, i16, i8) {
+// important that this hashes the same as a raw rusqlite value
+impl Hash for SqliteValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            SqliteValue::Null => {
+                // do nothing
+            }
+            SqliteValue::Integer(i) => i.hash(state),
+            SqliteValue::Real(r) => r.hash(state),
+            SqliteValue::Text(v) => v.as_bytes().hash(state),
+            SqliteValue::Blob(v) => v.as_slice().hash(state),
+        }
+    }
+}
+
+pub fn integer_decode(val: f64) -> (u64, i16, i8) {
     let bits: u64 = val.to_bits();
     let sign: i8 = if bits >> 63 == 0 { 1 } else { -1 };
     let mut exponent: i16 = ((bits >> 52) & 0x7ff) as i16;
@@ -560,9 +589,11 @@ where
 #[serde(transparent)]
 pub struct TableName(pub CompactString);
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(transparent)]
-pub struct ColumnName(pub CompactString);
+impl fmt::Display for TableName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 impl Deref for TableName {
     type Target = CompactString;
@@ -609,6 +640,10 @@ impl ToSql for TableName {
         self.0.as_str().to_sql()
     }
 }
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct ColumnName(pub CompactString);
 
 impl Deref for ColumnName {
     type Target = CompactString;

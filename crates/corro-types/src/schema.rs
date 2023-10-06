@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    hash::Hash,
     time::{Instant, SystemTime},
 };
 
@@ -13,6 +14,8 @@ use sqlite3_parser::ast::{
     QualifiedName, SortedColumn, Stmt, TableConstraint, TableOptions, ToTokens,
 };
 use tracing::{debug, info};
+
+use crate::sqlite::queue_full_table_hash;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct NormalizedColumn {
@@ -59,7 +62,7 @@ pub enum SqliteType {
     Blob,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedTable {
     pub name: String,
     pub pk: IndexSet<String>,
@@ -77,6 +80,22 @@ impl fmt::Display for NormalizedTable {
             body: self.raw.clone(),
         })
         .to_fmt(f)
+    }
+}
+
+impl Hash for NormalizedTable {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        for key in self.pk.iter() {
+            key.hash(state);
+        }
+
+        for (name, col) in self.columns.iter() {
+            name.hash(state);
+            col.hash(state);
+        }
+
+        // NOTE: this is only good enough for detecting changes in a table's primary keys and columns
     }
 }
 
@@ -226,6 +245,25 @@ pub fn apply_schema(
                 .to_string(),
             );
 
+            // create buckets (before checking if table exists)
+            tx.execute_batch(&format!(
+                "
+                CREATE TABLE {name}__corro_buckets (
+                    key INTEGER PRIMARY KEY NOT NULL,
+                    bucket INTEGER NOT NULL
+                );
+                
+                CREATE INDEX {name}__corro_buckets_bucket ON {name}__corro_buckets (bucket);
+
+                CREATE TABLE {name}__corro_hashes (
+                    bucket INTEGER PRIMARY KEY NOT NULL,
+                    hash INTEGER NOT NULL
+                );
+            "
+            ))?;
+
+            let existing = create_table_res.is_err();
+
             if let Err(e) = create_table_res {
                 debug!("could not create table '{name}', trying to reconcile schema if table already exists");
                 let sql: Vec<String> = tx
@@ -267,6 +305,10 @@ pub fn apply_schema(
             }
 
             tx.execute_batch(&format!("SELECT crsql_as_crr('{name}');"))?;
+
+            if existing {
+                queue_full_table_hash(tx, table)?;
+            }
 
             if schema_to_merge.tables.contains_key(name) {
                 // just merged!

@@ -162,63 +162,83 @@ pub enum UnpackError {
     Misuse,
 }
 
-pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError> {
-    let mut ret = vec![];
-    let num_columns = buf.get_u8();
+pub struct ColumnIterator<'a> {
+    buf: std::io::Cursor<&'a [u8]>,
+    num_columns: Option<u8>,
+}
 
-    for _i in 0..num_columns {
-        if !buf.has_remaining() {
-            return Err(UnpackError::Abort);
+impl<'a> Iterator for ColumnIterator<'a> {
+    type Item = Result<SqliteValueRef<'a>, UnpackError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let num_cols = self.num_columns.get_or_insert_with(|| self.buf.get_u8());
+
+        if *num_cols == 0 {
+            return None;
         }
-        let column_type_and_maybe_intlen = buf.get_u8();
+
+        *num_cols -= 1;
+
+        if !self.buf.has_remaining() {
+            return Some(Err(UnpackError::Abort));
+        }
+
+        let column_type_and_maybe_intlen = self.buf.get_u8();
         let column_type = ColumnType::from_u8(column_type_and_maybe_intlen & 0x07);
         let intlen = (column_type_and_maybe_intlen >> 3) as usize;
 
         match column_type {
             Some(ColumnType::Blob) => {
-                if buf.remaining() < intlen {
-                    return Err(UnpackError::Abort);
+                if self.buf.remaining() < intlen {
+                    return Some(Err(UnpackError::Abort));
                 }
-                let len = buf.get_int(intlen) as usize;
-                if buf.remaining() < len {
-                    return Err(UnpackError::Abort);
+                let len = self.buf.get_int(intlen) as usize;
+                if self.buf.remaining() < len {
+                    return Some(Err(UnpackError::Abort));
                 }
-                ret.push(SqliteValueRef::Blob(&buf[0..len]));
-                buf.advance(len);
+                let ret = SqliteValueRef::Blob(&self.buf.get_ref()[0..len]);
+                self.buf.advance(len);
+
+                Some(Ok(ret))
             }
             Some(ColumnType::Float) => {
-                if buf.remaining() < 8 {
-                    return Err(UnpackError::Abort);
+                if self.buf.remaining() < 8 {
+                    return Some(Err(UnpackError::Abort));
                 }
-                ret.push(SqliteValueRef::Real(buf.get_f64()));
+                Some(Ok(SqliteValueRef::Real(self.buf.get_f64())))
             }
             Some(ColumnType::Integer) => {
-                if buf.remaining() < intlen {
-                    return Err(UnpackError::Abort);
+                if self.buf.remaining() < intlen {
+                    return Some(Err(UnpackError::Abort));
                 }
-                ret.push(SqliteValueRef::Integer(buf.get_int(intlen)));
+                Some(Ok(SqliteValueRef::Integer(self.buf.get_int(intlen))))
             }
-            Some(ColumnType::Null) => {
-                ret.push(SqliteValueRef::Null);
-            }
+            Some(ColumnType::Null) => Some(Ok(SqliteValueRef::Null)),
             Some(ColumnType::Text) => {
-                if buf.remaining() < intlen {
-                    return Err(UnpackError::Abort);
+                if self.buf.remaining() < intlen {
+                    return Some(Err(UnpackError::Abort));
                 }
-                let len = buf.get_int(intlen) as usize;
-                if buf.remaining() < len {
-                    return Err(UnpackError::Abort);
+                let len = self.buf.get_int(intlen) as usize;
+                if self.buf.remaining() < len {
+                    return Some(Err(UnpackError::Abort));
                 }
-                ret.push(SqliteValueRef::Text(unsafe {
-                    std::str::from_utf8_unchecked(&buf[0..len])
-                }));
-                buf.advance(len);
+                let ret = SqliteValueRef::Text(unsafe {
+                    std::str::from_utf8_unchecked(&self.buf.get_ref()[0..len])
+                });
+                self.buf.advance(len);
+
+                Some(Ok(ret))
             }
-            None => return Err(UnpackError::Misuse),
+            None => Some(Err(UnpackError::Misuse)),
         }
     }
+}
 
-    Ok(ret)
+pub fn unpack_columns(buf: &[u8]) -> ColumnIterator {
+    ColumnIterator {
+        buf: std::io::Cursor::new(buf),
+        num_columns: None,
+    }
 }
 
 pub enum MatcherCmd {
@@ -252,10 +272,9 @@ impl MatcherHandle {
             .group_by(|change| (change.table.as_str(), change.pk.as_slice()));
 
         for ((table, pk), _) in grouped.into_iter() {
-            let pks = unpack_columns(pk)?
-                .into_iter()
-                .map(|v| v.to_owned())
-                .collect();
+            let pks = unpack_columns(pk)
+                .map(|v| v.map(|v| v.to_owned()))
+                .collect::<Result<Vec<_>, _>>()?;
             if let Some(v) = candidates.get_mut(table) {
                 v.push(pks);
             } else {

@@ -30,12 +30,14 @@ use corro_types::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset,
         ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
-    change::Change,
+    change::{row_to_change, Change},
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members, Rtt},
-    pubsub::{migrate_subs, Matcher},
-    schema::init_schema,
-    sqlite::{CrConn, Migration, SqlitePoolError},
+    pubsub::{migrate_subs, unpack_columns, Matcher},
+    schema::{init_schema, NormalizedTable},
+    sqlite::{
+        register_seahash_aggregate, register_xor_aggregate, CrConn, Migration, SqlitePoolError,
+    },
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
 };
 
@@ -55,7 +57,9 @@ use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    named_params, params, params_from_iter, Connection, OptionalExtension, Transaction,
+};
 use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
@@ -904,6 +908,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     );
 
     spawn_counted(handle_changes(agent.clone(), rx_changes, tripwire.clone()));
+    tokio::spawn(handle_hashing(agent.clone()));
 
     spawn_counted(
         sync_loop(
@@ -1133,13 +1138,6 @@ async fn clear_overwritten_versions(agent: Agent) {
     }
 }
 
-// const CHECKSUM_SEEDS: [u64; 4] = [
-//     0x16f11fe89b0d677c,
-//     0xb480a793d8e6c86c,
-//     0x6fe2e5aaf078ebc9,
-//     0x14f994a4c5259381,
-// ];
-
 async fn metrics_loop(agent: Agent) {
     let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
 
@@ -1165,8 +1163,6 @@ fn collect_metrics(agent: &Agent) {
         }
     };
 
-    // let mut low_count_tables = vec![];
-
     for table in schema.tables.keys() {
         match conn
             .prepare_cached(&format!("SELECT count(*) FROM {table}"))
@@ -1174,9 +1170,6 @@ fn collect_metrics(agent: &Agent) {
         {
             Ok(count) => {
                 gauge!("corro.db.table.rows.total", count as f64, "table" => table.clone());
-                // if count <= MAX_COUNT_TO_HASH {
-                //     low_count_tables.push(table);
-                // }
             }
             Err(e) => {
                 error!("could not query count for table {table}: {e}");
@@ -1204,38 +1197,27 @@ fn collect_metrics(agent: &Agent) {
         }
     }
 
-    // for name in low_count_tables {
-    //     if let Some(table) = schema.tables.get(name) {
-    //         let pks = table.pk.iter().cloned().collect::<Vec<String>>().join(",");
-    //         match conn
-    //             .prepare_cached(&format!("SELECT * FROM {name} ORDER BY {pks}"))
-    //             .and_then(|mut prepped| {
-    //                 let col_count = prepped.column_count();
-    //                 prepped.query(()).and_then(|mut rows| {
-    //                     let mut hasher = seahash::SeaHasher::with_seeds(
-    //                         CHECKSUM_SEEDS[0],
-    //                         CHECKSUM_SEEDS[1],
-    //                         CHECKSUM_SEEDS[2],
-    //                         CHECKSUM_SEEDS[3],
-    //                     );
-    //                     while let Ok(Some(row)) = rows.next() {
-    //                         for idx in 0..col_count {
-    //                             let v: SqliteValue = row.get(idx)?;
-    //                             v.hash(&mut hasher);
-    //                         }
-    //                     }
-    //                     Ok(hasher.finish())
-    //                 })
-    //             }) {
-    //             Ok(hash) => {
-    //                 gauge!("corro.db.table.checksum", hash as f64, "table" => name.clone());
-    //             }
-    //             Err(e) => {
-    //                 error!("could not query clock table values for hashing {table}: {e}");
-    //             }
-    //         }
-    //     }
-    // }
+    if let Err(e) = register_xor_aggregate(&conn) {
+        error!("could not register xor function: {e}");
+        return;
+    }
+
+    for name in schema.tables.keys() {
+        match conn
+            .prepare_cached(&format!(
+                "SELECT xor(hash) FROM {name}__corro_hashes ORDER BY bucket ASC"
+            ))
+            .and_then(|mut prepped| prepped.query_row::<i64, _, _>([], |row| row.get(0)))
+        {
+            Ok(hash) => {
+                // lossy, but hopefully all in the same beautiful way!
+                gauge!("corro.db.table.checksum", hash as f64, "table" => name.clone());
+            }
+            Err(e) => {
+                error!("could not xor hashes for table {name}: {e}");
+            }
+        }
+    }
 }
 
 pub async fn handle_change(
@@ -1705,7 +1687,7 @@ async fn process_fully_buffered_changes(
                             WHERE site_id = ?
                               AND version = ?
                             ORDER BY db_version ASC, seq ASC
-                            "#,
+                "#,
             )?
             .execute(params![max_db_version, actor_id.as_bytes(), version])?;
             info!(%actor_id, version, "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
@@ -1731,7 +1713,7 @@ async fn process_fully_buffered_changes(
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
                     VALUES (
                         :actor_id,
-                        :version,
+                        :start_version,
                         :db_version,
                         :last_seq,
                         :ts
@@ -1739,14 +1721,20 @@ async fn process_fully_buffered_changes(
             )?
             .execute(named_params! {
                 ":actor_id": actor_id,
-                ":version": version,
+                ":start_version": version,
                 ":db_version": db_version,
-             // ":start_version": 0,
                 ":last_seq": last_seq,
                 ":ts": ts
             })?;
 
             info!(%actor_id, version, "inserted bookkeeping row after buffered insert");
+
+            // TODO: use a queue like __corro_hash_queue instead!
+            let mut changes = tx.prepare_cached("SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq FROM crsql_changes WHERE db_version = ?")?.query_map([db_version], row_to_change)?.collect::<Result<Vec<_>, _>>()?;
+
+            changes.sort_by(|a, b| a.table.cmp(&b.table).then_with(|| a.pk.cmp(&b.pk)));
+
+            queue_hash_jobs(agent, &tx, &changes)?;
 
             Some(KnownDbVersion::Current {
                 db_version,
@@ -1773,6 +1761,52 @@ async fn process_fully_buffered_changes(
     })?;
 
     Ok(inserted)
+}
+
+fn queue_hash_jobs(agent: &Agent, conn: &Connection, changes: &[Change]) -> rusqlite::Result<()> {
+    let mut table_cache = BTreeMap::new();
+    for (table, group) in changes.iter().group_by(|change| &change.table).into_iter() {
+        let bucket_stmt = {
+            let schema = agent.schema().read();
+            if let Some(norm_table) = schema.tables.get(table.as_str()) {
+                table_cache.entry(table.clone()).or_insert_with(|| {
+                    let pks_list = norm_table.pk
+                        .iter()
+                        .map(|pk| format!("pks.{pk}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    let pks_where = norm_table.pk.iter()
+                        .map(|pk| format!("pks.{pk} = ?"))
+                        .collect::<Vec<_>>()
+                        .join(" AND  ");
+
+                    format!("
+                    INSERT INTO {table}__corro_buckets
+                        SELECT __crsql_key as key, seahash_concat({pks_list}) - (seahash_concat({pks_list}) % ?) AS bucket
+                            FROM {table}__crsql_pks AS pks WHERE {pks_where}
+                        ON CONFLICT({table}__corro_buckets.key) IGNORE
+                        RETURNING {table}__corro_buckets.bucket")
+                })
+            } else {
+                warn!("table not found to prepare hashing: '{table}'");
+                continue;
+            }
+        };
+
+        for (pk, _) in group.group_by(|change| &change.pk).into_iter() {
+            let bucket: i64 = conn
+                .prepare_cached(bucket_stmt)?
+                .query_row(params_from_iter(unpack_columns(pk).flatten()), |row| {
+                    row.get(0)
+                })?;
+
+            conn.prepare_cached("INSERT INTO __corro_hash_queue (tbl_name, bucket) VALUES (?, ?)")?
+                .execute(params![table.as_str(), bucket])?;
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn process_multiple_changes(
@@ -1915,6 +1949,12 @@ pub async fn process_multiple_changes(
             }
         }
 
+        // queue hashing jobs
+        for (_, changeset, _) in changesets.iter() {
+            // trust in the ordering here...
+            queue_hash_jobs(agent, &tx, changeset.changes())?;
+        }
+
         let mut count = 0;
 
         for (actor_id, knowns) in knowns.iter_mut() {
@@ -1993,7 +2033,7 @@ pub async fn process_multiple_changes(
         }
 
         for (actor_id, changeset, src) in changesets {
-            process_subs(agent, changeset.changes());
+            process_after_changes(agent, changeset.changes());
             if matches!(src, ChangeSource::Broadcast) && !changeset.is_empty() {
                 if let Err(_e) =
                     agent
@@ -2244,7 +2284,11 @@ fn process_single_version(
     Ok((known, changeset))
 }
 
-pub fn process_subs(agent: &Agent, changeset: &[Change]) {
+pub fn process_after_changes(agent: &Agent, changeset: &[Change]) {
+    process_subs(agent, changeset);
+}
+
+fn process_subs(agent: &Agent, changeset: &[Change]) {
     trace!("process subs...");
 
     let mut matchers_to_delete = vec![];
@@ -2396,6 +2440,152 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         );
     }
     Ok(())
+}
+
+const MAX_BUCKET_TO_HASH: usize = 100;
+
+// FIXME: find a way to return a reference
+fn get_cached_insert_stmt(
+    cache: &mut HashMap<NormalizedTable, String>,
+    table: &NormalizedTable,
+) -> String {
+    if let Some(stmt) = cache.get(table).cloned() {
+        return stmt;
+    }
+
+    let mut cols = table.pk.clone();
+
+    let pks_where_tbl = cols
+        .iter()
+        .map(|pk| format!("pks.{pk} = ?"))
+        .collect::<Vec<_>>()
+        .join(" AND  ");
+
+    for (col, _) in table.columns.iter() {
+        cols.insert(col.clone());
+    }
+
+    let cols_list = cols
+        .iter()
+        .map(|col| format!("tbl.{col}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    cache
+        .entry(table.clone())
+        .or_insert(format!(
+            "INSERT OR REPLACE INTO {table_name}__corro_hashes
+                    SELECT buckets.bucket, seahash_concat({cols_list}) AS hash
+                        FROM {table_name}__corro_buckets AS buckets
+                        LEFT JOIN {table_name}__crsql_pks AS pks ON __crsql_key = buckets.key
+                        LEFT JOIN {table_name} AS tbl ON {pks_where_tbl}
+                        WHERE buckets.bucket = ?
+                ",
+            table_name = &table.name
+        ))
+        .clone()
+}
+
+async fn handle_hashing(agent: Agent) {
+    // this should be "ok"
+    let mut conn = agent
+        .pool()
+        .dedicated()
+        .await
+        .expect("could not get a dedicated connection from the pool");
+
+    register_seahash_aggregate(&conn).expect("could not register seahash_concat function");
+    register_xor_aggregate(&conn).expect("could not register xor function");
+
+    let mut stmt_cache: HashMap<NormalizedTable, String> = HashMap::new();
+
+    let res = block_in_place(|| {
+        let schema = agent.schema().read();
+        for (table_name, table) in schema.tables.iter() {
+            let tx = conn.transaction()?;
+            let pks_list = table
+                .pk
+                .iter()
+                .map(|pk| format!("pks.{pk}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let buckets: HashSet<i64> = tx.prepare_cached(&format!("
+                INSERT INTO {table_name}__corro_buckets
+                    SELECT key, bucket FROM (
+                        SELECT __crsql_key AS key, seahash_concat({pks_list}) - (seahash_concat({pks_list}) % ?) AS bucket
+                            FROM {table_name}__crsql_pks AS pks WHERE __crsql_key IN (
+                                SELECT __crsql_key FROM {table_name}__crsql_pks EXCEPT SELECT key FROM {table_name}__corro_buckets
+                            )
+                        )
+                    RETURNING bucket"))?.query_map([], |row| row.get(0))?.collect::<Result<HashSet<_>, _>>()?;
+
+            let stmt = get_cached_insert_stmt(&mut stmt_cache, table);
+
+            for bucket in buckets {
+                tx.prepare_cached(&stmt)?.execute([bucket])?;
+            }
+
+            // just to be on the safe side... could be huge?
+            tx.commit()?;
+        }
+
+        Ok::<_, rusqlite::Error>(())
+    });
+
+    if let Err(e) = res {
+        error!("could not ensure hash buckets for missing keys: {e}");
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+
+        let res = block_in_place(|| {
+            loop {
+                let mut buf: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+
+                let tx = conn.transaction()?;
+
+                {
+                    let mut prepped = tx.prepare_cached("DELETE FROM __corro_hash_queue WHERE rowid IN (SELECT rowid FROM __corro_hash_queue LIMIT ?) RETURNING tbl_name, bucket")?;
+                    let rows = prepped
+                        .query_map([MAX_BUCKET_TO_HASH], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                    for row in rows {
+                        let (tbl_name, bucket) = row?;
+                        buf.entry(tbl_name).or_default().push(bucket);
+                    }
+                }
+
+                if buf.is_empty() {
+                    break;
+                }
+
+                while let Some((table_name, buckets)) = buf.pop_first() {
+                    let table = match { agent.schema().read().tables.get(&table_name).cloned() } {
+                        Some(table) => table,
+                        None => {
+                            warn!("could not find table in schema for hashing: {table_name}");
+                            continue;
+                        }
+                    };
+
+                    let stmt = get_cached_insert_stmt(&mut stmt_cache, &table);
+
+                    for bucket in buckets {
+                        tx.prepare_cached(&stmt)?.execute([bucket])?;
+                    }
+                }
+                tx.commit()?;
+            }
+            Ok::<_, rusqlite::Error>(())
+        });
+
+        if let Err(e) = res {
+            error!("could not process buckets for hashing: {e}");
+        }
+    }
 }
 
 const MIN_CHANGES_CHUNK: usize = 1000;
@@ -2744,6 +2934,14 @@ fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         "
         CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version);
+
+        -- bucket hashing queue
+        CREATE TABLE __corro_hash_queue (
+            tbl_name TEXT NOT NULL,
+            bucket INTEGER NOT NULL,
+
+            PRIMARY KEY (tbl_name, bucket)
+        );
     ",
     )
 }

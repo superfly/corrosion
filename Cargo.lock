@@ -868,6 +868,7 @@ dependencies = [
  "rangemap",
  "rcgen",
  "rusqlite",
+ "seahash",
  "serde",
  "serde_json",
  "serde_with",
