@@ -1656,6 +1656,7 @@ async fn process_fully_buffered_changes(
             .await
             .for_actor(actor_id)
     };
+
     let mut bookedw = booked
         .write(format!(
             "process_fully_buffered(booked writer):{}",
@@ -1763,7 +1764,21 @@ async fn process_fully_buffered_changes(
         tx.commit()?;
 
         let inserted = if let Some(known_version) = known_version {
+            let db_version = if let KnownDbVersion::Current { db_version, .. } = &known_version {
+                Some(*db_version)
+            } else {
+                None
+            };
+
             bookedw.insert(version, known_version);
+
+            drop(bookedw);
+
+            if let Some(db_version) = db_version {
+                // TODO: write changes into a queueing table
+                process_subs_by_db_version(agent, &conn, db_version);
+            }
+
             true
         } else {
             false
@@ -2253,6 +2268,26 @@ pub fn process_subs(agent: &Agent, changeset: &[Change]) {
         let matchers = agent.matchers().read();
         for (id, matcher) in matchers.iter() {
             if let Err(e) = matcher.process_change(changeset) {
+                error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
+                matchers_to_delete.push(*id);
+            }
+        }
+    }
+
+    for id in matchers_to_delete {
+        agent.matchers().write().remove(&id);
+    }
+}
+
+pub fn process_subs_by_db_version(agent: &Agent, conn: &Connection, db_version: i64) {
+    trace!("process subs by db version...");
+
+    let mut matchers_to_delete = vec![];
+
+    {
+        let matchers = agent.matchers().read();
+        for (id, matcher) in matchers.iter() {
+            if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
                 error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
                 matchers_to_delete.push(*id);
             }
