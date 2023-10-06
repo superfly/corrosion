@@ -2516,7 +2516,8 @@ async fn handle_hashing(agent: Agent) {
                             FROM {table_name}__crsql_pks AS pks WHERE __crsql_key IN (
                                 SELECT __crsql_key AS key FROM {table_name}__crsql_pks EXCEPT SELECT key FROM {table_name}__corro_buckets
                             )
-                        ) WHERE bucket IS NOT NULL
+                            GROUP BY key
+                        )
                     RETURNING bucket"))?.query_map([BUCKET_SIZE], |row| row.get(0))?.collect::<Result<HashSet<_>, _>>()?;
 
             info!(table = %table_name, "queueing {} buckets for hashing", buckets.len());
