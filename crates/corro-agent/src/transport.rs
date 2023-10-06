@@ -1,6 +1,12 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
+use metrics::histogram;
 use quinn::{
     ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
     SendStream,
@@ -120,7 +126,9 @@ impl Transport {
                 }
             }
 
+            let start = Instant::now();
             let conn = self.0.endpoint.connect(addr, server_name.as_str())?.await?;
+            histogram!("corro.transport.connect.time.seconds", start.elapsed().as_secs_f64(), "ip" => server_name);
             if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
                 debug!("could not send RTT for connection through sender: {e}");
             }
