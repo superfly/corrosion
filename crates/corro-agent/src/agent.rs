@@ -2514,7 +2514,7 @@ async fn handle_hashing(agent: Agent) {
                     SELECT key, bucket FROM (
                         SELECT __crsql_key AS key, seahash_concat({pks_list}) - (seahash_concat({pks_list}) % ?) AS bucket
                             FROM {table_name}__crsql_pks AS pks WHERE __crsql_key IN (
-                                SELECT __crsql_key FROM {table_name}__crsql_pks EXCEPT SELECT key FROM {table_name}__corro_buckets
+                                SELECT __crsql_key AS key FROM {table_name}__crsql_pks EXCEPT SELECT key FROM {table_name}__corro_buckets
                             )
                         ) WHERE bucket IS NOT NULL
                     RETURNING bucket"))?.query_map([BUCKET_SIZE], |row| row.get(0))?.collect::<Result<HashSet<_>, _>>()?;

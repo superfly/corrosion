@@ -247,7 +247,6 @@ impl rusqlite::functions::Aggregate<i64, Option<i64>> for XorAggregate {
                     // do nothing
                 }
                 rusqlite::types::ValueRef::Integer(i) => {
-                    println!("xoring {i}");
                     *xor ^= i;
                 }
                 rusqlite::types::ValueRef::Real(_f) => Err(
