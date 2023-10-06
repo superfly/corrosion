@@ -51,13 +51,11 @@ impl Transport {
                 debug!("sent datagram to {addr}");
                 return Ok(send);
             }
-            Err(e @ SendDatagramError::ConnectionLost(ConnectionError::VersionMismatch)) => {
-                return Err(e.into());
-            }
             Err(SendDatagramError::ConnectionLost(e)) => {
                 debug!("retryable error attempting to open unidirectional stream: {e}");
             }
             Err(e) => {
+                increment_counter!("corro.transport.send_datagram.errors", "addr" => addr.to_string(), "error" => e.to_string());
                 return Err(e.into());
             }
         }
@@ -129,11 +127,11 @@ impl Transport {
             let start = Instant::now();
             let conn = match self.0.endpoint.connect(addr, server_name.as_str())?.await {
                 Ok(conn) => {
-                    histogram!("corro.transport.connect.time.seconds", start.elapsed().as_secs_f64(), "ip" => server_name);
+                    histogram!("corro.transport.connect.time.seconds", start.elapsed().as_secs_f64(), "addr" => server_name);
                     conn
                 }
                 Err(e) => {
-                    increment_counter!("corro.transport.connect.errors", "ip" => server_name, "error" => e.to_string());
+                    increment_counter!("corro.transport.connect.errors", "addr" => server_name, "error" => e.to_string());
                     return Err(e.into());
                 }
             };
