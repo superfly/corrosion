@@ -4,7 +4,7 @@ use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
-const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
+const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {

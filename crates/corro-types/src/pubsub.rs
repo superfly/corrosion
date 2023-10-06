@@ -11,7 +11,6 @@ use corro_api_types::{Change, ChangeId, ColumnType, RowId, SqliteValue, SqliteVa
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::IndexMap;
-use itertools::Itertools;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction};
 use sqlite3_parser::{
     ast::{
@@ -238,28 +237,27 @@ struct InnerMatcherHandle {
 }
 
 impl MatcherHandle {
-    pub fn process_change(&self, changes: &[Change]) -> Result<(), MatcherError> {
+    fn process_changes_from_iter<I, T, P>(&self, iter: I) -> Result<(), MatcherError>
+    where
+        I: Iterator<Item = rusqlite::Result<(T, P)>>,
+        T: AsRef<str>,
+        P: AsRef<[u8]>,
+    {
         let mut candidates: IndexMap<CompactString, Vec<Vec<SqliteValue>>> = IndexMap::new();
 
-        let grouped = changes
-            .iter()
-            .filter(|change| {
-                self.0
-                    .parsed
-                    .table_columns
-                    .contains_key(change.table.as_str())
-            })
-            .group_by(|change| (change.table.as_str(), change.pk.as_slice()));
+        let filtered = iter
+            .flatten()
+            .filter(|(table, _)| self.0.parsed.table_columns.contains_key(table.as_ref()));
 
-        for ((table, pk), _) in grouped.into_iter() {
-            let pks = unpack_columns(pk)?
+        for (table, pk) in filtered {
+            let pks = unpack_columns(pk.as_ref())?
                 .into_iter()
                 .map(|v| v.to_owned())
                 .collect();
-            if let Some(v) = candidates.get_mut(table) {
+            if let Some(v) = candidates.get_mut(table.as_ref()) {
                 v.push(pks);
             } else {
-                candidates.insert(table.to_compact_string(), vec![pks]);
+                candidates.insert(table.as_ref().to_compact_string(), vec![pks]);
             }
         }
 
@@ -269,6 +267,30 @@ impl MatcherHandle {
             .map_err(|_| MatcherError::ChangeQueueClosedOrFull)?;
 
         Ok(())
+    }
+
+    pub fn process_changes_from_db_version(
+        &self,
+        conn: &Connection,
+        db_version: i64,
+    ) -> Result<(), MatcherError> {
+        let mut prepped = conn.prepare_cached(
+            "SELECT \"table\", DISTINCT(pk) FROM crsql_changes WHERE db_version = ? ORDER BY seq GROUP BY \"table\"",
+        )?;
+
+        let rows = prepped.query_map([db_version], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        self.process_changes_from_iter(rows)
+    }
+
+    pub fn process_change(&self, changes: &[Change]) -> Result<(), MatcherError> {
+        self.process_changes_from_iter(
+            changes
+                .iter()
+                .map(|change| Ok((change.table.as_str(), change.pk.as_slice()))),
+        )
     }
 
     pub fn id(&self) -> Uuid {
