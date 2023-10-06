@@ -2519,10 +2519,13 @@ async fn handle_hashing(agent: Agent) {
                         ) WHERE bucket IS NOT NULL
                     RETURNING bucket"))?.query_map([BUCKET_SIZE], |row| row.get(0))?.collect::<Result<HashSet<_>, _>>()?;
 
-            let stmt = get_cached_insert_stmt(&mut stmt_cache, table);
+            info!(table = %table_name, "queueing {} buckets for hashing", buckets.len());
 
             for bucket in buckets {
-                tx.prepare_cached(&stmt)?.execute([bucket])?;
+                tx.prepare_cached(
+                    "INSERT OR IGNORE INTO __corro_hash_queue (tbl_name, bucket) VALUES (?, ?)",
+                )?
+                .execute(params![table_name, bucket])?;
             }
 
             // just to be on the safe side... could be huge?
@@ -2543,9 +2546,11 @@ async fn handle_hashing(agent: Agent) {
         interval.tick().await;
 
         let res = block_in_place(|| {
-            loop {
-                let mut buf: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+            let mut count = 0;
+            let mut buf: BTreeMap<String, Vec<i64>> = BTreeMap::new();
 
+            let start = Instant::now();
+            loop {
                 let tx = conn.transaction()?;
 
                 {
@@ -2574,11 +2579,16 @@ async fn handle_hashing(agent: Agent) {
                     let stmt = get_cached_insert_stmt(&mut stmt_cache, &table);
 
                     for bucket in buckets {
-                        tx.prepare_cached(&stmt)?.execute([bucket])?;
+                        count += tx.prepare_cached(&stmt)?.execute([bucket])?;
                     }
                 }
                 tx.commit()?;
             }
+
+            if count > 0 {
+                info!("hashed {count} buckets in {:?}", start.elapsed());
+            }
+
             Ok::<_, rusqlite::Error>(())
         });
 
