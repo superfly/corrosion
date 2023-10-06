@@ -35,7 +35,7 @@ use corro_types::{
     members::{MemberEvent, Members, Rtt},
     pubsub::{migrate_subs, unpack_columns, Matcher},
     schema::{init_schema, NormalizedTable},
-    sqlite::{CrConn, Migration, SqlitePoolError, BUCKET_SIZE},
+    sqlite::{CrConn, Migration, SqlitePoolError, BUCKETS_COUNT},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
 };
 
@@ -1778,7 +1778,7 @@ fn queue_hash_jobs(agent: &Agent, conn: &Connection, changes: &[Change]) -> rusq
 
                     format!("
                     INSERT OR IGNORE INTO {table}__corro_buckets
-                        SELECT __crsql_key as key, seahash_concat({pks_list}) - (seahash_concat({pks_list}) % {BUCKET_SIZE}) AS bucket
+                        SELECT __crsql_key as key, seahash_concat({pks_list}) % {BUCKETS_COUNT} AS bucket
                             FROM {table}__crsql_pks AS pks WHERE {pks_where}
                         RETURNING {table}__corro_buckets.bucket")
                 })
@@ -2512,13 +2512,13 @@ async fn handle_hashing(agent: Agent) {
             let buckets: HashSet<i64> = tx.prepare_cached(&format!("
                 INSERT INTO {table_name}__corro_buckets
                     SELECT key, bucket FROM (
-                        SELECT __crsql_key AS key, seahash_concat({pks_list}) - (seahash_concat({pks_list}) % ?) AS bucket
+                        SELECT __crsql_key AS key, seahash_concat({pks_list}) % ? AS bucket
                             FROM {table_name}__crsql_pks AS pks WHERE __crsql_key IN (
                                 SELECT __crsql_key AS key FROM {table_name}__crsql_pks EXCEPT SELECT key FROM {table_name}__corro_buckets
                             )
                             GROUP BY key
                         )
-                    RETURNING bucket"))?.query_map([BUCKET_SIZE], |row| row.get(0))?.collect::<Result<HashSet<_>, _>>()?;
+                    RETURNING bucket"))?.query_map([BUCKETS_COUNT], |row| row.get(0))?.collect::<Result<HashSet<_>, _>>()?;
 
             info!(table = %table_name, "queueing {} buckets for hashing", buckets.len());
 

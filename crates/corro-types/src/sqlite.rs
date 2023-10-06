@@ -309,7 +309,7 @@ impl rusqlite::functions::Aggregate<SeaHasher, Option<i64>> for SeahashAggregate
     }
 }
 
-pub const BUCKET_SIZE: u64 = 10240;
+pub const BUCKETS_COUNT: u64 = 10240;
 
 pub fn queue_full_table_hash(conn: &Connection, table: &NormalizedTable) -> rusqlite::Result<()> {
     conn.execute_batch(&format!(
@@ -324,7 +324,7 @@ pub fn queue_full_table_hash(conn: &Connection, table: &NormalizedTable) -> rusq
         .collect::<Vec<_>>()
         .join(",");
 
-    let ins = conn.execute(&format!("INSERT INTO {table_name}__corro_buckets SELECT __crsql_key as key, seahash_concat({pks_list}) - (seahash_concat({pks_list}) % ?) AS bucket FROM {table_name}__crsql_pks AS pks GROUP BY __crsql_key", table_name = &table.name), [BUCKET_SIZE])?;
+    let ins = conn.execute(&format!("INSERT INTO {table_name}__corro_buckets SELECT __crsql_key as key, seahash_concat({pks_list}) % ? AS bucket FROM {table_name}__crsql_pks AS pks GROUP BY __crsql_key", table_name = &table.name), [BUCKETS_COUNT])?;
 
     info!(
         "inserted {ins} rows into {table_name}__corro_buckets",
