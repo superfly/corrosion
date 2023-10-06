@@ -52,7 +52,7 @@ impl Transport {
                 return Ok(send);
             }
             Err(SendDatagramError::ConnectionLost(e)) => {
-                debug!("retryable error attempting to open unidirectional stream: {e}");
+                debug!("retryable error attempting to send datagram: {e}");
             }
             Err(e) => {
                 increment_counter!("corro.transport.send_datagram.errors", "addr" => addr.to_string(), "error" => e.to_string());

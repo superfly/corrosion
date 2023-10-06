@@ -81,7 +81,7 @@ fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig
 
     // max idle timeout
     transport_config.max_idle_timeout(Some(
-        Duration::from_secs(std::cmp::min(config.idle_timeout_secs as u64, 10))
+        Duration::from_secs(config.idle_timeout_secs as u64)
             .try_into()
             .unwrap(),
     ));
