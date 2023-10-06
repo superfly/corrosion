@@ -1729,6 +1729,8 @@ async fn process_fully_buffered_changes(
 
             queue_hash_jobs(agent, &tx, &changes)?;
 
+            process_after_changes(agent, &changes);
+
             Some(KnownDbVersion::Current {
                 db_version,
                 last_seq,
@@ -2282,6 +2284,10 @@ fn process_single_version(
 }
 
 pub fn process_after_changes(agent: &Agent, changeset: &[Change]) {
+    debug!(
+        "processing after changes hooks, changes len: {}",
+        changeset.len()
+    );
     process_subs(agent, changeset);
 }
 

@@ -163,7 +163,7 @@ pub enum UnpackError {
 }
 
 pub struct ColumnIterator<'a> {
-    buf: std::io::Cursor<&'a [u8]>,
+    buf: &'a [u8],
     num_columns: Option<u8>,
 }
 
@@ -171,9 +171,11 @@ impl<'a> Iterator for ColumnIterator<'a> {
     type Item = Result<SqliteValueRef<'a>, UnpackError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        trace!("ColumnIterator::next, num_cols: {:?}", self.num_columns);
         let num_cols = self.num_columns.get_or_insert_with(|| self.buf.get_u8());
 
         if *num_cols == 0 {
+            debug!("no more columns!");
             return None;
         }
 
@@ -196,7 +198,7 @@ impl<'a> Iterator for ColumnIterator<'a> {
                 if self.buf.remaining() < len {
                     return Some(Err(UnpackError::Abort));
                 }
-                let ret = SqliteValueRef::Blob(&self.buf.get_ref()[0..len]);
+                let ret = SqliteValueRef::Blob(&self.buf[0..len]);
                 self.buf.advance(len);
 
                 Some(Ok(ret))
@@ -223,7 +225,7 @@ impl<'a> Iterator for ColumnIterator<'a> {
                     return Some(Err(UnpackError::Abort));
                 }
                 let ret = SqliteValueRef::Text(unsafe {
-                    std::str::from_utf8_unchecked(&self.buf.get_ref()[0..len])
+                    std::str::from_utf8_unchecked(&self.buf[0..len])
                 });
                 self.buf.advance(len);
 
@@ -236,7 +238,7 @@ impl<'a> Iterator for ColumnIterator<'a> {
 
 pub fn unpack_columns(buf: &[u8]) -> ColumnIterator {
     ColumnIterator {
-        buf: std::io::Cursor::new(buf),
+        buf,
         num_columns: None,
     }
 }
