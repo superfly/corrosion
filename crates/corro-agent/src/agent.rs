@@ -2943,7 +2943,32 @@ fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
             PRIMARY KEY (tbl_name, bucket)
         );
     ",
-    )
+    )?;
+
+    let tables: Vec<String> = tx
+        .prepare("SELECT tbl_name FROM __corro_schema WHERE type = 'table';")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for tbl_name in tables {
+        tx.execute_batch(&format!(
+            "
+            CREATE TABLE {tbl_name}__corro_buckets (
+                key INTEGER PRIMARY KEY NOT NULL,
+                bucket INTEGER NOT NULL
+            );
+            
+            CREATE INDEX {tbl_name}__corro_buckets_bucket ON {tbl_name}__corro_buckets (bucket);
+
+            CREATE TABLE {tbl_name}__corro_hashes (
+                bucket INTEGER PRIMARY KEY NOT NULL,
+                hash INTEGER NOT NULL
+            );
+        "
+        ))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
