@@ -35,9 +35,7 @@ use corro_types::{
     members::{MemberEvent, Members, Rtt},
     pubsub::{migrate_subs, unpack_columns, Matcher},
     schema::{init_schema, NormalizedTable},
-    sqlite::{
-        register_seahash_aggregate, register_xor_aggregate, CrConn, Migration, SqlitePoolError,
-    },
+    sqlite::{CrConn, Migration, SqlitePoolError, BUCKET_SIZE},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
 };
 
@@ -1197,15 +1195,10 @@ fn collect_metrics(agent: &Agent) {
         }
     }
 
-    if let Err(e) = register_xor_aggregate(&conn) {
-        error!("could not register xor function: {e}");
-        return;
-    }
-
     for name in schema.tables.keys() {
         match conn
             .prepare_cached(&format!(
-                "SELECT xor(hash) FROM {name}__corro_hashes ORDER BY bucket ASC"
+                "SELECT COALESCE(xor(hash), 0) FROM {name}__corro_hashes ORDER BY bucket ASC"
             ))
             .and_then(|mut prepped| prepped.query_row::<i64, _, _>([], |row| row.get(0)))
         {
@@ -1730,7 +1723,7 @@ async fn process_fully_buffered_changes(
             info!(%actor_id, version, "inserted bookkeeping row after buffered insert");
 
             // TODO: use a queue like __corro_hash_queue instead!
-            let mut changes = tx.prepare_cached("SELECT \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq FROM crsql_changes WHERE db_version = ?")?.query_map([db_version], row_to_change)?.collect::<Result<Vec<_>, _>>()?;
+            let mut changes = tx.prepare_cached("SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = ?")?.query_map([db_version], row_to_change)?.collect::<Result<Vec<_>, _>>()?;
 
             changes.sort_by(|a, b| a.table.cmp(&b.table).then_with(|| a.pk.cmp(&b.pk)));
 
@@ -1782,10 +1775,9 @@ fn queue_hash_jobs(agent: &Agent, conn: &Connection, changes: &[Change]) -> rusq
                         .join(" AND  ");
 
                     format!("
-                    INSERT INTO {table}__corro_buckets
-                        SELECT __crsql_key as key, seahash_concat({pks_list}) - (seahash_concat({pks_list}) % ?) AS bucket
+                    INSERT OR IGNORE INTO {table}__corro_buckets
+                        SELECT __crsql_key as key, seahash_concat({pks_list}) - (seahash_concat({pks_list}) % {BUCKET_SIZE}) AS bucket
                             FROM {table}__crsql_pks AS pks WHERE {pks_where}
-                        ON CONFLICT({table}__corro_buckets.key) IGNORE
                         RETURNING {table}__corro_buckets.bucket")
                 })
             } else {
@@ -1795,14 +1787,19 @@ fn queue_hash_jobs(agent: &Agent, conn: &Connection, changes: &[Change]) -> rusq
         };
 
         for (pk, _) in group.group_by(|change| &change.pk).into_iter() {
-            let bucket: i64 = conn
+            let bucket: Option<i64> = conn
                 .prepare_cached(bucket_stmt)?
                 .query_row(params_from_iter(unpack_columns(pk).flatten()), |row| {
                     row.get(0)
-                })?;
+                })
+                .optional()?;
 
-            conn.prepare_cached("INSERT INTO __corro_hash_queue (tbl_name, bucket) VALUES (?, ?)")?
+            if let Some(bucket) = bucket {
+                conn.prepare_cached(
+                    "INSERT INTO __corro_hash_queue (tbl_name, bucket) VALUES (?, ?)",
+                )?
                 .execute(params![table.as_str(), bucket])?;
+            }
         }
     }
 
@@ -2457,7 +2454,7 @@ fn get_cached_insert_stmt(
 
     let pks_where_tbl = cols
         .iter()
-        .map(|pk| format!("pks.{pk} = ?"))
+        .map(|pk| format!("tbl.{pk} = pks.{pk}"))
         .collect::<Vec<_>>()
         .join(" AND  ");
 
@@ -2494,9 +2491,6 @@ async fn handle_hashing(agent: Agent) {
         .await
         .expect("could not get a dedicated connection from the pool");
 
-    register_seahash_aggregate(&conn).expect("could not register seahash_concat function");
-    register_xor_aggregate(&conn).expect("could not register xor function");
-
     let mut stmt_cache: HashMap<NormalizedTable, String> = HashMap::new();
 
     let res = block_in_place(|| {
@@ -2516,8 +2510,8 @@ async fn handle_hashing(agent: Agent) {
                             FROM {table_name}__crsql_pks AS pks WHERE __crsql_key IN (
                                 SELECT __crsql_key FROM {table_name}__crsql_pks EXCEPT SELECT key FROM {table_name}__corro_buckets
                             )
-                        )
-                    RETURNING bucket"))?.query_map([], |row| row.get(0))?.collect::<Result<HashSet<_>, _>>()?;
+                        ) WHERE bucket IS NOT NULL
+                    RETURNING bucket"))?.query_map([BUCKET_SIZE], |row| row.get(0))?.collect::<Result<HashSet<_>, _>>()?;
 
             let stmt = get_cached_insert_stmt(&mut stmt_cache, table);
 

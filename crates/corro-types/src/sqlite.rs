@@ -128,6 +128,9 @@ pub(crate) fn setup_conn(conn: &mut Connection, attach: &AttachMap) -> Result<()
         "#,
     )?;
 
+    register_seahash_aggregate(conn)?;
+    register_xor_aggregate(conn)?;
+
     for (path, name) in attach.iter() {
         conn.execute_batch(&format!(
             "ATTACH DATABASE {} AS {}",
@@ -307,7 +310,7 @@ impl rusqlite::functions::Aggregate<SeaHasher, Option<i64>> for SeahashAggregate
     }
 }
 
-const BUCKET_SIZE: u64 = 10240;
+pub const BUCKET_SIZE: u64 = 10240;
 
 pub fn queue_full_table_hash(conn: &Connection, table: &NormalizedTable) -> rusqlite::Result<()> {
     conn.execute_batch(&format!(
@@ -390,7 +393,7 @@ mod tests {
             "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER, c TEXT, d BLOB, e REAL);";
         let mut new_schema = parse_sql(create_table)?;
 
-        let mut conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
+        let mut conn = rusqlite_to_crsqlite(rusqlite::Connection::open_in_memory()?)?;
 
         conn.execute_batch(create_table)?;
 
