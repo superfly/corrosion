@@ -702,6 +702,7 @@ name = "corro-agent"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "axum",
  "backoff",
  "bincode",
@@ -712,6 +713,7 @@ dependencies = [
  "corro-speedy",
  "corro-tests",
  "corro-types",
+ "deadpool",
  "eyre",
  "foca",
  "futures",

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 arc-swap = { workspace = true }
+async-trait = { workspace = true }
 axum = { workspace = true }
 backoff = { path = "../backoff" }
 bincode = { workspace = true }
@@ -13,6 +14,7 @@ camino = { workspace = true }
 compact_str = { workspace = true }
 config = { workspace = true }
 corro-types = { path = "../corro-types" }
+deadpool = { workspace = true }
 eyre = { workspace = true }
 foca = { workspace = true }
 futures = { workspace = true }

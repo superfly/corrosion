@@ -19,7 +19,7 @@ use crate::{
         },
     },
     broadcast::runtime_loop,
-    transport::{ConnectError, Transport},
+    transport::{Transport, TransportError},
 };
 
 use arc_swap::ArcSwap;
@@ -2305,7 +2305,7 @@ pub enum SyncClientError {
     #[error("service unavailable right now")]
     Unavailable,
     #[error(transparent)]
-    Connect(#[from] ConnectError),
+    Connect(#[from] TransportError),
     #[error("request timed out")]
     RequestTimedOut,
     #[error(transparent)]
@@ -2411,7 +2411,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
     let (tx, rx) = transport
         .open_bi(addr)
         .await
-        .map_err(crate::transport::ConnectError::from)?;
+        .map_err(crate::transport::TransportError::from)?;
 
     increment_counter!("corro.sync.attempts.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
 

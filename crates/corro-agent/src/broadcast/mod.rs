@@ -747,30 +747,19 @@ impl PendingBroadcast {
 fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
     tokio::spawn(async move {
         trace!("singly broadcasting to {addr}");
-        let mut stream = match transport.open_uni(addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!("could not open unidirectional stream to {addr}: {e}");
-                return;
-            }
-        };
 
-        match tokio::time::timeout(Duration::from_secs(5), stream.write_all(&payload)).await {
+        let len = payload.len();
+        match tokio::time::timeout(Duration::from_secs(5), transport.send_uni(addr, payload)).await
+        {
             Err(_e) => {
                 warn!("timed out writing broadcast to uni stream");
-                return;
             }
             Ok(Err(e)) => {
                 error!("could not write to uni stream to {addr}: {e}");
-                return;
             }
             Ok(Ok(_)) => {
-                counter!("corro.peer.stream.bytes.sent.total", payload.len() as u64, "type" => "uni");
+                counter!("corro.peer.stream.bytes.sent.total", len as u64, "type" => "uni");
             }
-        }
-
-        if let Err(e) = stream.finish().await {
-            debug!("could not finish broadcast uni stream to {addr}: {e}");
         }
     });
 }
