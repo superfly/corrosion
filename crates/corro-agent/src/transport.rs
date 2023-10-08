@@ -75,6 +75,8 @@ impl Transport {
 
         stream.write_all(&data).await?;
 
+        stream.finish().await?;
+
         Ok(())
     }
 
