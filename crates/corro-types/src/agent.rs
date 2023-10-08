@@ -24,7 +24,7 @@ use tokio::{
     runtime::Handle,
     sync::{
         mpsc::{channel, Sender},
-        oneshot,
+        oneshot, Semaphore,
     },
 };
 use tokio::{
@@ -88,6 +88,12 @@ pub struct AgentInner {
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     tx_changes: Sender<(ChangeV1, ChangeSource)>,
     schema: RwLock<NormalizedSchema>,
+    limits: Limits,
+}
+
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub sync: Arc<Semaphore>,
 }
 
 impl Agent {
@@ -107,6 +113,9 @@ impl Agent {
             tx_empty: config.tx_empty,
             tx_changes: config.tx_changes,
             schema: config.schema,
+            limits: Limits {
+                sync: Arc::new(Semaphore::new(3)),
+            },
         }))
     }
 
@@ -176,6 +185,10 @@ impl Agent {
 
     pub fn set_config(&self, new_conf: Config) {
         self.0.config.store(Arc::new(new_conf))
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.0.limits
     }
 }
 

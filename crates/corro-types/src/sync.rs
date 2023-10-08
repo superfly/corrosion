@@ -21,6 +21,13 @@ pub enum SyncMessageV1 {
     State(SyncStateV1),
     Changeset(ChangeV1),
     Clock(Timestamp),
+    Rejection(SyncRejectionV1),
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Readable, Writable)]
+pub enum SyncRejectionV1 {
+    #[error("max concurrency reached")]
+    MaxConcurrencyReached,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Readable, Writable, Serialize, Deserialize)]

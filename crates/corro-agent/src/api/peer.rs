@@ -11,7 +11,9 @@ use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
 use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset, Timestamp};
 use corro_types::change::{row_to_change, Change};
 use corro_types::config::{GossipConfig, TlsClientConfig};
-use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
+use corro_types::sync::{
+    SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncRejectionV1, SyncStateV1,
+};
 use futures::{Stream, TryFutureExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
@@ -38,6 +40,8 @@ pub enum SyncError {
     Send(#[from] SyncSendError),
     #[error(transparent)]
     Recv(#[from] SyncRecvError),
+    #[error(transparent)]
+    Rejection(#[from] SyncRejectionV1),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -861,13 +865,32 @@ pub async fn bidirectional_sync(
     read: RecvStream,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
-    let (tx, mut rx) = channel::<SyncMessage>(256);
-
-    let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
-
     let mut codec = LengthDelimitedCodec::new();
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
+
+    let _permit = if their_sync_state.is_some() {
+        // sync initiated by other end
+        match agent.limits().sync.clone().try_acquire_owned() {
+            Err(_e) => {
+                encode_write_sync_msg(
+                    &mut codec,
+                    &mut encode_buf,
+                    &mut send_buf,
+                    SyncMessage::V1(SyncMessageV1::Rejection(
+                        SyncRejectionV1::MaxConcurrencyReached,
+                    )),
+                    &mut write,
+                )
+                .await?;
+                write.flush().await.map_err(SyncSendError::from)?;
+                return Ok(0);
+            }
+            Ok(permit) => Some(permit),
+        }
+    } else {
+        None
+    };
 
     encode_write_sync_msg(
         &mut codec,
@@ -879,10 +902,16 @@ pub async fn bidirectional_sync(
     .await?;
     write.flush().await.map_err(SyncSendError::from)?;
 
+    let (tx, mut rx) = channel::<SyncMessage>(256);
+    let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
+
     let their_sync_state = match their_sync_state {
         Some(state) => state,
         None => match read_sync_msg(&mut read).await? {
             Some(SyncMessage::V1(SyncMessageV1::State(state))) => state,
+            Some(SyncMessage::V1(SyncMessageV1::Rejection(rejection))) => {
+                return Err(rejection.into())
+            }
             Some(_) => return Err(SyncRecvError::ExpectedSyncState.into()),
             None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
         },
@@ -1003,6 +1032,9 @@ pub async fn bidirectional_sync(
                         SyncMessage::V1(SyncMessageV1::Clock(_)) => {
                             warn!("received sync clock message more than once, ignoring");
                             continue;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
+                            return Err(rejection.into())
                         }
                     },
                 }

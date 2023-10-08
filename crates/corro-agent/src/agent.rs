@@ -605,7 +605,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 }
                             };
 
-                            increment_counter!("corro.peer.streams.accept.total", "type" => "bi");
+                            increment_counter!("corro.peer.stream.accept.total", "type" => "bi");
 
                             debug!(
                                 "accepted a bidirectional stream from {}",
@@ -928,8 +928,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     tokio::spawn(metrics_loop(agent.clone(), transport));
 
     tokio::spawn(handle_broadcasts(agent.clone(), bcast_rx));
-
-    // tokio::spawn
 
     loop {
         tokio::select! {
