@@ -918,14 +918,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
 
-    tokio::spawn(handle_gossip_to_send(transport, to_send_rx));
+    tokio::spawn(handle_gossip_to_send(transport.clone(), to_send_rx));
     tokio::spawn(handle_notifications(
         agent.clone(),
         notifications_rx,
         foca_tx.clone(),
         member_events_tx,
     ));
-    tokio::spawn(metrics_loop(agent.clone()));
+    tokio::spawn(metrics_loop(agent.clone(), transport));
 
     tokio::spawn(handle_broadcasts(agent.clone(), bcast_rx));
 
@@ -1140,20 +1140,21 @@ async fn clear_overwritten_versions(agent: Agent) {
 //     0x14f994a4c5259381,
 // ];
 
-async fn metrics_loop(agent: Agent) {
+async fn metrics_loop(agent: Agent, transport: Transport) {
     let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
 
     loop {
         metrics_interval.tick().await;
 
-        block_in_place(|| collect_metrics(&agent));
+        block_in_place(|| collect_metrics(&agent, &transport));
     }
 }
 
 // const MAX_COUNT_TO_HASH: i64 = 500_000;
 
-fn collect_metrics(agent: &Agent) {
+fn collect_metrics(agent: &Agent, transport: &Transport) {
     agent.pool().emit_metrics();
+    transport.emit_metrics();
 
     let schema = agent.schema().read();
 

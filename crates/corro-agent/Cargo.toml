@@ -22,6 +22,7 @@ itertools = { workspace = true }
 metrics = { workspace = true }
 parking_lot = { workspace = true }
 quinn = { workspace = true }
+quinn-proto = { workspace = true }
 quinn-plaintext = { workspace = true }
 quoted-string = { workspace = true }
 rand = { workspace = true }

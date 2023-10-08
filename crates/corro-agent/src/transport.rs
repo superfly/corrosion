@@ -6,11 +6,12 @@ use std::{
 };
 
 use bytes::Bytes;
-use metrics::{histogram, increment_counter};
+use metrics::{gauge, histogram, increment_counter};
 use quinn::{
     ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
     SendStream,
 };
+use quinn_proto::ConnectionStats;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
@@ -127,7 +128,10 @@ impl Transport {
             let start = Instant::now();
             let conn = match self.0.endpoint.connect(addr, server_name.as_str())?.await {
                 Ok(conn) => {
-                    histogram!("corro.transport.connect.time.seconds", start.elapsed().as_secs_f64(), "addr" => server_name);
+                    histogram!(
+                        "corro.transport.connect.time.seconds",
+                        start.elapsed().as_secs_f64()
+                    );
                     conn
                 }
                 Err(e) => {
@@ -144,6 +148,298 @@ impl Transport {
         };
 
         Ok(conn)
+    }
+
+    pub fn emit_metrics(&self) {
+        let read = self.0.conns.blocking_read();
+
+        gauge!("corro.transport.connections", read.len() as f64);
+
+        // make aggregate stats for all connections... so as to not overload a metrics server
+        let stats = read
+            .iter()
+            .fold(ConnectionStats::default(), |mut acc, (_, conn)| {
+                let stats = conn.stats();
+
+                acc.path.congestion_events += stats.path.congestion_events;
+                acc.path.lost_packets += stats.path.lost_packets;
+                acc.path.lost_bytes += stats.path.lost_bytes;
+                acc.path.sent_packets += stats.path.sent_packets;
+                acc.path.sent_plpmtud_probes += stats.path.sent_plpmtud_probes;
+                acc.path.lost_plpmtud_probes += stats.path.lost_plpmtud_probes;
+                acc.path.black_holes_detected += stats.path.black_holes_detected;
+
+                acc.frame_rx.acks += stats.frame_rx.acks;
+                acc.frame_rx.crypto += stats.frame_rx.crypto;
+                acc.frame_rx.connection_close += stats.frame_rx.connection_close;
+                acc.frame_rx.data_blocked += stats.frame_rx.data_blocked;
+                acc.frame_rx.datagram += stats.frame_rx.datagram;
+                acc.frame_rx.handshake_done += stats.frame_rx.handshake_done;
+                acc.frame_rx.max_data += stats.frame_rx.max_data;
+                acc.frame_rx.max_stream_data += stats.frame_rx.max_stream_data;
+                acc.frame_rx.max_streams_bidi += stats.frame_rx.max_streams_bidi;
+                acc.frame_rx.max_streams_uni += stats.frame_rx.max_streams_uni;
+                acc.frame_rx.new_connection_id += stats.frame_rx.new_connection_id;
+                acc.frame_rx.new_token += stats.frame_rx.new_token;
+                acc.frame_rx.path_challenge += stats.frame_rx.path_challenge;
+                acc.frame_rx.path_response += stats.frame_rx.path_response;
+                acc.frame_rx.ping += stats.frame_rx.ping;
+                acc.frame_rx.reset_stream += stats.frame_rx.reset_stream;
+                acc.frame_rx.retire_connection_id += stats.frame_rx.retire_connection_id;
+                acc.frame_rx.stream_data_blocked += stats.frame_rx.stream_data_blocked;
+                acc.frame_rx.streams_blocked_bidi += stats.frame_rx.streams_blocked_bidi;
+                acc.frame_rx.streams_blocked_uni += stats.frame_rx.streams_blocked_uni;
+                acc.frame_rx.stop_sending += stats.frame_rx.stop_sending;
+                acc.frame_rx.stream += stats.frame_rx.stream;
+
+                acc.frame_tx.acks += stats.frame_tx.acks;
+                acc.frame_tx.crypto += stats.frame_tx.crypto;
+                acc.frame_tx.connection_close += stats.frame_tx.connection_close;
+                acc.frame_tx.data_blocked += stats.frame_tx.data_blocked;
+                acc.frame_tx.datagram += stats.frame_tx.datagram;
+                acc.frame_tx.handshake_done += stats.frame_tx.handshake_done;
+                acc.frame_tx.max_data += stats.frame_tx.max_data;
+                acc.frame_tx.max_stream_data += stats.frame_tx.max_stream_data;
+                acc.frame_tx.max_streams_bidi += stats.frame_tx.max_streams_bidi;
+                acc.frame_tx.max_streams_uni += stats.frame_tx.max_streams_uni;
+                acc.frame_tx.new_connection_id += stats.frame_tx.new_connection_id;
+                acc.frame_tx.new_token += stats.frame_tx.new_token;
+                acc.frame_tx.path_challenge += stats.frame_tx.path_challenge;
+                acc.frame_tx.path_response += stats.frame_tx.path_response;
+                acc.frame_tx.ping += stats.frame_tx.ping;
+                acc.frame_tx.reset_stream += stats.frame_tx.reset_stream;
+                acc.frame_tx.retire_connection_id += stats.frame_tx.retire_connection_id;
+                acc.frame_tx.stream_data_blocked += stats.frame_tx.stream_data_blocked;
+                acc.frame_tx.streams_blocked_bidi += stats.frame_tx.streams_blocked_bidi;
+                acc.frame_tx.streams_blocked_uni += stats.frame_tx.streams_blocked_uni;
+                acc.frame_tx.stop_sending += stats.frame_tx.stop_sending;
+                acc.frame_tx.stream += stats.frame_tx.stream;
+
+                acc.udp_rx.bytes += stats.udp_rx.bytes;
+                acc.udp_rx.datagrams += stats.udp_rx.datagrams;
+                acc.udp_rx.transmits += stats.udp_rx.transmits;
+
+                acc.udp_tx.bytes += stats.udp_tx.bytes;
+                acc.udp_tx.datagrams += stats.udp_tx.datagrams;
+                acc.udp_tx.transmits += stats.udp_tx.transmits;
+
+                acc
+            });
+
+        gauge!(
+            "corro.transport.path.congestion_events",
+            stats.path.congestion_events as f64
+        );
+        gauge!(
+            "corro.transport.path.lost_packets",
+            stats.path.lost_packets as f64
+        );
+        gauge!(
+            "corro.transport.path.lost_bytes",
+            stats.path.lost_bytes as f64
+        );
+        gauge!(
+            "corro.transport.path.sent_packets",
+            stats.path.sent_packets as f64
+        );
+        gauge!(
+            "corro.transport.path.sent_plpmtud_probes",
+            stats.path.sent_plpmtud_probes as f64
+        );
+        gauge!(
+            "corro.transport.path.lost_plpmtud_probes",
+            stats.path.lost_plpmtud_probes as f64
+        );
+        gauge!(
+            "corro.transport.path.black_holes_detected",
+            stats.path.black_holes_detected as f64
+        );
+
+        gauge!("corro.transport.frame_rx.acks", stats.frame_rx.acks as f64);
+        gauge!(
+            "corro.transport.frame_rx.crypto",
+            stats.frame_rx.crypto as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.connection_close",
+            stats.frame_rx.connection_close as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.data_blocked",
+            stats.frame_rx.data_blocked as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.datagram",
+            stats.frame_rx.datagram as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.handshake_done",
+            stats.frame_rx.handshake_done as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.max_data",
+            stats.frame_rx.max_data as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.max_stream_data",
+            stats.frame_rx.max_stream_data as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.max_streams_bidi",
+            stats.frame_rx.max_streams_bidi as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.max_streams_uni",
+            stats.frame_rx.max_streams_uni as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.new_connection_id",
+            stats.frame_rx.new_connection_id as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.new_token",
+            stats.frame_rx.new_token as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.path_challenge",
+            stats.frame_rx.path_challenge as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.path_response",
+            stats.frame_rx.path_response as f64
+        );
+        gauge!("corro.transport.frame_rx.ping", stats.frame_rx.ping as f64);
+        gauge!(
+            "corro.transport.frame_rx.reset_stream",
+            stats.frame_rx.reset_stream as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.retire_connection_id",
+            stats.frame_rx.retire_connection_id as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.stream_data_blocked",
+            stats.frame_rx.stream_data_blocked as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.streams_blocked_bidi",
+            stats.frame_rx.streams_blocked_bidi as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.streams_blocked_uni",
+            stats.frame_rx.streams_blocked_uni as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.stop_sending",
+            stats.frame_rx.stop_sending as f64
+        );
+        gauge!(
+            "corro.transport.frame_rx.stream",
+            stats.frame_rx.stream as f64
+        );
+
+        gauge!("corro.transport.frame_tx.acks", stats.frame_tx.acks as f64);
+        gauge!(
+            "corro.transport.frame_tx.crypto",
+            stats.frame_tx.crypto as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.connection_close",
+            stats.frame_tx.connection_close as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.data_blocked",
+            stats.frame_tx.data_blocked as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.datagram",
+            stats.frame_tx.datagram as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.handshake_done",
+            stats.frame_tx.handshake_done as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.max_data",
+            stats.frame_tx.max_data as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.max_stream_data",
+            stats.frame_tx.max_stream_data as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.max_streams_bidi",
+            stats.frame_tx.max_streams_bidi as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.max_streams_uni",
+            stats.frame_tx.max_streams_uni as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.new_connection_id",
+            stats.frame_tx.new_connection_id as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.new_token",
+            stats.frame_tx.new_token as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.path_challenge",
+            stats.frame_tx.path_challenge as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.path_response",
+            stats.frame_tx.path_response as f64
+        );
+        gauge!("corro.transport.frame_tx.ping", stats.frame_tx.ping as f64);
+        gauge!(
+            "corro.transport.frame_tx.reset_stream",
+            stats.frame_tx.reset_stream as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.retire_connection_id",
+            stats.frame_tx.retire_connection_id as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.stream_data_blocked",
+            stats.frame_tx.stream_data_blocked as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.streams_blocked_bidi",
+            stats.frame_tx.streams_blocked_bidi as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.streams_blocked_uni",
+            stats.frame_tx.streams_blocked_uni as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.stop_sending",
+            stats.frame_tx.stop_sending as f64
+        );
+        gauge!(
+            "corro.transport.frame_tx.stream",
+            stats.frame_tx.stream as f64
+        );
+
+        gauge!("corro.transport.udp_rx.bytes", stats.udp_rx.bytes as f64);
+        gauge!(
+            "corro.transport.udp_rx.datagrams",
+            stats.udp_rx.datagrams as f64
+        );
+        gauge!(
+            "corro.transport.udp_rx.transmits",
+            stats.udp_rx.transmits as f64
+        );
+
+        gauge!("corro.transport.udp_tx.bytes", stats.udp_tx.bytes as f64);
+        gauge!(
+            "corro.transport.udp_tx.datagrams",
+            stats.udp_tx.datagrams as f64
+        );
+        gauge!(
+            "corro.transport.udp_tx.transmits",
+            stats.udp_tx.transmits as f64
+        );
     }
 }
 
