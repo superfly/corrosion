@@ -1,13 +1,11 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    ops::Deref,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use deadpool::managed::{Manager, Metrics, Pool, PoolError, RecycleResult};
 use metrics::{gauge, histogram, increment_counter};
 use quinn::{
     ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
@@ -23,44 +21,8 @@ pub struct Transport(Arc<TransportInner>);
 #[derive(Debug)]
 struct TransportInner {
     endpoint: Endpoint,
-    conns: RwLock<HashMap<SocketAddr, PooledConnection>>,
+    conns: RwLock<HashMap<SocketAddr, Connection>>,
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
-}
-
-#[derive(Debug, Clone)]
-struct PooledConnection {
-    uni_pool: Pool<SendStreamManager>,
-}
-
-impl Deref for PooledConnection {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.uni_pool.manager().conn
-    }
-}
-
-#[derive(Debug)]
-struct SendStreamManager {
-    conn: Connection,
-}
-
-#[async_trait::async_trait]
-impl Manager for SendStreamManager {
-    type Error = ConnectionError;
-    type Type = SendStream;
-
-    async fn create(&self) -> Result<Self::Type, Self::Error> {
-        self.conn.open_uni().await
-    }
-
-    async fn recycle(
-        &self,
-        _obj: &mut Self::Type,
-        _metrics: &Metrics,
-    ) -> RecycleResult<Self::Error> {
-        Ok(())
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -71,8 +33,6 @@ pub enum TransportError {
     Connection(#[from] quinn::ConnectionError),
     #[error(transparent)]
     Datagram(#[from] SendDatagramError),
-    #[error(transparent)]
-    SendStreamPool(#[from] PoolError<ConnectionError>),
     #[error(transparent)]
     SendStreamWrite(#[from] WriteError),
 }
@@ -111,7 +71,7 @@ impl Transport {
     pub async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
 
-        let mut stream = conn.uni_pool.get().await?;
+        let mut stream = conn.open_uni().await?;
 
         stream.write_all(&data).await?;
 
@@ -138,7 +98,7 @@ impl Transport {
         Ok(conn.open_bi().await?)
     }
 
-    async fn connect(&self, addr: SocketAddr) -> Result<PooledConnection, TransportError> {
+    async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
         let server_name = addr.ip().to_string();
 
         {
@@ -168,12 +128,7 @@ impl Transport {
                         "corro.transport.connect.time.seconds",
                         start.elapsed().as_secs_f64()
                     );
-                    PooledConnection {
-                        uni_pool: Pool::builder(SendStreamManager { conn })
-                            .max_size(3)
-                            .build()
-                            .unwrap(),
-                    }
+                    conn
                 }
                 Err(e) => {
                     increment_counter!("corro.transport.connect.errors", "addr" => server_name, "error" => e.to_string());
