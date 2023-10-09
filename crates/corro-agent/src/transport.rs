@@ -160,14 +160,14 @@ impl Transport {
                 let stats = conn.stats();
 
                 gauge!("corro.transport.path.cwnd", stats.path.cwnd as f64, "addr" => addr.to_string());
+                gauge!("corro.transport.path.congestion_events", stats.path.congestion_events as f64, "addr" => addr.to_string());
+                gauge!("corro.transport.path.black_holes_detected", stats.path.black_holes_detected as f64, "addr" => addr.to_string());
 
-                acc.path.congestion_events += stats.path.congestion_events;
                 acc.path.lost_packets += stats.path.lost_packets;
                 acc.path.lost_bytes += stats.path.lost_bytes;
                 acc.path.sent_packets += stats.path.sent_packets;
                 acc.path.sent_plpmtud_probes += stats.path.sent_plpmtud_probes;
                 acc.path.lost_plpmtud_probes += stats.path.lost_plpmtud_probes;
-                acc.path.black_holes_detected += stats.path.black_holes_detected;
 
                 acc.frame_rx.acks += stats.frame_rx.acks;
                 acc.frame_rx.crypto += stats.frame_rx.crypto;
@@ -225,11 +225,6 @@ impl Transport {
 
                 acc
             });
-
-        gauge!(
-            "corro.transport.path.congestion_events",
-            stats.path.congestion_events as f64
-        );
         gauge!(
             "corro.transport.path.lost_packets",
             stats.path.lost_packets as f64
@@ -249,10 +244,6 @@ impl Transport {
         gauge!(
             "corro.transport.path.lost_plpmtud_probes",
             stats.path.lost_plpmtud_probes as f64
-        );
-        gauge!(
-            "corro.transport.path.black_holes_detected",
-            stats.path.black_holes_detected as f64
         );
 
         gauge!("corro.transport.frame_rx", stats.frame_rx.acks as f64, "type" => "acks");
