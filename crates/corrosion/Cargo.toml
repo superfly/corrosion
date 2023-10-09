@@ -37,6 +37,7 @@ tempfile = { workspace = true }
 tikv-jemallocator = "0.5"
 time = { workspace = true }
 tokio = { workspace = true }
+tokio-metrics = { workspace = true }
 tokio-serde = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
