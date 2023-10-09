@@ -156,8 +156,10 @@ impl Transport {
         // make aggregate stats for all connections... so as to not overload a metrics server
         let stats = read
             .iter()
-            .fold(ConnectionStats::default(), |mut acc, (_, conn)| {
+            .fold(ConnectionStats::default(), |mut acc, (addr, conn)| {
                 let stats = conn.stats();
+
+                gauge!("corro.transport.path.cwnd", stats.path.cwnd as f64, "addr" => addr.to_string());
 
                 acc.path.congestion_events += stats.path.congestion_events;
                 acc.path.lost_packets += stats.path.lost_packets;
