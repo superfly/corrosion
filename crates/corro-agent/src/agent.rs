@@ -26,8 +26,8 @@ use arc_swap::ArcSwap;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
-        Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion, KnownVersion,
-        PartialVersion, SplitPool,
+        Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion, PartialVersion,
+        SplitPool,
     },
     broadcast::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset,
@@ -1124,13 +1124,6 @@ async fn clear_overwritten_versions(agent: Agent) {
     }
 }
 
-// const CHECKSUM_SEEDS: [u64; 4] = [
-//     0x16f11fe89b0d677c,
-//     0xb480a793d8e6c86c,
-//     0x6fe2e5aaf078ebc9,
-//     0x14f994a4c5259381,
-// ];
-
 async fn metrics_loop(agent: Agent, transport: Transport) {
     let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
 
@@ -1195,39 +1188,6 @@ fn collect_metrics(agent: &Agent, transport: &Transport) {
             error!("could not query count for buffered changes: {e}");
         }
     }
-
-    // for name in low_count_tables {
-    //     if let Some(table) = schema.tables.get(name) {
-    //         let pks = table.pk.iter().cloned().collect::<Vec<String>>().join(",");
-    //         match conn
-    //             .prepare_cached(&format!("SELECT * FROM {name} ORDER BY {pks}"))
-    //             .and_then(|mut prepped| {
-    //                 let col_count = prepped.column_count();
-    //                 prepped.query(()).and_then(|mut rows| {
-    //                     let mut hasher = seahash::SeaHasher::with_seeds(
-    //                         CHECKSUM_SEEDS[0],
-    //                         CHECKSUM_SEEDS[1],
-    //                         CHECKSUM_SEEDS[2],
-    //                         CHECKSUM_SEEDS[3],
-    //                     );
-    //                     while let Ok(Some(row)) = rows.next() {
-    //                         for idx in 0..col_count {
-    //                             let v: SqliteValue = row.get(idx)?;
-    //                             v.hash(&mut hasher);
-    //                         }
-    //                     }
-    //                     Ok(hasher.finish())
-    //                 })
-    //             }) {
-    //             Ok(hash) => {
-    //                 gauge!("corro.db.table.checksum", hash as f64, "table" => name.clone());
-    //             }
-    //             Err(e) => {
-    //                 error!("could not query clock table values for hashing {table}: {e}");
-    //             }
-    //         }
-    //     }
-    // }
 }
 
 pub async fn handle_change(
@@ -1269,19 +1229,6 @@ pub async fn handle_change(
         }
     }
 }
-
-// fn chunk_range(
-//     range: RangeInclusive<i64>,
-//     chunk_size: i64,
-// ) -> impl Iterator<Item = RangeInclusive<i64>> {
-//     range
-//         .clone()
-//         .step_by(chunk_size as usize)
-//         .map(move |block_start| {
-//             let block_end = (block_start + chunk_size).min(*range.end());
-//             block_start..=block_end
-//         })
-// }
 
 fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>> {
     let tables = tx

@@ -7,7 +7,7 @@ use tokio_util::codec::{Decoder, LengthDelimitedCodec};
 
 use crate::{
     actor::ActorId,
-    agent::{Booked, Bookie, KnownDbVersion},
+    agent::{Booked, Bookie},
     broadcast::{ChangeV1, Timestamp},
 };
 

@@ -17,7 +17,7 @@ use compact_str::CompactString;
 use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
-use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
+use rangemap::RangeInclusiveSet;
 use rusqlite::{Connection, InterruptHandle};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -765,6 +765,12 @@ pub struct PartialVersion {
     pub last_seq: i64,
     // timestamp when the change was produced by the source
     pub ts: Timestamp,
+}
+
+impl From<PartialVersion> for KnownDbVersion {
+    fn from(PartialVersion { seqs, last_seq, ts }: PartialVersion) -> Self {
+        KnownDbVersion::Partial { seqs, last_seq, ts }
+    }
 }
 
 #[derive(Debug)]

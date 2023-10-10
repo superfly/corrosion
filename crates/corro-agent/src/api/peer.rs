@@ -1,5 +1,6 @@
 use std::cmp;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection};
+use seahash::SeaHasher;
 use speedy::Writable;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{channel, Sender};
@@ -704,34 +706,94 @@ async fn process_sync(
 
         let all_versions = {
             booked
-                .read(format!(
-                    "process_range(overlapping):{}",
-                    actor_id.as_simple()
-                ))
+                .read(format!("all_versions:{}", actor_id.as_simple()))
                 .await
                 .all_versions()
         };
 
-        // 1. process needed versions
+        // process needed versions
         if let Some(needed) = sync_state.need.get(&actor_id) {
-            for range in needed {
-                for overlap in all_versions.overlapping(range) {
-                    let start = cmp::max(range.start(), overlap.start());
-                    let end = cmp::min(range.end(), overlap.end());
-                    process_range(&booked, &pool, *start..=*end, actor_id, is_local, &sender)
-                        .await?;
+            let truly_needed = {
+                let mut truly_needed = RangeInclusiveSet::from_iter(needed.iter().cloned());
+
+                let read = booked
+                    .read(format!("cleared_overlapping:{}", actor_id.as_simple()))
+                    .await;
+
+                if let Some(head) = sync_state.heads.get(&actor_id).copied() {
+                    if let Some(last) = read.last() {
+                        if last > head {
+                            truly_needed.insert(head + 1..=last);
+                        }
+                    }
                 }
+
+                let mut to_rem = vec![];
+
+                for needed in truly_needed.iter() {
+                    for range in read.cleared.overlapping(needed) {
+                        let start = *cmp::max(range.start(), needed.start());
+                        let end = *cmp::min(range.end(), needed.end());
+
+                        sender
+                            .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                                actor_id,
+                                changeset: Changeset::Empty {
+                                    versions: start..=end,
+                                },
+                            })))
+                            .await?;
+
+                        to_rem.push(start..=end);
+                    }
+                }
+
+                for range in to_rem {
+                    // don't need to process this range anymore!
+                    truly_needed.remove(range);
+                }
+
+                truly_needed
+            };
+
+            let mut ranges = vec![];
+
+            // handle non-cleared needs
+            for range in truly_needed {
+                for overlap in all_versions.overlapping(&range) {
+                    let start = *cmp::max(range.start(), overlap.start());
+                    let end = *cmp::min(range.end(), overlap.end());
+
+                    for chunked in chunk_range(start..=end, 20) {
+                        ranges.push(chunked);
+                    }
+                }
+            }
+
+            // order them in a predictable way by hashing start + end + local_actor_id
+            // this should prevent too many nodes sending the same data in the same order
+            // when syncing in parallel
+            ranges.sort_by_key(|range| {
+                let mut hasher = SeaHasher::new();
+                (range, local_actor_id).hash(&mut hasher);
+                hasher.finish()
+            });
+
+            for range in ranges {
+                process_range(&booked, &pool, range, actor_id, is_local, &sender).await?;
             }
         }
 
-        // 2. process partial needs
+        // process partial needs
         if let Some(partially_needed) = sync_state.partial_need.get(&actor_id) {
             for (version, seqs_needed) in partially_needed.iter() {
                 let known = {
                     booked
                         .read(format!("process_sync(partials)[{version}]"))
                         .await
+                        .partials
                         .get(version)
+                        .cloned()
                         .map(KnownDbVersion::from)
                 };
                 if let Some(known) = known {
@@ -749,39 +811,24 @@ async fn process_sync(
                 }
             }
         }
-
-        // 3. process newer-than-heads
-        let their_last_version = sync_state.heads.get(&actor_id).copied().unwrap_or(0);
-        let our_last_version = booked
-            .read(format!(
-                "process_sync(our_last_version):{}",
-                actor_id.as_simple()
-            ))
-            .await
-            .last()
-            .unwrap_or(0);
-
-        trace!(actor_id = %local_actor_id, "their last version: {their_last_version} vs ours: {our_last_version}");
-
-        if their_last_version >= our_last_version {
-            // nothing to teach the other node!
-            continue;
-        }
-
-        process_range(
-            &booked,
-            &pool,
-            (their_last_version + 1)..=our_last_version,
-            actor_id,
-            is_local,
-            &sender,
-        )
-        .await?;
     }
 
     debug!("done processing sync state");
 
     Ok(())
+}
+
+fn chunk_range(
+    range: RangeInclusive<i64>,
+    chunk_size: i64,
+) -> impl Iterator<Item = RangeInclusive<i64>> {
+    range
+        .clone()
+        .step_by(chunk_size as usize)
+        .map(move |block_start| {
+            let block_end = (block_start + chunk_size).min(*range.end());
+            block_start..=block_end
+        })
 }
 
 fn encode_sync_msg(
