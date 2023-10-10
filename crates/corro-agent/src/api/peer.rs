@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, BufMut, BytesMut};
 use compact_str::format_compact;
-use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
+use corro_types::agent::{Agent, KnownDbVersion, KnownVersion, PartialVersion, SplitPool};
 use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset, Timestamp};
 use corro_types::change::{row_to_change, Change};
 use corro_types::config::{GossipConfig, TlsClientConfig};
@@ -17,6 +17,7 @@ use corro_types::sync::{
 use futures::{Stream, TryFutureExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
+use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection};
 use speedy::Writable;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -331,7 +332,7 @@ const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
 async fn process_range(
     booked: &Booked,
     pool: &SplitPool,
-    range: &RangeInclusive<i64>,
+    range: RangeInclusive<i64>,
     actor_id: ActorId,
     is_local: bool,
     sender: &Sender<SyncMessage>,
@@ -339,58 +340,27 @@ async fn process_range(
     let (start, end) = (range.start(), range.end());
     trace!("processing range {start}..={end} for {}", actor_id);
 
-    let overlapping: Vec<(_, KnownDbVersion)> = {
-        booked
-            .read(format!(
-                "process_range(overlapping):{}",
-                actor_id.as_simple()
-            ))
-            .await
-            .overlapping(range)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    };
-
-    for (versions, known_version) in overlapping {
-        debug!("got overlapping range {versions:?} in {range:?}");
-
-        let mut processed = BTreeSet::new();
-        // optimization, cleared versions can't be revived... sending a single batch!
-        if let KnownDbVersion::Cleared = &known_version {
-            sender
-                .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Empty { versions },
-                })))
-                .await?;
-            continue;
+    for version in range {
+        let known = {
+            booked
+                .read(format!("process_range[{version}]:{}", actor_id.as_simple()))
+                .await
+                .get(&version)
+                .map(KnownDbVersion::from)
+        };
+        if let Some(known_version) = known {
+            process_version(
+                pool,
+                actor_id,
+                is_local,
+                version,
+                known_version,
+                booked,
+                vec![],
+                sender,
+            )
+            .await?;
         }
-
-        for version in versions {
-            let known = {
-                booked
-                    .read(format!("process_range[{version}]:{}", actor_id.as_simple()))
-                    .await
-                    .get(&version)
-                    .cloned()
-            };
-            if let Some(known_version) = known {
-                process_version(
-                    pool,
-                    actor_id,
-                    is_local,
-                    version,
-                    known_version,
-                    booked,
-                    vec![],
-                    sender,
-                )
-                .await?;
-                processed.insert(version);
-            }
-        }
-
-        debug!("processed versions {processed:?}");
     }
 
     Ok(())
@@ -500,7 +470,7 @@ fn handle_known_version(
                         ));
                         let maybe_current_version = match bw.get(&version) {
                             Some(known) => match known {
-                                KnownDbVersion::Partial { seqs, .. } => {
+                                KnownVersion::Partial(PartialVersion { seqs, .. }) => {
                                     if seqs != &partial_seqs {
                                         info!(%actor_id, version, "different partial sequences, updating! range_needed: {range_needed:?}");
                                         partial_seqs = seqs.clone();
@@ -512,8 +482,8 @@ fn handle_known_version(
                                     }
                                     None
                                 }
-                                known @ KnownDbVersion::Current { .. } => Some(known.clone()),
-                                KnownDbVersion::Cleared => {
+                                known @ KnownVersion::Current(_) => Some(known.into()),
+                                KnownVersion::Cleared => {
                                     debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
                                     break;
                                 }
@@ -732,10 +702,25 @@ async fn process_sync(
 
         let is_local = actor_id == local_actor_id;
 
+        let all_versions = {
+            booked
+                .read(format!(
+                    "process_range(overlapping):{}",
+                    actor_id.as_simple()
+                ))
+                .await
+                .all_versions()
+        };
+
         // 1. process needed versions
         if let Some(needed) = sync_state.need.get(&actor_id) {
             for range in needed {
-                process_range(&booked, &pool, range, actor_id, is_local, &sender).await?;
+                for overlap in all_versions.overlapping(range) {
+                    let start = cmp::max(range.start(), overlap.start());
+                    let end = cmp::min(range.end(), overlap.end());
+                    process_range(&booked, &pool, *start..=*end, actor_id, is_local, &sender)
+                        .await?;
+                }
             }
         }
 
@@ -747,7 +732,7 @@ async fn process_sync(
                         .read(format!("process_sync(partials)[{version}]"))
                         .await
                         .get(version)
-                        .cloned()
+                        .map(KnownDbVersion::from)
                 };
                 if let Some(known) = known {
                     process_version(
@@ -786,7 +771,7 @@ async fn process_sync(
         process_range(
             &booked,
             &pool,
-            &((their_last_version + 1)..=our_last_version),
+            (their_last_version + 1)..=our_last_version,
             actor_id,
             is_local,
             &sender,
@@ -1181,8 +1166,8 @@ mod tests {
         {
             let read = booked.read("test").await;
 
-            assert_eq!(read.get(&1).unwrap().clone(), known1);
-            assert_eq!(read.get(&2).unwrap().clone(), known2);
+            assert_eq!(KnownDbVersion::from(read.get(&1).unwrap()), known1);
+            assert_eq!(KnownDbVersion::from(read.get(&2).unwrap()), known2);
         }
 
         {

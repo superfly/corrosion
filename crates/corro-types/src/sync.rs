@@ -112,6 +112,7 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             booked
                 .read(format!("generate_sync(need):{}", actor_id.as_simple()))
                 .await
+                .all_versions()
                 .gaps(&(1..=last_version))
                 .collect()
         };
@@ -124,19 +125,12 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             let read = booked
                 .read(format!("generate_sync(partials):{}", actor_id.as_simple()))
                 .await;
-            for (range, known) in read.iter() {
-                if let KnownDbVersion::Partial { seqs, last_seq, .. } = known {
-                    if seqs.gaps(&(0..=*last_seq)).count() == 0 {
-                        // soon to be processed, but we got it all
-                        continue;
-                    }
-
-                    state
-                        .partial_need
-                        .entry(actor_id)
-                        .or_default()
-                        .insert(*range.start(), seqs.gaps(&(0..=*last_seq)).collect());
-                }
+            for (v, partial) in read.partials.iter() {
+                state
+                    .partial_need
+                    .entry(actor_id)
+                    .or_default()
+                    .insert(*v, partial.seqs.gaps(&(0..=partial.last_seq)).collect());
             }
         }
 

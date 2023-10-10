@@ -25,7 +25,10 @@ use crate::{
 use arc_swap::ArcSwap;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion, SplitPool},
+    agent::{
+        Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion, KnownVersion,
+        PartialVersion, SplitPool,
+    },
     broadcast::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset,
         ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
@@ -1086,34 +1089,24 @@ async fn clear_overwritten_versions(agent: Agent) {
                     deleted += tx
                         .prepare_cached("DELETE FROM __corro_bookkeeping WHERE db_version = ?")?
                         .execute([db_v])?;
-                    new_copy.insert(*v..=*v, KnownDbVersion::Cleared);
+                    new_copy.insert(*v, KnownDbVersion::Cleared);
                 }
 
-                for (range, known) in to_clear
+                for range in to_clear
                     .iter()
-                    .filter_map(|(_, v)| new_copy.get_key_value(v))
+                    .filter_map(|(_, v)| new_copy.cleared.get(v))
                     .dedup()
                 {
-                    match known {
-                        KnownDbVersion::Cleared => {
-                            inserted += store_empty_changeset(
-                                &tx,
-                                actor_id,
-                                *range.start()..=*range.end(),
-                            )?;
-                        }
-                        known => {
-                            warn!(%actor_id, "unexpected known db version when attempting to clear: {known:?}");
-                        }
-                    }
+                    inserted +=
+                        store_empty_changeset(&tx, actor_id, *range.start()..=*range.end())?;
                 }
 
                 tx.commit()?;
 
                 debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
 
-                **bookedw = BookedVersions(new_copy);
-                debug!("compacted in-memory cache by clearing db versions for actor {actor_id}, new total: {}", bookedw.len());
+                **bookedw = new_copy;
+                debug!("compacted in-memory cache by clearing db versions for actor {actor_id}");
 
                 Ok::<_, rusqlite::Error>(())
             });
@@ -1666,8 +1659,8 @@ async fn process_fully_buffered_changes(
 
     let inserted = block_in_place(|| {
         let (last_seq, ts) = {
-            match bookedw.get(&version) {
-                Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
+            match bookedw.partials.get(&version) {
+                Some(PartialVersion { seqs, last_seq, ts }) => {
                     if seqs.gaps(&(0..=*last_seq)).count() != 0 {
                         error!(%actor_id, version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(0..=*last_seq)).collect::<RangeInclusiveSet<i64>>());
                         // TODO: return an error here
@@ -1675,12 +1668,8 @@ async fn process_fully_buffered_changes(
                     }
                     (*last_seq, *ts)
                 }
-                Some(_) => {
-                    warn!(%actor_id, %version, "already processed buffered changes, returning");
-                    return Ok(false);
-                }
                 None => {
-                    warn!(%actor_id, %version, "version not found in cache,returning");
+                    warn!(%actor_id, %version, "version not found in cache, returning");
                     return Ok(false);
                 }
             }
@@ -2664,9 +2653,9 @@ async fn process_completed_empties(
                 actor_id.as_simple()
             ));
 
-            for (range, _) in empties
+            for range in empties
                 .iter()
-                .filter_map(|range| bookedw.get_key_value(range.start()))
+                .filter_map(|range| bookedw.cleared.get(range.start()))
                 .dedup()
             {
                 inserted += store_empty_changeset(&tx, actor_id, range.clone())?;

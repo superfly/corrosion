@@ -747,23 +747,96 @@ impl Drop for LockTracker {
     }
 }
 
-#[derive(Default)]
-pub struct BookedVersions(pub RangeInclusiveMap<i64, KnownDbVersion>);
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CurrentVersion {
+    // cr-sqlite db version
+    pub db_version: i64,
+    // actual last sequence originally produced
+    pub last_seq: i64,
+    // timestamp when the change was produced by the source
+    pub ts: Timestamp,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PartialVersion {
+    // range of sequences recorded
+    pub seqs: RangeInclusiveSet<i64>,
+    // actual last sequence originally produced
+    pub last_seq: i64,
+    // timestamp when the change was produced by the source
+    pub ts: Timestamp,
+}
+
+#[derive(Debug)]
+pub enum KnownVersion<'a> {
+    Cleared,
+    Current(&'a CurrentVersion),
+    Partial(&'a PartialVersion),
+}
+
+impl<'a> KnownVersion<'a> {
+    pub fn is_cleared(&self) -> bool {
+        matches!(self, KnownVersion::Cleared)
+    }
+}
+
+impl<'a> From<KnownVersion<'a>> for KnownDbVersion {
+    fn from(value: KnownVersion<'a>) -> Self {
+        match value {
+            KnownVersion::Cleared => KnownDbVersion::Cleared,
+            KnownVersion::Current(CurrentVersion {
+                db_version,
+                last_seq,
+                ts,
+            }) => KnownDbVersion::Current {
+                db_version: *db_version,
+                last_seq: *last_seq,
+                ts: *ts,
+            },
+            KnownVersion::Partial(PartialVersion { seqs, last_seq, ts }) => {
+                KnownDbVersion::Partial {
+                    seqs: seqs.clone(),
+                    last_seq: *last_seq,
+                    ts: *ts,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct BookedVersions {
+    pub cleared: RangeInclusiveSet<i64>,
+    pub current: BTreeMap<i64, CurrentVersion>,
+    pub partials: BTreeMap<i64, PartialVersion>,
+}
 
 impl BookedVersions {
+    pub fn contains_version(&self, version: &i64) -> bool {
+        self.cleared.contains(version)
+            || self.current.contains_key(version)
+            || self.partials.contains_key(version)
+    }
+
+    pub fn get(&self, version: &i64) -> Option<KnownVersion> {
+        self.cleared
+            .get(version)
+            .map(|_| KnownVersion::Cleared)
+            .or_else(|| self.current.get(version).map(KnownVersion::Current))
+            .or_else(|| self.partials.get(version).map(KnownVersion::Partial))
+    }
+
     pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
-        match seqs {
-            Some(check_seqs) => match self.0.get(&version) {
-                Some(known) => match known {
-                    KnownDbVersion::Partial { seqs, .. } => {
-                        check_seqs.clone().all(|seq| seqs.contains(&seq))
+        self.contains_version(&version)
+            && seqs
+                .map(|check_seqs| match self.get(&version) {
+                    Some(KnownVersion::Cleared) | Some(KnownVersion::Current(_)) => true,
+                    Some(KnownVersion::Partial(partial)) => {
+                        check_seqs.clone().all(|seq| partial.seqs.contains(&seq))
                     }
-                    KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
-                },
-                None => false,
-            },
-            None => self.0.contains_key(&version),
-        }
+                    None => false,
+                })
+                .unwrap_or(true)
     }
 
     pub fn contains_all(
@@ -775,24 +848,26 @@ impl BookedVersions {
     }
 
     pub fn contains_current(&self, version: &i64) -> bool {
-        matches!(self.0.get(version), Some(KnownDbVersion::Current { .. }))
+        self.current.contains_key(version)
     }
 
     pub fn current_versions(&self) -> BTreeMap<i64, i64> {
-        self.0
+        self.current
             .iter()
-            .filter_map(|(range, known)| {
-                if let KnownDbVersion::Current { db_version, .. } = known {
-                    Some((*db_version, *range.start()))
-                } else {
-                    None
-                }
-            })
+            .map(|(version, current)| (current.db_version, *version))
             .collect()
     }
 
     pub fn last(&self) -> Option<i64> {
-        self.0.iter().map(|(k, _v)| *k.end()).max()
+        // TODO: we probably don't need to traverse all of that...
+        //       maybe use `skip` based on the len
+        std::cmp::max(
+            self.cleared.iter().map(|k| *k.end()).max(),
+            std::cmp::max(
+                self.current.last_key_value().map(|(k, _)| *k),
+                self.partials.last_key_value().map(|(k, _)| *k),
+            ),
+        )
     }
 
     pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
@@ -800,15 +875,37 @@ impl BookedVersions {
     }
 
     pub fn insert_many(&mut self, versions: RangeInclusive<i64>, known_version: KnownDbVersion) {
-        self.0.insert(versions, known_version);
+        match known_version {
+            KnownDbVersion::Partial { seqs, last_seq, ts } => {
+                self.partials
+                    .insert(*versions.start(), PartialVersion { seqs, last_seq, ts });
+            }
+            KnownDbVersion::Current {
+                db_version,
+                last_seq,
+                ts,
+            } => {
+                self.current.insert(
+                    *versions.start(),
+                    CurrentVersion {
+                        db_version,
+                        last_seq,
+                        ts,
+                    },
+                );
+            }
+            KnownDbVersion::Cleared => {
+                self.cleared.insert(versions);
+            }
+        }
     }
-}
 
-impl Deref for BookedVersions {
-    type Target = RangeInclusiveMap<i64, KnownDbVersion>;
+    pub fn all_versions(&self) -> RangeInclusiveSet<i64> {
+        let mut versions = self.cleared.clone();
+        versions.extend(self.current.keys().map(|key| *key..=*key));
+        versions.extend(self.partials.keys().map(|key| *key..=*key));
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+        versions
     }
 }
 
