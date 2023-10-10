@@ -71,7 +71,17 @@ impl Transport {
     pub async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
 
-        let mut stream = conn.open_uni().await?;
+        let mut stream = match conn.open_uni().await {
+            Ok(stream) => stream,
+            Err(e @ ConnectionError::VersionMismatch) => {
+                return Err(e.into());
+            }
+            Err(e) => {
+                debug!("retryable error attempting to open unidirectional stream: {e}");
+                let conn = self.connect(addr).await?;
+                conn.open_uni().await?
+            }
+        };
 
         stream.write_all(&data).await?;
 
