@@ -197,7 +197,7 @@ where
             return Ok((ret, start.elapsed()));
         }
 
-        let last_version = book_writer.last().unwrap_or(0);
+        let last_version = book_writer.last().unwrap_or_default();
         trace!("last_version: {last_version}");
         let version = last_version + 1;
         trace!("version: {version}");

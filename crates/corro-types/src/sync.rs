@@ -104,8 +104,8 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
                 .await
                 .last()
         } {
-            Some(v) => v,
             None => continue,
+            Some(v) => v,
         };
 
         let need: Vec<_> = {
