@@ -865,10 +865,9 @@ impl BookedVersions {
     }
 
     pub fn last(&self) -> Option<i64> {
-        // TODO: we probably don't need to traverse all of that...
-        //       maybe use `skip` based on the len
-
         std::cmp::max(
+            // TODO: we probably don't need to traverse all of that...
+            //       maybe use `skip` based on the len
             self.cleared.iter().map(|k| *k.end()).max(),
             std::cmp::max(
                 self.current.last_key_value().map(|(k, _)| *k),
