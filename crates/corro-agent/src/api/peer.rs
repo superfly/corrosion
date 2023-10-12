@@ -22,7 +22,7 @@ use corro_types::sync::{
 };
 use futures::stream::FuturesUnordered;
 use futures::{Stream, TryFutureExt, TryStreamExt};
-use metrics::counter;
+use metrics::{counter, increment_counter};
 use quinn::{RecvStream, SendStream};
 use rand::seq::SliceRandom;
 use rangemap::RangeInclusiveSet;
@@ -1090,6 +1090,8 @@ pub async fn parallel_sync(
             None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
         }
         trace!(%actor_id, self_actor_id = %agent.actor_id(), "read clock payload");
+
+        increment_counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string());
 
         let needs = our_sync_state.compute_available_needs(&their_sync_state);
 
