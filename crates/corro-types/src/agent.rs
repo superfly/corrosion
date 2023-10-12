@@ -891,8 +891,10 @@ impl BookedVersions {
                 last_seq,
                 ts,
             } => {
+                let version = *versions.start();
+                self.partials.remove(&version);
                 self.current.insert(
-                    *versions.start(),
+                    version,
                     CurrentVersion {
                         db_version,
                         last_seq,
@@ -901,6 +903,10 @@ impl BookedVersions {
                 );
             }
             KnownDbVersion::Cleared => {
+                for version in versions.clone() {
+                    self.partials.remove(&version);
+                    self.current.remove(&version);
+                }
                 self.cleared.insert(versions);
             }
         }

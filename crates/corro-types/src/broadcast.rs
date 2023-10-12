@@ -20,10 +20,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::{error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
-use crate::{
-    actor::{Actor, ActorId},
-    sync::SyncStateV1,
-};
+use crate::actor::{Actor, ActorId};
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayload {
@@ -42,7 +39,7 @@ pub enum BiPayload {
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum BiPayloadV1 {
-    SyncState(SyncStateV1),
+    SyncStart(ActorId),
 }
 
 #[derive(Debug)]

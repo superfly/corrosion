@@ -9,7 +9,10 @@ use std::{
 
 use crate::{
     api::{
-        peer::{bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, SyncError},
+        peer::{
+            bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, parallel_sync,
+            receive_sync, SyncError,
+        },
         public::{
             api_v1_db_schema, api_v1_queries, api_v1_transactions,
             pubsub::{
@@ -639,24 +642,19 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                         Ok(payload) => {
                                                             match payload {
                                                                 BiPayload::V1(
-                                                                    BiPayloadV1::SyncState(state),
+                                                                    BiPayloadV1::SyncStart(
+                                                                        actor_id,
+                                                                    ),
                                                                 ) => {
+                                                                    trace!("framed read buffer len: {}", framed.read_buffer().len());
                                                                     // println!("got sync state: {state:?}");
-                                                                    if let Err(e) =
-                                                                        bidirectional_sync(
-                                                                            &agent,
-                                                                            generate_sync(
-                                                                                agent.bookie(),
-                                                                                agent.actor_id(),
-                                                                            )
-                                                                            .await,
-                                                                            Some(state),
-                                                                            framed.into_inner(),
-                                                                            tx,
-                                                                        )
-                                                                        .await
+                                                                    if let Err(e) = receive_sync(
+                                                                        &agent, actor_id, framed,
+                                                                        tx,
+                                                                    )
+                                                                    .await
                                                                     {
-                                                                        warn!("could not complete bidirectional sync: {e}");
+                                                                        warn!("could not complete receiving sync: {e}");
                                                                     }
                                                                     break;
                                                                 }
@@ -2330,91 +2328,107 @@ async fn handle_sync2(agent: &Agent, transport: &Transport) -> Result<(), SyncCl
         return Err(SyncClientError::NoGoodCandidate);
     }
 
-    todo!()
-}
-
-async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
-    let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
-    for (actor_id, needed) in sync_state.need.iter() {
-        gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
-    }
-    for (actor_id, version) in sync_state.heads.iter() {
-        gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
-    }
-
-    let (actor_id, addr) = {
-        let candidates = {
-            let members = agent.members().read();
-
-            members
-                .states
-                .iter()
-                .filter(|(id, _state)| **id != agent.actor_id())
-                .map(|(id, state)| (*id, state.addr))
-                .collect::<Vec<(ActorId, SocketAddr)>>()
-        };
-
-        if candidates.is_empty() {
-            return Err(SyncClientError::NoGoodCandidate);
-        }
-
-        debug!("found {} candidates to synchronize with", candidates.len());
-
-        let mut rng = StdRng::from_entropy();
-
-        let mut choices = candidates.into_iter().choose_multiple(&mut rng, 2);
-
-        choices.sort_by(|a, b| {
-            sync_state
-                .need_len_for_actor(&b.0)
-                .cmp(&sync_state.need_len_for_actor(&a.0))
-        });
-
-        if let Some(chosen) = choices.get(0).cloned() {
-            chosen
-        } else {
-            return Err(SyncClientError::NoGoodCandidate);
-        }
-    };
-
-    debug!(
-        actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
-        actor_id,
-        sync_state.need_len(),
-    );
-
-    debug!(actor = %agent.actor_id(), "sync message: {sync_state:?}");
-
-    increment_counter!("corro.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
-
-    histogram!(
-        "corro.sync.client.request.operations.need.count",
-        sync_state.need.len() as f64
-    );
-
-    let (tx, rx) = transport
-        .open_bi(addr)
-        .await
-        .map_err(crate::transport::TransportError::from)?;
-
-    increment_counter!("corro.sync.attempts.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
-
-    // FIXME: check if it's ok to sync (don't overload host)
-
     let start = Instant::now();
-    let n = bidirectional_sync(agent, sync_state, None, rx, tx).await?;
+    let n = parallel_sync(agent, transport, chosen.clone(), sync_state).await?;
 
     let elapsed = start.elapsed();
     if n > 0 {
         info!(
             "synced {n} changes w/ {} in {}s @ {} changes/s",
-            actor_id,
+            chosen
+                .into_iter()
+                .map(|(actor_id, _)| actor_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
             elapsed.as_secs_f64(),
             n as f64 / elapsed.as_secs_f64()
         );
     }
     Ok(())
 }
+
+// async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
+//     let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
+//     for (actor_id, needed) in sync_state.need.iter() {
+//         gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
+//     }
+//     for (actor_id, version) in sync_state.heads.iter() {
+//         gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
+//     }
+
+//     let (actor_id, addr) = {
+//         let candidates = {
+//             let members = agent.members().read();
+
+//             members
+//                 .states
+//                 .iter()
+//                 .filter(|(id, _state)| **id != agent.actor_id())
+//                 .map(|(id, state)| (*id, state.addr))
+//                 .collect::<Vec<(ActorId, SocketAddr)>>()
+//         };
+
+//         if candidates.is_empty() {
+//             return Err(SyncClientError::NoGoodCandidate);
+//         }
+
+//         debug!("found {} candidates to synchronize with", candidates.len());
+
+//         let mut rng = StdRng::from_entropy();
+
+//         let mut choices = candidates.into_iter().choose_multiple(&mut rng, 2);
+
+//         choices.sort_by(|a, b| {
+//             sync_state
+//                 .need_len_for_actor(&b.0)
+//                 .cmp(&sync_state.need_len_for_actor(&a.0))
+//         });
+
+//         if let Some(chosen) = choices.get(0).cloned() {
+//             chosen
+//         } else {
+//             return Err(SyncClientError::NoGoodCandidate);
+//         }
+//     };
+
+//     debug!(
+//         actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
+//         actor_id,
+//         sync_state.need_len(),
+//     );
+
+//     debug!(actor = %agent.actor_id(), "sync message: {sync_state:?}");
+
+//     increment_counter!("corro.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+
+//     histogram!(
+//         "corro.sync.client.request.operations.need.count",
+//         sync_state.need.len() as f64
+//     );
+
+//     let (tx, rx) = transport
+//         .open_bi(addr)
+//         .await
+//         .map_err(crate::transport::TransportError::from)?;
+
+//     increment_counter!("corro.sync.attempts.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
+
+//     // FIXME: check if it's ok to sync (don't overload host)
+
+//     let start = Instant::now();
+//     let n = bidirectional_sync(agent, sync_state, None, rx, tx).await?;
+
+//     let elapsed = start.elapsed();
+//     if n > 0 {
+//         info!(
+//             "synced {n} changes w/ {} in {}s @ {} changes/s",
+//             actor_id,
+//             elapsed.as_secs_f64(),
+//             n as f64 / elapsed.as_secs_f64()
+//         );
+//     }
+//     Ok(())
+// }
 
 const MIN_CHANGES_CHUNK: usize = 1000;
 
@@ -2589,7 +2603,7 @@ async fn sync_loop(
         match branch {
             Branch::Tick => {
                 // ignoring here, there is trying and logging going on inside
-                match handle_sync(&agent, &transport)
+                match handle_sync2(&agent, &transport)
                     .preemptible(&mut tripwire)
                     .await
                 {
@@ -3148,7 +3162,7 @@ pub mod tests {
 
         let start = Instant::now();
 
-        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
