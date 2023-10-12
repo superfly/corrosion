@@ -4394,3 +4394,8 @@ checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
 dependencies = [
  "time",
 ]
+
+[[patch.unused]]
+name = "quinn-proto"
+version = "0.10.5"
+source = "git+https://github.com/jeromegn/quinn?rev=9d0faf1c#9d0faf1c12dccca34d71eae9d36e75203d447f68"
