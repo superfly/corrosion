@@ -1,6 +1,7 @@
-use std::{collections::HashMap, io, ops::RangeInclusive};
+use std::{cmp, collections::HashMap, io, ops::RangeInclusive};
 
 use bytes::BytesMut;
+use rangemap::RangeInclusiveSet;
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 use tokio_util::codec::{Decoder, LengthDelimitedCodec};
@@ -22,7 +23,11 @@ pub enum SyncMessageV1 {
     Changeset(ChangeV1),
     Clock(Timestamp),
     Rejection(SyncRejectionV1),
+    Start(ActorId),
+    Request(SyncRequestV1),
 }
+
+pub type SyncRequestV1 = Vec<(ActorId, Vec<SyncNeedV1>)>;
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Readable, Writable)]
 pub enum SyncRejectionV1 {
@@ -72,6 +77,156 @@ impl SyncStateV1 {
                 .get(actor_id)
                 .map(|partials| partials.len() as i64)
                 .unwrap_or(0)
+    }
+
+    pub fn compute_available_needs(
+        &self,
+        other: &SyncStateV1,
+    ) -> HashMap<ActorId, Vec<SyncNeedV1>> {
+        let mut needs: HashMap<ActorId, Vec<SyncNeedV1>> = HashMap::new();
+
+        for (actor_id, head) in other.heads.iter() {
+            if *actor_id == self.actor_id {
+                continue;
+            }
+            let other_haves = {
+                let mut haves = RangeInclusiveSet::from_iter([(1..=*head)].into_iter());
+
+                // remove needs
+                if let Some(other_need) = other.need.get(actor_id) {
+                    for need in other_need.iter() {
+                        // create gaps
+                        haves.remove(need.clone());
+                    }
+                }
+
+                // remove partials
+                if let Some(other_partials) = other.partial_need.get(actor_id) {
+                    for (v, _) in other_partials.iter() {
+                        haves.remove(*v..=*v);
+                    }
+                }
+
+                // we are left with all the versions they fully have!
+
+                haves
+            };
+
+            if let Some(our_need) = self.need.get(actor_id) {
+                for range in our_need.iter() {
+                    for overlap in other_haves.overlapping(range) {
+                        let start = cmp::max(range.start(), overlap.start());
+                        let end = cmp::min(range.end(), overlap.end());
+                        needs.entry(*actor_id).or_default().push(SyncNeedV1::Full {
+                            versions: *start..=*end,
+                        })
+                    }
+                }
+            }
+
+            if let Some(our_partials) = self.partial_need.get(actor_id) {
+                for (v, seqs) in our_partials.iter() {
+                    if other_haves.contains(v) {
+                        needs
+                            .entry(*actor_id)
+                            .or_default()
+                            .push(SyncNeedV1::Partial {
+                                version: *v,
+                                seqs: seqs.clone(),
+                            });
+                    } else if let Some(other_seqs) = other
+                        .partial_need
+                        .get(actor_id)
+                        .and_then(|versions| versions.get(v))
+                    {
+                        let max_other_seq = other_seqs.iter().map(|range| *range.end()).max();
+                        let max_our_seq = seqs.iter().map(|range| *range.end()).max();
+
+                        let end_seq = cmp::max(max_other_seq, max_our_seq);
+
+                        if let Some(end) = end_seq {
+                            let mut other_seqs_haves = RangeInclusiveSet::from_iter([1..=end]);
+
+                            for seqs in other_seqs.iter() {
+                                other_seqs_haves.remove(seqs.clone());
+                            }
+
+                            let seqs = seqs
+                                .iter()
+                                .flat_map(|range| {
+                                    other_seqs_haves
+                                        .overlapping(range)
+                                        .map(|overlap| {
+                                            let start = cmp::max(range.start(), overlap.start());
+                                            let end = cmp::min(range.end(), overlap.end());
+                                            *start..=*end
+                                        })
+                                        .collect::<Vec<RangeInclusive<i64>>>()
+                                })
+                                .collect::<Vec<RangeInclusive<i64>>>();
+
+                            if !seqs.is_empty() {
+                                needs
+                                    .entry(*actor_id)
+                                    .or_default()
+                                    .push(SyncNeedV1::Partial { version: *v, seqs });
+                            }
+                        }
+                    }
+                }
+            }
+
+            let missing = match self.heads.get(actor_id) {
+                Some(our_head) => {
+                    if head > our_head {
+                        Some((*our_head + 1)..=*head)
+                    } else {
+                        None
+                    }
+                }
+                None => Some(1..=*head),
+            };
+
+            if let Some(missing) = missing {
+                needs
+                    .entry(*actor_id)
+                    .or_default()
+                    .push(SyncNeedV1::Full { versions: missing });
+            }
+        }
+
+        needs
+    }
+}
+
+// pub fn extract_common_needs(
+//     mut needs: Vec<HashMap<ActorId, Vec<SyncNeedV1>>>,
+// ) -> (
+//     HashMap<ActorId, Vec<SyncNeedV1>>,
+//     Vec<HashMap<ActorId, Vec<SyncNeedV1>>>,
+// ) {
+//     let mut common = HashMap::new();
+
+//     todo!()
+// }
+
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub enum SyncNeedV1 {
+    Full {
+        versions: RangeInclusive<i64>,
+    },
+    Partial {
+        version: i64,
+        seqs: Vec<RangeInclusive<i64>>,
+    },
+}
+
+impl SyncNeedV1 {
+    pub fn count(&self) -> usize {
+        match self {
+            SyncNeedV1::Full { versions } => (versions.end() - versions.start()) as usize + 1,
+            SyncNeedV1::Partial { .. } => 1,
+        }
     }
 }
 
@@ -182,5 +337,86 @@ impl SyncMessage {
             Some(mut buf) => Some(Self::from_buf(&mut buf)?),
             None => None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[test]
+    fn test_compute_available_needs() {
+        let actor1 = ActorId(Uuid::new_v4());
+
+        let mut our_state = SyncStateV1::default();
+        our_state.heads.insert(actor1, 10);
+
+        let mut other_state = SyncStateV1::default();
+        other_state.heads.insert(actor1, 13);
+
+        assert_eq!(
+            our_state.compute_available_needs(&other_state),
+            [(actor1, vec![SyncNeedV1::Full { versions: 11..=13 }])].into()
+        );
+
+        our_state.need.entry(actor1).or_default().push(2..=5);
+        our_state.need.entry(actor1).or_default().push(7..=7);
+
+        assert_eq!(
+            our_state.compute_available_needs(&other_state),
+            [(
+                actor1,
+                vec![
+                    SyncNeedV1::Full { versions: 2..=5 },
+                    SyncNeedV1::Full { versions: 7..=7 },
+                    SyncNeedV1::Full { versions: 11..=13 }
+                ]
+            )]
+            .into()
+        );
+
+        our_state
+            .partial_need
+            .insert(actor1, [(9i64, vec![100..=120, 130..=132])].into());
+
+        assert_eq!(
+            our_state.compute_available_needs(&other_state),
+            [(
+                actor1,
+                vec![
+                    SyncNeedV1::Full { versions: 2..=5 },
+                    SyncNeedV1::Full { versions: 7..=7 },
+                    SyncNeedV1::Partial {
+                        version: 9,
+                        seqs: vec![100..=120, 130..=132]
+                    },
+                    SyncNeedV1::Full { versions: 11..=13 }
+                ]
+            )]
+            .into()
+        );
+
+        other_state
+            .partial_need
+            .insert(actor1, [(9i64, vec![100..=110, 130..=130])].into());
+
+        assert_eq!(
+            our_state.compute_available_needs(&other_state),
+            [(
+                actor1,
+                vec![
+                    SyncNeedV1::Full { versions: 2..=5 },
+                    SyncNeedV1::Full { versions: 7..=7 },
+                    SyncNeedV1::Partial {
+                        version: 9,
+                        seqs: vec![111..=120, 131..=132]
+                    },
+                    SyncNeedV1::Full { versions: 11..=13 }
+                ]
+            )]
+            .into()
+        );
     }
 }

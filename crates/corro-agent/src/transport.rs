@@ -83,7 +83,7 @@ impl Transport {
             }
         };
 
-        stream.write_all(&data).await?;
+        stream.write_chunk(data).await?;
 
         stream.finish().await?;
 

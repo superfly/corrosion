@@ -8,14 +8,18 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, BufMut, BytesMut};
 use compact_str::format_compact;
-use corro_types::agent::{Agent, KnownDbVersion, KnownVersion, PartialVersion, SplitPool};
+use corro_types::agent::{
+    Agent, CurrentVersion, KnownDbVersion, KnownVersion, PartialVersion, SplitPool,
+};
 use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset, Timestamp};
 use corro_types::change::{row_to_change, Change};
 use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{
-    SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncRejectionV1, SyncStateV1,
+    generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
+    SyncRequestV1, SyncStateV1,
 };
-use futures::{Stream, TryFutureExt};
+use futures::stream::FuturesUnordered;
+use futures::{Stream, TryFutureExt, TryStreamExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rangemap::RangeInclusiveSet;
@@ -23,7 +27,7 @@ use rusqlite::{params, Connection};
 use seahash::SeaHasher;
 use speedy::Writable;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{self, channel, Sender};
 use tokio::task::block_in_place;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
@@ -31,6 +35,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::agent::SyncRecvError;
 use crate::api::public::ChunkedChanges;
+use crate::transport::{Transport, TransportError};
 
 use corro_types::{
     actor::ActorId,
@@ -45,12 +50,17 @@ pub enum SyncError {
     Recv(#[from] SyncRecvError),
     #[error(transparent)]
     Rejection(#[from] SyncRejectionV1),
+    #[error(transparent)]
+    Transport(#[from] TransportError),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncSendError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    Write(#[from] quinn::WriteError),
 
     #[error(transparent)]
     Rusqlite(#[from] rusqlite::Error),
@@ -97,7 +107,7 @@ fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig
     transport_config.max_concurrent_bidi_streams(32u32.into());
 
     // max concurrent unidirectional streams
-    transport_config.max_concurrent_uni_streams(2048u32.into());
+    transport_config.max_concurrent_uni_streams(256u32.into());
 
     if let Some(max_mtu) = config.max_mtu {
         info!("Setting maximum MTU for QUIC at {max_mtu}");
@@ -682,143 +692,226 @@ async fn process_sync(
     local_actor_id: ActorId,
     pool: SplitPool,
     bookie: Bookie,
-    sync_state: SyncStateV1,
     sender: Sender<SyncMessage>,
+    mut recv: mpsc::Receiver<SyncRequestV1>,
 ) -> eyre::Result<()> {
-    let booked_actors: HashMap<ActorId, Booked> = {
-        bookie
-            .read("process_sync")
-            .await
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect()
-    };
+    let mut current_haves = vec![];
+    let mut partial_needs = vec![];
 
-    for (actor_id, booked) in booked_actors {
-        if actor_id == sync_state.actor_id {
-            trace!("skipping itself!");
-            // don't send the requester's data
-            continue;
-        }
-        // trace!(actor_id = %local_actor_id, "processing sync for {actor_id}, last: {:?}", booked.last().await);
+    while let Some(req) = recv.recv().await {
+        for (actor_id, needs) in req {
+            let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() } {
+                Some(booked) => booked,
+                None => continue,
+            };
 
-        let is_local = actor_id == local_actor_id;
+            let is_local = actor_id == local_actor_id;
 
-        trace!(%actor_id, %local_actor_id, "processing sync");
+            let mut cleared: RangeInclusiveSet<i64> = RangeInclusiveSet::new();
 
-        let all_versions = {
-            booked
-                .read(format!("all_versions:{}", actor_id.as_simple()))
-                .await
-                .all_versions()
-        };
-
-        trace!(%actor_id, %local_actor_id, "all versions: {all_versions:?}");
-
-        let truly_needed = {
-            let mut truly_needed = RangeInclusiveSet::new();
-            let read = booked
-                .read(format!("cleared_overlapping:{}", actor_id.as_simple()))
-                .await;
-
-            if let Some(needed) = sync_state.need.get(&actor_id) {
-                truly_needed.extend(needed.iter().cloned());
-            }
-
-            let head = sync_state.heads.get(&actor_id).copied().unwrap_or_default();
-            if let Some(last) = read.last() {
-                trace!(%actor_id, %local_actor_id, "their last: {head}, our last: {last}");
-                if last > head {
-                    truly_needed.insert(head + 1..=last);
+            {
+                let read = booked.read("process_need(full)").await;
+                for need in needs {
+                    match need {
+                        SyncNeedV1::Full { versions } => {
+                            for version in versions {
+                                match read.get(&version) {
+                                    Some(KnownVersion::Cleared) => {
+                                        cleared.insert(version..=version);
+                                    }
+                                    Some(known) => {
+                                        current_haves.push((version, KnownDbVersion::from(known)));
+                                    }
+                                    None => continue,
+                                }
+                            }
+                        }
+                        SyncNeedV1::Partial { version, seqs } => match read.get(&version) {
+                            Some(KnownVersion::Cleared) => {
+                                cleared.insert(version..=version);
+                            }
+                            Some(known) => {
+                                partial_needs.push((version, KnownDbVersion::from(known), seqs));
+                            }
+                            None => continue,
+                        },
+                    }
                 }
             }
 
-            let mut cleared = vec![];
-
-            for needed in truly_needed.iter() {
-                for range in read.cleared.overlapping(needed) {
-                    let start = *cmp::max(range.start(), needed.start());
-                    let end = *cmp::min(range.end(), needed.end());
-
-                    trace!(%actor_id, %local_actor_id, "immediately sending cleared ranges: {start}..={end}");
-
-                    sender
-                        .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                            actor_id,
-                            changeset: Changeset::Empty {
-                                versions: start..=end,
-                            },
-                        })))
-                        .await?;
-
-                    cleared.push(start..=end);
-                }
-            }
-
-            for range in cleared {
-                // don't need to process this range anymore!
-                truly_needed.remove(range);
-            }
-
-            truly_needed
-        };
-
-        let mut ranges = vec![];
-
-        // handle non-cleared needs
-        for range in truly_needed {
-            for overlap in all_versions.overlapping(&range) {
-                let start = *cmp::max(range.start(), overlap.start());
-                let end = *cmp::min(range.end(), overlap.end());
-
-                for chunked in chunk_range(start..=end, 20) {
-                    ranges.push(chunked);
-                }
-            }
-        }
-
-        // order them in a predictable way by hashing start + end + local_actor_id
-        // this should prevent too many nodes sending the same data in the same order
-        // when syncing in parallel
-        ranges.sort_by_key(|range| {
-            let mut hasher = SeaHasher::new();
-            (range, local_actor_id).hash(&mut hasher);
-            hasher.finish()
-        });
-
-        for range in ranges {
-            trace!(%actor_id, %local_actor_id, "processing range to sync: {range:?}");
-            process_range(&booked, &pool, range, actor_id, is_local, &sender).await?;
-        }
-
-        // process partial needs
-        if let Some(partially_needed) = sync_state.partial_need.get(&actor_id) {
-            for (version, seqs_needed) in partially_needed.iter() {
-                let known = {
-                    booked
-                        .read(format!("process_sync(partials)[{version}]"))
-                        .await
-                        .partials
-                        .get(version)
-                        .cloned()
-                        .map(KnownDbVersion::from)
-                };
-                if let Some(known) = known {
-                    process_version(
-                        &pool,
+            for versions in cleared {
+                sender
+                    .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                         actor_id,
-                        is_local,
-                        *version,
-                        known,
-                        &booked,
-                        seqs_needed.clone(),
-                        &sender,
-                    )
+                        changeset: Changeset::Empty { versions },
+                    })))
                     .await?;
-                }
+            }
+
+            for (version, known_version) in current_haves.drain(..) {
+                process_version(
+                    &pool,
+                    actor_id,
+                    is_local,
+                    version,
+                    known_version,
+                    &booked,
+                    vec![],
+                    &sender,
+                )
+                .await?;
+            }
+
+            for (version, known_version, seqs_needed) in partial_needs.drain(..) {
+                process_version(
+                    &pool,
+                    actor_id,
+                    is_local,
+                    version,
+                    known_version,
+                    &booked,
+                    seqs_needed,
+                    &sender,
+                )
+                .await?;
             }
         }
     }
+
+    // let booked_actors: HashMap<ActorId, Booked> = {
+    //     bookie
+    //         .read("process_sync")
+    //         .await
+    //         .iter()
+    //         .map(|(k, v)| (*k, v.clone()))
+    //         .collect()
+    // };
+
+    // for (actor_id, booked) in booked_actors {
+    //     if actor_id == sync_state.actor_id {
+    //         trace!("skipping itself!");
+    //         // don't send the requester's data
+    //         continue;
+    //     }
+    //     // trace!(actor_id = %local_actor_id, "processing sync for {actor_id}, last: {:?}", booked.last().await);
+
+    //     let is_local = actor_id == local_actor_id;
+
+    //     trace!(%actor_id, %local_actor_id, "processing sync");
+
+    //     let all_versions = {
+    //         booked
+    //             .read(format!("all_versions:{}", actor_id.as_simple()))
+    //             .await
+    //             .all_versions()
+    //     };
+
+    //     trace!(%actor_id, %local_actor_id, "all versions: {all_versions:?}");
+
+    //     let truly_needed = {
+    //         let mut truly_needed = RangeInclusiveSet::new();
+    //         let read = booked
+    //             .read(format!("cleared_overlapping:{}", actor_id.as_simple()))
+    //             .await;
+
+    //         if let Some(needed) = sync_state.need.get(&actor_id) {
+    //             truly_needed.extend(needed.iter().cloned());
+    //         }
+
+    //         let head = sync_state.heads.get(&actor_id).copied().unwrap_or_default();
+    //         if let Some(last) = read.last() {
+    //             trace!(%actor_id, %local_actor_id, "their last: {head}, our last: {last}");
+    //             if last > head {
+    //                 truly_needed.insert(head + 1..=last);
+    //             }
+    //         }
+
+    //         let mut cleared = vec![];
+
+    //         for needed in truly_needed.iter() {
+    //             for range in read.cleared.overlapping(needed) {
+    //                 let start = *cmp::max(range.start(), needed.start());
+    //                 let end = *cmp::min(range.end(), needed.end());
+
+    //                 trace!(%actor_id, %local_actor_id, "immediately sending cleared ranges: {start}..={end}");
+
+    //                 sender
+    //                     .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+    //                         actor_id,
+    //                         changeset: Changeset::Empty {
+    //                             versions: start..=end,
+    //                         },
+    //                     })))
+    //                     .await?;
+
+    //                 cleared.push(start..=end);
+    //             }
+    //         }
+
+    //         for range in cleared {
+    //             // don't need to process this range anymore!
+    //             truly_needed.remove(range);
+    //         }
+
+    //         truly_needed
+    //     };
+
+    //     let mut ranges = vec![];
+
+    //     // handle non-cleared needs
+    //     for range in truly_needed {
+    //         for overlap in all_versions.overlapping(&range) {
+    //             let start = *cmp::max(range.start(), overlap.start());
+    //             let end = *cmp::min(range.end(), overlap.end());
+
+    //             for chunked in chunk_range(start..=end, 20) {
+    //                 ranges.push(chunked);
+    //             }
+    //         }
+    //     }
+
+    //     // order them in a predictable way by hashing start + end + local_actor_id
+    //     // this should prevent too many nodes sending the same data in the same order
+    //     // when syncing in parallel
+    //     ranges.sort_by_key(|range| {
+    //         let mut hasher = SeaHasher::new();
+    //         (range, local_actor_id).hash(&mut hasher);
+    //         hasher.finish()
+    //     });
+
+    //     for range in ranges {
+    //         trace!(%actor_id, %local_actor_id, "processing range to sync: {range:?}");
+    //         process_range(&booked, &pool, range, actor_id, is_local, &sender).await?;
+    //     }
+
+    //     // process partial needs
+    //     if let Some(partially_needed) = sync_state.partial_need.get(&actor_id) {
+    //         for (version, seqs_needed) in partially_needed.iter() {
+    //             let known = {
+    //                 booked
+    //                     .read(format!("process_sync(partials)[{version}]"))
+    //                     .await
+    //                     .partials
+    //                     .get(version)
+    //                     .cloned()
+    //                     .map(KnownDbVersion::from)
+    //             };
+    //             if let Some(known) = known {
+    //                 process_version(
+    //                     &pool,
+    //                     actor_id,
+    //                     is_local,
+    //                     *version,
+    //                     known,
+    //                     &booked,
+    //                     seqs_needed.clone(),
+    //                     &sender,
+    //                 )
+    //                 .await?;
+    //             }
+    //         }
+    //     }
+    // }
 
     debug!("done processing sync state");
 
@@ -851,29 +944,25 @@ fn encode_sync_msg(
     Ok(())
 }
 
-async fn encode_write_sync_msg<W: AsyncWrite + Unpin>(
+async fn encode_write_sync_msg(
     codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
     send_buf: &mut BytesMut,
     msg: SyncMessage,
-    write: &mut W,
+    write: &mut SendStream,
 ) -> Result<(), SyncSendError> {
     encode_sync_msg(codec, encode_buf, send_buf, msg)?;
 
     write_sync_buf(send_buf, write).await
 }
 
-async fn write_sync_buf<W: AsyncWrite + Unpin>(
+async fn write_sync_buf(
     send_buf: &mut BytesMut,
-    write: &mut W,
+    write: &mut SendStream,
 ) -> Result<(), SyncSendError> {
-    while send_buf.has_remaining() {
-        let n = write.write_buf(send_buf).await?;
-        if n == 0 {
-            break;
-        }
-        counter!("corro.sync.chunk.sent.bytes", n as u64);
-    }
+    let len = send_buf.len();
+    write.write_chunk(send_buf.split().freeze()).await?;
+    counter!("corro.sync.chunk.sent.bytes", len as u64);
 
     Ok(())
 }
@@ -897,6 +986,460 @@ pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
     }
 }
 
+pub async fn parallel_sync(
+    agent: &Agent,
+    transport: &Transport,
+    members: Vec<(ActorId, SocketAddr)>,
+    our_sync_state: SyncStateV1,
+) -> Result<usize, SyncError> {
+    let results = FuturesUnordered::from_iter(members.iter().map(|(actor_id, addr)| async {
+        let mut codec = LengthDelimitedCodec::new();
+        let mut send_buf = BytesMut::new();
+        let mut encode_buf = BytesMut::new();
+
+        let actor_id = *actor_id;
+        let (mut tx, rx) = transport.open_bi(*addr).await?;
+        let mut read = FramedRead::new(rx, LengthDelimitedCodec::new());
+
+        encode_write_sync_msg(
+            &mut codec,
+            &mut encode_buf,
+            &mut send_buf,
+            SyncMessage::V1(SyncMessageV1::Start(agent.actor_id())),
+            &mut tx,
+        )
+        .await?;
+
+        encode_write_sync_msg(
+            &mut codec,
+            &mut encode_buf,
+            &mut send_buf,
+            SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
+            &mut tx,
+        )
+        .await?;
+        tx.flush().await.map_err(SyncSendError::from)?;
+
+        let their_sync_state = match read_sync_msg(&mut read).await? {
+            Some(SyncMessage::V1(SyncMessageV1::State(state))) => state,
+            Some(SyncMessage::V1(SyncMessageV1::Rejection(rejection))) => {
+                return Err(rejection.into())
+            }
+            Some(_) => return Err(SyncRecvError::ExpectedSyncState.into()),
+            None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
+        };
+
+        match read_sync_msg(&mut read).await? {
+            Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match actor_id.try_into() {
+                Ok(id) => {
+                    if let Err(e) = agent
+                        .clock()
+                        .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), id))
+                    {
+                        warn!("could not update clock from actor {actor_id}: {e}");
+                    }
+                }
+                Err(e) => {
+                    error!("could not convert ActorId to uhlc ID: {e}");
+                }
+            },
+            Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
+            None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
+        }
+
+        let needs = our_sync_state.compute_available_needs(&their_sync_state);
+
+        Ok::<_, SyncError>((actor_id, needs, tx, read))
+    }))
+    .collect::<Vec<Result<_, SyncError>>>()
+    .await;
+
+    if results.iter().all(Result::is_err) {
+        for res in results {
+            res?;
+        }
+        // unreachable really...
+        return Ok(0);
+    }
+
+    let len = results.len();
+    let (readers, mut servers) = results.into_iter().flatten().fold(
+        (Vec::with_capacity(len), Vec::with_capacity(len)),
+        |(mut readers, mut servers), (actor_id, needs, tx, read)| {
+            readers.push((actor_id, read));
+
+            servers.push((
+                actor_id,
+                needs
+                    .into_iter()
+                    .map(|(actor_id, needs)| {
+                        (
+                            actor_id,
+                            needs.into_iter().flat_map(|need| match need {
+                                SyncNeedV1::Full { versions } => chunk_range(versions, 10)
+                                    .map(|versions| SyncNeedV1::Full { versions })
+                                    .collect(),
+
+                                need => vec![need],
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                tx,
+            ));
+
+            (readers, servers)
+        },
+    );
+
+    tokio::spawn(async move {
+        let mut codec = LengthDelimitedCodec::new();
+        let mut send_buf = BytesMut::new();
+        let mut encode_buf = BytesMut::new();
+
+        // already requested full versions
+        let mut req_full: HashMap<ActorId, RangeInclusiveSet<i64>> = HashMap::new();
+
+        // already requested partial version sequences
+        let mut req_partials: HashMap<(ActorId, i64), RangeInclusiveSet<i64>> = HashMap::new();
+
+        let mut done_count = 0;
+        loop {
+            if done_count == servers.len() {
+                break;
+            }
+            for (_actor_id, needs, tx) in servers.iter_mut() {
+                if needs.is_empty() {
+                    continue;
+                }
+                for (actor_id, needs) in needs.drain(0..cmp::min(10, needs.len())) {
+                    for need in needs {
+                        let actual_needs = match need {
+                            SyncNeedV1::Full { versions } => {
+                                let range = req_full.entry(actor_id).or_default();
+
+                                let mut new_versions =
+                                    RangeInclusiveSet::from_iter([versions.clone()].into_iter());
+
+                                // check if we've already requested
+                                for overlap in range.overlapping(&versions) {
+                                    new_versions.remove(overlap.clone());
+                                }
+
+                                if new_versions.is_empty() {
+                                    continue;
+                                }
+
+                                new_versions
+                                    .into_iter()
+                                    .map(|versions| {
+                                        range.remove(versions.clone());
+                                        SyncNeedV1::Full { versions }
+                                    })
+                                    .collect()
+                            }
+                            SyncNeedV1::Partial { version, seqs } => {
+                                let range = req_partials.entry((actor_id, version)).or_default();
+                                let mut new_seqs =
+                                    RangeInclusiveSet::from_iter(seqs.clone().into_iter());
+
+                                for seqs in seqs {
+                                    for overlap in range.overlapping(&seqs) {
+                                        new_seqs.remove(overlap.clone());
+                                    }
+                                }
+
+                                if new_seqs.is_empty() {
+                                    continue;
+                                }
+
+                                vec![SyncNeedV1::Partial {
+                                    version,
+                                    seqs: new_seqs
+                                        .into_iter()
+                                        .map(|seqs| {
+                                            range.remove(seqs.clone());
+                                            seqs
+                                        })
+                                        .collect(),
+                                }]
+                            }
+                        };
+
+                        if actual_needs.is_empty() {
+                            continue;
+                        }
+
+                        if let Err(e) = encode_sync_msg(
+                            &mut codec,
+                            &mut encode_buf,
+                            &mut send_buf,
+                            SyncMessage::V1(SyncMessageV1::Request(vec![(actor_id, actual_needs)])),
+                        ) {
+                            error!("could not encode sync request: {e}");
+                            continue;
+                        }
+                    }
+                }
+
+                if !send_buf.is_empty() {
+                    if let Err(e) = write_sync_buf(&mut send_buf, tx).await {
+                        error!("could not write sync request: {e}");
+                    }
+                }
+
+                if needs.is_empty() {
+                    if let Err(e) = tx.finish().await {
+                        warn!("could not finish stream while sending sync requests: {e}");
+                    }
+                    done_count += 1;
+                }
+            }
+        }
+    });
+
+    // now handle receiving changesets!
+
+    let counts = FuturesUnordered::from_iter(readers.into_iter().map(|(actor_id, mut read)| {
+        let tx_changes = agent.tx_changes().clone();
+        async move {
+            let mut count = 0;
+
+            loop {
+                match read_sync_msg(&mut read).await {
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(e) => {
+                        error!("sync recv error: {e}");
+                        break;
+                    }
+                    Ok(Some(msg)) => match msg {
+                        SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
+                            count += change.len();
+                            tx_changes
+                                .send((change, ChangeSource::Sync))
+                                .await
+                                .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Request(_)) => {
+                            warn!("received sync request message unexpectedly, ignoring");
+                            continue;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Start(_)) => {
+                            warn!("received sync start message unexpectedly, ignoring");
+                            continue;
+                        }
+                        SyncMessage::V1(SyncMessageV1::State(_)) => {
+                            warn!("received sync state message unexpectedly, ignoring");
+                            continue;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Clock(_)) => {
+                            warn!("received sync clock message unexpectedly, ignoring");
+                            continue;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
+                            return Err(rejection.into())
+                        }
+                    },
+                }
+            }
+
+            debug!(%actor_id, self_actor_id = %agent.actor_id(), "done reading sync messages");
+
+            counter!("corro.sync.changes.recv", count as u64, "actor_id" => actor_id.to_string());
+
+            Ok(count)
+        }
+    }))
+    .collect::<Vec<Result<usize, SyncError>>>()
+    .await;
+
+    for res in counts.iter() {
+        if let Err(e) = res {
+            error!("could not properly recv from peer: {e}");
+        }
+    }
+
+    Ok(counts.into_iter().flatten().sum::<usize>())
+}
+
+pub async fn receive_sync(
+    agent: &Agent,
+    their_actor_id: ActorId,
+    read: RecvStream,
+    mut write: SendStream,
+) -> Result<usize, SyncError> {
+    let mut codec = LengthDelimitedCodec::new();
+    let mut send_buf = BytesMut::new();
+    let mut encode_buf = BytesMut::new();
+
+    let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
+
+    // read the clock
+    match read_sync_msg(&mut read).await? {
+        Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match their_actor_id.try_into() {
+            Ok(id) => {
+                if let Err(e) = agent
+                    .clock()
+                    .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), id))
+                {
+                    warn!("could not update clock from actor {their_actor_id}: {e}");
+                }
+            }
+            Err(e) => {
+                error!("could not convert ActorId to uhlc ID: {e}");
+            }
+        },
+        Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
+        None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
+    }
+
+    let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
+
+    // first, send the current sync state
+    encode_write_sync_msg(
+        &mut codec,
+        &mut encode_buf,
+        &mut send_buf,
+        SyncMessage::V1(SyncMessageV1::State(sync_state)),
+        &mut write,
+    )
+    .await?;
+
+    // then the current clock's timestamp
+    encode_write_sync_msg(
+        &mut codec,
+        &mut encode_buf,
+        &mut send_buf,
+        SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
+        &mut write,
+    )
+    .await?;
+
+    // ensure we flush here so the data gets there fast. clock needs to be fresh!
+    write.flush().await.map_err(SyncSendError::from)?;
+
+    let (tx_need, rx_need) = mpsc::channel(256);
+    let (tx, mut rx) = mpsc::channel::<SyncMessage>(256);
+
+    tokio::spawn(
+        process_sync(
+            agent.actor_id(),
+            agent.pool().clone(),
+            agent.bookie().clone(),
+            tx,
+            rx_need,
+        )
+        .inspect_err(|e| error!("could not process sync request: {e}")),
+    );
+
+    let tx_changes = agent.tx_changes().clone();
+
+    let (_sent_count, recv_count) = tokio::try_join!(
+        async move {
+            let mut count = 0;
+
+            let mut check_buf = tokio::time::interval(Duration::from_secs(1));
+
+            loop {
+                tokio::select! {
+                    maybe_msg = rx.recv() => match maybe_msg {
+                        Some(msg) => {
+                            if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+                                count += change.len();
+                            }
+                            encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
+
+                            if send_buf.len() >= 16 * 1024 {
+                                write_sync_buf(&mut send_buf, &mut write).await?;
+                            }
+                        },
+                        None => {
+                            break;
+                        }
+                    },
+                    _ = check_buf.tick() => {
+                        if !send_buf.is_empty() {
+                            write_sync_buf(&mut send_buf, &mut write).await?;
+                        }
+                    }
+                }
+            }
+
+            if !send_buf.is_empty() {
+                write_sync_buf(&mut send_buf, &mut write).await?;
+            }
+
+            if let Err(e) = write.finish().await {
+                warn!("could not properly finish QUIC send stream: {e}");
+            }
+
+            debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
+
+            counter!("corro.sync.changes.sent", count as u64, "actor_id" => their_actor_id.to_string());
+
+            Ok::<_, SyncError>(count)
+        },
+        async move {
+            let mut count = 0;
+
+            loop {
+                match read_sync_msg(&mut read).await {
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(e) => {
+                        error!("sync recv error: {e}");
+                        break;
+                    }
+                    Ok(Some(msg)) => match msg {
+                        SyncMessage::V1(SyncMessageV1::Request(req)) => {
+                            count += req
+                                .iter()
+                                .map(|(_, needs)| {
+                                    needs.iter().map(|need| need.count()).sum::<usize>()
+                                })
+                                .sum::<usize>();
+                            tx_need
+                                .send(req)
+                                .await
+                                .map_err(|_| SyncRecvError::RequestsChannelClosed)?;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
+                            warn!("received sync changeset message unexpectedly, ignoring");
+                            continue;
+                        }
+                        SyncMessage::V1(SyncMessageV1::State(_)) => {
+                            warn!("received sync state message unexpectedly, ignoring");
+                            continue;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Start(_)) => {
+                            warn!("received sync start message unexpectedly, ignoring");
+                            continue;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Clock(_)) => {
+                            warn!("received sync clock message more than once, ignoring");
+                            continue;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
+                            return Err(rejection.into())
+                        }
+                    },
+                }
+            }
+
+            debug!(actor_id = %agent.actor_id(), "done reading sync messages");
+
+            counter!("corro.sync.requests.recv", count as u64, "actor_id" => their_actor_id.to_string());
+
+            Ok(count)
+        }
+    )?;
+
+    Ok(recv_count)
+}
+
 pub async fn bidirectional_sync(
     agent: &Agent,
     our_sync_state: SyncStateV1,
@@ -908,28 +1451,28 @@ pub async fn bidirectional_sync(
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
 
-    let _permit = if their_sync_state.is_some() {
-        // sync initiated by other end
-        match agent.limits().sync.clone().try_acquire_owned() {
-            Err(_e) => {
-                encode_write_sync_msg(
-                    &mut codec,
-                    &mut encode_buf,
-                    &mut send_buf,
-                    SyncMessage::V1(SyncMessageV1::Rejection(
-                        SyncRejectionV1::MaxConcurrencyReached,
-                    )),
-                    &mut write,
-                )
-                .await?;
-                write.flush().await.map_err(SyncSendError::from)?;
-                return Ok(0);
-            }
-            Ok(permit) => Some(permit),
-        }
-    } else {
-        None
-    };
+    // let _permit = if their_sync_state.is_some() {
+    //     // sync initiated by other end
+    //     match agent.limits().sync.clone().try_acquire_owned() {
+    //         Err(_e) => {
+    //             encode_write_sync_msg(
+    //                 &mut codec,
+    //                 &mut encode_buf,
+    //                 &mut send_buf,
+    //                 SyncMessage::V1(SyncMessageV1::Rejection(
+    //                     SyncRejectionV1::MaxConcurrencyReached,
+    //                 )),
+    //                 &mut write,
+    //             )
+    //             .await?;
+    //             write.flush().await.map_err(SyncSendError::from)?;
+    //             return Ok(0);
+    //         }
+    //         Ok(permit) => Some(permit),
+    //     }
+    // } else {
+    //     None
+    // };
 
     encode_write_sync_msg(
         &mut codec,
@@ -986,13 +1529,15 @@ pub async fn bidirectional_sync(
         None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
     }
 
+    let (tx_need, rx_need) = mpsc::channel(256);
+
     tokio::spawn(
         process_sync(
             agent.actor_id(),
             agent.pool().clone(),
             agent.bookie().clone(),
-            their_sync_state,
             tx,
+            rx_need,
         )
         .inspect_err(|e| error!("could not process sync request: {e}")),
     );
@@ -1063,6 +1608,16 @@ pub async fn bidirectional_sync(
                                 .send((change, ChangeSource::Sync))
                                 .await
                                 .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Request(req)) => {
+                            tx_need
+                                .send(req)
+                                .await
+                                .map_err(|_| SyncRecvError::RequestsChannelClosed)?;
+                        }
+                        SyncMessage::V1(SyncMessageV1::Start(_)) => {
+                            warn!("received sync start message more than once, ignoring");
+                            continue;
                         }
                         SyncMessage::V1(SyncMessageV1::State(_)) => {
                             warn!("received sync state message more than once, ignoring");

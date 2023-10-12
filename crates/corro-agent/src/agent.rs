@@ -532,9 +532,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                             loop {
                                                 match codec.decode(&mut buf) {
                                                     Ok(Some(b)) => {
-                                                        // TODO: checksum?
-                                                        let b = b.freeze();
-
                                                         match UniPayload::read_from_buffer(&b) {
                                                             Ok(payload) => {
                                                                 trace!(
@@ -2283,6 +2280,57 @@ pub enum SyncRecvError {
     TimedOut,
     #[error("changes channel is closed")]
     ChangesChannelClosed,
+    #[error("requests channel is closed")]
+    RequestsChannelClosed,
+}
+
+async fn handle_sync2(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
+    let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
+
+    for (actor_id, needed) in sync_state.need.iter() {
+        gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.to_string());
+    }
+    for (actor_id, version) in sync_state.heads.iter() {
+        gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
+    }
+
+    let chosen: Vec<(ActorId, SocketAddr)> = {
+        let candidates = {
+            let members = agent.members().read();
+
+            members
+                .states
+                .iter()
+                .filter(|(id, _state)| **id != agent.actor_id())
+                .map(|(id, state)| (*id, state.addr))
+                .collect::<Vec<(ActorId, SocketAddr)>>()
+        };
+
+        if candidates.is_empty() {
+            return Err(SyncClientError::NoGoodCandidate);
+        }
+
+        debug!("found {} candidates to synchronize with", candidates.len());
+
+        let mut rng = StdRng::from_entropy();
+
+        let mut choices = candidates.into_iter().choose_multiple(&mut rng, 6);
+
+        choices.sort_by(|a, b| {
+            sync_state
+                .need_len_for_actor(&b.0)
+                .cmp(&sync_state.need_len_for_actor(&a.0))
+        });
+
+        choices.truncate(3);
+        choices
+    };
+
+    if chosen.is_empty() {
+        return Err(SyncClientError::NoGoodCandidate);
+    }
+
+    todo!()
 }
 
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
@@ -2437,11 +2485,67 @@ async fn handle_changes(
 
 const CHECK_EMPTIES_TO_INSERT_AFTER: Duration = Duration::from_secs(120);
 
+async fn write_empties_loop(
+    agent: Agent,
+    mut rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
+    mut tripwire: Tripwire,
+) {
+    let mut inserted_empties = 0;
+    let mut empties: BTreeMap<ActorId, Vec<RangeInclusive<i64>>> = BTreeMap::new();
+
+    let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
+    tokio::pin!(next_empties_check);
+
+    loop {
+        tokio::select! {
+            maybe_empty = rx_empty.recv() => match maybe_empty {
+                Some((actor_id, versions)) => {
+                    empties.entry(actor_id).or_default().push(versions);
+                    inserted_empties += 1;
+
+                    if inserted_empties < 1000 {
+                        continue;
+                    }
+                },
+                None => {
+                    debug!("empties queue is done");
+                    break;
+                }
+            },
+            _ = &mut next_empties_check => {
+                next_empties_check.as_mut().reset(tokio::time::Instant::now() + CHECK_EMPTIES_TO_INSERT_AFTER);
+                if empties.is_empty() {
+                    continue;
+                }
+            },
+            _ = &mut tripwire => break
+        }
+
+        inserted_empties = 0;
+
+        if let Err(e) = process_completed_empties(&agent, &mut empties).await {
+            error!("could not process empties: {e}");
+        }
+    }
+    info!("Draining empty versions to process...");
+    // drain empties channel
+    while let Ok((actor_id, versions)) = rx_empty.try_recv() {
+        empties.entry(actor_id).or_default().push(versions);
+    }
+
+    if !empties.is_empty() {
+        info!("inserting last unprocessed empties before shut down");
+        if let Err(e) = process_completed_empties(&agent, &mut empties).await {
+            error!("could not process empties: {e}");
+        }
+    }
+}
+
 async fn sync_loop(
     agent: Agent,
     transport: Transport,
     mut rx_apply: Receiver<(ActorId, i64)>,
-    mut rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
+    rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
     mut tripwire: Tripwire,
 ) {
     let mut sync_backoff = backoff::Backoff::new(0)
@@ -2450,61 +2554,12 @@ async fn sync_loop(
     let next_sync_at = tokio::time::sleep(sync_backoff.next().unwrap());
     tokio::pin!(next_sync_at);
 
-    spawn_counted({
-        let mut tripwire = tripwire.clone();
-        let agent = agent.clone();
-        async move {
-            let mut inserted_empties = 0;
-            let mut empties: BTreeMap<ActorId, Vec<RangeInclusive<i64>>> = BTreeMap::new();
-
-            let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
-            tokio::pin!(next_empties_check);
-
-            loop {
-                tokio::select! {
-                    maybe_empty = rx_empty.recv() => match maybe_empty {
-                        Some((actor_id, versions)) => {
-                            empties.entry(actor_id).or_default().push(versions);
-                            inserted_empties += 1;
-
-                            if inserted_empties < 1000 {
-                                continue;
-                            }
-                        },
-                        None => {
-                            debug!("empties queue is done");
-                            break;
-                        }
-                    },
-                    _ = &mut next_empties_check => {
-                        next_empties_check.as_mut().reset(tokio::time::Instant::now() + CHECK_EMPTIES_TO_INSERT_AFTER);
-                        if empties.is_empty() {
-                            continue;
-                        }
-                    },
-                    _ = &mut tripwire => break
-                }
-
-                inserted_empties = 0;
-
-                if let Err(e) = process_completed_empties(&agent, &mut empties).await {
-                    error!("could not process empties: {e}");
-                }
-            }
-            info!("Draining empty versions to process...");
-            // drain empties channel
-            while let Ok((actor_id, versions)) = rx_empty.try_recv() {
-                empties.entry(actor_id).or_default().push(versions);
-            }
-
-            if !empties.is_empty() {
-                info!("inserting last unprocessed empties before shut down");
-                if let Err(e) = process_completed_empties(&agent, &mut empties).await {
-                    error!("could not process empties: {e}");
-                }
-            }
-        }
-    });
+    // TODO: move this elsewhere, doesn't have be spawned here...
+    spawn_counted(write_empties_loop(
+        agent.clone(),
+        rx_empty,
+        tripwire.clone(),
+    ));
 
     loop {
         enum Branch {
