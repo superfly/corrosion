@@ -483,6 +483,10 @@ pub fn runtime_loop(
                         {
                             gauge!("corro.gossip.members", foca.num_members() as f64);
                             gauge!(
+                                "corro.gossip.member.states",
+                                foca.iter_membership_state().count() as f64
+                            );
+                            gauge!(
                                 "corro.gossip.updates_backlog",
                                 foca.updates_backlog() as f64
                             );

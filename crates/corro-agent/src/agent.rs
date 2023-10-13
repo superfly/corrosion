@@ -2533,7 +2533,7 @@ async fn write_empties_loop(
                     empties.entry(actor_id).or_default().push(versions);
                     inserted_empties += 1;
 
-                    if inserted_empties < 1000 {
+                    if inserted_empties < 50 {
                         continue;
                     }
                 },
@@ -2665,7 +2665,7 @@ async fn process_completed_empties(
         "processing empty versions (count: {})",
         empties.values().map(Vec::len).sum::<usize>()
     );
-    let mut conn = agent.pool().write_normal().await?;
+    let mut conn = agent.pool().write_low().await?;
 
     block_in_place(|| {
         let tx = conn.transaction()?;
