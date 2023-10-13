@@ -21,7 +21,7 @@ use corro_types::sync::{
     SyncRequestV1, SyncStateV1,
 };
 use futures::stream::{self, BufferUnordered, FuturesUnordered};
-use futures::{Future, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{Future, Stream, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use metrics::{counter, increment_counter};
 use quinn::{RecvStream, SendStream};
@@ -35,6 +35,7 @@ use tokio::sync::mpsc::{self, channel, Sender};
 use tokio::task::block_in_place;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt as TokioStreamExt;
 // use tokio_stream::StreamExt as TokioStreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
@@ -701,7 +702,9 @@ async fn process_sync(
     sender: Sender<SyncMessage>,
     recv: mpsc::Receiver<SyncRequestV1>,
 ) -> eyre::Result<()> {
-    ReceiverStream::new(recv)
+    let chunked_reqs = ReceiverStream::new(recv).chunks_timeout(10, Duration::from_millis(500));
+
+    chunked_reqs
         .map(Ok)
         .try_for_each_concurrent(6, |reqs| {
             let sender = sender.clone();
@@ -711,7 +714,14 @@ async fn process_sync(
                 let mut current_haves = vec![];
                 let mut partial_needs = vec![];
 
-                for (actor_id, needs) in reqs {
+                let agg = reqs
+                    .into_iter()
+                    .flatten()
+                    .group_by(|req| req.0)
+                    .into_iter()
+                    .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
+                    .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
+                for (actor_id, needs) in agg {
                     let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() }
                     {
                         Some(booked) => booked,
