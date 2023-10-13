@@ -253,34 +253,23 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
     };
 
     for (actor_id, booked) in actors {
-        let last_version = match {
-            booked
-                .read(format!("generate_sync(last):{}", actor_id.as_simple()))
-                .await
-                .last()
-        } {
+        let bookedr = booked
+            .read(format!("generate_sync:{}", actor_id.as_simple()))
+            .await;
+
+        let last_version = match { bookedr.last() } {
             None => continue,
             Some(v) => v,
         };
 
-        let need: Vec<_> = {
-            booked
-                .read(format!("generate_sync(need):{}", actor_id.as_simple()))
-                .await
-                .all_versions()
-                .gaps(&(1..=last_version))
-                .collect()
-        };
+        let need: Vec<_> = { bookedr.all_versions().gaps(&(1..=last_version)).collect() };
 
         if !need.is_empty() {
             state.need.insert(actor_id, need);
         }
 
         {
-            let read = booked
-                .read(format!("generate_sync(partials):{}", actor_id.as_simple()))
-                .await;
-            for (v, partial) in read.partials.iter() {
+            for (v, partial) in bookedr.partials.iter() {
                 state
                     .partial_need
                     .entry(actor_id)
