@@ -2670,10 +2670,11 @@ async fn process_completed_empties(
         let booked = {
             agent
                 .bookie()
-                .blocking_write(format!(
+                .write(format!(
                     "process_completed_empties(for_actor_blocking):{}",
                     actor_id.as_simple()
                 ))
+                .await
                 .for_actor(actor_id)
         };
 
