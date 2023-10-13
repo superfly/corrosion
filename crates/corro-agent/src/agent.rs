@@ -69,7 +69,7 @@ use tokio::{
     net::TcpListener,
     sync::mpsc::{channel, Receiver, Sender},
     task::block_in_place,
-    time::{sleep, timeout},
+    time::{sleep, timeout, error::Elapsed},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
 use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
@@ -2287,7 +2287,7 @@ pub enum SyncRecvError {
     #[error("expected sync clock message, received something else")]
     ExpectedClockMessage,
     #[error("timed out waiting for sync message")]
-    TimedOut,
+    TimedOut(#[from] Elapsed),
     #[error("changes channel is closed")]
     ChangesChannelClosed,
     #[error("requests channel is closed")]

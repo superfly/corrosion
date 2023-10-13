@@ -32,6 +32,7 @@ use speedy::Writable;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{self, channel, Sender};
 use tokio::task::block_in_place;
+use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
@@ -997,8 +998,8 @@ async fn write_buf(send_buf: &mut BytesMut, write: &mut SendStream) -> Result<()
 pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
     read: &mut R,
 ) -> Result<Option<SyncMessage>, SyncRecvError> {
-    match tokio::time::timeout(Duration::from_secs(10), read.next()).await {
-        Ok(Some(buf_res)) => match buf_res {
+    match read.next().await {
+        Some(buf_res) => match buf_res {
             Ok(mut buf) => {
                 counter!("corro.sync.chunk.recv.bytes", buf.len() as u64);
                 match SyncMessage::from_buf(&mut buf) {
@@ -1008,8 +1009,7 @@ pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
             }
             Err(e) => Err(SyncRecvError::from(e)),
         },
-        Ok(None) => Ok(None),
-        Err(_e) => Err(SyncRecvError::TimedOut),
+        None => Ok(None),
     }
 }
 
@@ -1066,7 +1066,7 @@ pub async fn parallel_sync(
 
                 trace!(%actor_id, self_actor_id = %agent.actor_id(), "flushed sync payloads");
 
-                let their_sync_state = match read_sync_msg(&mut read).await? {
+                let their_sync_state = match timeout(Duration::from_secs(2), read_sync_msg(&mut read)).await.map_err(SyncRecvError::from)?? {
                     Some(SyncMessage::V1(SyncMessageV1::State(state))) => state,
                     Some(SyncMessage::V1(SyncMessageV1::Rejection(rejection))) => {
                         return Err(rejection.into())
@@ -1076,7 +1076,7 @@ pub async fn parallel_sync(
                 };
                 trace!(%actor_id, self_actor_id = %agent.actor_id(), "read state payload: {their_sync_state:?}");
 
-                match read_sync_msg(&mut read).await? {
+                match timeout(Duration::from_secs(2), read_sync_msg(&mut read)).await.map_err(SyncRecvError::from)??  {
                     Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match actor_id.try_into() {
                         Ok(id) => {
                             if let Err(e) = agent
