@@ -208,6 +208,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 restored.old_len, restored.new_len
             );
         }
+        Command::Cluster(ClusterCommand::MembershipStates) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Cluster(
+                corro_admin::ClusterCommand::MembershipStates,
+            ))
+            .await?;
+        }
         Command::Consul(cmd) => match cmd {
             ConsulCommand::Sync => match cli.config()?.consul.as_ref() {
                 Some(consul) => {
@@ -443,6 +450,10 @@ enum Command {
         self_actor_id: bool,
     },
 
+    /// Cluster interactions
+    #[command(subcommand)]
+    Cluster(ClusterCommand),
+
     /// Consul interactions
     #[command(subcommand)]
     Consul(ConsulCommand),
@@ -488,6 +499,12 @@ enum Command {
     /// Tls-related commands
     #[command(subcommand)]
     Tls(TlsCommand),
+}
+
+#[derive(Subcommand)]
+enum ClusterCommand {
+    /// Dumps the current member states
+    MembershipStates,
 }
 
 #[derive(Subcommand)]

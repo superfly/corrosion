@@ -40,7 +40,7 @@ use tripwire::Tripwire;
 
 use crate::{
     actor::ActorId,
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, Timestamp},
+    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     config::Config,
     pubsub::MatcherHandle,
     schema::NormalizedSchema,
@@ -68,6 +68,7 @@ pub struct AgentConfig {
     pub tx_apply: Sender<(ActorId, i64)>,
     pub tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
+    pub tx_foca: Sender<FocaInput>,
 
     pub schema: RwLock<NormalizedSchema>,
     pub tripwire: Tripwire,
@@ -87,6 +88,7 @@ pub struct AgentInner {
     tx_apply: Sender<(ActorId, i64)>,
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     tx_changes: Sender<(ChangeV1, ChangeSource)>,
+    tx_foca: Sender<FocaInput>,
     schema: RwLock<NormalizedSchema>,
     limits: Limits,
 }
@@ -112,6 +114,7 @@ impl Agent {
             tx_apply: config.tx_apply,
             tx_empty: config.tx_empty,
             tx_changes: config.tx_changes,
+            tx_foca: config.tx_foca,
             schema: config.schema,
             limits: Limits {
                 sync: Arc::new(Semaphore::new(3)),
@@ -157,6 +160,10 @@ impl Agent {
 
     pub fn tx_empty(&self) -> &Sender<(ActorId, RangeInclusive<i64>)> {
         &self.0.tx_empty
+    }
+
+    pub fn tx_foca(&self) -> &Sender<FocaInput> {
+        &self.0.tx_foca
     }
 
     pub fn bookie(&self) -> &Bookie {

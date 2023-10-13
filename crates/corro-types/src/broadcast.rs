@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use time::OffsetDateTime;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{self, Sender};
 use tracing::{error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
@@ -48,6 +48,12 @@ pub enum FocaInput {
     Data(Bytes),
     ClusterSize(NonZeroU32),
     ApplyMany(Vec<Member<Actor>>),
+    Cmd(FocaCmd),
+}
+
+#[derive(Debug)]
+pub enum FocaCmd {
+    MembershipStates(mpsc::Sender<foca::Member<Actor>>),
 }
 
 #[derive(Debug, Clone, Readable, Writable)]

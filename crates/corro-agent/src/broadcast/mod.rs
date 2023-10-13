@@ -33,7 +33,7 @@ use tripwire::Tripwire;
 use corro_types::{
     actor::Actor,
     agent::Agent,
-    broadcast::{BroadcastInput, DispatchRuntime, FocaInput, UniPayload, UniPayloadV1},
+    broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
     members::MemberEvent,
 };
 
@@ -348,6 +348,16 @@ pub fn runtime_loop(
                                 error!("foca apply_many error: {e}");
                             }
                         }
+                        FocaInput::Cmd(cmd) => match cmd {
+                            FocaCmd::MembershipStates(sender) => {
+                                for member in foca.iter_membership_state() {
+                                    if let Err(e) = sender.send(member.clone()).await {
+                                        error!("could not send back foca membership: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                        },
                     },
                     Branch::MemberEvents(evts) => {
                         trace!("handling Branch::MemberEvents");

@@ -96,6 +96,7 @@ pub struct AgentOptions {
     pub rx_apply: Receiver<(ActorId, i64)>,
     pub rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
     pub rx_changes: Receiver<(ChangeV1, ChangeSource)>,
+    pub rx_foca: Receiver<FocaInput>,
     pub rtt_rx: Receiver<(SocketAddr, Duration)>,
     pub tripwire: Tripwire,
 }
@@ -261,6 +262,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let (tx_bcast, rx_bcast) = channel(10240);
     let (tx_empty, rx_empty) = channel(10240);
     let (tx_changes, rx_changes) = channel(1024);
+    let (tx_foca, rx_foca) = channel(10240);
 
     let opts = AgentOptions {
         actor_id,
@@ -271,6 +273,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         rx_apply,
         rx_empty,
         rx_changes,
+        rx_foca,
         rtt_rx,
         tripwire: tripwire.clone(),
     };
@@ -288,6 +291,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_apply,
         tx_empty,
         tx_changes,
+        tx_foca,
         schema: RwLock::new(schema),
         tripwire,
     });
@@ -314,6 +318,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rx_apply,
         rx_empty,
         rx_changes,
+        rx_foca,
         rtt_rx,
     } = opts;
 
@@ -377,7 +382,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
-    let (foca_tx, foca_rx) = channel(10240);
     let (member_events_tx, member_events_rx) = tokio::sync::broadcast::channel::<MemberEvent>(512);
 
     runtime_loop(
@@ -388,7 +392,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         ),
         agent.clone(),
         transport.clone(),
-        foca_rx,
+        rx_foca,
         rx_bcast,
         member_events_rx.resubscribe(),
         to_send_tx,
@@ -434,7 +438,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     spawn_counted({
         let agent = agent.clone();
         let mut tripwire = tripwire.clone();
-        let foca_tx = foca_tx.clone();
         async move {
             loop {
                 let connecting = match gossip_server_endpoint
@@ -450,7 +453,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 let process_uni_tx = process_uni_tx.clone();
                 let agent = agent.clone();
                 let tripwire = tripwire.clone();
-                let foca_tx = foca_tx.clone();
                 tokio::spawn(async move {
                     let remote_addr = connecting.remote_address();
                     // let local_ip = connecting.local_ip().unwrap();
@@ -471,7 +473,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     tokio::spawn({
                         let conn = conn.clone();
                         let mut tripwire = tripwire.clone();
-                        let foca_tx = foca_tx.clone();
+                        let foca_tx = agent.tx_foca().clone();
                         async move {
                             loop {
                                 let b = tokio::select! {
@@ -696,7 +698,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     tokio::spawn({
         let agent = agent.clone();
-        let foca_tx = foca_tx.clone();
         async move {
             let mut boff = backoff::Backoff::new(10)
                 .timeout_range(Duration::from_secs(5), Duration::from_secs(120))
@@ -717,7 +718,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     Ok(addrs) => {
                         for addr in addrs.iter() {
                             debug!("Bootstrapping w/ {addr}");
-                            if let Err(e) = foca_tx.send(FocaInput::Announce((*addr).into())).await
+                            if let Err(e) = agent
+                                .tx_foca()
+                                .send(FocaInput::Announce((*addr).into()))
+                                .await
                             {
                                 error!("could not send foca Announce message: {e}");
                             } else {
@@ -798,7 +802,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             }
         }
 
-        foca_tx.send(FocaInput::ApplyMany(foca_states)).await.ok();
+        agent
+            .tx_foca()
+            .send(FocaInput::ApplyMany(foca_states))
+            .await
+            .ok();
     }
 
     let api = Router::new()
@@ -920,7 +928,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     tokio::spawn(handle_notifications(
         agent.clone(),
         notifications_rx,
-        foca_tx.clone(),
         member_events_tx,
     ));
     tokio::spawn(metrics_loop(agent.clone(), transport));
@@ -1297,7 +1304,6 @@ async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>) {
 async fn handle_notifications(
     agent: Agent,
     mut notification_rx: Receiver<Notification<Actor>>,
-    foca_tx: Sender<FocaInput>,
     member_events: tokio::sync::broadcast::Sender<MemberEvent>,
 ) {
     while let Some(notification) = notification_rx.recv().await {
@@ -1313,7 +1319,7 @@ async fn handle_notifications(
                     // notify of new cluster size
                     let members_len = { agent.members().read().states.len() as u32 };
                     if let Ok(size) = members_len.try_into() {
-                        if let Err(e) = foca_tx.send(FocaInput::ClusterSize(size)).await {
+                        if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await {
                             error!("could not send new foca cluster size: {e}");
                         }
                     }
@@ -1332,7 +1338,7 @@ async fn handle_notifications(
                     // notify of new cluster size
                     let member_len = { agent.members().read().states.len() as u32 };
                     if let Ok(size) = member_len.try_into() {
-                        if let Err(e) = foca_tx.send(FocaInput::ClusterSize(size)).await {
+                        if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await {
                             error!("could not send new foca cluster size: {e}");
                         }
                     }

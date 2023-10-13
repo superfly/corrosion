@@ -1028,7 +1028,7 @@ pub async fn parallel_sync(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let mut results = FuturesUnordered::from_iter(members.iter().map(|(actor_id, addr)| async {
+    let results = FuturesUnordered::from_iter(members.iter().map(|(actor_id, addr)| async {
         (
             *actor_id,
             *addr,
@@ -1110,6 +1110,8 @@ pub async fn parallel_sync(
 
     debug!("collected member needs and such!");
 
+    let expected_len = results.len();
+
     let syncers = results.into_iter().fold(Ok(vec![]), |agg, (actor_id, addr, res)| {
         match res {
             Ok((needs, tx, read)) => {
@@ -1173,6 +1175,10 @@ pub async fn parallel_sync(
         )
     };
 
+    if readers.is_empty() && servers.is_empty() {
+        return Ok(0);
+    }
+
     tokio::spawn(async move {
         // reusable buffers and constructs
         let mut codec = LengthDelimitedCodec::new();
@@ -1186,6 +1192,9 @@ pub async fn parallel_sync(
         let mut req_partials: HashMap<(ActorId, i64), RangeInclusiveSet<i64>> = HashMap::new();
 
         loop {
+            if servers.is_empty() {
+                break;
+            }
             let mut next_servers = Vec::with_capacity(servers.len());
             for (_actor_id, mut needs, mut tx) in servers {
                 for (actor_id, needs) in needs.drain(0..cmp::min(10, needs.len())) {
