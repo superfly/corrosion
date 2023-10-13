@@ -1110,13 +1110,11 @@ pub async fn parallel_sync(
 
     debug!("collected member needs and such!");
 
-    let expected_len = results.len();
-
     let syncers = results.into_iter().fold(Ok(vec![]), |agg, (actor_id, addr, res)| {
         match res {
             Ok((needs, tx, read)) => {
                 let mut v = agg.unwrap_or_default();
-                v.push((actor_id, needs, tx, read));
+                v.push((actor_id, addr, needs, tx, read));
                 Ok(v)
             },
             Err(e) => {
@@ -1135,7 +1133,7 @@ pub async fn parallel_sync(
         let mut rng = rand::thread_rng();
         syncers.into_iter().fold(
             (Vec::with_capacity(len), Vec::with_capacity(len)),
-            |(mut readers, mut servers), (actor_id, needs, tx, read)| {
+            |(mut readers, mut servers), (actor_id, addr, needs, tx, read)| {
                 if needs.is_empty() {
                     trace!(%actor_id, "no needs!");
                     return (readers, servers);
@@ -1146,6 +1144,7 @@ pub async fn parallel_sync(
 
                 servers.push((
                     actor_id,
+                    addr,
                     needs
                         .into_iter()
                         .map(|(actor_id, needs)| {
@@ -1191,13 +1190,14 @@ pub async fn parallel_sync(
         // already requested partial version sequences
         let mut req_partials: HashMap<(ActorId, i64), RangeInclusiveSet<i64>> = HashMap::new();
 
+        let start = Instant::now();
+
         loop {
             if servers.is_empty() {
                 break;
             }
             let mut next_servers = Vec::with_capacity(servers.len());
-            for (actor_id, mut needs, mut tx) in servers {
-                let mut req_count = 0;
+            'servers: for (server_actor_id, addr, mut needs, mut tx) in servers {
                 for (actor_id, needs) in needs.drain(0..cmp::min(10, needs.len())) {
                     for need in needs {
                         let actual_needs = match need {
@@ -1258,36 +1258,32 @@ pub async fn parallel_sync(
 
                         let req_len = actual_needs.len();
 
-                        if let Err(e) = encode_sync_msg(
+                        if let Err(e) = encode_write_sync_msg(
                             &mut codec,
                             &mut encode_buf,
                             &mut send_buf,
                             SyncMessage::V1(SyncMessageV1::Request(vec![(actor_id, actual_needs)])),
-                        ) {
-                            error!("could not encode sync request: {e}");
-                            continue;
+                            &mut tx,
+                        )
+                        .await
+                        {
+                            error!(%server_actor_id, %actor_id, %addr, "could not encode sync request: {e}");
+                            continue 'servers;
                         }
 
-                        req_count += req_len;
+                        counter!("corro.sync.client.req.sent", req_len as u64, "actor_id" => server_actor_id.to_string());
                     }
                 }
-
-                if !send_buf.is_empty() {
-                    if let Err(e) = write_buf(&mut send_buf, &mut tx).await {
-                        error!("could not write sync request: {e}");
-                        continue;
-                    }
-                }
-
-                counter!("corro.sync.client.req.sent", req_count as u64, "actor_id" => actor_id.to_string());
 
                 if needs.is_empty() {
                     if let Err(e) = tx.finish().await {
                         warn!("could not finish stream while sending sync requests: {e}");
                     }
-                } else {
-                    next_servers.push((actor_id, needs, tx));
+                    info!(%server_actor_id, %addr, "done trying to sync w/ actor after {:?}", start.elapsed());
+                    continue;
                 }
+
+                next_servers.push((server_actor_id, addr, needs, tx));
             }
             servers = next_servers;
         }
