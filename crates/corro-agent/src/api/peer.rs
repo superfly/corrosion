@@ -22,6 +22,7 @@ use corro_types::sync::{
 };
 use futures::stream::FuturesUnordered;
 use futures::{Stream, TryFutureExt, TryStreamExt};
+use itertools::Itertools;
 use metrics::{counter, increment_counter};
 use quinn::{RecvStream, SendStream};
 use rand::seq::SliceRandom;
@@ -33,6 +34,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{self, channel, Sender};
 use tokio::task::block_in_place;
 use tokio::time::timeout;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
@@ -697,13 +699,23 @@ async fn process_sync(
     pool: SplitPool,
     bookie: Bookie,
     sender: Sender<SyncMessage>,
-    mut recv: mpsc::Receiver<SyncRequestV1>,
+    recv: mpsc::Receiver<SyncRequestV1>,
 ) -> eyre::Result<()> {
     let mut current_haves = vec![];
     let mut partial_needs = vec![];
 
-    while let Some(req) = recv.recv().await {
-        for (actor_id, needs) in req {
+    let chunked_reqs = ReceiverStream::new(recv).chunks_timeout(100, Duration::from_secs(1));
+    tokio::pin!(chunked_reqs);
+
+    while let Some(reqs) = chunked_reqs.next().await {
+        let agg = reqs
+            .into_iter()
+            .flatten()
+            .group_by(|req| req.0)
+            .into_iter()
+            .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
+            .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
+        for (actor_id, needs) in agg {
             let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() } {
                 Some(booked) => booked,
                 None => continue,
@@ -715,6 +727,7 @@ async fn process_sync(
 
             {
                 let read = booked.read("process_need(full)").await;
+
                 for need in needs {
                     match need {
                         SyncNeedV1::Full { versions } => {
@@ -742,7 +755,6 @@ async fn process_sync(
                     }
                 }
             }
-
             for versions in cleared {
                 sender
                     .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
