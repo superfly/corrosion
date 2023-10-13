@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
@@ -2311,8 +2312,8 @@ async fn handle_sync2(agent: &Agent, transport: &Transport) -> Result<(), SyncCl
                 .states
                 .iter()
                 .filter(|(id, _state)| **id != agent.actor_id())
-                .map(|(id, state)| (*id, state.addr))
-                .collect::<Vec<(ActorId, SocketAddr)>>()
+                .map(|(id, state)| (*id, state.ring.unwrap_or(255), state.addr))
+                .collect::<Vec<(ActorId, u8, SocketAddr)>>()
         };
 
         if candidates.is_empty() {
@@ -2321,18 +2322,28 @@ async fn handle_sync2(agent: &Agent, transport: &Transport) -> Result<(), SyncCl
 
         debug!("found {} candidates to synchronize with", candidates.len());
 
+        let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
+
         let mut rng = StdRng::from_entropy();
 
-        let mut choices = candidates.into_iter().choose_multiple(&mut rng, 6);
+        let mut choices = candidates
+            .into_iter()
+            .choose_multiple(&mut rng, desired_count * 2);
 
         choices.sort_by(|a, b| {
+            // most missing actors first
             sync_state
                 .need_len_for_actor(&b.0)
                 .cmp(&sync_state.need_len_for_actor(&a.0))
+                // if equal, look at proximity (via `ring`)
+                .then_with(|| a.1.cmp(&b.1))
         });
 
-        choices.truncate(3);
+        choices.truncate(desired_count);
         choices
+            .into_iter()
+            .map(|(actor_id, _, addr)| (actor_id, addr))
+            .collect()
     };
 
     if chosen.is_empty() {

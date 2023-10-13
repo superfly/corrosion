@@ -1201,6 +1201,9 @@ pub async fn parallel_sync(
             }
             let mut next_servers = Vec::with_capacity(servers.len());
             'servers: for (server_actor_id, addr, mut needs, mut tx) in servers {
+                if needs.is_empty() {
+                    continue;
+                }
                 for (actor_id, need) in needs.drain(0..cmp::min(10, needs.len())) {
                     let actual_needs = match need {
                         SyncNeedV1::Full { versions } => {
