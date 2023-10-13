@@ -1147,7 +1147,7 @@ pub async fn parallel_sync(
                     addr,
                     needs
                         .into_iter()
-                        .map(|(actor_id, needs)| {
+                        .flat_map(|(actor_id, needs)| {
                             let mut needs: Vec<_> = needs
                                 .into_iter()
                                 .flat_map(|need| match need {
@@ -1160,10 +1160,13 @@ pub async fn parallel_sync(
                                 })
                                 .collect();
 
-                            // NOTE: IMPORTANT! shuffle the vec so we don't keep looping later on
+                            // NOTE: IMPORTANT! shuffle the vec so we don't keep looping over the same later on
                             needs.shuffle(&mut rng);
 
-                            (actor_id, needs)
+                            needs
+                                .into_iter()
+                                .map(|need| (actor_id, need))
+                                .collect::<Vec<_>>()
                         })
                         .collect::<Vec<_>>(),
                     tx,
@@ -1198,83 +1201,80 @@ pub async fn parallel_sync(
             }
             let mut next_servers = Vec::with_capacity(servers.len());
             'servers: for (server_actor_id, addr, mut needs, mut tx) in servers {
-                for (actor_id, needs) in needs.drain(0..cmp::min(10, needs.len())) {
-                    info!(%server_actor_id, %actor_id, %addr, "collecting needs to request, starting len: {}", needs.len());
-                    for need in needs {
-                        let actual_needs = match need {
-                            SyncNeedV1::Full { versions } => {
-                                let range = req_full.entry(actor_id).or_default();
+                for (actor_id, need) in needs.drain(0..cmp::min(10, needs.len())) {
+                    let actual_needs = match need {
+                        SyncNeedV1::Full { versions } => {
+                            let range = req_full.entry(actor_id).or_default();
 
-                                let mut new_versions =
-                                    RangeInclusiveSet::from_iter([versions.clone()].into_iter());
+                            let mut new_versions =
+                                RangeInclusiveSet::from_iter([versions.clone()].into_iter());
 
-                                // check if we've already requested
-                                for overlap in range.overlapping(&versions) {
-                                    new_versions.remove(overlap.clone());
+                            // check if we've already requested
+                            for overlap in range.overlapping(&versions) {
+                                new_versions.remove(overlap.clone());
+                            }
+
+                            if new_versions.is_empty() {
+                                continue;
+                            }
+
+                            new_versions
+                                .into_iter()
+                                .map(|versions| {
+                                    range.remove(versions.clone());
+                                    SyncNeedV1::Full { versions }
+                                })
+                                .collect()
+                        }
+                        SyncNeedV1::Partial { version, seqs } => {
+                            let range = req_partials.entry((actor_id, version)).or_default();
+                            let mut new_seqs =
+                                RangeInclusiveSet::from_iter(seqs.clone().into_iter());
+
+                            for seqs in seqs {
+                                for overlap in range.overlapping(&seqs) {
+                                    new_seqs.remove(overlap.clone());
                                 }
+                            }
 
-                                if new_versions.is_empty() {
-                                    continue;
-                                }
+                            if new_seqs.is_empty() {
+                                continue;
+                            }
 
-                                new_versions
+                            vec![SyncNeedV1::Partial {
+                                version,
+                                seqs: new_seqs
                                     .into_iter()
-                                    .map(|versions| {
-                                        range.remove(versions.clone());
-                                        SyncNeedV1::Full { versions }
+                                    .map(|seqs| {
+                                        range.remove(seqs.clone());
+                                        seqs
                                     })
-                                    .collect()
-                            }
-                            SyncNeedV1::Partial { version, seqs } => {
-                                let range = req_partials.entry((actor_id, version)).or_default();
-                                let mut new_seqs =
-                                    RangeInclusiveSet::from_iter(seqs.clone().into_iter());
-
-                                for seqs in seqs {
-                                    for overlap in range.overlapping(&seqs) {
-                                        new_seqs.remove(overlap.clone());
-                                    }
-                                }
-
-                                if new_seqs.is_empty() {
-                                    continue;
-                                }
-
-                                vec![SyncNeedV1::Partial {
-                                    version,
-                                    seqs: new_seqs
-                                        .into_iter()
-                                        .map(|seqs| {
-                                            range.remove(seqs.clone());
-                                            seqs
-                                        })
-                                        .collect(),
-                                }]
-                            }
-                        };
-
-                        if actual_needs.is_empty() {
-                            warn!(%server_actor_id, %actor_id, %addr, "nothing to send!");
-                            continue;
+                                    .collect(),
+                            }]
                         }
+                    };
 
-                        let req_len = actual_needs.len();
-
-                        if let Err(e) = encode_write_sync_msg(
-                            &mut codec,
-                            &mut encode_buf,
-                            &mut send_buf,
-                            SyncMessage::V1(SyncMessageV1::Request(vec![(actor_id, actual_needs)])),
-                            &mut tx,
-                        )
-                        .await
-                        {
-                            error!(%server_actor_id, %actor_id, %addr, "could not encode sync request: {e} (elapsed: {:?})", start.elapsed());
-                            continue 'servers;
-                        }
-
-                        counter!("corro.sync.client.req.sent", req_len as u64, "actor_id" => server_actor_id.to_string());
+                    if actual_needs.is_empty() {
+                        warn!(%server_actor_id, %actor_id, %addr, "nothing to send!");
+                        continue;
                     }
+
+                    let req_len = actual_needs.len();
+
+                    if let Err(e) = encode_write_sync_msg(
+                        &mut codec,
+                        &mut encode_buf,
+                        &mut send_buf,
+                        SyncMessage::V1(SyncMessageV1::Request(vec![(actor_id, actual_needs)])),
+                        &mut tx,
+                    )
+                    .await
+                    {
+                        error!(%server_actor_id, %actor_id, %addr, "could not encode sync request: {e} (elapsed: {:?})", start.elapsed());
+                        continue 'servers;
+                    }
+
+                    counter!("corro.sync.client.req.sent", req_len as u64, "actor_id" => server_actor_id.to_string());
                 }
 
                 if needs.is_empty() {
