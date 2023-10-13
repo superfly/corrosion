@@ -1313,7 +1313,9 @@ pub async fn parallel_sync(
                     }
                     Ok(Some(msg)) => match msg {
                         SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
-                            count += change.len();
+                            let changes_len = cmp::max(change.len(), 1);
+                            count += changes_len;
+                            counter!("corro.sync.changes.recv", changes_len as u64, "actor_id" => actor_id.to_string());
                             tx_changes
                                 .send((change, ChangeSource::Sync))
                                 .await
@@ -1343,8 +1345,6 @@ pub async fn parallel_sync(
             }
 
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "done reading sync messages");
-
-            counter!("corro.sync.changes.recv", count as u64, "actor_id" => actor_id.to_string());
 
             Ok(count)
         }
@@ -1442,8 +1442,25 @@ pub async fn serve_sync(
 
             let mut check_buf = tokio::time::interval(Duration::from_secs(1));
 
+            let mut stopped = false;
+
             loop {
                 tokio::select! {
+                    biased;
+
+                    stopped_res = write.stopped() => {
+                        match stopped_res {
+                            Ok(code) => {
+                                info!("send stream was stopped by peer, code: {code}");
+                            },
+                            Err(e) => {
+                                warn!("error waiting for stop from stream: {e}");
+                            }
+                        }
+                        stopped = true;
+                        break;
+                    },
+
                     maybe_msg = rx.recv() => match maybe_msg {
                         Some(msg) => {
                             if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
@@ -1459,6 +1476,7 @@ pub async fn serve_sync(
                             break;
                         }
                     },
+
                     _ = check_buf.tick() => {
                         if !send_buf.is_empty() {
                             write_buf(&mut send_buf, &mut write).await?;
@@ -1466,13 +1484,14 @@ pub async fn serve_sync(
                     }
                 }
             }
+            if !stopped {
+                if !send_buf.is_empty() {
+                    write_buf(&mut send_buf, &mut write).await?;
+                }
 
-            if !send_buf.is_empty() {
-                write_buf(&mut send_buf, &mut write).await?;
-            }
-
-            if let Err(e) = write.finish().await {
-                warn!("could not properly finish QUIC send stream: {e}");
+                if let Err(e) = write.finish().await {
+                    warn!("could not properly finish QUIC send stream: {e}");
+                }
             }
 
             debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
@@ -1541,210 +1560,210 @@ pub async fn serve_sync(
     Ok(recv_count)
 }
 
-pub async fn bidirectional_sync(
-    agent: &Agent,
-    our_sync_state: SyncStateV1,
-    their_sync_state: Option<SyncStateV1>,
-    read: RecvStream,
-    mut write: SendStream,
-) -> Result<usize, SyncError> {
-    let mut codec = LengthDelimitedCodec::new();
-    let mut send_buf = BytesMut::new();
-    let mut encode_buf = BytesMut::new();
+// pub async fn bidirectional_sync(
+//     agent: &Agent,
+//     our_sync_state: SyncStateV1,
+//     their_sync_state: Option<SyncStateV1>,
+//     read: RecvStream,
+//     mut write: SendStream,
+// ) -> Result<usize, SyncError> {
+//     let mut codec = LengthDelimitedCodec::new();
+//     let mut send_buf = BytesMut::new();
+//     let mut encode_buf = BytesMut::new();
 
-    // let _permit = if their_sync_state.is_some() {
-    //     // sync initiated by other end
-    //     match agent.limits().sync.clone().try_acquire_owned() {
-    //         Err(_e) => {
-    //             encode_write_sync_msg(
-    //                 &mut codec,
-    //                 &mut encode_buf,
-    //                 &mut send_buf,
-    //                 SyncMessage::V1(SyncMessageV1::Rejection(
-    //                     SyncRejectionV1::MaxConcurrencyReached,
-    //                 )),
-    //                 &mut write,
-    //             )
-    //             .await?;
-    //             write.flush().await.map_err(SyncSendError::from)?;
-    //             return Ok(0);
-    //         }
-    //         Ok(permit) => Some(permit),
-    //     }
-    // } else {
-    //     None
-    // };
+//     // let _permit = if their_sync_state.is_some() {
+//     //     // sync initiated by other end
+//     //     match agent.limits().sync.clone().try_acquire_owned() {
+//     //         Err(_e) => {
+//     //             encode_write_sync_msg(
+//     //                 &mut codec,
+//     //                 &mut encode_buf,
+//     //                 &mut send_buf,
+//     //                 SyncMessage::V1(SyncMessageV1::Rejection(
+//     //                     SyncRejectionV1::MaxConcurrencyReached,
+//     //                 )),
+//     //                 &mut write,
+//     //             )
+//     //             .await?;
+//     //             write.flush().await.map_err(SyncSendError::from)?;
+//     //             return Ok(0);
+//     //         }
+//     //         Ok(permit) => Some(permit),
+//     //     }
+//     // } else {
+//     //     None
+//     // };
 
-    encode_write_sync_msg(
-        &mut codec,
-        &mut encode_buf,
-        &mut send_buf,
-        SyncMessage::V1(SyncMessageV1::State(our_sync_state)),
-        &mut write,
-    )
-    .await?;
-    write.flush().await.map_err(SyncSendError::from)?;
+//     encode_write_sync_msg(
+//         &mut codec,
+//         &mut encode_buf,
+//         &mut send_buf,
+//         SyncMessage::V1(SyncMessageV1::State(our_sync_state)),
+//         &mut write,
+//     )
+//     .await?;
+//     write.flush().await.map_err(SyncSendError::from)?;
 
-    let (tx, mut rx) = channel::<SyncMessage>(256);
-    let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
+//     let (tx, mut rx) = channel::<SyncMessage>(256);
+//     let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
 
-    let their_sync_state = match their_sync_state {
-        Some(state) => state,
-        None => match read_sync_msg(&mut read).await? {
-            Some(SyncMessage::V1(SyncMessageV1::State(state))) => state,
-            Some(SyncMessage::V1(SyncMessageV1::Rejection(rejection))) => {
-                return Err(rejection.into())
-            }
-            Some(_) => return Err(SyncRecvError::ExpectedSyncState.into()),
-            None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
-        },
-    };
+//     let their_sync_state = match their_sync_state {
+//         Some(state) => state,
+//         None => match read_sync_msg(&mut read).await? {
+//             Some(SyncMessage::V1(SyncMessageV1::State(state))) => state,
+//             Some(SyncMessage::V1(SyncMessageV1::Rejection(rejection))) => {
+//                 return Err(rejection.into())
+//             }
+//             Some(_) => return Err(SyncRecvError::ExpectedSyncState.into()),
+//             None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
+//         },
+//     };
 
-    let their_actor_id = their_sync_state.actor_id;
+//     let their_actor_id = their_sync_state.actor_id;
 
-    encode_write_sync_msg(
-        &mut codec,
-        &mut encode_buf,
-        &mut send_buf,
-        SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
-        &mut write,
-    )
-    .await?;
-    write.flush().await.map_err(SyncSendError::from)?;
+//     encode_write_sync_msg(
+//         &mut codec,
+//         &mut encode_buf,
+//         &mut send_buf,
+//         SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
+//         &mut write,
+//     )
+//     .await?;
+//     write.flush().await.map_err(SyncSendError::from)?;
 
-    match read_sync_msg(&mut read).await? {
-        Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match their_actor_id.try_into() {
-            Ok(id) => {
-                if let Err(e) = agent
-                    .clock()
-                    .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), id))
-                {
-                    warn!("could not update clock from actor {their_actor_id}: {e}");
-                }
-            }
-            Err(e) => {
-                error!("could not convert ActorId to uhlc ID: {e}");
-            }
-        },
-        Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
-        None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
-    }
+//     match read_sync_msg(&mut read).await? {
+//         Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match their_actor_id.try_into() {
+//             Ok(id) => {
+//                 if let Err(e) = agent
+//                     .clock()
+//                     .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), id))
+//                 {
+//                     warn!("could not update clock from actor {their_actor_id}: {e}");
+//                 }
+//             }
+//             Err(e) => {
+//                 error!("could not convert ActorId to uhlc ID: {e}");
+//             }
+//         },
+//         Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
+//         None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
+//     }
 
-    let (tx_need, rx_need) = mpsc::channel(256);
+//     let (tx_need, rx_need) = mpsc::channel(256);
 
-    tokio::spawn(
-        process_sync(
-            agent.actor_id(),
-            agent.pool().clone(),
-            agent.bookie().clone(),
-            tx,
-            rx_need,
-        )
-        .inspect_err(|e| error!("could not process sync request: {e}")),
-    );
+//     tokio::spawn(
+//         process_sync(
+//             agent.actor_id(),
+//             agent.pool().clone(),
+//             agent.bookie().clone(),
+//             tx,
+//             rx_need,
+//         )
+//         .inspect_err(|e| error!("could not process sync request: {e}")),
+//     );
 
-    let tx_changes = agent.tx_changes().clone();
+//     let tx_changes = agent.tx_changes().clone();
 
-    let (_sent_count, recv_count) = tokio::try_join!(
-        async move {
-            let mut count = 0;
+//     let (_sent_count, recv_count) = tokio::try_join!(
+//         async move {
+//             let mut count = 0;
 
-            let mut check_buf = tokio::time::interval(Duration::from_secs(1));
+//             let mut check_buf = tokio::time::interval(Duration::from_secs(1));
 
-            loop {
-                tokio::select! {
-                    maybe_msg = rx.recv() => match maybe_msg {
-                        Some(msg) => {
-                            if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
-                                count += change.len();
-                            }
-                            encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
+//             loop {
+//                 tokio::select! {
+//                     maybe_msg = rx.recv() => match maybe_msg {
+//                         Some(msg) => {
+//                             if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+//                                 count += change.len();
+//                             }
+//                             encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
 
-                            if send_buf.len() >= 16 * 1024 {
-                                write_buf(&mut send_buf, &mut write).await?;
-                            }
-                        },
-                        None => {
-                            break;
-                        }
-                    },
-                    _ = check_buf.tick() => {
-                        if !send_buf.is_empty() {
-                            write_buf(&mut send_buf, &mut write).await?;
-                        }
-                    }
-                }
-            }
+//                             if send_buf.len() >= 16 * 1024 {
+//                                 write_buf(&mut send_buf, &mut write).await?;
+//                             }
+//                         },
+//                         None => {
+//                             break;
+//                         }
+//                     },
+//                     _ = check_buf.tick() => {
+//                         if !send_buf.is_empty() {
+//                             write_buf(&mut send_buf, &mut write).await?;
+//                         }
+//                     }
+//                 }
+//             }
 
-            if !send_buf.is_empty() {
-                write_buf(&mut send_buf, &mut write).await?;
-            }
+//             if !send_buf.is_empty() {
+//                 write_buf(&mut send_buf, &mut write).await?;
+//             }
 
-            if let Err(e) = write.finish().await {
-                warn!("could not properly finish QUIC send stream: {e}");
-            }
+//             if let Err(e) = write.finish().await {
+//                 warn!("could not properly finish QUIC send stream: {e}");
+//             }
 
-            debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
+//             debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
 
-            counter!("corro.sync.changes.sent", count as u64, "actor_id" => their_actor_id.to_string());
+//             counter!("corro.sync.changes.sent", count as u64, "actor_id" => their_actor_id.to_string());
 
-            Ok::<_, SyncError>(count)
-        },
-        async move {
-            let mut count = 0;
+//             Ok::<_, SyncError>(count)
+//         },
+//         async move {
+//             let mut count = 0;
 
-            loop {
-                match read_sync_msg(&mut read).await {
-                    Ok(None) => {
-                        break;
-                    }
-                    Err(e) => {
-                        error!("sync recv error: {e}");
-                        break;
-                    }
-                    Ok(Some(msg)) => match msg {
-                        SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
-                            count += change.len();
-                            tx_changes
-                                .send((change, ChangeSource::Sync))
-                                .await
-                                .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
-                        }
-                        SyncMessage::V1(SyncMessageV1::Request(req)) => {
-                            tx_need
-                                .send(req)
-                                .await
-                                .map_err(|_| SyncRecvError::RequestsChannelClosed)?;
-                        }
-                        SyncMessage::V1(SyncMessageV1::Start(_)) => {
-                            warn!("received sync start message more than once, ignoring");
-                            continue;
-                        }
-                        SyncMessage::V1(SyncMessageV1::State(_)) => {
-                            warn!("received sync state message more than once, ignoring");
-                            continue;
-                        }
-                        SyncMessage::V1(SyncMessageV1::Clock(_)) => {
-                            warn!("received sync clock message more than once, ignoring");
-                            continue;
-                        }
-                        SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
-                            return Err(rejection.into())
-                        }
-                    },
-                }
-            }
+//             loop {
+//                 match read_sync_msg(&mut read).await {
+//                     Ok(None) => {
+//                         break;
+//                     }
+//                     Err(e) => {
+//                         error!("sync recv error: {e}");
+//                         break;
+//                     }
+//                     Ok(Some(msg)) => match msg {
+//                         SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
+//                             count += change.len();
+//                             tx_changes
+//                                 .send((change, ChangeSource::Sync))
+//                                 .await
+//                                 .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
+//                         }
+//                         SyncMessage::V1(SyncMessageV1::Request(req)) => {
+//                             tx_need
+//                                 .send(req)
+//                                 .await
+//                                 .map_err(|_| SyncRecvError::RequestsChannelClosed)?;
+//                         }
+//                         SyncMessage::V1(SyncMessageV1::Start(_)) => {
+//                             warn!("received sync start message more than once, ignoring");
+//                             continue;
+//                         }
+//                         SyncMessage::V1(SyncMessageV1::State(_)) => {
+//                             warn!("received sync state message more than once, ignoring");
+//                             continue;
+//                         }
+//                         SyncMessage::V1(SyncMessageV1::Clock(_)) => {
+//                             warn!("received sync clock message more than once, ignoring");
+//                             continue;
+//                         }
+//                         SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
+//                             return Err(rejection.into())
+//                         }
+//                     },
+//                 }
+//             }
 
-            debug!(actor_id = %agent.actor_id(), "done reading sync messages");
+//             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
 
-            counter!("corro.sync.changes.recv", count as u64, "actor_id" => their_actor_id.to_string());
+//             counter!("corro.sync.changes.recv", count as u64, "actor_id" => their_actor_id.to_string());
 
-            Ok(count)
-        }
-    )?;
+//             Ok(count)
+//         }
+//     )?;
 
-    Ok(recv_count)
-}
+//     Ok(recv_count)
+// }
 
 #[cfg(test)]
 mod tests {

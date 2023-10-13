@@ -10,8 +10,7 @@ use std::{
 use crate::{
     api::{
         peer::{
-            bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, parallel_sync,
-            serve_sync, SyncError,
+            gossip_client_endpoint, gossip_server_endpoint, parallel_sync, serve_sync, SyncError,
         },
         public::{
             api_v1_db_schema, api_v1_queries, api_v1_transactions,
@@ -69,7 +68,7 @@ use tokio::{
     net::TcpListener,
     sync::mpsc::{channel, Receiver, Sender},
     task::block_in_place,
-    time::{sleep, timeout, error::Elapsed},
+    time::{error::Elapsed, sleep, timeout},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
 use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
