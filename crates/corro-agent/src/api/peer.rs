@@ -1261,20 +1261,24 @@ pub async fn parallel_sync(
 
                     let req_len = actual_needs.len();
 
-                    if let Err(e) = encode_write_sync_msg(
+                    if let Err(e) = encode_sync_msg(
                         &mut codec,
                         &mut encode_buf,
                         &mut send_buf,
                         SyncMessage::V1(SyncMessageV1::Request(vec![(actor_id, actual_needs)])),
-                        &mut tx,
-                    )
-                    .await
-                    {
+                    ) {
                         error!(%server_actor_id, %actor_id, %addr, "could not encode sync request: {e} (elapsed: {:?})", start.elapsed());
                         continue 'servers;
                     }
 
                     counter!("corro.sync.client.req.sent", req_len as u64, "actor_id" => server_actor_id.to_string());
+                }
+
+                if !send_buf.is_empty() {
+                    if let Err(e) = write_buf(&mut send_buf, &mut tx).await {
+                        error!(%server_actor_id, %addr, "could not write sync requests: {e} (elapsed: {:?})", start.elapsed());
+                        continue;
+                    }
                 }
 
                 if needs.is_empty() {
