@@ -31,10 +31,10 @@ use rusqlite::{params, Connection};
 use seahash::SeaHasher;
 use speedy::Writable;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::{self, channel, Sender};
+use tokio::sync::mpsc::{self, channel, unbounded_channel, Sender};
 use tokio::task::block_in_place;
 use tokio::time::timeout;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_stream::StreamExt as TokioStreamExt;
 // use tokio_stream::StreamExt as TokioStreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
@@ -703,81 +703,108 @@ async fn process_sync(
     recv: mpsc::Receiver<SyncRequestV1>,
 ) -> eyre::Result<()> {
     let chunked_reqs = ReceiverStream::new(recv).chunks_timeout(10, Duration::from_millis(500));
+    tokio::pin!(chunked_reqs);
 
-    chunked_reqs
-        .map(Ok)
-        .try_for_each_concurrent(6, |reqs| {
-            let sender = sender.clone();
-            let pool = pool.clone();
-            let bookie = bookie.clone();
-            async move {
-                let mut current_haves = vec![];
-                let mut partial_needs = vec![];
+    let (job_tx, job_rx) = unbounded_channel();
 
-                let agg = reqs
-                    .into_iter()
-                    .flatten()
-                    .group_by(|req| req.0)
-                    .into_iter()
-                    .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
-                    .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
-                for (actor_id, needs) in agg {
-                    let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() }
-                    {
-                        Some(booked) => booked,
-                        None => continue,
-                    };
+    let mut buf =
+        futures::StreamExt::buffer_unordered(
+            UnboundedReceiverStream::<
+                std::pin::Pin<Box<dyn Future<Output = eyre::Result<()>> + Send>>,
+            >::new(job_rx),
+            6,
+        );
 
-                    let is_local = actor_id == local_actor_id;
+    let mut current_haves = vec![];
+    let mut partial_needs = vec![];
 
-                    let mut cleared: RangeInclusiveSet<i64> = RangeInclusiveSet::new();
+    loop {
+        let reqs = tokio::select! {
+            Some(reqs) = chunked_reqs.next() => {
+                reqs
+            },
+            Some(res) = buf.next() => {
+                res?;
+                continue;
+            },
+            else => {
+                break;
+            }
+        };
 
-                    {
-                        let read = booked.read("process_need(full)").await;
+        let agg = reqs
+            .into_iter()
+            .flatten()
+            .group_by(|req| req.0)
+            .into_iter()
+            .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
+            .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
 
-                        for need in needs {
-                            match need {
-                                SyncNeedV1::Full { versions } => {
-                                    for version in versions {
-                                        match read.get(&version) {
-                                            Some(KnownVersion::Cleared) => {
-                                                cleared.insert(version..=version);
-                                            }
-                                            Some(known) => {
-                                                current_haves
-                                                    .push((version, KnownDbVersion::from(known)));
-                                            }
-                                            None => continue,
-                                        }
-                                    }
-                                }
-                                SyncNeedV1::Partial { version, seqs } => match read.get(&version) {
+        for (actor_id, needs) in agg {
+            let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() } {
+                Some(booked) => booked,
+                None => continue,
+            };
+
+            let is_local = actor_id == local_actor_id;
+
+            let mut cleared: RangeInclusiveSet<i64> = RangeInclusiveSet::new();
+
+            {
+                let read = booked.read("process_need(full)").await;
+
+                for need in needs {
+                    match need {
+                        SyncNeedV1::Full { versions } => {
+                            for version in versions {
+                                match read.get(&version) {
                                     Some(KnownVersion::Cleared) => {
                                         cleared.insert(version..=version);
                                     }
                                     Some(known) => {
-                                        partial_needs.push((
-                                            version,
-                                            KnownDbVersion::from(known),
-                                            seqs,
-                                        ));
+                                        current_haves.push((version, KnownDbVersion::from(known)));
                                     }
                                     None => continue,
-                                },
+                                }
                             }
                         }
+                        SyncNeedV1::Partial { version, seqs } => match read.get(&version) {
+                            Some(KnownVersion::Cleared) => {
+                                cleared.insert(version..=version);
+                            }
+                            Some(known) => {
+                                partial_needs.push((version, KnownDbVersion::from(known), seqs));
+                            }
+                            None => continue,
+                        },
                     }
+                }
+            }
 
-                    for versions in cleared {
+            for versions in cleared {
+                let sender = sender.clone();
+                if job_tx
+                    .send(Box::pin(async move {
                         sender
                             .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                                 actor_id,
                                 changeset: Changeset::Empty { versions },
                             })))
-                            .await?;
-                    }
+                            .await
+                            .map_err(eyre::Report::from)
+                    }))
+                    .is_err()
+                {
+                    eyre::bail!("could not send into job channel");
+                }
+            }
 
-                    for (version, known_version) in current_haves.drain(..) {
+            for (version, known_version) in current_haves.drain(..) {
+                let pool = pool.clone();
+                let booked = booked.clone();
+                let sender = sender.clone();
+                if job_tx
+                    .send(Box::pin(async move {
                         process_version(
                             &pool,
                             actor_id,
@@ -788,10 +815,20 @@ async fn process_sync(
                             vec![],
                             &sender,
                         )
-                        .await?;
-                    }
+                        .await
+                    }))
+                    .is_err()
+                {
+                    eyre::bail!("could not send into job channel");
+                }
+            }
 
-                    for (version, known_version, seqs_needed) in partial_needs.drain(..) {
+            for (version, known_version, seqs_needed) in partial_needs.drain(..) {
+                let pool = pool.clone();
+                let booked = booked.clone();
+                let sender = sender.clone();
+                if job_tx
+                    .send(Box::pin(async move {
                         process_version(
                             &pool,
                             actor_id,
@@ -802,13 +839,128 @@ async fn process_sync(
                             seqs_needed,
                             &sender,
                         )
-                        .await?;
-                    }
+                        .await
+                    }))
+                    .is_err()
+                {
+                    eyre::bail!("could not send into job channel");
                 }
-                Ok::<_, eyre::Report>(())
             }
-        })
-        .await?;
+        }
+    }
+
+    while let Some(res) = buf.next().await {
+        res?;
+    }
+
+    // chunked_reqs
+    //     .flat_map(|reqs|{
+
+    //     })
+    //     .try_for_each_concurrent(6, |reqs| {
+    //         let sender = sender.clone();
+    //         let pool = pool.clone();
+    //         let bookie = bookie.clone();
+    //         async move {
+    //             let mut current_haves = vec![];
+    //             let mut partial_needs = vec![];
+
+    //             let agg = reqs
+    //                 .into_iter()
+    //                 .flatten()
+    //                 .group_by(|req| req.0)
+    //                 .into_iter()
+    //                 .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
+    //                 .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
+
+    //             for (actor_id, needs) in agg {
+    //                 let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() }
+    //                 {
+    //                     Some(booked) => booked,
+    //                     None => continue,
+    //                 };
+
+    //                 let is_local = actor_id == local_actor_id;
+
+    //                 let mut cleared: RangeInclusiveSet<i64> = RangeInclusiveSet::new();
+
+    //                 {
+    //                     let read = booked.read("process_need(full)").await;
+
+    //                     for need in needs {
+    //                         match need {
+    //                             SyncNeedV1::Full { versions } => {
+    //                                 for version in versions {
+    //                                     match read.get(&version) {
+    //                                         Some(KnownVersion::Cleared) => {
+    //                                             cleared.insert(version..=version);
+    //                                         }
+    //                                         Some(known) => {
+    //                                             current_haves
+    //                                                 .push((version, KnownDbVersion::from(known)));
+    //                                         }
+    //                                         None => continue,
+    //                                     }
+    //                                 }
+    //                             }
+    //                             SyncNeedV1::Partial { version, seqs } => match read.get(&version) {
+    //                                 Some(KnownVersion::Cleared) => {
+    //                                     cleared.insert(version..=version);
+    //                                 }
+    //                                 Some(known) => {
+    //                                     partial_needs.push((
+    //                                         version,
+    //                                         KnownDbVersion::from(known),
+    //                                         seqs,
+    //                                     ));
+    //                                 }
+    //                                 None => continue,
+    //                             },
+    //                         }
+    //                     }
+    //                 }
+
+    //                 for versions in cleared {
+    //                     sender
+    //                         .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+    //                             actor_id,
+    //                             changeset: Changeset::Empty { versions },
+    //                         })))
+    //                         .await?;
+    //                 }
+
+    //                 for (version, known_version) in current_haves.drain(..) {
+    //                     process_version(
+    //                         &pool,
+    //                         actor_id,
+    //                         is_local,
+    //                         version,
+    //                         known_version,
+    //                         &booked,
+    //                         vec![],
+    //                         &sender,
+    //                     )
+    //                     .await?;
+    //                 }
+
+    //                 for (version, known_version, seqs_needed) in partial_needs.drain(..) {
+    //                     process_version(
+    //                         &pool,
+    //                         actor_id,
+    //                         is_local,
+    //                         version,
+    //                         known_version,
+    //                         &booked,
+    //                         seqs_needed,
+    //                         &sender,
+    //                     )
+    //                     .await?;
+    //                 }
+    //             }
+    //             Ok::<_, eyre::Report>(())
+    //         }
+    //     })
+    //     .await?;
 
     // while let Some(reqs) = chunked_reqs.next().await {
     //     let agg = reqs
