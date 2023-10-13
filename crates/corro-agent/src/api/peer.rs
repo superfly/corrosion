@@ -1199,6 +1199,7 @@ pub async fn parallel_sync(
             let mut next_servers = Vec::with_capacity(servers.len());
             'servers: for (server_actor_id, addr, mut needs, mut tx) in servers {
                 for (actor_id, needs) in needs.drain(0..cmp::min(10, needs.len())) {
+                    info!(%server_actor_id, %actor_id, %addr, "collecting needs to request, starting len: {}", needs.len());
                     for need in needs {
                         let actual_needs = match need {
                             SyncNeedV1::Full { versions } => {
@@ -1253,6 +1254,7 @@ pub async fn parallel_sync(
                         };
 
                         if actual_needs.is_empty() {
+                            warn!(%server_actor_id, %actor_id, %addr, "nothing to send!");
                             continue;
                         }
 
@@ -1267,7 +1269,7 @@ pub async fn parallel_sync(
                         )
                         .await
                         {
-                            error!(%server_actor_id, %actor_id, %addr, "could not encode sync request: {e}");
+                            error!(%server_actor_id, %actor_id, %addr, "could not encode sync request: {e} (elapsed: {:?})", start.elapsed());
                             continue 'servers;
                         }
 
@@ -1361,7 +1363,7 @@ pub async fn serve_sync(
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
-    debug!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "serve sync");
+    info!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "received sync request");
     let mut codec = LengthDelimitedCodec::new();
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
