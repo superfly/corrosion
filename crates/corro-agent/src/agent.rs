@@ -2665,42 +2665,47 @@ async fn process_completed_empties(
         "processing empty versions (count: {})",
         empties.values().map(Vec::len).sum::<usize>()
     );
-    let mut conn = agent.pool().write_low().await?;
 
-    block_in_place(|| {
-        let tx = conn.transaction()?;
+    while let Some((actor_id, empties)) = empties.pop_first() {
+        let booked = {
+            agent
+                .bookie()
+                .blocking_write(format!(
+                    "process_completed_empties(for_actor_blocking):{}",
+                    actor_id.as_simple()
+                ))
+                .for_actor(actor_id)
+        };
 
-        let mut inserted = 0;
-        while let Some((actor_id, empties)) = empties.pop_first() {
-            let booked = {
-                agent
-                    .bookie()
-                    .blocking_write(format!(
-                        "process_completed_empties(for_actor_blocking):{}",
-                        actor_id.as_simple()
-                    ))
-                    .for_actor(actor_id)
-            };
-            let bookedw = booked.blocking_write(format!(
-                "process_completed_empties(booked writer):{}",
+        let mut conn = agent.pool().write_low().await?;
+
+        block_in_place(|| {
+            let tx = conn.transaction()?;
+
+            let mut inserted = 0;
+
+            let bookedr = booked.blocking_read(format!(
+                "process_completed_empties(booked read):{}",
                 actor_id.as_simple()
             ));
 
             for range in empties
                 .iter()
-                .filter_map(|range| bookedw.cleared.get(range.start()))
+                .filter_map(|range| bookedr.cleared.get(range.start()))
                 .dedup()
             {
                 inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
             }
-        }
 
-        tx.commit()?;
+            tx.commit()?;
 
-        info!("upserted {inserted} empty versions");
+            info!("upserted {inserted} empty versions");
 
-        Ok(())
-    })
+            Ok::<_, eyre::Report>(())
+        })?;
+    }
+
+    Ok(())
 }
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {

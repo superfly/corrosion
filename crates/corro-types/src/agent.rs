@@ -526,6 +526,13 @@ impl<T> CountedTokioRwLock<T> {
             .acquire_blocking_write_owned(label, self.lock.clone())
     }
 
+    pub fn blocking_read<C: Into<CompactString>>(
+        &self,
+        label: C,
+    ) -> CountedTokioRwLockReadGuard<'_, T> {
+        self.registry.acquire_blocking_read(label, &self.lock)
+    }
+
     pub async fn read<C: Into<CompactString>>(
         &self,
         label: C,
@@ -710,6 +717,30 @@ impl LockRegistry {
             registry: self.clone(),
         };
         let w = lock.read().await;
+        self.set_lock_state(&id, LockState::Locked);
+        CountedTokioRwLockReadGuard { lock: w, _tracker }
+    }
+
+    fn acquire_blocking_read<'a, T, C: Into<CompactString>>(
+        &self,
+        label: C,
+        lock: &'a TokioRwLock<T>,
+    ) -> CountedTokioRwLockReadGuard<'a, T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label: label.into(),
+                kind: LockKind::Read,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = lock.blocking_read();
         self.set_lock_state(&id, LockState::Locked);
         CountedTokioRwLockReadGuard { lock: w, _tracker }
     }
@@ -957,6 +988,13 @@ impl Booked {
         label: L,
     ) -> CountedTokioRwLockWriteGuard<'_, BookedVersions> {
         self.0.blocking_write(label)
+    }
+
+    pub fn blocking_read<L: Into<CompactString>>(
+        &self,
+        label: L,
+    ) -> CountedTokioRwLockReadGuard<'_, BookedVersions> {
+        self.0.blocking_read(label)
     }
 
     pub fn blocking_write_owned<L: Into<CompactString>>(
