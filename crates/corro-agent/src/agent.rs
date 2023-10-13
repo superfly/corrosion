@@ -1736,7 +1736,7 @@ pub async fn process_multiple_changes(
     agent: &Agent,
     changes: Vec<(ChangeV1, ChangeSource)>,
 ) -> Result<(), ChangeError> {
-    info!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.len());
+    info!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
     let bookie = agent.bookie();
 
@@ -2452,7 +2452,7 @@ async fn handle_sync2(agent: &Agent, transport: &Transport) -> Result<(), SyncCl
 //     Ok(())
 // }
 
-const MIN_CHANGES_CHUNK: usize = 1000;
+const MIN_CHANGES_CHUNK: usize = 100;
 
 async fn handle_changes(
     agent: Agent,
