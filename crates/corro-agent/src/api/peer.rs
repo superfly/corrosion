@@ -1196,7 +1196,8 @@ pub async fn parallel_sync(
                 break;
             }
             let mut next_servers = Vec::with_capacity(servers.len());
-            for (_actor_id, mut needs, mut tx) in servers {
+            for (actor_id, mut needs, mut tx) in servers {
+                let mut req_count = 0;
                 for (actor_id, needs) in needs.drain(0..cmp::min(10, needs.len())) {
                     for need in needs {
                         let actual_needs = match need {
@@ -1255,6 +1256,8 @@ pub async fn parallel_sync(
                             continue;
                         }
 
+                        let req_len = actual_needs.len();
+
                         if let Err(e) = encode_sync_msg(
                             &mut codec,
                             &mut encode_buf,
@@ -1264,6 +1267,8 @@ pub async fn parallel_sync(
                             error!("could not encode sync request: {e}");
                             continue;
                         }
+
+                        req_count += req_len;
                     }
                 }
 
@@ -1274,12 +1279,14 @@ pub async fn parallel_sync(
                     }
                 }
 
+                counter!("corro.sync.client.req.sent", req_count as u64, "actor_id" => actor_id.to_string());
+
                 if needs.is_empty() {
                     if let Err(e) = tx.finish().await {
                         warn!("could not finish stream while sending sync requests: {e}");
                     }
                 } else {
-                    next_servers.push((_actor_id, needs, tx));
+                    next_servers.push((actor_id, needs, tx));
                 }
             }
             servers = next_servers;
