@@ -20,8 +20,8 @@ use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
     SyncRequestV1, SyncStateV1,
 };
-use futures::stream::FuturesUnordered;
-use futures::{Stream, TryFutureExt, TryStreamExt};
+use futures::stream::{self, BufferUnordered, FuturesUnordered};
+use futures::{Future, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use metrics::{counter, increment_counter};
 use quinn::{RecvStream, SendStream};
@@ -35,7 +35,7 @@ use tokio::sync::mpsc::{self, channel, Sender};
 use tokio::task::block_in_place;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
+// use tokio_stream::StreamExt as TokioStreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
 
@@ -701,98 +701,191 @@ async fn process_sync(
     sender: Sender<SyncMessage>,
     recv: mpsc::Receiver<SyncRequestV1>,
 ) -> eyre::Result<()> {
-    let mut current_haves = vec![];
-    let mut partial_needs = vec![];
+    ReceiverStream::new(recv)
+        .map(Ok)
+        .try_for_each_concurrent(6, |reqs| {
+            let sender = sender.clone();
+            let pool = pool.clone();
+            let bookie = bookie.clone();
+            async move {
+                let mut current_haves = vec![];
+                let mut partial_needs = vec![];
 
-    let chunked_reqs = ReceiverStream::new(recv).chunks_timeout(100, Duration::from_secs(1));
-    tokio::pin!(chunked_reqs);
+                for (actor_id, needs) in reqs {
+                    let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() }
+                    {
+                        Some(booked) => booked,
+                        None => continue,
+                    };
 
-    while let Some(reqs) = chunked_reqs.next().await {
-        let agg = reqs
-            .into_iter()
-            .flatten()
-            .group_by(|req| req.0)
-            .into_iter()
-            .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
-            .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
-        for (actor_id, needs) in agg {
-            let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() } {
-                Some(booked) => booked,
-                None => continue,
-            };
+                    let is_local = actor_id == local_actor_id;
 
-            let is_local = actor_id == local_actor_id;
+                    let mut cleared: RangeInclusiveSet<i64> = RangeInclusiveSet::new();
 
-            let mut cleared: RangeInclusiveSet<i64> = RangeInclusiveSet::new();
+                    {
+                        let read = booked.read("process_need(full)").await;
 
-            {
-                let read = booked.read("process_need(full)").await;
-
-                for need in needs {
-                    match need {
-                        SyncNeedV1::Full { versions } => {
-                            for version in versions {
-                                match read.get(&version) {
+                        for need in needs {
+                            match need {
+                                SyncNeedV1::Full { versions } => {
+                                    for version in versions {
+                                        match read.get(&version) {
+                                            Some(KnownVersion::Cleared) => {
+                                                cleared.insert(version..=version);
+                                            }
+                                            Some(known) => {
+                                                current_haves
+                                                    .push((version, KnownDbVersion::from(known)));
+                                            }
+                                            None => continue,
+                                        }
+                                    }
+                                }
+                                SyncNeedV1::Partial { version, seqs } => match read.get(&version) {
                                     Some(KnownVersion::Cleared) => {
                                         cleared.insert(version..=version);
                                     }
                                     Some(known) => {
-                                        current_haves.push((version, KnownDbVersion::from(known)));
+                                        partial_needs.push((
+                                            version,
+                                            KnownDbVersion::from(known),
+                                            seqs,
+                                        ));
                                     }
                                     None => continue,
-                                }
+                                },
                             }
                         }
-                        SyncNeedV1::Partial { version, seqs } => match read.get(&version) {
-                            Some(KnownVersion::Cleared) => {
-                                cleared.insert(version..=version);
-                            }
-                            Some(known) => {
-                                partial_needs.push((version, KnownDbVersion::from(known), seqs));
-                            }
-                            None => continue,
-                        },
+                    }
+
+                    for versions in cleared {
+                        sender
+                            .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                                actor_id,
+                                changeset: Changeset::Empty { versions },
+                            })))
+                            .await?;
+                    }
+
+                    for (version, known_version) in current_haves.drain(..) {
+                        process_version(
+                            &pool,
+                            actor_id,
+                            is_local,
+                            version,
+                            known_version,
+                            &booked,
+                            vec![],
+                            &sender,
+                        )
+                        .await?;
+                    }
+
+                    for (version, known_version, seqs_needed) in partial_needs.drain(..) {
+                        process_version(
+                            &pool,
+                            actor_id,
+                            is_local,
+                            version,
+                            known_version,
+                            &booked,
+                            seqs_needed,
+                            &sender,
+                        )
+                        .await?;
                     }
                 }
+                Ok::<_, eyre::Report>(())
             }
-            for versions in cleared {
-                sender
-                    .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                        actor_id,
-                        changeset: Changeset::Empty { versions },
-                    })))
-                    .await?;
-            }
+        })
+        .await?;
 
-            for (version, known_version) in current_haves.drain(..) {
-                process_version(
-                    &pool,
-                    actor_id,
-                    is_local,
-                    version,
-                    known_version,
-                    &booked,
-                    vec![],
-                    &sender,
-                )
-                .await?;
-            }
+    // while let Some(reqs) = chunked_reqs.next().await {
+    //     let agg = reqs
+    //         .into_iter()
+    //         .flatten()
+    //         .group_by(|req| req.0)
+    //         .into_iter()
+    //         .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
+    //         .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
+    //     for (actor_id, needs) in agg {
+    //         let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() } {
+    //             Some(booked) => booked,
+    //             None => continue,
+    //         };
 
-            for (version, known_version, seqs_needed) in partial_needs.drain(..) {
-                process_version(
-                    &pool,
-                    actor_id,
-                    is_local,
-                    version,
-                    known_version,
-                    &booked,
-                    seqs_needed,
-                    &sender,
-                )
-                .await?;
-            }
-        }
-    }
+    //         let is_local = actor_id == local_actor_id;
+
+    //         let mut cleared: RangeInclusiveSet<i64> = RangeInclusiveSet::new();
+
+    //         {
+    //             let read = booked.read("process_need(full)").await;
+
+    //             for need in needs {
+    //                 match need {
+    //                     SyncNeedV1::Full { versions } => {
+    //                         for version in versions {
+    //                             match read.get(&version) {
+    //                                 Some(KnownVersion::Cleared) => {
+    //                                     cleared.insert(version..=version);
+    //                                 }
+    //                                 Some(known) => {
+    //                                     current_haves.push((version, KnownDbVersion::from(known)));
+    //                                 }
+    //                                 None => continue,
+    //                             }
+    //                         }
+    //                     }
+    //                     SyncNeedV1::Partial { version, seqs } => match read.get(&version) {
+    //                         Some(KnownVersion::Cleared) => {
+    //                             cleared.insert(version..=version);
+    //                         }
+    //                         Some(known) => {
+    //                             partial_needs.push((version, KnownDbVersion::from(known), seqs));
+    //                         }
+    //                         None => continue,
+    //                     },
+    //                 }
+    //             }
+    //         }
+    //         for versions in cleared {
+    //             sender
+    //                 .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+    //                     actor_id,
+    //                     changeset: Changeset::Empty { versions },
+    //                 })))
+    //                 .await?;
+    //         }
+
+    //         for (version, known_version) in current_haves.drain(..) {
+    //             process_version(
+    //                 &pool,
+    //                 actor_id,
+    //                 is_local,
+    //                 version,
+    //                 known_version,
+    //                 &booked,
+    //                 vec![],
+    //                 &sender,
+    //             )
+    //             .await?;
+    //         }
+
+    //         for (version, known_version, seqs_needed) in partial_needs.drain(..) {
+    //             process_version(
+    //                 &pool,
+    //                 actor_id,
+    //                 is_local,
+    //                 version,
+    //                 known_version,
+    //                 &booked,
+    //                 seqs_needed,
+    //                 &sender,
+    //             )
+    //             .await?;
+    //         }
+    //     }
+    // }
 
     // let booked_actors: HashMap<ActorId, Booked> = {
     //     bookie
@@ -1437,7 +1530,7 @@ pub async fn serve_sync(
     write.flush().await.map_err(SyncSendError::from)?;
     trace!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "flushed sync messages");
 
-    let (tx_need, rx_need) = mpsc::channel(256);
+    let (tx_need, rx_need) = mpsc::channel(1024);
     let (tx, mut rx) = mpsc::channel::<SyncMessage>(256);
 
     tokio::spawn(
