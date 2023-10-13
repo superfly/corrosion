@@ -11,7 +11,7 @@ use crate::{
     api::{
         peer::{
             bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, parallel_sync,
-            receive_sync, SyncError,
+            serve_sync, SyncError,
         },
         public::{
             api_v1_db_schema, api_v1_queries, api_v1_transactions,
@@ -648,7 +648,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                                 ) => {
                                                                     trace!("framed read buffer len: {}", framed.read_buffer().len());
                                                                     // println!("got sync state: {state:?}");
-                                                                    if let Err(e) = receive_sync(
+                                                                    if let Err(e) = serve_sync(
                                                                         &agent, actor_id, framed,
                                                                         tx,
                                                                     )
@@ -1320,6 +1320,7 @@ async fn handle_notifications(
 
                     member_events.send(MemberEvent::Up(actor.clone())).ok();
                 }
+                increment_counter!("corro.swim.notification", "type" => "memberup");
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
@@ -1337,19 +1338,24 @@ async fn handle_notifications(
                     }
                     member_events.send(MemberEvent::Down(actor.clone())).ok();
                 }
+                increment_counter!("corro.swim.notification", "type" => "memberdown");
             }
             Notification::Active => {
                 info!("Current node is considered ACTIVE");
+                increment_counter!("corro.swim.notification", "type" => "active");
             }
             Notification::Idle => {
                 warn!("Current node is considered IDLE");
+                increment_counter!("corro.swim.notification", "type" => "idle");
             }
             // this happens when we leave the cluster
             Notification::Defunct => {
                 debug!("Current node is considered DEFUNCT");
+                increment_counter!("corro.swim.notification", "type" => "defunct");
             }
             Notification::Rejoin(id) => {
                 info!("Rejoined the cluster with id: {id:?}");
+                increment_counter!("corro.swim.notification", "type" => "rejoin");
             }
         }
     }
@@ -2445,7 +2451,9 @@ async fn handle_changes(
     loop {
         tokio::select! {
             Some((change, src)) = rx_changes.recv() => {
-                count += std::cmp::max(change.len(), 1);
+                let changes_count = std::cmp::max(change.len(), 1);
+                counter!("corro.agent.changes.recv", changes_count as u64);
+                count += changes_count;
                 buf.push((change, src));
                 if count < MIN_CHANGES_CHUNK {
                     continue;
@@ -2478,7 +2486,9 @@ async fn handle_changes(
 
     // drain!
     while let Ok((change, src)) = rx_changes.try_recv() {
-        count += std::cmp::max(change.len(), 1);
+        let changes_count = std::cmp::max(change.len(), 1);
+        counter!("corro.agent.changes.recv", changes_count as u64);
+        count += changes_count;
         buf.push((change, src));
         if count >= MIN_CHANGES_CHUNK {
             // drain and process current changes!
@@ -2612,7 +2622,8 @@ async fn sync_loop(
                         break;
                     }
                     tripwire::Outcome::Completed(res) => {
-                        if res.is_err() {
+                        if let Err(e) = res {
+                            error!("could not sync: {e}");
                             // keep syncing until we successfully sync
                             continue;
                         }
