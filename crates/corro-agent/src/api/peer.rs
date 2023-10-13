@@ -720,8 +720,9 @@ async fn process_sync(
 
     loop {
         let reqs = tokio::select! {
-            Some(reqs) = chunked_reqs.next() => {
-                reqs
+            maybe_reqs = chunked_reqs.next() => match maybe_reqs {
+                Some(reqs) => reqs,
+                None => break,
             },
             Some(res) = buf.next() => {
                 res?;
@@ -848,10 +849,11 @@ async fn process_sync(
             }
         }
     }
+    debug!("done w/ sync server loop");
 
-    while let Some(res) = buf.next().await {
-        res?;
-    }
+    drop(job_tx);
+
+    buf.try_collect().await?;
 
     // chunked_reqs
     //     .flat_map(|reqs|{
