@@ -1923,7 +1923,7 @@ pub async fn process_multiple_changes(
                     .for_actor(actor_id)
             };
             let mut booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer):{}",
+                "process_multiple_changes(booked writer, post commit):{}",
                 actor_id.as_simple()
             ));
 
@@ -2457,6 +2457,7 @@ async fn write_empties_loop(
             maybe_empty = rx_empty.recv() => match maybe_empty {
                 Some((actor_id, versions)) => {
                     empties.entry(actor_id).or_default().insert(versions);
+                    continue;
                 },
                 None => {
                     debug!("empties queue is done");
