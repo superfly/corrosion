@@ -1773,6 +1773,7 @@ pub async fn process_multiple_changes(
     let mut conn = agent.pool().write_normal().await?;
 
     block_in_place(|| {
+        let start = Instant::now();
         let tx = conn.transaction()?;
 
         let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
@@ -1912,6 +1913,8 @@ pub async fn process_multiple_changes(
         debug!("inserted {count} new changesets");
 
         tx.commit()?;
+
+        info!("committed {count} changes in {:?}", start.elapsed());
 
         for (actor_id, knowns) in knowns {
             let booked = {
