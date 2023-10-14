@@ -2369,7 +2369,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
     Ok(())
 }
 
-const MIN_CHANGES_CHUNK: usize = 100;
+const MIN_CHANGES_CHUNK: usize = 500;
 
 async fn handle_changes(
     agent: Agent,
