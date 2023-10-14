@@ -261,7 +261,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let (tx_bcast, rx_bcast) = channel(10240);
     let (tx_empty, rx_empty) = channel(10240);
-    let (tx_changes, rx_changes) = channel(1024);
+    let (tx_changes, rx_changes) = channel(5192);
     let (tx_foca, rx_foca) = channel(10240);
 
     let opts = AgentOptions {

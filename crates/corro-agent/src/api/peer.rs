@@ -1708,7 +1708,7 @@ pub async fn serve_sync(
         .inspect_err(|e| error!("could not process sync request: {e}")),
     );
 
-    let (_sent_count, recv_count) = tokio::try_join!(
+    let (send_res, recv_res) = tokio::join!(
         async move {
             let mut count = 0;
 
@@ -1723,10 +1723,10 @@ pub async fn serve_sync(
                     stopped_res = write.stopped() => {
                         match stopped_res {
                             Ok(code) => {
-                                info!("send stream was stopped by peer, code: {code}");
+                                info!(actor_id = %their_actor_id, "send stream was stopped by peer, code: {code}");
                             },
                             Err(e) => {
-                                warn!("error waiting for stop from stream: {e}");
+                                warn!(actor_id = %their_actor_id, "error waiting for stop from stream: {e}");
                             }
                         }
                         stopped = true;
@@ -1800,19 +1800,19 @@ pub async fn serve_sync(
                                 .map_err(|_| SyncRecvError::RequestsChannelClosed)?;
                         }
                         SyncMessage::V1(SyncMessageV1::Changeset(_)) => {
-                            warn!("received sync changeset message unexpectedly, ignoring");
+                            warn!(actor_id = %their_actor_id, "received sync changeset message unexpectedly, ignoring");
                             continue;
                         }
                         SyncMessage::V1(SyncMessageV1::State(_)) => {
-                            warn!("received sync state message unexpectedly, ignoring");
+                            warn!(actor_id = %their_actor_id, "received sync state message unexpectedly, ignoring");
                             continue;
                         }
                         SyncMessage::V1(SyncMessageV1::Start(_)) => {
-                            warn!("received sync start message unexpectedly, ignoring");
+                            warn!(actor_id = %their_actor_id, "received sync start message unexpectedly, ignoring");
                             continue;
                         }
                         SyncMessage::V1(SyncMessageV1::Clock(_)) => {
-                            warn!("received sync clock message more than once, ignoring");
+                            warn!(actor_id = %their_actor_id, "received sync clock message more than once, ignoring");
                             continue;
                         }
                         SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
@@ -1828,9 +1828,13 @@ pub async fn serve_sync(
 
             Ok(count)
         }
-    )?;
+    );
 
-    Ok(recv_count)
+    if let Err(e) = send_res {
+        error!(actor_id = %their_actor_id, "could not complete serving sync due to a send side error: {e}");
+    }
+
+    recv_res
 }
 
 #[cfg(test)]
