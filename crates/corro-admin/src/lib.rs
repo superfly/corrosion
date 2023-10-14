@@ -181,6 +181,7 @@ async fn handle_conn(
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,
                     }
+                    send_success(&mut stream).await;
                 }
                 Command::Locks { top } => {
                     info_log(&mut stream, "gathering top locks").await;
@@ -208,6 +209,7 @@ async fn handle_conn(
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,
                     }
+                    send_success(&mut stream).await;
                 }
                 Command::Cluster(ClusterCommand::MembershipStates) => {
                     info_log(&mut stream, "gathering membership state").await;
@@ -228,6 +230,7 @@ async fn handle_conn(
                             Err(e) => send_error(&mut stream, e).await,
                         }
                     }
+                    send_success(&mut stream).await;
                 }
             },
             Ok(None) => {
