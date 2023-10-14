@@ -2294,7 +2294,7 @@ pub enum SyncRecvError {
     RequestsChannelClosed,
 }
 
-async fn handle_sync2(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
+async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
     let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
 
     for (actor_id, needed) in sync_state.need.iter() {
@@ -2368,89 +2368,6 @@ async fn handle_sync2(agent: &Agent, transport: &Transport) -> Result<(), SyncCl
     }
     Ok(())
 }
-
-// async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
-//     let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
-//     for (actor_id, needed) in sync_state.need.iter() {
-//         gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
-//     }
-//     for (actor_id, version) in sync_state.heads.iter() {
-//         gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
-//     }
-
-//     let (actor_id, addr) = {
-//         let candidates = {
-//             let members = agent.members().read();
-
-//             members
-//                 .states
-//                 .iter()
-//                 .filter(|(id, _state)| **id != agent.actor_id())
-//                 .map(|(id, state)| (*id, state.addr))
-//                 .collect::<Vec<(ActorId, SocketAddr)>>()
-//         };
-
-//         if candidates.is_empty() {
-//             return Err(SyncClientError::NoGoodCandidate);
-//         }
-
-//         debug!("found {} candidates to synchronize with", candidates.len());
-
-//         let mut rng = StdRng::from_entropy();
-
-//         let mut choices = candidates.into_iter().choose_multiple(&mut rng, 2);
-
-//         choices.sort_by(|a, b| {
-//             sync_state
-//                 .need_len_for_actor(&b.0)
-//                 .cmp(&sync_state.need_len_for_actor(&a.0))
-//         });
-
-//         if let Some(chosen) = choices.get(0).cloned() {
-//             chosen
-//         } else {
-//             return Err(SyncClientError::NoGoodCandidate);
-//         }
-//     };
-
-//     debug!(
-//         actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
-//         actor_id,
-//         sync_state.need_len(),
-//     );
-
-//     debug!(actor = %agent.actor_id(), "sync message: {sync_state:?}");
-
-//     increment_counter!("corro.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
-
-//     histogram!(
-//         "corro.sync.client.request.operations.need.count",
-//         sync_state.need.len() as f64
-//     );
-
-//     let (tx, rx) = transport
-//         .open_bi(addr)
-//         .await
-//         .map_err(crate::transport::TransportError::from)?;
-
-//     increment_counter!("corro.sync.attempts.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
-
-//     // FIXME: check if it's ok to sync (don't overload host)
-
-//     let start = Instant::now();
-//     let n = bidirectional_sync(agent, sync_state, None, rx, tx).await?;
-
-//     let elapsed = start.elapsed();
-//     if n > 0 {
-//         info!(
-//             "synced {n} changes w/ {} in {}s @ {} changes/s",
-//             actor_id,
-//             elapsed.as_secs_f64(),
-//             n as f64 / elapsed.as_secs_f64()
-//         );
-//     }
-//     Ok(())
-// }
 
 const MIN_CHANGES_CHUNK: usize = 100;
 
@@ -2530,8 +2447,7 @@ async fn write_empties_loop(
     mut rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
     mut tripwire: Tripwire,
 ) {
-    let mut inserted_empties = 0;
-    let mut empties: BTreeMap<ActorId, Vec<RangeInclusive<i64>>> = BTreeMap::new();
+    let mut empties: BTreeMap<ActorId, RangeInclusiveSet<i64>> = BTreeMap::new();
 
     let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
     tokio::pin!(next_empties_check);
@@ -2540,12 +2456,7 @@ async fn write_empties_loop(
         tokio::select! {
             maybe_empty = rx_empty.recv() => match maybe_empty {
                 Some((actor_id, versions)) => {
-                    empties.entry(actor_id).or_default().push(versions);
-                    inserted_empties += 1;
-
-                    if inserted_empties < 50 {
-                        continue;
-                    }
+                    empties.entry(actor_id).or_default().insert(versions);
                 },
                 None => {
                     debug!("empties queue is done");
@@ -2561,8 +2472,6 @@ async fn write_empties_loop(
             _ = &mut tripwire => break
         }
 
-        inserted_empties = 0;
-
         if let Err(e) = process_completed_empties(&agent, &mut empties).await {
             error!("could not process empties: {e}");
         }
@@ -2570,7 +2479,7 @@ async fn write_empties_loop(
     info!("Draining empty versions to process...");
     // drain empties channel
     while let Ok((actor_id, versions)) = rx_empty.try_recv() {
-        empties.entry(actor_id).or_default().push(versions);
+        empties.entry(actor_id).or_default().insert(versions);
     }
 
     if !empties.is_empty() {
@@ -2629,7 +2538,7 @@ async fn sync_loop(
         match branch {
             Branch::Tick => {
                 // ignoring here, there is trying and logging going on inside
-                match handle_sync2(&agent, &transport)
+                match handle_sync(&agent, &transport)
                     .preemptible(&mut tripwire)
                     .await
                 {
@@ -2669,51 +2578,33 @@ async fn sync_loop(
 
 async fn process_completed_empties(
     agent: &Agent,
-    empties: &mut BTreeMap<ActorId, Vec<RangeInclusive<i64>>>,
+    empties: &mut BTreeMap<ActorId, RangeInclusiveSet<i64>>,
 ) -> eyre::Result<()> {
     info!(
         "processing empty versions (count: {})",
-        empties.values().map(Vec::len).sum::<usize>()
+        empties.values().map(RangeInclusiveSet::len).sum::<usize>()
     );
 
     while let Some((actor_id, empties)) = empties.pop_first() {
-        let booked = {
-            agent
-                .bookie()
-                .write(format!(
-                    "process_completed_empties(for_actor_blocking):{}",
-                    actor_id.as_simple()
-                ))
-                .await
-                .for_actor(actor_id)
-        };
+        let v = empties.into_iter().collect::<Vec<_>>();
 
-        let mut conn = agent.pool().write_low().await?;
+        for ranges in v.chunks(50) {
+            let mut conn = agent.pool().write_low().await?;
+            block_in_place(|| {
+                let tx = conn.transaction()?;
 
-        block_in_place(|| {
-            let tx = conn.transaction()?;
+                let mut inserted = 0;
+                for range in ranges {
+                    inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
+                }
 
-            let mut inserted = 0;
+                tx.commit()?;
 
-            let bookedr = booked.blocking_read(format!(
-                "process_completed_empties(booked read):{}",
-                actor_id.as_simple()
-            ));
+                info!("upserted {inserted} empty version ranges");
 
-            for range in empties
-                .iter()
-                .filter_map(|range| bookedr.cleared.get(range.start()))
-                .dedup()
-            {
-                inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
-            }
-
-            tx.commit()?;
-
-            info!("upserted {inserted} empty versions");
-
-            Ok::<_, eyre::Report>(())
-        })?;
+                Ok::<_, eyre::Report>(())
+            })?;
+        }
     }
 
     Ok(())
