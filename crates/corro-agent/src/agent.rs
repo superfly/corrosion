@@ -2384,9 +2384,8 @@ async fn handle_changes(
     loop {
         tokio::select! {
             Some((change, src)) = rx_changes.recv() => {
-                let changes_count = std::cmp::max(change.len(), 1);
-                counter!("corro.agent.changes.recv", changes_count as u64);
-                count += changes_count;
+                counter!("corro.agent.changes.recv", std::cmp::max(change.len(), 1) as u64); // count empties...
+                count += change.len(); // don't count empties
                 buf.push((change, src));
                 if count < MIN_CHANGES_CHUNK {
                     continue;

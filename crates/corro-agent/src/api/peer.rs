@@ -1,16 +1,13 @@
 use std::cmp;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use compact_str::format_compact;
-use corro_types::agent::{
-    Agent, CurrentVersion, KnownDbVersion, KnownVersion, PartialVersion, SplitPool,
-};
+use corro_types::agent::{Agent, KnownDbVersion, KnownVersion, PartialVersion, SplitPool};
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
@@ -20,7 +17,7 @@ use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
     SyncRequestV1, SyncStateV1,
 };
-use futures::stream::{self, BufferUnordered, FuturesUnordered};
+use futures::stream::FuturesUnordered;
 use futures::{Future, Stream, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use metrics::{counter, increment_counter};
@@ -28,10 +25,9 @@ use quinn::{RecvStream, SendStream};
 use rand::seq::SliceRandom;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{params, Connection};
-use seahash::SeaHasher;
 use speedy::Writable;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::{self, channel, unbounded_channel, Sender};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc::{self, unbounded_channel, Sender};
 use tokio::task::block_in_place;
 use tokio::time::timeout;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
