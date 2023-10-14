@@ -1580,7 +1580,7 @@ pub async fn parallel_sync(
                         break;
                     }
                     Err(e) => {
-                        error!("sync recv error: {e}");
+                        error!(%actor_id, "sync recv error: {e}");
                         break;
                     }
                     Ok(Some(msg)) => match msg {
@@ -1756,6 +1756,7 @@ pub async fn serve_sync(
                     }
                 }
             }
+
             if !stopped {
                 if !send_buf.is_empty() {
                     write_buf(&mut send_buf, &mut write).await?;
