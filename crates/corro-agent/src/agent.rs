@@ -1543,7 +1543,7 @@ fn store_empty_changeset(
     let deleted = tx.prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND start_version >= ? AND start_version <= ? AND end_version IS NULL")?.execute(params![actor_id, versions.start(), versions.end()])?;
 
     if deleted > 0 {
-        info!("deleted {deleted} still-live versions from database's bookkeeping");
+        debug!("deleted {deleted} still-live versions from database's bookkeeping");
     }
 
     // insert cleared versions
@@ -2592,6 +2592,9 @@ async fn process_completed_empties(
         empties.values().map(RangeInclusiveSet::len).sum::<usize>()
     );
 
+    let mut inserted = 0;
+
+    let start = Instant::now();
     while let Some((actor_id, empties)) = empties.pop_first() {
         let v = empties.into_iter().collect::<Vec<_>>();
 
@@ -2600,23 +2603,21 @@ async fn process_completed_empties(
             block_in_place(|| {
                 let tx = conn.transaction()?;
 
-                let start = Instant::now();
-                let mut inserted = 0;
                 for range in ranges {
                     inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
                 }
 
                 tx.commit()?;
 
-                info!(
-                    "upserted {inserted} empty version ranges in {:?}",
-                    start.elapsed()
-                );
-
                 Ok::<_, eyre::Report>(())
             })?;
         }
     }
+
+    info!(
+        "upserted {inserted} empty version ranges in {:?}",
+        start.elapsed()
+    );
 
     Ok(())
 }
