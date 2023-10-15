@@ -58,14 +58,14 @@ impl Members {
 
         trace!("member: {member:?}");
 
-        if actor.ts().to_time() < member.ts.to_time() {
+        if actor.ts().to_duration() < member.ts.to_duration() {
             debug!("older timestamp, ignoring");
             return (false, false);
         }
 
         // sometimes, this can be equal
-        let newer = actor.ts() > member.ts;
-        let same = actor.ts() == member.ts;
+        let newer = actor.ts().to_duration() > member.ts.to_duration();
+        let same = actor.ts().to_duration() == member.ts.to_duration();
 
         if newer {
             member.addr = actor.addr();
