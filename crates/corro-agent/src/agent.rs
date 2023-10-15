@@ -1290,7 +1290,7 @@ async fn handle_notifications(
         trace!("handle notification");
         match notification {
             Notification::MemberUp(actor) => {
-                let added = { agent.members().write().add_member(&actor) };
+                let (added, same) = { agent.members().write().add_member(&actor) };
                 trace!("Member Up {actor:?} (added: {added})");
                 if added {
                     debug!("Member Up {actor:?}");
@@ -1305,6 +1305,19 @@ async fn handle_notifications(
                     }
 
                     member_events.send(MemberEvent::Up(actor.clone())).ok();
+                } else if !same {
+                    // had a older timestamp!
+                    if let Err(e) = agent
+                        .tx_foca()
+                        .send(FocaInput::ApplyMany(vec![foca::Member::new(
+                            actor.clone(),
+                            foca::Incarnation::default(),
+                            foca::State::Down,
+                        )]))
+                        .await
+                    {
+                        warn!(?actor, "could not manually declare actor as down! {e}");
+                    }
                 }
                 increment_counter!("corro.swim.notification", "type" => "memberup");
             }
