@@ -344,43 +344,6 @@ const MIN_CHANGES_BYTES_PER_MESSAGE: usize = 1024;
 
 const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
 
-async fn process_range(
-    booked: &Booked,
-    pool: &SplitPool,
-    range: RangeInclusive<i64>,
-    actor_id: ActorId,
-    is_local: bool,
-    sender: &Sender<SyncMessage>,
-) -> eyre::Result<()> {
-    let (start, end) = (range.start(), range.end());
-    trace!("processing range {start}..={end} for {}", actor_id);
-
-    for version in range {
-        let known = {
-            booked
-                .read(format!("process_range[{version}]:{}", actor_id.as_simple()))
-                .await
-                .get(&version)
-                .map(KnownDbVersion::from)
-        };
-        if let Some(known_version) = known {
-            process_version(
-                pool,
-                actor_id,
-                is_local,
-                version,
-                known_version,
-                booked,
-                vec![],
-                sender,
-            )
-            .await?;
-        }
-    }
-
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn handle_known_version(
     conn: &mut Connection,

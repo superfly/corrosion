@@ -221,7 +221,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
                 let mut conn = pool.write_priority().await?;
                 let tx = conn.transaction()?;
-                clear_buffered_meta(&tx, actor_id, version)?;
+                clear_buffered_meta(&tx, actor_id, version..=version)?;
                 tx.commit()?;
                 continue;
             }
@@ -1067,54 +1067,27 @@ async fn clear_overwritten_versions(agent: Agent) {
                     .for_actor(actor_id)
             };
 
-            let mut conn = match pool.write_low().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    error!("could not acquire low priority write connection: {e}");
-                    continue;
-                }
-            };
-
             let mut bookedw = booked
                 .write(format!("clearing:{}", actor_id.as_simple()))
                 .await;
 
-            let res = block_in_place(|| {
-                let tx = conn.transaction()?;
-
-                let mut new_copy = bookedw.clone();
-
-                for (db_v, v) in to_clear
-                    .iter()
-                    .filter(|(_db_v, v)| bookedw.contains_current(v))
-                {
-                    deleted += tx
-                        .prepare_cached("DELETE FROM __corro_bookkeeping WHERE db_version = ?")?
-                        .execute([db_v])?;
-                    new_copy.insert(*v, KnownDbVersion::Cleared);
+            for (_db_v, v) in to_clear.iter() {
+                if bookedw.contains_current(v) {
+                    bookedw.insert(*v, KnownDbVersion::Cleared);
+                    deleted += 1;
                 }
+            }
 
-                for range in to_clear
-                    .iter()
-                    .filter_map(|(_, v)| new_copy.cleared.get(v))
-                    .dedup()
-                {
-                    inserted +=
-                        store_empty_changeset(&tx, actor_id, *range.start()..=*range.end())?;
+            for range in to_clear
+                .iter()
+                .filter_map(|(_, v)| bookedw.cleared.get(v))
+                .dedup()
+            {
+                if let Err(e) = agent.tx_empty().send((actor_id, range.clone())).await {
+                    error!("could not schedule version to be cleared: {e}");
+                } else {
+                    inserted += 1;
                 }
-
-                tx.commit()?;
-
-                debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
-
-                **bookedw = new_copy;
-                debug!("compacted in-memory cache by clearing db versions for actor {actor_id}");
-
-                Ok::<_, rusqlite::Error>(())
-            });
-
-            if let Err(e) = res {
-                error!(%actor_id, "could not compact bookkeeping: {e}");
             }
         }
 
@@ -1254,12 +1227,19 @@ fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>>
             .join(" UNION ")
     );
 
-    let cleared_db_version = tx
+    let start = Instant::now();
+    let cleared_db_versions: BTreeSet<i64> = tx
         .prepare_cached(&to_clear_query)?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
 
-    Ok(cleared_db_version)
+    info!(
+        "aggregated {} db versions to clear in {:?}",
+        cleared_db_versions.len(),
+        start.elapsed()
+    );
+
+    Ok(cleared_db_versions)
 }
 
 async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Bytes)>) {
@@ -1546,40 +1526,51 @@ fn store_empty_changeset(
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
 ) -> Result<usize, rusqlite::Error> {
+    // first, delete "current" versions, they're now gone!
+    let deleted = tx.prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND start_version >= ? AND start_version <= ? AND end_version IS NULL")?.execute(params![actor_id, versions.start(), versions.end()])?;
+
+    if deleted > 0 {
+        info!("deleted {deleted} still-live versions from database's bookkeeping");
+    }
+
+    // insert cleared versions
     let inserted = tx
         .prepare_cached(
             "
-        INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, last_seq, ts)
-            VALUES (?, ?, ?, NULL, NULL, NULL)
-            ON CONFLICT (actor_id, start_version) DO UPDATE SET
-                end_version = excluded.end_version,
-                db_version = NULL,
-                last_seq = NULL,
-                ts = NULL
-            WHERE end_version < excluded.end_version;
-    ",
+                INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, last_seq, ts)
+                    VALUES (?, ?, ?, NULL, NULL, NULL)
+                    ON CONFLICT (actor_id, start_version) DO UPDATE SET
+                        end_version = excluded.end_version,
+                        db_version = NULL,
+                        last_seq = NULL,
+                        ts = NULL
+                    WHERE end_version < excluded.end_version;
+            ",
         )?
         .execute(params![actor_id, versions.start(), versions.end()])?;
 
-    for version in versions {
-        clear_buffered_meta(tx, actor_id, version)?;
-    }
+    // remove any buffered data or seqs bookkeeping for these versions
+    clear_buffered_meta(tx, actor_id, versions)?;
 
     Ok(inserted)
 }
 
-fn clear_buffered_meta(tx: &Transaction, actor_id: ActorId, version: i64) -> rusqlite::Result<()> {
+fn clear_buffered_meta(
+    tx: &Transaction,
+    actor_id: ActorId,
+    versions: RangeInclusive<i64>,
+) -> rusqlite::Result<()> {
     // remove all buffered changes for cleanup purposes
     let count = tx
-        .prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?
-        .execute(params![actor_id, version])?;
-    debug!(%actor_id, version, "deleted {count} buffered changes");
+        .prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ?")?
+        .execute(params![actor_id, versions.start(), versions.end()])?;
+    debug!(%actor_id, ?versions, "deleted {count} buffered changes");
 
     // delete all bookkept sequences for this version
     let count = tx
-        .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?
-        .execute(params![actor_id, version])?;
-    debug!(%actor_id, version, "deleted {count} sequences in bookkeeping");
+        .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?")?
+        .execute(params![actor_id, versions.start(), versions.end()])?;
+    debug!(%actor_id, ?versions, "deleted {count} sequences in bookkeeping");
 
     Ok(())
 }
@@ -1656,7 +1647,7 @@ async fn process_fully_buffered_changes(
             info!(%actor_id, version, "no buffered rows, skipped insertion into crsql_changes");
         }
 
-        clear_buffered_meta(&tx, actor_id, version)?;
+        clear_buffered_meta(&tx, actor_id, version..=version)?;
 
         let rows_impacted: i64 = tx
             .prepare_cached("SELECT crsql_rows_impacted()")?
@@ -2163,7 +2154,7 @@ fn process_complete_version(
     };
 
     // in case we got both buffered data and a complete set of changes
-    clear_buffered_meta(tx, actor_id, version)?;
+    clear_buffered_meta(tx, actor_id, version..=version)?;
 
     for (table_name, count) in changes_per_table {
         counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
@@ -2372,7 +2363,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
     Ok(())
 }
 
-const MIN_CHANGES_CHUNK: usize = 500;
+const MIN_CHANGES_CHUNK: usize = 1000;
 
 async fn handle_changes(
     agent: Agent,
@@ -2596,6 +2587,7 @@ async fn process_completed_empties(
             block_in_place(|| {
                 let tx = conn.transaction()?;
 
+                let start = Instant::now();
                 let mut inserted = 0;
                 for range in ranges {
                     inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
@@ -2603,7 +2595,10 @@ async fn process_completed_empties(
 
                 tx.commit()?;
 
-                info!("upserted {inserted} empty version ranges");
+                info!(
+                    "upserted {inserted} empty version ranges in {:?}",
+                    start.elapsed()
+                );
 
                 Ok::<_, eyre::Report>(())
             })?;
