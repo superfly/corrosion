@@ -75,7 +75,7 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
 use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, info_span, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 use trust_dns_resolver::{
     error::ResolveErrorKind,
@@ -989,6 +989,9 @@ async fn clear_overwritten_versions(agent: Agent) {
         info!("starting compaction...");
         let start = Instant::now();
 
+        let span = info_span!("compact_overwritten_versions");
+        let _guard = span.enter();
+
         let mut to_check: BTreeMap<i64, (ActorId, i64)> = BTreeMap::new();
 
         {
@@ -1059,6 +1062,9 @@ async fn clear_overwritten_versions(agent: Agent) {
         let mut inserted = 0;
 
         for (actor_id, to_clear) in to_clear_by_actor {
+            let span = info_span!("clear_overwritten_for_actor", %actor_id);
+            let _guard = span.enter();
+
             info!(%actor_id, "clearing actor {} versions", to_clear.len());
             let booked = {
                 bookie
@@ -1165,6 +1171,7 @@ fn collect_metrics(agent: &Agent, transport: &Transport) {
     }
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn handle_change(
     bcast: BroadcastV1,
     self_actor_id: ActorId,
@@ -1205,6 +1212,7 @@ pub async fn handle_change(
     }
 }
 
+#[tracing::instrument(skip_all)]
 fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>> {
     let tables = tx
         .prepare_cached(
@@ -1979,6 +1987,7 @@ pub async fn process_multiple_changes(
     Ok(())
 }
 
+#[tracing::instrument(skip(tx, parts))]
 fn process_incomplete_version(
     tx: &Transaction,
     actor_id: ActorId,
@@ -2069,6 +2078,7 @@ fn process_incomplete_version(
     })
 }
 
+#[tracing::instrument(skip(tx, last_db_version, parts))]
 fn process_complete_version(
     tx: &Transaction,
     actor_id: ActorId,
@@ -2177,6 +2187,7 @@ fn process_complete_version(
     Ok::<_, rusqlite::Error>((known_version, new_changeset))
 }
 
+#[tracing::instrument(skip(tx, last_db_version, change))]
 fn process_single_version(
     tx: &Transaction,
     last_db_version: Option<i64>,
@@ -2302,6 +2313,7 @@ pub enum SyncRecvError {
     RequestsChannelClosed,
 }
 
+#[tracing::instrument(skip_all)]
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
     let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
 

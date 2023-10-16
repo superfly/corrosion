@@ -34,7 +34,7 @@ use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_stream::StreamExt as TokioStreamExt;
 // use tokio_stream::StreamExt as TokioStreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn, Instrument, info_span};
 
 use crate::agent::SyncRecvError;
 use crate::api::public::ChunkedChanges;
@@ -654,6 +654,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     Ok(())
 }
 
+#[tracing::instrument(skip_all)]
 async fn process_sync(
     local_actor_id: ActorId,
     pool: SplitPool,
@@ -832,6 +833,7 @@ fn chunk_range(
         })
 }
 
+#[tracing::instrument(skip_all)]
 fn encode_sync_msg(
     codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
@@ -859,6 +861,7 @@ async fn encode_write_bipayload_msg(
     write_buf(send_buf, write).await
 }
 
+#[tracing::instrument(skip_all)]
 fn encode_bipayload_msg(
     codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
@@ -884,6 +887,7 @@ async fn encode_write_sync_msg(
     write_buf(send_buf, write).await
 }
 
+#[tracing::instrument(skip_all, fields(buf_size = send_buf.len()))]
 async fn write_buf(send_buf: &mut BytesMut, write: &mut SendStream) -> Result<(), SyncSendError> {
     let len = send_buf.len();
     write.write_chunk(send_buf.split().freeze()).await?;
@@ -892,6 +896,7 @@ async fn write_buf(send_buf: &mut BytesMut, write: &mut SendStream) -> Result<()
     Ok(())
 }
 
+#[tracing::instrument(skip(read))]
 pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
     read: &mut R,
 ) -> Result<Option<SyncMessage>, SyncRecvError> {
@@ -910,6 +915,7 @@ pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
     }
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn parallel_sync(
     agent: &Agent,
     transport: &Transport,
@@ -1092,6 +1098,9 @@ pub async fn parallel_sync(
 
         let start = Instant::now();
 
+        let span = info_span!("send_sync_requests");
+        let _guard = span.enter();
+
         loop {
             if servers.is_empty() {
                 break;
@@ -1193,13 +1202,16 @@ pub async fn parallel_sync(
             }
             servers = next_servers;
         }
-    });
+    }.in_current_span());
 
     // now handle receiving changesets!
 
     let counts = FuturesUnordered::from_iter(readers.into_iter().map(|(actor_id, mut read)| {
         let tx_changes = agent.tx_changes().clone();
         async move {
+            let span = info_span!("read_sync_messages", %actor_id);
+            let _guard = span.enter();
+            
             let mut count = 0;
 
             loop {
@@ -1247,7 +1259,7 @@ pub async fn parallel_sync(
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "done reading sync messages");
 
             Ok(count)
-        }
+        }.in_current_span()
     }))
     .collect::<Vec<Result<usize, SyncError>>>()
     .await;
@@ -1261,6 +1273,7 @@ pub async fn parallel_sync(
     Ok(counts.into_iter().flatten().sum::<usize>())
 }
 
+#[tracing::instrument(skip(agent, their_actor_id, read, write), fields(actor_id = %their_actor_id))]
 pub async fn serve_sync(
     agent: &Agent,
     their_actor_id: ActorId,
@@ -1332,12 +1345,15 @@ pub async fn serve_sync(
             agent.bookie().clone(),
             tx,
             rx_need,
-        )
+        ).in_current_span()
         .inspect_err(|e| error!("could not process sync request: {e}")),
     );
 
     let (send_res, recv_res) = tokio::join!(
         async move {
+            let span = info_span!("process_versions_to_send");
+            let _guard = span.enter();
+
             let mut count = 0;
 
             let mut check_buf = tokio::time::interval(Duration::from_secs(1));
@@ -1400,8 +1416,11 @@ pub async fn serve_sync(
             counter!("corro.sync.changes.sent", count as u64, "actor_id" => their_actor_id.to_string());
 
             Ok::<_, SyncError>(count)
-        },
+        }.in_current_span(),
         async move {
+            let span = info_span!("process_version_requests");
+            let _guard = span.enter();
+
             let mut count = 0;
 
             loop {
@@ -1455,7 +1474,7 @@ pub async fn serve_sync(
             counter!("corro.sync.requests.recv", count as u64, "actor_id" => their_actor_id.to_string());
 
             Ok(count)
-        }
+        }.in_current_span()
     );
 
     if let Err(e) = send_res {

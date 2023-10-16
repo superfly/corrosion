@@ -46,6 +46,7 @@ impl Transport {
         }))
     }
 
+    #[tracing::instrument(skip(self, data))]
     pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
         debug!("connected to {addr}");
@@ -68,6 +69,7 @@ impl Transport {
         Ok(conn.send_datagram(data)?)
     }
 
+    #[tracing::instrument(skip(self, data))]
     pub async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
 
@@ -90,6 +92,7 @@ impl Transport {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn open_bi(
         &self,
         addr: SocketAddr,
@@ -110,6 +113,7 @@ impl Transport {
         Ok(conn.open_bi().await?)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
         let server_name = addr.ip().to_string();
 
@@ -486,6 +490,7 @@ impl Transport {
 
 const NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0);
 
+#[tracing::instrument(skip(conn))]
 fn test_conn(conn: &Connection) -> bool {
     match conn.close_reason() {
         None => true,
