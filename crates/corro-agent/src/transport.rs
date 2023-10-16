@@ -12,8 +12,8 @@ use quinn::{
     SendStream, WriteError,
 };
 use quinn_proto::ConnectionStats;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, warn};
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tracing::{debug, info_span, warn};
 
 #[derive(Debug, Clone)]
 pub struct Transport(Arc<TransportInner>);
@@ -21,7 +21,7 @@ pub struct Transport(Arc<TransportInner>);
 #[derive(Debug)]
 struct TransportInner {
     endpoint: Endpoint,
-    conns: RwLock<HashMap<SocketAddr, Connection>>,
+    conns: RwLock<HashMap<SocketAddr, Arc<Mutex<Option<Connection>>>>>,
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
 }
 
@@ -46,7 +46,7 @@ impl Transport {
         }))
     }
 
-    #[tracing::instrument(skip(self, data))]
+    #[tracing::instrument(skip(self, data), fields(buf_size = data.len()))]
     pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
         debug!("connected to {addr}");
@@ -69,7 +69,7 @@ impl Transport {
         Ok(conn.send_datagram(data)?)
     }
 
-    #[tracing::instrument(skip(self, data))]
+    #[tracing::instrument(skip(self, data), fields(buf_size = data.len()))]
     pub async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
 
@@ -113,52 +113,64 @@ impl Transport {
         Ok(conn.open_bi().await?)
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
-        let server_name = addr.ip().to_string();
+    async fn measured_connect(
+        &self,
+        addr: SocketAddr,
+        server_name: String,
+    ) -> Result<Connection, TransportError> {
+        let start = Instant::now();
 
+        let span = info_span!("quic_connect", %addr);
+        let _guard = span.enter();
+        match self.0.endpoint.connect(addr, &server_name)?.await {
+            Ok(conn) => {
+                histogram!(
+                    "corro.transport.connect.time.seconds",
+                    start.elapsed().as_secs_f64()
+                );
+                span.record("rtt", conn.rtt().as_secs_f64());
+                Ok(conn)
+            }
+            Err(e) => {
+                increment_counter!("corro.transport.connect.errors", "addr" => server_name, "error" => e.to_string());
+                Err(e.into())
+            }
+        }
+    }
+
+    // this shouldn't block for long...
+    async fn get_lock(&self, addr: SocketAddr) -> Arc<Mutex<Option<Connection>>> {
         {
             let r = self.0.conns.read().await;
-            if let Some(conn) = r.get(&addr).cloned() {
-                if test_conn(&conn) {
-                    if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
-                        debug!("could not send RTT for connection through sender: {e}");
-                    }
-                    return Ok(conn);
-                }
+            if let Some(lock) = r.get(&addr) {
+                return lock.clone();
             }
         }
 
-        let conn = {
-            let mut w = self.0.conns.write().await;
-            if let Some(conn) = w.get(&addr).cloned() {
-                if test_conn(&conn) {
-                    return Ok(conn);
+        let mut w = self.0.conns.write().await;
+        w.entry(addr).or_default().clone()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
+        let conn_lock = self.get_lock(addr).await;
+
+        let mut lock = conn_lock.lock().await;
+
+        if let Some(conn) = lock.as_ref() {
+            if test_conn(conn) {
+                if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
+                    debug!("could not send RTT for connection through sender: {e}");
                 }
+                return Ok(conn.clone());
             }
+        }
 
-            let start = Instant::now();
-            let conn = match self.0.endpoint.connect(addr, server_name.as_str())?.await {
-                Ok(conn) => {
-                    histogram!(
-                        "corro.transport.connect.time.seconds",
-                        start.elapsed().as_secs_f64()
-                    );
-                    conn
-                }
-                Err(e) => {
-                    increment_counter!("corro.transport.connect.errors", "addr" => server_name, "error" => e.to_string());
-                    return Err(e.into());
-                }
-            };
+        // clear it, if there was one it didn't pass the test.
+        *lock = None;
 
-            if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
-                debug!("could not send RTT for connection through sender: {e}");
-            }
-            w.insert(addr, conn.clone());
-            conn
-        };
-
+        let conn = self.measured_connect(addr, addr.ip().to_string()).await?;
+        lock.replace(conn.clone());
         Ok(conn)
     }
 
@@ -171,7 +183,10 @@ impl Transport {
         let stats = read
             .iter()
             .fold(ConnectionStats::default(), |mut acc, (addr, conn)| {
-                let stats = conn.stats();
+                let stats = match conn.blocking_lock().as_ref() {
+                    Some(conn) => conn.stats(),
+                    None => return acc,
+                };
 
                 gauge!("corro.transport.path.cwnd", stats.path.cwnd as f64, "addr" => addr.to_string());
                 gauge!("corro.transport.path.congestion_events", stats.path.congestion_events as f64, "addr" => addr.to_string());
@@ -490,7 +505,6 @@ impl Transport {
 
 const NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0);
 
-#[tracing::instrument(skip(conn))]
 fn test_conn(conn: &Connection) -> bool {
     match conn.close_reason() {
         None => true,

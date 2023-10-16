@@ -1171,7 +1171,6 @@ fn collect_metrics(agent: &Agent, transport: &Transport) {
     }
 }
 
-#[tracing::instrument(skip_all)]
 pub async fn handle_change(
     bcast: BroadcastV1,
     self_actor_id: ActorId,
