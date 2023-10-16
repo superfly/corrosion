@@ -38,6 +38,7 @@ metrics-exporter-prometheus = "0.12.0"
 once_cell = "1.17.1"
 opentelemetry = { version = "0.20.0", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.13.0" }
+opentelemetry-semantic-conventions = { version = "0.12.0" }
 parking_lot = { version = "0.12.1" }
 pin-project-lite = "0.2.9"
 quinn = "0.10.2"

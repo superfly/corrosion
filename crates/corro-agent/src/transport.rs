@@ -174,7 +174,6 @@ impl Transport {
         Ok(conn)
     }
 
-    #[tracing::instrument(skip_all)]
     pub fn emit_metrics(&self) {
         let conns = {
             let read = self.0.conns.blocking_read();

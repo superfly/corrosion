@@ -2595,6 +2595,7 @@ async fn sync_loop(
     }
 }
 
+#[tracing::instrument(skip_all)]
 async fn process_completed_empties(
     agent: &Agent,
     empties: &mut BTreeMap<ActorId, RangeInclusiveSet<i64>>,

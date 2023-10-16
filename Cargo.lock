@@ -915,6 +915,7 @@ dependencies = [
  "once_cell",
  "opentelemetry",
  "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions",
  "rusqlite",
  "seahash",
  "serde",

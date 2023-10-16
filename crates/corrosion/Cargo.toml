@@ -28,6 +28,7 @@ notify-debouncer-mini = { version = "0.3.0", default-features = false }
 once_cell = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
 rusqlite = { workspace = true }
 seahash = { workspace = true }
 serde = { workspace = true }

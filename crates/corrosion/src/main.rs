@@ -78,8 +78,18 @@ fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
             let batch_config = BatchConfig::default().with_max_queue_size(10240);
 
             let trace_config = trace::config().with_resource(Resource::new([
-                KeyValue::new("service.name", "corrosion"),
-                KeyValue::new("service.version", VERSION),
+                KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::SERVICE_NAME,
+                    "corrosion",
+                ),
+                KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
+                    VERSION,
+                ),
+                KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::HOST_NAME,
+                    hostname::get().unwrap().to_string_lossy().into_owned(),
+                ),
             ]));
 
             let tracer = opentelemetry_otlp::new_pipeline()

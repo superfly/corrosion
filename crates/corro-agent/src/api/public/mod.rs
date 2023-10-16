@@ -306,6 +306,7 @@ where
     })
 }
 
+#[tracing::instrument(skip_all)]
 fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
     let mut prepped = match &stmt {
         Statement::Simple(q) => tx.prepare(q),
@@ -326,6 +327,7 @@ fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usi
     }
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn api_v1_transactions(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Extension(agent): Extension<Agent>,
