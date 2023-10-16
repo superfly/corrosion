@@ -69,9 +69,9 @@ fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
         let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
 
         if let Some(otel) = &config.telemetry.open_telemetry {
-            let otlp_exporter = opentelemetry_otlp::new_exporter().tonic();
+            let otlp_exporter = opentelemetry_otlp::new_exporter().tonic().with_env();
             let otlp_exporter = match otel {
-                OtelConfig::FromEnv => otlp_exporter.with_env(),
+                OtelConfig::FromEnv => otlp_exporter,
                 OtelConfig::Exporter { endpoint } => otlp_exporter.with_endpoint(endpoint),
             };
 
