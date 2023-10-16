@@ -97,8 +97,12 @@ fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
                         .init();
                 }
                 LogFormat::Json => {
-                    sub.with(tracing_subscriber::fmt::Layer::new().json())
-                        .init();
+                    sub.with(
+                        tracing_subscriber::fmt::Layer::new()
+                            .json()
+                            .with_span_list(false),
+                    )
+                    .init();
                 }
             }
         } else {
@@ -108,8 +112,12 @@ fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
                         .init();
                 }
                 LogFormat::Json => {
-                    sub.with(tracing_subscriber::fmt::Layer::new().json())
-                        .init();
+                    sub.with(
+                        tracing_subscriber::fmt::Layer::new()
+                            .json()
+                            .with_span_list(false),
+                    )
+                    .init();
                 }
             }
         }
