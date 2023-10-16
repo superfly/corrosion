@@ -182,7 +182,7 @@ impl Transport {
                 .filter_map(|(addr, conn)| {
                     conn.blocking_lock()
                         .as_ref()
-                        .map(|conn| (*addr, conn.clone()))
+                        .map(|conn| (*addr, conn.stats()))
                 })
                 .collect::<Vec<_>>()
         };
@@ -192,9 +192,7 @@ impl Transport {
         // make aggregate stats for all connections... so as to not overload a metrics server
         let stats = conns
             .iter()
-            .fold(ConnectionStats::default(), |mut acc, (addr, conn)| {
-                let stats = conn.stats();
-
+            .fold(ConnectionStats::default(), |mut acc, (addr, stats)| {
                 gauge!("corro.transport.path.cwnd", stats.path.cwnd as f64, "addr" => addr.to_string());
                 gauge!("corro.transport.path.congestion_events", stats.path.congestion_events as f64, "addr" => addr.to_string());
                 gauge!("corro.transport.path.black_holes_detected", stats.path.black_holes_detected as f64, "addr" => addr.to_string());
