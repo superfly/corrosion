@@ -170,23 +170,30 @@ impl Transport {
         *lock = None;
 
         let conn = self.measured_connect(addr, addr.ip().to_string()).await?;
-        lock.replace(conn.clone());
+        *lock = Some(conn.clone());
         Ok(conn)
     }
 
+    #[tracing::instrument(skip_all)]
     pub fn emit_metrics(&self) {
-        let read = self.0.conns.blocking_read();
+        let conns = {
+            let read = self.0.conns.blocking_read();
+            read.iter()
+                .filter_map(|(addr, conn)| {
+                    conn.blocking_lock()
+                        .as_ref()
+                        .map(|conn| (*addr, conn.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
 
-        gauge!("corro.transport.connections", read.len() as f64);
+        gauge!("corro.transport.connections", conns.len() as f64);
 
         // make aggregate stats for all connections... so as to not overload a metrics server
-        let stats = read
+        let stats = conns
             .iter()
             .fold(ConnectionStats::default(), |mut acc, (addr, conn)| {
-                let stats = match conn.blocking_lock().as_ref() {
-                    Some(conn) => conn.stats(),
-                    None => return acc,
-                };
+                let stats = conn.stats();
 
                 gauge!("corro.transport.path.cwnd", stats.path.cwnd as f64, "addr" => addr.to_string());
                 gauge!("corro.transport.path.congestion_events", stats.path.congestion_events as f64, "addr" => addr.to_string());
