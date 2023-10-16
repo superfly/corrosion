@@ -46,7 +46,7 @@ impl Transport {
         }))
     }
 
-    #[tracing::instrument(skip(self, data), fields(buf_size = data.len()))]
+    #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug")]
     pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
         debug!("connected to {addr}");
