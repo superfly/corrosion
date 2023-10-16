@@ -352,17 +352,17 @@ impl SplitPool {
     }
 
     // get a read-only connection
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self), level = "debug")]
     pub async fn read(&self) -> Result<sqlite_pool::Connection<CrConn>, SqlitePoolError> {
         self.0.read.get().await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self), level = "debug")]
     pub fn read_blocking(&self) -> Result<sqlite_pool::Connection<CrConn>, SqlitePoolError> {
         Handle::current().block_on(self.0.read.get())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self), level = "debug")]
     pub async fn dedicated(&self) -> rusqlite::Result<Connection> {
         block_in_place(|| {
             let mut conn = rusqlite::Connection::open(&self.0.path)?;
@@ -510,7 +510,7 @@ impl<T> CountedTokioRwLock<T> {
         }
     }
 
-    #[tracing::instrument(skip(self, label))]
+    #[tracing::instrument(skip(self, label), level = "debug")]
     pub async fn write<C: Into<CompactString>>(
         &self,
         label: C,
@@ -518,7 +518,7 @@ impl<T> CountedTokioRwLock<T> {
         self.registry.acquire_write(label, &self.lock).await
     }
 
-    #[tracing::instrument(skip(self, label))]
+    #[tracing::instrument(skip(self, label), level = "debug")]
     pub fn blocking_write<C: Into<CompactString>>(
         &self,
         label: C,
@@ -526,7 +526,7 @@ impl<T> CountedTokioRwLock<T> {
         self.registry.acquire_blocking_write(label, &self.lock)
     }
 
-    #[tracing::instrument(skip(self, label))]
+    #[tracing::instrument(skip(self, label), level = "debug")]
     pub fn blocking_write_owned<C: Into<CompactString>>(
         &self,
         label: C,
@@ -535,7 +535,7 @@ impl<T> CountedTokioRwLock<T> {
             .acquire_blocking_write_owned(label, self.lock.clone())
     }
 
-    #[tracing::instrument(skip(self, label))]
+    #[tracing::instrument(skip(self, label), level = "debug")]
     pub fn blocking_read<C: Into<CompactString>>(
         &self,
         label: C,
@@ -543,7 +543,7 @@ impl<T> CountedTokioRwLock<T> {
         self.registry.acquire_blocking_read(label, &self.lock)
     }
 
-    #[tracing::instrument(skip(self, label))]
+    #[tracing::instrument(skip(self, label), level = "debug")]
     pub async fn read<C: Into<CompactString>>(
         &self,
         label: C,
