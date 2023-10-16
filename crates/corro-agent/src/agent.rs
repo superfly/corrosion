@@ -1736,6 +1736,7 @@ async fn process_fully_buffered_changes(
     Ok(inserted)
 }
 
+#[tracing::instrument(skip(agent, changes))]
 pub async fn process_multiple_changes(
     agent: &Agent,
     changes: Vec<(ChangeV1, ChangeSource)>,

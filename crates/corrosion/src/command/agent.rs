@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use camino::Utf8PathBuf;
 use corro_admin::AdminConfig;
-use corro_types::config::{Config, TelemetryConfig};
+use corro_types::config::{Config, PrometheusConfig};
 use metrics::gauge;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use spawn::wait_for_all_pending_handles;
@@ -14,7 +14,7 @@ use crate::VERSION;
 pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> {
     info!("Starting Corrosion Agent v{VERSION}");
 
-    if let Some(TelemetryConfig::Prometheus { bind_addr }) = config.telemetry {
+    if let Some(PrometheusConfig { bind_addr }) = config.telemetry.prometheus {
         setup_prometheus(bind_addr).expect("could not setup prometheus");
         let info = crate::version();
         gauge!("corro.build.info", 1.0, "version" => info.crate_info.version.to_string(), "ts" => info.timestamp.to_string(), "rustc_version" => info.compiler.version.to_string());

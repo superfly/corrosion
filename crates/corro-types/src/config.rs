@@ -16,7 +16,7 @@ pub struct Config {
     pub admin: AdminConfig,
 
     #[serde(default)]
-    pub telemetry: Option<TelemetryConfig>,
+    pub telemetry: TelemetryConfig,
 
     #[serde(default)]
     pub log: LogConfig,
@@ -24,13 +24,24 @@ pub struct Config {
     pub consul: Option<ConsulConfig>,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TelemetryConfig {
+    pub prometheus: Option<PrometheusConfig>,
+    pub open_telemetry: Option<OtelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrometheusConfig {
+    #[serde(alias = "addr")]
+    pub bind_addr: SocketAddr,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum TelemetryConfig {
-    Prometheus {
-        #[serde(alias = "addr")]
-        bind_addr: SocketAddr,
-    },
+pub enum OtelConfig {
+    FromEnv,
+    Exporter { endpoint: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,7 +189,7 @@ pub struct ConfigBuilder {
     gossip_addr: Option<SocketAddr>,
     api_addr: Option<SocketAddr>,
     admin_path: Option<Utf8PathBuf>,
-    metrics_addr: Option<SocketAddr>,
+    prometheus_addr: Option<SocketAddr>,
     bootstrap: Option<Vec<String>>,
     log: Option<LogConfig>,
     schema_paths: Vec<Utf8PathBuf>,
@@ -203,8 +214,8 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn metrics_addr(mut self, addr: SocketAddr) -> Self {
-        self.metrics_addr = Some(addr);
+    pub fn prometheus_addr(mut self, addr: SocketAddr) -> Self {
+        self.prometheus_addr = Some(addr);
         self
     }
 
@@ -245,6 +256,14 @@ impl ConfigBuilder {
 
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
+
+        let telemetry = TelemetryConfig {
+            prometheus: self
+                .prometheus_addr
+                .map(|bind_addr| PrometheusConfig { bind_addr }),
+            open_telemetry: None,
+        };
+
         Ok(Config {
             db: DbConfig {
                 path: db_path,
@@ -269,9 +288,7 @@ impl ConfigBuilder {
             admin: AdminConfig {
                 uds_path: self.admin_path.unwrap_or_else(default_admin_path),
             },
-            telemetry: self
-                .metrics_addr
-                .map(|bind_addr| TelemetryConfig::Prometheus { bind_addr }),
+            telemetry,
             log: self.log.unwrap_or_default(),
 
             consul: self.consul,
