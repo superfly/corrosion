@@ -75,7 +75,7 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
 use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, info_span, trace, warn};
+use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 use trust_dns_resolver::{
     error::ResolveErrorKind,
@@ -2425,7 +2425,10 @@ async fn handle_changes(
         }
 
         // drain and process current changes!
-        if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect()).await {
+        if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect())
+            .instrument(info_span!("handle_changes"))
+            .await
+        {
             error!("could not process multiple changes: {e}");
         }
 
@@ -2434,6 +2437,9 @@ async fn handle_changes(
     }
 
     info!("draining changes receiver...");
+
+    let span = info_span!("drain_handle_changes");
+    let _guard = span.enter();
 
     // drain!
     while let Ok((change, src)) = rx_changes.try_recv() {
