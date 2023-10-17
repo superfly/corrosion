@@ -7,13 +7,14 @@ use std::{
 
 use bytes::Bytes;
 use metrics::{gauge, histogram, increment_counter};
+use parking_lot::RwLock;
 use quinn::{
     ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
     SendStream, WriteError,
 };
 use quinn_proto::ConnectionStats;
-use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{debug, info_span, warn};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, info_span, warn, Instrument};
 
 #[derive(Debug, Clone)]
 pub struct Transport(Arc<TransportInner>);
@@ -120,40 +121,45 @@ impl Transport {
     ) -> Result<Connection, TransportError> {
         let start = Instant::now();
 
-        let span = info_span!("quic_connect", %addr);
-        let _guard = span.enter();
-        match self.0.endpoint.connect(addr, &server_name)?.await {
-            Ok(conn) => {
-                histogram!(
-                    "corro.transport.connect.time.seconds",
-                    start.elapsed().as_secs_f64()
-                );
-                span.record("rtt", conn.rtt().as_secs_f64());
-                Ok(conn)
+        async {
+            match self
+                .0
+                .endpoint
+                .connect(addr, &server_name)?
+                .await
+            {
+                Ok(conn) => {
+                    histogram!(
+                        "corro.transport.connect.time.seconds",
+                        start.elapsed().as_secs_f64()
+                    );
+                    tracing::Span::current().record("rtt", conn.rtt().as_secs_f64());
+                    Ok(conn)
+                }
+                Err(e) => {
+                    increment_counter!("corro.transport.connect.errors", "addr" => server_name, "error" => e.to_string());
+                    Err(e.into())
+                }
             }
-            Err(e) => {
-                increment_counter!("corro.transport.connect.errors", "addr" => server_name, "error" => e.to_string());
-                Err(e.into())
-            }
-        }
+        }.instrument(info_span!("quic_connect", %addr, rtt = tracing::field::Empty)).await
     }
 
     // this shouldn't block for long...
-    async fn get_lock(&self, addr: SocketAddr) -> Arc<Mutex<Option<Connection>>> {
+    fn get_lock(&self, addr: SocketAddr) -> Arc<Mutex<Option<Connection>>> {
         {
-            let r = self.0.conns.read().await;
+            let r = self.0.conns.read();
             if let Some(lock) = r.get(&addr) {
                 return lock.clone();
             }
         }
 
-        let mut w = self.0.conns.write().await;
+        let mut w = self.0.conns.write();
         w.entry(addr).or_default().clone()
     }
 
     #[tracing::instrument(skip(self))]
     async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
-        let conn_lock = self.get_lock(addr).await;
+        let conn_lock = self.get_lock(addr);
 
         let mut lock = conn_lock.lock().await;
 
@@ -176,7 +182,7 @@ impl Transport {
 
     pub fn emit_metrics(&self) {
         let conns = {
-            let read = self.0.conns.blocking_read();
+            let read = self.0.conns.read();
             read.iter()
                 .filter_map(|(addr, conn)| {
                     conn.blocking_lock()

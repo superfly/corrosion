@@ -75,7 +75,7 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
 use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, info_span, trace, warn, Instrument};
+use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 use trust_dns_resolver::{
     error::ResolveErrorKind,
@@ -989,9 +989,6 @@ async fn clear_overwritten_versions(agent: Agent) {
         info!("starting compaction...");
         let start = Instant::now();
 
-        let span = info_span!("compact_overwritten_versions");
-        let _guard = span.enter();
-
         let mut to_check: BTreeMap<i64, (ActorId, i64)> = BTreeMap::new();
 
         {
@@ -1062,9 +1059,6 @@ async fn clear_overwritten_versions(agent: Agent) {
         let mut inserted = 0;
 
         for (actor_id, to_clear) in to_clear_by_actor {
-            let span = info_span!("clear_overwritten_for_actor", %actor_id);
-            let _guard = span.enter();
-
             info!(%actor_id, "clearing actor {} versions", to_clear.len());
             let booked = {
                 bookie
@@ -2312,6 +2306,7 @@ pub enum SyncRecvError {
     RequestsChannelClosed,
 }
 
+#[tracing::instrument(skip_all, level = "debug")]
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
     let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
 
@@ -2424,10 +2419,7 @@ async fn handle_changes(
         }
 
         // drain and process current changes!
-        if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect())
-            .instrument(info_span!("handle_changes"))
-            .await
-        {
+        if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect()).await {
             error!("could not process multiple changes: {e}");
         }
 
@@ -2436,9 +2428,6 @@ async fn handle_changes(
     }
 
     info!("draining changes receiver...");
-
-    let span = info_span!("drain_handle_changes");
-    let _guard = span.enter();
 
     // drain!
     while let Ok((change, src)) = rx_changes.try_recv() {
