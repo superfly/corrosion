@@ -832,7 +832,6 @@ fn chunk_range(
         })
 }
 
-#[tracing::instrument(skip_all)]
 fn encode_sync_msg(
     codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
@@ -860,7 +859,6 @@ async fn encode_write_bipayload_msg(
     write_buf(send_buf, write).await
 }
 
-#[tracing::instrument(skip_all)]
 fn encode_bipayload_msg(
     codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
@@ -886,7 +884,7 @@ async fn encode_write_sync_msg(
     write_buf(send_buf, write).await
 }
 
-#[tracing::instrument(skip_all, fields(buf_size = send_buf.len()))]
+#[tracing::instrument(skip_all, fields(buf_size = send_buf.len()), err)]
 async fn write_buf(send_buf: &mut BytesMut, write: &mut SendStream) -> Result<(), SyncSendError> {
     let len = send_buf.len();
     write.write_chunk(send_buf.split().freeze()).await?;
@@ -895,7 +893,7 @@ async fn write_buf(send_buf: &mut BytesMut, write: &mut SendStream) -> Result<()
     Ok(())
 }
 
-#[tracing::instrument(skip(read))]
+#[tracing::instrument(skip(read), fields(buf_size = tracing::field::Empty), err)]
 pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
     read: &mut R,
 ) -> Result<Option<SyncMessage>, SyncRecvError> {
@@ -903,6 +901,7 @@ pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
         Some(buf_res) => match buf_res {
             Ok(mut buf) => {
                 counter!("corro.sync.chunk.recv.bytes", buf.len() as u64);
+                tracing::Span::current().record("buf_size", buf.len());
                 match SyncMessage::from_buf(&mut buf) {
                     Ok(msg) => Ok(Some(msg)),
                     Err(e) => Err(SyncRecvError::from(e)),
@@ -914,7 +913,7 @@ pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
     }
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip_all, err)]
 pub async fn parallel_sync(
     agent: &Agent,
     transport: &Transport,
@@ -1187,7 +1186,7 @@ pub async fn parallel_sync(
                 }
 
                 if needs.is_empty() {
-                    if let Err(e) = tx.finish().await {
+                    if let Err(e) = tx.finish().instrument(info_span!("quic_finish")).await {
                         warn!("could not finish stream while sending sync requests: {e}");
                     }
                     info!(%server_actor_id, %addr, "done trying to sync w/ actor after {:?}", start.elapsed());
@@ -1208,6 +1207,8 @@ pub async fn parallel_sync(
             let mut count = 0;
 
             loop {
+                let span = info_span!("read_sync_loop_iteration", changes_len = tracing::field::Empty);
+                let _guard = span.enter();
                 match read_sync_msg(&mut read).await {
                     Ok(None) => {
                         break;
@@ -1219,6 +1220,7 @@ pub async fn parallel_sync(
                     Ok(Some(msg)) => match msg {
                         SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
                             let changes_len = cmp::max(change.len(), 1);
+                            tracing::Span::current().record("changes_len", changes_len);
                             count += changes_len;
                             counter!("corro.sync.changes.recv", changes_len as u64, "actor_id" => actor_id.to_string());
                             tx_changes
@@ -1249,7 +1251,7 @@ pub async fn parallel_sync(
                 }
             }
 
-            debug!(%actor_id, self_actor_id = %agent.actor_id(), "done reading sync messages");
+            info!(%actor_id, %count, "done reading sync messages");
 
             Ok(count)
         }.instrument(info_span!("read_sync_requests_responses", %actor_id))
@@ -1266,7 +1268,7 @@ pub async fn parallel_sync(
     Ok(counts.into_iter().flatten().sum::<usize>())
 }
 
-#[tracing::instrument(skip(agent, their_actor_id, read, write), fields(actor_id = %their_actor_id))]
+#[tracing::instrument(skip(agent, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]
 pub async fn serve_sync(
     agent: &Agent,
     their_actor_id: ActorId,

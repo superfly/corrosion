@@ -1590,7 +1590,7 @@ fn clear_buffered_meta(
     Ok(())
 }
 
-#[tracing::instrument(skip(agent))]
+#[tracing::instrument(skip(agent), err)]
 async fn process_fully_buffered_changes(
     agent: &Agent,
     actor_id: ActorId,
@@ -1739,7 +1739,7 @@ async fn process_fully_buffered_changes(
     Ok(inserted)
 }
 
-#[tracing::instrument(skip(agent, changes))]
+#[tracing::instrument(skip(agent, changes), err)]
 pub async fn process_multiple_changes(
     agent: &Agent,
     changes: Vec<(ChangeV1, ChangeSource)>,
@@ -1982,7 +1982,7 @@ pub async fn process_multiple_changes(
     Ok(())
 }
 
-#[tracing::instrument(skip(tx, parts))]
+#[tracing::instrument(skip(tx, parts), err)]
 fn process_incomplete_version(
     tx: &Transaction,
     actor_id: ActorId,
@@ -2073,7 +2073,7 @@ fn process_incomplete_version(
     })
 }
 
-#[tracing::instrument(skip(tx, last_db_version, parts))]
+#[tracing::instrument(skip(tx, last_db_version, parts), err)]
 fn process_complete_version(
     tx: &Transaction,
     actor_id: ActorId,
@@ -2182,7 +2182,7 @@ fn process_complete_version(
     Ok::<_, rusqlite::Error>((known_version, new_changeset))
 }
 
-#[tracing::instrument(skip(tx, last_db_version, change))]
+#[tracing::instrument(skip(tx, last_db_version, change), err)]
 fn process_single_version(
     tx: &Transaction,
     last_db_version: Option<i64>,
@@ -2308,7 +2308,7 @@ pub enum SyncRecvError {
     RequestsChannelClosed,
 }
 
-#[tracing::instrument(skip_all, level = "debug")]
+#[tracing::instrument(skip_all, err, level = "debug")]
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
     let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
 
@@ -2591,7 +2591,7 @@ async fn sync_loop(
     }
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip_all, err)]
 async fn process_completed_empties(
     agent: &Agent,
     empties: &mut BTreeMap<ActorId, RangeInclusiveSet<i64>>,

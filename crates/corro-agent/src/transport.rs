@@ -46,7 +46,7 @@ impl Transport {
         }))
     }
 
-    #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug")]
+    #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
     pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
         debug!("connected to {addr}");
@@ -70,7 +70,7 @@ impl Transport {
         Ok(conn.send_datagram(data)?)
     }
 
-    #[tracing::instrument(skip(self, data), fields(buf_size = data.len()))]
+    #[tracing::instrument(skip(self, data), fields(buf_size = data.len(), err))]
     pub async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
 
@@ -105,7 +105,7 @@ impl Transport {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self), err)]
     pub async fn open_bi(
         &self,
         addr: SocketAddr,
@@ -172,7 +172,7 @@ impl Transport {
         w.entry(addr).or_default().clone()
     }
 
-    #[tracing::instrument(skip(self), fields(tid = ?std::thread::current().id()))]
+    #[tracing::instrument(skip(self), fields(tid = ?std::thread::current().id()), err)]
     async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
         let conn_lock = self.get_lock(addr).await;
 

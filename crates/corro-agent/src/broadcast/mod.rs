@@ -27,7 +27,7 @@ use tokio::{
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
-use tracing::{debug, error, log::info, trace, warn, Instrument};
+use tracing::{debug, error, log::info, trace, warn};
 use tripwire::Tripwire;
 
 use corro_types::{
@@ -628,7 +628,11 @@ pub fn runtime_loop(
                         let members = agent.members().read();
                         for addr in members.ring0() {
                             // this spawns, so we won't be holding onto the read lock for long
-                            transmit_broadcast(payload.clone(), transport.clone(), addr);
+                            tokio::spawn(transmit_broadcast(
+                                payload.clone(),
+                                transport.clone(),
+                                addr,
+                            ));
                         }
 
                         if local_bcast_buf.len() >= BROADCAST_CUTOFF {
@@ -698,7 +702,11 @@ pub fn runtime_loop(
                 for addr in broadcast_to {
                     debug!(actor = %actor_id, "broadcasting {} bytes to: {addr} (send count: {})", pending.payload.len(), pending.send_count);
 
-                    transmit_broadcast(pending.payload.clone(), transport.clone(), addr);
+                    tokio::spawn(transmit_broadcast(
+                        pending.payload.clone(),
+                        transport.clone(),
+                        addr,
+                    ));
                 }
 
                 pending.send_count = pending.send_count.wrapping_add(1);
@@ -759,26 +767,19 @@ impl PendingBroadcast {
 }
 
 #[tracing::instrument(skip(payload, transport), fields(buf_size = payload.len()))]
-fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
-    tokio::spawn(
-        async move {
-            trace!("singly broadcasting to {addr}");
+async fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
+    trace!("singly broadcasting to {addr}");
 
-            let len = payload.len();
-            match tokio::time::timeout(Duration::from_secs(5), transport.send_uni(addr, payload))
-                .await
-            {
-                Err(_e) => {
-                    warn!("timed out writing broadcast to uni stream");
-                }
-                Ok(Err(e)) => {
-                    error!("could not write to uni stream to {addr}: {e}");
-                }
-                Ok(Ok(_)) => {
-                    counter!("corro.peer.stream.bytes.sent.total", len as u64, "type" => "uni");
-                }
-            }
+    let len = payload.len();
+    match tokio::time::timeout(Duration::from_secs(5), transport.send_uni(addr, payload)).await {
+        Err(_e) => {
+            warn!("timed out writing broadcast to uni stream");
         }
-        .in_current_span(),
-    );
+        Ok(Err(e)) => {
+            error!("could not write to uni stream to {addr}: {e}");
+        }
+        Ok(Ok(_)) => {
+            counter!("corro.peer.stream.bytes.sent.total", len as u64, "type" => "uni");
+        }
+    }
 }

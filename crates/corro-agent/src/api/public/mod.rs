@@ -306,7 +306,7 @@ where
     })
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip_all, err)]
 fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
     let mut prepped = match &stmt {
         Statement::Simple(q) => tx.prepare(q),
