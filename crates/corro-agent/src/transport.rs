@@ -70,7 +70,7 @@ impl Transport {
         Ok(conn.send_datagram(data)?)
     }
 
-    #[tracing::instrument(skip(self, data), fields(buf_size = data.len(), err))]
+    #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
     pub async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
 
@@ -172,11 +172,11 @@ impl Transport {
         w.entry(addr).or_default().clone()
     }
 
-    #[tracing::instrument(skip(self), fields(tid = ?std::thread::current().id()), err)]
+    #[tracing::instrument(skip(self), fields(tid = ?std::thread::current().id()), level = "debug", err)]
     async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
         let conn_lock = self.get_lock(addr).await;
 
-        let mut lock = conn_lock.lock().instrument(info_span!("conn_lock")).await;
+        let mut lock = conn_lock.lock().await;
 
         if let Some(conn) = lock.as_ref() {
             if test_conn(conn) {
