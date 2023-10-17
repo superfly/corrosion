@@ -27,7 +27,7 @@ use tokio::{
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
-use tracing::{debug, debug_span, error, info_span, log::info, trace, warn, Instrument};
+use tracing::{debug, error, log::info, trace, warn, Instrument};
 use tripwire::Tripwire;
 
 use corro_types::{
@@ -758,6 +758,7 @@ impl PendingBroadcast {
     }
 }
 
+#[tracing::instrument(skip(payload, transport), fields(buf_size = payload.len()))]
 fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
     tokio::spawn(
         async move {
@@ -778,6 +779,6 @@ fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
                 }
             }
         }
-        .instrument(debug_span!("transmit_broadcast")),
+        .in_current_span(),
     );
 }

@@ -35,7 +35,7 @@ use tokio::{
     task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, Instrument};
 use tripwire::Tripwire;
 
 use crate::{
@@ -401,12 +401,15 @@ impl SplitPool {
         histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
         let conn = self.0.write.get().await?;
 
-        tokio::spawn(timeout_wait(
-            token.clone(),
-            conn.get_interrupt_handle(),
-            Duration::from_secs(30),
-            queue,
-        ));
+        tokio::spawn(
+            timeout_wait(
+                token.clone(),
+                conn.get_interrupt_handle(),
+                Duration::from_secs(30),
+                queue,
+            )
+            .in_current_span(),
+        );
 
         Ok(WriteConn {
             conn,

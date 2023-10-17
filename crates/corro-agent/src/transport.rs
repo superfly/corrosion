@@ -50,6 +50,7 @@ impl Transport {
     pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
         debug!("connected to {addr}");
+
         match conn.send_datagram(data.clone()) {
             Ok(send) => {
                 debug!("sent datagram to {addr}");
@@ -73,7 +74,11 @@ impl Transport {
     pub async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
 
-        let mut stream = match conn.open_uni().await {
+        let mut stream = match conn
+            .open_uni()
+            .instrument(info_span!("quic_open_uni"))
+            .await
+        {
             Ok(stream) => stream,
             Err(e @ ConnectionError::VersionMismatch) => {
                 return Err(e.into());
@@ -81,13 +86,21 @@ impl Transport {
             Err(e) => {
                 debug!("retryable error attempting to open unidirectional stream: {e}");
                 let conn = self.connect(addr).await?;
-                conn.open_uni().await?
+                conn.open_uni()
+                    .instrument(info_span!("quic_open_uni"))
+                    .await?
             }
         };
 
-        stream.write_chunk(data).await?;
+        stream
+            .write_chunk(data)
+            .instrument(info_span!("quic_write_chunk"))
+            .await?;
 
-        stream.finish().await?;
+        stream
+            .finish()
+            .instrument(info_span!("quic_finish"))
+            .await?;
 
         Ok(())
     }
@@ -98,7 +111,7 @@ impl Transport {
         addr: SocketAddr,
     ) -> Result<(SendStream, RecvStream), TransportError> {
         let conn = self.connect(addr).await?;
-        match conn.open_bi().await {
+        match conn.open_bi().instrument(info_span!("quic_open_bi")).await {
             Ok(send_recv) => return Ok(send_recv),
             Err(e @ ConnectionError::VersionMismatch) => {
                 return Err(e.into());
@@ -110,7 +123,10 @@ impl Transport {
 
         // retry, it should reconnect!
         let conn = self.connect(addr).await?;
-        Ok(conn.open_bi().await?)
+        Ok(conn
+            .open_bi()
+            .instrument(info_span!("quic_open_bi"))
+            .await?)
     }
 
     async fn measured_connect(
@@ -160,7 +176,7 @@ impl Transport {
     async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
         let conn_lock = self.get_lock(addr).await;
 
-        let mut lock = conn_lock.lock().await;
+        let mut lock = conn_lock.lock().instrument(info_span!("conn_lock")).await;
 
         if let Some(conn) = lock.as_ref() {
             if test_conn(conn) {

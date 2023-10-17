@@ -914,7 +914,7 @@ pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
     }
 }
 
-#[tracing::instrument(skip_all, level = "debug")]
+#[tracing::instrument(skip_all)]
 pub async fn parallel_sync(
     agent: &Agent,
     transport: &Transport,
@@ -1266,7 +1266,7 @@ pub async fn parallel_sync(
     Ok(counts.into_iter().flatten().sum::<usize>())
 }
 
-#[tracing::instrument(skip(agent, their_actor_id, read, write), fields(actor_id = %their_actor_id), level = "debug")]
+#[tracing::instrument(skip(agent, their_actor_id, read, write), fields(actor_id = %their_actor_id))]
 pub async fn serve_sync(
     agent: &Agent,
     their_actor_id: ActorId,

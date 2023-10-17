@@ -75,7 +75,7 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
 use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 use trust_dns_resolver::{
     error::ResolveErrorKind,
@@ -1249,18 +1249,19 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
         trace!("got gossip to send to {actor:?}");
 
         let addr = actor.addr();
+        let actor_id = actor.id();
 
         let transport = transport.clone();
 
+        let len = data.len();
         spawn_counted(async move {
-            let len = data.len();
             if let Err(e) = transport.send_datagram(addr, data).await {
                 error!("could not write datagram {addr}: {e}");
                 return;
             }
-            increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor.id().to_string());
+            increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor_id.to_string());
             counter!("corro.peer.datagram.bytes.sent.total", len as u64);
-        });
+        }.instrument(info_span!("send_swim_payload", %addr, %actor_id, buf_size = len)));
     }
 }
 
@@ -1589,6 +1590,7 @@ fn clear_buffered_meta(
     Ok(())
 }
 
+#[tracing::instrument(skip(agent))]
 async fn process_fully_buffered_changes(
     agent: &Agent,
     actor_id: ActorId,
