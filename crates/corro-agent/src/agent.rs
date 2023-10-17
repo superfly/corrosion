@@ -75,7 +75,7 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
 use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, debug_span, error, info, info_span, trace, warn, Instrument};
+use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 use trust_dns_resolver::{
     error::ResolveErrorKind,
@@ -1841,10 +1841,8 @@ pub async fn process_multiple_changes(
 
                     // optimizing this, insert later!
                     let (known, changeset) = if change.is_complete() && change.is_empty() {
-                        if let Err(e) = agent
-                            .tx_empty()
-                            .blocking_send((actor_id, change.versions()))
-                        {
+                        // we never want to block here
+                        if let Err(e) = agent.tx_empty().try_send((actor_id, change.versions())) {
                             error!("could not send empty changed versions into channel: {e}");
                         }
                         (
