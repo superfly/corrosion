@@ -654,7 +654,6 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     Ok(())
 }
 
-#[tracing::instrument(skip_all)]
 async fn process_sync(
     local_actor_id: ActorId,
     pool: SplitPool,
@@ -915,7 +914,6 @@ pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
     }
 }
 
-#[tracing::instrument(skip_all)]
 pub async fn parallel_sync(
     agent: &Agent,
     transport: &Transport,

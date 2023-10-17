@@ -758,7 +758,6 @@ impl PendingBroadcast {
     }
 }
 
-#[tracing::instrument(skip(payload, transport), fields(buf_size = payload.len()), level = "debug")]
 fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
     tokio::spawn(
         async move {

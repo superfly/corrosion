@@ -2312,7 +2312,6 @@ pub enum SyncRecvError {
     RequestsChannelClosed,
 }
 
-#[tracing::instrument(skip_all)]
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
     let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
 
