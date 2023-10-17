@@ -644,15 +644,16 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                         Ok(payload) => {
                                                             match payload {
                                                                 BiPayload::V1(
-                                                                    BiPayloadV1::SyncStart(
+                                                                    BiPayloadV1::SyncStart {
                                                                         actor_id,
-                                                                    ),
+                                                                        trace_ctx,
+                                                                    },
                                                                 ) => {
                                                                     trace!("framed read buffer len: {}", framed.read_buffer().len());
                                                                     // println!("got sync state: {state:?}");
                                                                     if let Err(e) = serve_sync(
-                                                                        &agent, actor_id, framed,
-                                                                        tx,
+                                                                        &agent, actor_id,
+                                                                        trace_ctx, framed, tx,
                                                                     )
                                                                     .await
                                                                     {

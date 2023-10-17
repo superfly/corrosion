@@ -20,6 +20,7 @@ hex = { workspace = true }
 hyper = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
+opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
@@ -45,6 +46,7 @@ tokio-util = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
 trust-dns-resolver = { workspace = true }

@@ -1,6 +1,7 @@
 use std::{cmp, collections::HashMap, io, ops::RangeInclusive};
 
 use bytes::BytesMut;
+use opentelemetry::propagation::{Extractor, Injector};
 use rangemap::RangeInclusiveSet;
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
@@ -23,8 +24,44 @@ pub enum SyncMessageV1 {
     Changeset(ChangeV1),
     Clock(Timestamp),
     Rejection(SyncRejectionV1),
-    Start(ActorId),
     Request(SyncRequestV1),
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
+pub struct SyncTraceContextV1 {
+    pub traceparent: Option<String>,
+    pub tracestate: Option<String>,
+}
+
+impl Injector for SyncTraceContextV1 {
+    fn set(&mut self, key: &str, value: String) {
+        match key {
+            "traceparent" => self.traceparent = Some(value),
+            "tracestate" => self.tracestate = Some(value),
+            _ => {}
+        }
+    }
+}
+
+impl Extractor for SyncTraceContextV1 {
+    fn get(&self, key: &str) -> Option<&str> {
+        match key {
+            "traceparent" => self.traceparent.as_deref(),
+            "tracestate" => self.tracestate.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        let mut v = Vec::with_capacity(2);
+        if self.traceparent.is_some() {
+            v.push("traceparent");
+        }
+        if self.tracestate.is_some() {
+            v.push("tracestate");
+        }
+        v
+    }
 }
 
 pub type SyncRequestV1 = Vec<(ActorId, Vec<SyncNeedV1>)>;
@@ -198,17 +235,6 @@ impl SyncStateV1 {
         needs
     }
 }
-
-// pub fn extract_common_needs(
-//     mut needs: Vec<HashMap<ActorId, Vec<SyncNeedV1>>>,
-// ) -> (
-//     HashMap<ActorId, Vec<SyncNeedV1>>,
-//     Vec<HashMap<ActorId, Vec<SyncNeedV1>>>,
-// ) {
-//     let mut common = HashMap::new();
-
-//     todo!()
-// }
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum SyncNeedV1 {

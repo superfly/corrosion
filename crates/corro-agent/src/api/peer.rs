@@ -15,7 +15,7 @@ use corro_types::change::{row_to_change, Change};
 use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
-    SyncRequestV1, SyncStateV1,
+    SyncRequestV1, SyncStateV1, SyncTraceContextV1,
 };
 use futures::stream::FuturesUnordered;
 use futures::{Future, Stream, TryFutureExt, TryStreamExt};
@@ -35,6 +35,7 @@ use tokio_stream::StreamExt as TokioStreamExt;
 // use tokio_stream::StreamExt as TokioStreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::agent::SyncRecvError;
 use crate::api::public::ChunkedChanges;
@@ -929,7 +930,15 @@ pub async fn parallel_sync(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let results = FuturesUnordered::from_iter(members.iter().map(|(actor_id, addr)| async {
+
+    let mut trace_ctx = SyncTraceContextV1::default();
+    opentelemetry::global::get_text_map_propagator(|prop| {
+        prop.inject_context(&tracing::Span::current().context(), &mut trace_ctx)
+    });
+
+    let results = FuturesUnordered::from_iter(members.iter().map(|(actor_id, addr)| {
+        let trace_ctx = trace_ctx.clone();
+        async {
         (
             *actor_id,
             *addr,
@@ -946,7 +955,7 @@ pub async fn parallel_sync(
                     &mut codec,
                     &mut encode_buf,
                     &mut send_buf,
-                    BiPayload::V1(BiPayloadV1::SyncStart(agent.actor_id())),
+                    BiPayload::V1(BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}),
                     &mut tx,
                 )
                 .await?;
@@ -1005,6 +1014,7 @@ pub async fn parallel_sync(
                 Ok::<_, SyncError>((needs, tx, read))
             }.await
         )
+    }
     }.instrument(info_span!("sync_client_handshake", %actor_id, %addr))))
     .collect::<Vec<(ActorId, SocketAddr, Result<_, SyncError>)>>()
     .await;
@@ -1230,10 +1240,6 @@ pub async fn parallel_sync(
                             warn!("received sync request message unexpectedly, ignoring");
                             continue;
                         }
-                        SyncMessage::V1(SyncMessageV1::Start(_)) => {
-                            warn!("received sync start message unexpectedly, ignoring");
-                            continue;
-                        }
                         SyncMessage::V1(SyncMessageV1::State(_)) => {
                             warn!("received sync state message unexpectedly, ignoring");
                             continue;
@@ -1270,9 +1276,14 @@ pub async fn parallel_sync(
 pub async fn serve_sync(
     agent: &Agent,
     their_actor_id: ActorId,
+    trace_ctx: SyncTraceContextV1,
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
+    let context =
+        opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&trace_ctx));
+    tracing::Span::current().set_parent(context);
+
     info!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "received sync request");
     let mut codec = LengthDelimitedCodec::new();
     let mut send_buf = BytesMut::new();
@@ -1440,10 +1451,6 @@ pub async fn serve_sync(
                         }
                         SyncMessage::V1(SyncMessageV1::State(_)) => {
                             warn!(actor_id = %their_actor_id, "received sync state message unexpectedly, ignoring");
-                            continue;
-                        }
-                        SyncMessage::V1(SyncMessageV1::Start(_)) => {
-                            warn!(actor_id = %their_actor_id, "received sync start message unexpectedly, ignoring");
                             continue;
                         }
                         SyncMessage::V1(SyncMessageV1::Clock(_)) => {
