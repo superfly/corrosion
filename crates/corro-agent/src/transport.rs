@@ -7,13 +7,12 @@ use std::{
 
 use bytes::Bytes;
 use metrics::{gauge, histogram, increment_counter};
-use parking_lot::RwLock;
 use quinn::{
     ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
     SendStream, WriteError,
 };
 use quinn_proto::ConnectionStats;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info_span, warn, Instrument};
 
 #[derive(Debug, Clone)]
@@ -145,21 +144,21 @@ impl Transport {
     }
 
     // this shouldn't block for long...
-    fn get_lock(&self, addr: SocketAddr) -> Arc<Mutex<Option<Connection>>> {
+    async fn get_lock(&self, addr: SocketAddr) -> Arc<Mutex<Option<Connection>>> {
         {
-            let r = self.0.conns.read();
+            let r = self.0.conns.read().await;
             if let Some(lock) = r.get(&addr) {
                 return lock.clone();
             }
         }
 
-        let mut w = self.0.conns.write();
+        let mut w = self.0.conns.write().await;
         w.entry(addr).or_default().clone()
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self), fields(tid = ?std::thread::current().id()))]
     async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
-        let conn_lock = self.get_lock(addr);
+        let conn_lock = self.get_lock(addr).await;
 
         let mut lock = conn_lock.lock().await;
 
@@ -182,7 +181,7 @@ impl Transport {
 
     pub fn emit_metrics(&self) {
         let conns = {
-            let read = self.0.conns.read();
+            let read = self.0.conns.blocking_read();
             read.iter()
                 .filter_map(|(addr, conn)| {
                     conn.blocking_lock()
