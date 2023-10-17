@@ -766,7 +766,7 @@ impl PendingBroadcast {
     }
 }
 
-#[tracing::instrument(skip(payload, transport), fields(buf_size = payload.len()))]
+#[tracing::instrument(skip(payload, transport), fields(buf_size = payload.len()), level = "debug")]
 async fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
     trace!("singly broadcasting to {addr}");
 

@@ -75,7 +75,7 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
 use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, info_span, trace, warn, Instrument};
+use tracing::{debug, debug_span, error, info, info_span, trace, warn, Instrument};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 use trust_dns_resolver::{
     error::ResolveErrorKind,
@@ -1262,7 +1262,7 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
             }
             increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor_id.to_string());
             counter!("corro.peer.datagram.bytes.sent.total", len as u64);
-        }.instrument(info_span!("send_swim_payload", %addr, %actor_id, buf_size = len)));
+        }.instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)));
     }
 }
 
