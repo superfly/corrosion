@@ -1053,6 +1053,11 @@ pub async fn parallel_sync(
 
                 trace!(%actor_id, "needs: {needs:?}");
 
+                info!(%actor_id, %addr, "needs len: {}", needs.values().map(|needs| needs.iter().map(|need| match need {
+                    SyncNeedV1::Full {versions} => (versions.end() - versions.start()) as usize + 1,
+                    SyncNeedV1::Partial {..} => 0,
+                }).sum::<usize>()).sum::<usize>());
+
                 servers.push((
                     actor_id,
                     addr,
