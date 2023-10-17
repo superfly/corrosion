@@ -182,7 +182,7 @@ impl SyncStateV1 {
                         let end_seq = cmp::max(max_other_seq, max_our_seq);
 
                         if let Some(end) = end_seq {
-                            let mut other_seqs_haves = RangeInclusiveSet::from_iter([1..=end]);
+                            let mut other_seqs_haves = RangeInclusiveSet::from_iter([0..=end]);
 
                             for seqs in other_seqs.iter() {
                                 other_seqs_haves.remove(seqs.clone());
