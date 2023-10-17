@@ -939,83 +939,83 @@ pub async fn parallel_sync(
     let results = FuturesUnordered::from_iter(members.iter().map(|(actor_id, addr)| {
         let trace_ctx = trace_ctx.clone();
         async {
-        (
-            *actor_id,
-            *addr,
-            async {
-                let mut codec = LengthDelimitedCodec::new();
-                let mut send_buf = BytesMut::new();
-                let mut encode_buf = BytesMut::new();
+            (
+                *actor_id,
+                *addr,
+                async {
+                    let mut codec = LengthDelimitedCodec::new();
+                    let mut send_buf = BytesMut::new();
+                    let mut encode_buf = BytesMut::new();
 
-                let actor_id = *actor_id;
-                let (mut tx, rx) = transport.open_bi(*addr).await?;
-                let mut read = FramedRead::new(rx, LengthDelimitedCodec::new());
+                    let actor_id = *actor_id;
+                    let (mut tx, rx) = transport.open_bi(*addr).await?;
+                    let mut read = FramedRead::new(rx, LengthDelimitedCodec::new());
 
-                encode_write_bipayload_msg(
-                    &mut codec,
-                    &mut encode_buf,
-                    &mut send_buf,
-                    BiPayload::V1(BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}),
-                    &mut tx,
-                )
-                .await?;
+                    encode_write_bipayload_msg(
+                        &mut codec,
+                        &mut encode_buf,
+                        &mut send_buf,
+                        BiPayload::V1(BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}),
+                        &mut tx,
+                    ).instrument(info_span!("write_sync_start"))
+                    .await?;
 
-                trace!(%actor_id, self_actor_id = %agent.actor_id(), "sent start payload");
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "sent start payload");
 
-                encode_write_sync_msg(
-                    &mut codec,
-                    &mut encode_buf,
-                    &mut send_buf,
-                    SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
-                    &mut tx,
-                )
-                .await?;
+                    encode_write_sync_msg(
+                        &mut codec,
+                        &mut encode_buf,
+                        &mut send_buf,
+                        SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
+                        &mut tx,
+                    ).instrument(info_span!("write_sync_clock"))
+                    .await?;
 
-                trace!(%actor_id, self_actor_id = %agent.actor_id(), "sent clock payload");
-                tx.flush().instrument(info_span!("quic_flush")).await.map_err(SyncSendError::from)?;
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "sent clock payload");
+                    tx.flush().instrument(info_span!("quic_flush")).await.map_err(SyncSendError::from)?;
 
-                trace!(%actor_id, self_actor_id = %agent.actor_id(), "flushed sync payloads");
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "flushed sync payloads");
 
-                let their_sync_state = match timeout(Duration::from_secs(2), read_sync_msg(&mut read)).await.map_err(SyncRecvError::from)?? {
-                    Some(SyncMessage::V1(SyncMessageV1::State(state))) => state,
-                    Some(SyncMessage::V1(SyncMessageV1::Rejection(rejection))) => {
-                        return Err(rejection.into())
-                    }
-                    Some(_) => return Err(SyncRecvError::ExpectedSyncState.into()),
-                    None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
-                };
-                trace!(%actor_id, self_actor_id = %agent.actor_id(), "read state payload: {their_sync_state:?}");
+                    let their_sync_state = match timeout(Duration::from_secs(2), read_sync_msg(&mut read)).instrument(info_span!("read_sync_state")).await.map_err(SyncRecvError::from)?? {
+                        Some(SyncMessage::V1(SyncMessageV1::State(state))) => state,
+                        Some(SyncMessage::V1(SyncMessageV1::Rejection(rejection))) => {
+                            return Err(rejection.into())
+                        }
+                        Some(_) => return Err(SyncRecvError::ExpectedSyncState.into()),
+                        None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
+                    };
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "read state payload: {their_sync_state:?}");
 
-                match timeout(Duration::from_secs(2), read_sync_msg(&mut read)).await.map_err(SyncRecvError::from)??  {
-                    Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match actor_id.try_into() {
-                        Ok(id) => {
-                            if let Err(e) = agent
-                                .clock()
-                                .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), id))
-                            {
-                                warn!("could not update clock from actor {actor_id}: {e}");
+                    match timeout(Duration::from_secs(2), read_sync_msg(&mut read)).instrument(info_span!("read_sync_clock")).await.map_err(SyncRecvError::from)??  {
+                        Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match actor_id.try_into() {
+                            Ok(id) => {
+                                if let Err(e) = agent
+                                    .clock()
+                                    .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), id))
+                                {
+                                    warn!("could not update clock from actor {actor_id}: {e}");
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!("could not convert ActorId to uhlc ID: {e}");
-                        }
-                    },
-                    Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
-                    None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
-                }
-                trace!(%actor_id, self_actor_id = %agent.actor_id(), "read clock payload");
+                            Err(e) => {
+                                error!("could not convert ActorId to uhlc ID: {e}");
+                            }
+                        },
+                        Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
+                        None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
+                    }
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "read clock payload");
 
-                increment_counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string());
+                    increment_counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string());
 
-                let needs = our_sync_state.compute_available_needs(&their_sync_state);
+                    let needs = our_sync_state.compute_available_needs(&their_sync_state);
 
-                trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
 
-                Ok::<_, SyncError>((needs, tx, read))
-            }.await
-        )
-    }
-    }.instrument(info_span!("sync_client_handshake", %actor_id, %addr))))
+                    Ok::<_, SyncError>((needs, tx, read))
+                }.await
+            )
+        }.instrument(info_span!("sync_client_handshake", %actor_id, %addr))
+    }))
     .collect::<Vec<(ActorId, SocketAddr, Result<_, SyncError>)>>()
     .await;
 
@@ -1290,7 +1290,10 @@ pub async fn serve_sync(
     let mut encode_buf = BytesMut::new();
 
     // read the clock
-    match read_sync_msg(&mut read).await? {
+    match read_sync_msg(&mut read)
+        .instrument(info_span!("read_peer_clock"))
+        .await?
+    {
         Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match their_actor_id.try_into() {
             Ok(id) => {
                 if let Err(e) = agent
@@ -1320,6 +1323,7 @@ pub async fn serve_sync(
         SyncMessage::V1(SyncMessageV1::State(sync_state)),
         &mut write,
     )
+    .instrument(info_span!("write_sync_state"))
     .await?;
 
     trace!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "sent sync state");
@@ -1332,11 +1336,16 @@ pub async fn serve_sync(
         SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
         &mut write,
     )
+    .instrument(info_span!("write_sync_clock"))
     .await?;
     trace!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "sent clock");
 
     // ensure we flush here so the data gets there fast. clock needs to be fresh!
-    write.flush().await.map_err(SyncSendError::from)?;
+    write
+        .flush()
+        .instrument(info_span!("quic_flush"))
+        .await
+        .map_err(SyncSendError::from)?;
     trace!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "flushed sync messages");
 
     let (tx_need, rx_need) = mpsc::channel(1024);

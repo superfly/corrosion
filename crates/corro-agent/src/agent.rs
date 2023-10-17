@@ -2564,7 +2564,9 @@ async fn sync_loop(
                     }
                     tripwire::Outcome::Completed(res) => {
                         if let Err(e) = res {
-                            error!("could not sync: {e}");
+                            if !matches!(e, SyncClientError::NoGoodCandidate) {
+                                error!("could not sync: {e}");
+                            }
                             // keep syncing until we successfully sync
                             continue;
                         }
