@@ -963,7 +963,7 @@ pub async fn parallel_sync(
                 .await?;
 
                 trace!(%actor_id, self_actor_id = %agent.actor_id(), "sent clock payload");
-                tx.flush().await.map_err(SyncSendError::from)?;
+                tx.flush().instrument(info_span!("quic_flush")).await.map_err(SyncSendError::from)?;
 
                 trace!(%actor_id, self_actor_id = %agent.actor_id(), "flushed sync payloads");
 
@@ -1207,8 +1207,6 @@ pub async fn parallel_sync(
             let mut count = 0;
 
             loop {
-                let span = info_span!("read_sync_loop_iteration", changes_len = tracing::field::Empty);
-                let _guard = span.enter();
                 match read_sync_msg(&mut read).await {
                     Ok(None) => {
                         break;
@@ -1220,7 +1218,7 @@ pub async fn parallel_sync(
                     Ok(Some(msg)) => match msg {
                         SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
                             let changes_len = cmp::max(change.len(), 1);
-                            tracing::Span::current().record("changes_len", changes_len);
+                            // tracing::Span::current().record("changes_len", changes_len);
                             count += changes_len;
                             counter!("corro.sync.changes.recv", changes_len as u64, "actor_id" => actor_id.to_string());
                             tx_changes
