@@ -52,7 +52,7 @@ use axum::{
     routing::{get, post},
     BoxError, Extension, Router, TypedHeader,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use foca::{Member, Notification};
 use futures::{FutureExt, StreamExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
@@ -65,14 +65,13 @@ use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction}
 use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
-    io::AsyncReadExt,
     net::TcpListener,
     sync::mpsc::{channel, Receiver, Sender},
     task::block_in_place,
     time::{error::Elapsed, sleep, timeout},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
-use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
@@ -506,7 +505,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         let mut tripwire = tripwire.clone();
                         async move {
                             loop {
-                                let mut rx = tokio::select! {
+                                let rx = tokio::select! {
                                     rx_res = conn.accept_uni() => match rx_res {
                                         Ok(rx) => rx,
                                         Err(e) => {
@@ -530,61 +529,36 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 tokio::spawn({
                                     let process_uni_tx = process_uni_tx.clone();
                                     async move {
-                                        let mut codec = LengthDelimitedCodec::new();
-                                        let mut buf = BytesMut::new();
+                                        let mut framed =
+                                            FramedRead::new(rx, LengthDelimitedCodec::new());
 
-                                        let stream_ended = loop {
-                                            loop {
-                                                match codec.decode(&mut buf) {
-                                                    Ok(Some(b)) => {
-                                                        match UniPayload::read_from_buffer(&b) {
-                                                            Ok(payload) => {
-                                                                trace!(
-                                                                    "parsed a payload: {payload:?}"
-                                                                );
+                                        loop {
+                                            match StreamExt::next(&mut framed).await {
+                                                Some(Ok(b)) => {
+                                                    match UniPayload::read_from_buffer(&b) {
+                                                        Ok(payload) => {
+                                                            trace!("parsed a payload: {payload:?}");
 
-                                                                if let Err(e) = process_uni_tx
-                                                                    .send(payload)
-                                                                    .await
-                                                                {
-                                                                    error!("could not send UniPayload for processing: {e}");
-                                                                    // this means we won't be able to process more...
-                                                                    return;
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                error!(
-                                                                "could not decode UniPayload: {e}"
-                                                            );
-                                                                continue;
+                                                            if let Err(e) =
+                                                                process_uni_tx.send(payload).await
+                                                            {
+                                                                error!("could not send UniPayload for processing: {e}");
+                                                                // this means we won't be able to process more...
+                                                                return;
                                                             }
                                                         }
+                                                        Err(e) => {
+                                                            error!(
+                                                                "could not decode UniPayload: {e}"
+                                                            );
+                                                            continue;
+                                                        }
                                                     }
-                                                    Ok(None) => break,
-                                                    Err(e) => {
-                                                        error!("decode error: {e}");
-                                                    }
                                                 }
-                                            }
-
-                                            match rx.read_buf(&mut buf).await {
-                                                Ok(0) => {
-                                                    break true;
+                                                Some(Err(e)) => {
+                                                    error!("decode error: {e}");
                                                 }
-                                                Ok(n) => {
-                                                    counter!("corro.peer.stream.bytes.recv.total", n as u64, "type" => "uni");
-                                                    trace!("read {n} bytes");
-                                                }
-                                                Err(e) => {
-                                                    error!("error reading bytes into buffer: {e}");
-                                                    break true;
-                                                }
-                                            }
-                                        };
-
-                                        if !stream_ended {
-                                            if let Err(e) = rx.stop(0u32.into()) {
-                                                warn!("error stopping recved uni stream: {e}");
+                                                None => break,
                                             }
                                         }
                                     }
