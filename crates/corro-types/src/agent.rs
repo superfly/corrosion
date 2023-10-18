@@ -553,6 +553,10 @@ impl<T> CountedTokioRwLock<T> {
     ) -> CountedTokioRwLockReadGuard<'_, T> {
         self.registry.acquire_read(label, &self.lock).await
     }
+
+    pub fn registry(&self) -> &LockRegistry {
+        &self.registry
+    }
 }
 
 pub struct CountedTokioRwLockWriteGuard<'a, T> {
@@ -1037,10 +1041,6 @@ impl BookieInner {
             })
             .clone()
     }
-
-    pub fn registry(&self) -> &LockRegistry {
-        &self.registry
-    }
 }
 
 impl Deref for BookieInner {
@@ -1088,5 +1088,9 @@ impl Bookie {
         label: L,
     ) -> CountedTokioRwLockWriteGuard<BookieInner> {
         self.0.blocking_write(label)
+    }
+
+    pub fn registry(&self) -> &LockRegistry {
+        self.0.registry()
     }
 }

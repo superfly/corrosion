@@ -185,14 +185,8 @@ async fn handle_conn(
                 }
                 Command::Locks { top } => {
                     info_log(&mut stream, "gathering top locks").await;
-                    let registry = {
-                        agent
-                            .bookie()
-                            .read("admin:registry")
-                            .await
-                            .registry()
-                            .clone()
-                    };
+                    let bookie = agent.bookie();
+                    let registry = bookie.registry();
 
                     let topn: Vec<LockMetaElapsed> = {
                         registry
