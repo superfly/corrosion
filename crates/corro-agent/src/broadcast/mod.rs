@@ -736,7 +736,7 @@ fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
 
     // max payload size for udp datagrams, use a safe value here...
     // TODO: calculate from smallest max datagram size for all QUIC conns
-    config.max_packet_size = 1200.try_into().unwrap();
+    config.max_packet_size = 1178.try_into().unwrap();
 
     config
 }
