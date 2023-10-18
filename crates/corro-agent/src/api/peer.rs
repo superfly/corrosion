@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, BufMut, BytesMut};
+use compact_str::format_compact;
 use corro_types::agent::{Agent, KnownDbVersion, SplitPool};
-use corro_types::broadcast::{ChangeV1, Changeset, Timestamp};
+use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset, Timestamp};
 use corro_types::change::{row_to_change, Change};
 use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncStateV1};
@@ -23,7 +24,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::agent::{process_multiple_changes, SyncRecvError};
+use crate::agent::SyncRecvError;
 use crate::api::public::ChunkedChanges;
 
 use corro_types::{
@@ -80,7 +81,7 @@ fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig
 
     // max idle timeout
     transport_config.max_idle_timeout(Some(
-        Duration::from_secs(std::cmp::min(config.idle_timeout_secs as u64, 10))
+        Duration::from_secs(config.idle_timeout_secs as u64)
             .try_into()
             .unwrap(),
     ));
@@ -336,7 +337,10 @@ async fn process_range(
 
     let overlapping: Vec<(_, KnownDbVersion)> = {
         booked
-            .read()
+            .read(format!(
+                "process_range(overlapping):{}",
+                actor_id.as_simple()
+            ))
             .await
             .overlapping(range)
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -359,7 +363,13 @@ async fn process_range(
         }
 
         for version in versions {
-            let known = { booked.read().await.get(&version).cloned() };
+            let known = {
+                booked
+                    .read(format!("process_range[{version}]:{}", actor_id.as_simple()))
+                    .await
+                    .get(&version)
+                    .cloned()
+            };
             if let Some(known_version) = known {
                 process_version(
                     pool,
@@ -395,11 +405,15 @@ fn handle_known_version(
     ts: Timestamp,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
+    debug!(%actor_id, %version, "handle known version! known: {init_known:?}, seqs_needed: {seqs_needed:?}");
     let mut seqs_iter = seqs_needed.into_iter();
     while let Some(range_needed) = seqs_iter.by_ref().next() {
         match &init_known {
             KnownDbVersion::Current { db_version, .. } => {
-                let bw = booked.blocking_write();
+                let bw = booked.blocking_write(format_compact!(
+                    "sync_handle_known[{version}]:{}",
+                    actor_id.as_simple()
+                ));
                 match bw.get(&version) {
                     Some(known) => {
                         // a current version cannot go back to a partial version
@@ -476,8 +490,11 @@ fn handle_known_version(
 
                         debug!("partial, effective range: {start_seq}..={end_seq}");
 
-                        let bw = booked.blocking_write();
-                        let maybe_db_version = match bw.get(&version) {
+                        let bw = booked.blocking_write(format_compact!(
+                            "sync_handle_known(partial)[{version}]:{}",
+                            actor_id.as_simple()
+                        ));
+                        let maybe_current_version = match bw.get(&version) {
                             Some(known) => match known {
                                 KnownDbVersion::Partial { seqs, .. } => {
                                     if seqs != &partial_seqs {
@@ -491,7 +508,7 @@ fn handle_known_version(
                                     }
                                     None
                                 }
-                                KnownDbVersion::Current { db_version, .. } => Some(*db_version),
+                                known @ KnownDbVersion::Current { .. } => Some(known.clone()),
                                 KnownDbVersion::Cleared => {
                                     debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
                                     break;
@@ -503,24 +520,25 @@ fn handle_known_version(
                             }
                         };
 
-                        if let Some(db_version) = maybe_db_version {
+                        if let Some(known) = maybe_current_version {
                             info!(%actor_id, version, "switched from partial to current version");
+
+                            // drop write lock
                             drop(bw);
+
+                            // restart the seqs_needed here!
                             let mut seqs_needed: Vec<RangeInclusive<i64>> = seqs_iter.collect();
                             if let Some(new_start_seq) = last_sent_seq.take() {
                                 range_needed = (new_start_seq + 1)..=*range_needed.end();
                             }
                             seqs_needed.insert(0, range_needed);
+
                             return handle_known_version(
                                 conn,
                                 actor_id,
                                 is_local,
                                 version,
-                                KnownDbVersion::Current {
-                                    db_version,
-                                    last_seq,
-                                    ts,
-                                },
+                                known,
                                 booked,
                                 seqs_needed,
                                 last_seq,
@@ -693,7 +711,7 @@ async fn process_sync(
 ) -> eyre::Result<()> {
     let booked_actors: HashMap<ActorId, Booked> = {
         bookie
-            .read()
+            .read("process_sync")
             .await
             .iter()
             .map(|(k, v)| (*k, v.clone()))
@@ -720,7 +738,13 @@ async fn process_sync(
         // 2. process partial needs
         if let Some(partially_needed) = sync_state.partial_need.get(&actor_id) {
             for (version, seqs_needed) in partially_needed.iter() {
-                let known = { booked.read().await.get(version).cloned() };
+                let known = {
+                    booked
+                        .read(format!("process_sync(partials)[{version}]"))
+                        .await
+                        .get(version)
+                        .cloned()
+                };
                 if let Some(known) = known {
                     process_version(
                         &pool,
@@ -739,9 +763,16 @@ async fn process_sync(
 
         // 3. process newer-than-heads
         let their_last_version = sync_state.heads.get(&actor_id).copied().unwrap_or(0);
-        let our_last_version = booked.last().await.unwrap_or(0);
+        let our_last_version = booked
+            .read(format!(
+                "process_sync(our_last_version):{}",
+                actor_id.as_simple()
+            ))
+            .await
+            .last()
+            .unwrap_or(0);
 
-        debug!(actor_id = %local_actor_id, "their last version: {their_last_version} vs ours: {our_last_version}");
+        trace!(actor_id = %local_actor_id, "their last version: {their_last_version} vs ours: {our_last_version}");
 
         if their_last_version >= our_last_version {
             // nothing to teach the other node!
@@ -764,19 +795,37 @@ async fn process_sync(
     Ok(())
 }
 
-async fn write_sync_msg<W: AsyncWrite + Unpin>(
+fn encode_sync_msg(
     codec: &mut LengthDelimitedCodec,
-    buf: &mut BytesMut,
+    encode_buf: &mut BytesMut,
+    send_buf: &mut BytesMut,
+    msg: SyncMessage,
+) -> Result<(), SyncSendError> {
+    msg.write_to_stream(encode_buf.writer())
+        .map_err(SyncMessageEncodeError::from)?;
+
+    codec.encode(encode_buf.split().freeze(), send_buf)?;
+    Ok(())
+}
+
+async fn encode_write_sync_msg<W: AsyncWrite + Unpin>(
+    codec: &mut LengthDelimitedCodec,
+    encode_buf: &mut BytesMut,
+    send_buf: &mut BytesMut,
     msg: SyncMessage,
     write: &mut W,
 ) -> Result<(), SyncSendError> {
-    msg.write_to_stream(buf.writer())
-        .map_err(SyncMessageEncodeError::from)?;
+    encode_sync_msg(codec, encode_buf, send_buf, msg)?;
 
-    codec.encode(buf.split().freeze(), buf)?;
+    write_sync_buf(send_buf, write).await
+}
 
-    while buf.has_remaining() {
-        let n = write.write_buf(buf).await?;
+async fn write_sync_buf<W: AsyncWrite + Unpin>(
+    send_buf: &mut BytesMut,
+    write: &mut W,
+) -> Result<(), SyncSendError> {
+    while send_buf.has_remaining() {
+        let n = write.write_buf(send_buf).await?;
         if n == 0 {
             break;
         }
@@ -812,15 +861,17 @@ pub async fn bidirectional_sync(
     read: RecvStream,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
-    let (tx, mut rx) = channel::<SyncMessage>(128);
+    let (tx, mut rx) = channel::<SyncMessage>(256);
 
     let mut read = FramedRead::new(read, LengthDelimitedCodec::new());
 
     let mut codec = LengthDelimitedCodec::new();
     let mut send_buf = BytesMut::new();
+    let mut encode_buf = BytesMut::new();
 
-    write_sync_msg(
+    encode_write_sync_msg(
         &mut codec,
+        &mut encode_buf,
         &mut send_buf,
         SyncMessage::V1(SyncMessageV1::State(our_sync_state)),
         &mut write,
@@ -839,8 +890,9 @@ pub async fn bidirectional_sync(
 
     let their_actor_id = their_sync_state.actor_id;
 
-    write_sync_msg(
+    encode_write_sync_msg(
         &mut codec,
+        &mut encode_buf,
         &mut send_buf,
         SyncMessage::V1(SyncMessageV1::Clock(agent.clock().new_timestamp().into())),
         &mut write,
@@ -849,14 +901,19 @@ pub async fn bidirectional_sync(
     write.flush().await.map_err(SyncSendError::from)?;
 
     match read_sync_msg(&mut read).await? {
-        Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => {
-            if let Err(e) = agent
-                .clock()
-                .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), their_actor_id.into()))
-            {
-                warn!("could not update clock from actor {their_actor_id}: {e}");
+        Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match their_actor_id.try_into() {
+            Ok(id) => {
+                if let Err(e) = agent
+                    .clock()
+                    .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), id))
+                {
+                    warn!("could not update clock from actor {their_actor_id}: {e}");
+                }
             }
-        }
+            Err(e) => {
+                error!("could not convert ActorId to uhlc ID: {e}");
+            }
+        },
         Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
         None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
     }
@@ -872,15 +929,41 @@ pub async fn bidirectional_sync(
         .inspect_err(|e| error!("could not process sync request: {e}")),
     );
 
+    let tx_changes = agent.tx_changes().clone();
+
     let (_sent_count, recv_count) = tokio::try_join!(
         async move {
             let mut count = 0;
 
-            while let Some(msg) = rx.recv().await {
-                if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
-                    count += change.len();
+            let mut check_buf = tokio::time::interval(Duration::from_secs(1));
+
+            loop {
+                tokio::select! {
+                    maybe_msg = rx.recv() => match maybe_msg {
+                        Some(msg) => {
+                            if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
+                                count += change.len();
+                            }
+                            encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
+
+                            if send_buf.len() >= 16 * 1024 {
+                                write_sync_buf(&mut send_buf, &mut write).await?;
+                            }
+                        },
+                        None => {
+                            break;
+                        }
+                    },
+                    _ = check_buf.tick() => {
+                        if !send_buf.is_empty() {
+                            write_sync_buf(&mut send_buf, &mut write).await?;
+                        }
+                    }
                 }
-                write_sync_msg(&mut codec, &mut send_buf, msg, &mut write).await?;
+            }
+
+            if !send_buf.is_empty() {
+                write_sync_buf(&mut send_buf, &mut write).await?;
             }
 
             if let Err(e) = write.finish().await {
@@ -896,9 +979,6 @@ pub async fn bidirectional_sync(
         async move {
             let mut count = 0;
 
-            // changes buffer
-            let mut buf = Vec::with_capacity(4);
-
             loop {
                 match read_sync_msg(&mut read).await {
                     Ok(None) => {
@@ -910,9 +990,11 @@ pub async fn bidirectional_sync(
                     }
                     Ok(Some(msg)) => match msg {
                         SyncMessage::V1(SyncMessageV1::Changeset(change)) => {
-                            let len = change.len();
-                            buf.push(change);
-                            count += len;
+                            count += change.len();
+                            tx_changes
+                                .send((change, ChangeSource::Sync))
+                                .await
+                                .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
                         }
                         SyncMessage::V1(SyncMessageV1::State(_)) => {
                             warn!("received sync state message more than once, ignoring");
@@ -924,17 +1006,7 @@ pub async fn bidirectional_sync(
                         }
                     },
                 }
-
-                if buf.len() == buf.capacity() {
-                    process_multiple_changes(agent, buf.drain(..).collect())
-                        .await
-                        .map_err(SyncRecvError::from)?;
-                }
             }
-
-            process_multiple_changes(agent, buf.drain(..).collect())
-                .await
-                .map_err(SyncRecvError::from)?;
 
             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
 
@@ -949,14 +1021,227 @@ pub async fn bidirectional_sync(
 
 #[cfg(test)]
 mod tests {
+    use axum::{Extension, Json};
     use camino::Utf8PathBuf;
+    use corro_tests::TEST_SCHEMA;
     use corro_types::{
-        config::TlsConfig,
+        api::{ColumnName, TableName},
+        config::{Config, TlsConfig},
+        pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
+    use hyper::StatusCode;
     use tempfile::TempDir;
+    use tokio::sync::mpsc;
+    use tripwire::Tripwire;
+
+    use crate::{
+        agent::{process_multiple_changes, setup},
+        api::public::api_v1_db_schema,
+    };
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_known_version() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
+        let dir = tempfile::tempdir()?;
+
+        let (agent, _agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire,
+        )
+        .await?;
+
+        let (status_code, _res) =
+            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+
+        let ts = agent.clock().new_timestamp().into();
+
+        let change1 = Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![1i64.into()])?,
+            cid: ColumnName("text".into()),
+            val: "one".into(),
+            col_version: 1,
+            db_version: 1,
+            seq: 0,
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        let change2 = Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![2i64.into()])?,
+            cid: ColumnName("text".into()),
+            val: "two".into(),
+            col_version: 1,
+            db_version: 2,
+            seq: 0,
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        process_multiple_changes(
+            &agent,
+            vec![
+                (
+                    ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Full {
+                            version: 1,
+                            changes: vec![change1.clone()],
+                            seqs: 0..=0,
+                            last_seq: 0,
+                            ts,
+                        },
+                    },
+                    ChangeSource::Sync,
+                ),
+                (
+                    ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Full {
+                            version: 2,
+                            changes: vec![change2.clone()],
+                            seqs: 0..=0,
+                            last_seq: 0,
+                            ts,
+                        },
+                    },
+                    ChangeSource::Sync,
+                ),
+            ],
+        )
+        .await?;
+
+        let known1 = KnownDbVersion::Current {
+            db_version: 1,
+            last_seq: 0,
+            ts,
+        };
+
+        let known2 = KnownDbVersion::Current {
+            db_version: 2,
+            last_seq: 0, // original last seq
+            ts,
+        };
+
+        let booked = agent
+            .bookie()
+            .read("test")
+            .await
+            .get(&actor_id)
+            .cloned()
+            .unwrap();
+
+        {
+            let read = booked.read("test").await;
+
+            assert_eq!(read.get(&1).unwrap().clone(), known1);
+            assert_eq!(read.get(&2).unwrap().clone(), known2);
+        }
+
+        {
+            let (tx, mut rx) = mpsc::channel(5);
+            let mut conn = agent.pool().read().await?;
+
+            {
+                let mut prepped = conn.prepare("SELECT * FROM crsql_changes;")?;
+                let mut rows = prepped.query([])?;
+
+                loop {
+                    let row = rows.next()?;
+                    if row.is_none() {
+                        break;
+                    }
+
+                    println!("ROW: {row:?}");
+                }
+            }
+
+            block_in_place(|| {
+                handle_known_version(
+                    &mut conn,
+                    actor_id,
+                    false,
+                    1,
+                    known1,
+                    &booked,
+                    vec![0..=0],
+                    0,
+                    ts,
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: 1,
+                        changes: vec![change1],
+                        seqs: 0..=0,
+                        last_seq: 0,
+                        ts,
+                    }
+                }))
+            );
+
+            block_in_place(|| {
+                handle_known_version(
+                    &mut conn,
+                    actor_id,
+                    false,
+                    2,
+                    known2,
+                    &booked,
+                    vec![0..=0],
+                    0,
+                    ts,
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: 2,
+                        changes: vec![change2],
+                        seqs: 0..=0,
+                        last_seq: 0,
+                        ts,
+                    }
+                }))
+            );
+        }
+
+        // make_broadcastable_change(&agent, |tx| {
+        //     tx.execute("INSERT INTO test (id, text) VALUES (1, \"one\")", [])
+        // })?;
+
+        // make_broadcastable_change(&agent, |tx| {
+        //     tx.execute("INSERT INTO test (id, text) VALUES (2, \"two\")", [])
+        // })?;
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_mutual_tls() -> eyre::Result<()> {

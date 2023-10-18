@@ -21,16 +21,101 @@ pub mod sqlite;
 #[serde(rename_all = "snake_case")]
 pub enum QueryEvent {
     Columns(Vec<CompactString>),
-    Row(i64, Vec<SqliteValue>),
+    Row(RowId, Vec<SqliteValue>),
     #[serde(rename = "eoq")]
     EndOfQuery {
         time: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        change_id: Option<ChangeId>,
     },
-    Change(ChangeType, i64, Vec<SqliteValue>),
+    Change(ChangeType, RowId, Vec<SqliteValue>, ChangeId),
     Error(CompactString),
 }
 
-pub type RowIdCells = (i64, Vec<SqliteValue>);
+impl QueryEvent {
+    pub fn meta(&self) -> QueryEventMeta {
+        match self {
+            QueryEvent::Columns(_) => QueryEventMeta::Columns,
+            QueryEvent::Row(rowid, _) => QueryEventMeta::Row(*rowid),
+            QueryEvent::EndOfQuery { .. } => QueryEventMeta::EndOfQuery,
+            QueryEvent::Change(_, _, _, id) => QueryEventMeta::Change(*id),
+            QueryEvent::Error(_) => QueryEventMeta::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum QueryEventMeta {
+    Columns,
+    Row(RowId),
+    EndOfQuery,
+    Change(ChangeId),
+    Error,
+}
+
+/// RowId newtype to differentiate from ChangeId
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
+#[serde(transparent)]
+pub struct RowId(pub i64);
+
+impl fmt::Display for RowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<i64> for RowId {
+    fn from(value: i64) -> Self {
+        Self(value)
+    }
+}
+
+impl FromSql for RowId {
+    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value {
+            ValueRef::Integer(i) => Ok(i.into()),
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
+impl ToSql for RowId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
+    }
+}
+
+/// ChangeId newtype to differentiate from RowId
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
+#[serde(transparent)]
+pub struct ChangeId(pub i64);
+
+impl fmt::Display for ChangeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<i64> for ChangeId {
+    fn from(value: i64) -> Self {
+        Self(value)
+    }
+}
+
+impl FromSql for ChangeId {
+    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value {
+            ValueRef::Integer(i) => Ok(i.into()),
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
+impl ToSql for ChangeId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]

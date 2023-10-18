@@ -36,7 +36,7 @@ mod tests {
 
         tokio::fs::write(
             new_path.join("blah.sql"),
-            b"CREATE TABLE blah (id BIGINT PRIMARY KEY);",
+            b"CREATE TABLE blah (id BIGINT NOT NULL PRIMARY KEY);",
         )
         .await?;
 

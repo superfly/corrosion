@@ -20,9 +20,9 @@ use corro_types::{
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tokio_util::codec::{Decoder, LinesCodec};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{
     fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
     EnvFilter,
@@ -119,10 +119,14 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
 
                 for table in tables {
-                    let n = conn.execute(&format!("UPDATE \"{table}\" SET __crsql_site_id = ? WHERE __crsql_site_id IS NULL"), [ordinal])?;
+                    let n = conn.execute(
+                        &format!("UPDATE \"{table}\" SET site_id = ? WHERE site_id IS NULL"),
+                        [ordinal],
+                    )?;
                     debug!("updated {n} rows in {table}");
                 }
 
+                // clear __corro_members, this state is per actor
                 conn.execute("DELETE FROM __corro_members;", [])?;
 
                 conn.execute_batch(
@@ -135,9 +139,65 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
 
             info!("successfully cleaned for restoration and backed up database to {path}");
         }
-        Command::Restore { path } => {
+        Command::Restore {
+            path,
+            self_actor_id,
+        } => {
             if AdminConn::connect(cli.admin_path()).await.is_ok() {
                 eyre::bail!("corrosion is currently running, shut it down before restoring!");
+            }
+
+            if *self_actor_id {
+                let db_path = match cli.db_path() {
+                    Ok(db_path) => db_path,
+                    Err(_e) => {
+                        eyre::bail!(
+                            "path to current database is required when passing --self-actor-id"
+                        );
+                    }
+                };
+
+                let site_id: [u8; 16] = {
+                    let conn = Connection::open(&db_path)?;
+                    conn.query_row(
+                        "SELECT site_id FROM crsql_site_id WHERE ordinal = 0;",
+                        [],
+                        |row| row.get(0),
+                    )?
+                };
+
+                let conn = Connection::open(path)?;
+
+                let ordinal: Option<i64> = conn
+                    .query_row(
+                        "DELETE FROM crsql_site_id WHERE site_id = ? RETURNING ordinal",
+                        [site_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if ordinal.is_none() {
+                    warn!("snapshot database did not know about the current actor id");
+                }
+
+                let inserted = conn.execute(
+                    "INSERT INTO crsql_site_id (ordinal, site_id) VALUES (0, ?)",
+                    [site_id],
+                )?;
+                if inserted != 1 {
+                    eyre::bail!("could not insert old site id into crsql_site_id table");
+                }
+
+                if let Some(ordinal) = ordinal {
+                    let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+
+                    for table in tables {
+                        let n = conn.execute(
+                            &format!("UPDATE \"{table}\" SET site_id = NULL WHERE site_id = ?"),
+                            [ordinal],
+                        )?;
+                        info!("Updated {n} rows in {table}");
+                    }
+                }
             }
 
             let restored =
@@ -203,12 +263,12 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                                 .join("|")
                         );
                     }
-                    QueryEvent::EndOfQuery { time } => {
+                    QueryEvent::EndOfQuery { time, .. } => {
                         if *timer {
                             println!("time: {time}s");
                         }
                     }
-                    QueryEvent::Change(_, _, _) => {
+                    QueryEvent::Change(_, _, _, _) => {
                         break;
                     }
                     QueryEvent::Error(e) => {
@@ -259,6 +319,11 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 corro_admin::SyncCommand::Generate,
             ))
             .await?;
+        }
+        Command::Locks { top } => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Locks { top: *top })
+                .await?;
         }
         Command::Template { template, flags } => {
             command::tpl::run(cli.api_addr()?, template, flags).await?;
@@ -367,10 +432,16 @@ enum Command {
     Agent,
 
     /// Backup the Corrosion DB
-    Backup { path: String },
+    Backup {
+        path: String,
+    },
 
     /// Restore the Corrosion DB from a backup
-    Restore { path: PathBuf },
+    Restore {
+        path: PathBuf,
+        #[arg(long, default_value = "false")]
+        self_actor_id: bool,
+    },
 
     /// Consul interactions
     #[command(subcommand)]
@@ -403,6 +474,10 @@ enum Command {
     /// Sync-related commands
     #[command(subcommand)]
     Sync(SyncCommand),
+
+    Locks {
+        top: usize,
+    },
 
     Template {
         template: Vec<String>,

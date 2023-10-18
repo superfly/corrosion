@@ -1,16 +1,11 @@
-use std::{error::Error as StdError, io, net::SocketAddr, ops::Deref, path::Path, time::Duration};
+pub mod sub;
 
-use bytes::{Buf, BytesMut};
-use corro_api_types::{
-    sqlite::RusqliteConnManager, ExecResponse, ExecResult, QueryEvent, Statement,
-};
-use futures::{Stream, TryStreamExt};
+use std::{net::SocketAddr, ops::Deref, path::Path};
+
+use corro_api_types::{ChangeId, ExecResponse, ExecResult, Statement};
+use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
-use tokio_serde::{formats::SymmetricalJson, SymmetricallyFramed};
-use tokio_util::{
-    codec::{Decoder, FramedRead, LinesCodecError},
-    io::StreamReader,
-};
+use sub::SubscriptionStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -70,16 +65,22 @@ impl CorrosionApiClient {
     pub async fn subscribe(
         &self,
         statement: &Statement,
-    ) -> Result<
-        (
-            Uuid,
-            impl Stream<Item = io::Result<QueryEvent>> + Send + Sync + 'static,
-        ),
-        Error,
-    > {
+        from: Option<ChangeId>,
+    ) -> Result<SubscriptionStream, Error> {
+        let p_and_q: PathAndQuery = if let Some(change_id) = from {
+            format!("/v1/subscriptions?from={}", change_id.0).try_into()?
+        } else {
+            PathAndQuery::from_static("/v1/subscriptions")
+        };
+        let url = hyper::Uri::builder()
+            .scheme("http")
+            .authority(self.api_addr.to_string())
+            .path_and_query(p_and_q)
+            .build()?;
+
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/v1/subscriptions", self.api_addr))
+            .uri(url)
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statement)?))?;
@@ -97,16 +98,34 @@ impl CorrosionApiClient {
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
             .ok_or(Error::ExpectedQueryId)?;
 
-        Ok((id, subscription_stream(res.into_body())))
+        Ok(SubscriptionStream::new(
+            id,
+            from,
+            self.api_client.clone(),
+            self.api_addr,
+            res.into_body(),
+        ))
     }
 
     pub async fn subscription(
         &self,
         id: Uuid,
-    ) -> Result<impl Stream<Item = io::Result<QueryEvent>> + Send + Sync + 'static, Error> {
+        from: Option<ChangeId>,
+    ) -> Result<SubscriptionStream, Error> {
+        let p_and_q: PathAndQuery = if let Some(change_id) = from {
+            format!("/v1/subscriptions/{id}?from={}", change_id.0).try_into()?
+        } else {
+            format!("/v1/subscriptions/{id}").try_into()?
+        };
+        let url = hyper::Uri::builder()
+            .scheme("http")
+            .authority(self.api_addr.to_string())
+            .path_and_query(p_and_q)
+            .build()?;
+
         let req = hyper::Request::builder()
             .method(hyper::Method::GET)
-            .uri(format!("http://{}/v1/subscriptions/{}", self.api_addr, id))
+            .uri(url)
             .header(hyper::header::ACCEPT, "application/json")
             .body(hyper::Body::empty())?;
 
@@ -116,7 +135,13 @@ impl CorrosionApiClient {
             return Err(Error::UnexpectedStatusCode(res.status()));
         }
 
-        Ok(subscription_stream(res.into_body()))
+        Ok(SubscriptionStream::new(
+            id,
+            from,
+            self.api_client.clone(),
+            self.api_addr,
+            res.into_body(),
+        ))
     }
 
     pub async fn execute(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
@@ -240,162 +265,24 @@ impl CorrosionApiClient {
     }
 }
 
-fn subscription_stream(body: hyper::Body) -> impl Stream<Item = io::Result<QueryEvent>> {
-    let body = StreamReader::new(body.map_err(|e| {
-        if let Some(io_error) = e
-            .source()
-            .and_then(|source| source.downcast_ref::<io::Error>())
-        {
-            return io::Error::from(io_error.kind());
-        }
-        io::Error::new(io::ErrorKind::Other, e)
-    }));
-
-    let framed = FramedRead::new(body, LinesBytesCodec::new())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
-
-    SymmetricallyFramed::new(framed, SymmetricalJson::<QueryEvent>::default())
-}
-
-struct LinesBytesCodec {
-    // Stored index of the next index to examine for a `\n` character.
-    // This is used to optimize searching.
-    // For example, if `decode` was called with `abc`, it would hold `3`,
-    // because that is the next index to examine.
-    // The next time `decode` is called with `abcde\n`, the method will
-    // only look at `de\n` before returning.
-    next_index: usize,
-
-    /// The maximum length for a given line. If `usize::MAX`, lines will be
-    /// read until a `\n` character is reached.
-    max_length: usize,
-
-    /// Are we currently discarding the remainder of a line which was over
-    /// the length limit?
-    is_discarding: bool,
-}
-
-impl LinesBytesCodec {
-    /// Returns a `LinesBytesCodec` for splitting up data into lines.
-    ///
-    /// # Note
-    ///
-    /// The returned `LinesBytesCodec` will not have an upper bound on the length
-    /// of a buffered line. See the documentation for [`new_with_max_length`]
-    /// for information on why this could be a potential security risk.
-    ///
-    /// [`new_with_max_length`]: crate::codec::LinesBytesCodec::new_with_max_length()
-    pub fn new() -> LinesBytesCodec {
-        LinesBytesCodec {
-            next_index: 0,
-            max_length: usize::MAX,
-            is_discarding: false,
-        }
-    }
-}
-
-impl Decoder for LinesBytesCodec {
-    type Item = BytesMut;
-    type Error = LinesCodecError;
-
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<BytesMut>, LinesCodecError> {
-        loop {
-            // Determine how far into the buffer we'll search for a newline. If
-            // there's no max_length set, we'll read to the end of the buffer.
-            let read_to = std::cmp::min(self.max_length.saturating_add(1), buf.len());
-
-            let newline_offset = buf[self.next_index..read_to]
-                .iter()
-                .position(|b| *b == b'\n');
-
-            match (self.is_discarding, newline_offset) {
-                (true, Some(offset)) => {
-                    // If we found a newline, discard up to that offset and
-                    // then stop discarding. On the next iteration, we'll try
-                    // to read a line normally.
-                    buf.advance(offset + self.next_index + 1);
-                    self.is_discarding = false;
-                    self.next_index = 0;
-                }
-                (true, None) => {
-                    // Otherwise, we didn't find a newline, so we'll discard
-                    // everything we read. On the next iteration, we'll continue
-                    // discarding up to max_len bytes unless we find a newline.
-                    buf.advance(read_to);
-                    self.next_index = 0;
-                    if buf.is_empty() {
-                        return Ok(None);
-                    }
-                }
-                (false, Some(offset)) => {
-                    // Found a line!
-                    let newline_index = offset + self.next_index;
-                    self.next_index = 0;
-                    let mut line = buf.split_to(newline_index + 1);
-                    line.truncate(line.len() - 1);
-                    without_carriage_return(&mut line);
-                    return Ok(Some(line));
-                }
-                (false, None) if buf.len() > self.max_length => {
-                    // Reached the maximum length without finding a
-                    // newline, return an error and start discarding on the
-                    // next call.
-                    self.is_discarding = true;
-                    return Err(LinesCodecError::MaxLineLengthExceeded);
-                }
-                (false, None) => {
-                    // We didn't find a line or reach the length limit, so the next
-                    // call will resume searching at the current offset.
-                    self.next_index = read_to;
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
-    fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<BytesMut>, LinesCodecError> {
-        Ok(match self.decode(buf)? {
-            Some(frame) => Some(frame),
-            None => {
-                // No terminating newline - return remaining data, if any
-                if buf.is_empty() || buf == &b"\r"[..] {
-                    None
-                } else {
-                    let mut line = buf.split_to(buf.len());
-                    line.truncate(line.len() - 1);
-                    without_carriage_return(&mut line);
-                    self.next_index = 0;
-                    Some(line)
-                }
-            }
-        })
-    }
-}
-
-fn without_carriage_return(s: &mut BytesMut) {
-    if let Some(&b'\r') = s.last() {
-        s.truncate(s.len() - 1);
-    }
-}
-
 #[derive(Clone)]
 pub struct CorrosionClient {
     api_client: CorrosionApiClient,
-    pool: bb8::Pool<RusqliteConnManager>,
+    pool: sqlite_pool::RusqlitePool,
 }
 
 impl CorrosionClient {
     pub fn new<P: AsRef<Path>>(api_addr: SocketAddr, db_path: P) -> Self {
         Self {
             api_client: CorrosionApiClient::new(api_addr),
-            pool: bb8::Pool::builder()
+            pool: sqlite_pool::Config::new(db_path.as_ref())
                 .max_size(5)
-                .max_lifetime(Some(Duration::from_secs(30)))
-                .build_unchecked(RusqliteConnManager::new(&db_path)),
+                .create_pool()
+                .expect("could not build pool, this can't fail because we specified a runtime"),
         }
     }
 
-    pub fn pool(&self) -> &bb8::Pool<RusqliteConnManager> {
+    pub fn pool(&self) -> &sqlite_pool::RusqlitePool {
         &self.pool
     }
 }
@@ -412,6 +299,8 @@ impl Deref for CorrosionClient {
 pub enum Error {
     #[error(transparent)]
     Hyper(#[from] hyper::Error),
+    #[error(transparent)]
+    InvalidUri(#[from] http::uri::InvalidUri),
     #[error(transparent)]
     Http(#[from] hyper::http::Error),
     #[error(transparent)]

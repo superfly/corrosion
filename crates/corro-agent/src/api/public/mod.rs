@@ -9,16 +9,16 @@ use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
-    api::{ExecResponse, ExecResult, QueryEvent, Statement},
+    api::{row_to_change, ExecResponse, ExecResult, QueryEvent, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
-    change::{row_to_change, SqliteValue},
-    schema::{make_schema_inner, parse_sql},
+    change::SqliteValue,
+    schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
 use itertools::Itertools;
 use metrics::counter;
-use rusqlite::{params, params_from_iter, ToSql, Transaction};
+use rusqlite::{named_params, params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
     sync::{
@@ -160,10 +160,18 @@ where
     trace!("got conn");
 
     let actor_id = agent.actor_id();
-    let booked = agent.bookie().for_actor(actor_id).await;
+    let booked = {
+        agent
+            .bookie()
+            .write("make_broadcastable_changes(for_actor)")
+            .await
+            .for_actor(actor_id)
+    };
     // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
     // so it probably doesn't matter too much, except for reads of internal state
-    let mut book_writer = booked.write().await;
+    let mut book_writer = booked
+        .write("make_broadcastable_changes(booked writer)")
+        .await;
 
     let start = Instant::now();
     block_in_place(move || {
@@ -189,25 +197,33 @@ where
             return Ok((ret, start.elapsed()));
         }
 
+        let last_version = book_writer.last().unwrap_or(0);
+        trace!("last_version: {last_version}");
+        let version = last_version + 1;
+        trace!("version: {version}");
+
         let last_seq: i64 = tx
             .prepare_cached(
                 "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
             )?
             .query_row([db_version], |row| row.get(0))?;
 
-        let last_version = book_writer.last().unwrap_or(0);
-        trace!("last_version: {last_version}");
-        let version = last_version + 1;
-        trace!("version: {version}");
-
         let elapsed = {
             tx.prepare_cached(
                 r#"
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
-                    VALUES (?, ?, ?, ?, ?);
+                    VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
             "#,
             )?
-            .execute(params![actor_id, version, db_version, last_seq, ts])?;
+            .execute(named_params! {
+                ":actor_id": actor_id,
+                ":start_version": version,
+                ":db_version": db_version,
+                ":last_seq": last_seq,
+                ":ts": ts
+            })?;
+
+            debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
             tx.commit()?;
             start.elapsed()
@@ -501,7 +517,8 @@ async fn build_query_rows_response(
                             .collect::<rusqlite::Result<Vec<_>>>()
                         {
                             Ok(cells) => {
-                                if let Err(e) = data_tx.blocking_send(QueryEvent::Row(rowid, cells))
+                                if let Err(e) =
+                                    data_tx.blocking_send(QueryEvent::Row(rowid.into(), cells))
                                 {
                                     error!("could not send back row: {e}");
                                     return;
@@ -527,6 +544,7 @@ async fn build_query_rows_response(
 
             _ = data_tx.blocking_send(QueryEvent::EndOfQuery {
                 time: elapsed.as_secs_f64(),
+                change_id: None,
             });
         });
     });
@@ -628,7 +646,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     block_in_place(|| {
         let tx = conn.transaction()?;
 
-        make_schema_inner(&tx, &schema_write, &mut new_schema)?;
+        apply_schema(&tx, &schema_write, &mut new_schema)?;
 
         for tbl_name in partial_schema.tables.keys() {
             tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
@@ -689,19 +707,17 @@ pub async fn api_v1_db_schema(
 
 #[cfg(test)]
 mod tests {
-    use arc_swap::ArcSwap;
     use bytes::Bytes;
-    use corro_types::{actor::ActorId, agent::SplitPool, config::Config, schema::SqliteType};
+    use corro_types::{api::RowId, config::Config, schema::SqliteType};
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
-    use tokio::sync::mpsc::{channel, error::TryRecvError};
+    use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
-    use uuid::Uuid;
 
     use super::*;
 
-    use crate::agent::migrate;
+    use crate::agent::setup;
 
     struct UnsyncBodyStream(std::pin::Pin<Box<UnsyncBoxBody<Bytes, axum::Error>>>);
 
@@ -724,36 +740,17 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
-
-        {
-            let mut conn = pool.write_priority().await?;
-            migrate(&mut conn)?;
-        }
-
-        let (tx_bcast, mut rx_bcast) = channel(1);
-        let (tx_apply, _rx_apply) = channel(1);
-
-        let agent = Agent::new(corro_types::agent::AgentConfig {
-            actor_id: ActorId(Uuid::new_v4()),
-            pool,
-            config: ArcSwap::from_pointee(
-                Config::builder()
-                    .db_path(dir.path().join("corrosion.db").display().to_string())
-                    .gossip_addr("127.0.0.1:1234".parse()?)
-                    .api_addr("127.0.0.1:8080".parse()?)
-                    .build()?,
-            ),
-            gossip_addr: "127.0.0.1:0".parse().unwrap(),
-            api_addr: "127.0.0.1:0".parse().unwrap(),
-            members: Default::default(),
-            clock: Default::default(),
-            bookie: Default::default(),
-            tx_bcast,
-            tx_apply,
-            schema: Default::default(),
+        let (agent, mut agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
             tripwire,
-        });
+        )
+        .await?;
+
+        let rx_bcast = &mut agent_options.rx_bcast;
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
@@ -791,7 +788,17 @@ mod tests {
             }))
         ));
 
-        assert_eq!(agent.bookie().last(&agent.actor_id()).await, Some(1));
+        assert_eq!(
+            agent
+                .bookie()
+                .write("test")
+                .await
+                .for_actor(agent.actor_id())
+                .read("test")
+                .await
+                .last(),
+            Some(1)
+        );
 
         println!("second req...");
 
@@ -824,36 +831,15 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
 
-        let pool = SplitPool::create(dir.path().join("./test.sqlite"), tripwire.clone()).await?;
-
-        {
-            let mut conn = pool.write_priority().await?;
-            migrate(&mut conn)?;
-        }
-
-        let (tx_bcast, _rx_bcast) = channel(1);
-        let (tx_apply, _rx_apply) = channel(1);
-
-        let agent = Agent::new(corro_types::agent::AgentConfig {
-            actor_id: ActorId(Uuid::new_v4()),
-            pool,
-            config: ArcSwap::from_pointee(
-                Config::builder()
-                    .db_path(dir.path().join("corrosion.db").display().to_string())
-                    .gossip_addr("127.0.0.1:1234".parse()?)
-                    .api_addr("127.0.0.1:8080".parse()?)
-                    .build()?,
-            ),
-            gossip_addr: "127.0.0.1:0".parse().unwrap(),
-            api_addr: "127.0.0.1:0".parse().unwrap(),
-            members: Default::default(),
-            clock: Default::default(),
-            bookie: Default::default(),
-            tx_bcast,
-            tx_apply,
-            schema: Default::default(),
+        let (agent, _agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
             tripwire,
-        });
+        )
+        .await?;
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
@@ -917,7 +903,7 @@ mod tests {
 
         assert_eq!(
             row,
-            QueryEvent::Row(1, vec!["service-id".into(), "service-name".into()])
+            QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
         );
 
         buf.extend_from_slice(&body.data().await.unwrap()?);
@@ -928,7 +914,10 @@ mod tests {
 
         assert_eq!(
             row,
-            QueryEvent::Row(2, vec!["service-id-2".into(), "service-name-2".into()])
+            QueryEvent::Row(
+                RowId(2),
+                vec!["service-id-2".into(), "service-name-2".into()]
+            )
         );
 
         buf.extend_from_slice(&body.data().await.unwrap()?);
@@ -950,43 +939,21 @@ mod tests {
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
 
         let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("./test.sqlite");
 
-        let pool = SplitPool::create(&db_path, tripwire.clone()).await?;
-
-        {
-            let mut conn = pool.write_priority().await?;
-            migrate(&mut conn)?;
-        }
-
-        let (tx_bcast, _rx_bcast) = channel(1);
-        let (tx_apply, _rx_apply) = channel(1);
-
-        let agent = Agent::new(corro_types::agent::AgentConfig {
-            actor_id: ActorId(Uuid::new_v4()),
-            pool,
-            config: ArcSwap::from_pointee(
-                Config::builder()
-                    .db_path(dir.path().join("corrosion.db").display().to_string())
-                    .gossip_addr("127.0.0.1:1234".parse()?)
-                    .api_addr("127.0.0.1:8080".parse()?)
-                    .build()?,
-            ),
-            gossip_addr: "127.0.0.1:0".parse().unwrap(),
-            api_addr: "127.0.0.1:0".parse().unwrap(),
-            members: Default::default(),
-            clock: Default::default(),
-            bookie: Default::default(),
-            tx_bcast,
-            tx_apply,
-            schema: Default::default(),
+        let (agent, _agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
             tripwire,
-        });
+        )
+        .await?;
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
             axum::Json(vec![
-                "CREATE TABLE tests (id BIGINT PRIMARY KEY, foo TEXT);".into(),
+                "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
             ]),
         )
         .await;
@@ -1004,7 +971,7 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert!(id_col.nullable);
+            assert!(!id_col.nullable);
             assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
@@ -1017,8 +984,8 @@ mod tests {
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
             axum::Json(vec![
-                "CREATE TABLE tests2 (id BIGINT PRIMARY KEY, foo TEXT);".into(),
-                "CREATE TABLE tests (id BIGINT PRIMARY KEY, foo TEXT);".into(),
+                "CREATE TABLE tests2 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
+                "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
             ]),
         )
         .await;
@@ -1035,7 +1002,7 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert!(id_col.nullable);
+            assert!(!id_col.nullable);
             assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
@@ -1052,7 +1019,7 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert!(id_col.nullable);
+            assert!(!id_col.nullable);
             assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
@@ -1064,7 +1031,7 @@ mod tests {
 
         // w/ existing table!
 
-        let create_stmt = "CREATE TABLE tests3 (id BIGINT PRIMARY KEY, foo TEXT, updated_at INTEGER NOT NULL DEFAULT 0);";
+        let create_stmt = "CREATE TABLE tests3 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT, updated_at INTEGER NOT NULL DEFAULT 0);";
 
         {
             // adding the table and an index
@@ -1107,7 +1074,7 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert!(id_col.nullable);
+            assert!(!id_col.nullable);
             assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
@@ -1124,7 +1091,7 @@ mod tests {
             let id_col = tests.columns.get("id").unwrap();
             assert_eq!(id_col.name, "id");
             assert_eq!(id_col.sql_type, SqliteType::Integer);
-            assert!(id_col.nullable);
+            assert!(!id_col.nullable);
             assert!(id_col.primary_key);
 
             let foo_col = tests.columns.get("foo").unwrap();
