@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    hash::{Hash, Hasher},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -154,10 +155,9 @@ impl Transport {
     ) -> Result<Connection, TransportError> {
         let start = Instant::now();
 
-        let endpoint_idx = match addr {
-            SocketAddr::V4(v4) => (u32::from(*v4.ip()) % self.0.endpoints.len() as u32) as usize,
-            SocketAddr::V6(v6) => (u128::from(*v6.ip()) % self.0.endpoints.len() as u128) as usize,
-        };
+        let mut hasher = seahash::SeaHasher::new();
+        addr.hash(&mut hasher);
+        let endpoint_idx = (hasher.finish() % self.0.endpoints.len() as u64) as usize;
 
         async {
             match tokio::time::timeout(Duration::from_secs(5), self
