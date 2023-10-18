@@ -531,6 +531,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                         loop {
                                             match StreamExt::next(&mut framed).await {
                                                 Some(Ok(b)) => {
+                                                    counter!("corro.peer.stream.bytes.recv.total", b.len() as u64, "type" => "uni");
                                                     match UniPayload::read_from_buffer(&b) {
                                                         Ok(payload) => {
                                                             trace!("parsed a payload: {payload:?}");
