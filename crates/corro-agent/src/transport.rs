@@ -66,6 +66,9 @@ impl Transport {
             }
             Err(e) => {
                 increment_counter!("corro.transport.send_datagram.errors", "addr" => addr.to_string(), "error" => e.to_string());
+                if matches!(e, SendDatagramError::TooLarge) {
+                    warn!(%addr, "attempted to send a larger-than-PMTU datagram. len: {}", data.len());
+                }
                 return Err(e.into());
             }
         }
