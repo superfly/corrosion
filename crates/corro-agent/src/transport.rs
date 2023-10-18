@@ -12,7 +12,10 @@ use quinn::{
     SendStream, WriteError,
 };
 use quinn_proto::ConnectionStats;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::{
+    sync::{mpsc, Mutex, RwLock},
+    time::error::Elapsed,
+};
 use tracing::{debug, info_span, warn, Instrument};
 
 #[derive(Debug, Clone)]
@@ -35,6 +38,8 @@ pub enum TransportError {
     Datagram(#[from] SendDatagramError),
     #[error(transparent)]
     SendStreamWrite(#[from] WriteError),
+    #[error(transparent)]
+    TimedOut(#[from] Elapsed),
 }
 
 impl Transport {
@@ -137,22 +142,26 @@ impl Transport {
         let start = Instant::now();
 
         async {
-            match self
+            match tokio::time::timeout(Duration::from_secs(5), self
                 .0
                 .endpoint
-                .connect(addr, &server_name)?
+                .connect(addr, &server_name)?)
                 .await
             {
-                Ok(conn) => {
+                Ok(Ok(conn)) => {
                     histogram!(
                         "corro.transport.connect.time.seconds",
                         start.elapsed().as_secs_f64()
                     );
                     tracing::Span::current().record("rtt", conn.rtt().as_secs_f64());
                     Ok(conn)
+                },
+                Ok(Err(e)) => {
+                    increment_counter!("corro.transport.connect.errors", "addr" => server_name, "error" => e.to_string());
+                    Err(e.into())
                 }
                 Err(e) => {
-                    increment_counter!("corro.transport.connect.errors", "addr" => server_name, "error" => e.to_string());
+                    increment_counter!("corro.transport.connect.errors", "addr" => server_name, "error" => "timed out");
                     Err(e.into())
                 }
             }
