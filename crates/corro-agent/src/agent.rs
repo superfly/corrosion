@@ -10,9 +10,7 @@ use std::{
 
 use crate::{
     api::{
-        peer::{
-            gossip_client_endpoint, gossip_server_endpoint, parallel_sync, serve_sync, SyncError,
-        },
+        peer::{gossip_server_endpoint, parallel_sync, serve_sync, SyncError},
         public::{
             api_v1_db_schema, api_v1_queries, api_v1_transactions,
             pubsub::{
@@ -242,11 +240,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let gossip_server_endpoint = gossip_server_endpoint(&conf.gossip).await?;
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
-    let gossip_client_endpoint = gossip_client_endpoint(&conf.gossip).await?;
-
     let (rtt_tx, rtt_rx) = channel(128);
 
-    let transport = Transport::new(gossip_client_endpoint, rtt_tx);
+    let transport = Transport::new(&conf.gossip, rtt_tx).await?;
 
     let api_listener = TcpListener::bind(conf.api.bind_addr).await?;
     let api_addr = api_listener.local_addr()?;

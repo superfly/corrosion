@@ -6,6 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use corro_types::config::GossipConfig;
 use metrics::{gauge, histogram, increment_counter};
 use quinn::{
     ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
@@ -18,12 +19,14 @@ use tokio::{
 };
 use tracing::{debug, info_span, warn, Instrument};
 
+use crate::api::peer::gossip_client_endpoint;
+
 #[derive(Debug, Clone)]
 pub struct Transport(Arc<TransportInner>);
 
 #[derive(Debug)]
 struct TransportInner {
-    endpoint: Endpoint,
+    endpoints: Vec<Endpoint>,
     conns: RwLock<HashMap<SocketAddr, Arc<Mutex<Option<Connection>>>>>,
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
 }
@@ -43,12 +46,19 @@ pub enum TransportError {
 }
 
 impl Transport {
-    pub fn new(endpoint: Endpoint, rtt_tx: mpsc::Sender<(SocketAddr, Duration)>) -> Self {
-        Self(Arc::new(TransportInner {
-            endpoint,
+    pub async fn new(
+        config: &GossipConfig,
+        rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
+    ) -> eyre::Result<Self> {
+        let mut endpoints = vec![];
+        for _ in 0..4 {
+            endpoints.push(gossip_client_endpoint(config).await?);
+        }
+        Ok(Self(Arc::new(TransportInner {
+            endpoints,
             conns: Default::default(),
             rtt_tx,
-        }))
+        })))
     }
 
     #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
@@ -144,10 +154,15 @@ impl Transport {
     ) -> Result<Connection, TransportError> {
         let start = Instant::now();
 
+        let endpoint_idx = match addr {
+            SocketAddr::V4(v4) => (u32::from(*v4.ip()) % self.0.endpoints.len() as u32) as usize,
+            SocketAddr::V6(v6) => (u128::from(*v6.ip()) % self.0.endpoints.len() as u128) as usize,
+        };
+
         async {
             match tokio::time::timeout(Duration::from_secs(5), self
                 .0
-                .endpoint
+                .endpoints[endpoint_idx]
                 .connect(addr, &server_name)?)
                 .await
             {
