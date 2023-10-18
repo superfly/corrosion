@@ -415,13 +415,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     // async message decoder task
     tokio::spawn({
-        let bookie = agent.bookie().clone();
-        let self_actor_id = agent.actor_id();
+        let agent = agent.clone();
         async move {
             while let Some(payload) = process_uni_rx.recv().await {
                 match payload {
                     UniPayload::V1(UniPayloadV1::Broadcast(bcast)) => {
-                        handle_change(bcast, self_actor_id, &bookie, &bcast_msg_tx).await
+                        handle_change(&agent, bcast, &bcast_msg_tx).await
                     }
                 }
             }
@@ -1137,20 +1136,31 @@ fn collect_metrics(agent: &Agent, transport: &Transport) {
     }
 }
 
-pub async fn handle_change(
-    bcast: BroadcastV1,
-    self_actor_id: ActorId,
-    bookie: &Bookie,
-    bcast_msg_tx: &Sender<BroadcastV1>,
-) {
+pub async fn handle_change(agent: &Agent, bcast: BroadcastV1, bcast_msg_tx: &Sender<BroadcastV1>) {
     match bcast {
         BroadcastV1::Change(change) => {
+            let diff = if let Some(ts) = change.ts() {
+                if let Ok(id) = change.actor_id.try_into() {
+                    Some(
+                        agent
+                            .clock()
+                            .new_timestamp()
+                            .get_diff_duration(&uhlc::Timestamp::new(ts.0, id)),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             increment_counter!("corro.broadcast.recv.count", "kind" => "change");
 
             trace!("handling {} changes", change.len());
 
             let booked = {
-                bookie
+                agent
+                    .bookie()
                     .write(format!(
                         "handle_change(for_actor):{}",
                         change.actor_id.as_simple()
@@ -1171,9 +1181,14 @@ pub async fn handle_change(
                 return;
             }
 
-            if change.actor_id == self_actor_id {
+            if change.actor_id == agent.actor_id() {
                 return;
             }
+
+            if let Some(diff) = diff {
+                histogram!("corro.broadcast.recv.lag.seconds", diff.as_secs_f64(), "actor_id" => change.actor_id.to_string());
+            }
+
             if let Err(e) = bcast_msg_tx.send(BroadcastV1::Change(change)).await {
                 error!("could not send change message through broadcast channel: {e}");
             }
