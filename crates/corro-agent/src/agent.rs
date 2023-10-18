@@ -1084,7 +1084,7 @@ async fn clear_overwritten_versions(agent: Agent) {
                 .filter_map(|(_, v)| bookedw.cleared.get(v))
                 .dedup()
             {
-                if let Err(e) = agent.tx_empty().send((actor_id, range.clone())).await {
+                if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
                     error!("could not schedule version to be cleared: {e}");
                 } else {
                     inserted += 1;
@@ -1178,13 +1178,17 @@ pub async fn handle_change(
 
             trace!("handling {} changes", change.len());
 
-            if bookie
-                .write(format!(
-                    "handle_change(for_actor):{}",
-                    change.actor_id.as_simple()
-                ))
-                .await
-                .for_actor(change.actor_id)
+            let booked = {
+                bookie
+                    .write(format!(
+                        "handle_change(for_actor):{}",
+                        change.actor_id.as_simple()
+                    ))
+                    .await
+                    .for_actor(change.actor_id)
+            };
+
+            if booked
                 .read(format!(
                     "handle_change(contains?):{}",
                     change.actor_id.as_simple()
