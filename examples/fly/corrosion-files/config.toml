@@ -5,13 +5,12 @@ schema_paths = ["/etc/corrosion/schemas"]
 [gossip]
 # addr and bootstrap for Fly.io deployment example are written 
 # on startup by entrypoint script
-plaintext = true # Cryptography and authz are handled by Fly.io private networking
-max_mtu = 1372 # For Fly.io private network
+plaintext = true   # Cryptography and authz are handled by Fly.io private networking
+max_mtu = 1372     # For Fly.io private network
 disable_gso = true # For Fly.io private network
 
 [api]
 addr = "[::]:8080" # Must be available on IPv6 for Fly.io private network
-# authz = { bearer-token = "secure-token" }
 
 [admin]
 path = "/app/admin.sock"
