@@ -16,13 +16,13 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use time::OffsetDateTime;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{self, Sender};
 use tracing::{error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
     actor::{Actor, ActorId},
-    sync::SyncStateV1,
+    sync::SyncTraceContextV1,
 };
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -42,7 +42,11 @@ pub enum BiPayload {
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum BiPayloadV1 {
-    SyncState(SyncStateV1),
+    SyncStart {
+        actor_id: ActorId,
+        #[speedy(default_on_eof)]
+        trace_ctx: SyncTraceContextV1,
+    },
 }
 
 #[derive(Debug)]
@@ -51,6 +55,12 @@ pub enum FocaInput {
     Data(Bytes),
     ClusterSize(NonZeroU32),
     ApplyMany(Vec<Member<Actor>>),
+    Cmd(FocaCmd),
+}
+
+#[derive(Debug)]
+pub enum FocaCmd {
+    MembershipStates(mpsc::Sender<foca::Member<Actor>>),
 }
 
 #[derive(Debug, Clone, Readable, Writable)]

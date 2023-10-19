@@ -3,6 +3,7 @@ use std::{fmt::Display, time::Duration};
 use camino::Utf8PathBuf;
 use corro_types::{
     agent::{Agent, LockKind, LockMeta, LockState},
+    broadcast::{FocaCmd, FocaInput},
     sqlite::SqlitePoolError,
     sync::generate_sync,
 };
@@ -10,7 +11,10 @@ use futures::{SinkExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
 use time::OffsetDateTime;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::{
+    net::{UnixListener, UnixStream},
+    sync::mpsc,
+};
 use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
@@ -80,11 +84,17 @@ pub enum Command {
     Ping,
     Sync(SyncCommand),
     Locks { top: usize },
+    Cluster(ClusterCommand),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncCommand {
     Generate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClusterCommand {
+    MembershipStates,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -171,17 +181,12 @@ async fn handle_conn(
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,
                     }
+                    send_success(&mut stream).await;
                 }
                 Command::Locks { top } => {
                     info_log(&mut stream, "gathering top locks").await;
-                    let registry = {
-                        agent
-                            .bookie()
-                            .read("admin:registry")
-                            .await
-                            .registry()
-                            .clone()
-                    };
+                    let bookie = agent.bookie();
+                    let registry = bookie.registry();
 
                     let topn: Vec<LockMetaElapsed> = {
                         registry
@@ -198,6 +203,28 @@ async fn handle_conn(
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,
                     }
+                    send_success(&mut stream).await;
+                }
+                Command::Cluster(ClusterCommand::MembershipStates) => {
+                    info_log(&mut stream, "gathering membership state").await;
+
+                    let (tx, mut rx) = mpsc::channel(1024);
+                    if let Err(e) = agent
+                        .tx_foca()
+                        .send(FocaInput::Cmd(FocaCmd::MembershipStates(tx)))
+                        .await
+                    {
+                        send_error(&mut stream, e).await;
+                        continue;
+                    }
+
+                    while let Some(member) = rx.recv().await {
+                        match serde_json::to_value(&member) {
+                            Ok(json) => send(&mut stream, Response::Json(json)).await,
+                            Err(e) => send_error(&mut stream, e).await,
+                        }
+                    }
+                    send_success(&mut stream).await;
                 }
             },
             Ok(None) => {

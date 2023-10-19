@@ -49,7 +49,7 @@ impl Members {
 
     // A result of `true` means that the effective list of
     // cluster member addresses has changed
-    pub fn add_member(&mut self, actor: &Actor) -> bool {
+    pub fn add_member(&mut self, actor: &Actor) -> (bool, bool) {
         let actor_id = actor.id();
         let member = self
             .states
@@ -58,12 +58,14 @@ impl Members {
 
         trace!("member: {member:?}");
 
-        if actor.ts().to_time() < member.ts.to_time() {
+        if actor.ts().to_duration() < member.ts.to_duration() {
             debug!("older timestamp, ignoring");
-            return false;
+            return (false, false);
         }
 
-        let newer = actor.ts() > member.ts;
+        // sometimes, this can be equal
+        let newer = actor.ts().to_duration() > member.ts.to_duration();
+        let same = actor.ts().to_duration() == member.ts.to_duration();
 
         if newer {
             member.addr = actor.addr();
@@ -73,7 +75,7 @@ impl Members {
             self.recalculate_rings(actor.addr());
         }
 
-        newer
+        (newer, same)
     }
 
     // A result of `true` means that the effective list of

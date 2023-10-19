@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
@@ -9,7 +10,7 @@ use std::{
 
 use crate::{
     api::{
-        peer::{bidirectional_sync, gossip_client_endpoint, gossip_server_endpoint, SyncError},
+        peer::{gossip_server_endpoint, parallel_sync, serve_sync, SyncError},
         public::{
             api_v1_db_schema, api_v1_queries, api_v1_transactions,
             pubsub::{
@@ -19,13 +20,16 @@ use crate::{
         },
     },
     broadcast::runtime_loop,
-    transport::{ConnectError, Transport},
+    transport::{Transport, TransportError},
 };
 
 use arc_swap::ArcSwap;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion, SplitPool},
+    agent::{
+        Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion, PartialVersion,
+        SplitPool,
+    },
     broadcast::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset,
         ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
@@ -46,7 +50,7 @@ use axum::{
     routing::{get, post},
     BoxError, Extension, Router, TypedHeader,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use foca::{Member, Notification};
 use futures::{FutureExt, StreamExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
@@ -59,17 +63,16 @@ use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction}
 use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
-    io::AsyncReadExt,
     net::TcpListener,
     sync::mpsc::{channel, Receiver, Sender},
     task::block_in_place,
-    time::{sleep, timeout},
+    time::{error::Elapsed, sleep, timeout},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
-use tokio_util::codec::{Decoder, FramedRead, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 use trust_dns_resolver::{
     error::ResolveErrorKind,
@@ -90,6 +93,7 @@ pub struct AgentOptions {
     pub rx_apply: Receiver<(ActorId, i64)>,
     pub rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
     pub rx_changes: Receiver<(ChangeV1, ChangeSource)>,
+    pub rx_foca: Receiver<FocaInput>,
     pub rtt_rx: Receiver<(SocketAddr, Duration)>,
     pub tripwire: Tripwire,
 }
@@ -214,7 +218,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
                 let mut conn = pool.write_priority().await?;
                 let tx = conn.transaction()?;
-                clear_buffered_meta(&tx, actor_id, version)?;
+                clear_buffered_meta(&tx, actor_id, version..=version)?;
                 tx.commit()?;
                 continue;
             }
@@ -236,11 +240,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let gossip_server_endpoint = gossip_server_endpoint(&conf.gossip).await?;
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
-    let gossip_client_endpoint = gossip_client_endpoint(&conf.gossip).await?;
-
     let (rtt_tx, rtt_rx) = channel(128);
 
-    let transport = Transport::new(gossip_client_endpoint, rtt_tx);
+    let transport = Transport::new(&conf.gossip, rtt_tx).await?;
 
     let api_listener = TcpListener::bind(conf.api.bind_addr).await?;
     let api_addr = api_listener.local_addr()?;
@@ -254,7 +256,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let (tx_bcast, rx_bcast) = channel(10240);
     let (tx_empty, rx_empty) = channel(10240);
-    let (tx_changes, rx_changes) = channel(10240);
+    let (tx_changes, rx_changes) = channel(5192);
+    let (tx_foca, rx_foca) = channel(10240);
 
     let opts = AgentOptions {
         actor_id,
@@ -265,6 +268,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         rx_apply,
         rx_empty,
         rx_changes,
+        rx_foca,
         rtt_rx,
         tripwire: tripwire.clone(),
     };
@@ -282,6 +286,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_apply,
         tx_empty,
         tx_changes,
+        tx_foca,
         schema: RwLock::new(schema),
         tripwire,
     });
@@ -308,6 +313,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rx_apply,
         rx_empty,
         rx_changes,
+        rx_foca,
         rtt_rx,
     } = opts;
 
@@ -371,7 +377,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
-    let (foca_tx, foca_rx) = channel(10240);
     let (member_events_tx, member_events_rx) = tokio::sync::broadcast::channel::<MemberEvent>(512);
 
     runtime_loop(
@@ -382,7 +387,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         ),
         agent.clone(),
         transport.clone(),
-        foca_rx,
+        rx_foca,
         rx_bcast,
         member_events_rx.resubscribe(),
         to_send_tx,
@@ -410,13 +415,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     // async message decoder task
     tokio::spawn({
-        let bookie = agent.bookie().clone();
-        let self_actor_id = agent.actor_id();
+        let agent = agent.clone();
         async move {
             while let Some(payload) = process_uni_rx.recv().await {
                 match payload {
                     UniPayload::V1(UniPayloadV1::Broadcast(bcast)) => {
-                        handle_change(bcast, self_actor_id, &bookie, &bcast_msg_tx).await
+                        handle_change(&agent, bcast, &bcast_msg_tx).await
                     }
                 }
             }
@@ -428,7 +432,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     spawn_counted({
         let agent = agent.clone();
         let mut tripwire = tripwire.clone();
-        let foca_tx = foca_tx.clone();
         async move {
             loop {
                 let connecting = match gossip_server_endpoint
@@ -444,7 +447,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 let process_uni_tx = process_uni_tx.clone();
                 let agent = agent.clone();
                 let tripwire = tripwire.clone();
-                let foca_tx = foca_tx.clone();
                 tokio::spawn(async move {
                     let remote_addr = connecting.remote_address();
                     // let local_ip = connecting.local_ip().unwrap();
@@ -465,7 +467,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     tokio::spawn({
                         let conn = conn.clone();
                         let mut tripwire = tripwire.clone();
-                        let foca_tx = foca_tx.clone();
+                        let foca_tx = agent.tx_foca().clone();
                         async move {
                             loop {
                                 let b = tokio::select! {
@@ -498,7 +500,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                         let mut tripwire = tripwire.clone();
                         async move {
                             loop {
-                                let mut rx = tokio::select! {
+                                let rx = tokio::select! {
                                     rx_res = conn.accept_uni() => match rx_res {
                                         Ok(rx) => rx,
                                         Err(e) => {
@@ -522,64 +524,37 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 tokio::spawn({
                                     let process_uni_tx = process_uni_tx.clone();
                                     async move {
-                                        let mut codec = LengthDelimitedCodec::new();
-                                        let mut buf = BytesMut::new();
+                                        let mut framed =
+                                            FramedRead::new(rx, LengthDelimitedCodec::new());
 
-                                        let stream_ended = loop {
-                                            loop {
-                                                match codec.decode(&mut buf) {
-                                                    Ok(Some(b)) => {
-                                                        // TODO: checksum?
-                                                        let b = b.freeze();
+                                        loop {
+                                            match StreamExt::next(&mut framed).await {
+                                                Some(Ok(b)) => {
+                                                    counter!("corro.peer.stream.bytes.recv.total", b.len() as u64, "type" => "uni");
+                                                    match UniPayload::read_from_buffer(&b) {
+                                                        Ok(payload) => {
+                                                            trace!("parsed a payload: {payload:?}");
 
-                                                        match UniPayload::read_from_buffer(&b) {
-                                                            Ok(payload) => {
-                                                                trace!(
-                                                                    "parsed a payload: {payload:?}"
-                                                                );
-
-                                                                if let Err(e) = process_uni_tx
-                                                                    .send(payload)
-                                                                    .await
-                                                                {
-                                                                    error!("could not send UniPayload for processing: {e}");
-                                                                    // this means we won't be able to process more...
-                                                                    return;
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                error!(
-                                                                "could not decode UniPayload: {e}"
-                                                            );
-                                                                continue;
+                                                            if let Err(e) =
+                                                                process_uni_tx.send(payload).await
+                                                            {
+                                                                error!("could not send UniPayload for processing: {e}");
+                                                                // this means we won't be able to process more...
+                                                                return;
                                                             }
                                                         }
+                                                        Err(e) => {
+                                                            error!(
+                                                                "could not decode UniPayload: {e}"
+                                                            );
+                                                            continue;
+                                                        }
                                                     }
-                                                    Ok(None) => break,
-                                                    Err(e) => {
-                                                        error!("decode error: {e}");
-                                                    }
                                                 }
-                                            }
-
-                                            match rx.read_buf(&mut buf).await {
-                                                Ok(0) => {
-                                                    break true;
+                                                Some(Err(e)) => {
+                                                    error!("decode error: {e}");
                                                 }
-                                                Ok(n) => {
-                                                    counter!("corro.peer.stream.bytes.recv.total", n as u64, "type" => "uni");
-                                                    trace!("read {n} bytes");
-                                                }
-                                                Err(e) => {
-                                                    error!("error reading bytes into buffer: {e}");
-                                                    break true;
-                                                }
-                                            }
-                                        };
-
-                                        if !stream_ended {
-                                            if let Err(e) = rx.stop(0u32.into()) {
-                                                warn!("error stopping recved uni stream: {e}");
+                                                None => break,
                                             }
                                         }
                                     }
@@ -605,7 +580,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 }
                             };
 
-                            increment_counter!("corro.peer.streams.accept.total", "type" => "bi");
+                            increment_counter!("corro.peer.stream.accept.total", "type" => "bi");
 
                             debug!(
                                 "accepted a bidirectional stream from {}",
@@ -639,24 +614,20 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                                         Ok(payload) => {
                                                             match payload {
                                                                 BiPayload::V1(
-                                                                    BiPayloadV1::SyncState(state),
+                                                                    BiPayloadV1::SyncStart {
+                                                                        actor_id,
+                                                                        trace_ctx,
+                                                                    },
                                                                 ) => {
+                                                                    trace!("framed read buffer len: {}", framed.read_buffer().len());
                                                                     // println!("got sync state: {state:?}");
-                                                                    if let Err(e) =
-                                                                        bidirectional_sync(
-                                                                            &agent,
-                                                                            generate_sync(
-                                                                                agent.bookie(),
-                                                                                agent.actor_id(),
-                                                                            )
-                                                                            .await,
-                                                                            Some(state),
-                                                                            framed.into_inner(),
-                                                                            tx,
-                                                                        )
-                                                                        .await
+                                                                    if let Err(e) = serve_sync(
+                                                                        &agent, actor_id,
+                                                                        trace_ctx, framed, tx,
+                                                                    )
+                                                                    .await
                                                                     {
-                                                                        warn!("could not complete bidirectional sync: {e}");
+                                                                        warn!("could not complete receiving sync: {e}");
                                                                     }
                                                                     break;
                                                                 }
@@ -698,7 +669,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     tokio::spawn({
         let agent = agent.clone();
-        let foca_tx = foca_tx.clone();
         async move {
             let mut boff = backoff::Backoff::new(10)
                 .timeout_range(Duration::from_secs(5), Duration::from_secs(120))
@@ -719,7 +689,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     Ok(addrs) => {
                         for addr in addrs.iter() {
                             debug!("Bootstrapping w/ {addr}");
-                            if let Err(e) = foca_tx.send(FocaInput::Announce((*addr).into())).await
+                            if let Err(e) = agent
+                                .tx_foca()
+                                .send(FocaInput::Announce((*addr).into()))
+                                .await
                             {
                                 error!("could not send foca Announce message: {e}");
                             } else {
@@ -800,7 +773,11 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             }
         }
 
-        foca_tx.send(FocaInput::ApplyMany(foca_states)).await.ok();
+        agent
+            .tx_foca()
+            .send(FocaInput::ApplyMany(foca_states))
+            .await
+            .ok();
     }
 
     let api = Router::new()
@@ -918,18 +895,15 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
 
-    tokio::spawn(handle_gossip_to_send(transport, to_send_rx));
+    tokio::spawn(handle_gossip_to_send(transport.clone(), to_send_rx));
     tokio::spawn(handle_notifications(
         agent.clone(),
         notifications_rx,
-        foca_tx.clone(),
         member_events_tx,
     ));
-    tokio::spawn(metrics_loop(agent.clone()));
+    tokio::spawn(metrics_loop(agent.clone(), transport));
 
     tokio::spawn(handle_broadcasts(agent.clone(), bcast_rx));
-
-    // tokio::spawn
 
     loop {
         tokio::select! {
@@ -1064,64 +1038,27 @@ async fn clear_overwritten_versions(agent: Agent) {
                     .for_actor(actor_id)
             };
 
-            let mut conn = match pool.write_low().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    error!("could not acquire low priority write connection: {e}");
-                    continue;
-                }
-            };
-
             let mut bookedw = booked
                 .write(format!("clearing:{}", actor_id.as_simple()))
                 .await;
 
-            let res = block_in_place(|| {
-                let tx = conn.transaction()?;
-
-                let mut new_copy = bookedw.clone();
-
-                for (db_v, v) in to_clear
-                    .iter()
-                    .filter(|(_db_v, v)| bookedw.contains_current(v))
-                {
-                    deleted += tx
-                        .prepare_cached("DELETE FROM __corro_bookkeeping WHERE db_version = ?")?
-                        .execute([db_v])?;
-                    new_copy.insert(*v..=*v, KnownDbVersion::Cleared);
+            for (_db_v, v) in to_clear.iter() {
+                if bookedw.contains_current(v) {
+                    bookedw.insert(*v, KnownDbVersion::Cleared);
+                    deleted += 1;
                 }
+            }
 
-                for (range, known) in to_clear
-                    .iter()
-                    .filter_map(|(_, v)| new_copy.get_key_value(v))
-                    .dedup()
-                {
-                    match known {
-                        KnownDbVersion::Cleared => {
-                            inserted += store_empty_changeset(
-                                &tx,
-                                actor_id,
-                                *range.start()..=*range.end(),
-                            )?;
-                        }
-                        known => {
-                            warn!(%actor_id, "unexpected known db version when attempting to clear: {known:?}");
-                        }
-                    }
+            for range in to_clear
+                .iter()
+                .filter_map(|(_, v)| bookedw.cleared.get(v))
+                .dedup()
+            {
+                if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
+                    error!("could not schedule version to be cleared: {e}");
+                } else {
+                    inserted += 1;
                 }
-
-                tx.commit()?;
-
-                debug!("compacted in-db version state for actor {actor_id}, deleted: {deleted}, inserted: {inserted}");
-
-                **bookedw = BookedVersions(new_copy);
-                debug!("compacted in-memory cache by clearing db versions for actor {actor_id}, new total: {}", bookedw.len());
-
-                Ok::<_, rusqlite::Error>(())
-            });
-
-            if let Err(e) = res {
-                error!(%actor_id, "could not compact bookkeeping: {e}");
             }
         }
 
@@ -1133,27 +1070,21 @@ async fn clear_overwritten_versions(agent: Agent) {
     }
 }
 
-// const CHECKSUM_SEEDS: [u64; 4] = [
-//     0x16f11fe89b0d677c,
-//     0xb480a793d8e6c86c,
-//     0x6fe2e5aaf078ebc9,
-//     0x14f994a4c5259381,
-// ];
-
-async fn metrics_loop(agent: Agent) {
+async fn metrics_loop(agent: Agent, transport: Transport) {
     let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
 
     loop {
         metrics_interval.tick().await;
 
-        block_in_place(|| collect_metrics(&agent));
+        block_in_place(|| collect_metrics(&agent, &transport));
     }
 }
 
 // const MAX_COUNT_TO_HASH: i64 = 500_000;
 
-fn collect_metrics(agent: &Agent) {
+fn collect_metrics(agent: &Agent, transport: &Transport) {
     agent.pool().emit_metrics();
+    transport.emit_metrics();
 
     let schema = agent.schema().read();
 
@@ -1203,60 +1134,42 @@ fn collect_metrics(agent: &Agent) {
             error!("could not query count for buffered changes: {e}");
         }
     }
-
-    // for name in low_count_tables {
-    //     if let Some(table) = schema.tables.get(name) {
-    //         let pks = table.pk.iter().cloned().collect::<Vec<String>>().join(",");
-    //         match conn
-    //             .prepare_cached(&format!("SELECT * FROM {name} ORDER BY {pks}"))
-    //             .and_then(|mut prepped| {
-    //                 let col_count = prepped.column_count();
-    //                 prepped.query(()).and_then(|mut rows| {
-    //                     let mut hasher = seahash::SeaHasher::with_seeds(
-    //                         CHECKSUM_SEEDS[0],
-    //                         CHECKSUM_SEEDS[1],
-    //                         CHECKSUM_SEEDS[2],
-    //                         CHECKSUM_SEEDS[3],
-    //                     );
-    //                     while let Ok(Some(row)) = rows.next() {
-    //                         for idx in 0..col_count {
-    //                             let v: SqliteValue = row.get(idx)?;
-    //                             v.hash(&mut hasher);
-    //                         }
-    //                     }
-    //                     Ok(hasher.finish())
-    //                 })
-    //             }) {
-    //             Ok(hash) => {
-    //                 gauge!("corro.db.table.checksum", hash as f64, "table" => name.clone());
-    //             }
-    //             Err(e) => {
-    //                 error!("could not query clock table values for hashing {table}: {e}");
-    //             }
-    //         }
-    //     }
-    // }
 }
 
-pub async fn handle_change(
-    bcast: BroadcastV1,
-    self_actor_id: ActorId,
-    bookie: &Bookie,
-    bcast_msg_tx: &Sender<BroadcastV1>,
-) {
+pub async fn handle_change(agent: &Agent, bcast: BroadcastV1, bcast_msg_tx: &Sender<BroadcastV1>) {
     match bcast {
         BroadcastV1::Change(change) => {
+            let diff = if let Some(ts) = change.ts() {
+                if let Ok(id) = change.actor_id.try_into() {
+                    Some(
+                        agent
+                            .clock()
+                            .new_timestamp()
+                            .get_diff_duration(&uhlc::Timestamp::new(ts.0, id)),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             increment_counter!("corro.broadcast.recv.count", "kind" => "change");
 
             trace!("handling {} changes", change.len());
 
-            if bookie
-                .write(format!(
-                    "handle_change(for_actor):{}",
-                    change.actor_id.as_simple()
-                ))
-                .await
-                .for_actor(change.actor_id)
+            let booked = {
+                agent
+                    .bookie()
+                    .write(format!(
+                        "handle_change(for_actor):{}",
+                        change.actor_id.as_simple()
+                    ))
+                    .await
+                    .for_actor(change.actor_id)
+            };
+
+            if booked
                 .read(format!(
                     "handle_change(contains?):{}",
                     change.actor_id.as_simple()
@@ -1268,9 +1181,14 @@ pub async fn handle_change(
                 return;
             }
 
-            if change.actor_id == self_actor_id {
+            if change.actor_id == agent.actor_id() {
                 return;
             }
+
+            if let Some(diff) = diff {
+                histogram!("corro.broadcast.recv.lag.seconds", diff.as_secs_f64());
+            }
+
             if let Err(e) = bcast_msg_tx.send(BroadcastV1::Change(change)).await {
                 error!("could not send change message through broadcast channel: {e}");
             }
@@ -1278,19 +1196,7 @@ pub async fn handle_change(
     }
 }
 
-// fn chunk_range(
-//     range: RangeInclusive<i64>,
-//     chunk_size: i64,
-// ) -> impl Iterator<Item = RangeInclusive<i64>> {
-//     range
-//         .clone()
-//         .step_by(chunk_size as usize)
-//         .map(move |block_start| {
-//             let block_end = (block_start + chunk_size).min(*range.end());
-//             block_start..=block_end
-//         })
-// }
-
+#[tracing::instrument(skip_all)]
 fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>> {
     let tables = tx
         .prepare_cached(
@@ -1313,12 +1219,19 @@ fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>>
             .join(" UNION ")
     );
 
-    let cleared_db_version = tx
+    let start = Instant::now();
+    let cleared_db_versions: BTreeSet<i64> = tx
         .prepare_cached(&to_clear_query)?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
 
-    Ok(cleared_db_version)
+    info!(
+        "aggregated {} db versions to clear in {:?}",
+        cleared_db_versions.len(),
+        start.elapsed()
+    );
+
+    Ok(cleared_db_versions)
 }
 
 async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Bytes)>) {
@@ -1327,18 +1240,19 @@ async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(A
         trace!("got gossip to send to {actor:?}");
 
         let addr = actor.addr();
+        let actor_id = actor.id();
 
         let transport = transport.clone();
 
+        let len = data.len();
         spawn_counted(async move {
-            let len = data.len();
             if let Err(e) = transport.send_datagram(addr, data).await {
                 error!("could not write datagram {addr}: {e}");
                 return;
             }
-            increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor.id().to_string());
+            increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor_id.to_string());
             counter!("corro.peer.datagram.bytes.sent.total", len as u64);
-        });
+        }.instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)));
     }
 }
 
@@ -1363,14 +1277,13 @@ async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>) {
 async fn handle_notifications(
     agent: Agent,
     mut notification_rx: Receiver<Notification<Actor>>,
-    foca_tx: Sender<FocaInput>,
     member_events: tokio::sync::broadcast::Sender<MemberEvent>,
 ) {
     while let Some(notification) = notification_rx.recv().await {
         trace!("handle notification");
         match notification {
             Notification::MemberUp(actor) => {
-                let added = { agent.members().write().add_member(&actor) };
+                let (added, same) = { agent.members().write().add_member(&actor) };
                 trace!("Member Up {actor:?} (added: {added})");
                 if added {
                     debug!("Member Up {actor:?}");
@@ -1379,13 +1292,27 @@ async fn handle_notifications(
                     // notify of new cluster size
                     let members_len = { agent.members().read().states.len() as u32 };
                     if let Ok(size) = members_len.try_into() {
-                        if let Err(e) = foca_tx.send(FocaInput::ClusterSize(size)).await {
+                        if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await {
                             error!("could not send new foca cluster size: {e}");
                         }
                     }
 
                     member_events.send(MemberEvent::Up(actor.clone())).ok();
+                } else if !same {
+                    // had a older timestamp!
+                    if let Err(e) = agent
+                        .tx_foca()
+                        .send(FocaInput::ApplyMany(vec![foca::Member::new(
+                            actor.clone(),
+                            foca::Incarnation::default(),
+                            foca::State::Down,
+                        )]))
+                        .await
+                    {
+                        warn!(?actor, "could not manually declare actor as down! {e}");
+                    }
                 }
+                increment_counter!("corro.swim.notification", "type" => "memberup");
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
@@ -1397,25 +1324,30 @@ async fn handle_notifications(
                     // notify of new cluster size
                     let member_len = { agent.members().read().states.len() as u32 };
                     if let Ok(size) = member_len.try_into() {
-                        if let Err(e) = foca_tx.send(FocaInput::ClusterSize(size)).await {
+                        if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await {
                             error!("could not send new foca cluster size: {e}");
                         }
                     }
                     member_events.send(MemberEvent::Down(actor.clone())).ok();
                 }
+                increment_counter!("corro.swim.notification", "type" => "memberdown");
             }
             Notification::Active => {
                 info!("Current node is considered ACTIVE");
+                increment_counter!("corro.swim.notification", "type" => "active");
             }
             Notification::Idle => {
                 warn!("Current node is considered IDLE");
+                increment_counter!("corro.swim.notification", "type" => "idle");
             }
             // this happens when we leave the cluster
             Notification::Defunct => {
                 debug!("Current node is considered DEFUNCT");
+                increment_counter!("corro.swim.notification", "type" => "defunct");
             }
             Notification::Rejoin(id) => {
                 info!("Rejoined the cluster with id: {id:?}");
+                increment_counter!("corro.swim.notification", "type" => "rejoin");
             }
         }
     }
@@ -1600,44 +1532,56 @@ fn store_empty_changeset(
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
 ) -> Result<usize, rusqlite::Error> {
+    // first, delete "current" versions, they're now gone!
+    let deleted = tx.prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND start_version >= ? AND start_version <= ? AND end_version IS NULL")?.execute(params![actor_id, versions.start(), versions.end()])?;
+
+    if deleted > 0 {
+        debug!("deleted {deleted} still-live versions from database's bookkeeping");
+    }
+
+    // insert cleared versions
     let inserted = tx
         .prepare_cached(
             "
-        INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, last_seq, ts)
-            VALUES (?, ?, ?, NULL, NULL, NULL)
-            ON CONFLICT (actor_id, start_version) DO UPDATE SET
-                end_version = excluded.end_version,
-                db_version = NULL,
-                last_seq = NULL,
-                ts = NULL
-            WHERE end_version < excluded.end_version;
-    ",
+                INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, last_seq, ts)
+                    VALUES (?, ?, ?, NULL, NULL, NULL)
+                    ON CONFLICT (actor_id, start_version) DO UPDATE SET
+                        end_version = excluded.end_version,
+                        db_version = NULL,
+                        last_seq = NULL,
+                        ts = NULL
+                    WHERE end_version < excluded.end_version;
+            ",
         )?
         .execute(params![actor_id, versions.start(), versions.end()])?;
 
-    for version in versions {
-        clear_buffered_meta(tx, actor_id, version)?;
-    }
+    // remove any buffered data or seqs bookkeeping for these versions
+    clear_buffered_meta(tx, actor_id, versions)?;
 
     Ok(inserted)
 }
 
-fn clear_buffered_meta(tx: &Transaction, actor_id: ActorId, version: i64) -> rusqlite::Result<()> {
+fn clear_buffered_meta(
+    tx: &Transaction,
+    actor_id: ActorId,
+    versions: RangeInclusive<i64>,
+) -> rusqlite::Result<()> {
     // remove all buffered changes for cleanup purposes
     let count = tx
-        .prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?
-        .execute(params![actor_id, version])?;
-    debug!(%actor_id, version, "deleted {count} buffered changes");
+        .prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ?")?
+        .execute(params![actor_id, versions.start(), versions.end()])?;
+    debug!(%actor_id, ?versions, "deleted {count} buffered changes");
 
     // delete all bookkept sequences for this version
     let count = tx
-        .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?
-        .execute(params![actor_id, version])?;
-    debug!(%actor_id, version, "deleted {count} sequences in bookkeeping");
+        .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?")?
+        .execute(params![actor_id, versions.start(), versions.end()])?;
+    debug!(%actor_id, ?versions, "deleted {count} sequences in bookkeeping");
 
     Ok(())
 }
 
+#[tracing::instrument(skip(agent), err)]
 async fn process_fully_buffered_changes(
     agent: &Agent,
     actor_id: ActorId,
@@ -1667,8 +1611,8 @@ async fn process_fully_buffered_changes(
 
     let inserted = block_in_place(|| {
         let (last_seq, ts) = {
-            match bookedw.get(&version) {
-                Some(KnownDbVersion::Partial { seqs, last_seq, ts }) => {
+            match bookedw.partials.get(&version) {
+                Some(PartialVersion { seqs, last_seq, ts }) => {
                     if seqs.gaps(&(0..=*last_seq)).count() != 0 {
                         error!(%actor_id, version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(0..=*last_seq)).collect::<RangeInclusiveSet<i64>>());
                         // TODO: return an error here
@@ -1676,12 +1620,8 @@ async fn process_fully_buffered_changes(
                     }
                     (*last_seq, *ts)
                 }
-                Some(_) => {
-                    warn!(%actor_id, %version, "already processed buffered changes, returning");
-                    return Ok(false);
-                }
                 None => {
-                    warn!(%actor_id, %version, "version not found in cache,returning");
+                    warn!(%actor_id, %version, "version not found in cache, returning");
                     return Ok(false);
                 }
             }
@@ -1714,7 +1654,7 @@ async fn process_fully_buffered_changes(
             info!(%actor_id, version, "no buffered rows, skipped insertion into crsql_changes");
         }
 
-        clear_buffered_meta(&tx, actor_id, version)?;
+        clear_buffered_meta(&tx, actor_id, version..=version)?;
 
         let rows_impacted: i64 = tx
             .prepare_cached("SELECT crsql_rows_impacted()")?
@@ -1790,11 +1730,12 @@ async fn process_fully_buffered_changes(
     Ok(inserted)
 }
 
+#[tracing::instrument(skip(agent, changes), err)]
 pub async fn process_multiple_changes(
     agent: &Agent,
     changes: Vec<(ChangeV1, ChangeSource)>,
 ) -> Result<(), ChangeError> {
-    info!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.len());
+    info!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
     let bookie = agent.bookie();
 
@@ -1831,6 +1772,7 @@ pub async fn process_multiple_changes(
     let mut conn = agent.pool().write_normal().await?;
 
     block_in_place(|| {
+        let start = Instant::now();
         let tx = conn.transaction()?;
 
         let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
@@ -1889,10 +1831,8 @@ pub async fn process_multiple_changes(
 
                     // optimizing this, insert later!
                     let (known, changeset) = if change.is_complete() && change.is_empty() {
-                        if let Err(e) = agent
-                            .tx_empty()
-                            .blocking_send((actor_id, change.versions()))
-                        {
+                        // we never want to block here
+                        if let Err(e) = agent.tx_empty().try_send((actor_id, change.versions())) {
                             error!("could not send empty changed versions into channel: {e}");
                         }
                         (
@@ -1971,6 +1911,8 @@ pub async fn process_multiple_changes(
 
         tx.commit()?;
 
+        info!("committed {count} changes in {:?}", start.elapsed());
+
         for (actor_id, knowns) in knowns {
             let booked = {
                 bookie
@@ -1981,7 +1923,7 @@ pub async fn process_multiple_changes(
                     .for_actor(actor_id)
             };
             let mut booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer):{}",
+                "process_multiple_changes(booked writer, post commit):{}",
                 actor_id.as_simple()
             ));
 
@@ -2029,6 +1971,7 @@ pub async fn process_multiple_changes(
     Ok(())
 }
 
+#[tracing::instrument(skip(tx, parts), err)]
 fn process_incomplete_version(
     tx: &Transaction,
     actor_id: ActorId,
@@ -2119,6 +2062,7 @@ fn process_incomplete_version(
     })
 }
 
+#[tracing::instrument(skip(tx, last_db_version, parts), err)]
 fn process_complete_version(
     tx: &Transaction,
     actor_id: ActorId,
@@ -2218,7 +2162,7 @@ fn process_complete_version(
     };
 
     // in case we got both buffered data and a complete set of changes
-    clear_buffered_meta(tx, actor_id, version)?;
+    clear_buffered_meta(tx, actor_id, version..=version)?;
 
     for (table_name, count) in changes_per_table {
         counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
@@ -2227,6 +2171,7 @@ fn process_complete_version(
     Ok::<_, rusqlite::Error>((known_version, new_changeset))
 }
 
+#[tracing::instrument(skip(tx, last_db_version, change), err)]
 fn process_single_version(
     tx: &Transaction,
     last_db_version: Option<i64>,
@@ -2306,7 +2251,7 @@ pub enum SyncClientError {
     #[error("service unavailable right now")]
     Unavailable,
     #[error(transparent)]
-    Connect(#[from] ConnectError),
+    Connect(#[from] TransportError),
     #[error("request timed out")]
     RequestTimedOut,
     #[error(transparent)]
@@ -2345,21 +2290,25 @@ pub enum SyncRecvError {
     #[error("expected sync clock message, received something else")]
     ExpectedClockMessage,
     #[error("timed out waiting for sync message")]
-    TimedOut,
+    TimedOut(#[from] Elapsed),
     #[error("changes channel is closed")]
     ChangesChannelClosed,
+    #[error("requests channel is closed")]
+    RequestsChannelClosed,
 }
 
+#[tracing::instrument(skip_all, err, level = "debug")]
 async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
     let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
+
     for (actor_id, needed) in sync_state.need.iter() {
-        gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.0.to_string());
+        gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.to_string());
     }
     for (actor_id, version) in sync_state.heads.iter() {
         gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
     }
 
-    let (actor_id, addr) = {
+    let chosen: Vec<(ActorId, SocketAddr)> = {
         let candidates = {
             let members = agent.members().read();
 
@@ -2367,8 +2316,8 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
                 .states
                 .iter()
                 .filter(|(id, _state)| **id != agent.actor_id())
-                .map(|(id, state)| (*id, state.addr))
-                .collect::<Vec<(ActorId, SocketAddr)>>()
+                .map(|(id, state)| (*id, state.ring.unwrap_or(255), state.addr))
+                .collect::<Vec<(ActorId, u8, SocketAddr)>>()
         };
 
         if candidates.is_empty() {
@@ -2377,55 +2326,46 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
 
         debug!("found {} candidates to synchronize with", candidates.len());
 
+        let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
+
         let mut rng = StdRng::from_entropy();
 
-        let mut choices = candidates.into_iter().choose_multiple(&mut rng, 2);
+        let mut choices = candidates
+            .into_iter()
+            .choose_multiple(&mut rng, desired_count * 2);
 
         choices.sort_by(|a, b| {
+            // most missing actors first
             sync_state
                 .need_len_for_actor(&b.0)
                 .cmp(&sync_state.need_len_for_actor(&a.0))
+                // if equal, look at proximity (via `ring`)
+                .then_with(|| a.1.cmp(&b.1))
         });
 
-        if let Some(chosen) = choices.get(0).cloned() {
-            chosen
-        } else {
-            return Err(SyncClientError::NoGoodCandidate);
-        }
+        choices.truncate(desired_count);
+        choices
+            .into_iter()
+            .map(|(actor_id, _, addr)| (actor_id, addr))
+            .collect()
     };
 
-    debug!(
-        actor_id = %agent.actor_id(), "syncing with: {}, need len: {}",
-        actor_id,
-        sync_state.need_len(),
-    );
-
-    debug!(actor = %agent.actor_id(), "sync message: {sync_state:?}");
-
-    increment_counter!("corro.sync.client.member", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
-
-    histogram!(
-        "corro.sync.client.request.operations.need.count",
-        sync_state.need.len() as f64
-    );
-
-    let (tx, rx) = transport
-        .open_bi(addr)
-        .await
-        .map_err(crate::transport::ConnectError::from)?;
-
-    increment_counter!("corro.sync.attempts.count", "id" => actor_id.0.to_string(), "addr" => addr.to_string());
-
-    // FIXME: check if it's ok to sync (don't overload host)
+    if chosen.is_empty() {
+        return Err(SyncClientError::NoGoodCandidate);
+    }
 
     let start = Instant::now();
-    let n = bidirectional_sync(agent, sync_state, None, rx, tx).await?;
+    let n = parallel_sync(agent, transport, chosen.clone(), sync_state).await?;
 
     let elapsed = start.elapsed();
     if n > 0 {
         info!(
             "synced {n} changes w/ {} in {}s @ {} changes/s",
-            actor_id,
+            chosen
+                .into_iter()
+                .map(|(actor_id, _)| actor_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
             elapsed.as_secs_f64(),
             n as f64 / elapsed.as_secs_f64()
         );
@@ -2448,7 +2388,8 @@ async fn handle_changes(
     loop {
         tokio::select! {
             Some((change, src)) = rx_changes.recv() => {
-                count += std::cmp::max(change.len(), 1);
+                counter!("corro.agent.changes.recv", std::cmp::max(change.len(), 1) as u64); // count empties...
+                count += change.len(); // don't count empties
                 buf.push((change, src));
                 if count < MIN_CHANGES_CHUNK {
                     continue;
@@ -2481,7 +2422,9 @@ async fn handle_changes(
 
     // drain!
     while let Ok((change, src)) = rx_changes.try_recv() {
-        count += std::cmp::max(change.len(), 1);
+        let changes_count = std::cmp::max(change.len(), 1);
+        counter!("corro.agent.changes.recv", changes_count as u64);
+        count += changes_count;
         buf.push((change, src));
         if count >= MIN_CHANGES_CHUNK {
             // drain and process current changes!
@@ -2502,11 +2445,60 @@ async fn handle_changes(
 
 const CHECK_EMPTIES_TO_INSERT_AFTER: Duration = Duration::from_secs(120);
 
+async fn write_empties_loop(
+    agent: Agent,
+    mut rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
+    mut tripwire: Tripwire,
+) {
+    let mut empties: BTreeMap<ActorId, RangeInclusiveSet<i64>> = BTreeMap::new();
+
+    let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
+    tokio::pin!(next_empties_check);
+
+    loop {
+        tokio::select! {
+            maybe_empty = rx_empty.recv() => match maybe_empty {
+                Some((actor_id, versions)) => {
+                    empties.entry(actor_id).or_default().insert(versions);
+                    continue;
+                },
+                None => {
+                    debug!("empties queue is done");
+                    break;
+                }
+            },
+            _ = &mut next_empties_check => {
+                next_empties_check.as_mut().reset(tokio::time::Instant::now() + CHECK_EMPTIES_TO_INSERT_AFTER);
+                if empties.is_empty() {
+                    continue;
+                }
+            },
+            _ = &mut tripwire => break
+        }
+
+        if let Err(e) = process_completed_empties(&agent, &mut empties).await {
+            error!("could not process empties: {e}");
+        }
+    }
+    info!("Draining empty versions to process...");
+    // drain empties channel
+    while let Ok((actor_id, versions)) = rx_empty.try_recv() {
+        empties.entry(actor_id).or_default().insert(versions);
+    }
+
+    if !empties.is_empty() {
+        info!("inserting last unprocessed empties before shut down");
+        if let Err(e) = process_completed_empties(&agent, &mut empties).await {
+            error!("could not process empties: {e}");
+        }
+    }
+}
+
 async fn sync_loop(
     agent: Agent,
     transport: Transport,
     mut rx_apply: Receiver<(ActorId, i64)>,
-    mut rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
+    rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
     mut tripwire: Tripwire,
 ) {
     let mut sync_backoff = backoff::Backoff::new(0)
@@ -2515,61 +2507,12 @@ async fn sync_loop(
     let next_sync_at = tokio::time::sleep(sync_backoff.next().unwrap());
     tokio::pin!(next_sync_at);
 
-    spawn_counted({
-        let mut tripwire = tripwire.clone();
-        let agent = agent.clone();
-        async move {
-            let mut inserted_empties = 0;
-            let mut empties: BTreeMap<ActorId, Vec<RangeInclusive<i64>>> = BTreeMap::new();
-
-            let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
-            tokio::pin!(next_empties_check);
-
-            loop {
-                tokio::select! {
-                    maybe_empty = rx_empty.recv() => match maybe_empty {
-                        Some((actor_id, versions)) => {
-                            empties.entry(actor_id).or_default().push(versions);
-                            inserted_empties += 1;
-
-                            if inserted_empties < 1000 {
-                                continue;
-                            }
-                        },
-                        None => {
-                            debug!("empties queue is done");
-                            break;
-                        }
-                    },
-                    _ = &mut next_empties_check => {
-                        next_empties_check.as_mut().reset(tokio::time::Instant::now() + CHECK_EMPTIES_TO_INSERT_AFTER);
-                        if empties.is_empty() {
-                            continue;
-                        }
-                    },
-                    _ = &mut tripwire => break
-                }
-
-                inserted_empties = 0;
-
-                if let Err(e) = process_completed_empties(&agent, &mut empties).await {
-                    error!("could not process empties: {e}");
-                }
-            }
-            info!("Draining empty versions to process...");
-            // drain empties channel
-            while let Ok((actor_id, versions)) = rx_empty.try_recv() {
-                empties.entry(actor_id).or_default().push(versions);
-            }
-
-            if !empties.is_empty() {
-                info!("inserting last unprocessed empties before shut down");
-                if let Err(e) = process_completed_empties(&agent, &mut empties).await {
-                    error!("could not process empties: {e}");
-                }
-            }
-        }
-    });
+    // TODO: move this elsewhere, doesn't have be spawned here...
+    spawn_counted(write_empties_loop(
+        agent.clone(),
+        rx_empty,
+        tripwire.clone(),
+    ));
 
     loop {
         enum Branch {
@@ -2608,7 +2551,10 @@ async fn sync_loop(
                         break;
                     }
                     tripwire::Outcome::Completed(res) => {
-                        if res.is_err() {
+                        if let Err(e) = res {
+                            if !matches!(e, SyncClientError::NoGoodCandidate) {
+                                error!("could not sync: {e}");
+                            }
                             // keep syncing until we successfully sync
                             continue;
                         }
@@ -2636,50 +2582,44 @@ async fn sync_loop(
     }
 }
 
+#[tracing::instrument(skip_all, err)]
 async fn process_completed_empties(
     agent: &Agent,
-    empties: &mut BTreeMap<ActorId, Vec<RangeInclusive<i64>>>,
+    empties: &mut BTreeMap<ActorId, RangeInclusiveSet<i64>>,
 ) -> eyre::Result<()> {
     info!(
         "processing empty versions (count: {})",
-        empties.values().map(Vec::len).sum::<usize>()
+        empties.values().map(RangeInclusiveSet::len).sum::<usize>()
     );
-    let mut conn = agent.pool().write_normal().await?;
 
-    block_in_place(|| {
-        let tx = conn.transaction()?;
+    let mut inserted = 0;
 
-        let mut inserted = 0;
-        while let Some((actor_id, empties)) = empties.pop_first() {
-            let booked = {
-                agent
-                    .bookie()
-                    .blocking_write(format!(
-                        "process_completed_empties(for_actor_blocking):{}",
-                        actor_id.as_simple()
-                    ))
-                    .for_actor(actor_id)
-            };
-            let bookedw = booked.blocking_write(format!(
-                "process_completed_empties(booked writer):{}",
-                actor_id.as_simple()
-            ));
+    let start = Instant::now();
+    while let Some((actor_id, empties)) = empties.pop_first() {
+        let v = empties.into_iter().collect::<Vec<_>>();
 
-            for (range, _) in empties
-                .iter()
-                .filter_map(|range| bookedw.get_key_value(range.start()))
-                .dedup()
-            {
-                inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
-            }
+        for ranges in v.chunks(50) {
+            let mut conn = agent.pool().write_low().await?;
+            block_in_place(|| {
+                let tx = conn.transaction()?;
+
+                for range in ranges {
+                    inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
+                }
+
+                tx.commit()?;
+
+                Ok::<_, eyre::Report>(())
+            })?;
         }
+    }
 
-        tx.commit()?;
+    info!(
+        "upserted {inserted} empty version ranges in {:?}",
+        start.elapsed()
+    );
 
-        info!("upserted {inserted} empty versions");
-
-        Ok(())
-    })
+    Ok(())
 }
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -3158,7 +3098,7 @@ pub mod tests {
 
         let start = Instant::now();
 
-        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             interval.tick().await;

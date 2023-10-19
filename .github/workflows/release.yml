@@ -9,7 +9,7 @@ on:
       - v[0-9]+.*
 
 env:
-  RUSTFLAGS: -D warnings
+  RUSTFLAGS: -D warnings --cfg tokio_unstable
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -34,6 +34,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - uses: actions/checkout@v3
 
@@ -44,10 +47,8 @@ jobs:
           target: ${{ matrix.target }}
         if: startsWith(matrix.os, 'ubuntu')
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-          key: ${{ matrix.target }}
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.3
 
       - uses: taiki-e/upload-rust-binary-action@v1
         with:

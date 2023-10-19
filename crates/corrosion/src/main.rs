@@ -16,10 +16,20 @@ use corro_api_types::SqliteValue;
 use corro_client::CorrosionApiClient;
 use corro_types::{
     api::{ExecResult, QueryEvent, Statement},
-    config::{default_admin_path, Config, ConfigError, LogFormat},
+    config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
+use opentelemetry::{
+    global,
+    sdk::{
+        propagation::TraceContextPropagator,
+        trace::{self, BatchConfig},
+        Resource,
+    },
+    KeyValue,
+};
+use opentelemetry_otlp::WithExportConfig;
 use rusqlite::{Connection, OptionalExtension};
 use tokio_util::codec::{Decoder, LinesCodec};
 use tracing::{debug, error, info, warn};
@@ -51,19 +61,74 @@ fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
             eprintln!("While parsing env filters: {diags}, using default");
         }
 
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
         // Tracing
         let (env_filter, _handle) = tracing_subscriber::reload::Layer::new(filter.layer());
 
         let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
 
-        match config.log.format {
-            LogFormat::Plaintext => {
-                sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
+        if let Some(otel) = &config.telemetry.open_telemetry {
+            let otlp_exporter = opentelemetry_otlp::new_exporter().tonic().with_env();
+            let otlp_exporter = match otel {
+                OtelConfig::FromEnv => otlp_exporter,
+                OtelConfig::Exporter { endpoint } => otlp_exporter.with_endpoint(endpoint),
+            };
+
+            let batch_config = BatchConfig::default().with_max_queue_size(10240);
+
+            let trace_config = trace::config().with_resource(Resource::new([
+                KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::SERVICE_NAME,
+                    "corrosion",
+                ),
+                KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
+                    VERSION,
+                ),
+                KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::HOST_NAME,
+                    hostname::get().unwrap().to_string_lossy().into_owned(),
+                ),
+            ]));
+
+            let tracer = opentelemetry_otlp::new_pipeline()
+                .tracing()
+                .with_exporter(otlp_exporter)
+                .with_trace_config(trace_config)
+                .with_batch_config(batch_config)
+                .install_batch(opentelemetry::runtime::Tokio)
+                .expect("Failed to initialize OpenTelemetry OTLP exporter.");
+
+            let sub = sub.with(tracing_opentelemetry::layer().with_tracer(tracer));
+            match config.log.format {
+                LogFormat::Plaintext => {
+                    sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
+                        .init();
+                }
+                LogFormat::Json => {
+                    sub.with(
+                        tracing_subscriber::fmt::Layer::new()
+                            .json()
+                            .with_span_list(false),
+                    )
                     .init();
+                }
             }
-            LogFormat::Json => {
-                sub.with(tracing_subscriber::fmt::Layer::new().json())
+        } else {
+            match config.log.format {
+                LogFormat::Plaintext => {
+                    sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
+                        .init();
+                }
+                LogFormat::Json => {
+                    sub.with(
+                        tracing_subscriber::fmt::Layer::new()
+                            .json()
+                            .with_span_list(false),
+                    )
                     .init();
+                }
             }
         }
     } else {
@@ -207,6 +272,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 "successfully restored! old size: {}, new size: {}",
                 restored.old_len, restored.new_len
             );
+        }
+        Command::Cluster(ClusterCommand::MembershipStates) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Cluster(
+                corro_admin::ClusterCommand::MembershipStates,
+            ))
+            .await?;
         }
         Command::Consul(cmd) => match cmd {
             ConsulCommand::Sync => match cli.config()?.consul.as_ref() {
@@ -443,6 +515,10 @@ enum Command {
         self_actor_id: bool,
     },
 
+    /// Cluster interactions
+    #[command(subcommand)]
+    Cluster(ClusterCommand),
+
     /// Consul interactions
     #[command(subcommand)]
     Consul(ConsulCommand),
@@ -488,6 +564,12 @@ enum Command {
     /// Tls-related commands
     #[command(subcommand)]
     Tls(TlsCommand),
+}
+
+#[derive(Subcommand)]
+enum ClusterCommand {
+    /// Dumps the current member states
+    MembershipStates,
 }
 
 #[derive(Subcommand)]
