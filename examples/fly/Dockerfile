@@ -35,11 +35,11 @@ RUN useradd -ms /bin/bash corrosion
 
 COPY examples/fly/entrypoint.sh /entrypoint.sh
 
-COPY examples/fly/corrosion-files/ /etc/corrosion/
+# COPY examples/fly/corrosion-files/* /etc/corrosion/
 
-# COPY examples/fly/config.toml /etc/corrosion/config.toml
-# COPY examples/fly/schemas /etc/corrosion/schemas
-# COPY examples/fly/templates /etc/corrosion/templates
+COPY examples/fly/config.toml /etc/corrosion/config.toml
+COPY examples/fly/schemas /etc/corrosion/schemas
+COPY examples/fly/templates /etc/corrosion/templates
 
 ENTRYPOINT ["/entrypoint.sh"]
 # Run the app
