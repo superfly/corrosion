@@ -1,11 +1,14 @@
-# Work with cluster data
+# Work with cluster data on Fly.io
 
 With your Corrosion cluster deployed, you can work with the example database.
 
 To get started, shell into each Corrosion node, in separate terminals. 
+
 ```
-fly ssh console --pty --app <your-app-name> --select`
+fly ssh console --pty --app <your-app-name> --select
 ```
+
+If you run the command from the directory containing your Corrosion app's `fly.toml` configuration file, you can omit the `--app` flag. 
 
 We'll call one Machine "Node A" and the other "Node B". Every node is read-write, so it doesn't matter which is which.
 
@@ -15,7 +18,7 @@ The example schema, `todo.sql`, specifies a single table called `todos`, with `i
 -- /etc/corrosion/schemas/todo.sql
 
 CREATE TABLE todos (
-    id BLOB PRIMARY KEY,
+    id BLOB NOT NULL PRIMARY KEY,
     title TEXT NOT NULL DEFAULT '',
     completed_at INTEGER
 );
@@ -25,6 +28,8 @@ CREATE TABLE todos (
 
 ### Insert some data on Node A
 
+From Node A's terminal session:
+
 ```bash
 # corrosion exec --param 'some-id' --param 'Write some Corrosion docs!' 'INSERT INTO todos (id, title) VALUES (?, ?)'
 INFO corrosion: Rows affected: 1
@@ -33,7 +38,7 @@ INFO corrosion: Rows affected: 1
 
 Via SQLite directly:
 
-```bash
+```plain
 # sqlite3 /var/lib/corrosion/state.db 'SELECT * FROM todos;'
 some-id|Write some Corrosion docs!|
 ```
@@ -47,6 +52,8 @@ some-id|Write some Corrosion docs!|
 ```
 
 ### Query data on Node B
+
+From Node B's terminal:
 
 ```bash
 # corrosion query 'SELECT * FROM todos;' --columns
@@ -62,7 +69,9 @@ Node A's contribution is already present in Node B's database.
 INFO corrosion: Rows affected: 1
 ```
 
-### Check the data on Node A
+### Check the data that Node A has
+
+
 ```bash
 # corrosion query 'SELECT * FROM todos;' --columns
 id|title|completed_at
@@ -86,7 +95,7 @@ The example template `todos.rhai` makes a checklist out of the rows in our `todo
 
 ### Start `corrosion template` and watch the output file
 
-On Node A, start processing the template. 
+On Node A, start processing the template.
 
 ```bash
 # corrosion template "/etc/corrosion/templates/todos.rhai:todos.txt" &

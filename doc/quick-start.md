@@ -10,7 +10,7 @@ This is a simple of starting a 2-node Corrosion cluster running on the same host
 -- /etc/corrosion/schema/todo.sql
 
 CREATE TABLE todos (
-    id BLOB PRIMARY KEY,
+    id BLOB NOT NULL PRIMARY KEY,
     title TEXT NOT NULL DEFAULT '',
     completed_at INTEGER
 );
