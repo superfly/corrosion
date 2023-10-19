@@ -6,6 +6,7 @@ use rangemap::RangeInclusiveSet;
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 use tokio_util::codec::{Decoder, LengthDelimitedCodec};
+use tracing::warn;
 
 use crate::{
     actor::ActorId,
@@ -124,6 +125,10 @@ impl SyncStateV1 {
 
         for (actor_id, head) in other.heads.iter() {
             if *actor_id == self.actor_id {
+                continue;
+            }
+            if *head == 0 {
+                warn!(actor_id = %other.actor_id, "sent a 0 head version for actor id {}", actor_id);
                 continue;
             }
             let other_haves = {
