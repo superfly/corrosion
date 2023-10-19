@@ -69,10 +69,10 @@ Node A's contribution is already present in Node B's database.
 INFO corrosion: Rows affected: 1
 ```
 
-### Check the data that Node A has
+### Check the data in Node A's database
 
 
-```bash
+```
 # corrosion query 'SELECT * FROM todos;' --columns
 id|title|completed_at
 some-id|Write some Corrosion docs!|
@@ -97,7 +97,7 @@ The example template `todos.rhai` makes a checklist out of the rows in our `todo
 
 On Node A, start processing the template.
 
-```bash
+```
 # corrosion template "/etc/corrosion/templates/todos.rhai:todos.txt" &
 [1] 354
 root@4d8964eb9d9487:/#  INFO corrosion::command::tpl: Watching and rendering /etc/corrosion/templates/todos.rhai to todos.txt
@@ -106,7 +106,7 @@ Whenever there's an update to the results of the template's query (or queries), 
 
 Start watching the output file.
 
-```bash
+```
 # watch -n 0.5 cat todos.txt
 Every 0.5s: cat todos.txt
 
@@ -118,7 +118,7 @@ Every 0.5s: cat todos.txt
 
 On the other Machine (Node B), insert some data.
 
-```bash
+```
 # corrosion exec --param 'some-id-3' --param 'Hello from a template!' 'INSERT INTO todos (id, title) VALUES (?, ?)'
 INFO corrosion: Rows affected: 1
 ```
@@ -137,12 +137,12 @@ Every 0.5s: cat todos.txt
 
 Mark all tasks as completed, on either node:
 
-```bash
+```
 # corrosion exec 'UPDATE todos SET completed_at = 1234567890'
 INFO corrosion: Rows affected: 3
 ```
 
-```bash
+```
 $ watch -n 0.5 cat todos.txt
 Every 0.5s: cat todos.txt
 
@@ -151,4 +151,4 @@ Every 0.5s: cat todos.txt
 [X] Hello from a template!
 ```
 
-
+Now you have a distributed to-do list app! A front end is left as an exercise for the reader ;)
