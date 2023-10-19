@@ -17,14 +17,14 @@ use compact_str::CompactString;
 use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
-use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
+use rangemap::RangeInclusiveSet;
 use rusqlite::{Connection, InterruptHandle};
 use serde::{Deserialize, Serialize};
 use tokio::{
     runtime::Handle,
     sync::{
         mpsc::{channel, Sender},
-        oneshot,
+        oneshot, Semaphore,
     },
 };
 use tokio::{
@@ -35,12 +35,12 @@ use tokio::{
     task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, Instrument};
 use tripwire::Tripwire;
 
 use crate::{
     actor::ActorId,
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, Timestamp},
+    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     config::Config,
     pubsub::MatcherHandle,
     schema::NormalizedSchema,
@@ -68,6 +68,7 @@ pub struct AgentConfig {
     pub tx_apply: Sender<(ActorId, i64)>,
     pub tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
+    pub tx_foca: Sender<FocaInput>,
 
     pub schema: RwLock<NormalizedSchema>,
     pub tripwire: Tripwire,
@@ -87,7 +88,14 @@ pub struct AgentInner {
     tx_apply: Sender<(ActorId, i64)>,
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     tx_changes: Sender<(ChangeV1, ChangeSource)>,
+    tx_foca: Sender<FocaInput>,
     schema: RwLock<NormalizedSchema>,
+    limits: Limits,
+}
+
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub sync: Arc<Semaphore>,
 }
 
 impl Agent {
@@ -106,7 +114,11 @@ impl Agent {
             tx_apply: config.tx_apply,
             tx_empty: config.tx_empty,
             tx_changes: config.tx_changes,
+            tx_foca: config.tx_foca,
             schema: config.schema,
+            limits: Limits {
+                sync: Arc::new(Semaphore::new(3)),
+            },
         }))
     }
 
@@ -150,6 +162,10 @@ impl Agent {
         &self.0.tx_empty
     }
 
+    pub fn tx_foca(&self) -> &Sender<FocaInput> {
+        &self.0.tx_foca
+    }
+
     pub fn bookie(&self) -> &Bookie {
         &self.0.bookie
     }
@@ -176,6 +192,10 @@ impl Agent {
 
     pub fn set_config(&self, new_conf: Config) {
         self.0.config.store(Arc::new(new_conf))
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.0.limits
     }
 }
 
@@ -332,14 +352,17 @@ impl SplitPool {
     }
 
     // get a read-only connection
+    #[tracing::instrument(skip(self), level = "debug")]
     pub async fn read(&self) -> Result<sqlite_pool::Connection<CrConn>, SqlitePoolError> {
         self.0.read.get().await
     }
 
+    #[tracing::instrument(skip(self), level = "debug")]
     pub fn read_blocking(&self) -> Result<sqlite_pool::Connection<CrConn>, SqlitePoolError> {
         Handle::current().block_on(self.0.read.get())
     }
 
+    #[tracing::instrument(skip(self), level = "debug")]
     pub async fn dedicated(&self) -> rusqlite::Result<Connection> {
         block_in_place(|| {
             let mut conn = rusqlite::Connection::open(&self.0.path)?;
@@ -349,16 +372,19 @@ impl SplitPool {
     }
 
     // get a high priority write connection (e.g. client input)
+    #[tracing::instrument(skip(self))]
     pub async fn write_priority(&self) -> Result<WriteConn, PoolError> {
         self.write_inner(&self.0.priority_tx, "priority").await
     }
 
     // get a normal priority write connection (e.g. sync process)
+    #[tracing::instrument(skip(self))]
     pub async fn write_normal(&self) -> Result<WriteConn, PoolError> {
         self.write_inner(&self.0.normal_tx, "normal").await
     }
 
     // get a low priority write connection (e.g. background tasks)
+    #[tracing::instrument(skip(self))]
     pub async fn write_low(&self) -> Result<WriteConn, PoolError> {
         self.write_inner(&self.0.low_tx, "low").await
     }
@@ -375,12 +401,15 @@ impl SplitPool {
         histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
         let conn = self.0.write.get().await?;
 
-        tokio::spawn(timeout_wait(
-            token.clone(),
-            conn.get_interrupt_handle(),
-            Duration::from_secs(30),
-            queue,
-        ));
+        tokio::spawn(
+            timeout_wait(
+                token.clone(),
+                conn.get_interrupt_handle(),
+                Duration::from_secs(30),
+                queue,
+            )
+            .in_current_span(),
+        );
 
         Ok(WriteConn {
             conn,
@@ -484,6 +513,7 @@ impl<T> CountedTokioRwLock<T> {
         }
     }
 
+    #[tracing::instrument(skip(self, label), level = "debug")]
     pub async fn write<C: Into<CompactString>>(
         &self,
         label: C,
@@ -491,6 +521,7 @@ impl<T> CountedTokioRwLock<T> {
         self.registry.acquire_write(label, &self.lock).await
     }
 
+    #[tracing::instrument(skip(self, label), level = "debug")]
     pub fn blocking_write<C: Into<CompactString>>(
         &self,
         label: C,
@@ -498,6 +529,7 @@ impl<T> CountedTokioRwLock<T> {
         self.registry.acquire_blocking_write(label, &self.lock)
     }
 
+    #[tracing::instrument(skip(self, label), level = "debug")]
     pub fn blocking_write_owned<C: Into<CompactString>>(
         &self,
         label: C,
@@ -506,11 +538,24 @@ impl<T> CountedTokioRwLock<T> {
             .acquire_blocking_write_owned(label, self.lock.clone())
     }
 
+    #[tracing::instrument(skip(self, label), level = "debug")]
+    pub fn blocking_read<C: Into<CompactString>>(
+        &self,
+        label: C,
+    ) -> CountedTokioRwLockReadGuard<'_, T> {
+        self.registry.acquire_blocking_read(label, &self.lock)
+    }
+
+    #[tracing::instrument(skip(self, label), level = "debug")]
     pub async fn read<C: Into<CompactString>>(
         &self,
         label: C,
     ) -> CountedTokioRwLockReadGuard<'_, T> {
         self.registry.acquire_read(label, &self.lock).await
+    }
+
+    pub fn registry(&self) -> &LockRegistry {
+        &self.registry
     }
 }
 
@@ -694,6 +739,30 @@ impl LockRegistry {
         CountedTokioRwLockReadGuard { lock: w, _tracker }
     }
 
+    fn acquire_blocking_read<'a, T, C: Into<CompactString>>(
+        &self,
+        label: C,
+        lock: &'a TokioRwLock<T>,
+    ) -> CountedTokioRwLockReadGuard<'a, T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label: label.into(),
+                kind: LockKind::Read,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = lock.blocking_read();
+        self.set_lock_state(&id, LockState::Locked);
+        CountedTokioRwLockReadGuard { lock: w, _tracker }
+    }
+
     fn set_lock_state(&self, id: &LockId, state: LockState) {
         if let Some(meta) = self.map.write().get_mut(id) {
             meta.state = state
@@ -734,23 +803,102 @@ impl Drop for LockTracker {
     }
 }
 
-#[derive(Default)]
-pub struct BookedVersions(pub RangeInclusiveMap<i64, KnownDbVersion>);
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CurrentVersion {
+    // cr-sqlite db version
+    pub db_version: i64,
+    // actual last sequence originally produced
+    pub last_seq: i64,
+    // timestamp when the change was produced by the source
+    pub ts: Timestamp,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PartialVersion {
+    // range of sequences recorded
+    pub seqs: RangeInclusiveSet<i64>,
+    // actual last sequence originally produced
+    pub last_seq: i64,
+    // timestamp when the change was produced by the source
+    pub ts: Timestamp,
+}
+
+impl From<PartialVersion> for KnownDbVersion {
+    fn from(PartialVersion { seqs, last_seq, ts }: PartialVersion) -> Self {
+        KnownDbVersion::Partial { seqs, last_seq, ts }
+    }
+}
+
+#[derive(Debug)]
+pub enum KnownVersion<'a> {
+    Cleared,
+    Current(&'a CurrentVersion),
+    Partial(&'a PartialVersion),
+}
+
+impl<'a> KnownVersion<'a> {
+    pub fn is_cleared(&self) -> bool {
+        matches!(self, KnownVersion::Cleared)
+    }
+}
+
+impl<'a> From<KnownVersion<'a>> for KnownDbVersion {
+    fn from(value: KnownVersion<'a>) -> Self {
+        match value {
+            KnownVersion::Cleared => KnownDbVersion::Cleared,
+            KnownVersion::Current(CurrentVersion {
+                db_version,
+                last_seq,
+                ts,
+            }) => KnownDbVersion::Current {
+                db_version: *db_version,
+                last_seq: *last_seq,
+                ts: *ts,
+            },
+            KnownVersion::Partial(PartialVersion { seqs, last_seq, ts }) => {
+                KnownDbVersion::Partial {
+                    seqs: seqs.clone(),
+                    last_seq: *last_seq,
+                    ts: *ts,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct BookedVersions {
+    pub cleared: RangeInclusiveSet<i64>,
+    pub current: BTreeMap<i64, CurrentVersion>,
+    pub partials: BTreeMap<i64, PartialVersion>,
+}
 
 impl BookedVersions {
+    pub fn contains_version(&self, version: &i64) -> bool {
+        self.cleared.contains(version)
+            || self.current.contains_key(version)
+            || self.partials.contains_key(version)
+    }
+
+    pub fn get(&self, version: &i64) -> Option<KnownVersion> {
+        self.cleared
+            .get(version)
+            .map(|_| KnownVersion::Cleared)
+            .or_else(|| self.current.get(version).map(KnownVersion::Current))
+            .or_else(|| self.partials.get(version).map(KnownVersion::Partial))
+    }
+
     pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
-        match seqs {
-            Some(check_seqs) => match self.0.get(&version) {
-                Some(known) => match known {
-                    KnownDbVersion::Partial { seqs, .. } => {
-                        check_seqs.clone().all(|seq| seqs.contains(&seq))
+        self.contains_version(&version)
+            && seqs
+                .map(|check_seqs| match self.get(&version) {
+                    Some(KnownVersion::Cleared) | Some(KnownVersion::Current(_)) => true,
+                    Some(KnownVersion::Partial(partial)) => {
+                        check_seqs.clone().all(|seq| partial.seqs.contains(&seq))
                     }
-                    KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
-                },
-                None => false,
-            },
-            None => self.0.contains_key(&version),
-        }
+                    None => false,
+                })
+                .unwrap_or(true)
     }
 
     pub fn contains_all(
@@ -762,24 +910,26 @@ impl BookedVersions {
     }
 
     pub fn contains_current(&self, version: &i64) -> bool {
-        matches!(self.0.get(version), Some(KnownDbVersion::Current { .. }))
+        self.current.contains_key(version)
     }
 
     pub fn current_versions(&self) -> BTreeMap<i64, i64> {
-        self.0
+        self.current
             .iter()
-            .filter_map(|(range, known)| {
-                if let KnownDbVersion::Current { db_version, .. } = known {
-                    Some((*db_version, *range.start()))
-                } else {
-                    None
-                }
-            })
+            .map(|(version, current)| (current.db_version, *version))
             .collect()
     }
 
     pub fn last(&self) -> Option<i64> {
-        self.0.iter().map(|(k, _v)| *k.end()).max()
+        std::cmp::max(
+            // TODO: we probably don't need to traverse all of that...
+            //       maybe use `skip` based on the len
+            self.cleared.iter().map(|k| *k.end()).max(),
+            std::cmp::max(
+                self.current.last_key_value().map(|(k, _)| *k),
+                self.partials.last_key_value().map(|(k, _)| *k),
+            ),
+        )
     }
 
     pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
@@ -787,15 +937,43 @@ impl BookedVersions {
     }
 
     pub fn insert_many(&mut self, versions: RangeInclusive<i64>, known_version: KnownDbVersion) {
-        self.0.insert(versions, known_version);
+        match known_version {
+            KnownDbVersion::Partial { seqs, last_seq, ts } => {
+                self.partials
+                    .insert(*versions.start(), PartialVersion { seqs, last_seq, ts });
+            }
+            KnownDbVersion::Current {
+                db_version,
+                last_seq,
+                ts,
+            } => {
+                let version = *versions.start();
+                self.partials.remove(&version);
+                self.current.insert(
+                    version,
+                    CurrentVersion {
+                        db_version,
+                        last_seq,
+                        ts,
+                    },
+                );
+            }
+            KnownDbVersion::Cleared => {
+                for version in versions.clone() {
+                    self.partials.remove(&version);
+                    self.current.remove(&version);
+                }
+                self.cleared.insert(versions);
+            }
+        }
     }
-}
 
-impl Deref for BookedVersions {
-    type Target = RangeInclusiveMap<i64, KnownDbVersion>;
+    pub fn all_versions(&self) -> RangeInclusiveSet<i64> {
+        let mut versions = self.cleared.clone();
+        versions.extend(self.current.keys().map(|key| *key..=*key));
+        versions.extend(self.partials.keys().map(|key| *key..=*key));
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+        versions
     }
 }
 
@@ -830,6 +1008,13 @@ impl Booked {
         self.0.blocking_write(label)
     }
 
+    pub fn blocking_read<L: Into<CompactString>>(
+        &self,
+        label: L,
+    ) -> CountedTokioRwLockReadGuard<'_, BookedVersions> {
+        self.0.blocking_read(label)
+    }
+
     pub fn blocking_write_owned<L: Into<CompactString>>(
         &self,
         label: L,
@@ -855,10 +1040,6 @@ impl BookieInner {
                 )))
             })
             .clone()
-    }
-
-    pub fn registry(&self) -> &LockRegistry {
-        &self.registry
     }
 }
 
@@ -907,5 +1088,9 @@ impl Bookie {
         label: L,
     ) -> CountedTokioRwLockWriteGuard<BookieInner> {
         self.0.blocking_write(label)
+    }
+
+    pub fn registry(&self) -> &LockRegistry {
+        self.0.registry()
     }
 }

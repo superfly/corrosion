@@ -26,6 +26,9 @@ metrics-exporter-prometheus = { workspace = true }
 notify = { version = "6.0.1", default-features = false, features = ["macos_kqueue"] }
 notify-debouncer-mini = { version = "0.3.0", default-features = false }
 once_cell = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
 rusqlite = { workspace = true }
 seahash = { workspace = true }
 serde = { workspace = true }
@@ -37,10 +40,12 @@ tempfile = { workspace = true }
 tikv-jemallocator = "0.5"
 time = { workspace = true }
 tokio = { workspace = true }
+tokio-metrics = { workspace = true }
 tokio-serde = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-filter = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
 uuid = { workspace = true }

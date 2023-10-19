@@ -33,7 +33,7 @@ use tripwire::Tripwire;
 use corro_types::{
     actor::Actor,
     agent::Agent,
-    broadcast::{BroadcastInput, DispatchRuntime, FocaInput, UniPayload, UniPayloadV1},
+    broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
     members::MemberEvent,
 };
 
@@ -348,6 +348,16 @@ pub fn runtime_loop(
                                 error!("foca apply_many error: {e}");
                             }
                         }
+                        FocaInput::Cmd(cmd) => match cmd {
+                            FocaCmd::MembershipStates(sender) => {
+                                for member in foca.iter_membership_state() {
+                                    if let Err(e) = sender.send(member.clone()).await {
+                                        error!("could not send back foca membership: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                        },
                     },
                     Branch::MemberEvents(evts) => {
                         trace!("handling Branch::MemberEvents");
@@ -472,6 +482,10 @@ pub fn runtime_loop(
                         trace!("handling Branch::Metrics");
                         {
                             gauge!("corro.gossip.members", foca.num_members() as f64);
+                            gauge!(
+                                "corro.gossip.member.states",
+                                foca.iter_membership_state().count() as f64
+                            );
                             gauge!(
                                 "corro.gossip.updates_backlog",
                                 foca.updates_backlog() as f64
@@ -614,7 +628,11 @@ pub fn runtime_loop(
                         let members = agent.members().read();
                         for addr in members.ring0() {
                             // this spawns, so we won't be holding onto the read lock for long
-                            transmit_broadcast(payload.clone(), transport.clone(), addr);
+                            tokio::spawn(transmit_broadcast(
+                                payload.clone(),
+                                transport.clone(),
+                                addr,
+                            ));
                         }
 
                         if local_bcast_buf.len() >= BROADCAST_CUTOFF {
@@ -684,7 +702,11 @@ pub fn runtime_loop(
                 for addr in broadcast_to {
                     debug!(actor = %actor_id, "broadcasting {} bytes to: {addr} (send count: {})", pending.payload.len(), pending.send_count);
 
-                    transmit_broadcast(pending.payload.clone(), transport.clone(), addr);
+                    tokio::spawn(transmit_broadcast(
+                        pending.payload.clone(),
+                        transport.clone(),
+                        addr,
+                    ));
                 }
 
                 pending.send_count = pending.send_count.wrapping_add(1);
@@ -714,7 +736,7 @@ fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
 
     // max payload size for udp datagrams, use a safe value here...
     // TODO: calculate from smallest max datagram size for all QUIC conns
-    config.max_packet_size = 1200.try_into().unwrap();
+    config.max_packet_size = 1178.try_into().unwrap();
 
     config
 }
@@ -744,33 +766,20 @@ impl PendingBroadcast {
     }
 }
 
-fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
-    tokio::spawn(async move {
-        trace!("singly broadcasting to {addr}");
-        let mut stream = match transport.open_uni(addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!("could not open unidirectional stream to {addr}: {e}");
-                return;
-            }
-        };
+#[tracing::instrument(skip(payload, transport), fields(buf_size = payload.len()), level = "debug")]
+async fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAddr) {
+    trace!("singly broadcasting to {addr}");
 
-        match tokio::time::timeout(Duration::from_secs(5), stream.write_all(&payload)).await {
-            Err(_e) => {
-                warn!("timed out writing broadcast to uni stream");
-                return;
-            }
-            Ok(Err(e)) => {
-                error!("could not write to uni stream to {addr}: {e}");
-                return;
-            }
-            Ok(Ok(_)) => {
-                counter!("corro.peer.stream.bytes.sent.total", payload.len() as u64, "type" => "uni");
-            }
+    let len = payload.len();
+    match tokio::time::timeout(Duration::from_secs(5), transport.send_uni(addr, payload)).await {
+        Err(_e) => {
+            warn!("timed out writing broadcast to uni stream");
         }
-
-        if let Err(e) = stream.finish().await {
-            debug!("could not finish broadcast uni stream to {addr}: {e}");
+        Ok(Err(e)) => {
+            error!("could not write to uni stream to {addr}: {e}");
         }
-    });
+        Ok(Ok(_)) => {
+            counter!("corro.peer.stream.bytes.sent.total", len as u64, "type" => "uni");
+        }
+    }
 }

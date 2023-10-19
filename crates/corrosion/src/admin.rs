@@ -57,7 +57,6 @@ impl AdminConn {
                     }
                     Response::Json(json) => {
                         println!("{}", serde_json::to_string_pretty(&json).unwrap());
-                        break;
                     }
                 },
             }

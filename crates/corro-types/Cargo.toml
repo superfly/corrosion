@@ -24,6 +24,7 @@ indexmap = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
 once_cell = { workspace = true }
+opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 rangemap = { workspace = true }
