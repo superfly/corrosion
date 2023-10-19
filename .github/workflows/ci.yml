@@ -24,24 +24,23 @@ jobs:
     
     runs-on: ${{ matrix.os }}
 
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: rui314/setup-mold@v1
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          target: ${{ matrix.target }}
-
+      - name: Install Rust specified toolchain
+        run: rustup show
+        
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.3
 
       - name: Test with latest nextest release
         run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
