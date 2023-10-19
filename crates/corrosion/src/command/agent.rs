@@ -70,6 +70,9 @@ fn setup_prometheus(addr: SocketAddr) -> eyre::Result<()> {
             0.100, // 100ms
             0.200, // 200ms
             1.0,   // 1s
+            2.0,   // 2s
+            3.0,   // 3s
+            4.0,   // 4s
             5.0,   // 5s
             10.0,  // 10s :screaming:
             30.0, 60.0,

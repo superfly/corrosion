@@ -1186,7 +1186,7 @@ pub async fn handle_change(agent: &Agent, bcast: BroadcastV1, bcast_msg_tx: &Sen
             }
 
             if let Some(diff) = diff {
-                histogram!("corro.broadcast.recv.lag.seconds", diff.as_secs_f64(), "actor_id" => change.actor_id.to_string());
+                histogram!("corro.broadcast.recv.lag.seconds", diff.as_secs_f64());
             }
 
             if let Err(e) = bcast_msg_tx.send(BroadcastV1::Change(change)).await {
