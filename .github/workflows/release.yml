@@ -9,7 +9,7 @@ on:
       - v[0-9]+.*
 
 env:
-  RUSTFLAGS: -D warnings
+  RUSTFLAGS: -D warnings --cfg tokio_unstable
   CARGO_TERM_COLOR: always
 
 jobs:
