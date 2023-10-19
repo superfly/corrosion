@@ -18,7 +18,7 @@ use tokio::{
     sync::{mpsc, Mutex, RwLock},
     time::error::Elapsed,
 };
-use tracing::{debug, info_span, warn, Instrument};
+use tracing::{debug, debug_span, warn, Instrument};
 
 use crate::api::peer::gossip_client_endpoint;
 
@@ -95,7 +95,7 @@ impl Transport {
 
         let mut stream = match conn
             .open_uni()
-            .instrument(info_span!("quic_open_uni"))
+            .instrument(debug_span!("quic_open_uni"))
             .await
         {
             Ok(stream) => stream,
@@ -106,31 +106,31 @@ impl Transport {
                 debug!("retryable error attempting to open unidirectional stream: {e}");
                 let conn = self.connect(addr).await?;
                 conn.open_uni()
-                    .instrument(info_span!("quic_open_uni"))
+                    .instrument(debug_span!("quic_open_uni"))
                     .await?
             }
         };
 
         stream
             .write_chunk(data)
-            .instrument(info_span!("quic_write_chunk"))
+            .instrument(debug_span!("quic_write_chunk"))
             .await?;
 
         stream
             .finish()
-            .instrument(info_span!("quic_finish"))
+            .instrument(debug_span!("quic_finish"))
             .await?;
 
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), err)]
+    #[tracing::instrument(skip(self), level = "debug", err)]
     pub async fn open_bi(
         &self,
         addr: SocketAddr,
     ) -> Result<(SendStream, RecvStream), TransportError> {
         let conn = self.connect(addr).await?;
-        match conn.open_bi().instrument(info_span!("quic_open_bi")).await {
+        match conn.open_bi().instrument(debug_span!("quic_open_bi")).await {
             Ok(send_recv) => return Ok(send_recv),
             Err(e @ ConnectionError::VersionMismatch) => {
                 return Err(e.into());
@@ -144,7 +144,7 @@ impl Transport {
         let conn = self.connect(addr).await?;
         Ok(conn
             .open_bi()
-            .instrument(info_span!("quic_open_bi"))
+            .instrument(debug_span!("quic_open_bi"))
             .await?)
     }
 
@@ -183,7 +183,7 @@ impl Transport {
                     Err(e.into())
                 }
             }
-        }.instrument(info_span!("quic_connect", %addr, rtt = tracing::field::Empty)).await
+        }.instrument(debug_span!("quic_connect", %addr, rtt = tracing::field::Empty)).await
     }
 
     // this shouldn't block for long...

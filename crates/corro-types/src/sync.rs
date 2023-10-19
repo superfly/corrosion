@@ -268,7 +268,7 @@ impl From<SyncStateV1> for SyncMessage {
 }
 
 // generates a `SyncMessage` to tell another node what versions we're missing
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip_all, level = "debug")]
 pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
     let mut state = SyncStateV1 {
         actor_id,
