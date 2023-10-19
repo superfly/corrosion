@@ -36,8 +36,8 @@ pub struct SyncTraceContextV1 {
 impl Injector for SyncTraceContextV1 {
     fn set(&mut self, key: &str, value: String) {
         match key {
-            "traceparent" => self.traceparent = Some(value),
-            "tracestate" => self.tracestate = Some(value),
+            "traceparent" if !value.is_empty() => self.traceparent = Some(value),
+            "tracestate" if !value.is_empty() => self.tracestate = Some(value),
             _ => {}
         }
     }
