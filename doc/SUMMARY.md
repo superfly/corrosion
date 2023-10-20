@@ -19,7 +19,7 @@
 - [Deploy on Fly.io](deploy-on-fly/README.md)
   - [Launch a Corrosion Cluster](deploy-on-fly/launch.md)
   - [Work with cluster data on Fly.io](deploy-on-fly/explore.md)
-  - [Connect to Corrosion on Fly.io from your local machine](deploy-on-fly/fly-proxy.md)
+  - [Run Corrosion commands on a remote node](deploy-on-fly/fly-proxy.md)
 
 # Reference
 - [API](api/README.md)

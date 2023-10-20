@@ -4,7 +4,7 @@ The Corrosion repository on GitHub includes example files to deploy Fly Machines
 
 - [Launch a Corrosion cluster on Fly.io](./launch.md)
 - [Work with cluster data on Fly.io](./explore.md)
-- [Connect from your local machine](./fly-proxy.md)
+- [Run Corrosion commands on a remote node](./fly-proxy.md)
 
 Corrosion is designed to run on the same node as any program that uses it. On Fly.io, that means deploying from a Docker image that runs both your code and Corrosion.
 
