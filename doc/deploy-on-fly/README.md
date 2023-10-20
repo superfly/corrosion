@@ -2,7 +2,7 @@
 
 The [Corrosion repository](https://github.com/superfly/corrosion) on GitHub includes example files to deploy Fly Machines running Corrosion in a cluster, communicating via [Fly private networking](https://fly.io/docs/reference/private-networking/).
 
-- [Launch a Corrosion cluster on Fly.io](./launch.md)
+- [Launch a Corrosion cluster](./launch.md)
 - [Work with cluster data on Fly.io](./explore.md)
 - [Run Corrosion commands on a remote node](./fly-proxy.md)
 

@@ -1,4 +1,4 @@
-# Launch on Fly.io
+# Launch a Corrosion cluster
 
 This example deploys a 2-node Corrosion cluster on [Fly Machines](https://fly.io/docs/machines/) VMs, using the example files in `corrosion/examples/fly/` within the Corrosion git repository.
 
