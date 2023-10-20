@@ -2,7 +2,6 @@
 
 Corrosion's CLI works through the API. You can install Corrosion locally and run Corrosion commands on a remote node.
 
-
 ## Connecting
 
 A convenient way to access a remote node's API port on Fly.io is to open a user-mode WireGuard tunnel using the [`fly proxy`](https://fly.io/docs/flyctl/proxy/) command.

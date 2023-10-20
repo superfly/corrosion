@@ -2,7 +2,7 @@
 
 This example deploys a 2-node Corrosion cluster on [Fly Machines](https://fly.io/docs/machines/) VMs, using the example files in `corrosion/examples/fly/` within the Corrosion git repository.
 
-Each node is a separate Fly Machine, and nodes communicate with each other over Fly.io private networking. The cluster is initialized with an empty database.
+Each node is a separate [Fly Machine](https://fly.io/docs/machines/), and nodes communicate with each other over Fly.io private networking. The cluster is initialized with an empty database.
 
 You'll be provisioning two `shared-cpu-1x` Machines and two 1GB [Fly volumes](https://fly.io/docs/reference/volumes/) for persistent storage. See the [Fly.io resource pricing](https://fly.io/pricing/) page for cost information.
 
@@ -32,7 +32,7 @@ Check out the latest release as a new branch.
 $ git checkout tags/v0.1.0 -b v010
 ```
 
-Fly Launch uses a TOML file for app configuration. Copy the example `fly.toml` to the working directory.
+[Fly Launch](https://fly.io/docs/apps/launch/) uses a TOML file for [app configuration](https://fly.io/docs/reference/configuration/). Copy the example `fly.toml` to the working directory.
 
 ```bash
 $ cp examples/fly/fly.toml .
@@ -96,7 +96,7 @@ You can also see the latest internal activity with the `fly logs` command.
 
 ## Check on the database
 
-To get a shell session on a Fly Machine: 
+To get a shell session on a Fly Machine use [`fly ssh console`](https://fly.io/docs/flyctl/ssh-console/): 
 
 ```bash
 $ fly ssh console --pty --select
@@ -125,7 +125,7 @@ Scale up to two Machines. Put the second one in [another part of the world](http
 $ fly scale count 1 --region <second-fly-region>
 ```
 
-`fly scale count` provisions a new Machine with an empty volume attached, because the original Machine has a volume. Once the new node joins the cluster, Corrosion populates its local database on this volume with the latest data from the cluster.
+The [`fly scale count` command](https://fly.io/docs/flyctl/scale-count/) provisions a new Machine with an empty volume attached, because the original Machine has a volume. Once the new node joins the cluster, Corrosion populates its local database on this volume with the latest data from the cluster.
 
 Once the second Machine is running, you should be able to see log messages from Corrosion on both instances.
 
@@ -134,6 +134,8 @@ You can use the example database to test out your Corrosion cluster: [Work with 
 ## Example Files
 
 ### Fly Launch configuration
+
+The Fly platform uses a [TOML file to configure an app for deployment](https://fly.io/docs/reference/configuration/).
 
 ```bash
 $ cp examples/fly/fly.toml .
