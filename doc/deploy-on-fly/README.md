@@ -4,7 +4,7 @@ The [Corrosion repository](https://github.com/superfly/corrosion) on GitHub incl
 
 - [Launch a Corrosion cluster](./launch.md)
 - [Work with cluster data on Fly.io](./explore.md)
-- [Run Corrosion commands on a remote node](./fly-proxy.md)
+- [Run Corrosion commands on a remote node](./local-remote.md)
 
 Corrosion is designed to run on the same node as any program that uses it. On Fly.io, that means deploying from a Docker image that runs both your code and Corrosion.
 

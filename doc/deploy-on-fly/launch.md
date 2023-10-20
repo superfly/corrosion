@@ -131,7 +131,7 @@ Once the second Machine is running, you should be able to see log messages from 
 
 You can use the example database to test out your Corrosion cluster: [Work with cluster data on Fly.io](./explore.md).
 
-## Example Files
+## Appendix: Example files for deployment on Fly.io
 
 ### Fly Launch configuration
 
