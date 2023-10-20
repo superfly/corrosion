@@ -129,7 +129,7 @@ $ fly scale count 1 --region <second-fly-region>
 
 Once the second Machine is running, you should be able to see log messages from Corrosion on both instances.
 
-You can use the example database to test out your Corrosion cluster: [Work with cluster data on Fly.io](./play.md).
+You can use the example database to test out your Corrosion cluster: [Work with cluster data on Fly.io](./explore.md).
 
 ## Example Files
 
@@ -159,6 +159,8 @@ path = "/"
 The `app` entry is updated with your chosen app name on launch.
 
 The `mounts` section tells Fly Launch that this app needs a storage volume named `"corro_data"` and that it should be mounted at `/var/lib/corrosion` in the Machine's file system. A Fly Volume of this name will be created for the first Machine on the first deployment.
+
+Corrosion exports Prometheus metrics; the `metrics` section tells the [Fly Platform where to look for them](https://fly.io/docs/reference/metrics/#prometheus-on-fly-io). This port setting corresponds to the setting for `prometheus.addr` under `telemetry` in the [Corrosion configuration](#corrosion-configuration).
 
 No public services are configured for the Corrosion cluster, because nodes communicate over private networking.
 
@@ -215,7 +217,7 @@ CMD ["corrosion", "agent"]
 
 ### Corrosion configuration
 
-The supplied `config.toml` file omits the `gossip.addr` and `gossip.bootstrap` entries. On startup. the `entrypoint.sh` script fills these in using `FLY_PRIVATE_IP` and `FLY_APP_NAME` environment variables that exist within the runtime environment.
+The supplied example Corrosion config file, `config.toml`, omits the `gossip.addr` and `gossip.bootstrap` entries. On startup. the `entrypoint.sh` script fills these in using `FLY_PRIVATE_IP` and `FLY_APP_NAME` environment variables that exist within the runtime environment.
 
 The complete configuration file looks something like this on the running Machine:
 
@@ -247,4 +249,4 @@ prometheus.addr = "0.0.0.0:9090"
 colors = false
 ```
 
-The network settings are tailored for communication over your Fly private IPv6 WireGuard network.
+The network settings in this example config are tailored for communication over your Fly private IPv6 WireGuard network. Cluster members communicate over port 8787, and the Corrosion API is reachable on port 8080. Corrosion exports Prometheus metrics at port 9090, which is hooked up to the [Prometheus service on Fly.io](https://fly.io/docs/reference/metrics/#prometheus-on-fly-io) via the `metrics` section in [`fly.toml`](#fly-launch-configuration).
