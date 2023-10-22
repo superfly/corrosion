@@ -1,33 +1,43 @@
 use std::{
+    collections::HashMap,
     iter::Peekable,
-    ops::RangeInclusive,
+    mem::forget,
+    ops::{Deref, DerefMut, RangeInclusive},
     time::{Duration, Instant},
 };
 
-use axum::{response::IntoResponse, Extension};
-use bytes::{BufMut, BytesMut};
+use axum::{extract, response::IntoResponse, Extension};
+use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
     api::{row_to_change, ExecResponse, ExecResult, QueryEvent, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::SqliteValue,
+    http::{IoBodyStream, LinesBytesCodec},
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
+use futures::StreamExt;
 use hyper::StatusCode;
 use itertools::Itertools;
 use metrics::counter;
-use rusqlite::{named_params, params_from_iter, ToSql, Transaction};
+use rusqlite::{named_params, params_from_iter, Connection, ToSql, Transaction};
+use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
 use tokio::{
     sync::{
-        mpsc::{self, channel},
+        mpsc::{self, channel, error::SendError, Receiver, Sender},
         oneshot,
     },
     task::block_in_place,
 };
-use tracing::{debug, error, info, trace};
+use tokio_util::{
+    codec::{Encoder, FramedRead, LengthDelimitedCodec},
+    io::StreamReader,
+    sync::CancellationToken,
+};
+use tracing::{debug, error, info, trace, Instrument};
 
 use corro_types::{
     broadcast::{BroadcastInput, BroadcastV1},
@@ -144,6 +154,489 @@ where
             self.last_start_seq..=self.last_seq, // even if empty, this is all we have still applied
         )))
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum Stmt {
+    Prepare(String),
+    Drop(u32),
+    Reset(u32),
+    Columns(u32),
+
+    Execute(u32, Vec<SqliteValue>),
+    Query(u32, Vec<SqliteValue>),
+
+    Next(u32),
+
+    Begin,
+    Commit,
+    Rollback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum SqliteResult {
+    Ok,
+    Error(String),
+
+    Statement {
+        id: u32,
+        params_count: usize,
+    },
+
+    Execute {
+        rows_affected: usize,
+        last_insert_rowid: i64,
+    },
+
+    Columns(Vec<String>),
+
+    // None represents the end of a statement's rows
+    Row(Option<Vec<SqliteValue>>),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum HandleConnError {
+    #[error(transparent)]
+    Rusqlite(#[from] rusqlite::Error),
+    #[error("events channel closed")]
+    EventsChannelClosed,
+}
+
+impl<T> From<SendError<T>> for HandleConnError {
+    fn from(value: SendError<T>) -> Self {
+        HandleConnError::EventsChannelClosed
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IncrMap<V> {
+    map: HashMap<u32, V>,
+    last: u32,
+}
+
+impl<V> IncrMap<V> {
+    pub fn insert(&mut self, v: V) -> u32 {
+        self.last += 1;
+        self.map.insert(self.last, v);
+        self.last
+    }
+}
+
+impl<V> Default for IncrMap<V> {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+            last: Default::default(),
+        }
+    }
+}
+
+impl<V> Deref for IncrMap<V> {
+    type Target = HashMap<u32, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl<V> DerefMut for IncrMap<V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConnCache<'conn> {
+    prepared: IncrMap<rusqlite::Statement<'conn>>,
+    cells: Vec<SqliteValue>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum StmtError {
+    #[error(transparent)]
+    Rusqlite(#[from] rusqlite::Error),
+    #[error("statement not found: {id}")]
+    StatementNotFound { id: u32 },
+}
+
+fn handle_stmt<'conn>(
+    agent: &Agent,
+    conn: &'conn Connection,
+    cache: &mut ConnCache<'conn>,
+    stmt: Stmt,
+) -> Result<SqliteResult, StmtError> {
+    match stmt {
+        Stmt::Prepare(sql) => {
+            let prepped = conn.prepare(&sql)?;
+            let params_count = prepped.parameter_count();
+            let id = cache.prepared.insert(prepped);
+            Ok(SqliteResult::Statement { id, params_count })
+        }
+        Stmt::Columns(id) => {
+            let prepped = cache
+                .prepared
+                .get(&id)
+                .ok_or(StmtError::StatementNotFound { id })?;
+            Ok(SqliteResult::Columns(
+                prepped
+                    .column_names()
+                    .into_iter()
+                    .map(|name| name.to_string())
+                    .collect(),
+            ))
+        }
+        Stmt::Execute(id, params) => {
+            let prepped = cache
+                .prepared
+                .get_mut(&id)
+                .ok_or(StmtError::StatementNotFound { id })?;
+            let rows_affected = prepped.execute(params_from_iter(params))?;
+            Ok(SqliteResult::Execute {
+                rows_affected,
+                last_insert_rowid: conn.last_insert_rowid(),
+            })
+        }
+        Stmt::Query(id, params) => {
+            let prepped = cache
+                .prepared
+                .get_mut(&id)
+                .ok_or(StmtError::StatementNotFound { id })?;
+
+            for (i, param) in params.into_iter().enumerate() {
+                prepped.raw_bind_parameter(i + 1, param)?;
+            }
+
+            Ok(SqliteResult::Ok)
+        }
+        Stmt::Next(id) => {
+            let prepped = cache
+                .prepared
+                .get_mut(&id)
+                .ok_or(StmtError::StatementNotFound { id })?;
+
+            // creates an interator for already-bound statements
+            let mut rows = prepped.raw_query();
+
+            let res = match rows.next()? {
+                Some(row) => {
+                    let col_count = row.as_ref().column_count();
+                    cache.cells.clear();
+                    for idx in 0..col_count {
+                        let v = row.get::<_, SqliteValue>(idx)?;
+                        cache.cells.push(v);
+                    }
+                    Ok(SqliteResult::Row(Some(cache.cells.drain(..).collect_vec())))
+                }
+                None => Ok(SqliteResult::Row(None)),
+            };
+
+            // prevent running Drop so it doesn't reset everything...
+            forget(rows);
+
+            res
+        }
+        Stmt::Begin => {
+            conn.execute_batch("BEGIN")?;
+            Ok(SqliteResult::Ok)
+        }
+        Stmt::Commit => {
+            handle_commit(agent, conn)?;
+            Ok(SqliteResult::Ok)
+        }
+        Stmt::Rollback => {
+            conn.execute_batch("ROLLBACK")?;
+            Ok(SqliteResult::Ok)
+        }
+        Stmt::Drop(id) => {
+            cache.prepared.remove(&id);
+            Ok(SqliteResult::Ok)
+        }
+        Stmt::Reset(id) => {
+            let prepped = cache
+                .prepared
+                .get_mut(&id)
+                .ok_or(StmtError::StatementNotFound { id })?;
+
+            // not sure how to reset a statement otherwise..
+            let rows = prepped.raw_query();
+            drop(rows);
+
+            Ok(SqliteResult::Ok)
+        }
+    }
+}
+
+fn handle_interactive(
+    agent: &Agent,
+    mut queries: Receiver<Stmt>,
+    events: Sender<SqliteResult>,
+) -> Result<(), HandleConnError> {
+    let conn = match agent.pool().client_dedicated() {
+        Ok(conn) => conn,
+        Err(e) => {
+            return events
+                .blocking_send(SqliteResult::Error(e.to_string()))
+                .map_err(HandleConnError::from);
+        }
+    };
+
+    let mut cache = ConnCache::default();
+
+    while let Some(stmt) = queries.blocking_recv() {
+        match handle_stmt(agent, &conn, &mut cache, stmt) {
+            Ok(res) => {
+                events.blocking_send(res)?;
+            }
+            Err(e) => {
+                events.blocking_send(SqliteResult::Error(e.to_string()))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
+    let actor_id = agent.actor_id();
+
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+
+    let db_version: i64 = conn
+        .prepare_cached("SELECT crsql_next_db_version()")?
+        .query_row((), |row| row.get(0))?;
+
+    let has_changes: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE site_id IS NULL AND db_version = ?);",
+        )?
+        .query_row([db_version], |row| row.get(0))?;
+
+    if !has_changes {
+        conn.execute_batch("COMMIT")?;
+        return Ok(());
+    }
+
+    let booked = {
+        agent
+            .bookie()
+            .blocking_write("handle_write_tx(for_actor)")
+            .for_actor(actor_id)
+    };
+
+    let last_seq: i64 = conn
+        .prepare_cached(
+            "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
+        )?
+        .query_row([db_version], |row| row.get(0))?;
+
+    let mut book_writer = booked.blocking_write("handle_write_tx(book_writer)");
+
+    let last_version = book_writer.last().unwrap_or_default();
+    trace!("last_version: {last_version}");
+    let version = last_version + 1;
+    trace!("version: {version}");
+
+    conn.prepare_cached(
+        r#"
+            INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
+                VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
+        "#,
+    )?
+    .execute(named_params! {
+        ":actor_id": actor_id,
+        ":start_version": version,
+        ":db_version": db_version,
+        ":last_seq": last_seq,
+        ":ts": ts
+    })?;
+
+    debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
+
+    conn.execute_batch("COMMIT")?;
+
+    trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
+
+    book_writer.insert(
+        version,
+        KnownDbVersion::Current {
+            db_version,
+            last_seq,
+            ts,
+        },
+    );
+
+    let agent = agent.clone();
+
+    spawn_counted(async move {
+        let conn = agent.pool().read().await?;
+
+        block_in_place(|| {
+            // TODO: make this more generic so both sync and local changes can use it.
+            let mut prepped = conn.prepare_cached(r#"
+                SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl
+                    FROM crsql_changes
+                    WHERE site_id IS NULL
+                    AND db_version = ?
+                    ORDER BY seq ASC
+            "#)?;
+            let rows = prepped.query_map([db_version], row_to_change)?;
+            let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_BYTE_SIZE);
+            for changes_seqs in chunked {
+                match changes_seqs {
+                    Ok((changes, seqs)) => {
+                        for (table_name, count) in changes.iter().counts_by(|change| &change.table)
+                        {
+                            counter!("corro.changes.committed", count as u64, "table" => table_name.to_string(), "source" => "local");
+                        }
+                        process_subs(&agent, &changes);
+
+                        trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
+
+                        let tx_bcast = agent.tx_bcast().clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tx_bcast
+                                .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
+                                    ChangeV1 {
+                                        actor_id,
+                                        changeset: Changeset::Full {
+                                            version,
+                                            changes,
+                                            seqs,
+                                            last_seq,
+                                            ts,
+                                        },
+                                    },
+                                )))
+                                .await
+                            {
+                                error!("could not send change message for broadcast: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                        break;
+                    }
+                }
+            }
+            Ok::<_, rusqlite::Error>(())
+        })?;
+        Ok::<_, eyre::Report>(())
+    });
+    Ok::<_, rusqlite::Error>(())
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn api_v1_begins(
+    // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    Extension(agent): Extension<Agent>,
+    req_body: extract::RawBody<hyper::Body>,
+) -> impl IntoResponse {
+    let (mut body_tx, body) = hyper::Body::channel();
+
+    let req_body = IoBodyStream { body: req_body.0 };
+
+    let (queries_tx, queries_rx) = channel(512);
+    let (events_tx, mut events_rx) = channel(512);
+    let cancel = CancellationToken::new();
+
+    tokio::spawn({
+        let cancel = cancel.clone();
+        let events_tx = events_tx.clone();
+        async move {
+            let _drop_guard = cancel.drop_guard();
+
+            let mut req_reader =
+                FramedRead::new(StreamReader::new(req_body), LengthDelimitedCodec::default());
+
+            while let Some(buf_res) = req_reader.next().await {
+                match buf_res {
+                    Ok(buf) => match rmp_serde::from_slice(&buf) {
+                        Ok(req) => {
+                            if let Err(e) = queries_tx.send(req).await {
+                                error!("could not send request into channel: {e}");
+                                if let Err(e) = events_tx
+                                    .send(SqliteResult::Error("request channel closed".into()))
+                                    .await
+                                {
+                                    error!("could not send error event: {e}");
+                                }
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            error!("could not parse message: {e}");
+                            if let Err(e) = events_tx
+                                .send(SqliteResult::Error("request channel closed".into()))
+                                .await
+                            {
+                                error!("could not send error event: {e}");
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        error!("could not read buffer from request body: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+        .in_current_span()
+    });
+
+    // probably a better way to do this...
+    spawn_counted(
+        async move { block_in_place(|| handle_interactive(&agent, queries_rx, events_tx)) }
+            .in_current_span(),
+    );
+
+    tokio::spawn(async move {
+        let mut ser_buf = BytesMut::new();
+        let mut encode_buf = BytesMut::new();
+        let mut codec = LengthDelimitedCodec::default();
+
+        while let Some(event) = events_rx.recv().await {
+            match rmp_serde::encode::write(&mut (&mut ser_buf).writer(), &event) {
+                Ok(_) => match codec.encode(ser_buf.split().freeze(), &mut encode_buf) {
+                    Ok(_) => {
+                        if let Err(e) = body_tx.send_data(encode_buf.split().freeze()).await {
+                            error!("could not send tx event to response body: {e}");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!("could not encode event: {e}");
+                        if let Err(e) = body_tx
+                            .send_data(Bytes::from(r#"{"error": "could not encode event"}"#))
+                            .await
+                        {
+                            error!("could not send encoding error to body: {e}");
+                            return;
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("could not serialize event: {e}");
+                    if let Err(e) = body_tx
+                        .send_data(Bytes::from(r#"{"error": "could not serialize event"}"#))
+                        .await
+                    {
+                        error!("could not send serialize error to body: {e}");
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    hyper::Response::builder()
+        .status(hyper::StatusCode::SWITCHING_PROTOCOLS)
+        .body(body)
+        .unwrap()
 }
 
 const MAX_CHANGES_BYTE_SIZE: usize = 8 * 1024;
@@ -710,9 +1203,11 @@ pub async fn api_v1_db_schema(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use corro_tests::launch_test_agent;
     use corro_types::{api::RowId, config::Config, schema::SqliteType};
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
+    use spawn::wait_for_all_pending_handles;
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
@@ -1243,5 +1738,42 @@ mod tests {
         );
 
         assert_eq!(chunker.next(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_interactive() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let ta = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+        let (q_tx, q_rx) = channel(1);
+        let (e_tx, mut e_rx) = channel(1);
+
+        spawn_counted(async move { block_in_place(|| handle_interactive(&ta.agent, q_rx, e_tx)) });
+
+        q_tx.send(Stmt::Prepare("SELECT 123".into())).await?;
+        let e = e_rx.recv().await.unwrap();
+        println!("e: {e:?}");
+
+        q_tx.send(Stmt::Query(1, vec![])).await?;
+        let e = e_rx.recv().await.unwrap();
+        println!("e: {e:?}");
+
+        q_tx.send(Stmt::Next(1)).await?;
+        let e = e_rx.recv().await.unwrap();
+        assert_eq!(e, SqliteResult::Row(Some(vec![SqliteValue::Integer(123)])));
+
+        q_tx.send(Stmt::Next(1)).await?;
+        let e = e_rx.recv().await.unwrap();
+        assert_eq!(e, SqliteResult::Row(None));
+
+        drop(q_tx);
+        drop(e_rx);
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
     }
 }

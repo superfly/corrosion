@@ -345,7 +345,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         };
 
         for (id, sql) in rows {
-            let conn = agent.pool().dedicated().await?;
+            let conn = block_in_place(|| agent.pool().dedicated())?;
             let (evt_tx, evt_rx) = channel(512);
             match Matcher::restore(id, &agent.schema().read(), conn, evt_tx, &sql) {
                 Ok(handle) => {
@@ -2321,7 +2321,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         };
 
         if candidates.is_empty() {
-            return Err(SyncClientError::NoGoodCandidate);
+            return Ok(());
         }
 
         debug!("found {} candidates to synchronize with", candidates.len());
@@ -2351,7 +2351,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
     };
 
     if chosen.is_empty() {
-        return Err(SyncClientError::NoGoodCandidate);
+        return Ok(());
     }
 
     let start = Instant::now();

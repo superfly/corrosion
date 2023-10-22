@@ -677,14 +677,12 @@ fn prepare_table(
         .unwrap_or_else(|| {
             Ok(columns
                 .iter()
-                .filter_map(|def| {
-                    def.constraints
-                        .iter()
-                        .any(|named| {
-                            matches!(named.constraint, ColumnConstraint::PrimaryKey { .. })
-                        })
-                        .then(|| def.col_name.0.clone())
+                .filter(|&def| {
+                    def.constraints.iter().any(|named| {
+                        matches!(named.constraint, ColumnConstraint::PrimaryKey { .. })
+                    })
                 })
+                .map(|def| def.col_name.0.clone())
                 .collect())
         })?;
 

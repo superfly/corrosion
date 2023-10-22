@@ -5,6 +5,7 @@ pub mod api;
 pub mod broadcast;
 pub mod change;
 pub mod config;
+pub mod http;
 pub mod members;
 pub mod pubsub;
 pub mod schema;

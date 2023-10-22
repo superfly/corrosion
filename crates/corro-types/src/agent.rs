@@ -20,19 +20,16 @@ use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{Connection, InterruptHandle};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{
+    OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, RwLock as TokioRwLock,
+    RwLockReadGuard as TokioRwLockReadGuard, RwLockWriteGuard as TokioRwLockWriteGuard,
+};
 use tokio::{
     runtime::Handle,
     sync::{
         mpsc::{channel, Sender},
         oneshot, Semaphore,
     },
-};
-use tokio::{
-    sync::{
-        OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, RwLock as TokioRwLock,
-        RwLockReadGuard as TokioRwLockReadGuard, RwLockWriteGuard as TokioRwLockWriteGuard,
-    },
-    task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, Instrument};
@@ -363,12 +360,16 @@ impl SplitPool {
     }
 
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn dedicated(&self) -> rusqlite::Result<Connection> {
-        block_in_place(|| {
-            let mut conn = rusqlite::Connection::open(&self.0.path)?;
-            setup_conn(&mut conn, &self.0.attachments)?;
-            Ok(conn)
-        })
+    pub fn dedicated(&self) -> rusqlite::Result<Connection> {
+        let mut conn = rusqlite::Connection::open(&self.0.path)?;
+        setup_conn(&mut conn, &self.0.attachments)?;
+        Ok(conn)
+    }
+
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
+        let conn = rusqlite::Connection::open(&self.0.path)?;
+        rusqlite_to_crsqlite(conn)
     }
 
     // get a high priority write connection (e.g. client input)

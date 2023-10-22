@@ -186,7 +186,7 @@ pub async fn process_sub_channel(
     };
 
     // get a dedicated connection
-    let conn = match agent.pool().dedicated().await {
+    let conn = match agent.pool().dedicated() {
         Ok(conn) => conn,
         Err(e) => {
             error!("could not acquire dedicated connection for subscription cleanup: {e}");
@@ -428,7 +428,7 @@ pub async fn catch_up_sub(
     let last_query_event = {
         let mut buf = BytesMut::new();
 
-        let mut conn = match agent.pool().dedicated().await {
+        let mut conn = match agent.pool().dedicated() {
             Ok(conn) => conn,
             Err(e) => {
                 evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await?;
@@ -532,7 +532,7 @@ pub async fn upsert_sub(
         return Err(MatcherUpsertError::SubFromWithoutMatcher);
     }
 
-    let conn = agent.pool().dedicated().await?;
+    let conn = agent.pool().dedicated()?;
 
     let (evt_tx, evt_rx) = mpsc::channel(512);
 

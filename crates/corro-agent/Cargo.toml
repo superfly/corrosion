@@ -28,6 +28,7 @@ quinn-plaintext = { workspace = true }
 quoted-string = { workspace = true }
 rand = { workspace = true }
 rangemap = { workspace = true }
+rmp-serde = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = "*"
