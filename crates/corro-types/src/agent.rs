@@ -373,19 +373,19 @@ impl SplitPool {
     }
 
     // get a high priority write connection (e.g. client input)
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_priority(&self) -> Result<WriteConn, PoolError> {
         self.write_inner(&self.0.priority_tx, "priority").await
     }
 
     // get a normal priority write connection (e.g. sync process)
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_normal(&self) -> Result<WriteConn, PoolError> {
         self.write_inner(&self.0.normal_tx, "normal").await
     }
 
     // get a low priority write connection (e.g. background tasks)
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_low(&self) -> Result<WriteConn, PoolError> {
         self.write_inner(&self.0.low_tx, "low").await
     }
