@@ -2736,7 +2736,7 @@ pub mod tests {
     use serde_json::json;
     use spawn::wait_for_all_pending_handles;
     use tokio::time::{sleep, timeout, MissedTickBehavior};
-    use tracing::{info, info_span};
+    use tracing::info_span;
     use tripwire::Tripwire;
 
     use super::*;

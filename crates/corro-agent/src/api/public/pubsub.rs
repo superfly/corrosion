@@ -202,16 +202,31 @@ pub async fn process_sub_channel(
 
 fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<Option<String>> {
     Ok(match stmt {
-        Statement::Simple(q) => conn.prepare(q)?.expanded_sql(),
-        Statement::WithParams(q, params) => {
-            let mut prepped = conn.prepare(q)?;
+        Statement::Simple(query)
+        | Statement::Verbose {
+            query,
+            params: None,
+            named_params: None,
+        } => conn.prepare(query)?.expanded_sql(),
+        Statement::WithParams(query, params)
+        | Statement::Verbose {
+            query,
+            params: Some(params),
+            ..
+        } => {
+            let mut prepped = conn.prepare(query)?;
             for (i, param) in params.iter().enumerate() {
                 prepped.raw_bind_parameter(i + 1, param)?;
             }
             prepped.expanded_sql()
         }
-        Statement::WithNamedParams(q, params) => {
-            let mut prepped = conn.prepare(q)?;
+        Statement::WithNamedParams(query, params)
+        | Statement::Verbose {
+            query,
+            named_params: Some(params),
+            ..
+        } => {
+            let mut prepped = conn.prepare(query)?;
             for (k, v) in params.iter() {
                 let idx = match prepped.parameter_index(k)? {
                     Some(idx) => idx,

@@ -308,16 +308,25 @@ where
 
 #[tracing::instrument(skip_all, err)]
 fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
-    let mut prepped = match &stmt {
-        Statement::Simple(q) => tx.prepare(q),
-        Statement::WithParams(q, _) => tx.prepare(q),
-        Statement::WithNamedParams(q, _) => tx.prepare(q),
-    }?;
+    let mut prepped = tx.prepare(stmt.query())?;
 
     match stmt {
-        Statement::Simple(_) => prepped.execute([]),
-        Statement::WithParams(_, params) => prepped.execute(params_from_iter(params)),
-        Statement::WithNamedParams(_, params) => prepped.execute(
+        Statement::Simple(_)
+        | Statement::Verbose {
+            params: None,
+            named_params: None,
+            ..
+        } => prepped.execute([]),
+        Statement::WithParams(_, params)
+        | Statement::Verbose {
+            params: Some(params),
+            ..
+        } => prepped.execute(params_from_iter(params)),
+        Statement::WithNamedParams(_, params)
+        | Statement::Verbose {
+            named_params: Some(params),
+            ..
+        } => prepped.execute(
             params
                 .iter()
                 .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
@@ -429,11 +438,7 @@ async fn build_query_rows_response(
             }
         };
 
-        let prepped_res = block_in_place(|| match &stmt {
-            Statement::Simple(q) => conn.prepare(q),
-            Statement::WithParams(q, _) => conn.prepare(q),
-            Statement::WithNamedParams(q, _) => conn.prepare(q),
-        });
+        let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
 
         let mut prepped = match prepped_res {
             Ok(prepped) => prepped,
@@ -476,9 +481,22 @@ async fn build_query_rows_response(
             let start = Instant::now();
 
             let query = match stmt {
-                Statement::Simple(_) => prepped.query(()),
-                Statement::WithParams(_, params) => prepped.query(params_from_iter(params)),
-                Statement::WithNamedParams(_, params) => prepped.query(
+                Statement::Simple(_)
+                | Statement::Verbose {
+                    params: None,
+                    named_params: None,
+                    ..
+                } => prepped.query(()),
+                Statement::WithParams(_, params)
+                | Statement::Verbose {
+                    params: Some(params),
+                    ..
+                } => prepped.query(params_from_iter(params)),
+                Statement::WithNamedParams(_, params)
+                | Statement::Verbose {
+                    named_params: Some(params),
+                    ..
+                } => prepped.query(
                     params
                         .iter()
                         .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
