@@ -451,7 +451,7 @@ fn handle_known_version(
                             Some(known) => match known {
                                 KnownVersion::Partial(PartialVersion { seqs, .. }) => {
                                     if seqs != &partial_seqs {
-                                        info!(%actor_id, version, "different partial sequences, updating! range_needed: {range_needed:?}");
+                                        warn!(%actor_id, version, "different partial sequences, updating! range_needed: {range_needed:?}");
                                         partial_seqs = seqs.clone();
                                         if let Some(new_start_seq) = last_sent_seq.take() {
                                             range_needed =
@@ -474,7 +474,7 @@ fn handle_known_version(
                         };
 
                         if let Some(known) = maybe_current_version {
-                            info!(%actor_id, version, "switched from partial to current version");
+                            warn!(%actor_id, version, "switched from partial to current version");
 
                             // drop write lock
                             drop(bw);
@@ -1053,7 +1053,7 @@ pub async fn parallel_sync(
 
                 trace!(%actor_id, "needs: {needs:?}");
 
-                info!(%actor_id, %addr, "needs len: {}", needs.values().map(|needs| needs.iter().map(|need| match need {
+                debug!(%actor_id, %addr, "needs len: {}", needs.values().map(|needs| needs.iter().map(|need| match need {
                     SyncNeedV1::Full {versions} => (versions.end() - versions.start()) as usize + 1,
                     SyncNeedV1::Partial {..} => 0,
                 }).sum::<usize>()).sum::<usize>());
@@ -1204,7 +1204,7 @@ pub async fn parallel_sync(
                     if let Err(e) = tx.finish().instrument(info_span!("quic_finish")).await {
                         warn!("could not finish stream while sending sync requests: {e}");
                     }
-                    info!(%server_actor_id, %addr, "done trying to sync w/ actor after {:?}", start.elapsed());
+                    debug!(%server_actor_id, %addr, "done trying to sync w/ actor after {:?}", start.elapsed());
                     continue;
                 }
 
@@ -1260,7 +1260,7 @@ pub async fn parallel_sync(
                 }
             }
 
-            info!(%actor_id, %count, "done reading sync messages");
+            debug!(%actor_id, %count, "done reading sync messages");
 
             Ok(count)
         }.instrument(info_span!("read_sync_requests_responses", %actor_id))
@@ -1289,7 +1289,7 @@ pub async fn serve_sync(
         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&trace_ctx));
     tracing::Span::current().set_parent(context);
 
-    info!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "received sync request");
+    debug!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "received sync request");
     let mut codec = LengthDelimitedCodec::new();
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
@@ -1383,7 +1383,7 @@ pub async fn serve_sync(
                     stopped_res = write.stopped() => {
                         match stopped_res {
                             Ok(code) => {
-                                info!(actor_id = %their_actor_id, "send stream was stopped by peer, code: {code}");
+                                debug!(actor_id = %their_actor_id, "send stream was stopped by peer, code: {code}");
                             },
                             Err(e) => {
                                 warn!(actor_id = %their_actor_id, "error waiting for stop from stream: {e}");

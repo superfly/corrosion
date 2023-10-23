@@ -137,7 +137,7 @@ pub async fn process_sub_channel(
             biased;
             Some(query_evt) = evt_rx.recv() => query_evt,
             _ = deadline_check => {
-                info!("all subscribers for {id} are gone and didn't come back within {MAX_UNSUB_TIME:?}");
+                info!("All subscribers for {id} are gone and didn't come back within {MAX_UNSUB_TIME:?}");
                 break;
             },
             _ = subs_check.tick() => {

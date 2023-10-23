@@ -202,7 +202,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 )?;
             }
 
-            info!("successfully cleaned for restoration and backed up database to {path}");
+            info!("Successfully cleaned for restoration and backed up database to {path}");
         }
         Command::Restore {
             path,
