@@ -843,6 +843,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "tripwire",
 ]
 
 [[package]]

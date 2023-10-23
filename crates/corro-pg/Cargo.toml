@@ -24,3 +24,4 @@ tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 corro-tests = { path = "../corro-tests" }
 tokio-postgres = { version = "0.7.10" }
+tripwire = { path = "../tripwire" }
