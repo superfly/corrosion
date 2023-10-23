@@ -12,7 +12,7 @@ use command::{
     tls::{generate_ca, generate_client_cert, generate_server_cert},
     tpl::TemplateFlags,
 };
-use corro_api_types::{SqliteParam, SqliteValue};
+use corro_api_types::SqliteParam;
 use corro_client::CorrosionApiClient;
 use corro_types::{
     api::{ExecResult, QueryEvent, Statement},
