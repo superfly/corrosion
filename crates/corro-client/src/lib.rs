@@ -185,7 +185,7 @@ impl CorrosionApiClient {
     pub async fn schema_from_paths<P: AsRef<Path>>(
         &self,
         schema_paths: &[P],
-    ) -> Result<ExecResponse, Error> {
+    ) -> Result<Option<ExecResponse>, Error> {
         let mut statements = vec![];
 
         for schema_path in schema_paths.iter() {
@@ -261,7 +261,11 @@ impl CorrosionApiClient {
             }
         }
 
-        self.schema(&statements).await
+        if statements.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(self.schema(&statements).await?))
     }
 }
 
