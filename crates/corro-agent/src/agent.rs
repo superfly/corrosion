@@ -2258,8 +2258,6 @@ pub enum SyncClientError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Pool(#[from] SqlitePoolError),
-    #[error("no good candidates found")]
-    NoGoodCandidate,
     #[error("could not decode message: {0}")]
     Decoded(#[from] SyncMessageDecodeError),
     #[error("could not encode message: {0}")]
@@ -2321,7 +2319,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         };
 
         if candidates.is_empty() {
-            return Err(SyncClientError::NoGoodCandidate);
+            return Ok(());
         }
 
         debug!("found {} candidates to synchronize with", candidates.len());
@@ -2351,7 +2349,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
     };
 
     if chosen.is_empty() {
-        return Err(SyncClientError::NoGoodCandidate);
+        return Ok(());
     }
 
     let start = Instant::now();
@@ -2552,9 +2550,7 @@ async fn sync_loop(
                     }
                     tripwire::Outcome::Completed(res) => {
                         if let Err(e) = res {
-                            if !matches!(e, SyncClientError::NoGoodCandidate) {
-                                error!("could not sync: {e}");
-                            }
+                            error!("could not sync: {e}");
                             // keep syncing until we successfully sync
                             continue;
                         }
