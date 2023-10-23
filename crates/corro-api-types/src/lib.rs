@@ -11,6 +11,7 @@ use rusqlite::{
     Row, ToSql,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use smallvec::{SmallVec, ToSmallVec};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use sqlite::ChangeType;
@@ -120,9 +121,25 @@ impl ToSql for ChangeId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Statement {
+    Verbose {
+        query: String,
+        params: Option<Vec<SqliteParam>>,
+        named_params: Option<HashMap<String, SqliteParam>>,
+    },
     Simple(String),
-    WithParams(String, Vec<SqliteValue>),
-    WithNamedParams(String, HashMap<String, SqliteValue>),
+    WithParams(String, Vec<SqliteParam>),
+    WithNamedParams(String, HashMap<String, SqliteParam>),
+}
+
+impl Statement {
+    pub fn query(&self) -> &str {
+        match self {
+            Statement::Verbose { query, .. }
+            | Statement::Simple(query)
+            | Statement::WithParams(query, _)
+            | Statement::WithNamedParams(query, _) => query,
+        }
+    }
 }
 
 impl From<&str> for Statement {
@@ -289,6 +306,76 @@ impl FromSql for ColumnType {
             }),
             _ => Err(FromSqlError::InvalidType),
         }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SqliteParam {
+    #[default]
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Real(f64),
+    Text(CompactString),
+    Blob(SmallVec<[u8; 512]>),
+    Json(Box<RawValue>),
+}
+
+impl From<&str> for SqliteParam {
+    fn from(value: &str) -> Self {
+        Self::Text(value.into())
+    }
+}
+
+impl From<Vec<u8>> for SqliteParam {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Blob(value.into())
+    }
+}
+
+impl From<String> for SqliteParam {
+    fn from(value: String) -> Self {
+        Self::Text(value.into())
+    }
+}
+
+impl From<u16> for SqliteParam {
+    fn from(value: u16) -> Self {
+        Self::Integer(value as i64)
+    }
+}
+
+impl From<i64> for SqliteParam {
+    fn from(value: i64) -> Self {
+        Self::Integer(value)
+    }
+}
+
+impl ToSql for SqliteParam {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(match self {
+            SqliteParam::Null => ToSqlOutput::Owned(Value::Null),
+            SqliteParam::Bool(v) => ToSqlOutput::Owned(Value::Integer(*v as i64)),
+            SqliteParam::Integer(i) => ToSqlOutput::Owned(Value::Integer(*i)),
+            SqliteParam::Real(f) => ToSqlOutput::Owned(Value::Real(*f)),
+            SqliteParam::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
+            SqliteParam::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b)),
+            SqliteParam::Json(map) => ToSqlOutput::Borrowed(ValueRef::Text(map.get().as_bytes())),
+        })
+    }
+}
+
+impl<'a> ToSql for SqliteValueRef<'a> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'a>> {
+        Ok(match self {
+            SqliteValueRef::Null => ToSqlOutput::Owned(Value::Null),
+            SqliteValueRef::Integer(i) => ToSqlOutput::Owned(Value::Integer(*i)),
+            SqliteValueRef::Real(f) => ToSqlOutput::Owned(Value::Real(*f)),
+            SqliteValueRef::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
+            SqliteValueRef::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b)),
+        })
     }
 }
 
@@ -653,5 +740,41 @@ impl FromSql for ColumnName {
 impl ToSql for ColumnName {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         self.0.as_str().to_sql()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_statement_serialization() {
+        let s = serde_json::to_string(&vec![Statement::WithParams(
+            "select 1
+                from table
+                where column = ?"
+                .into(),
+            vec!["my-value".into()],
+        )])
+        .unwrap();
+        println!("{s}");
+
+        let stmts: Vec<Statement> = serde_json::from_str(&s).unwrap();
+        println!("stmts: {stmts:?}");
+
+        let json = r#"[["some statement",[1,"encodedID","nodeName",1,"Name","State",true,true,"",1234,1698084893487,1698084893487]]]"#;
+
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        println!("value: {value:#?}");
+
+        let stmts: Vec<Statement> = serde_json::from_str(json).unwrap();
+        println!("stmts: {stmts:?}");
+
+        let json = r#"[{"query": "some statement", "params": [1,"encodedID","nodeName",1,"Name","State",true,true,"",1234,1698084893487,1698084893487]}]"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        println!("value: {value:#?}");
+
+        let stmts: Vec<Statement> = serde_json::from_str(json).unwrap();
+        println!("stmts: {stmts:?}");
     }
 }
