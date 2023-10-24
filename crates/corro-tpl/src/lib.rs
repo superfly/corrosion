@@ -12,6 +12,7 @@ use compact_str::ToCompactString;
 use corro_client::sub::SubscriptionStream;
 use corro_client::CorrosionApiClient;
 use corro_types::api::QueryEvent;
+use corro_types::api::SqliteParam;
 use corro_types::api::Statement;
 use corro_types::change::SqliteValue;
 use futures::StreamExt;
@@ -536,33 +537,28 @@ impl Engine {
             }
         });
 
-        fn dyn_to_sql(v: Dynamic) -> Result<SqliteValue, Box<EvalAltResult>> {
+        fn dyn_to_sql(v: Dynamic) -> Result<SqliteParam, Box<EvalAltResult>> {
             Ok(match v.type_name() {
-                "()" => SqliteValue::Null,
-                "i64" => SqliteValue::Integer(
+                "()" => SqliteParam::Null,
+                "i64" => SqliteParam::Integer(
                     v.as_int()
                         .map_err(|_e| Box::new(EvalAltResult::from("could not cast to i64")))?,
                 ),
-                "f64" => SqliteValue::Real(corro_types::api::Real(
+                "f64" => SqliteParam::Real(
                     v.as_float()
                         .map_err(|_e| Box::new(EvalAltResult::from("could not cast to f64")))?,
-                )),
-                "bool" => {
-                    if v.as_bool()
-                        .map_err(|_e| Box::new(EvalAltResult::from("could not cast to bool")))?
-                    {
-                        SqliteValue::Integer(1)
-                    } else {
-                        SqliteValue::Integer(0)
-                    }
-                }
-                "blob" => SqliteValue::Blob(
+                ),
+                "bool" => SqliteParam::Bool(
+                    v.as_bool()
+                        .map_err(|_e| Box::new(EvalAltResult::from("could not cast to bool")))?,
+                ),
+                "blob" => SqliteParam::Blob(
                     v.into_blob()
                         .map_err(|_e| Box::new(EvalAltResult::from("could not cast to blob")))?
                         .into(),
                 ),
                 // convert everything else into a string, including a string
-                _ => SqliteValue::Text(v.to_compact_string()),
+                _ => SqliteParam::Text(v.to_compact_string()),
             })
         }
 

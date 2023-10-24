@@ -957,7 +957,7 @@ async fn clear_overwritten_versions(agent: Agent) {
             interval = COMPACT_BOOKED_INTERVAL;
         }
 
-        info!("starting compaction...");
+        info!("Starting compaction...");
         let start = Instant::now();
 
         let mut to_check: BTreeMap<i64, (ActorId, i64)> = BTreeMap::new();
@@ -991,7 +991,7 @@ async fn clear_overwritten_versions(agent: Agent) {
             }
         }
 
-        info!("got actors and their versions");
+        debug!("got actors and their versions");
 
         let cleared_versions: BTreeSet<i64> = {
             match pool.read().await {
@@ -1030,7 +1030,7 @@ async fn clear_overwritten_versions(agent: Agent) {
         let mut inserted = 0;
 
         for (actor_id, to_clear) in to_clear_by_actor {
-            info!(%actor_id, "clearing actor {} versions", to_clear.len());
+            info!(%actor_id, "Clearing {} versions", to_clear.len());
             let booked = {
                 bookie
                     .write(format!("to_clear_get_booked:{}", actor_id.as_simple()))
@@ -1063,7 +1063,7 @@ async fn clear_overwritten_versions(agent: Agent) {
         }
 
         info!(
-            "compaction done, cleared {} db bookkeeping table rows in {:?}",
+            "Compaction done, cleared {} DB bookkeeping table rows in {:?}",
             deleted - inserted,
             start.elapsed()
         );
@@ -1226,7 +1226,7 @@ fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>>
         .collect::<rusqlite::Result<_>>()?;
 
     info!(
-        "aggregated {} db versions to clear in {:?}",
+        "Aggregated {} DB versions to clear in {:?}",
         cleared_db_versions.len(),
         start.elapsed()
     );
@@ -1629,7 +1629,7 @@ async fn process_fully_buffered_changes(
 
         let tx = conn.transaction()?;
 
-        info!(%actor_id, version, "processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+        info!(%actor_id, version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
         let max_db_version: Option<i64> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional()?;
 
@@ -1649,9 +1649,9 @@ async fn process_fully_buffered_changes(
                             "#,
             )?
             .execute(params![max_db_version, actor_id.as_bytes(), version])?;
-            info!(%actor_id, version, "inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+            info!(%actor_id, version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
         } else {
-            info!(%actor_id, version, "no buffered rows, skipped insertion into crsql_changes");
+            info!(%actor_id, version, "No buffered rows, skipped insertion into crsql_changes");
         }
 
         clear_buffered_meta(&tx, actor_id, version..=version)?;
@@ -1660,7 +1660,7 @@ async fn process_fully_buffered_changes(
             .prepare_cached("SELECT crsql_rows_impacted()")?
             .query_row((), |row| row.get(0))?;
 
-        info!(%actor_id, version, "rows impacted by buffered changes insertion: {rows_impacted}");
+        debug!(%actor_id, version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
         let known_version = if rows_impacted > 0 {
             let db_version: i64 =
@@ -1687,7 +1687,7 @@ async fn process_fully_buffered_changes(
                 ":ts": ts
             })?;
 
-            info!(%actor_id, version, "inserted bookkeeping row after buffered insert");
+            debug!(%actor_id, version, "inserted bookkeeping row after buffered insert");
 
             Some(KnownDbVersion::Current {
                 db_version,
@@ -1697,7 +1697,7 @@ async fn process_fully_buffered_changes(
         } else {
             store_empty_changeset(&tx, actor_id, version..=version)?;
 
-            info!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
+            debug!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
             Some(KnownDbVersion::Cleared)
         };
 
@@ -1735,7 +1735,7 @@ pub async fn process_multiple_changes(
     agent: &Agent,
     changes: Vec<(ChangeV1, ChangeSource)>,
 ) -> Result<(), ChangeError> {
-    info!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _)| cmp::max(change.len(), 1)).sum::<usize>());
+    debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
     let bookie = agent.bookie();
 
@@ -1911,7 +1911,7 @@ pub async fn process_multiple_changes(
 
         tx.commit()?;
 
-        info!("committed {count} changes in {:?}", start.elapsed());
+        debug!("committed {count} changes in {:?}", start.elapsed());
 
         for (actor_id, knowns) in knowns {
             let booked = {
@@ -1934,7 +1934,7 @@ pub async fn process_multiple_changes(
                     let version = *versions.start();
                     if gaps_count == 0 {
                         // if we have no gaps, then we can schedule applying all these changes.
-                        info!(%actor_id, version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
+                        debug!(%actor_id, version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
                         let tx_apply = agent.tx_apply().clone();
                         tokio::spawn(async move {
                             if let Err(e) = tx_apply.send((actor_id, version)).await {
@@ -2082,7 +2082,7 @@ fn process_complete_version(
 
     let max_db_version = changes.iter().map(|c| c.db_version).max().unwrap_or(0);
 
-    info!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
+    debug!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
 
     debug_assert!(len <= (seqs.end() - seqs.start() + 1) as usize);
 
@@ -2258,8 +2258,6 @@ pub enum SyncClientError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Pool(#[from] SqlitePoolError),
-    #[error("no good candidates found")]
-    NoGoodCandidate,
     #[error("could not decode message: {0}")]
     Decoded(#[from] SyncMessageDecodeError),
     #[error("could not encode message: {0}")]
@@ -2418,7 +2416,7 @@ async fn handle_changes(
         count = 0;
     }
 
-    info!("draining changes receiver...");
+    info!("Draining changes receiver...");
 
     // drain!
     while let Ok((change, src)) = rx_changes.try_recv() {
@@ -2487,7 +2485,7 @@ async fn write_empties_loop(
     }
 
     if !empties.is_empty() {
-        info!("inserting last unprocessed empties before shut down");
+        info!("Inserting last unprocessed empties before shut down");
         if let Err(e) = process_completed_empties(&agent, &mut empties).await {
             error!("could not process empties: {e}");
         }
@@ -2552,9 +2550,7 @@ async fn sync_loop(
                     }
                     tripwire::Outcome::Completed(res) => {
                         if let Err(e) = res {
-                            if !matches!(e, SyncClientError::NoGoodCandidate) {
-                                error!("could not sync: {e}");
-                            }
+                            error!("could not sync: {e}");
                             // keep syncing until we successfully sync
                             continue;
                         }
@@ -2565,13 +2561,13 @@ async fn sync_loop(
                     .reset(tokio::time::Instant::now() + sync_backoff.next().unwrap());
             }
             Branch::BackgroundApply { actor_id, version } => {
-                info!(%actor_id, version, "picked up background apply of buffered changes");
+                debug!(%actor_id, version, "picked up background apply of buffered changes");
                 match process_fully_buffered_changes(&agent, actor_id, version).await {
                     Ok(false) => {
                         warn!(%actor_id, version, "did not apply buffered changes");
                     }
                     Ok(true) => {
-                        info!(%actor_id, version, "succesfully applied buffered changes");
+                        debug!(%actor_id, version, "succesfully applied buffered changes");
                     }
                     Err(e) => {
                         error!(%actor_id, version, "could not apply fully buffered changes: {e}");
@@ -2587,7 +2583,7 @@ async fn process_completed_empties(
     agent: &Agent,
     empties: &mut BTreeMap<ActorId, RangeInclusiveSet<i64>>,
 ) -> eyre::Result<()> {
-    info!(
+    debug!(
         "processing empty versions (count: {})",
         empties.values().map(RangeInclusiveSet::len).sum::<usize>()
     );
@@ -2614,7 +2610,7 @@ async fn process_completed_empties(
         }
     }
 
-    info!(
+    debug!(
         "upserted {inserted} empty version ranges in {:?}",
         start.elapsed()
     );
@@ -2740,7 +2736,7 @@ pub mod tests {
     use serde_json::json;
     use spawn::wait_for_all_pending_handles;
     use tokio::time::{sleep, timeout, MissedTickBehavior};
-    use tracing::{info, info_span};
+    use tracing::info_span;
     use tripwire::Tripwire;
 
     use super::*;
@@ -3125,11 +3121,11 @@ pub mod tests {
 
                 let actual_count: i64 =
                     conn.query_row("SELECT count(*) FROM crsql_changes;", (), |row| row.get(0))?;
-                info!("actual count: {actual_count}");
+                debug!("actual count: {actual_count}");
 
                 let bookie = ta.agent.bookie();
 
-                info!(
+                debug!(
                     "last version: {:?}",
                     bookie
                         .write("test")
@@ -3144,7 +3140,6 @@ pub mod tests {
                 let needed = sync.need_len();
 
                 debug!("generated sync: {sync:?}");
-                info!("needed: {needed}");
 
                 v.push((counts.values().sum::<i64>(), needed));
             }

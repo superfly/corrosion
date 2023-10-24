@@ -801,16 +801,25 @@ where
 
 #[tracing::instrument(skip_all, err)]
 fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
-    let mut prepped = match &stmt {
-        Statement::Simple(q) => tx.prepare(q),
-        Statement::WithParams(q, _) => tx.prepare(q),
-        Statement::WithNamedParams(q, _) => tx.prepare(q),
-    }?;
+    let mut prepped = tx.prepare(stmt.query())?;
 
     match stmt {
-        Statement::Simple(_) => prepped.execute([]),
-        Statement::WithParams(_, params) => prepped.execute(params_from_iter(params)),
-        Statement::WithNamedParams(_, params) => prepped.execute(
+        Statement::Simple(_)
+        | Statement::Verbose {
+            params: None,
+            named_params: None,
+            ..
+        } => prepped.execute([]),
+        Statement::WithParams(_, params)
+        | Statement::Verbose {
+            params: Some(params),
+            ..
+        } => prepped.execute(params_from_iter(params)),
+        Statement::WithNamedParams(_, params)
+        | Statement::Verbose {
+            named_params: Some(params),
+            ..
+        } => prepped.execute(
             params
                 .iter()
                 .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
@@ -922,11 +931,7 @@ async fn build_query_rows_response(
             }
         };
 
-        let prepped_res = block_in_place(|| match &stmt {
-            Statement::Simple(q) => conn.prepare(q),
-            Statement::WithParams(q, _) => conn.prepare(q),
-            Statement::WithNamedParams(q, _) => conn.prepare(q),
-        });
+        let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
 
         let mut prepped = match prepped_res {
             Ok(prepped) => prepped,
@@ -969,9 +974,22 @@ async fn build_query_rows_response(
             let start = Instant::now();
 
             let query = match stmt {
-                Statement::Simple(_) => prepped.query(()),
-                Statement::WithParams(_, params) => prepped.query(params_from_iter(params)),
-                Statement::WithNamedParams(_, params) => prepped.query(
+                Statement::Simple(_)
+                | Statement::Verbose {
+                    params: None,
+                    named_params: None,
+                    ..
+                } => prepped.query(()),
+                Statement::WithParams(_, params)
+                | Statement::Verbose {
+                    params: Some(params),
+                    ..
+                } => prepped.query(params_from_iter(params)),
+                Statement::WithNamedParams(_, params)
+                | Statement::Verbose {
+                    named_params: Some(params),
+                    ..
+                } => prepped.query(
                     params
                         .iter()
                         .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
@@ -1147,7 +1165,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
             tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
 
             let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL AND sql IS NOT NULL", [tbl_name])?;
-            info!("updated {n} rows in __corro_schema for table {tbl_name}");
+            info!("Updated {n} rows in __corro_schema for table {tbl_name}");
         }
 
         tx.commit()?;

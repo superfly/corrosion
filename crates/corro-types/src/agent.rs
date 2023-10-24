@@ -300,7 +300,7 @@ impl SplitPool {
                 wait_conn_drop(tx).await
             }
 
-            info!("write loop done, draining...");
+            info!("Write loop done, draining...");
 
             // keep processing priority messages
             // NOTE: using `recv` would wait indefinitely, this loop only waits until all

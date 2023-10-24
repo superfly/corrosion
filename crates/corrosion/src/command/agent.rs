@@ -43,8 +43,11 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
             .schema_from_paths(config.db.schema_paths.as_slice())
             .await
         {
-            Ok(res) => {
+            Ok(Some(res)) => {
                 info!("Applied schema in {}s", res.time);
+            }
+            Ok(None) => {
+                info!("No schema files to apply, skipping.");
             }
             Err(e) => {
                 error!("could not apply schema: {e}");

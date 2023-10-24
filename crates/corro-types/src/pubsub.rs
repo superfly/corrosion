@@ -689,7 +689,7 @@ impl Matcher {
 
                     match res {
                         Ok(deleted) => info!(
-                            "deleted {deleted} old changes row for subscription {}",
+                            "Deleted {deleted} old changes row for subscription {}",
                             self.id.as_simple()
                         ),
                         Err(e) => {

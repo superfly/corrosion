@@ -12,7 +12,7 @@ use command::{
     tls::{generate_ca, generate_client_cert, generate_server_cert},
     tpl::TemplateFlags,
 };
-use corro_api_types::SqliteValue;
+use corro_api_types::SqliteParam;
 use corro_client::CorrosionApiClient;
 use corro_types::{
     api::{ExecResult, QueryEvent, Statement},
@@ -202,7 +202,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 )?;
             }
 
-            info!("successfully cleaned for restoration and backed up database to {path}");
+            info!("Successfully cleaned for restoration and backed up database to {path}");
         }
         Command::Restore {
             path,
@@ -301,7 +301,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             } else {
                 Statement::WithParams(
                     query.clone(),
-                    param.iter().map(|p| SqliteValue::Text(p.into())).collect(),
+                    param.iter().map(|p| SqliteParam::Text(p.into())).collect(),
                 )
             };
 
@@ -359,7 +359,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             } else {
                 Statement::WithParams(
                     query.clone(),
-                    param.iter().map(|p| SqliteValue::Text(p.into())).collect(),
+                    param.iter().map(|p| SqliteParam::Text(p.into())).collect(),
                 )
             };
 
