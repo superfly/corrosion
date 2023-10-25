@@ -128,7 +128,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let schema = {
         let mut conn = pool.write_priority().await?;
         migrate(&mut conn)?;
-        init_schema(&conn)?
+        let mut schema = init_schema(&conn)?;
+        schema.constrain()?;
+        schema
     };
 
     {
@@ -316,6 +318,15 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rx_foca,
         rtt_rx,
     } = opts;
+
+    if let Some(pg_conf) = agent.config().api.pg.clone() {
+        info!("Starting PostgreSQL wire-compatible server");
+        let pg_server = corro_pg::start(agent.clone(), pg_conf).await?;
+        info!(
+            "Started PostgreSQL wire-compatible server, listening at {}",
+            pg_server.local_addr
+        );
+    }
 
     let mut matcher_id_cache = MatcherIdCache::default();
     let mut matcher_bcast_cache = MatcherBroadcastCache::default();

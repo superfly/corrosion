@@ -15,7 +15,7 @@ use sqlite3_parser::ast::{
 use tracing::{debug, info};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NormalizedColumn {
+pub struct Column {
     pub name: String,
     pub sql_type: SqliteType,
     pub nullable: bool,
@@ -25,7 +25,7 @@ pub struct NormalizedColumn {
     pub raw: ColumnDefinition,
 }
 
-impl std::hash::Hash for NormalizedColumn {
+impl std::hash::Hash for Column {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state);
         self.sql_type.hash(state);
@@ -36,7 +36,7 @@ impl std::hash::Hash for NormalizedColumn {
     }
 }
 
-impl fmt::Display for NormalizedColumn {
+impl fmt::Display for Column {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.raw.to_fmt(f)
     }
@@ -44,7 +44,7 @@ impl fmt::Display for NormalizedColumn {
 
 /// SQLite data types.
 /// See [Fundamental Datatypes](https://sqlite.org/c3ref/c_blob.html).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SqliteType {
     /// NULL
@@ -60,15 +60,15 @@ pub enum SqliteType {
 }
 
 #[derive(Debug, Clone)]
-pub struct NormalizedTable {
+pub struct Table {
     pub name: String,
     pub pk: IndexSet<String>,
-    pub columns: IndexMap<String, NormalizedColumn>,
-    pub indexes: IndexMap<String, NormalizedIndex>,
+    pub columns: IndexMap<String, Column>,
+    pub indexes: IndexMap<String, Index>,
     pub raw: CreateTableBody,
 }
 
-impl fmt::Display for NormalizedTable {
+impl fmt::Display for Table {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Cmd::Stmt(Stmt::CreateTable {
             temporary: false,
@@ -81,16 +81,78 @@ impl fmt::Display for NormalizedTable {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NormalizedIndex {
+pub struct Index {
     pub name: String,
     pub tbl_name: String,
     pub columns: Vec<SortedColumn>,
     pub where_clause: Option<Expr>,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct NormalizedSchema {
-    pub tables: IndexMap<String, NormalizedTable>,
+pub struct Schema {
+    pub tables: IndexMap<String, Table>,
+}
+
+impl Schema {
+    pub fn constrain(&mut self) -> Result<(), ConstrainedSchemaError> {
+        self.tables.retain(|name, table| {
+            !(name.contains("crsql") && name.contains("sqlite") && name.starts_with("__corro"))
+        });
+
+        for (tbl_name, table) in self.tables.iter() {
+            // this should always be the case...
+            if let CreateTableBody::ColumnsAndConstraints {
+                columns,
+                constraints,
+                options,
+            } = &table.raw
+            {
+                if let Some(constraints) = constraints {
+                    for named in constraints.iter() {
+                        if let TableConstraint::PrimaryKey { columns, .. } = &named.constraint {
+                            for column in columns.iter() {
+                                if !matches!(column.expr, Expr::Id(_)) {
+                                    return Err(ConstrainedSchemaError::PrimaryKeyExpr);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // error here!
+            }
+
+            for (name, column) in table.columns.iter() {
+                if !column.primary_key && !column.nullable && column.default_value.is_none() {
+                    return Err(ConstrainedSchemaError::NotNullableColumnNeedsDefault {
+                        tbl_name: tbl_name.clone(),
+                        name: name.clone(),
+                    });
+                }
+
+                if column
+                    .raw
+                    .constraints
+                    .iter()
+                    .any(|named| matches!(named.constraint, ColumnConstraint::ForeignKey { .. }))
+                {
+                    return Err(ConstrainedSchemaError::ForeignKey {
+                        tbl_name: tbl_name.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+
+            for (name, index) in table.indexes.iter() {
+                if index.unique {
+                    return Err(ConstrainedSchemaError::UniqueIndex(name.clone()));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,51 +165,30 @@ pub enum SchemaError {
     Parse(#[from] sqlite3_parser::lexer::sql::Error),
     #[error("nothing to parse")]
     NothingParsed,
-    #[error("unsupported statement: {0}")]
+    #[error("unsupported command: {0}")]
     UnsupportedCmd(Cmd),
-    #[error("unique indexes are not supported: {0}")]
-    UniqueIndex(Cmd),
+    #[error("missing table for index (table: '{tbl_name}', index: '{name}')")]
+    IndexWithoutTable { tbl_name: String, name: String },
     #[error("temporary tables are not supported: {0}")]
     TemporaryTable(Cmd),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConstrainedSchemaError {
+    #[error("unique indexes are not supported: {0}")]
+    UniqueIndex(String),
     #[error("table as select arenot supported: {0}")]
     TableAsSelect(Cmd),
     #[error("not nullable column '{name}' on table '{tbl_name}' needs a default value for forward schema compatibility")]
     NotNullableColumnNeedsDefault { tbl_name: String, name: String },
     #[error("foreign keys are not supported (table: '{tbl_name}', column: '{name}')")]
     ForeignKey { tbl_name: String, name: String },
-    #[error("missing table for index (table: '{tbl_name}', index: '{name}')")]
-    IndexWithoutTable { tbl_name: String, name: String },
     #[error("expr used as primary")]
     PrimaryKeyExpr,
-    #[error("won't drop table without the destructive flag set (table: '{0}')")]
-    DropTableWithoutDestructiveFlag(String),
-    #[error("won't drop table without the destructive flag set (table: '{0}', column: '{1}')")]
-    DropColumnWithoutDestructiveFlag(String, String),
-    #[error("can't add a primary key (table: '{0}', column: '{1}')")]
-    AddPrimaryKey(String, String),
-    #[error("can't modify primary keys (table: '{0}')")]
-    ModifyPrimaryKeys(String),
-
-    #[error("tried importing an existing schema for table '{0}' due to a failed CREATE TABLE but didn't find anything (this should never happen)")]
-    ImportedSchemaNotFound(String),
-
-    #[error("existing schema for table '{tbl_name}' primary keys mismatched, expected: {expected:?}, got: {got:?}")]
-    ImportedSchemaPkMismatch {
-        tbl_name: String,
-        expected: IndexSet<String>,
-        got: IndexSet<String>,
-    },
-
-    #[error("existing schema for table '{tbl_name}' columns mismatched, expected: {expected:?}, got: {got:?}")]
-    ImportedSchemaColumnsMismatch {
-        tbl_name: String,
-        expected: IndexMap<String, NormalizedColumn>,
-        got: IndexMap<String, NormalizedColumn>,
-    },
 }
 
 #[allow(clippy::result_large_err)]
-pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
+pub fn init_schema(conn: &Connection) -> Result<Schema, SchemaError> {
     let mut dump = String::new();
 
     let tables: HashMap<String, String> = conn
@@ -177,12 +218,47 @@ pub fn init_schema(conn: &Connection) -> Result<NormalizedSchema, SchemaError> {
     parse_sql(dump.as_str())
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ApplySchemaError {
+    #[error(transparent)]
+    Rusqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Schema(#[from] SchemaError),
+    #[error(transparent)]
+    ConstrainedSchema(#[from] ConstrainedSchemaError),
+    #[error("won't drop table without the destructive flag set (table: '{0}')")]
+    DropTableWithoutDestructiveFlag(String),
+    #[error("won't drop table without the destructive flag set (table: '{0}', column: '{1}')")]
+    DropColumnWithoutDestructiveFlag(String, String),
+    #[error("can't add a primary key (table: '{0}', column: '{1}')")]
+    AddPrimaryKey(String, String),
+    #[error("can't modify primary keys (table: '{0}')")]
+    ModifyPrimaryKeys(String),
+
+    #[error("tried importing an existing schema for table '{0}' due to a failed CREATE TABLE but didn't find anything (this should never happen)")]
+    ImportedSchemaNotFound(String),
+
+    #[error("existing schema for table '{tbl_name}' primary keys mismatched, expected: {expected:?}, got: {got:?}")]
+    ImportedSchemaPkMismatch {
+        tbl_name: String,
+        expected: IndexSet<String>,
+        got: IndexSet<String>,
+    },
+
+    #[error("existing schema for table '{tbl_name}' columns mismatched, expected: {expected:?}, got: {got:?}")]
+    ImportedSchemaColumnsMismatch {
+        tbl_name: String,
+        expected: IndexMap<String, Column>,
+        got: IndexMap<String, Column>,
+    },
+}
+
 #[allow(clippy::result_large_err)]
 pub fn apply_schema(
     tx: &Transaction,
-    schema: &NormalizedSchema,
-    new_schema: &mut NormalizedSchema,
-) -> Result<(), SchemaError> {
+    schema: &Schema,
+    new_schema: &mut Schema,
+) -> Result<(), ApplySchemaError> {
     if let Some(name) = schema
         .tables
         .keys()
@@ -191,12 +267,12 @@ pub fn apply_schema(
         .next()
     {
         // TODO: add options and check flag
-        return Err(SchemaError::DropTableWithoutDestructiveFlag(
+        return Err(ApplySchemaError::DropTableWithoutDestructiveFlag(
             (*name).clone(),
         ));
     }
 
-    let mut schema_to_merge = NormalizedSchema::default();
+    let mut schema_to_merge = Schema::default();
 
     {
         let new_table_names = new_schema
@@ -245,10 +321,10 @@ pub fn apply_schema(
                 let parsed_table = parse_sql(&sql)?
                     .tables
                     .remove(name)
-                    .ok_or_else(|| SchemaError::ImportedSchemaNotFound(name.clone()))?;
+                    .ok_or_else(|| ApplySchemaError::ImportedSchemaNotFound(name.clone()))?;
 
                 if parsed_table.pk != table.pk {
-                    return Err(SchemaError::ImportedSchemaPkMismatch {
+                    return Err(ApplySchemaError::ImportedSchemaPkMismatch {
                         tbl_name: name.clone(),
                         expected: table.pk.clone(),
                         got: parsed_table.pk,
@@ -256,7 +332,7 @@ pub fn apply_schema(
                 }
 
                 if parsed_table.columns != table.columns {
-                    return Err(SchemaError::ImportedSchemaColumnsMismatch {
+                    return Err(ApplySchemaError::ImportedSchemaColumnsMismatch {
                         tbl_name: name.clone(),
                         expected: table.columns.clone(),
                         got: parsed_table.columns,
@@ -327,7 +403,7 @@ pub fn apply_schema(
         debug!("dropped cols: {dropped_cols:?}");
 
         if let Some(col_name) = dropped_cols.into_iter().next() {
-            return Err(SchemaError::DropColumnWithoutDestructiveFlag(
+            return Err(ApplySchemaError::DropColumnWithoutDestructiveFlag(
                 name.clone(),
                 col_name.clone(),
             ));
@@ -335,7 +411,7 @@ pub fn apply_schema(
 
         // 2. check for changed columns
 
-        let changed_cols: HashMap<String, NormalizedColumn> = table
+        let changed_cols: HashMap<String, Column> = table
             .columns
             .iter()
             .filter_map(|(name, col)| {
@@ -379,13 +455,17 @@ pub fn apply_schema(
                 for (col_name, col) in new_cols_iter {
                     info!("adding column '{col_name}'");
                     if col.primary_key {
-                        return Err(SchemaError::AddPrimaryKey(name.clone(), col_name.clone()));
+                        return Err(ApplySchemaError::AddPrimaryKey(
+                            name.clone(),
+                            col_name.clone(),
+                        ));
                     }
                     if !col.nullable && col.default_value.is_none() {
-                        return Err(SchemaError::NotNullableColumnNeedsDefault {
+                        return Err(ConstrainedSchemaError::NotNullableColumnNeedsDefault {
                             tbl_name: name.clone(),
                             name: col_name.clone(),
-                        });
+                        }
+                        .into());
                     }
                     tx.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {}", col))?;
                 }
@@ -415,7 +495,7 @@ pub fn apply_schema(
                 .collect::<Vec<&String>>();
 
             if primary_keys != new_primary_keys {
-                return Err(SchemaError::ModifyPrimaryKeys(name.clone()));
+                return Err(ApplySchemaError::ModifyPrimaryKeys(name.clone()));
             }
 
             // "12-step" process to modifying a table
@@ -537,7 +617,7 @@ pub fn apply_schema(
 }
 
 #[allow(clippy::result_large_err)]
-pub fn parse_sql_to_schema(schema: &mut NormalizedSchema, sql: &str) -> Result<(), SchemaError> {
+pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), SchemaError> {
     debug!("parsing {sql}");
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
 
@@ -549,9 +629,6 @@ pub fn parse_sql_to_schema(schema: &mut NormalizedSchema, sql: &str) -> Result<(
                 return Err(err.into());
             }
             Ok(Some(ref cmd @ Cmd::Stmt(ref stmt))) => match stmt {
-                Stmt::CreateIndex { unique: true, .. } => {
-                    return Err(SchemaError::UniqueIndex(cmd.clone()))
-                }
                 Stmt::CreateTable {
                     temporary: true, ..
                 } => return Err(SchemaError::TemporaryTable(cmd.clone())),
@@ -570,29 +647,31 @@ pub fn parse_sql_to_schema(schema: &mut NormalizedSchema, sql: &str) -> Result<(
                             options,
                         },
                 } => {
-                    if let Some(table) =
-                        prepare_table(tbl_name, columns, constraints.as_ref(), options)?
-                    {
-                        schema.tables.insert(tbl_name.name.0.clone(), table);
-                        debug!("inserted table: {}", tbl_name.name.0);
-                    } else {
-                        debug!("skipped table: {}", tbl_name.name.0);
-                    }
+                    schema.tables.insert(
+                        tbl_name.name.0.clone(),
+                        prepare_table(tbl_name, columns, constraints.as_ref(), options),
+                    );
+                    debug!("inserted table: {}", tbl_name.name.0);
                 }
                 Stmt::CreateIndex {
-                    unique: false,
-                    if_not_exists: _,
+                    unique,
                     idx_name,
                     tbl_name,
                     columns,
                     where_clause,
+                    ..
                 } => {
                     if let Some(table) = schema.tables.get_mut(tbl_name.0.as_str()) {
-                        if let Some(index) =
-                            prepare_index(idx_name, tbl_name, columns, where_clause.as_ref())?
-                        {
-                            table.indexes.insert(idx_name.name.0.clone(), index);
-                        }
+                        table.indexes.insert(
+                            idx_name.name.0.clone(),
+                            Index {
+                                name: idx_name.name.0.clone(),
+                                tbl_name: tbl_name.0.clone(),
+                                columns: columns.to_vec(),
+                                where_clause: where_clause.clone(),
+                                unique: *unique,
+                            },
+                        );
                     } else {
                         return Err(SchemaError::IndexWithoutTable {
                             tbl_name: tbl_name.0.clone(),
@@ -610,35 +689,12 @@ pub fn parse_sql_to_schema(schema: &mut NormalizedSchema, sql: &str) -> Result<(
 }
 
 #[allow(clippy::result_large_err)]
-pub fn parse_sql(sql: &str) -> Result<NormalizedSchema, SchemaError> {
-    let mut schema = NormalizedSchema::default();
+pub fn parse_sql(sql: &str) -> Result<Schema, SchemaError> {
+    let mut schema = Schema::default();
 
     parse_sql_to_schema(&mut schema, sql)?;
 
     Ok(schema)
-}
-
-#[allow(clippy::result_large_err)]
-fn prepare_index(
-    name: &QualifiedName,
-    tbl_name: &Name,
-    columns: &[SortedColumn],
-    where_clause: Option<&Expr>,
-) -> Result<Option<NormalizedIndex>, SchemaError> {
-    debug!("preparing index: {}", name.name.0);
-    if tbl_name.0.contains("crsql")
-        & tbl_name.0.contains("sqlite")
-        & tbl_name.0.starts_with("__corro")
-    {
-        return Ok(None);
-    }
-
-    Ok(Some(NormalizedIndex {
-        name: name.name.0.clone(),
-        tbl_name: tbl_name.0.clone(),
-        columns: columns.to_vec(),
-        where_clause: where_clause.cloned(),
-    }))
 }
 
 #[allow(clippy::result_large_err)]
@@ -647,16 +703,7 @@ fn prepare_table(
     columns: &[ColumnDefinition],
     constraints: Option<&Vec<NamedTableConstraint>>,
     options: &TableOptions,
-) -> Result<Option<NormalizedTable>, SchemaError> {
-    debug!("preparing table: {}", tbl_name.name.0);
-    if tbl_name.name.0.contains("crsql")
-        & tbl_name.name.0.contains("sqlite")
-        & tbl_name.name.0.starts_with("__corro")
-    {
-        debug!("skipping table because of name");
-        return Ok(None);
-    }
-
+) -> Table {
     let pk = constraints
         .and_then(|constraints| {
             constraints
@@ -665,17 +712,17 @@ fn prepare_table(
                     TableConstraint::PrimaryKey { columns, .. } => Some(
                         columns
                             .iter()
-                            .map(|col| match &col.expr {
-                                Expr::Id(id) => Ok(id.0.clone()),
-                                _ => Err(SchemaError::PrimaryKeyExpr),
+                            .filter_map(|col| match &col.expr {
+                                Expr::Id(id) => Some(id.0.clone()),
+                                _ => None,
                             })
-                            .collect::<Result<IndexSet<_>, SchemaError>>(),
+                            .collect::<IndexSet<_>>(),
                     ),
                     _ => None,
                 })
         })
         .unwrap_or_else(|| {
-            Ok(columns
+            columns
                 .iter()
                 .filter(|&def| {
                     def.constraints.iter().any(|named| {
@@ -683,10 +730,10 @@ fn prepare_table(
                     })
                 })
                 .map(|def| def.col_name.0.clone())
-                .collect())
-        })?;
+                .collect()
+        });
 
-    Ok(Some(NormalizedTable {
+    Table {
         name: tbl_name.name.0.clone(),
         indexes: IndexMap::new(),
         columns: columns
@@ -714,27 +761,9 @@ fn prepare_table(
 
                 let primary_key = pk.contains(&def.col_name.0);
 
-                if !primary_key && (!nullable && default_value.is_none()) {
-                    return Err(SchemaError::NotNullableColumnNeedsDefault {
-                        tbl_name: tbl_name.name.0.clone(),
-                        name: def.col_name.0.clone(),
-                    });
-                }
-
-                if def
-                    .constraints
-                    .iter()
-                    .any(|named| matches!(named.constraint, ColumnConstraint::ForeignKey { .. }))
-                {
-                    return Err(SchemaError::ForeignKey {
-                        tbl_name: tbl_name.name.0.clone(),
-                        name: def.col_name.0.clone(),
-                    });
-                }
-
-                Ok((
+                (
                     def.col_name.0.clone(),
-                    NormalizedColumn {
+                    Column {
                         name: def.col_name.0.clone(),
                         sql_type: match def
                             .col_type
@@ -783,14 +812,14 @@ fn prepare_table(
                         }),
                         raw: def.clone(),
                     },
-                ))
+                )
             })
-            .collect::<Result<IndexMap<_, _>, SchemaError>>()?,
+            .collect::<IndexMap<_, _>>(),
         pk,
         raw: CreateTableBody::ColumnsAndConstraints {
             columns: columns.to_vec(),
             constraints: constraints.cloned(),
             options: *options,
         },
-    }))
+    }
 }

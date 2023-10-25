@@ -18,6 +18,8 @@ tracing = { workspace = true }
 time = { workspace = true }
 phf = "*"
 postgres-types = { version = "0.2", features = ["with-time-0_3"] }
+sqlite3-parser = { workspace = true }
+fallible-iterator = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

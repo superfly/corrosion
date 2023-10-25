@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     api::QueryEvent,
-    schema::{NormalizedSchema, NormalizedTable},
+    schema::{Schema, Table},
     sqlite::Migration,
 };
 
@@ -356,7 +356,7 @@ const CHANGE_TYPE_COL: &str = "type";
 impl Matcher {
     fn new(
         id: Uuid,
-        schema: &NormalizedSchema,
+        schema: &Schema,
         conn: &Connection,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
@@ -530,7 +530,7 @@ impl Matcher {
 
     pub fn restore(
         id: Uuid,
-        schema: &NormalizedSchema,
+        schema: &Schema,
         conn: Connection,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
@@ -544,7 +544,7 @@ impl Matcher {
 
     pub fn create(
         id: Uuid,
-        schema: &NormalizedSchema,
+        schema: &Schema,
         mut conn: Connection,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
@@ -1040,10 +1040,7 @@ pub struct ParsedSelect {
     children: Vec<ParsedSelect>,
 }
 
-fn extract_select_columns(
-    select: &Select,
-    schema: &NormalizedSchema,
-) -> Result<ParsedSelect, MatcherError> {
+fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSelect, MatcherError> {
     let mut parsed = ParsedSelect::default();
 
     if let OneSelect::Select {
@@ -1140,7 +1137,7 @@ fn extract_select_columns(
 
 fn extract_expr_columns(
     expr: &Expr,
-    schema: &NormalizedSchema,
+    schema: &Schema,
     parsed: &mut ParsedSelect,
 ) -> Result<(), MatcherError> {
     match expr {
@@ -1318,7 +1315,7 @@ fn extract_expr_columns(
 fn extract_columns(
     columns: &[ResultColumn],
     from: Option<&Name>,
-    schema: &NormalizedSchema,
+    schema: &Schema,
     parsed: &mut ParsedSelect,
 ) -> Result<(), MatcherError> {
     let mut i = 0;
@@ -1382,7 +1379,7 @@ fn extract_columns(
 
 fn table_to_expr(
     aliases: &HashMap<String, String>,
-    tbl: &NormalizedTable,
+    tbl: &Table,
     table: &str,
     id: Uuid,
 ) -> Result<Expr, MatcherError> {
@@ -1521,7 +1518,7 @@ mod tests {
 
         {
             let tx = conn.transaction()?;
-            apply_schema(&tx, &NormalizedSchema::default(), &mut schema)?;
+            apply_schema(&tx, &Schema::default(), &mut schema)?;
             tx.commit()?;
         }
 
@@ -1653,7 +1650,7 @@ mod tests {
 
         {
             let tx = conn.transaction().unwrap();
-            apply_schema(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
+            apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
             tx.commit().unwrap();
         }
 
@@ -1695,7 +1692,7 @@ mod tests {
 
             {
                 let tx = conn2.transaction().unwrap();
-                apply_schema(&tx, &NormalizedSchema::default(), &mut schema).unwrap();
+                apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
                 tx.commit().unwrap();
             }
 

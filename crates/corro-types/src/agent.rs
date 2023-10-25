@@ -40,7 +40,7 @@ use crate::{
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     config::Config,
     pubsub::MatcherHandle,
-    schema::NormalizedSchema,
+    schema::Schema,
     sqlite::{rusqlite_to_crsqlite, setup_conn, AttachMap, CrConn, SqlitePool, SqlitePoolError},
 };
 
@@ -67,7 +67,7 @@ pub struct AgentConfig {
     pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
     pub tx_foca: Sender<FocaInput>,
 
-    pub schema: RwLock<NormalizedSchema>,
+    pub schema: RwLock<Schema>,
     pub tripwire: Tripwire,
 }
 
@@ -86,7 +86,7 @@ pub struct AgentInner {
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     tx_changes: Sender<(ChangeV1, ChangeSource)>,
     tx_foca: Sender<FocaInput>,
-    schema: RwLock<NormalizedSchema>,
+    schema: RwLock<Schema>,
     limits: Limits,
 }
 
@@ -171,7 +171,7 @@ impl Agent {
         &self.0.members
     }
 
-    pub fn schema(&self) -> &RwLock<NormalizedSchema> {
+    pub fn schema(&self) -> &RwLock<Schema> {
         &self.0.schema
     }
 
