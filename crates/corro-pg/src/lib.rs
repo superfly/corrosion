@@ -1,5 +1,3 @@
-pub mod proto;
-pub mod proto_ext;
 pub mod sql_state;
 mod vtab;
 
@@ -40,8 +38,8 @@ use pgwire::{
 use postgres_types::{FromSql, Type};
 use rusqlite::{named_params, types::ValueRef, vtab::eponymous_only_module, Connection, Statement};
 use sqlite3_parser::ast::{
-    As, Cmd, CreateTableBody, Expr, FromClause, Id, InsertBody, Literal, Name, OneSelect,
-    ResultColumn, Select, SelectTable, Stmt,
+    As, Cmd, CreateTableBody, Expr, FromClause, Id, InsertBody, Name, OneSelect, ResultColumn,
+    Select, SelectTable, Stmt,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
