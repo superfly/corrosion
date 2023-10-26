@@ -20,15 +20,12 @@ enquote = { workspace = true }
 fallible-iterator = { workspace = true }
 foca = { workspace = true } 
 futures = { workspace = true }
-hyper = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
-rmp-serde = { workspace = true }
 metrics = { workspace = true }
 once_cell = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
-pin-project-lite = { workspace = true }
 rand = { workspace = true }
 rangemap = { workspace = true }
 rcgen = { workspace = true }
