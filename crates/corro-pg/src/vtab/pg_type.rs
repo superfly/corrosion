@@ -115,7 +115,10 @@ impl PgType {
             Type::VARCHAR => -1,
             Type::FLOAT4 => 4,
             Type::FLOAT8 => 8,
-            _ => todo!(),
+            _ => {
+                // TODO: not default...
+                Default::default()
+            }
         }
     }
     fn typbyval(&self) -> bool {
@@ -129,7 +132,10 @@ impl PgType {
             Type::VARCHAR => false,
             Type::FLOAT4 => true,
             Type::FLOAT8 => true,
-            _ => todo!(),
+            _ => {
+                // TODO: not default...
+                Default::default()
+            }
         }
     }
     fn typtype(&self) -> &'static str {
@@ -146,26 +152,32 @@ impl PgType {
             Type::VARCHAR => "S",
             Type::FLOAT4 => "N",
             Type::FLOAT8 => "N",
-            _ => todo!(),
+            _ => {
+                // TODO: not default...
+                Default::default()
+            }
         }
     }
     fn typispreferred(&self) -> bool {
-        todo!()
+        // TODO: not default...
+        Default::default()
     }
     fn typisdefined(&self) -> bool {
         true
     }
     fn typdelim(&self) -> &'static str {
-        todo!()
+        // TODO: not default...
+        Default::default()
     }
-    fn typrelid(&self) -> &'static str {
-        todo!()
+    fn typrelid(&self) -> i64 {
+        0
     }
     fn typelem(&self) -> &'static str {
         "0"
     }
     fn typarray(&self) -> &'static str {
-        todo!()
+        // TODO: not default...
+        Default::default()
     }
     fn typinput(&self) -> String {
         format!("{}in", self.0.name())
@@ -180,19 +192,23 @@ impl PgType {
         format!("{}send", self.0.name())
     }
     fn typmodin(&self) -> &'static str {
-        todo!()
+        // TODO: not default...
+        Default::default()
     }
     fn typmodout(&self) -> &'static str {
-        todo!()
+        // TODO: not default...
+        Default::default()
     }
     fn typanalyze(&self) -> &'static str {
         "-"
     }
     fn typalign(&self) -> &'static str {
-        todo!()
+        // TODO: not default...
+        Default::default()
     }
     fn typstorage(&self) -> &'static str {
-        todo!()
+        // TODO: not default...
+        Default::default()
     }
     fn typnotnull(&self) -> bool {
         false
@@ -207,7 +223,8 @@ impl PgType {
         0
     }
     fn typcollation(&self) -> &'static str {
-        todo!()
+        // TODO: not default...
+        Default::default()
     }
     fn typdefaultbin(&self) -> rusqlite::types::Null {
         rusqlite::types::Null

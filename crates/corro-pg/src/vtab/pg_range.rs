@@ -62,13 +62,6 @@ pub struct PgRangeTableCursor<'vtab> {
     phantom: PhantomData<&'vtab PgRangeTable>,
 }
 
-// {"rngtypid":"3904","rngsubtype":"23","rngmultitypid":"4451","rngcollation":"0","rngsubopc":"1978","rngcanonical":"int4range_canonical","rngsubdiff":"int4range_subdiff"}
-//  {"rngtypid":"3906","rngsubtype":"1700","rngmultitypid":"4532","rngcollation":"0","rngsubopc":"3125","rngcanonical":"-","rngsubdiff":"numrange_subdiff"}
-//  {"rngtypid":"3908","rngsubtype":"1114","rngmultitypid":"4533","rngcollation":"0","rngsubopc":"3128","rngcanonical":"-","rngsubdiff":"tsrange_subdiff"}
-//  {"rngtypid":"3910","rngsubtype":"1184","rngmultitypid":"4534","rngcollation":"0","rngsubopc":"3127","rngcanonical":"-","rngsubdiff":"tstzrange_subdiff"}
-//  {"rngtypid":"3912","rngsubtype":"1082","rngmultitypid":"4535","rngcollation":"0","rngsubopc":"3122","rngcanonical":"daterange_canonical","rngsubdiff":"daterange_subdiff"}
-//  {"rngtypid":"3926","rngsubtype":"20","rngmultitypid":"4536","rngcollation":"0","rngsubopc":"3124","rngcanonical":"int8range_canonical","rngsubdiff":"int8range_subdiff"}
-
 unsafe impl VTabCursor for PgRangeTableCursor<'_> {
     fn filter(
         &mut self,
