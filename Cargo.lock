@@ -830,6 +830,7 @@ dependencies = [
  "compact_str 0.7.0",
  "corro-tests",
  "corro-types",
+ "enquote",
  "fallible-iterator",
  "futures",
  "pgwire",

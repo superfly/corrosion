@@ -578,15 +578,18 @@ pub async fn start(
                                                 }
                                             }
 
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ParameterDescription(
-                                                        ParameterDescription::new(oids),
-                                                    ),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
+                                            if !oids.is_empty() {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::ParameterDescription(
+                                                            ParameterDescription::new(oids),
+                                                        ),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                            }
+
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::RowDescription(
@@ -1466,18 +1469,17 @@ pub async fn start(
                                             portals.retain(|_, (stmt_name, _, _, _)| {
                                                 stmt_name.as_str() != name
                                             });
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::CloseComplete(
-                                                        CloseComplete::new(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-                                            continue;
                                         }
-                                        // not finding a statement is not an error
+                                        back_tx.blocking_send(
+                                            (
+                                                PgWireBackendMessage::CloseComplete(
+                                                    CloseComplete::new(),
+                                                ),
+                                                true,
+                                            )
+                                                .into(),
+                                        )?;
+                                        continue;
                                     }
                                     // portal
                                     b'P' => {
@@ -1828,8 +1830,16 @@ fn extract_param(
                     SqliteName::Name(_) => {}
                     SqliteName::Qualified(tbl_name, col_name)
                     | SqliteName::DoublyQualified(_, tbl_name, col_name) => {
+                        println!("looking tbl {} for col {}", tbl_name.0, col_name.0);
                         if let Some(table) = tables.get(&tbl_name.0) {
-                            if let Some(col) = table.columns.get(&col_name.0) {
+                            println!("found table! {}", table.name);
+                            if let Ok(unquoted) = enquote::unquote(&col_name.0) {
+                                println!("unquoted column as: {unquoted}");
+                                if let Some(col) = table.columns.get(&unquoted) {
+                                    params.push(col.sql_type);
+                                }
+                            } else if let Some(col) = table.columns.get(&col_name.0) {
+                                println!("could not unquote, using original");
                                 params.push(col.sql_type);
                             }
                         }
@@ -2020,18 +2030,20 @@ fn handle_from<'a>(
     if let Some(select) = from.select.as_deref() {
         match select {
             SelectTable::Table(qname, maybe_alias, _) => {
-                if let Some(alias) = maybe_alias {
-                    let alias = match alias {
-                        As::As(name) => name.0.clone(),
-                        As::Elided(name) => name.0.clone(),
-                    };
-                    if let Some(table) = schema.tables.get(&qname.name.0) {
-                        tables.insert(alias, table);
-                    }
+                let maybe_table = if let Ok(unquoted) = enquote::unquote(&qname.name.0) {
+                    schema.tables.get(&unquoted)
                 } else {
-                    // not aliased
-                    if let Some(table) = schema.tables.get(&qname.name.0) {
-                        tables.insert(qname.name.0.clone(), table);
+                    schema.tables.get(&qname.name.0)
+                };
+
+                if let Some(table) = maybe_table {
+                    if let Some(alias) = maybe_alias {
+                        let alias = match alias {
+                            As::As(name) | As::Elided(name) => name.0.clone(),
+                        };
+                        tables.insert(alias, table);
+                    } else {
+                        tables.insert(table.name.clone(), table);
                     }
                 }
             }
@@ -2046,18 +2058,20 @@ fn handle_from<'a>(
         for join in joins.iter() {
             match &join.table {
                 SelectTable::Table(qname, maybe_alias, _) => {
-                    if let Some(alias) = maybe_alias {
-                        let alias = match alias {
-                            As::As(name) => name.0.clone(),
-                            As::Elided(name) => name.0.clone(),
-                        };
-                        if let Some(table) = schema.tables.get(&qname.name.0) {
-                            tables.insert(alias, table);
-                        }
+                    let maybe_table = if let Ok(unquoted) = enquote::unquote(&qname.name.0) {
+                        schema.tables.get(&unquoted)
                     } else {
-                        // not aliased
-                        if let Some(table) = schema.tables.get(&qname.name.0) {
-                            tables.insert(qname.name.0.clone(), table);
+                        schema.tables.get(&qname.name.0)
+                    };
+
+                    if let Some(table) = maybe_table {
+                        if let Some(alias) = maybe_alias {
+                            let alias = match alias {
+                                As::As(name) | As::Elided(name) => name.0.clone(),
+                            };
+                            tables.insert(alias, table);
+                        } else {
+                            tables.insert(table.name.clone(), table);
                         }
                     }
                 }
