@@ -299,7 +299,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
     let (agent, opts) = setup(conf, tripwire.clone()).await?;
 
-    tokio::spawn(run(agent.clone(), opts).inspect(|_| info!("corrosion agent run is done")));
+    tokio::spawn(run(agent.clone(), opts).inspect(|res| match res {
+        Ok(_) => info!("corrosion agent run is done"),
+        Err(e) => error!("running corrosion agent failed: {e}"),
+    }));
 
     Ok(agent)
 }
@@ -321,7 +324,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     if let Some(pg_conf) = agent.config().api.pg.clone() {
         info!("Starting PostgreSQL wire-compatible server");
-        let pg_server = corro_pg::start(agent.clone(), pg_conf).await?;
+        let pg_server = corro_pg::start(agent.clone(), pg_conf, tripwire.clone()).await?;
         info!(
             "Started PostgreSQL wire-compatible server, listening at {}",
             pg_server.local_addr
@@ -2419,6 +2422,7 @@ async fn handle_changes(
         }
 
         // drain and process current changes!
+        #[allow(clippy::drain_collect)]
         if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect()).await {
             error!("could not process multiple changes: {e}");
         }
@@ -2437,6 +2441,7 @@ async fn handle_changes(
         buf.push((change, src));
         if count >= MIN_CHANGES_CHUNK {
             // drain and process current changes!
+            #[allow(clippy::drain_collect)]
             if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect()).await {
                 error!("could not process multiple changes: {e}");
             }

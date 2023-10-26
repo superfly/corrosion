@@ -20,10 +20,11 @@ phf = "*"
 postgres-types = { version = "0.2", features = ["with-time-0_3"] }
 sqlite3-parser = { workspace = true }
 fallible-iterator = { workspace = true }
+tripwire = { path = "../tripwire" }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
-tempfile = { workspace = true }
 corro-tests = { path = "../corro-tests" }
 tokio-postgres = { version = "0.7.10" }
-tripwire = { path = "../tripwire" }
+spawn = { path = "../spawn" }

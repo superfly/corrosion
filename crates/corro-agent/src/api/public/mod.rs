@@ -14,7 +14,7 @@ use corro_types::{
     api::{row_to_change, ExecResponse, ExecResult, QueryEvent, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::SqliteValue,
-    http::{IoBodyStream, LinesBytesCodec},
+    http::IoBodyStream,
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
@@ -207,7 +207,7 @@ enum HandleConnError {
 }
 
 impl<T> From<SendError<T>> for HandleConnError {
-    fn from(value: SendError<T>) -> Self {
+    fn from(_: SendError<T>) -> Self {
         HandleConnError::EventsChannelClosed
     }
 }

@@ -837,6 +837,7 @@ dependencies = [
  "phf",
  "postgres-types",
  "rusqlite",
+ "spawn",
  "sqlite3-parser",
  "sqlparser",
  "tempfile",

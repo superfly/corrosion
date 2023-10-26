@@ -1,10 +1,16 @@
 pub mod proto;
 pub mod proto_ext;
 pub mod sql_state;
+mod vtab;
 
-use std::{borrow::Borrow, collections::HashMap, future::poll_fn, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::poll_fn,
+    net::SocketAddr,
+    sync::Arc,
+};
 
-use bytes::{Buf, BytesMut};
+use bytes::Buf;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, KnownDbVersion},
@@ -26,16 +32,16 @@ use pgwire::{
         response::{
             EmptyQueryResponse, ReadyForQuery, READY_STATUS_IDLE, READY_STATUS_TRANSACTION_BLOCK,
         },
-        startup::SslRequest,
+        startup::{ParameterStatus, SslRequest},
         PgWireBackendMessage, PgWireFrontendMessage,
     },
     tokio::PgWireMessageServerCodec,
 };
 use postgres_types::{FromSql, Type};
-use rusqlite::{named_params, types::ValueRef, Connection, Statement};
+use rusqlite::{named_params, types::ValueRef, vtab::eponymous_only_module, Connection, Statement};
 use sqlite3_parser::ast::{
-    Cmd, CreateTableBody, Expr, Id, InsertBody, Literal, Name, OneSelect, ResultColumn, Select,
-    SelectTable, Stmt,
+    As, Cmd, CreateTableBody, Expr, FromClause, Id, InsertBody, Literal, Name, OneSelect,
+    ResultColumn, Select, SelectTable, Stmt,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
@@ -45,8 +51,12 @@ use tokio::{
 };
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, trace, warn};
+use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
-use crate::sql_state::SqlState;
+use crate::{
+    sql_state::SqlState,
+    vtab::{pg_range::PgRangeTable, pg_type::PgTypeTable},
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -127,7 +137,7 @@ impl ParsedCmd {
                 Stmt::Insert { .. } => Tag::new_for_execution("INSERT", rows),
                 Stmt::Pragma(_, _) => Tag::new_for_execution("PRAGMA", rows),
                 Stmt::Reindex { .. } => Tag::new_for_execution("REINDEX", rows),
-                Stmt::Release(_) => Tag::new_for_execution("RELEAE", rows),
+                Stmt::Release(_) => Tag::new_for_execution("RELEASE", rows),
                 Stmt::Rollback { .. } => Tag::new_for_execution("ROLLBACK", rows),
                 Stmt::Savepoint(_) => Tag::new_for_execution("SAVEPOINT", rows),
 
@@ -139,29 +149,14 @@ impl ParsedCmd {
     }
 }
 
-#[derive(Clone, Debug)]
-struct Query {
-    cmds: Vec<ParsedCmd>,
-}
-
-impl Query {
-    fn len(&self) -> usize {
-        self.cmds.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.cmds.is_empty()
-    }
-}
-
-fn parse_query(sql: &str) -> Result<Query, sqlite3_parser::lexer::sql::Error> {
-    let mut cmds = vec![];
+fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, sqlite3_parser::lexer::sql::Error> {
+    let mut cmds = VecDeque::new();
 
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
     loop {
         match parser.next() {
             Ok(Some(cmd)) => {
-                cmds.push(ParsedCmd(cmd));
+                cmds.push_back(ParsedCmd(cmd));
             }
             Ok(None) => {
                 break;
@@ -170,7 +165,7 @@ fn parse_query(sql: &str) -> Result<Query, sqlite3_parser::lexer::sql::Error> {
         }
     }
 
-    Ok(Query { cmds })
+    Ok(cmds)
 }
 
 enum OpenTx {
@@ -215,13 +210,31 @@ async fn peek_for_sslrequest(
     }
 }
 
-pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
+#[derive(Debug, thiserror::Error)]
+pub enum PgStartError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Rusqlite(#[from] rusqlite::Error),
+}
+
+pub async fn start(
+    agent: Agent,
+    pg: PgConfig,
+    mut tripwire: Tripwire,
+) -> Result<PgServer, PgStartError> {
     let server = TcpListener::bind(pg.bind_addr).await?;
     let local_addr = server.local_addr()?;
 
+    // let tmp_dir = tempfile::TempDir::new()?;
+    // let pg_system_path = tmp_dir.path().join("pg_system.sqlite");
+
     tokio::spawn(async move {
         loop {
-            let (mut conn, remote_addr) = server.accept().await?;
+            let (mut conn, remote_addr) = match server.accept().preemptible(&mut tripwire).await {
+                Outcome::Completed(res) => res?,
+                Outcome::Preempted(_) => break,
+            };
             info!("accepted a conn, addr: {remote_addr}");
 
             let agent = agent.clone();
@@ -241,7 +254,6 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
                 match msg {
                     PgWireFrontendMessage::Startup(startup) => {
                         info!("received startup message: {startup:?}");
-                        println!("huh...");
                     }
                     _ => {
                         framed
@@ -265,6 +277,14 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
                         pgwire::messages::startup::Authentication::Ok,
                     ))
                     .await?;
+
+                framed
+                    .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                        "server_version".into(),
+                        "14.0.0".into(),
+                    )))
+                    .await?;
+
                 framed
                     .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                         READY_STATUS_IDLE,
@@ -340,6 +360,9 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
                     let conn = agent.pool().client_dedicated().unwrap();
                     println!("opened connection");
 
+                    conn.create_module("pg_type", eponymous_only_module::<PgTypeTable>(), None)?;
+                    conn.create_module("pg_range", eponymous_only_module::<PgRangeTable>(), None)?;
+
                     let schema = match compute_schema(&conn) {
                         Ok(schema) => schema,
                         Err(e) => {
@@ -401,8 +424,8 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
                                 continue;
                             }
                             PgWireFrontendMessage::Parse(parse) => {
-                                let mut query = match parse_query(parse.query()) {
-                                    Ok(query) => query,
+                                let mut cmds = match parse_query(parse.query()) {
+                                    Ok(cmds) => cmds,
                                     Err(e) => {
                                         back_tx.blocking_send(
                                             (
@@ -422,30 +445,28 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
                                     }
                                 };
 
-                                if query.len() > 1 {
-                                    back_tx.blocking_send(
-                                        (
-                                            PgWireBackendMessage::ErrorResponse(
-                                                ErrorInfo::new(
-                                                    "ERROR".to_owned(),
-                                                    sql_state::SqlState::PROTOCOL_VIOLATION
-                                                        .code()
-                                                        .into(),
-                                                    "only 1 command per Parse is allowed".into(),
-                                                )
+                                let parsed_cmd = match cmds.pop_front() {
+                                    Some(cmd) => cmd,
+                                    None => {
+                                        back_tx.blocking_send(
+                                            (
+                                                PgWireBackendMessage::ErrorResponse(
+                                                    ErrorInfo::new(
+                                                        "ERROR".to_owned(),
+                                                        sql_state::SqlState::PROTOCOL_VIOLATION
+                                                            .code()
+                                                            .into(),
+                                                        "only 1 command per Parse is allowed"
+                                                            .into(),
+                                                    )
+                                                    .into(),
+                                                ),
+                                                true,
+                                            )
                                                 .into(),
-                                            ),
-                                            true,
-                                        )
-                                            .into(),
-                                    )?;
-                                    continue;
-                                }
-
-                                let parsed_cmd = if query.is_empty() {
-                                    None
-                                } else {
-                                    Some(query.cmds.remove(0))
+                                        )?;
+                                        continue;
+                                    }
                                 };
 
                                 println!("parsed cmd: {parsed_cmd:?}");
@@ -475,7 +496,7 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
                                     parse.name().as_deref().unwrap_or("").into(),
                                     (
                                         parse.query().clone(),
-                                        parsed_cmd,
+                                        Some(parsed_cmd),
                                         prepped,
                                         parse
                                             .type_oids()
@@ -488,7 +509,7 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
                                 back_tx.blocking_send(
                                     (
                                         PgWireBackendMessage::ParseComplete(ParseComplete::new()),
-                                        true,
+                                        false,
                                     )
                                         .into(),
                                 )?;
@@ -638,7 +659,7 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
                                                             fields.iter().map(Into::into).collect(),
                                                         ),
                                                     ),
-                                                    true,
+                                                    false,
                                                 )
                                                     .into(),
                                             )?;
@@ -1001,6 +1022,7 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
 
                                 loop {
                                     if count >= max_rows {
+                                        // forget the Rows iterator here so as to not reset the statement!
                                         std::mem::forget(rows);
                                         back_tx.blocking_send(
                                             (
@@ -1152,14 +1174,7 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
                                     continue;
                                 }
 
-                                let mut cmd_iter = parsed_query.cmds.into_iter().peekable();
-
-                                loop {
-                                    let cmd = match cmd_iter.next() {
-                                        None => break,
-                                        Some(cmd) => cmd,
-                                    };
-
+                                for cmd in parsed_query.into_iter() {
                                     // need to start an implicit transaction
                                     if open_tx.is_none() && !cmd.is_begin() {
                                         if let Err(e) = conn.execute_batch("BEGIN") {
@@ -1565,9 +1580,10 @@ pub async fn start(agent: Agent, pg: PgConfig) -> std::io::Result<PgServer> {
         Ok::<_, BoxError>(())
     });
 
-    return Ok(PgServer { local_addr });
+    Ok(PgServer { local_addr })
 }
 
+#[allow(clippy::result_large_err)]
 fn name_to_type(name: &str) -> Result<Type, ErrorInfo> {
     match name.to_uppercase().as_ref() {
         "ANY" => Ok(Type::ANY),
@@ -1718,11 +1734,6 @@ enum SqliteName {
     DoublyQualified(Name, Name, Name),
 }
 
-enum ParamType {
-    Type(SqliteType),
-    FromColumn(SqliteName),
-}
-
 fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef> {
     match expr {
         Expr::Id(id) => Some(SqliteNameRef::Id(id)),
@@ -1733,35 +1744,36 @@ fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef> {
     }
 }
 
-fn literal_type(expr: &Expr) -> Option<SqliteType> {
-    match expr {
-        Expr::Literal(lit) => match lit {
-            Literal::Numeric(num) => {
-                if num.parse::<i64>().is_ok() {
-                    Some(SqliteType::Integer)
-                } else if num.parse::<f64>().is_ok() {
-                    Some(SqliteType::Real)
-                } else {
-                    // this should be unreachable...
-                    None
-                }
-            }
-            Literal::String(_) => Some(SqliteType::Text),
-            Literal::Blob(_) => Some(SqliteType::Blob),
-            Literal::Keyword(keyword) => {
-                // TODO: figure out what this is...
-                warn!("got a keyword: {keyword}");
-                None
-            }
-            Literal::Null => Some(SqliteType::Null),
-            Literal::CurrentDate | Literal::CurrentTime | Literal::CurrentTimestamp => {
-                // TODO: make this configurable at connection time or something
-                Some(SqliteType::Text)
-            }
-        },
-        _ => None,
-    }
-}
+// determines the type of a literal type if any
+// fn literal_type(expr: &Expr) -> Option<SqliteType> {
+//     match expr {
+//         Expr::Literal(lit) => match lit {
+//             Literal::Numeric(num) => {
+//                 if num.parse::<i64>().is_ok() {
+//                     Some(SqliteType::Integer)
+//                 } else if num.parse::<f64>().is_ok() {
+//                     Some(SqliteType::Real)
+//                 } else {
+//                     // this should be unreachable...
+//                     None
+//                 }
+//             }
+//             Literal::String(_) => Some(SqliteType::Text),
+//             Literal::Blob(_) => Some(SqliteType::Blob),
+//             Literal::Keyword(keyword) => {
+//                 // TODO: figure out what this is...
+//                 warn!("got a keyword: {keyword}");
+//                 None
+//             }
+//             Literal::Null => Some(SqliteType::Null),
+//             Literal::CurrentDate | Literal::CurrentTime | Literal::CurrentTimestamp => {
+//                 // TODO: make this configurable at connection time or something
+//                 Some(SqliteType::Text)
+//             }
+//         },
+//         _ => None,
+//     }
+// }
 
 fn handle_lhs_rhs(lhs: &Expr, rhs: &Expr) -> Option<SqliteName> {
     match (
@@ -1773,68 +1785,24 @@ fn handle_lhs_rhs(lhs: &Expr, rhs: &Expr) -> Option<SqliteName> {
     }
 }
 
-// fn handle_select(select: &Select, params: &mut Vec<ParamType>) {
-//     let mut aliases = HashMap::new();
-//     match &select.body.select {
-//         OneSelect::Select {
-//             columns,
-//             from,
-//             where_clause,
-//             ..
-//         } => {
-//             // process FROM for aliases only
-
-//             if let Some(from) = from {
-//                 if let Some(select) = from.select.as_deref() {
-//                     match select {
-//                         SelectTable::Table(name, alias, _) => {}
-//                         SelectTable::TableCall(name, _, alias) => {}
-//                         SelectTable::Select(_, alias) => {}
-//                         SelectTable::Sub(_, _) => {}
-//                     }
-//                 }
-//             }
-
-//             for col in columns.iter() {
-//                 match col {
-//                     ResultColumn::Expr(expr, _) => {
-//                         if is_param(expr) {
-//                             params.push(ParamType::Type(SqliteType::Text));
-//                         } else {
-//                             extract_param(expr, &aliases, params);
-//                         }
-//                     }
-//                     _ => {
-//                         // nothing to do here I don't think
-//                     }
-//                 }
-//             }
-
-//             if let Some(from) = from {
-//                 if let Some(select) = from.select.as_deref() {
-//                     match select {
-//                         SelectTable::Table(_, _, _) => {}
-//                         SelectTable::TableCall(_, _, _) => {}
-//                         SelectTable::Select(_, _) => {}
-//                         SelectTable::Sub(_, _) => {}
-//                     }
-//                 }
-//             }
-//         }
-//         OneSelect::Values(_) => {
-//             // TODO: handle values
-//         }
-//     }
-// }
-
-fn extract_param(expr: &Expr, tables: &HashMap<String, &Table>, params: &mut Vec<SqliteType>) {
+fn extract_param(
+    schema: &Schema,
+    expr: &Expr,
+    tables: &HashMap<String, &Table>,
+    params: &mut Vec<SqliteType>,
+) {
     match expr {
+        // expr BETWEEN expr AND expr
         Expr::Between {
-            lhs, start, end, ..
+            lhs: _,
+            start: _,
+            end: _,
+            not: _,
         } => {}
+
+        // expr operator expr
         Expr::Binary(lhs, _, rhs) => {
             if let Some(name) = handle_lhs_rhs(lhs, rhs) {
-                println!("HANDLED LHS RHS: {name:?}");
                 match name {
                     // not aliased!
                     SqliteName::Id(id) => {
@@ -1858,127 +1826,257 @@ fn extract_param(expr: &Expr, tables: &HashMap<String, &Table>, params: &mut Vec
                 }
             }
         }
+
+        // CASE expr [WHEN expr THEN expr, ..., ELSE expr]
         Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
+            base: _,
+            when_then_pairs: _,
+            else_expr: _,
         } => {}
-        Expr::Cast { expr, type_name } => {}
+
+        // CAST ( expr AS type-name )
+        Expr::Cast {
+            expr: _,
+            type_name: _,
+        } => {}
+
+        // expr COLLATE collation-name
         Expr::Collate(_, _) => {}
+
+        // schema-name.table-name.column-name
         Expr::DoublyQualified(_, _, _) => {}
-        Expr::Exists(_) => {}
+
+        // EXISTS ( select )
+        Expr::Exists(select) => handle_select(schema, select, params),
+
+        // function-name ( [DISTINCT] expr, ... ) filter-clause over-clause
         Expr::FunctionCall {
-            name,
-            distinctness,
-            args,
-            filter_over,
+            name: _,
+            distinctness: _,
+            args: _,
+            filter_over: _,
         } => {}
-        Expr::FunctionCallStar { name, filter_over } => {}
+
+        Expr::FunctionCallStar {
+            name: _,
+            filter_over: _,
+        } => {}
+
+        // id
         Expr::Id(_) => {}
-        Expr::InList { lhs, not, rhs } => {}
-        Expr::InSelect { lhs, not, rhs } => {}
+
+        // expr IN ( expr, ... )
+        Expr::InList { lhs, not: _, rhs } => {
+            if let Some(rhs) = rhs {
+                for expr in rhs.iter() {
+                    if let Some(name) = handle_lhs_rhs(lhs, expr) {
+                        println!("HANDLED LHS RHS: {name:?}");
+                        match name {
+                            // not aliased!
+                            SqliteName::Id(id) => {
+                                // find the first one to match
+                                for (_, table) in tables.iter() {
+                                    if let Some(col) = table.columns.get(&id.0) {
+                                        params.push(col.sql_type);
+                                        break;
+                                    }
+                                }
+                            }
+                            SqliteName::Name(_) => {}
+                            SqliteName::Qualified(tbl_name, col_name)
+                            | SqliteName::DoublyQualified(_, tbl_name, col_name) => {
+                                if let Some(table) = tables.get(&tbl_name.0) {
+                                    if let Some(col) = table.columns.get(&col_name.0) {
+                                        params.push(col.sql_type);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // expr IN ( select )
+        Expr::InSelect {
+            lhs: _,
+            not: _,
+            rhs,
+        } => {
+            // TODO: check LHS here
+            handle_select(schema, rhs.as_ref(), params);
+        }
+
+        // expr IN schema-name.table-name | schema-name.table-function ( expr, ... )
         Expr::InTable {
-            lhs,
-            not,
-            rhs,
-            args,
+            lhs: _,
+            not: _,
+            rhs: _,
+            args: _,
         } => {}
+
+        // expr IS NULL
         Expr::IsNull(_) => {}
+
+        // expr [NOT] LIKE | GLOB | REGEXP | MATCH expr
         Expr::Like {
-            lhs,
-            not,
-            op,
-            rhs,
-            escape,
+            lhs: _,
+            not: _,
+            op: _,
+            rhs: _,
+            escape: _,
         } => {}
-        Expr::Literal(_) => {}
+
+        // NULL | integer | float | text | blob
+        Expr::Literal(_) => {
+            // nothing to do
+        }
+
+        // TODO:
         Expr::Name(_) => {}
+
+        // expr NOT NULL
         Expr::NotNull(_) => {}
-        Expr::Parenthesized(_) => {}
+
+        // ( expr, ... )
+        Expr::Parenthesized(exprs) => {
+            for expr in exprs.iter() {
+                extract_param(schema, expr, tables, params)
+            }
+        }
+
+        // schema-name.table-name
         Expr::Qualified(_, _) => {}
+
+        // RAISE ( IGNORE | ROLLBACK | ABORT | FAIL [ error ] )
         Expr::Raise(_, _) => {}
-        Expr::Subquery(_) => {}
+
+        // SELECT
+        Expr::Subquery(select) => handle_select(schema, select, params),
+
+        // NOT | ~ | - | + expr
         Expr::Unary(_, _) => {}
+
+        // ? | $ | :
         Expr::Variable(_) => {}
     }
+}
+
+fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>) {
+    match &select.body.select {
+        OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            distinctness: _,
+            group_by: _,
+            window_clause: _,
+        } => {
+            if let Some(from) = from {
+                let tables = handle_from(schema, from, params);
+                if let Some(where_clause) = where_clause {
+                    println!("WHERE CLAUSE: {where_clause:?}");
+                    extract_param(schema, where_clause, &tables, params);
+                }
+            }
+            for col in columns.iter() {
+                if let ResultColumn::Expr(expr, _) = col {
+                    // TODO: check against table if we can...
+                    if is_param(expr) {
+                        params.push(SqliteType::Text);
+                    }
+                }
+            }
+        }
+        OneSelect::Values(values_values) => {
+            for values in values_values.iter() {
+                for value in values.iter() {
+                    if is_param(value) {
+                        params.push(SqliteType::Text);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn handle_from<'a>(
+    schema: &'a Schema,
+    from: &FromClause,
+    params: &mut Vec<SqliteType>,
+) -> HashMap<String, &'a Table> {
+    let mut tables: HashMap<String, &Table> = HashMap::new();
+    if let Some(select) = from.select.as_deref() {
+        match select {
+            SelectTable::Table(qname, maybe_alias, _) => {
+                if let Some(alias) = maybe_alias {
+                    let alias = match alias {
+                        As::As(name) => name.0.clone(),
+                        As::Elided(name) => name.0.clone(),
+                    };
+                    if let Some(table) = schema.tables.get(&qname.name.0) {
+                        tables.insert(alias, table);
+                    }
+                } else {
+                    // not aliased
+                    if let Some(table) = schema.tables.get(&qname.name.0) {
+                        tables.insert(qname.name.0.clone(), table);
+                    }
+                }
+            }
+            SelectTable::TableCall(_, _, _) => {}
+            SelectTable::Select(select, _) => {
+                handle_select(schema, select, params);
+            }
+            SelectTable::Sub(_, _) => {}
+        }
+    }
+    if let Some(joins) = &from.joins {
+        for join in joins.iter() {
+            match &join.table {
+                SelectTable::Table(qname, maybe_alias, _) => {
+                    if let Some(alias) = maybe_alias {
+                        let alias = match alias {
+                            As::As(name) => name.0.clone(),
+                            As::Elided(name) => name.0.clone(),
+                        };
+                        if let Some(table) = schema.tables.get(&qname.name.0) {
+                            tables.insert(alias, table);
+                        }
+                    } else {
+                        // not aliased
+                        if let Some(table) = schema.tables.get(&qname.name.0) {
+                            tables.insert(qname.name.0.clone(), table);
+                        }
+                    }
+                }
+                SelectTable::TableCall(_, _, _) => {}
+                SelectTable::Select(select, _) => {
+                    handle_select(schema, select, params);
+                }
+                SelectTable::Sub(_, _) => {}
+            }
+        }
+    }
+    tables
 }
 
 fn parameter_types(schema: &Schema, stmt: &Stmt) -> Vec<SqliteType> {
     let mut params = vec![];
 
     match stmt {
-        Stmt::Select(select) => match &select.body.select {
-            OneSelect::Select {
-                columns,
-                from,
-                where_clause,
-                ..
-            } => {
-                let mut tables: HashMap<String, &Table> = HashMap::new();
-                if let Some(from) = from {
-                    if let Some(select) = from.select.as_deref() {
-                        match select {
-                            SelectTable::Table(qname, maybe_alias, _) => {
-                                if let Some(alias) = maybe_alias {
-                                    let alias = match alias {
-                                        sqlite3_parser::ast::As::As(name) => name.0.clone(),
-                                        sqlite3_parser::ast::As::Elided(name) => name.0.clone(),
-                                    };
-                                    if let Some(table) = schema.tables.get(&qname.name.0) {
-                                        tables.insert(alias, table);
-                                    }
-                                } else {
-                                    // not aliased
-                                    if let Some(table) = schema.tables.get(&qname.name.0) {
-                                        tables.insert(qname.name.0.clone(), table);
-                                    }
-                                }
-                            }
-                            SelectTable::TableCall(_, _, _) => {}
-                            SelectTable::Select(_, _) => {}
-                            SelectTable::Sub(_, _) => {}
-                        }
-                    }
-                    if let Some(joins) = &from.joins {
-                        for join in joins.iter() {
-                            match &join.table {
-                                SelectTable::Table(qname, maybe_alias, _) => {
-                                    if let Some(alias) = maybe_alias {
-                                        let alias = match alias {
-                                            sqlite3_parser::ast::As::As(name) => name.0.clone(),
-                                            sqlite3_parser::ast::As::Elided(name) => name.0.clone(),
-                                        };
-                                        if let Some(table) = schema.tables.get(&qname.name.0) {
-                                            tables.insert(alias, table);
-                                        }
-                                    } else {
-                                        // not aliased
-                                        if let Some(table) = schema.tables.get(&qname.name.0) {
-                                            tables.insert(qname.name.0.clone(), table);
-                                        }
-                                    }
-                                }
-                                SelectTable::TableCall(_, _, _) => {}
-                                SelectTable::Select(_, _) => {}
-                                SelectTable::Sub(_, _) => {}
-                            }
-                        }
-                    }
-                }
-                if let Some(where_clause) = where_clause {
-                    println!("WHERE CLAUSE: {where_clause:?}");
-                    extract_param(where_clause, &tables, &mut params);
-                }
-            }
-            OneSelect::Values(_) => {
-                // TODO: handle this somehow...
-            }
-        },
+        Stmt::Select(select) => handle_select(schema, select, &mut params),
         Stmt::Delete {
             tbl_name,
             where_clause: Some(where_clause),
             ..
-        } => {}
+        } => {
+            let mut tables = HashMap::new();
+            if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
+                tables.insert(tbl_name.name.0.clone(), tbl);
+            }
+            extract_param(schema, where_clause, &tables, &mut params);
+        }
         Stmt::Insert {
             tbl_name,
             columns,
@@ -1988,29 +2086,29 @@ fn parameter_types(schema: &Schema, stmt: &Stmt) -> Vec<SqliteType> {
             println!("GOT AN INSERT TO {tbl_name:?} on columns: {columns:?} w/ body: {body:?}");
             if let Some(table) = schema.tables.get(&tbl_name.name.0) {
                 match body {
-                    InsertBody::Select(select, _) => match &select.body.select {
-                        OneSelect::Select {
-                            distinctness,
-                            columns,
-                            from,
-                            where_clause,
-                            group_by,
-                            window_clause,
-                        } => {
-                            // handle this at some point... like any other select!
-                        }
-                        OneSelect::Values(values_values) => {
+                    InsertBody::Select(select, _) => {
+                        if let OneSelect::Values(values_values) = &select.body.select {
                             for values in values_values.iter() {
                                 for (i, expr) in values.iter().enumerate() {
                                     if is_param(expr) {
-                                        if let Some((name, col)) = table.columns.get_index(i) {
+                                        // specified columns
+                                        let col = if let Some(columns) = columns {
+                                            columns
+                                                .get(i)
+                                                .and_then(|name| table.columns.get(&name.0))
+                                        } else {
+                                            table.columns.get_index(i).map(|(_name, col)| col)
+                                        };
+                                        if let Some(col) = col {
                                             params.push(col.sql_type);
                                         }
                                     }
                                 }
                             }
+                        } else {
+                            handle_select(schema, select, &mut params)
                         }
-                    },
+                    }
                     InsertBody::DefaultValues => {
                         // nothing to do!
                     }
@@ -2018,17 +2116,30 @@ fn parameter_types(schema: &Schema, stmt: &Stmt) -> Vec<SqliteType> {
             }
         }
         Stmt::Update {
-            with,
-            or_conflict,
+            with: _,
+            or_conflict: _,
             tbl_name,
-            indexed,
-            sets,
+            indexed: _,
+            sets: _,
             from,
             where_clause,
-            returning,
-            order_by,
-            limit,
-        } => {}
+            returning: _,
+            order_by: _,
+            limit: _,
+        } => {
+            let mut tables = if let Some(from) = from {
+                handle_from(schema, from, &mut params)
+            } else {
+                Default::default()
+            };
+            if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
+                tables.insert(tbl_name.name.0.clone(), tbl);
+            }
+            if let Some(where_clause) = where_clause {
+                println!("WHERE CLAUSE: {where_clause:?}");
+                extract_param(schema, where_clause, &tables, &mut params);
+            }
+        }
         _ => {
             // do nothing, there can't be bound params here!
         }
@@ -2040,7 +2151,7 @@ fn parameter_types(schema: &Schema, stmt: &Stmt) -> Vec<SqliteType> {
 #[cfg(test)]
 mod tests {
     use corro_tests::launch_test_agent;
-    use postgres_types::ToSql;
+    use spawn::wait_for_all_pending_handles;
     use tokio_postgres::NoTls;
     use tripwire::Tripwire;
 
@@ -2051,13 +2162,14 @@ mod tests {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
-        let ta = launch_test_agent(|builder| builder.build(), tripwire).await?;
+        let ta = launch_test_agent(|builder| builder.build(), tripwire.clone()).await?;
 
         let server = start(
             ta.agent.clone(),
             PgConfig {
                 bind_addr: "127.0.0.1:0".parse()?,
             },
+            tripwire,
         )
         .await?;
 
@@ -2067,85 +2179,96 @@ mod tests {
             server.local_addr.port()
         );
 
-        let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
-        // let (mut client, client_conn) =
-        // tokio_postgres::connect("host=localhost port=5432 user=jerome", NoTls).await?;
-        println!("client is ready!");
-        tokio::spawn(client_conn);
+        {
+            let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
+            // let (mut client, client_conn) =
+            // tokio_postgres::connect("host=localhost port=5432 user=jerome", NoTls).await?;
+            println!("client is ready!");
+            tokio::spawn(client_conn);
 
-        println!("before prepare");
-        let stmt = client.prepare("SELECT 1").await?;
-        println!(
-            "after prepare: params: {:?}, columns: {:?}",
-            stmt.params(),
-            stmt.columns()
-        );
+            println!("before prepare");
+            let stmt = client.prepare("SELECT 1").await?;
+            println!(
+                "after prepare: params: {:?}, columns: {:?}",
+                stmt.params(),
+                stmt.columns()
+            );
 
-        println!("before query");
-        let rows = client.query(&stmt, &[]).await?;
+            println!("before query");
+            let rows = client.query(&stmt, &[]).await?;
 
-        println!("rows count: {}", rows.len());
-        for row in rows {
-            println!("ROW!!! {row:?}");
-        }
+            println!("rows count: {}", rows.len());
+            for row in rows {
+                println!("ROW!!! {row:?}");
+            }
 
-        println!("before execute");
-        let affected = client
-            .execute("INSERT INTO tests VALUES (1,2)", &[])
-            .await?;
-        println!("after execute, affected: {affected}");
+            println!("before execute");
+            let affected = client
+                .execute("INSERT INTO tests VALUES (1,2)", &[])
+                .await?;
+            println!("after execute, affected: {affected}");
 
-        let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
-        println!("CHANGE ROW: {row:?}");
+            let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
+            println!("CHANGE ROW: {row:?}");
 
-        client
-            .batch_execute("SELECT 1; SELECT 2; SELECT 3;")
-            .await?;
-        println!("after batch exec");
+            client
+                .batch_execute("SELECT 1; SELECT 2; SELECT 3;")
+                .await?;
+            println!("after batch exec");
 
-        client.batch_execute("SELECT 1; BEGIN; SELECT 3;").await?;
-        println!("after batch exec 2");
+            client.batch_execute("SELECT 1; BEGIN; SELECT 3;").await?;
+            println!("after batch exec 2");
 
-        client.batch_execute("SELECT 3; COMMIT; SELECT 3;").await?;
-        println!("after batch exec 3");
+            client.batch_execute("SELECT 3; COMMIT; SELECT 3;").await?;
+            println!("after batch exec 3");
 
-        let tx = client.transaction().await?;
-        println!("after begin I assume");
-        let res = tx
-            .execute(
-                "INSERT INTO tests VALUES ($1, $2)",
-                &[&2i64, &"hello world"],
-            )
-            .await?;
-        println!("res (rows affected): {res}");
-        let res = tx
-            .execute(
-                "INSERT INTO tests2 VALUES ($1, $2)",
-                &[&2i64, &"hello world 2"],
-            )
-            .await?;
-        println!("res (rows affected): {res}");
-        tx.commit().await?;
-        println!("after commit");
+            let tx = client.transaction().await?;
+            println!("after begin I assume");
+            let res = tx
+                .execute(
+                    "INSERT INTO tests VALUES ($1, $2)",
+                    &[&2i64, &"hello world"],
+                )
+                .await?;
+            println!("res (rows affected): {res}");
+            let res = tx
+                .execute(
+                    "INSERT INTO tests2 VALUES ($1, $2)",
+                    &[&2i64, &"hello world 2"],
+                )
+                .await?;
+            println!("res (rows affected): {res}");
+            tx.commit().await?;
+            println!("after commit");
 
-        let row = client
-            .query_one("SELECT * FROM tests t WHERE t.id = ?", &[&2i64])
-            .await?;
-        println!("ROW: {row:?}");
+            let row = client
+                .query_one("SELECT * FROM tests t WHERE t.id = ?", &[&2i64])
+                .await?;
+            println!("ROW: {row:?}");
 
-        let row = client
-            .query_one("SELECT * FROM tests t WHERE t.id = ?", &[&2i64])
-            .await?;
-        println!("ROW: {row:?}");
+            let row = client
+                .query_one("SELECT * FROM tests t WHERE t.id = ?", &[&2i64])
+                .await?;
+            println!("ROW: {row:?}");
 
-        let row = client
+            let row = client
+                .query_one("SELECT * FROM tests t WHERE t.id IN (?)", &[&2i64])
+                .await?;
+            println!("ROW: {row:?}");
+
+            let row = client
         .query_one("SELECT t.id, t.text, t2.text as t2text FROM tests t LEFT JOIN tests2 t2 WHERE t.id = ?", &[&2i64])
         .await?;
-        println!("ROW: {row:?}");
+            println!("ROW: {row:?}");
 
-        println!("t.id: {:?}", row.try_get::<_, i64>(0));
-        println!("t.text: {:?}", row.try_get::<_, String>(1));
-        println!("t2text: {:?}", row.try_get::<_, String>(2));
+            println!("t.id: {:?}", row.try_get::<_, i64>(0));
+            println!("t.text: {:?}", row.try_get::<_, String>(1));
+            println!("t2text: {:?}", row.try_get::<_, String>(2));
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
 
         Ok(())
     }

@@ -12,7 +12,7 @@ use sqlite3_parser::ast::{
     Cmd, ColumnConstraint, ColumnDefinition, CreateTableBody, Expr, Name, NamedTableConstraint,
     QualifiedName, SortedColumn, Stmt, TableConstraint, TableOptions, ToTokens,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Column {
@@ -96,16 +96,16 @@ pub struct Schema {
 
 impl Schema {
     pub fn constrain(&mut self) -> Result<(), ConstrainedSchemaError> {
-        self.tables.retain(|name, table| {
+        self.tables.retain(|name, _table| {
             !(name.contains("crsql") && name.contains("sqlite") && name.starts_with("__corro"))
         });
 
         for (tbl_name, table) in self.tables.iter() {
             // this should always be the case...
             if let CreateTableBody::ColumnsAndConstraints {
-                columns,
+                columns: _,
                 constraints,
-                options,
+                options: _,
             } = &table.raw
             {
                 if let Some(constraints) = constraints {
@@ -618,7 +618,7 @@ pub fn apply_schema(
 
 #[allow(clippy::result_large_err)]
 pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), SchemaError> {
-    debug!("parsing {sql}");
+    trace!("parsing {sql}");
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
 
     loop {
@@ -651,7 +651,7 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), SchemaE
                         tbl_name.name.0.clone(),
                         prepare_table(tbl_name, columns, constraints.as_ref(), options),
                     );
-                    debug!("inserted table: {}", tbl_name.name.0);
+                    trace!("inserted table: {}", tbl_name.name.0);
                 }
                 Stmt::CreateIndex {
                     unique,
@@ -739,7 +739,7 @@ fn prepare_table(
         columns: columns
             .iter()
             .map(|def| {
-                debug!("visiting column: {}", def.col_name.0);
+                trace!("visiting column: {}", def.col_name.0);
                 let default_value = def.constraints.iter().find_map(|named| {
                     if let ColumnConstraint::Default(ref expr) = named.constraint {
                         Some(expr.to_string())
