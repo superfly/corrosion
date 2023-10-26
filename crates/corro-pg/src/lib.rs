@@ -15,6 +15,7 @@ use corro_types::{
     broadcast::Timestamp,
     config::PgConfig,
     schema::{parse_sql, Schema, SchemaError, SqliteType, Table},
+    sqlite::SqlitePoolError,
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
@@ -37,6 +38,7 @@ use pgwire::{
 };
 use postgres_types::{FromSql, Type};
 use rusqlite::{named_params, types::ValueRef, vtab::eponymous_only_module, Connection, Statement};
+use spawn::spawn_counted;
 use sqlite3_parser::ast::{
     As, Cmd, CreateTableBody, Expr, FromClause, Id, InsertBody, Name, OneSelect, ResultColumn,
     Select, SelectTable, Stmt,
@@ -1666,6 +1668,17 @@ fn handle_commit(agent: &Agent, conn: &Connection, commit_stmt: &str) -> rusqlit
             ts,
         },
     );
+
+    drop(book_writer);
+
+    spawn_counted({
+        let agent = agent.clone();
+        async move {
+            let conn = agent.pool().read().await?;
+            block_in_place(|| agent.process_subs_by_db_version(&conn, db_version));
+            Ok::<_, SqlitePoolError>(())
+        }
+    });
 
     Ok(())
 }
