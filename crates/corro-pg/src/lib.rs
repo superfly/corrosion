@@ -26,7 +26,7 @@ use pgwire::{
     },
     error::{ErrorInfo, PgWireError},
     messages::{
-        data::{ParameterDescription, RowDescription},
+        data::{NoData, ParameterDescription, RowDescription},
         extendedquery::{BindComplete, CloseComplete, ParseComplete, PortalSuspended},
         response::{
             EmptyQueryResponse, ReadyForQuery, READY_STATUS_IDLE, READY_STATUS_TRANSACTION_BLOCK,
@@ -49,7 +49,7 @@ use tokio::{
     sync::mpsc::channel,
     task::block_in_place,
 };
-use tokio_util::codec::Framed;
+use tokio_util::{codec::Framed, sync::CancellationToken};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
@@ -78,28 +78,99 @@ impl From<(PgWireBackendMessage, bool)> for BackendResponse {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum StmtTag {
+    Select,
+    InsertAsSelect,
+
+    Insert,
+    Update,
+    Delete,
+
+    Alter,
+    Analyze,
+    Attach,
+    Begin,
+    Commit,
+    Create,
+    Detach,
+    Drop,
+    Pragma,
+    Reindex,
+    Release,
+    Rollback,
+    Savepoint,
+    Vacuum,
+
+    Other,
+}
+
+impl StmtTag {
+    fn returns_rows_affected(&self) -> bool {
+        matches!(self, StmtTag::Insert | StmtTag::Update | StmtTag::Delete)
+    }
+    fn returns_num_rows(&self) -> bool {
+        matches!(self, StmtTag::Select | StmtTag::InsertAsSelect)
+    }
+    pub fn tag(&self, rows: Option<usize>) -> Tag {
+        match self {
+            StmtTag::Select => Tag::new_for_execution("SELECT", rows),
+            StmtTag::InsertAsSelect | StmtTag::Insert => Tag::new_for_execution("INSERT", rows),
+            StmtTag::Update => Tag::new_for_execution("UPDATE", rows),
+            StmtTag::Delete => Tag::new_for_execution("DELETE", rows),
+            StmtTag::Alter => Tag::new_for_execution("ALTER", rows),
+            StmtTag::Analyze => Tag::new_for_execution("ANALYZE", rows),
+            StmtTag::Attach => Tag::new_for_execution("ATTACH", rows),
+            StmtTag::Begin => Tag::new_for_execution("BEGIN", rows),
+            StmtTag::Commit => Tag::new_for_execution("COMMIT", rows),
+            StmtTag::Create => Tag::new_for_execution("CREATE", rows),
+            StmtTag::Detach => Tag::new_for_execution("DETACH", rows),
+            StmtTag::Drop => Tag::new_for_execution("DROP", rows),
+            StmtTag::Pragma => Tag::new_for_execution("PRAGMA", rows),
+            StmtTag::Reindex => Tag::new_for_execution("REINDEX", rows),
+            StmtTag::Release => Tag::new_for_execution("RELEASE", rows),
+            StmtTag::Rollback => Tag::new_for_execution("ROLLBACK", rows),
+            StmtTag::Savepoint => Tag::new_for_execution("SAVEPOINT", rows),
+            StmtTag::Vacuum => Tag::new_for_execution("VACUUM", rows),
+            StmtTag::Other => Tag::new_for_execution("OK", rows),
+        }
+    }
+}
+
+enum Prepared {
+    Empty,
+    NonEmpty {
+        sql: String,
+        param_types: Vec<Type>,
+        fields: Vec<FieldInfo>,
+        tag: StmtTag,
+    },
+}
+
+enum Portal<'a> {
+    Empty {
+        stmt_name: CompactString,
+    },
+    Parsed {
+        stmt_name: CompactString,
+        stmt: Statement<'a>,
+        result_formats: Vec<FieldFormat>,
+        tag: StmtTag,
+    },
+}
+
+impl<'a> Portal<'a> {
+    fn stmt_name(&self) -> &str {
+        match self {
+            Portal::Empty { stmt_name } | Portal::Parsed { stmt_name, .. } => stmt_name.as_str(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ParsedCmd(Cmd);
 
 impl ParsedCmd {
-    pub fn returns_rows_affected(&self) -> bool {
-        matches!(
-            self.0,
-            Cmd::Stmt(Stmt::Insert { .. })
-                | Cmd::Stmt(Stmt::Update { .. })
-                | Cmd::Stmt(Stmt::Delete { .. })
-        )
-    }
-    pub fn returns_num_rows(&self) -> bool {
-        matches!(
-            self.0,
-            Cmd::Stmt(Stmt::Select(_))
-                | Cmd::Stmt(Stmt::CreateTable {
-                    body: CreateTableBody::AsSelect(_),
-                    ..
-                })
-        )
-    }
     pub fn is_begin(&self) -> bool {
         matches!(self.0, Cmd::Stmt(Stmt::Begin(_, _)))
     }
@@ -110,41 +181,41 @@ impl ParsedCmd {
         matches!(self.0, Cmd::Stmt(Stmt::Rollback { .. }))
     }
 
-    fn tag(&self, rows: Option<usize>) -> Tag {
+    fn tag(&self) -> StmtTag {
         match &self.0 {
             Cmd::Stmt(stmt) => match stmt {
-                Stmt::Select(_)
-                | Stmt::CreateTable {
+                Stmt::Select(_) => StmtTag::Select,
+                Stmt::CreateTable {
                     body: CreateTableBody::AsSelect(_),
                     ..
-                } => Tag::new_for_query(rows.unwrap_or_default()),
-                Stmt::AlterTable(_, _) => Tag::new_for_execution("ALTER", rows),
-                Stmt::Analyze(_) => Tag::new_for_execution("ANALYZE", rows),
-                Stmt::Attach { .. } => Tag::new_for_execution("ATTACH", rows),
-                Stmt::Begin(_, _) => Tag::new_for_execution("BEGIN", rows),
-                Stmt::Commit(_) => Tag::new_for_execution("COMMIT", rows),
+                } => StmtTag::InsertAsSelect,
+                Stmt::AlterTable(_, _) => StmtTag::Alter,
+                Stmt::Analyze(_) => StmtTag::Analyze,
+                Stmt::Attach { .. } => StmtTag::Attach,
+                Stmt::Begin(_, _) => StmtTag::Begin,
+                Stmt::Commit(_) => StmtTag::Commit,
                 Stmt::CreateIndex { .. }
                 | Stmt::CreateTable { .. }
                 | Stmt::CreateTrigger { .. }
                 | Stmt::CreateView { .. }
-                | Stmt::CreateVirtualTable { .. } => Tag::new_for_execution("CREATE", rows),
-                Stmt::Delete { .. } => Tag::new_for_execution("DELETE", rows),
-                Stmt::Detach(_) => Tag::new_for_execution("DETACH", rows),
+                | Stmt::CreateVirtualTable { .. } => StmtTag::Create,
+                Stmt::Delete { .. } => StmtTag::Delete,
+                Stmt::Detach(_) => StmtTag::Detach,
                 Stmt::DropIndex { .. }
                 | Stmt::DropTable { .. }
                 | Stmt::DropTrigger { .. }
-                | Stmt::DropView { .. } => Tag::new_for_execution("DROP", rows),
-                Stmt::Insert { .. } => Tag::new_for_execution("INSERT", rows),
-                Stmt::Pragma(_, _) => Tag::new_for_execution("PRAGMA", rows),
-                Stmt::Reindex { .. } => Tag::new_for_execution("REINDEX", rows),
-                Stmt::Release(_) => Tag::new_for_execution("RELEASE", rows),
-                Stmt::Rollback { .. } => Tag::new_for_execution("ROLLBACK", rows),
-                Stmt::Savepoint(_) => Tag::new_for_execution("SAVEPOINT", rows),
+                | Stmt::DropView { .. } => StmtTag::Drop,
+                Stmt::Insert { .. } => StmtTag::Insert,
+                Stmt::Pragma(_, _) => StmtTag::Pragma,
+                Stmt::Reindex { .. } => StmtTag::Reindex,
+                Stmt::Release(_) => StmtTag::Release,
+                Stmt::Rollback { .. } => StmtTag::Rollback,
+                Stmt::Savepoint(_) => StmtTag::Savepoint,
 
-                Stmt::Update { .. } => Tag::new_for_execution("UPDATE", rows),
-                Stmt::Vacuum(_, _) => Tag::new_for_execution("VACUUM", rows),
+                Stmt::Update { .. } => StmtTag::Update,
+                Stmt::Vacuum(_, _) => StmtTag::Vacuum,
             },
-            _ => Tag::new_for_execution("OK", rows),
+            _ => StmtTag::Other,
         }
     }
 }
@@ -241,7 +312,7 @@ pub async fn start(
             tokio::spawn(async move {
                 conn.set_nodelay(true)?;
                 let ssl = peek_for_sslrequest(&mut conn, false).await?;
-                println!("SSL? {ssl}");
+                trace!("SSL? {ssl}");
 
                 let mut framed = Framed::new(
                     conn,
@@ -249,7 +320,7 @@ pub async fn start(
                 );
 
                 let msg = framed.next().await.unwrap()?;
-                println!("msg: {msg:?}");
+                trace!("msg: {msg:?}");
 
                 match msg {
                     PgWireFrontendMessage::Startup(startup) => {
@@ -293,18 +364,26 @@ pub async fn start(
 
                 framed.flush().await?;
 
-                println!("sent auth ok and ReadyForQuery");
+                trace!("sent auth ok and ReadyForQuery");
 
                 let (front_tx, mut front_rx) = channel(1024);
                 let (back_tx, mut back_rx) = channel(1024);
 
                 let (mut sink, mut stream) = framed.split();
 
+                let conn = agent.pool().client_dedicated().unwrap();
+                trace!("opened connection");
+
+                let cancel = CancellationToken::new();
+
                 tokio::spawn({
                     let back_tx = back_tx.clone();
+                    let cancel = cancel.clone();
                     async move {
+                        // cancel stuff if this loop breaks
+                        let _drop_guard = cancel.drop_guard();
+
                         while let Some(decode_res) = stream.next().await {
-                            println!("decode_res: {decode_res:?}");
                             let msg = match decode_res {
                                 Ok(msg) => msg,
                                 Err(PgWireError::IoError(io_error)) => {
@@ -312,6 +391,7 @@ pub async fn start(
                                     break;
                                 }
                                 Err(e) => {
+                                    warn!("could not receive pg frontend message: {e}");
                                     // attempt to send this...
                                     _ = back_tx.try_send(
                                         (
@@ -333,33 +413,42 @@ pub async fn start(
 
                             front_tx.send(msg).await?;
                         }
+                        debug!("frontend stream is done");
 
                         Ok::<_, BoxError>(())
                     }
                 });
 
-                tokio::spawn(async move {
-                    while let Some(back) = back_rx.recv().await {
-                        match back {
-                            BackendResponse::Message { message, flush } => {
-                                println!("sending: {message:?}");
-                                sink.feed(message).await?;
-                                if flush {
+                tokio::spawn({
+                    let cancel = cancel.clone();
+                    async move {
+                        let _drop_guard = cancel.drop_guard();
+                        while let Some(back) = back_rx.recv().await {
+                            match back {
+                                BackendResponse::Message { message, flush } => {
+                                    debug!("sending: {message:?}");
+                                    sink.feed(message).await?;
+                                    if flush {
+                                        sink.flush().await?;
+                                    }
+                                }
+                                BackendResponse::Flush => {
                                     sink.flush().await?;
                                 }
                             }
-                            BackendResponse::Flush => {
-                                sink.flush().await?;
-                            }
                         }
+                        debug!("backend stream is done");
+                        Ok::<_, std::io::Error>(())
                     }
-                    Ok::<_, std::io::Error>(())
+                });
+
+                let int_handle = conn.get_interrupt_handle();
+                tokio::spawn(async move {
+                    cancel.cancelled().await;
+                    int_handle.interrupt();
                 });
 
                 block_in_place(|| {
-                    let conn = agent.pool().client_dedicated().unwrap();
-                    println!("opened connection");
-
                     conn.create_module("pg_type", eponymous_only_module::<PgTypeTable>(), None)?;
                     conn.create_module("pg_range", eponymous_only_module::<PgRangeTable>(), None)?;
 
@@ -385,25 +474,14 @@ pub async fn start(
                         }
                     };
 
-                    let mut prepared: HashMap<
-                        CompactString,
-                        (String, Option<ParsedCmd>, Statement, Vec<Type>),
-                    > = HashMap::new();
+                    let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
 
-                    let mut portals: HashMap<
-                        CompactString,
-                        (
-                            CompactString,
-                            Option<ParsedCmd>,
-                            Statement,
-                            Vec<FieldFormat>,
-                        ),
-                    > = HashMap::new();
+                    let mut portals: HashMap<CompactString, Portal> = HashMap::new();
 
                     let mut open_tx = None;
 
                     'outer: while let Some(msg) = front_rx.blocking_recv() {
-                        println!("msg: {msg:?}");
+                        debug!("msg: {msg:?}");
 
                         match msg {
                             PgWireFrontendMessage::Startup(_) => {
@@ -424,6 +502,7 @@ pub async fn start(
                                 continue;
                             }
                             PgWireFrontendMessage::Parse(parse) => {
+                                let name: &str = parse.name().as_deref().unwrap_or("");
                                 let mut cmds = match parse_query(parse.query()) {
                                     Ok(cmds) => cmds,
                                     Err(e) => {
@@ -445,66 +524,113 @@ pub async fn start(
                                     }
                                 };
 
-                                let parsed_cmd = match cmds.pop_front() {
-                                    Some(cmd) => cmd,
+                                match cmds.pop_front() {
                                     None => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        sql_state::SqlState::PROTOCOL_VIOLATION
-                                                            .code()
-                                                            .into(),
-                                                        "only 1 command per Parse is allowed"
-                                                            .into(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        continue;
+                                        prepared.insert(name.into(), Prepared::Empty);
                                     }
-                                };
-
-                                println!("parsed cmd: {parsed_cmd:?}");
-
-                                let prepped = match conn.prepare(parse.query()) {
-                                    Ok(prepped) => prepped,
-                                    Err(e) => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
+                                    Some(parsed_cmd) => {
+                                        if !cmds.is_empty() {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".to_owned(),
+                                                            sql_state::SqlState::PROTOCOL_VIOLATION
+                                                                .code()
+                                                                .into(),
+                                                            "only 1 command per Parse is allowed"
+                                                                .into(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
                                                     .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        continue;
-                                    }
-                                };
+                                            )?;
+                                            continue;
+                                        }
 
-                                prepared.insert(
-                                    parse.name().as_deref().unwrap_or("").into(),
-                                    (
-                                        parse.query().clone(),
-                                        Some(parsed_cmd),
-                                        prepped,
-                                        parse
+                                        trace!("parsed cmd: {parsed_cmd:#?}");
+
+                                        let prepped = match conn.prepare(parse.query()) {
+                                            Ok(prepped) => prepped,
+                                            Err(e) => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::ErrorResponse(
+                                                            ErrorInfo::new(
+                                                                "ERROR".to_owned(),
+                                                                "XX000".to_owned(),
+                                                                e.to_string(),
+                                                            )
+                                                            .into(),
+                                                        ),
+                                                        true,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                                continue;
+                                            }
+                                        };
+
+                                        let mut param_types: Vec<Type> = parse
                                             .type_oids()
                                             .iter()
                                             .filter_map(|oid| Type::from_oid(*oid))
-                                            .collect(),
-                                    ),
-                                );
+                                            .collect();
+
+                                        if param_types.len() != prepped.parameter_count() {
+                                            param_types = parameter_types(&schema, &parsed_cmd.0)
+                                                .into_iter()
+                                                .map(|param| match param {
+                                                    SqliteType::Null => unreachable!(),
+                                                    SqliteType::Integer => Type::INT8,
+                                                    SqliteType::Real => Type::FLOAT8,
+                                                    SqliteType::Text => Type::TEXT,
+                                                    SqliteType::Blob => Type::BYTEA,
+                                                })
+                                                .collect();
+                                        }
+
+                                        let mut fields = vec![];
+                                        for col in prepped.columns() {
+                                            let col_type = match name_to_type(
+                                                col.decl_type().unwrap_or("text"),
+                                            ) {
+                                                Ok(t) => t,
+                                                Err(e) => {
+                                                    back_tx.blocking_send(
+                                                        (
+                                                            PgWireBackendMessage::ErrorResponse(
+                                                                e.into(),
+                                                            ),
+                                                            true,
+                                                        )
+                                                            .into(),
+                                                    )?;
+                                                    continue 'outer;
+                                                }
+                                            };
+                                            fields.push(FieldInfo::new(
+                                                col.name().to_string(),
+                                                None,
+                                                None,
+                                                col_type,
+                                                FieldFormat::Text,
+                                            ));
+                                        }
+
+                                        prepared.insert(
+                                            name.into(),
+                                            Prepared::NonEmpty {
+                                                sql: parse.query().clone(),
+                                                param_types,
+                                                fields,
+                                                tag: parsed_cmd.tag(),
+                                            },
+                                        );
+                                    }
+                                }
 
                                 back_tx.blocking_send(
                                     (
@@ -518,77 +644,51 @@ pub async fn start(
                                 let name = desc.name().as_deref().unwrap_or("");
                                 match desc.target_type() {
                                     // statement
-                                    b'S' => {
-                                        if let Some((_, cmd, prepped, param_types)) =
-                                            prepared.get(name)
-                                        {
-                                            let mut oids = vec![];
-                                            let mut fields = vec![];
-                                            for col in prepped.columns() {
-                                                let col_type =
-                                                    match name_to_type(
-                                                        col.decl_type().unwrap_or("text"),
-                                                    ) {
-                                                        Ok(t) => t,
-                                                        Err(e) => {
-                                                            back_tx.blocking_send((
-                                                            PgWireBackendMessage::ErrorResponse(
-                                                                e.into(),
-                                                            ),
-                                                            true,
-                                                        ).into())?;
-                                                            continue 'outer;
-                                                        }
-                                                    };
-                                                fields.push(FieldInfo::new(
-                                                    col.name().to_string(),
-                                                    None,
-                                                    None,
-                                                    col_type,
-                                                    FieldFormat::Text,
-                                                ));
-                                            }
-
-                                            if param_types.len() != prepped.parameter_count() {
-                                                if let Some(ParsedCmd(Cmd::Stmt(stmt))) = &cmd {
-                                                    let params = parameter_types(&schema, stmt);
-                                                    println!("GOT PARAMS TO OVERRIDE: {params:?}");
-                                                    for param in params {
-                                                        oids.push(match param {
-                                                            SqliteType::Null => unreachable!(),
-                                                            SqliteType::Integer => Type::INT8.oid(),
-                                                            SqliteType::Real => Type::FLOAT8.oid(),
-                                                            SqliteType::Text => Type::TEXT.oid(),
-                                                            SqliteType::Blob => Type::BYTEA.oid(),
-                                                        })
-                                                    }
-                                                }
-                                            } else {
-                                                for param in 0..prepped.parameter_count() {
-                                                    // if let Some(t) = param_types.get(param) {
-                                                    //     oids.push(t.oid());
-                                                    // }
-                                                    oids.push(
-                                                        param_types
-                                                            .get(param)
-                                                            .map(|t| t.oid())
-                                                            // this should not happen...
-                                                            .unwrap_or(Type::TEXT.oid()),
-                                                    );
-                                                }
-                                            }
-
-                                            if !oids.is_empty() {
-                                                back_tx.blocking_send(
-                                                    (
-                                                        PgWireBackendMessage::ParameterDescription(
-                                                            ParameterDescription::new(oids),
-                                                        ),
-                                                        false,
-                                                    )
+                                    b'S' => match prepared.get(name) {
+                                        None => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".into(),
+                                                            "XX000".into(),
+                                                            "statement not found".into(),
+                                                        )
                                                         .into(),
-                                                )?;
-                                            }
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                        }
+                                        Some(Prepared::Empty) => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::NoData(NoData::new()),
+                                                    false,
+                                                )
+                                                    .into(),
+                                            )?;
+                                        }
+                                        Some(Prepared::NonEmpty {
+                                            param_types,
+                                            fields,
+                                            ..
+                                        }) => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ParameterDescription(
+                                                        ParameterDescription::new(
+                                                            param_types
+                                                                .iter()
+                                                                .map(|t| t.oid())
+                                                                .collect(),
+                                                        ),
+                                                    ),
+                                                    false,
+                                                )
+                                                    .into(),
+                                            )?;
 
                                             back_tx.blocking_send(
                                                 (
@@ -601,33 +701,43 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            continue;
                                         }
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".into(),
-                                                        "XX000".into(),
-                                                        "statement not found".into(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                    }
+                                    },
                                     // portal
-                                    b'P' => {
-                                        if let Some((_, _, prepped, result_formats)) =
-                                            portals.get(name)
-                                        {
+                                    b'P' => match portals.get(name) {
+                                        None => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".into(),
+                                                            "XX000".into(),
+                                                            "portal not found".into(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                        }
+                                        Some(Portal::Empty { .. }) => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::NoData(NoData::new()),
+                                                    false,
+                                                )
+                                                    .into(),
+                                            )?;
+                                        }
+                                        Some(Portal::Parsed {
+                                            stmt,
+                                            result_formats,
+                                            ..
+                                        }) => {
                                             let mut oids = vec![];
                                             let mut fields = vec![];
-                                            for (i, col) in
-                                                prepped.columns().into_iter().enumerate()
-                                            {
+                                            for (i, col) in stmt.columns().into_iter().enumerate() {
                                                 let col_type =
                                                     match name_to_type(
                                                         col.decl_type().unwrap_or("text"),
@@ -666,23 +776,8 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            continue;
                                         }
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".into(),
-                                                        "XX000".into(),
-                                                        "portal not found".into(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                    }
+                                    },
                                     _ => {
                                         back_tx.blocking_send(
                                             (
@@ -711,7 +806,7 @@ pub async fn start(
 
                                 let stmt_name = bind.statement_name().as_deref().unwrap_or("");
 
-                                let (sql, query, _, param_types) = match prepared.get(stmt_name) {
+                                match prepared.get(stmt_name) {
                                     None => {
                                         back_tx.blocking_send(
                                             (
@@ -729,80 +824,23 @@ pub async fn start(
                                         )?;
                                         continue;
                                     }
-                                    Some(stmt) => stmt,
-                                };
-
-                                let mut prepped = match conn.prepare(sql) {
-                                    Ok(prepped) => prepped,
-                                    Err(e) => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        continue;
+                                    Some(Prepared::Empty) => {
+                                        portals.insert(
+                                            portal_name,
+                                            Portal::Empty {
+                                                stmt_name: stmt_name.into(),
+                                            },
+                                        );
                                     }
-                                };
-
-                                let param_types = if bind.parameters().len() != param_types.len() {
-                                    if let Some(ParsedCmd(Cmd::Stmt(stmt))) = &query {
-                                        let params = parameter_types(&schema, stmt);
-                                        println!("computed params: {params:?}",);
-                                        params
-                                            .iter()
-                                            .map(|param| match param {
-                                                SqliteType::Null => unreachable!(),
-                                                SqliteType::Integer => Type::INT8,
-                                                SqliteType::Real => Type::FLOAT8,
-                                                SqliteType::Text => Type::TEXT,
-                                                SqliteType::Blob => Type::BYTEA,
-                                            })
-                                            .collect()
-                                    } else {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        "could not determine parameter type".into(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        continue 'outer;
-                                    }
-                                } else {
-                                    param_types.clone()
-                                };
-
-                                println!("CMD: {query:?}");
-                                if bind.parameters().len() != param_types.len() {
-                                    if let Some(ParsedCmd(Cmd::Stmt(stmt))) = &query {
-                                        let params = parameter_types(&schema, stmt);
-                                        println!("computed params: {params:?}",);
-                                    }
-                                }
-
-                                for (i, param) in bind.parameters().iter().enumerate() {
-                                    let idx = i + 1;
-                                    let b = match param {
-                                        None => {
-                                            if let Err(e) = prepped
-                                                .raw_bind_parameter(idx, rusqlite::types::Null)
-                                            {
+                                    Some(Prepared::NonEmpty {
+                                        sql,
+                                        param_types,
+                                        tag,
+                                        ..
+                                    }) => {
+                                        let mut prepped = match conn.prepare(sql) {
+                                            Ok(prepped) => prepped,
+                                            Err(e) => {
                                                 back_tx.blocking_send(
                                                     (
                                                         PgWireBackendMessage::ErrorResponse(
@@ -817,109 +855,181 @@ pub async fn start(
                                                     )
                                                         .into(),
                                                 )?;
-                                                continue 'outer;
+                                                continue;
                                             }
-                                            continue;
-                                        }
-                                        Some(b) => b,
-                                    };
+                                        };
 
-                                    match param_types.get(i) {
-                                        None => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "ERROR".to_owned(),
-                                                            "XX000".to_owned(),
-                                                            "missing parameter type".into(),
-                                                        )
-                                                        .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-                                            continue 'outer;
-                                        }
-                                        Some(param_type) => match param_type {
-                                            &Type::BOOL => {
-                                                let value: bool =
-                                                    FromSql::from_sql(param_type, b.as_ref())?;
-                                                prepped.raw_bind_parameter(idx, value)?;
-                                            }
-                                            &Type::INT2 => {
-                                                let value: i16 =
-                                                    FromSql::from_sql(param_type, b.as_ref())?;
-                                                prepped.raw_bind_parameter(idx, value)?;
-                                            }
-                                            &Type::INT4 => {
-                                                let value: i32 =
-                                                    FromSql::from_sql(param_type, b.as_ref())?;
-                                                prepped.raw_bind_parameter(idx, value)?;
-                                            }
-                                            &Type::INT8 => {
-                                                let value: i64 =
-                                                    FromSql::from_sql(param_type, b.as_ref())?;
-                                                prepped.raw_bind_parameter(idx, value)?;
-                                            }
-                                            &Type::TEXT | &Type::VARCHAR => {
-                                                let value: &str =
-                                                    FromSql::from_sql(param_type, b.as_ref())?;
-                                                prepped.raw_bind_parameter(idx, value)?;
-                                            }
-                                            &Type::FLOAT4 => {
-                                                let value: f32 =
-                                                    FromSql::from_sql(param_type, b.as_ref())?;
-                                                prepped.raw_bind_parameter(idx, value)?;
-                                            }
-                                            &Type::FLOAT8 => {
-                                                let value: f64 =
-                                                    FromSql::from_sql(param_type, b.as_ref())?;
-                                                prepped.raw_bind_parameter(idx, value)?;
-                                            }
-                                            &Type::BYTEA => {
-                                                let value: &[u8] =
-                                                    FromSql::from_sql(param_type, b.as_ref())?;
-                                                prepped.raw_bind_parameter(idx, value)?;
-                                            }
-                                            t => {
-                                                warn!("unsupported type: {t:?}");
-                                                back_tx.blocking_send(
-                                                    (
-                                                        PgWireBackendMessage::ErrorResponse(
-                                                            ErrorInfo::new(
-                                                                "ERROR".to_owned(),
-                                                                "XX000".to_owned(),
-                                                                format!(
-                                                                "unsupported type {t} at index {i}"
-                                                            ),
+                                        trace!(
+                                            "bind params count: {}, statement params count: {}",
+                                            bind.parameters().len(),
+                                            prepped.parameter_count()
+                                        );
+
+                                        for (i, param) in bind.parameters().iter().enumerate() {
+                                            let idx = i + 1;
+                                            let b = match param {
+                                                None => {
+                                                    trace!("binding idx {idx} w/ NULL");
+                                                    if let Err(e) = prepped.raw_bind_parameter(
+                                                        idx,
+                                                        rusqlite::types::Null,
+                                                    ) {
+                                                        back_tx.blocking_send(
+                                                            (
+                                                                PgWireBackendMessage::ErrorResponse(
+                                                                    ErrorInfo::new(
+                                                                        "ERROR".to_owned(),
+                                                                        "XX000".to_owned(),
+                                                                        e.to_string(),
+                                                                    )
+                                                                    .into(),
+                                                                ),
+                                                                true,
                                                             )
+                                                                .into(),
+                                                        )?;
+                                                        continue 'outer;
+                                                    }
+                                                    continue;
+                                                }
+                                                Some(b) => b,
+                                            };
+
+                                            match param_types.get(i) {
+                                                None => {
+                                                    back_tx.blocking_send(
+                                                        (
+                                                            PgWireBackendMessage::ErrorResponse(
+                                                                ErrorInfo::new(
+                                                                    "ERROR".to_owned(),
+                                                                    "XX000".to_owned(),
+                                                                    "missing parameter type".into(),
+                                                                )
+                                                                .into(),
+                                                            ),
+                                                            true,
+                                                        )
                                                             .into(),
-                                                        ),
-                                                        true,
-                                                    )
-                                                        .into(),
-                                                )?;
-                                                continue 'outer;
+                                                    )?;
+                                                    continue 'outer;
+                                                }
+                                                Some(param_type) => {
+                                                    match param_type {
+                                                        &Type::BOOL => {
+                                                            let value: bool = FromSql::from_sql(
+                                                                param_type,
+                                                                b.as_ref(),
+                                                            )?;
+                                                            trace!("binding idx {idx} w/ value: {value}");
+                                                            prepped
+                                                                .raw_bind_parameter(idx, value)?;
+                                                        }
+                                                        &Type::INT2 => {
+                                                            let value: i16 = FromSql::from_sql(
+                                                                param_type,
+                                                                b.as_ref(),
+                                                            )?;
+                                                            trace!("binding idx {idx} w/ value: {value}");
+                                                            prepped
+                                                                .raw_bind_parameter(idx, value)?;
+                                                        }
+                                                        &Type::INT4 => {
+                                                            let value: i32 = FromSql::from_sql(
+                                                                param_type,
+                                                                b.as_ref(),
+                                                            )?;
+                                                            trace!("binding idx {idx} w/ value: {value}");
+                                                            prepped
+                                                                .raw_bind_parameter(idx, value)?;
+                                                        }
+                                                        &Type::INT8 => {
+                                                            let value: i64 = FromSql::from_sql(
+                                                                param_type,
+                                                                b.as_ref(),
+                                                            )?;
+                                                            trace!("binding idx {idx} w/ value: {value}");
+                                                            prepped
+                                                                .raw_bind_parameter(idx, value)?;
+                                                        }
+                                                        &Type::TEXT | &Type::VARCHAR => {
+                                                            let value: &str = FromSql::from_sql(
+                                                                param_type,
+                                                                b.as_ref(),
+                                                            )?;
+                                                            trace!("binding idx {idx} w/ value: {value}");
+                                                            prepped
+                                                                .raw_bind_parameter(idx, value)?;
+                                                        }
+                                                        &Type::FLOAT4 => {
+                                                            let value: f32 = FromSql::from_sql(
+                                                                param_type,
+                                                                b.as_ref(),
+                                                            )?;
+                                                            trace!("binding idx {idx} w/ value: {value}");
+                                                            prepped
+                                                                .raw_bind_parameter(idx, value)?;
+                                                        }
+                                                        &Type::FLOAT8 => {
+                                                            let value: f64 = FromSql::from_sql(
+                                                                param_type,
+                                                                b.as_ref(),
+                                                            )?;
+                                                            trace!("binding idx {idx} w/ value: {value}");
+                                                            prepped
+                                                                .raw_bind_parameter(idx, value)?;
+                                                        }
+                                                        &Type::BYTEA => {
+                                                            let value: &[u8] = FromSql::from_sql(
+                                                                param_type,
+                                                                b.as_ref(),
+                                                            )?;
+                                                            trace!("binding idx {idx} w/ value: {value:?}");
+                                                            prepped
+                                                                .raw_bind_parameter(idx, value)?;
+                                                        }
+                                                        t => {
+                                                            warn!("unsupported type: {t:?}");
+                                                            back_tx.blocking_send(
+                                                            (
+                                                                PgWireBackendMessage::ErrorResponse(
+                                                                    ErrorInfo::new(
+                                                                        "ERROR".to_owned(),
+                                                                        "XX000".to_owned(),
+                                                                        format!(
+                                                                        "unsupported type {t} at index {i}"
+                                                                    ),
+                                                                    )
+                                                                    .into(),
+                                                                ),
+                                                                true,
+                                                            )
+                                                                .into(),
+                                                        )?;
+                                                            continue 'outer;
+                                                        }
+                                                    }
+                                                }
                                             }
-                                        },
+                                        }
+
+                                        debug!("EXPANDED SQL: {:?}", prepped.expanded_sql());
+
+                                        portals.insert(
+                                            portal_name,
+                                            Portal::Parsed {
+                                                stmt_name: stmt_name.into(),
+                                                stmt: prepped,
+                                                result_formats: bind
+                                                    .result_column_format_codes()
+                                                    .iter()
+                                                    .copied()
+                                                    .map(FieldFormat::from)
+                                                    .collect(),
+                                                tag: *tag,
+                                            },
+                                        );
                                     }
                                 }
-
-                                portals.insert(
-                                    portal_name,
-                                    (
-                                        stmt_name.into(),
-                                        query.clone(),
-                                        prepped,
-                                        bind.result_column_format_codes()
-                                            .iter()
-                                            .copied()
-                                            .map(FieldFormat::from)
-                                            .collect(),
-                                    ),
-                                );
 
                                 back_tx.blocking_send(
                                     (
@@ -947,42 +1057,48 @@ pub async fn start(
                             }
                             PgWireFrontendMessage::Execute(execute) => {
                                 let name = execute.name().as_deref().unwrap_or("");
-                                let (parsed_cmd, prepped, result_formats) =
-                                    match portals.get_mut(name) {
-                                        Some((_, Some(parsed_cmd), prepped, result_formats)) => {
-                                            (parsed_cmd, prepped, result_formats)
-                                        }
-                                        Some((_, None, _, _)) => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::EmptyQueryResponse(
-                                                        EmptyQueryResponse::new(),
-                                                    ),
-                                                    false,
-                                                )
+                                let (prepped, result_formats, tag) = match portals.get_mut(name) {
+                                    Some(Portal::Empty { .. }) => {
+                                        trace!("empty portal");
+                                        back_tx.blocking_send(
+                                            (
+                                                PgWireBackendMessage::EmptyQueryResponse(
+                                                    EmptyQueryResponse::new(),
+                                                ),
+                                                false,
+                                            )
+                                                .into(),
+                                        )?;
+                                        continue;
+                                    }
+                                    Some(Portal::Parsed {
+                                        stmt,
+                                        result_formats,
+                                        tag,
+                                        ..
+                                    }) => (stmt, result_formats, tag),
+                                    None => {
+                                        back_tx.blocking_send(
+                                            (
+                                                PgWireBackendMessage::ErrorResponse(
+                                                    ErrorInfo::new(
+                                                        "ERROR".into(),
+                                                        "XX000".into(),
+                                                        "portal not found".into(),
+                                                    )
                                                     .into(),
-                                            )?;
-                                            continue;
-                                        }
-                                        None => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "ERROR".into(),
-                                                            "XX000".into(),
-                                                            "portal not found".into(),
-                                                        )
-                                                        .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-                                            continue;
-                                        }
-                                    };
+                                                ),
+                                                true,
+                                            )
+                                                .into(),
+                                        )?;
+                                        continue;
+                                    }
+                                };
 
+                                trace!("non-empty portal!");
+
+                                // TODO: maybe we don't need to recompute this...
                                 let mut fields = vec![];
                                 for (i, col) in prepped.columns().into_iter().enumerate() {
                                     let col_type =
@@ -1010,6 +1126,8 @@ pub async fn start(
                                     ));
                                 }
 
+                                trace!("fields: {fields:?}");
+
                                 let schema = Arc::new(fields);
 
                                 let mut rows = prepped.raw_query();
@@ -1023,8 +1141,11 @@ pub async fn start(
                                 };
                                 let mut count = 0;
 
+                                trace!("starting loop");
+
                                 loop {
                                     if count >= max_rows {
+                                        trace!("attained max rows");
                                         // forget the Rows iterator here so as to not reset the statement!
                                         std::mem::forget(rows);
                                         back_tx.blocking_send(
@@ -1039,9 +1160,12 @@ pub async fn start(
                                         continue 'outer;
                                     }
                                     let row = match rows.next() {
-                                        Ok(Some(row)) => row,
+                                        Ok(Some(row)) => {
+                                            trace!("got a row: {row:?}");
+                                            row
+                                        }
                                         Ok(None) => {
-                                            println!("done w/ rows");
+                                            trace!("done w/ rows");
                                             break;
                                         }
                                         Err(e) => {
@@ -1115,12 +1239,14 @@ pub async fn start(
                                     }
                                 }
 
-                                let tag = if parsed_cmd.returns_num_rows() {
-                                    parsed_cmd.tag(Some(count))
-                                } else if parsed_cmd.returns_rows_affected() {
-                                    parsed_cmd.tag(Some(conn.changes() as usize))
+                                trace!("done w/ rows, computing tag: {tag:?}");
+
+                                let tag = if tag.returns_num_rows() {
+                                    tag.tag(Some(count))
+                                } else if tag.returns_rows_affected() {
+                                    tag.tag(Some(conn.changes() as usize))
                                 } else {
-                                    parsed_cmd.tag(None)
+                                    tag.tag(None)
                                 };
 
                                 // done!
@@ -1197,13 +1323,13 @@ pub async fn start(
                                             )?;
                                             continue;
                                         }
-                                        println!("started IMPLICIT tx");
+                                        trace!("started IMPLICIT tx");
                                         open_tx = Some(OpenTx::Implicit);
                                     }
 
                                     // close the current implement tx first
                                     if matches!(open_tx, Some(OpenTx::Implicit)) && cmd.is_begin() {
-                                        println!("committing IMPLICIT tx");
+                                        trace!("committing IMPLICIT tx");
                                         open_tx = None;
 
                                         if let Err(e) = handle_commit(&agent, &conn, "COMMIT") {
@@ -1224,7 +1350,7 @@ pub async fn start(
 
                                             continue 'outer;
                                         }
-                                        println!("committed IMPLICIT tx");
+                                        trace!("committed IMPLICIT tx");
                                     }
 
                                     let count = if cmd.is_commit() {
@@ -1379,12 +1505,14 @@ pub async fn start(
                                         Some(count)
                                     };
 
-                                    let tag = if cmd.returns_num_rows() {
-                                        cmd.tag(count)
-                                    } else if cmd.returns_rows_affected() {
-                                        cmd.tag(Some(conn.changes() as usize))
+                                    let tag = cmd.tag();
+
+                                    let tag = if tag.returns_num_rows() {
+                                        tag.tag(count)
+                                    } else if tag.returns_rows_affected() {
+                                        tag.tag(Some(conn.changes() as usize))
                                     } else {
-                                        cmd.tag(None)
+                                        tag.tag(None)
                                     };
 
                                     back_tx.blocking_send(
@@ -1393,11 +1521,11 @@ pub async fn start(
                                     )?;
 
                                     if cmd.is_begin() {
-                                        println!("setting EXPLICIT tx");
+                                        trace!("setting EXPLICIT tx");
                                         // explicit tx
                                         open_tx = Some(OpenTx::Explicit)
                                     } else if cmd.is_rollback() || cmd.is_commit() {
-                                        println!("clearing current open tx");
+                                        trace!("clearing current open tx");
                                         // if this was a rollback, remove the current open tx
                                         open_tx = None;
                                     }
@@ -1405,7 +1533,7 @@ pub async fn start(
 
                                 // automatically commit an implicit tx
                                 if matches!(open_tx, Some(OpenTx::Implicit)) {
-                                    println!("committing IMPLICIT tx");
+                                    trace!("committing IMPLICIT tx");
                                     open_tx = None;
 
                                     if let Err(e) = handle_commit(&agent, &conn, "COMMIT") {
@@ -1425,7 +1553,7 @@ pub async fn start(
                                         )?;
                                         continue;
                                     }
-                                    println!("committed IMPLICIT tx");
+                                    trace!("committed IMPLICIT tx");
                                 }
 
                                 let ready_status = if open_tx.is_some() {
@@ -1466,9 +1594,7 @@ pub async fn start(
                                     // statement
                                     b'S' => {
                                         if prepared.remove(name).is_some() {
-                                            portals.retain(|_, (stmt_name, _, _, _)| {
-                                                stmt_name.as_str() != name
-                                            });
+                                            portals.retain(|_, portal| portal.stmt_name() != name);
                                         }
                                         back_tx.blocking_send(
                                             (
@@ -1830,16 +1956,16 @@ fn extract_param(
                     SqliteName::Name(_) => {}
                     SqliteName::Qualified(tbl_name, col_name)
                     | SqliteName::DoublyQualified(_, tbl_name, col_name) => {
-                        println!("looking tbl {} for col {}", tbl_name.0, col_name.0);
+                        trace!("looking tbl {} for col {}", tbl_name.0, col_name.0);
                         if let Some(table) = tables.get(&tbl_name.0) {
-                            println!("found table! {}", table.name);
-                            if let Ok(unquoted) = enquote::unquote(&col_name.0) {
-                                println!("unquoted column as: {unquoted}");
-                                if let Some(col) = table.columns.get(&unquoted) {
-                                    params.push(col.sql_type);
-                                }
-                            } else if let Some(col) = table.columns.get(&col_name.0) {
-                                println!("could not unquote, using original");
+                            trace!("found table! {}", table.name);
+                            let col_name = if col_name.0.starts_with('"') {
+                                rem_first_and_last(&col_name.0)
+                            } else {
+                                &col_name.0
+                            };
+
+                            if let Some(col) = table.columns.get(col_name) {
                                 params.push(col.sql_type);
                             }
                         }
@@ -1891,7 +2017,7 @@ fn extract_param(
             if let Some(rhs) = rhs {
                 for expr in rhs.iter() {
                     if let Some(name) = handle_lhs_rhs(lhs, expr) {
-                        println!("HANDLED LHS RHS: {name:?}");
+                        trace!("HANDLED LHS RHS: {name:?}");
                         match name {
                             // not aliased!
                             SqliteName::Id(id) => {
@@ -1983,8 +2109,15 @@ fn extract_param(
     }
 }
 
+fn rem_first_and_last(value: &str) -> &str {
+    let mut chars = value.chars();
+    chars.next();
+    chars.next_back();
+    chars.as_str()
+}
+
 fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>) {
-    match &select.body.select {
+    let tables = match &select.body.select {
         OneSelect::Select {
             columns,
             from,
@@ -1993,13 +2126,16 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
             group_by: _,
             window_clause: _,
         } => {
-            if let Some(from) = from {
+            let tables = if let Some(from) = from {
                 let tables = handle_from(schema, from, params);
                 if let Some(where_clause) = where_clause {
-                    println!("WHERE CLAUSE: {where_clause:?}");
+                    trace!("WHERE CLAUSE: {where_clause:?}");
                     extract_param(schema, where_clause, &tables, params);
                 }
-            }
+                tables
+            } else {
+                HashMap::new()
+            };
             for col in columns.iter() {
                 if let ResultColumn::Expr(expr, _) = col {
                     // TODO: check against table if we can...
@@ -2008,6 +2144,7 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
                     }
                 }
             }
+            tables
         }
         OneSelect::Values(values_values) => {
             for values in values_values.iter() {
@@ -2016,6 +2153,23 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
                         params.push(SqliteType::Text);
                     }
                 }
+            }
+            HashMap::new()
+        }
+    };
+    if let Some(limit) = &select.limit {
+        if is_param(&limit.expr) {
+            trace!("limit was a param (variable), pushing Integer type");
+            params.push(SqliteType::Integer);
+        } else {
+            extract_param(schema, &limit.expr, &tables, params);
+        }
+        if let Some(offset) = &limit.offset {
+            if is_param(offset) {
+                trace!("offset was a param (variable), pushing Integer type");
+                params.push(SqliteType::Integer);
+            } else {
+                extract_param(schema, offset, &tables, params);
             }
         }
     }
@@ -2030,13 +2184,13 @@ fn handle_from<'a>(
     if let Some(select) = from.select.as_deref() {
         match select {
             SelectTable::Table(qname, maybe_alias, _) => {
-                let maybe_table = if let Ok(unquoted) = enquote::unquote(&qname.name.0) {
-                    schema.tables.get(&unquoted)
+                let actual_tbl_name = if qname.name.0.starts_with('"') {
+                    rem_first_and_last(&qname.name.0)
                 } else {
-                    schema.tables.get(&qname.name.0)
+                    &qname.name.0
                 };
 
-                if let Some(table) = maybe_table {
+                if let Some(table) = schema.tables.get(actual_tbl_name) {
                     if let Some(alias) = maybe_alias {
                         let alias = match alias {
                             As::As(name) | As::Elided(name) => name.0.clone(),
@@ -2058,13 +2212,13 @@ fn handle_from<'a>(
         for join in joins.iter() {
             match &join.table {
                 SelectTable::Table(qname, maybe_alias, _) => {
-                    let maybe_table = if let Ok(unquoted) = enquote::unquote(&qname.name.0) {
-                        schema.tables.get(&unquoted)
+                    let actual_tbl_name = if qname.name.0.starts_with('"') {
+                        rem_first_and_last(&qname.name.0)
                     } else {
-                        schema.tables.get(&qname.name.0)
+                        &qname.name.0
                     };
 
-                    if let Some(table) = maybe_table {
+                    if let Some(table) = schema.tables.get(actual_tbl_name) {
                         if let Some(alias) = maybe_alias {
                             let alias = match alias {
                                 As::As(name) | As::Elided(name) => name.0.clone(),
@@ -2086,87 +2240,89 @@ fn handle_from<'a>(
     tables
 }
 
-fn parameter_types(schema: &Schema, stmt: &Stmt) -> Vec<SqliteType> {
+fn parameter_types(schema: &Schema, cmd: &Cmd) -> Vec<SqliteType> {
     let mut params = vec![];
 
-    match stmt {
-        Stmt::Select(select) => handle_select(schema, select, &mut params),
-        Stmt::Delete {
-            tbl_name,
-            where_clause: Some(where_clause),
-            ..
-        } => {
-            let mut tables = HashMap::new();
-            if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
-                tables.insert(tbl_name.name.0.clone(), tbl);
+    if let Cmd::Stmt(stmt) = cmd {
+        match stmt {
+            Stmt::Select(select) => handle_select(schema, select, &mut params),
+            Stmt::Delete {
+                tbl_name,
+                where_clause: Some(where_clause),
+                ..
+            } => {
+                let mut tables = HashMap::new();
+                if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
+                    tables.insert(tbl_name.name.0.clone(), tbl);
+                }
+                extract_param(schema, where_clause, &tables, &mut params);
             }
-            extract_param(schema, where_clause, &tables, &mut params);
-        }
-        Stmt::Insert {
-            tbl_name,
-            columns,
-            body,
-            ..
-        } => {
-            println!("GOT AN INSERT TO {tbl_name:?} on columns: {columns:?} w/ body: {body:?}");
-            if let Some(table) = schema.tables.get(&tbl_name.name.0) {
-                match body {
-                    InsertBody::Select(select, _) => {
-                        if let OneSelect::Values(values_values) = &select.body.select {
-                            for values in values_values.iter() {
-                                for (i, expr) in values.iter().enumerate() {
-                                    if is_param(expr) {
-                                        // specified columns
-                                        let col = if let Some(columns) = columns {
-                                            columns
-                                                .get(i)
-                                                .and_then(|name| table.columns.get(&name.0))
-                                        } else {
-                                            table.columns.get_index(i).map(|(_name, col)| col)
-                                        };
-                                        if let Some(col) = col {
-                                            params.push(col.sql_type);
+            Stmt::Insert {
+                tbl_name,
+                columns,
+                body,
+                ..
+            } => {
+                trace!("GOT AN INSERT TO {tbl_name:?} on columns: {columns:?} w/ body: {body:?}");
+                if let Some(table) = schema.tables.get(&tbl_name.name.0) {
+                    match body {
+                        InsertBody::Select(select, _) => {
+                            if let OneSelect::Values(values_values) = &select.body.select {
+                                for values in values_values.iter() {
+                                    for (i, expr) in values.iter().enumerate() {
+                                        if is_param(expr) {
+                                            // specified columns
+                                            let col = if let Some(columns) = columns {
+                                                columns
+                                                    .get(i)
+                                                    .and_then(|name| table.columns.get(&name.0))
+                                            } else {
+                                                table.columns.get_index(i).map(|(_name, col)| col)
+                                            };
+                                            if let Some(col) = col {
+                                                params.push(col.sql_type);
+                                            }
                                         }
                                     }
                                 }
+                            } else {
+                                handle_select(schema, select, &mut params)
                             }
-                        } else {
-                            handle_select(schema, select, &mut params)
                         }
-                    }
-                    InsertBody::DefaultValues => {
-                        // nothing to do!
+                        InsertBody::DefaultValues => {
+                            // nothing to do!
+                        }
                     }
                 }
             }
-        }
-        Stmt::Update {
-            with: _,
-            or_conflict: _,
-            tbl_name,
-            indexed: _,
-            sets: _,
-            from,
-            where_clause,
-            returning: _,
-            order_by: _,
-            limit: _,
-        } => {
-            let mut tables = if let Some(from) = from {
-                handle_from(schema, from, &mut params)
-            } else {
-                Default::default()
-            };
-            if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
-                tables.insert(tbl_name.name.0.clone(), tbl);
+            Stmt::Update {
+                with: _,
+                or_conflict: _,
+                tbl_name,
+                indexed: _,
+                sets: _,
+                from,
+                where_clause,
+                returning: _,
+                order_by: _,
+                limit: _,
+            } => {
+                let mut tables = if let Some(from) = from {
+                    handle_from(schema, from, &mut params)
+                } else {
+                    Default::default()
+                };
+                if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
+                    tables.insert(tbl_name.name.0.clone(), tbl);
+                }
+                if let Some(where_clause) = where_clause {
+                    trace!("WHERE CLAUSE: {where_clause:?}");
+                    extract_param(schema, where_clause, &tables, &mut params);
+                }
             }
-            if let Some(where_clause) = where_clause {
-                println!("WHERE CLAUSE: {where_clause:?}");
-                extract_param(schema, where_clause, &tables, &mut params);
+            _ => {
+                // do nothing, there can't be bound params here!
             }
-        }
-        _ => {
-            // do nothing, there can't be bound params here!
         }
     }
 
@@ -2282,7 +2438,7 @@ mod tests {
             println!("ROW: {row:?}");
 
             let row = client
-        .query_one("SELECT t.id, t.text, t2.text as t2text FROM tests t LEFT JOIN tests2 t2 WHERE t.id = ?", &[&2i64])
+        .query_one("SELECT t.id, t.text, t2.text as t2text FROM tests t LEFT JOIN tests2 t2 WHERE t.id = ? LIMIT ?", &[&2i64, &1i64])
         .await?;
             println!("ROW: {row:?}");
 
