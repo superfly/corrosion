@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Implement a PostgreSQL wire protocol (v3) compatible API ([#83](../../pull/83))
+- Accept _all_ JSON types for SQLite params input ([#82](../../pull/82))
 - Parallel synchronization w/ many deadlock and bug fixes ([#78](../../pull/78))
 - Upgraded to cr-sqlite 0.16.0 (unreleased) ([#75](../../pull/75))
 - Rewrite compaction logic to be more correct and efficient ([#74](../../pull/74))
