@@ -1256,9 +1256,17 @@ pub async fn start(
                                 )?;
                             }
                             PgWireFrontendMessage::Query(query) => {
-                                let trimmed = query.query().trim_matches(';');
+                                let mut normalized = query.query().trim_matches(';');
 
-                                let parsed_query = match parse_query(trimmed) {
+                                if normalized.starts_with("BEGIN READ")
+                                    || normalized.starts_with("BEGIN WORK")
+                                    || normalized.starts_with("BEGIN ISOLATION")
+                                    || normalized.starts_with("BEGIN NOT ")
+                                {
+                                    normalized = "BEGIN";
+                                }
+
+                                let parsed_query = match parse_query(normalized) {
                                     Ok(q) => q,
                                     Err(e) => {
                                         back_tx.blocking_send(
