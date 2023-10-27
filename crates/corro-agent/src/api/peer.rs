@@ -1021,6 +1021,7 @@ pub async fn parallel_sync(
 
     debug!("collected member needs and such!");
 
+    #[allow(clippy::manual_try_fold)]
     let syncers = results.into_iter().fold(Ok(vec![]), |agg, (actor_id, addr, res)| {
         match res {
             Ok((needs, tx, read)) => {

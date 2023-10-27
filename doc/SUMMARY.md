@@ -26,6 +26,7 @@
     - [POST /v1/transactions](api/transactions.md)
     - [POST /v1/queries](api/queries.md)
     - [POST /v1/subscriptions](api/subscriptions.md)
+    - [PostgreSQL Wire Protocol](api/pg.md)
 - [Command-line Interface](cli/README.md)
     - [agent](cli/agent.md)
     - [backup](cli/backup.md)

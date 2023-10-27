@@ -128,7 +128,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let schema = {
         let mut conn = pool.write_priority().await?;
         migrate(&mut conn)?;
-        init_schema(&conn)?
+        let mut schema = init_schema(&conn)?;
+        schema.constrain()?;
+        schema
     };
 
     {
@@ -297,7 +299,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
     let (agent, opts) = setup(conf, tripwire.clone()).await?;
 
-    tokio::spawn(run(agent.clone(), opts).inspect(|_| info!("corrosion agent run is done")));
+    tokio::spawn(run(agent.clone(), opts).inspect(|res| match res {
+        Ok(_) => info!("corrosion agent run is done"),
+        Err(e) => error!("running corrosion agent failed: {e}"),
+    }));
 
     Ok(agent)
 }
@@ -316,6 +321,15 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rx_foca,
         rtt_rx,
     } = opts;
+
+    if let Some(pg_conf) = agent.config().api.pg.clone() {
+        info!("Starting PostgreSQL wire-compatible server");
+        let pg_server = corro_pg::start(agent.clone(), pg_conf, tripwire.clone()).await?;
+        info!(
+            "Started PostgreSQL wire-compatible server, listening at {}",
+            pg_server.local_addr
+        );
+    }
 
     let mut matcher_id_cache = MatcherIdCache::default();
     let mut matcher_bcast_cache = MatcherBroadcastCache::default();
@@ -345,7 +359,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         };
 
         for (id, sql) in rows {
-            let conn = agent.pool().dedicated().await?;
+            let conn = block_in_place(|| agent.pool().dedicated())?;
             let (evt_tx, evt_rx) = channel(512);
             match Matcher::restore(id, &agent.schema().read(), conn, evt_tx, &sql) {
                 Ok(handle) => {
@@ -2408,6 +2422,7 @@ async fn handle_changes(
         }
 
         // drain and process current changes!
+        #[allow(clippy::drain_collect)]
         if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect()).await {
             error!("could not process multiple changes: {e}");
         }
@@ -2426,6 +2441,7 @@ async fn handle_changes(
         buf.push((change, src));
         if count >= MIN_CHANGES_CHUNK {
             // drain and process current changes!
+            #[allow(clippy::drain_collect)]
             if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect()).await {
                 error!("could not process multiple changes: {e}");
             }

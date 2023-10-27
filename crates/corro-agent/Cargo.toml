@@ -52,6 +52,7 @@ tripwire = { path = "../tripwire" }
 trust-dns-resolver = { workspace = true }
 uhlc = { workspace = true }
 uuid = { workspace = true }
+corro-pg = { path = "../corro-pg" }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }

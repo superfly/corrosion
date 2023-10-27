@@ -20,6 +20,10 @@ use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{Connection, InterruptHandle};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{
+    OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, RwLock as TokioRwLock,
+    RwLockReadGuard as TokioRwLockReadGuard, RwLockWriteGuard as TokioRwLockWriteGuard,
+};
 use tokio::{
     runtime::Handle,
     sync::{
@@ -27,15 +31,8 @@ use tokio::{
         oneshot, Semaphore,
     },
 };
-use tokio::{
-    sync::{
-        OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, RwLock as TokioRwLock,
-        RwLockReadGuard as TokioRwLockReadGuard, RwLockWriteGuard as TokioRwLockWriteGuard,
-    },
-    task::block_in_place,
-};
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info, Instrument};
+use tracing::{debug, error, info, trace, Instrument};
 use tripwire::Tripwire;
 
 use crate::{
@@ -43,7 +40,7 @@ use crate::{
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     config::Config,
     pubsub::MatcherHandle,
-    schema::NormalizedSchema,
+    schema::Schema,
     sqlite::{rusqlite_to_crsqlite, setup_conn, AttachMap, CrConn, SqlitePool, SqlitePoolError},
 };
 
@@ -70,7 +67,7 @@ pub struct AgentConfig {
     pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
     pub tx_foca: Sender<FocaInput>,
 
-    pub schema: RwLock<NormalizedSchema>,
+    pub schema: RwLock<Schema>,
     pub tripwire: Tripwire,
 }
 
@@ -89,7 +86,7 @@ pub struct AgentInner {
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     tx_changes: Sender<(ChangeV1, ChangeSource)>,
     tx_foca: Sender<FocaInput>,
-    schema: RwLock<NormalizedSchema>,
+    schema: RwLock<Schema>,
     limits: Limits,
 }
 
@@ -174,7 +171,7 @@ impl Agent {
         &self.0.members
     }
 
-    pub fn schema(&self) -> &RwLock<NormalizedSchema> {
+    pub fn schema(&self) -> &RwLock<Schema> {
         &self.0.schema
     }
 
@@ -196,6 +193,26 @@ impl Agent {
 
     pub fn limits(&self) -> &Limits {
         &self.0.limits
+    }
+
+    pub fn process_subs_by_db_version(&self, conn: &Connection, db_version: i64) {
+        trace!("process subs by db version...");
+
+        let mut matchers_to_delete = vec![];
+
+        {
+            let matchers = self.matchers().read();
+            for (id, matcher) in matchers.iter() {
+                if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
+                    error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
+                    matchers_to_delete.push(*id);
+                }
+            }
+        }
+
+        for id in matchers_to_delete {
+            self.matchers().write().remove(&id);
+        }
     }
 }
 
@@ -363,12 +380,16 @@ impl SplitPool {
     }
 
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn dedicated(&self) -> rusqlite::Result<Connection> {
-        block_in_place(|| {
-            let mut conn = rusqlite::Connection::open(&self.0.path)?;
-            setup_conn(&mut conn, &self.0.attachments)?;
-            Ok(conn)
-        })
+    pub fn dedicated(&self) -> rusqlite::Result<Connection> {
+        let mut conn = rusqlite::Connection::open(&self.0.path)?;
+        setup_conn(&mut conn, &self.0.attachments)?;
+        Ok(conn)
+    }
+
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
+        let conn = rusqlite::Connection::open(&self.0.path)?;
+        rusqlite_to_crsqlite(conn)
     }
 
     // get a high priority write connection (e.g. client input)

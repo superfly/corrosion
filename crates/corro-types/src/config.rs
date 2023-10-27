@@ -87,6 +87,14 @@ pub struct ApiConfig {
     pub bind_addr: SocketAddr,
     #[serde(alias = "authz", default)]
     pub authorization: Option<AuthzConfig>,
+    #[serde(default)]
+    pub pg: Option<PgConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PgConfig {
+    #[serde(alias = "addr")]
+    pub bind_addr: SocketAddr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +281,7 @@ impl ConfigBuilder {
             api: ApiConfig {
                 bind_addr: self.api_addr.ok_or(ConfigBuilderError::ApiAddrRequired)?,
                 authorization: None,
+                pg: None,
             },
             gossip: GossipConfig {
                 bind_addr: self

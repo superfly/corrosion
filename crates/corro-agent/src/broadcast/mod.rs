@@ -231,7 +231,7 @@ pub fn runtime_loop(
                                                             .map(serde_json::Value::from)
                                                             .collect::<Vec<serde_json::Value>>()
                                                     })
-                                                    .unwrap_or(vec![]),
+                                                    .unwrap_or_default(),
                                             ),
                                         )),
                                         Err(e) => {
@@ -425,7 +425,7 @@ pub fn runtime_loop(
                                                     .map(serde_json::Value::from)
                                                     .collect::<Vec<serde_json::Value>>()
                                             })
-                                            .unwrap_or(vec![]),
+                                            .unwrap_or_default(),
                                     );
 
                                     let upserted = tx.prepare_cached("INSERT INTO __corro_members (actor_id, address, state, foca_state, rtts)
