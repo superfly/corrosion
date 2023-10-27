@@ -1,0 +1,20 @@
+{
+    "workspace": {
+        "name": "Corrosion"
+    },
+    "project": {
+        "name": "Corrosion",
+        "readme_path": "./README.md"
+    },
+    "marketing": {},
+    "styles": {
+        "theme": "dark"
+    },
+    "components": {
+        "changelog": true,
+        "mdbook": {
+            "path": "./"
+        },
+        "artifacts": {}
+    }
+}

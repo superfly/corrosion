@@ -4,7 +4,9 @@
 
 [About CRDTs](https://crdt.tech/#:~:text=Conflict%2Dfree%20Replicated%20Data%20Types%20(CRDTs)%20are%20used%20in,merged%20into%20a%20consistent%20state.)
 
-> Conflict-free Replicated Data Types (CRDTs) are used in systems with optimistic replication, where they take care of conflict resolution. CRDTs ensure that, no matter what data modifications are made on different replicas, the data can always be merged into a consistent state. This merge is performed automatically by the CRDT, without requiring any special conflict resolution code or user intervention.
+```admonish
+Conflict-free Replicated Data Types (CRDTs) are used in systems with optimistic replication, where they take care of conflict resolution. CRDTs ensure that, no matter what data modifications are made on different replicas, the data can always be merged into a consistent state. This merge is performed automatically by the CRDT, without requiring any special conflict resolution code or user intervention.
+```
 
 ## cr-sqlite
 

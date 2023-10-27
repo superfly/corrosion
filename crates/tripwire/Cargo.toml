@@ -4,6 +4,7 @@ version = "0.1.0-alpha.0"
 edition = "2021"
 description = "makes futures pre-emptible"
 license = "MIT"
+repository = "https://github.com/superfly/corrosion"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
