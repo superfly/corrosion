@@ -447,7 +447,11 @@ pub async fn start(
                         while let Some(back) = back_rx.recv().await {
                             match back {
                                 BackendResponse::Message { message, flush } => {
-                                    debug!("sending: {message:?}");
+                                    if let PgWireBackendMessage::ErrorResponse(e) = &message {
+                                        warn!("sending: {e:?}");
+                                    } else {
+                                        debug!("sending: {message:?}");
+                                    }
                                     sink.feed(message).await?;
                                     if flush {
                                         sink.flush().await?;
