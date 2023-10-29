@@ -609,15 +609,24 @@ pub async fn start(
                                                 .into_iter()
                                                 .map(|param| match param {
                                                     (SqliteType::Null, _) => unreachable!(),
-                                                    (SqliteType::Text, _src) => Type::TEXT,
+                                                    (SqliteType::Text, src) => match src {
+                                                        Some("JSON") => Type::JSON,
+                                                        _ => Type::TEXT,
+                                                    },
                                                     (SqliteType::Numeric, Some(src)) => match src {
                                                         "BOOLEAN" => Type::BOOL,
                                                         _ => Type::FLOAT8,
                                                     },
-                                                    (SqliteType::Numeric, None) => Type::FLOAT8,
+                                                    (SqliteType::Numeric, src) => match src {
+                                                        Some("DATETIME") => Type::TIMESTAMP,
+                                                        _ => Type::FLOAT8,
+                                                    },
                                                     (SqliteType::Integer, _src) => Type::INT8,
                                                     (SqliteType::Real, _src) => Type::FLOAT8,
-                                                    (SqliteType::Blob, _src) => Type::BYTEA,
+                                                    (SqliteType::Blob, src) => match src {
+                                                        Some("JSONB") => Type::JSONB,
+                                                        _ => Type::BYTEA,
+                                                    },
                                                 })
                                                 .collect();
                                         }

@@ -17,15 +17,11 @@ unsafe impl<'vtab> VTab<'vtab> for PgRangeTable {
     fn connect(
         _: &mut VTabConnection,
         _aux: Option<&()>,
-        args: &[&[u8]],
+        _args: &[&[u8]],
     ) -> rusqlite::Result<(String, PgRangeTable)> {
         let vtab = PgRangeTable {
             base: sqlite3_vtab::default(),
         };
-
-        for arg in args {
-            println!("arg {:?}", std::str::from_utf8(arg));
-        }
 
         Ok((
             "CREATE TABLE pg_range (
