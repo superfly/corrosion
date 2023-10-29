@@ -2099,6 +2099,9 @@ fn extract_param<'a>(
                         }
                     }
                 }
+            } else {
+                extract_param(schema, lhs, tables, params);
+                extract_param(schema, rhs, tables, params);
             }
         }
 
