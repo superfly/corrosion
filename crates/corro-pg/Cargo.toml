@@ -9,6 +9,7 @@ compact_str = { workspace = true }
 corro-types = { path = "../corro-types" }
 fallible-iterator = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 pgwire = { version = "0.16.1" }
 postgres-types = { version = "0.2", features = ["with-time-0_3"] }
 rusqlite = { workspace = true }

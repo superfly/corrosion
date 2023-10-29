@@ -17,12 +17,18 @@ use tracing::{debug, info, trace};
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Column {
     pub name: String,
-    pub sql_type: SqliteType,
+    pub sql_type: (SqliteType, Option<String>),
     pub nullable: bool,
     pub default_value: Option<String>,
     pub generated: Option<String>,
     pub primary_key: bool,
     pub raw: ColumnDefinition,
+}
+
+impl Column {
+    pub fn sql_type(&self) -> (SqliteType, Option<&str>) {
+        (self.sql_type.0, self.sql_type.1.as_deref())
+    }
 }
 
 impl std::hash::Hash for Column {
@@ -49,12 +55,14 @@ impl fmt::Display for Column {
 pub enum SqliteType {
     /// NULL
     Null,
+    /// String
+    Text,
+    /// Integer or Real (default affinity)
+    Numeric,
     /// 64-bit signed integer
     Integer,
     /// 64-bit IEEE floating point number
     Real,
-    /// String
-    Text,
     /// BLOB
     Blob,
 }
@@ -765,14 +773,9 @@ fn prepare_table(
                     def.col_name.0.clone(),
                     Column {
                         name: def.col_name.0.clone(),
-                        sql_type: match def
-                            .col_type
-                            .as_ref()
-                            .map(|t| t.name.to_ascii_uppercase())
-                            .as_deref()
-                        {
+                        sql_type: match def.col_type.as_ref().map(|t| t.name.to_ascii_uppercase()) {
                             // 1. If the declared type contains the string "INT" then it is assigned INTEGER affinity.
-                            Some(s) if s.contains("INT") => SqliteType::Integer,
+                            Some(s) if s.contains("INT") => (SqliteType::Integer, Some(s)),
                             // 2. If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
                             Some(s)
                                 if s.contains("CHAR")
@@ -780,12 +783,14 @@ fn prepare_table(
                                     || s.contains("TEXT")
                                     || s == "JSON" =>
                             {
-                                SqliteType::Text
+                                (SqliteType::Text, Some(s))
                             }
 
                             // 3. If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
-                            Some(s) if s.contains("BLOB") || s == "JSONB" => SqliteType::Blob,
-                            None => SqliteType::Blob,
+                            Some(s) if s.contains("BLOB") || s == "JSONB" => {
+                                (SqliteType::Blob, Some(s))
+                            }
+                            None => (SqliteType::Blob, None),
 
                             // 4. If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
                             Some(s)
@@ -794,11 +799,11 @@ fn prepare_table(
                                     || s.contains("DOUB")
                                     || s == "ANY" =>
                             {
-                                SqliteType::Real
+                                (SqliteType::Real, Some(s))
                             }
 
                             // 5. Otherwise, the affinity is NUMERIC.
-                            Some(_s) => SqliteType::Real,
+                            Some(s) => (SqliteType::Numeric, Some(s)),
                         },
                         primary_key,
                         nullable,

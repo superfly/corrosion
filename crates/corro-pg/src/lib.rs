@@ -5,6 +5,7 @@ use std::{
     collections::{HashMap, VecDeque},
     future::poll_fn,
     net::SocketAddr,
+    str::{FromStr, Utf8Error},
     sync::Arc,
 };
 
@@ -29,7 +30,8 @@ use pgwire::{
         data::{NoData, ParameterDescription, RowDescription},
         extendedquery::{BindComplete, CloseComplete, ParseComplete, PortalSuspended},
         response::{
-            EmptyQueryResponse, ReadyForQuery, READY_STATUS_IDLE, READY_STATUS_TRANSACTION_BLOCK,
+            CommandComplete, EmptyQueryResponse, ReadyForQuery, READY_STATUS_IDLE,
+            READY_STATUS_TRANSACTION_BLOCK,
         },
         startup::{ParameterStatus, SslRequest},
         PgWireBackendMessage, PgWireFrontendMessage,
@@ -583,11 +585,16 @@ pub async fn start(
                                             param_types = parameter_types(&schema, &parsed_cmd.0)
                                                 .into_iter()
                                                 .map(|param| match param {
-                                                    SqliteType::Null => unreachable!(),
-                                                    SqliteType::Integer => Type::INT8,
-                                                    SqliteType::Real => Type::FLOAT8,
-                                                    SqliteType::Text => Type::TEXT,
-                                                    SqliteType::Blob => Type::BYTEA,
+                                                    (SqliteType::Null, _) => unreachable!(),
+                                                    (SqliteType::Text, src) => Type::TEXT,
+                                                    (SqliteType::Numeric, Some(src)) => match src {
+                                                        "BOOLEAN" => Type::BOOL,
+                                                        _ => Type::FLOAT8,
+                                                    },
+                                                    (SqliteType::Numeric, None) => Type::FLOAT8,
+                                                    (SqliteType::Integer, src) => Type::INT8,
+                                                    (SqliteType::Real, src) => Type::FLOAT8,
+                                                    (SqliteType::Blob, src) => Type::BYTEA,
                                                 })
                                                 .collect();
                                         }
@@ -865,6 +872,49 @@ pub async fn start(
                                             prepped.parameter_count()
                                         );
 
+                                        trace!("param types: {param_types:?}");
+
+                                        let mut format_codes = match bind
+                                            .parameter_format_codes()
+                                            .iter()
+                                            .map(|code| {
+                                                Ok(match *code {
+                                                    0 => FormatCode::Text,
+                                                    1 => FormatCode::Binary,
+                                                    n => return Err(UnknownFormatCode(n)),
+                                                })
+                                            })
+                                            .collect::<Result<Vec<FormatCode>, UnknownFormatCode>>()
+                                        {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::ErrorResponse(
+                                                            ErrorInfo::new(
+                                                                "ERROR".to_owned(),
+                                                                "XX000".to_owned(),
+                                                                e.to_string(),
+                                                            )
+                                                            .into(),
+                                                        ),
+                                                        true,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                                continue;
+                                            }
+                                        };
+                                        if format_codes.is_empty() {
+                                            // no format codes? default to text
+                                            format_codes =
+                                                vec![FormatCode::Text; bind.parameters().len()];
+                                        } else if format_codes.len() == 1 {
+                                            // single code means we should use it for all others
+                                            format_codes =
+                                                vec![format_codes[0]; bind.parameters().len()];
+                                        }
+
                                         for (i, param) in bind.parameters().iter().enumerate() {
                                             let idx = i + 1;
                                             let b = match param {
@@ -895,8 +945,11 @@ pub async fn start(
                                                 Some(b) => b,
                                             };
 
+                                            trace!("got param bytes: {b:?}");
+
                                             match param_types.get(i) {
                                                 None => {
+                                                    trace!("no param type found!");
                                                     back_tx.blocking_send(
                                                         (
                                                             PgWireBackendMessage::ErrorResponse(
@@ -914,78 +967,98 @@ pub async fn start(
                                                     continue 'outer;
                                                 }
                                                 Some(param_type) => {
+                                                    let format_code = format_codes[i];
+                                                    trace!("parsing param_type {param_type:?}, format_code: {format_code:?}, bytes: {b:?}");
                                                     match param_type {
-                                                        &Type::BOOL => {
-                                                            let value: bool = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                        t @ &Type::BOOL => {
+                                                            let value: bool = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::INT2 => {
-                                                            let value: i16 = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                        t @ &Type::INT2 => {
+                                                            let value: i16 = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::INT4 => {
-                                                            let value: i32 = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                        t @ &Type::INT4 => {
+                                                            let value: i32 = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::INT8 => {
-                                                            let value: i64 = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                        t @ &Type::INT8 => {
+                                                            let value: i64 = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::TEXT | &Type::VARCHAR => {
-                                                            let value: &str = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+
+                                                        t @ &Type::TEXT | t @ &Type::VARCHAR => {
+                                                            let value: &str = match format_code {
+                                                                FormatCode::Text => {
+                                                                    std::str::from_utf8(b)?
+                                                                }
+                                                                FormatCode::Binary => {
+                                                                    FromSql::from_sql(t, b)?
+                                                                }
+                                                            };
+                                                            trace!("binding idx {idx} w/ value: {value}");
+                                                            prepped
+                                                                .raw_bind_parameter(idx, value)?;
+                                                        }
+                                                        t @ &Type::FLOAT4 => {
+                                                            let value: f32 = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::FLOAT4 => {
-                                                            let value: f32 = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        &Type::FLOAT8 => {
-                                                            let value: f64 = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                        t @ &Type::FLOAT8 => {
+                                                            let value: f64 = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
                                                         &Type::BYTEA => {
-                                                            let value: &[u8] = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                            let maybe_decoded = matches!(
+                                                                format_code,
+                                                                FormatCode::Text
+                                                            )
+                                                            .then(|| hex::decode(b).ok())
+                                                            .flatten();
+
+                                                            trace!("binding idx {idx} w/ decoded value: {maybe_decoded:?} (bytes: {b:?})");
+                                                            prepped.raw_bind_parameter(
+                                                                idx,
+                                                                maybe_decoded
+                                                                    .as_deref()
+                                                                    .unwrap_or(b),
                                                             )?;
-                                                            trace!("binding idx {idx} w/ value: {value:?}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
                                                         }
                                                         t => {
                                                             warn!("unsupported type: {t:?}");
@@ -1241,17 +1314,22 @@ pub async fn start(
 
                                 trace!("done w/ rows, computing tag: {tag:?}");
 
-                                let tag = if tag.returns_num_rows() {
-                                    tag.tag(Some(count))
+                                let cmd_complete: CommandComplete = if tag.returns_num_rows() {
+                                    tag.tag(Some(count)).into()
                                 } else if tag.returns_rows_affected() {
-                                    tag.tag(Some(conn.changes() as usize))
+                                    let changes = conn.changes();
+                                    if matches!(tag, StmtTag::Insert) {
+                                        CommandComplete::new(format!("INSERT 0 {changes}"))
+                                    } else {
+                                        tag.tag(Some(changes as usize)).into()
+                                    }
                                 } else {
-                                    tag.tag(None)
+                                    tag.tag(None).into()
                                 };
 
                                 // done!
                                 back_tx.blocking_send(
-                                    (PgWireBackendMessage::CommandComplete(tag.into()), true)
+                                    (PgWireBackendMessage::CommandComplete(cmd_complete), true)
                                         .into(),
                                 )?;
                             }
@@ -1515,16 +1593,21 @@ pub async fn start(
 
                                     let tag = cmd.tag();
 
-                                    let tag = if tag.returns_num_rows() {
-                                        tag.tag(count)
+                                    let cmd_complete: CommandComplete = if tag.returns_num_rows() {
+                                        tag.tag(count).into()
                                     } else if tag.returns_rows_affected() {
-                                        tag.tag(Some(conn.changes() as usize))
+                                        let changes = conn.changes();
+                                        if matches!(tag, StmtTag::Insert) {
+                                            CommandComplete::new(format!("INSERT 0 {changes}"))
+                                        } else {
+                                            tag.tag(Some(changes as usize)).into()
+                                        }
                                     } else {
-                                        tag.tag(None)
+                                        tag.tag(None).into()
                                     };
 
                                     back_tx.blocking_send(
-                                        (PgWireBackendMessage::CommandComplete(tag.into()), true)
+                                        (PgWireBackendMessage::CommandComplete(cmd_complete), true)
                                             .into(),
                                     )?;
 
@@ -1717,6 +1800,43 @@ pub async fn start(
     });
 
     Ok(PgServer { local_addr })
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(i16)]
+pub enum FormatCode {
+    Text = 0,
+    Binary,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown format code {0}")]
+pub struct UnknownFormatCode(i16);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ToParamError<E> {
+    #[error("conversion from bytes to types failed: {0}")]
+    FromSql(Box<dyn std::error::Error + Sync + Send>),
+    #[error(transparent)]
+    Utf8(#[from] Utf8Error),
+    #[error("parse error: {0}")]
+    Parse(E),
+}
+
+fn from_type_and_format<'a, E, T: FromSql<'a> + FromStr<Err = E>>(
+    t: &Type,
+    b: &'a [u8],
+    format_code: FormatCode,
+) -> Result<T, ToParamError<E>>
+// where
+//     FromStr::Err =,
+{
+    Ok(match format_code {
+        FormatCode::Text => {
+            T::from_str(std::str::from_utf8(b)?).map_err(|e| ToParamError::<E>::Parse(e))?
+        }
+        FormatCode::Binary => T::from_sql(t, b).map_err(ToParamError::FromSql)?,
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -1932,11 +2052,11 @@ fn handle_lhs_rhs(lhs: &Expr, rhs: &Expr) -> Option<SqliteName> {
     }
 }
 
-fn extract_param(
-    schema: &Schema,
+fn extract_param<'a>(
+    schema: &'a Schema,
     expr: &Expr,
-    tables: &HashMap<String, &Table>,
-    params: &mut Vec<SqliteType>,
+    tables: &HashMap<String, &'a Table>,
+    params: &mut Vec<(SqliteType, Option<&'a str>)>,
 ) {
     match expr {
         // expr BETWEEN expr AND expr
@@ -1956,7 +2076,7 @@ fn extract_param(
                         // find the first one to match
                         for (_, table) in tables.iter() {
                             if let Some(col) = table.columns.get(&id.0) {
-                                params.push(col.sql_type);
+                                params.push(col.sql_type());
                                 break;
                             }
                         }
@@ -1974,7 +2094,7 @@ fn extract_param(
                             };
 
                             if let Some(col) = table.columns.get(col_name) {
-                                params.push(col.sql_type);
+                                params.push(col.sql_type());
                             }
                         }
                     }
@@ -2032,7 +2152,7 @@ fn extract_param(
                                 // find the first one to match
                                 for (_, table) in tables.iter() {
                                     if let Some(col) = table.columns.get(&id.0) {
-                                        params.push(col.sql_type);
+                                        params.push(col.sql_type());
                                         break;
                                     }
                                 }
@@ -2042,7 +2162,7 @@ fn extract_param(
                             | SqliteName::DoublyQualified(_, tbl_name, col_name) => {
                                 if let Some(table) = tables.get(&tbl_name.0) {
                                     if let Some(col) = table.columns.get(&col_name.0) {
-                                        params.push(col.sql_type);
+                                        params.push(col.sql_type());
                                     }
                                 }
                             }
@@ -2124,7 +2244,11 @@ fn rem_first_and_last(value: &str) -> &str {
     chars.as_str()
 }
 
-fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>) {
+fn handle_select<'a>(
+    schema: &'a Schema,
+    select: &Select,
+    params: &mut Vec<(SqliteType, Option<&'a str>)>,
+) {
     let tables = match &select.body.select {
         OneSelect::Select {
             columns,
@@ -2148,7 +2272,7 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
                 if let ResultColumn::Expr(expr, _) = col {
                     // TODO: check against table if we can...
                     if is_param(expr) {
-                        params.push(SqliteType::Text);
+                        params.push((SqliteType::Text, None));
                     }
                 }
             }
@@ -2158,7 +2282,7 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
             for values in values_values.iter() {
                 for value in values.iter() {
                     if is_param(value) {
-                        params.push(SqliteType::Text);
+                        params.push((SqliteType::Text, None));
                     }
                 }
             }
@@ -2168,14 +2292,14 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
     if let Some(limit) = &select.limit {
         if is_param(&limit.expr) {
             trace!("limit was a param (variable), pushing Integer type");
-            params.push(SqliteType::Integer);
+            params.push((SqliteType::Integer, None));
         } else {
             extract_param(schema, &limit.expr, &tables, params);
         }
         if let Some(offset) = &limit.offset {
             if is_param(offset) {
                 trace!("offset was a param (variable), pushing Integer type");
-                params.push(SqliteType::Integer);
+                params.push((SqliteType::Integer, None));
             } else {
                 extract_param(schema, offset, &tables, params);
             }
@@ -2186,7 +2310,7 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
 fn handle_from<'a>(
     schema: &'a Schema,
     from: &FromClause,
-    params: &mut Vec<SqliteType>,
+    params: &mut Vec<(SqliteType, Option<&'a str>)>,
 ) -> HashMap<String, &'a Table> {
     let mut tables: HashMap<String, &Table> = HashMap::new();
     if let Some(select) = from.select.as_deref() {
@@ -2248,7 +2372,7 @@ fn handle_from<'a>(
     tables
 }
 
-fn parameter_types(schema: &Schema, cmd: &Cmd) -> Vec<SqliteType> {
+fn parameter_types<'a>(schema: &'a Schema, cmd: &Cmd) -> Vec<(SqliteType, Option<&'a str>)> {
     let mut params = vec![];
 
     if let Cmd::Stmt(stmt) = cmd {
@@ -2288,7 +2412,7 @@ fn parameter_types(schema: &Schema, cmd: &Cmd) -> Vec<SqliteType> {
                                                 table.columns.get_index(i).map(|(_name, col)| col)
                                             };
                                             if let Some(col) = col {
-                                                params.push(col.sql_type);
+                                                params.push(col.sql_type());
                                             }
                                         }
                                     }

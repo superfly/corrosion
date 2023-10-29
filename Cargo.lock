@@ -832,6 +832,7 @@ dependencies = [
  "corro-types",
  "fallible-iterator",
  "futures",
+ "hex",
  "pgwire",
  "postgres-types",
  "rusqlite",
