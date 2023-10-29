@@ -323,7 +323,7 @@ pub async fn start(
                 Outcome::Completed(res) => res?,
                 Outcome::Preempted(_) => break,
             };
-            info!("accepted a conn, addr: {remote_addr}");
+            debug!("Accepted a PostgreSQL connection (from: {remote_addr})");
 
             let agent = agent.clone();
             tokio::spawn(async move {
@@ -345,7 +345,7 @@ pub async fn start(
 
                 match msg {
                     PgWireFrontendMessage::Startup(startup) => {
-                        info!("received startup message: {startup:?}");
+                        debug!("received startup message: {startup:?}");
                     }
                     _ => {
                         framed
@@ -609,15 +609,15 @@ pub async fn start(
                                                 .into_iter()
                                                 .map(|param| match param {
                                                     (SqliteType::Null, _) => unreachable!(),
-                                                    (SqliteType::Text, src) => Type::TEXT,
+                                                    (SqliteType::Text, _src) => Type::TEXT,
                                                     (SqliteType::Numeric, Some(src)) => match src {
                                                         "BOOLEAN" => Type::BOOL,
                                                         _ => Type::FLOAT8,
                                                     },
                                                     (SqliteType::Numeric, None) => Type::FLOAT8,
-                                                    (SqliteType::Integer, src) => Type::INT8,
-                                                    (SqliteType::Real, src) => Type::FLOAT8,
-                                                    (SqliteType::Blob, src) => Type::BYTEA,
+                                                    (SqliteType::Integer, _src) => Type::INT8,
+                                                    (SqliteType::Real, _src) => Type::FLOAT8,
+                                                    (SqliteType::Blob, _src) => Type::BYTEA,
                                                 })
                                                 .collect();
                                         }
