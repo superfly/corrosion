@@ -108,6 +108,21 @@ enum StmtTag {
 }
 
 impl StmtTag {
+    fn into_command_complete(self, rows: usize, conn: &Connection) -> CommandComplete {
+        if self.returns_num_rows() {
+            self.tag(Some(rows)).into()
+        } else if self.returns_rows_affected() {
+            let changes = conn.changes();
+            if matches!(self, StmtTag::Insert) {
+                CommandComplete::new(format!("INSERT 0 {changes}"))
+            } else {
+                self.tag(Some(changes as usize)).into()
+            }
+        } else {
+            self.tag(None).into()
+        }
+    }
+
     fn returns_rows_affected(&self) -> bool {
         matches!(self, StmtTag::Insert | StmtTag::Update | StmtTag::Delete)
     }
@@ -321,8 +336,12 @@ pub async fn start(
                     PgWireMessageServerCodec::new(ClientInfoHolder::new(remote_addr, false)),
                 );
 
-                let msg = framed.next().await.unwrap()?;
-                trace!("msg: {msg:?}");
+                let msg = match framed.next().await {
+                    Some(msg) => msg?,
+                    None => {
+                        return Ok(());
+                    }
+                };
 
                 match msg {
                     PgWireFrontendMessage::Startup(startup) => {
@@ -1314,22 +1333,14 @@ pub async fn start(
 
                                 trace!("done w/ rows, computing tag: {tag:?}");
 
-                                let cmd_complete: CommandComplete = if tag.returns_num_rows() {
-                                    tag.tag(Some(count)).into()
-                                } else if tag.returns_rows_affected() {
-                                    let changes = conn.changes();
-                                    if matches!(tag, StmtTag::Insert) {
-                                        CommandComplete::new(format!("INSERT 0 {changes}"))
-                                    } else {
-                                        tag.tag(Some(changes as usize)).into()
-                                    }
-                                } else {
-                                    tag.tag(None).into()
-                                };
-
                                 // done!
                                 back_tx.blocking_send(
-                                    (PgWireBackendMessage::CommandComplete(cmd_complete), true)
+                                    (
+                                        PgWireBackendMessage::CommandComplete(
+                                            (*tag).into_command_complete(count, &conn),
+                                        ),
+                                        true,
+                                    )
                                         .into(),
                                 )?;
                             }
@@ -1462,7 +1473,7 @@ pub async fn start(
 
                                             continue 'outer;
                                         }
-                                        None
+                                        0
                                     } else {
                                         let mut prepped = match conn.prepare(&cmd.0.to_string()) {
                                             Ok(prepped) => prepped,
@@ -1588,26 +1599,16 @@ pub async fn start(
                                                 }
                                             }
                                         }
-                                        Some(count)
-                                    };
-
-                                    let tag = cmd.tag();
-
-                                    let cmd_complete: CommandComplete = if tag.returns_num_rows() {
-                                        tag.tag(count).into()
-                                    } else if tag.returns_rows_affected() {
-                                        let changes = conn.changes();
-                                        if matches!(tag, StmtTag::Insert) {
-                                            CommandComplete::new(format!("INSERT 0 {changes}"))
-                                        } else {
-                                            tag.tag(Some(changes as usize)).into()
-                                        }
-                                    } else {
-                                        tag.tag(None).into()
+                                        count
                                     };
 
                                     back_tx.blocking_send(
-                                        (PgWireBackendMessage::CommandComplete(cmd_complete), true)
+                                        (
+                                            PgWireBackendMessage::CommandComplete(
+                                                cmd.tag().into_command_complete(count, &conn),
+                                            ),
+                                            true,
+                                        )
                                             .into(),
                                     )?;
 
