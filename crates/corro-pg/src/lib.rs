@@ -314,9 +314,6 @@ pub async fn start(
     let server = TcpListener::bind(pg.bind_addr).await?;
     let local_addr = server.local_addr()?;
 
-    // let tmp_dir = tempfile::TempDir::new()?;
-    // let pg_system_path = tmp_dir.path().join("pg_system.sqlite");
-
     tokio::spawn(async move {
         loop {
             let (mut conn, remote_addr) = match server.accept().preemptible(&mut tripwire).await {
