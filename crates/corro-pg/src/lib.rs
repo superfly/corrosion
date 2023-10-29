@@ -1844,12 +1844,11 @@ fn from_type_and_format<'a, E, T: FromSql<'a> + FromStr<Err = E>>(
 fn name_to_type(name: &str) -> Result<Type, ErrorInfo> {
     match name.to_uppercase().as_ref() {
         "ANY" => Ok(Type::ANY),
-        "INT" | "INTEGER" => Ok(Type::INT8),
+        "INT" | "INTEGER" | "DATETIME" => Ok(Type::INT8),
         "VARCHAR" => Ok(Type::VARCHAR),
         "TEXT" => Ok(Type::TEXT),
         "BINARY" | "BLOB" => Ok(Type::BYTEA),
         "FLOAT" => Ok(Type::FLOAT8),
-        "DATETIME" => Ok(Type::TIMESTAMP),
         _ => Err(ErrorInfo::new(
             "ERROR".to_owned(),
             "42846".to_owned(),
