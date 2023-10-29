@@ -1849,6 +1849,7 @@ fn name_to_type(name: &str) -> Result<Type, ErrorInfo> {
         "TEXT" => Ok(Type::TEXT),
         "BINARY" | "BLOB" => Ok(Type::BYTEA),
         "FLOAT" => Ok(Type::FLOAT8),
+        "DATETIME" => Ok(Type::TIMESTAMP),
         _ => Err(ErrorInfo::new(
             "ERROR".to_owned(),
             "42846".to_owned(),
