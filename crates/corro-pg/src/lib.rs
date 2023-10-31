@@ -262,6 +262,11 @@ impl ParsedCmd {
                 Stmt::Update { .. } => StmtTag::Update,
                 Stmt::Vacuum(_, _) => StmtTag::Vacuum,
             },
+            ParsedCmd::Postgres(stmt) => match stmt {
+                PgStatement::StartTransaction { .. } => StmtTag::Begin,
+                PgStatement::Commit { .. } => StmtTag::Commit,
+                _ => StmtTag::Other,
+            },
             _ => StmtTag::Other,
         }
     }
