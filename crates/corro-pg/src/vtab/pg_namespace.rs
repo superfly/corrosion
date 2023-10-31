@@ -72,7 +72,7 @@ unsafe impl VTabCursor for PgNamespaceTableCursor<'_> {
         _idx_str: Option<&str>,
         _args: &Values<'_>,
     ) -> rusqlite::Result<()> {
-        self.row_id = 1;
+        self.row_id = 0;
         Ok(())
     }
 

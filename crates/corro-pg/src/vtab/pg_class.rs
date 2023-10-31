@@ -82,8 +82,6 @@ unsafe impl<'vtab> VTab<'vtab> for PgClassTable {
 pub struct PgClassTableCursor<'vtab> {
     /// Base class. Must be first
     base: sqlite3_vtab_cursor,
-    /// The rowid
-    row_id: i64,
     phantom: PhantomData<&'vtab PgClassTable>,
 }
 
@@ -94,12 +92,10 @@ unsafe impl VTabCursor for PgClassTableCursor<'_> {
         _idx_str: Option<&str>,
         _args: &Values<'_>,
     ) -> rusqlite::Result<()> {
-        self.row_id = 1;
         Ok(())
     }
 
     fn next(&mut self) -> rusqlite::Result<()> {
-        self.row_id += 1;
         Ok(())
     }
 
@@ -112,6 +108,6 @@ unsafe impl VTabCursor for PgClassTableCursor<'_> {
     }
 
     fn rowid(&self) -> rusqlite::Result<i64> {
-        Ok(self.row_id)
+        Ok(1)
     }
 }

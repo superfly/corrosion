@@ -4,6 +4,7 @@ use postgres_types::Type;
 use rusqlite::vtab::{
     sqlite3_vtab, sqlite3_vtab_cursor, IndexInfo, VTab, VTabConnection, VTabCursor, Values,
 };
+use tracing::debug;
 
 #[repr(C)]
 pub struct PgTypeTable {
@@ -25,6 +26,8 @@ unsafe impl<'vtab> VTab<'vtab> for PgTypeTable {
         };
 
         let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+
+        debug!("creating table w/ name: {table_name}");
 
         Ok((
             format!(

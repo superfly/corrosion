@@ -549,30 +549,18 @@ pub async fn start(
                     let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
 
                     conn.create_module(
-                        "pg_database_module",
+                        "pg_database",
                         eponymous_only_module::<PgDatabaseTable>(),
                         Some(dbs),
                     )?;
+                    conn.create_module("pg_type", eponymous_only_module::<PgTypeTable>(), None)?;
+                    conn.create_module("pg_range", eponymous_only_module::<PgRangeTable>(), None)?;
                     conn.create_module(
-                        "pg_type_module",
-                        eponymous_only_module::<PgTypeTable>(),
-                        None,
-                    )?;
-                    conn.create_module(
-                        "pg_range_module",
-                        eponymous_only_module::<PgRangeTable>(),
-                        None,
-                    )?;
-                    conn.create_module(
-                        "pg_namespace_module",
+                        "pg_namespace",
                         eponymous_only_module::<PgNamespaceTable>(),
                         None,
                     )?;
-                    conn.create_module(
-                        "pg_class_module",
-                        eponymous_only_module::<PgClassTable>(),
-                        None,
-                    )?;
+                    conn.create_module("pg_class", eponymous_only_module::<PgClassTable>(), None)?;
 
                     conn.create_scalar_function(
                         "version",
@@ -594,8 +582,6 @@ pub async fn start(
                         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
                         |_ctx| Ok(false),
                     )?;
-
-                    // conn.execute_batch("CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_database USING pg_database_module (oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datlastsysoid, datfrozenxid, datminmxid, dattablespace, datacl)")?;
 
                     let schema = match compute_schema(&conn) {
                         Ok(schema) => schema,
