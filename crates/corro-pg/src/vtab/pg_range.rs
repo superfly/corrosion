@@ -17,14 +17,17 @@ unsafe impl<'vtab> VTab<'vtab> for PgRangeTable {
     fn connect(
         _: &mut VTabConnection,
         _aux: Option<&()>,
-        _args: &[&[u8]],
+        args: &[&[u8]],
     ) -> rusqlite::Result<(String, PgRangeTable)> {
         let vtab = PgRangeTable {
             base: sqlite3_vtab::default(),
         };
 
+        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+
         Ok((
-            "CREATE TABLE pg_range (
+            format!(
+                "CREATE TABLE {table_name} (
                 rngtypid 	INTEGER,
                 rngsubtype	INTEGER,
                 rngmultitypid	INTEGER,
@@ -33,7 +36,7 @@ unsafe impl<'vtab> VTab<'vtab> for PgRangeTable {
                 rngcanonical	TEXT,
                 rngsubdiff	TEXT
 		    )"
-            .into(),
+            ),
             vtab,
         ))
     }

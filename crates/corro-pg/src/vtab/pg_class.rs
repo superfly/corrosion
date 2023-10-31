@@ -17,14 +17,17 @@ unsafe impl<'vtab> VTab<'vtab> for PgClassTable {
     fn connect(
         _: &mut VTabConnection,
         _aux: Option<&()>,
-        _args: &[&[u8]],
+        args: &[&[u8]],
     ) -> rusqlite::Result<(String, PgClassTable)> {
         let vtab = PgClassTable {
             base: sqlite3_vtab::default(),
         };
 
+        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+
         Ok((
-            "CREATE TABLE pg_class (
+            format!(
+                "CREATE TABLE {table_name} (
                 oid                 INTEGER,
                 relname             TEXT,
                 relnamespace        INTEGER,
@@ -59,7 +62,7 @@ unsafe impl<'vtab> VTab<'vtab> for PgClassTable {
                 reloptions          TEXT,
                 relpartbound        TEXT
 		    )"
-            .into(),
+            ),
             vtab,
         ))
     }

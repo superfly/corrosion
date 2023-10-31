@@ -64,7 +64,10 @@ use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 use crate::{
     sql_state::SqlState,
     vtab::{
-        pg_class::PgClassTable, pg_namespace::PgNamespaceTable, pg_range::PgRangeTable,
+        pg_class::PgClassTable,
+        pg_database::{PgDatabase, PgDatabaseTable},
+        pg_namespace::PgNamespaceTable,
+        pg_range::PgRangeTable,
         pg_type::PgTypeTable,
     },
 };
@@ -540,15 +543,36 @@ pub async fn start(
                     int_handle.interrupt();
                 });
 
-                block_in_place(|| {
-                    conn.create_module("pg_type", eponymous_only_module::<PgTypeTable>(), None)?;
-                    conn.create_module("pg_range", eponymous_only_module::<PgRangeTable>(), None)?;
+                let res = block_in_place(|| {
+                    conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
+
+                    let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
+
                     conn.create_module(
-                        "pg_namespace",
+                        "pg_database_module",
+                        eponymous_only_module::<PgDatabaseTable>(),
+                        Some(dbs),
+                    )?;
+                    conn.create_module(
+                        "pg_type_module",
+                        eponymous_only_module::<PgTypeTable>(),
+                        None,
+                    )?;
+                    conn.create_module(
+                        "pg_range_module",
+                        eponymous_only_module::<PgRangeTable>(),
+                        None,
+                    )?;
+                    conn.create_module(
+                        "pg_namespace_module",
                         eponymous_only_module::<PgNamespaceTable>(),
                         None,
                     )?;
-                    conn.create_module("pg_class", eponymous_only_module::<PgClassTable>(), None)?;
+                    conn.create_module(
+                        "pg_class_module",
+                        eponymous_only_module::<PgClassTable>(),
+                        None,
+                    )?;
 
                     conn.create_scalar_function(
                         "version",
@@ -570,6 +594,8 @@ pub async fn start(
                         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
                         |_ctx| Ok(false),
                     )?;
+
+                    // conn.execute_batch("CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_database USING pg_database_module (oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datlastsysoid, datfrozenxid, datminmxid, dattablespace, datacl)")?;
 
                     let schema = match compute_schema(&conn) {
                         Ok(schema) => schema,
@@ -1272,41 +1298,16 @@ pub async fn start(
                                 )?;
                             }
                             PgWireFrontendMessage::Sync(_) => {
-                                let ready_status = match open_tx {
-                                    Some(OpenTx::Implicit) => {
-                                        if discard_until_sync {
-                                            // an error occured, rollback implicit tx!
-                                            warn!("receive Sync message w/ an error to send, rolling back implicit tx");
-                                            conn.execute_batch("ROLLBACK")?;
-                                        } else {
-                                            // no error, commit implicit tx
-                                            warn!("receive Sync message, committing implicit tx");
-                                            handle_commit(&agent, &conn)?;
-                                        }
-                                        READY_STATUS_IDLE
-                                    }
-                                    Some(OpenTx::Explicit) => {
-                                        if discard_until_sync {
-                                            READY_STATUS_FAILED_TRANSACTION_BLOCK
-                                        } else {
-                                            READY_STATUS_TRANSACTION_BLOCK
-                                        }
-                                    }
-                                    None => READY_STATUS_IDLE,
-                                };
+                                send_ready(
+                                    &agent,
+                                    &conn,
+                                    &mut open_tx,
+                                    discard_until_sync,
+                                    &back_tx,
+                                )?;
 
                                 // reset this
                                 discard_until_sync = false;
-
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                                            ready_status,
-                                        )),
-                                        true,
-                                    )
-                                        .into(),
-                                )?;
                             }
                             PgWireFrontendMessage::Execute(execute) => {
                                 let name = execute.name().as_deref().unwrap_or("");
@@ -1568,6 +1569,13 @@ pub async fn start(
                                             message: e.try_into()?,
                                             flush: true,
                                         })?;
+                                        send_ready(
+                                            &agent,
+                                            &conn,
+                                            &mut open_tx,
+                                            discard_until_sync,
+                                            &back_tx,
+                                        )?;
                                         continue 'outer;
                                     }
                                 }
@@ -1739,7 +1747,11 @@ pub async fn start(
                     }
 
                     Ok::<_, BoxError>(())
-                })?;
+                });
+
+                if let Err(e) = res {
+                    error!("connection failed: {e}");
+                }
 
                 Ok::<_, BoxError>(())
             });
@@ -1751,6 +1763,49 @@ pub async fn start(
     });
 
     Ok(PgServer { local_addr })
+}
+
+fn send_ready(
+    agent: &Agent,
+    conn: &Connection,
+    open_tx: &mut Option<OpenTx>,
+    discard_until_sync: bool,
+    back_tx: &Sender<BackendResponse>,
+) -> Result<(), BoxError> {
+    let ready_status = match open_tx {
+        Some(OpenTx::Implicit) => {
+            if discard_until_sync {
+                // an error occured, rollback implicit tx!
+                warn!("receive Sync message w/ an error to send, rolling back implicit tx");
+                conn.execute_batch("ROLLBACK")?;
+            } else {
+                // no error, commit implicit tx
+                warn!("receive Sync message, committing implicit tx");
+                handle_commit(agent, conn)?;
+            }
+            *open_tx = None;
+
+            READY_STATUS_IDLE
+        }
+        Some(OpenTx::Explicit) => {
+            if discard_until_sync {
+                READY_STATUS_FAILED_TRANSACTION_BLOCK
+            } else {
+                READY_STATUS_TRANSACTION_BLOCK
+            }
+        }
+        None => READY_STATUS_IDLE,
+    };
+
+    back_tx.blocking_send(
+        (
+            PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(ready_status)),
+            true,
+        )
+            .into(),
+    )?;
+
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
