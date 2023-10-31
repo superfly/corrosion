@@ -228,6 +228,10 @@ impl ParsedCmd {
         matches!(self, ParsedCmd::Postgres(PgStatement::ShowVariable { .. }))
     }
 
+    pub fn is_set(&self) -> bool {
+        matches!(self, ParsedCmd::Postgres(PgStatement::SetVariable { .. }))
+    }
+
     fn tag(&self) -> StmtTag {
         match &self {
             ParsedCmd::Sqlite(Cmd::Stmt(stmt)) => match stmt {
@@ -600,7 +604,12 @@ pub async fn start(
                     'outer: while let Some(msg) = front_rx.blocking_recv() {
                         debug!("msg: {msg:?}");
 
-                        if discard_until_sync && !matches!(msg, PgWireFrontendMessage::Sync(_)) {
+                        if discard_until_sync
+                            && !matches!(
+                                msg,
+                                PgWireFrontendMessage::Sync(_) | PgWireFrontendMessage::Flush(_)
+                            )
+                        {
                             debug!("discarding message due to previous error");
                             continue;
                         }
@@ -1795,6 +1804,19 @@ fn handle_query(
             .blocking_send(
                 (
                     PgWireBackendMessage::CommandComplete(CommandComplete::new("SHOW".into())),
+                    true,
+                )
+                    .into(),
+            )
+            .map_err(|_| QueryError::BackendResponseSendFailed)?;
+        return Ok(());
+    }
+
+    if cmd.is_set() {
+        back_tx
+            .blocking_send(
+                (
+                    PgWireBackendMessage::CommandComplete(CommandComplete::new("SET".into())),
                     true,
                 )
                     .into(),
