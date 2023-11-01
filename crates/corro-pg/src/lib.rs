@@ -2358,8 +2358,13 @@ fn extract_param<'a>(
                             SqliteName::Name(_) => {}
                             SqliteName::Qualified(tbl_name, col_name)
                             | SqliteName::DoublyQualified(_, tbl_name, col_name) => {
+                                let col_name = if col_name.0.starts_with('"') {
+                                    rem_first_and_last(&col_name.0)
+                                } else {
+                                    &col_name.0
+                                };
                                 if let Some(table) = tables.get(&tbl_name.0) {
-                                    if let Some(col) = table.columns.get(&col_name.0) {
+                                    if let Some(col) = table.columns.get(col_name) {
                                         params.push(col.sql_type());
                                     }
                                 }
@@ -2775,11 +2780,6 @@ mod tests {
             println!("t.id: {:?}", row.try_get::<_, i64>(0));
             println!("t.text: {:?}", row.try_get::<_, String>(1));
             println!("t2text: {:?}", row.try_get::<_, String>(2));
-
-            let row = client
-        .query_one("SELECT t.id, t.text, t2.text as t2text FROM tests t LEFT JOIN tests2 t2 WHERE t.id IN (?, ?, ?, ?)", &[&2i64, &10i64, &15i64, &23i64])
-        .await?;
-            println!("ROW: {row:?}");
         }
 
         tripwire_tx.send(()).await.ok();
