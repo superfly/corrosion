@@ -1928,7 +1928,7 @@ fn handle_query(
         let ncols = schema.len();
 
         let mut count = 0;
-        while let Ok(Some(row)) = rows.next() {
+        while let Some(row) = rows.next()? {
             count += 1;
             let mut encoder = DataRowEncoder::new(schema.clone());
             for idx in 0..ncols {
@@ -2775,6 +2775,11 @@ mod tests {
             println!("t.id: {:?}", row.try_get::<_, i64>(0));
             println!("t.text: {:?}", row.try_get::<_, String>(1));
             println!("t2text: {:?}", row.try_get::<_, String>(2));
+
+            let row = client
+        .query_one("SELECT t.id, t.text, t2.text as t2text FROM tests t LEFT JOIN tests2 t2 WHERE t.id IN (?, ?, ?, ?)", &[&2i64, &10i64, &15i64, &23i64])
+        .await?;
+            println!("ROW: {row:?}");
         }
 
         tripwire_tx.send(()).await.ok();
