@@ -3,8 +3,10 @@ mod vtab;
 
 use std::{
     collections::{HashMap, VecDeque},
+    fmt,
     future::poll_fn,
     net::SocketAddr,
+    str::{FromStr, Utf8Error},
     sync::Arc,
 };
 
@@ -29,7 +31,9 @@ use pgwire::{
         data::{NoData, ParameterDescription, RowDescription},
         extendedquery::{BindComplete, CloseComplete, ParseComplete, PortalSuspended},
         response::{
-            EmptyQueryResponse, ReadyForQuery, READY_STATUS_IDLE, READY_STATUS_TRANSACTION_BLOCK,
+            CommandComplete, EmptyQueryResponse, ErrorResponse, ReadyForQuery,
+            READY_STATUS_FAILED_TRANSACTION_BLOCK, READY_STATUS_IDLE,
+            READY_STATUS_TRANSACTION_BLOCK,
         },
         startup::{ParameterStatus, SslRequest},
         PgWireBackendMessage, PgWireFrontendMessage,
@@ -37,16 +41,20 @@ use pgwire::{
     tokio::PgWireMessageServerCodec,
 };
 use postgres_types::{FromSql, Type};
-use rusqlite::{named_params, types::ValueRef, vtab::eponymous_only_module, Connection, Statement};
+use rusqlite::{
+    functions::FunctionFlags, named_params, types::ValueRef, vtab::eponymous_only_module,
+    Connection, Statement,
+};
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
     As, Cmd, CreateTableBody, Expr, FromClause, Id, InsertBody, Name, OneSelect, ResultColumn,
     Select, SelectTable, Stmt,
 };
+use sqlparser::ast::Statement as PgStatement;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::mpsc::channel,
+    sync::mpsc::{channel, Sender},
     task::block_in_place,
 };
 use tokio_util::{codec::Framed, sync::CancellationToken};
@@ -55,7 +63,13 @@ use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
 use crate::{
     sql_state::SqlState,
-    vtab::{pg_range::PgRangeTable, pg_type::PgTypeTable},
+    vtab::{
+        pg_class::PgClassTable,
+        pg_database::{PgDatabase, PgDatabaseTable},
+        pg_namespace::PgNamespaceTable,
+        pg_range::PgRangeTable,
+        pg_type::PgTypeTable,
+    },
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -106,6 +120,21 @@ enum StmtTag {
 }
 
 impl StmtTag {
+    fn into_command_complete(self, rows: usize, conn: &Connection) -> CommandComplete {
+        if self.returns_num_rows() {
+            self.tag(Some(rows)).into()
+        } else if self.returns_rows_affected() {
+            let changes = conn.changes();
+            if matches!(self, StmtTag::Insert) {
+                CommandComplete::new(format!("INSERT 0 {changes}"))
+            } else {
+                self.tag(Some(changes as usize)).into()
+            }
+        } else {
+            self.tag(None).into()
+        }
+    }
+
     fn returns_rows_affected(&self) -> bool {
         matches!(self, StmtTag::Insert | StmtTag::Update | StmtTag::Delete)
     }
@@ -168,22 +197,47 @@ impl<'a> Portal<'a> {
 }
 
 #[derive(Clone, Debug)]
-struct ParsedCmd(Cmd);
+enum ParsedCmd {
+    Sqlite(Cmd),
+    Postgres(PgStatement),
+}
 
 impl ParsedCmd {
     pub fn is_begin(&self) -> bool {
-        matches!(self.0, Cmd::Stmt(Stmt::Begin(_, _)))
+        matches!(
+            self,
+            ParsedCmd::Sqlite(Cmd::Stmt(Stmt::Begin(_, _)))
+                | ParsedCmd::Postgres(PgStatement::StartTransaction { .. })
+        )
     }
+
     pub fn is_commit(&self) -> bool {
-        matches!(self.0, Cmd::Stmt(Stmt::Commit(_)))
+        matches!(
+            self,
+            ParsedCmd::Sqlite(Cmd::Stmt(Stmt::Commit(_)))
+                | ParsedCmd::Postgres(PgStatement::Commit { .. })
+        )
     }
+
     pub fn is_rollback(&self) -> bool {
-        matches!(self.0, Cmd::Stmt(Stmt::Rollback { .. }))
+        matches!(self, ParsedCmd::Sqlite(Cmd::Stmt(Stmt::Rollback { .. })))
+    }
+
+    pub fn is_pg(&self) -> bool {
+        matches!(self, ParsedCmd::Postgres(_))
+    }
+
+    pub fn is_show(&self) -> bool {
+        matches!(self, ParsedCmd::Postgres(PgStatement::ShowVariable { .. }))
+    }
+
+    pub fn is_set(&self) -> bool {
+        matches!(self, ParsedCmd::Postgres(PgStatement::SetVariable { .. }))
     }
 
     fn tag(&self) -> StmtTag {
-        match &self.0 {
-            Cmd::Stmt(stmt) => match stmt {
+        match &self {
+            ParsedCmd::Sqlite(Cmd::Stmt(stmt)) => match stmt {
                 Stmt::Select(_) => StmtTag::Select,
                 Stmt::CreateTable {
                     body: CreateTableBody::AsSelect(_),
@@ -215,24 +269,60 @@ impl ParsedCmd {
                 Stmt::Update { .. } => StmtTag::Update,
                 Stmt::Vacuum(_, _) => StmtTag::Vacuum,
             },
+            ParsedCmd::Postgres(stmt) => match stmt {
+                PgStatement::StartTransaction { .. } => StmtTag::Begin,
+                PgStatement::Commit { .. } => StmtTag::Commit,
+                _ => StmtTag::Other,
+            },
             _ => StmtTag::Other,
         }
     }
 }
 
-fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, sqlite3_parser::lexer::sql::Error> {
+impl fmt::Display for ParsedCmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParsedCmd::Sqlite(cmd) => cmd.fmt(f),
+            ParsedCmd::Postgres(stmt) => stmt.fmt(f),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParseError {
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] sqlite3_parser::lexer::sql::Error),
+    #[error("pg: {0}")]
+    Postgres(#[from] sqlparser::parser::ParserError),
+}
+
+fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
     let mut cmds = VecDeque::new();
 
-    let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
+    let normalized = sql.trim_matches(';').trim();
+    if normalized.is_empty() {
+        return Ok(cmds);
+    }
+
+    let mut parser = sqlite3_parser::lexer::sql::Parser::new(normalized.as_bytes());
     loop {
         match parser.next() {
             Ok(Some(cmd)) => {
-                cmds.push_back(ParsedCmd(cmd));
+                cmds.push_back(ParsedCmd::Sqlite(cmd));
             }
             Ok(None) => {
                 break;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                debug!("could not parse as sqlite: {e}");
+                let stmts = sqlparser::parser::Parser::parse_sql(
+                    &sqlparser::dialect::PostgreSqlDialect {},
+                    normalized,
+                )?;
+                for stmt in stmts {
+                    cmds.push_back(ParsedCmd::Postgres(stmt));
+                }
+            }
         }
     }
 
@@ -297,16 +387,13 @@ pub async fn start(
     let server = TcpListener::bind(pg.bind_addr).await?;
     let local_addr = server.local_addr()?;
 
-    // let tmp_dir = tempfile::TempDir::new()?;
-    // let pg_system_path = tmp_dir.path().join("pg_system.sqlite");
-
     tokio::spawn(async move {
         loop {
             let (mut conn, remote_addr) = match server.accept().preemptible(&mut tripwire).await {
                 Outcome::Completed(res) => res?,
                 Outcome::Preempted(_) => break,
             };
-            info!("accepted a conn, addr: {remote_addr}");
+            debug!("Accepted a PostgreSQL connection (from: {remote_addr})");
 
             let agent = agent.clone();
             tokio::spawn(async move {
@@ -319,12 +406,16 @@ pub async fn start(
                     PgWireMessageServerCodec::new(ClientInfoHolder::new(remote_addr, false)),
                 );
 
-                let msg = framed.next().await.unwrap()?;
-                trace!("msg: {msg:?}");
+                let msg = match framed.next().await {
+                    Some(msg) => msg?,
+                    None => {
+                        return Ok(());
+                    }
+                };
 
                 match msg {
                     PgWireFrontendMessage::Startup(startup) => {
-                        info!("received startup message: {startup:?}");
+                        debug!("received startup message: {startup:?}");
                     }
                     _ => {
                         framed
@@ -426,7 +517,11 @@ pub async fn start(
                         while let Some(back) = back_rx.recv().await {
                             match back {
                                 BackendResponse::Message { message, flush } => {
-                                    debug!("sending: {message:?}");
+                                    if let PgWireBackendMessage::ErrorResponse(e) = &message {
+                                        warn!("sending: {e:?}");
+                                    } else {
+                                        debug!("sending: {message:?}");
+                                    }
                                     sink.feed(message).await?;
                                     if flush {
                                         sink.flush().await?;
@@ -448,9 +543,45 @@ pub async fn start(
                     int_handle.interrupt();
                 });
 
-                block_in_place(|| {
+                let res = block_in_place(|| {
+                    conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
+
+                    let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
+
+                    conn.create_module(
+                        "pg_database",
+                        eponymous_only_module::<PgDatabaseTable>(),
+                        Some(dbs),
+                    )?;
                     conn.create_module("pg_type", eponymous_only_module::<PgTypeTable>(), None)?;
                     conn.create_module("pg_range", eponymous_only_module::<PgRangeTable>(), None)?;
+                    conn.create_module(
+                        "pg_namespace",
+                        eponymous_only_module::<PgNamespaceTable>(),
+                        None,
+                    )?;
+                    conn.create_module("pg_class", eponymous_only_module::<PgClassTable>(), None)?;
+
+                    conn.create_scalar_function(
+                        "version",
+                        0,
+                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                        |_ctx| Ok("PostgreSQL 14.9"),
+                    )?;
+
+                    conn.create_scalar_function(
+                        "pg_my_temp_schema",
+                        0,
+                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                        |_ctx| Ok(0i64),
+                    )?;
+
+                    conn.create_scalar_function(
+                        "pg_is_other_temp_schema",
+                        1,
+                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                        |_ctx| Ok(false),
+                    )?;
 
                     let schema = match compute_schema(&conn) {
                         Ok(schema) => schema,
@@ -478,10 +609,22 @@ pub async fn start(
 
                     let mut portals: HashMap<CompactString, Portal> = HashMap::new();
 
+                    let mut discard_until_sync = false;
+
                     let mut open_tx = None;
 
                     'outer: while let Some(msg) = front_rx.blocking_recv() {
                         debug!("msg: {msg:?}");
+
+                        if discard_until_sync
+                            && !matches!(
+                                msg,
+                                PgWireFrontendMessage::Sync(_) | PgWireFrontendMessage::Flush(_)
+                            )
+                        {
+                            debug!("discarding message due to previous error");
+                            continue;
+                        }
 
                         match msg {
                             PgWireFrontendMessage::Startup(_) => {
@@ -520,6 +663,7 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
+                                        discard_until_sync = true;
                                         continue;
                                     }
                                 };
@@ -547,6 +691,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
+                                            discard_until_sync = true;
                                             continue;
                                         }
 
@@ -569,6 +714,7 @@ pub async fn start(
                                                     )
                                                         .into(),
                                                 )?;
+                                                discard_until_sync = true;
                                                 continue;
                                             }
                                         };
@@ -580,14 +726,28 @@ pub async fn start(
                                             .collect();
 
                                         if param_types.len() != prepped.parameter_count() {
-                                            param_types = parameter_types(&schema, &parsed_cmd.0)
+                                            param_types = parameter_types(&schema, &parsed_cmd)
                                                 .into_iter()
                                                 .map(|param| match param {
-                                                    SqliteType::Null => unreachable!(),
-                                                    SqliteType::Integer => Type::INT8,
-                                                    SqliteType::Real => Type::FLOAT8,
-                                                    SqliteType::Text => Type::TEXT,
-                                                    SqliteType::Blob => Type::BYTEA,
+                                                    (SqliteType::Null, _) => unreachable!(),
+                                                    (SqliteType::Text, src) => match src {
+                                                        Some("JSON") => Type::JSON,
+                                                        _ => Type::TEXT,
+                                                    },
+                                                    (SqliteType::Numeric, Some(src)) => match src {
+                                                        "BOOLEAN" => Type::BOOL,
+                                                        _ => Type::FLOAT8,
+                                                    },
+                                                    (SqliteType::Numeric, src) => match src {
+                                                        Some("DATETIME") => Type::TIMESTAMP,
+                                                        _ => Type::FLOAT8,
+                                                    },
+                                                    (SqliteType::Integer, _src) => Type::INT8,
+                                                    (SqliteType::Real, _src) => Type::FLOAT8,
+                                                    (SqliteType::Blob, src) => match src {
+                                                        Some("JSONB") => Type::JSONB,
+                                                        _ => Type::BYTEA,
+                                                    },
                                                 })
                                                 .collect();
                                         }
@@ -599,15 +759,9 @@ pub async fn start(
                                             ) {
                                                 Ok(t) => t,
                                                 Err(e) => {
-                                                    back_tx.blocking_send(
-                                                        (
-                                                            PgWireBackendMessage::ErrorResponse(
-                                                                e.into(),
-                                                            ),
-                                                            true,
-                                                        )
-                                                            .into(),
-                                                    )?;
+                                                    back_tx
+                                                        .blocking_send((e.into(), true).into())?;
+                                                    discard_until_sync = true;
                                                     continue 'outer;
                                                 }
                                             };
@@ -660,6 +814,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
+                                            discard_until_sync = true;
                                         }
                                         Some(Prepared::Empty) => {
                                             back_tx.blocking_send(
@@ -720,6 +875,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
+                                            discard_until_sync = true;
                                         }
                                         Some(Portal::Empty { .. }) => {
                                             back_tx.blocking_send(
@@ -793,6 +949,7 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
+                                        discard_until_sync = true;
                                         continue;
                                     }
                                 }
@@ -822,6 +979,7 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
+                                        discard_until_sync = true;
                                         continue;
                                     }
                                     Some(Prepared::Empty) => {
@@ -855,6 +1013,7 @@ pub async fn start(
                                                     )
                                                         .into(),
                                                 )?;
+                                                discard_until_sync = true;
                                                 continue;
                                             }
                                         };
@@ -864,6 +1023,50 @@ pub async fn start(
                                             bind.parameters().len(),
                                             prepped.parameter_count()
                                         );
+
+                                        trace!("param types: {param_types:?}");
+
+                                        let mut format_codes = match bind
+                                            .parameter_format_codes()
+                                            .iter()
+                                            .map(|code| {
+                                                Ok(match *code {
+                                                    0 => FormatCode::Text,
+                                                    1 => FormatCode::Binary,
+                                                    n => return Err(UnknownFormatCode(n)),
+                                                })
+                                            })
+                                            .collect::<Result<Vec<FormatCode>, UnknownFormatCode>>()
+                                        {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::ErrorResponse(
+                                                            ErrorInfo::new(
+                                                                "ERROR".to_owned(),
+                                                                "XX000".to_owned(),
+                                                                e.to_string(),
+                                                            )
+                                                            .into(),
+                                                        ),
+                                                        true,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                                discard_until_sync = true;
+                                                continue;
+                                            }
+                                        };
+                                        if format_codes.is_empty() {
+                                            // no format codes? default to text
+                                            format_codes =
+                                                vec![FormatCode::Text; bind.parameters().len()];
+                                        } else if format_codes.len() == 1 {
+                                            // single code means we should use it for all others
+                                            format_codes =
+                                                vec![format_codes[0]; bind.parameters().len()];
+                                        }
 
                                         for (i, param) in bind.parameters().iter().enumerate() {
                                             let idx = i + 1;
@@ -888,6 +1091,7 @@ pub async fn start(
                                                             )
                                                                 .into(),
                                                         )?;
+                                                        discard_until_sync = true;
                                                         continue 'outer;
                                                     }
                                                     continue;
@@ -895,8 +1099,11 @@ pub async fn start(
                                                 Some(b) => b,
                                             };
 
+                                            trace!("got param bytes: {b:?}");
+
                                             match param_types.get(i) {
                                                 None => {
+                                                    trace!("no param type found!");
                                                     back_tx.blocking_send(
                                                         (
                                                             PgWireBackendMessage::ErrorResponse(
@@ -911,100 +1118,137 @@ pub async fn start(
                                                         )
                                                             .into(),
                                                     )?;
+                                                    discard_until_sync = true;
                                                     continue 'outer;
                                                 }
                                                 Some(param_type) => {
+                                                    let format_code = format_codes[i];
+                                                    trace!("parsing param_type {param_type:?}, format_code: {format_code:?}, bytes: {b:?}");
                                                     match param_type {
-                                                        &Type::BOOL => {
-                                                            let value: bool = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                        t @ &Type::BOOL => {
+                                                            let value: bool = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::INT2 => {
-                                                            let value: i16 = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                        t @ &Type::INT2 => {
+                                                            let value: i16 = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::INT4 => {
-                                                            let value: i32 = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                        t @ &Type::INT4 => {
+                                                            let value: i32 = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::INT8 => {
-                                                            let value: i64 = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                        t @ &Type::INT8 => {
+                                                            let value: i64 = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::TEXT | &Type::VARCHAR => {
-                                                            let value: &str = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+
+                                                        t @ &Type::TEXT
+                                                        | t @ &Type::VARCHAR
+                                                        | t @ &Type::JSON => {
+                                                            let value: &str = match format_code {
+                                                                FormatCode::Text => {
+                                                                    std::str::from_utf8(b)?
+                                                                }
+                                                                FormatCode::Binary => {
+                                                                    FromSql::from_sql(t, b)?
+                                                                }
+                                                            };
+                                                            trace!("binding idx {idx} w/ value: {value}");
+                                                            prepped
+                                                                .raw_bind_parameter(idx, value)?;
+                                                        }
+                                                        t @ &Type::FLOAT4 => {
+                                                            let value: f32 = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::FLOAT4 => {
-                                                            let value: f32 = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+                                                        t @ &Type::FLOAT8 => {
+                                                            let value: f64 = from_type_and_format(
+                                                                t,
+                                                                b,
+                                                                format_code,
                                                             )?;
                                                             trace!("binding idx {idx} w/ value: {value}");
                                                             prepped
                                                                 .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::FLOAT8 => {
-                                                            let value: f64 = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
+
+                                                        &Type::BYTEA | &Type::JSONB => {
+                                                            let maybe_decoded = matches!(
+                                                                format_code,
+                                                                FormatCode::Text
+                                                            )
+                                                            .then(|| hex::decode(b).ok())
+                                                            .flatten();
+
+                                                            trace!("binding idx {idx} w/ decoded value: {maybe_decoded:?} (bytes: {b:?})");
+                                                            prepped.raw_bind_parameter(
+                                                                idx,
+                                                                maybe_decoded
+                                                                    .as_deref()
+                                                                    .unwrap_or(b),
                                                             )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
                                                         }
-                                                        &Type::BYTEA => {
-                                                            let value: &[u8] = FromSql::from_sql(
-                                                                param_type,
-                                                                b.as_ref(),
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value:?}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
+
+                                                        // t @ &Type::TIMESTAMP => {
+                                                        //     let value: time::OffsetDateTime =
+                                                        //         from_type_and_format(
+                                                        //             t,
+                                                        //             b,
+                                                        //             format_code,
+                                                        //         )?;
+
+                                                        //     trace!("binding idx {idx} w/ value: {value}");
+                                                        //     prepped
+                                                        //         .raw_bind_parameter(idx, value)?;
+                                                        // }
                                                         t => {
                                                             warn!("unsupported type: {t:?}");
                                                             back_tx.blocking_send(
-                                                            (
-                                                                PgWireBackendMessage::ErrorResponse(
-                                                                    ErrorInfo::new(
-                                                                        "ERROR".to_owned(),
-                                                                        "XX000".to_owned(),
-                                                                        format!(
-                                                                        "unsupported type {t} at index {i}"
+                                                                (
+                                                                    PgWireBackendMessage::ErrorResponse(
+                                                                        ErrorInfo::new(
+                                                                            "ERROR".to_owned(),
+                                                                            "XX000".to_owned(),
+                                                                            format!(
+                                                                            "unsupported type {t} at index {i}"
+                                                                        ),
+                                                                        )
+                                                                        .into(),
                                                                     ),
-                                                                    )
-                                                                    .into(),
-                                                                ),
-                                                                true,
-                                                            )
-                                                                .into(),
-                                                        )?;
+                                                                    true,
+                                                                ).into(),
+                                                            )?;
+                                                            discard_until_sync = true;
                                                             continue 'outer;
                                                         }
                                                     }
@@ -1040,20 +1284,16 @@ pub async fn start(
                                 )?;
                             }
                             PgWireFrontendMessage::Sync(_) => {
-                                let ready_status = if open_tx.is_some() {
-                                    READY_STATUS_TRANSACTION_BLOCK
-                                } else {
-                                    READY_STATUS_IDLE
-                                };
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                                            ready_status,
-                                        )),
-                                        true,
-                                    )
-                                        .into(),
+                                send_ready(
+                                    &agent,
+                                    &conn,
+                                    &mut open_tx,
+                                    discard_until_sync,
+                                    &back_tx,
                                 )?;
+
+                                // reset this
+                                discard_until_sync = false;
                             }
                             PgWireFrontendMessage::Execute(execute) => {
                                 let name = execute.name().as_deref().unwrap_or("");
@@ -1092,6 +1332,7 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
+                                        discard_until_sync = true;
                                         continue;
                                     }
                                 };
@@ -1114,6 +1355,7 @@ pub async fn start(
                                                     )
                                                         .into(),
                                                 )?;
+                                                discard_until_sync = true;
                                                 continue 'outer;
                                             }
                                         };
@@ -1183,6 +1425,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
+                                            discard_until_sync = true;
                                             continue 'outer;
                                         }
                                     };
@@ -1234,6 +1477,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
+                                            discard_until_sync = true;
                                             continue 'outer;
                                         }
                                     }
@@ -1241,24 +1485,19 @@ pub async fn start(
 
                                 trace!("done w/ rows, computing tag: {tag:?}");
 
-                                let tag = if tag.returns_num_rows() {
-                                    tag.tag(Some(count))
-                                } else if tag.returns_rows_affected() {
-                                    tag.tag(Some(conn.changes() as usize))
-                                } else {
-                                    tag.tag(None)
-                                };
-
                                 // done!
                                 back_tx.blocking_send(
-                                    (PgWireBackendMessage::CommandComplete(tag.into()), true)
+                                    (
+                                        PgWireBackendMessage::CommandComplete(
+                                            (*tag).into_command_complete(count, &conn),
+                                        ),
+                                        true,
+                                    )
                                         .into(),
                                 )?;
                             }
                             PgWireFrontendMessage::Query(query) => {
-                                let trimmed = query.query().trim_matches(';');
-
-                                let parsed_query = match parse_query(trimmed) {
+                                let parsed_query = match parse_query(query.query()) {
                                     Ok(q) => q,
                                     Err(e) => {
                                         back_tx.blocking_send(
@@ -1304,230 +1543,26 @@ pub async fn start(
                                 }
 
                                 for cmd in parsed_query.into_iter() {
-                                    // need to start an implicit transaction
-                                    if open_tx.is_none() && !cmd.is_begin() {
-                                        if let Err(e) = conn.execute_batch("BEGIN") {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "ERROR".to_owned(),
-                                                            "XX000".to_owned(),
-                                                            e.to_string(),
-                                                        )
-                                                        .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-                                            continue;
-                                        }
-                                        trace!("started IMPLICIT tx");
-                                        open_tx = Some(OpenTx::Implicit);
-                                    }
-
-                                    // close the current implement tx first
-                                    if matches!(open_tx, Some(OpenTx::Implicit)) && cmd.is_begin() {
-                                        trace!("committing IMPLICIT tx");
-                                        open_tx = None;
-
-                                        if let Err(e) = handle_commit(&agent, &conn, "COMMIT") {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "ERROR".to_owned(),
-                                                            "XX000".to_owned(),
-                                                            e.to_string(),
-                                                        )
-                                                        .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-
-                                            continue 'outer;
-                                        }
-                                        trace!("committed IMPLICIT tx");
-                                    }
-
-                                    let count = if cmd.is_commit() {
-                                        open_tx = None;
-
-                                        if let Err(e) =
-                                            handle_commit(&agent, &conn, &cmd.0.to_string())
-                                        {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "ERROR".to_owned(),
-                                                            "XX000".to_owned(),
-                                                            e.to_string(),
-                                                        )
-                                                        .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-
-                                            continue 'outer;
-                                        }
-                                        None
-                                    } else {
-                                        let mut prepped = match conn.prepare(&cmd.0.to_string()) {
-                                            Ok(prepped) => prepped,
-                                            Err(e) => {
-                                                back_tx.blocking_send(
-                                                    (
-                                                        PgWireBackendMessage::ErrorResponse(
-                                                            ErrorInfo::new(
-                                                                "ERROR".to_owned(),
-                                                                "XX000".to_owned(),
-                                                                e.to_string(),
-                                                            )
-                                                            .into(),
-                                                        ),
-                                                        true,
-                                                    )
-                                                        .into(),
-                                                )?;
-                                                continue 'outer;
-                                            }
-                                        };
-
-                                        let mut fields = vec![];
-                                        for col in prepped.columns() {
-                                            let col_type = match name_to_type(
-                                                col.decl_type().unwrap_or("text"),
-                                            ) {
-                                                Ok(t) => t,
-                                                Err(e) => {
-                                                    back_tx.blocking_send(
-                                                        (
-                                                            PgWireBackendMessage::ErrorResponse(
-                                                                e.into(),
-                                                            ),
-                                                            true,
-                                                        )
-                                                            .into(),
-                                                    )?;
-                                                    continue 'outer;
-                                                }
-                                            };
-                                            fields.push(FieldInfo::new(
-                                                col.name().to_string(),
-                                                None,
-                                                None,
-                                                col_type,
-                                                FieldFormat::Text,
-                                            ));
-                                        }
-
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::RowDescription(
-                                                    RowDescription::new(
-                                                        fields.iter().map(Into::into).collect(),
-                                                    ),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
+                                    if let Err(e) = handle_query(
+                                        &agent,
+                                        &conn,
+                                        &cmd,
+                                        &mut open_tx,
+                                        &back_tx,
+                                        true,
+                                    ) {
+                                        back_tx.blocking_send(BackendResponse::Message {
+                                            message: e.try_into()?,
+                                            flush: true,
+                                        })?;
+                                        send_ready(
+                                            &agent,
+                                            &conn,
+                                            &mut open_tx,
+                                            discard_until_sync,
+                                            &back_tx,
                                         )?;
-
-                                        let schema = Arc::new(fields);
-
-                                        let mut rows = prepped.raw_query();
-                                        let ncols = schema.len();
-
-                                        let mut count = 0;
-                                        while let Ok(Some(row)) = rows.next() {
-                                            count += 1;
-                                            let mut encoder = DataRowEncoder::new(schema.clone());
-                                            for idx in 0..ncols {
-                                                let data = row.get_ref_unwrap::<usize>(idx);
-                                                match data {
-                                                    ValueRef::Null => {
-                                                        encoder.encode_field(&None::<i8>).unwrap()
-                                                    }
-                                                    ValueRef::Integer(i) => {
-                                                        encoder.encode_field(&i).unwrap();
-                                                    }
-                                                    ValueRef::Real(f) => {
-                                                        encoder.encode_field(&f).unwrap();
-                                                    }
-                                                    ValueRef::Text(t) => {
-                                                        encoder
-                                                            .encode_field(
-                                                                &String::from_utf8_lossy(t)
-                                                                    .as_ref(),
-                                                            )
-                                                            .unwrap();
-                                                    }
-                                                    ValueRef::Blob(b) => {
-                                                        encoder.encode_field(&b).unwrap();
-                                                    }
-                                                }
-                                            }
-                                            match encoder.finish() {
-                                                Ok(data_row) => {
-                                                    back_tx.blocking_send(
-                                                        (
-                                                            PgWireBackendMessage::DataRow(data_row),
-                                                            false,
-                                                        )
-                                                            .into(),
-                                                    )?;
-                                                }
-                                                Err(e) => {
-                                                    back_tx.blocking_send(
-                                                        (
-                                                            PgWireBackendMessage::ErrorResponse(
-                                                                ErrorInfo::new(
-                                                                    "ERROR".to_owned(),
-                                                                    "XX000".to_owned(),
-                                                                    e.to_string(),
-                                                                )
-                                                                .into(),
-                                                            ),
-                                                            true,
-                                                        )
-                                                            .into(),
-                                                    )?;
-                                                    continue 'outer;
-                                                }
-                                            }
-                                        }
-                                        Some(count)
-                                    };
-
-                                    let tag = cmd.tag();
-
-                                    let tag = if tag.returns_num_rows() {
-                                        tag.tag(count)
-                                    } else if tag.returns_rows_affected() {
-                                        tag.tag(Some(conn.changes() as usize))
-                                    } else {
-                                        tag.tag(None)
-                                    };
-
-                                    back_tx.blocking_send(
-                                        (PgWireBackendMessage::CommandComplete(tag.into()), true)
-                                            .into(),
-                                    )?;
-
-                                    if cmd.is_begin() {
-                                        trace!("setting EXPLICIT tx");
-                                        // explicit tx
-                                        open_tx = Some(OpenTx::Explicit)
-                                    } else if cmd.is_rollback() || cmd.is_commit() {
-                                        trace!("clearing current open tx");
-                                        // if this was a rollback, remove the current open tx
-                                        open_tx = None;
+                                        continue 'outer;
                                     }
                                 }
 
@@ -1536,7 +1571,7 @@ pub async fn start(
                                     trace!("committing IMPLICIT tx");
                                     open_tx = None;
 
-                                    if let Err(e) = handle_commit(&agent, &conn, "COMMIT") {
+                                    if let Err(e) = handle_commit(&agent, &conn) {
                                         back_tx.blocking_send(
                                             (
                                                 PgWireBackendMessage::ErrorResponse(
@@ -1635,6 +1670,7 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
+                                        discard_until_sync = true;
                                         continue;
                                     }
                                 }
@@ -1697,7 +1733,11 @@ pub async fn start(
                     }
 
                     Ok::<_, BoxError>(())
-                })?;
+                });
+
+                if let Err(e) = res {
+                    error!("connection failed: {e}");
+                }
 
                 Ok::<_, BoxError>(())
             });
@@ -1711,24 +1751,307 @@ pub async fn start(
     Ok(PgServer { local_addr })
 }
 
-#[allow(clippy::result_large_err)]
-fn name_to_type(name: &str) -> Result<Type, ErrorInfo> {
-    match name.to_uppercase().as_ref() {
-        "ANY" => Ok(Type::ANY),
-        "INT" | "INTEGER" => Ok(Type::INT8),
-        "VARCHAR" => Ok(Type::VARCHAR),
-        "TEXT" => Ok(Type::TEXT),
-        "BINARY" | "BLOB" => Ok(Type::BYTEA),
-        "FLOAT" => Ok(Type::FLOAT8),
-        _ => Err(ErrorInfo::new(
-            "ERROR".to_owned(),
-            "42846".to_owned(),
-            format!("Unsupported data type: {name}"),
-        )),
+fn send_ready(
+    agent: &Agent,
+    conn: &Connection,
+    open_tx: &mut Option<OpenTx>,
+    discard_until_sync: bool,
+    back_tx: &Sender<BackendResponse>,
+) -> Result<(), BoxError> {
+    let ready_status = match open_tx {
+        Some(OpenTx::Implicit) => {
+            if discard_until_sync {
+                // an error occured, rollback implicit tx!
+                warn!("receive Sync message w/ an error to send, rolling back implicit tx");
+                conn.execute_batch("ROLLBACK")?;
+            } else {
+                // no error, commit implicit tx
+                warn!("receive Sync message, committing implicit tx");
+                handle_commit(agent, conn)?;
+            }
+            *open_tx = None;
+
+            READY_STATUS_IDLE
+        }
+        Some(OpenTx::Explicit) => {
+            if discard_until_sync {
+                READY_STATUS_FAILED_TRANSACTION_BLOCK
+            } else {
+                READY_STATUS_TRANSACTION_BLOCK
+            }
+        }
+        None => READY_STATUS_IDLE,
+    };
+
+    back_tx.blocking_send(
+        (
+            PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(ready_status)),
+            true,
+        )
+            .into(),
+    )?;
+
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+enum QueryError {
+    #[error(transparent)]
+    Rusqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Unsupported(#[from] UnsupportedSqliteToPostgresType),
+    #[error("statement is not parsable as SQLite-flavored SQL")]
+    NotSqlite,
+    #[error(transparent)]
+    PgWire(#[from] PgWireError),
+    #[error("backend response channel is closed")]
+    BackendResponseSendFailed,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("channel is closed")]
+struct ChannelClosed;
+
+impl TryFrom<QueryError> for PgWireBackendMessage {
+    type Error = ChannelClosed;
+
+    fn try_from(value: QueryError) -> Result<Self, Self::Error> {
+        Ok(PgWireBackendMessage::ErrorResponse(match value {
+            QueryError::Rusqlite(e) => {
+                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
+            }
+            QueryError::Unsupported(e) => e.into(),
+            e @ QueryError::NotSqlite => {
+                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
+            }
+            QueryError::PgWire(e) => {
+                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
+            }
+            QueryError::BackendResponseSendFailed => return Err(ChannelClosed),
+        }))
     }
 }
 
-fn handle_commit(agent: &Agent, conn: &Connection, commit_stmt: &str) -> rusqlite::Result<()> {
+fn handle_query(
+    agent: &Agent,
+    conn: &Connection,
+    cmd: &ParsedCmd,
+    open_tx: &mut Option<OpenTx>,
+    back_tx: &Sender<BackendResponse>,
+    send_row_desc: bool,
+) -> Result<(), QueryError> {
+    if cmd.is_show() {
+        back_tx
+            .blocking_send(
+                (
+                    PgWireBackendMessage::CommandComplete(CommandComplete::new("SHOW".into())),
+                    true,
+                )
+                    .into(),
+            )
+            .map_err(|_| QueryError::BackendResponseSendFailed)?;
+        return Ok(());
+    }
+
+    if cmd.is_set() {
+        back_tx
+            .blocking_send(
+                (
+                    PgWireBackendMessage::CommandComplete(CommandComplete::new("SET".into())),
+                    true,
+                )
+                    .into(),
+            )
+            .map_err(|_| QueryError::BackendResponseSendFailed)?;
+        return Ok(());
+    }
+
+    // need to start an implicit transaction
+    if open_tx.is_none() && !cmd.is_begin() {
+        conn.execute_batch("BEGIN")?;
+        trace!("started IMPLICIT tx");
+        *open_tx = Some(OpenTx::Implicit);
+    }
+
+    // close the current implement tx first
+    if matches!(open_tx, Some(OpenTx::Implicit)) && cmd.is_begin() {
+        trace!("committing IMPLICIT tx");
+        *open_tx = None;
+
+        handle_commit(agent, conn)?;
+        trace!("committed IMPLICIT tx");
+    }
+
+    let count = if cmd.is_commit() {
+        *open_tx = None;
+
+        handle_commit(agent, conn)?;
+        0
+    } else {
+        let mut prepped = if cmd.is_begin() {
+            conn.prepare("BEGIN")?
+        } else if cmd.is_pg() {
+            return Err(QueryError::NotSqlite);
+        } else {
+            conn.prepare(&cmd.to_string())?
+        };
+
+        let mut fields = vec![];
+        for col in prepped.columns() {
+            let col_type = name_to_type(col.decl_type().unwrap_or("text"))?;
+            fields.push(FieldInfo::new(
+                col.name().to_string(),
+                None,
+                None,
+                col_type,
+                FieldFormat::Text,
+            ));
+        }
+
+        if send_row_desc {
+            back_tx
+                .blocking_send(
+                    (
+                        PgWireBackendMessage::RowDescription(RowDescription::new(
+                            fields.iter().map(Into::into).collect(),
+                        )),
+                        true,
+                    )
+                        .into(),
+                )
+                .map_err(|_| QueryError::BackendResponseSendFailed)?;
+        }
+
+        let schema = Arc::new(fields);
+
+        let mut rows = prepped.raw_query();
+        let ncols = schema.len();
+
+        let mut count = 0;
+        while let Ok(Some(row)) = rows.next() {
+            count += 1;
+            let mut encoder = DataRowEncoder::new(schema.clone());
+            for idx in 0..ncols {
+                let data = row.get_ref_unwrap::<usize>(idx);
+                match data {
+                    ValueRef::Null => encoder.encode_field(&None::<i8>).unwrap(),
+                    ValueRef::Integer(i) => {
+                        encoder.encode_field(&i).unwrap();
+                    }
+                    ValueRef::Real(f) => {
+                        encoder.encode_field(&f).unwrap();
+                    }
+                    ValueRef::Text(t) => {
+                        encoder
+                            .encode_field(&String::from_utf8_lossy(t).as_ref())
+                            .unwrap();
+                    }
+                    ValueRef::Blob(b) => {
+                        encoder.encode_field(&b).unwrap();
+                    }
+                }
+            }
+            let data_row = encoder.finish()?;
+            back_tx
+                .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
+                .map_err(|_| QueryError::BackendResponseSendFailed)?;
+        }
+        count
+    };
+
+    back_tx
+        .blocking_send(
+            (
+                PgWireBackendMessage::CommandComplete(cmd.tag().into_command_complete(count, conn)),
+                true,
+            )
+                .into(),
+        )
+        .map_err(|_| QueryError::BackendResponseSendFailed)?;
+
+    if cmd.is_begin() {
+        trace!("setting EXPLICIT tx");
+        // explicit tx
+        *open_tx = Some(OpenTx::Explicit)
+    } else if cmd.is_rollback() || cmd.is_commit() {
+        trace!("clearing current open tx");
+        // if this was a rollback, remove the current open tx
+        *open_tx = None;
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(i16)]
+pub enum FormatCode {
+    Text = 0,
+    Binary,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown format code {0}")]
+pub struct UnknownFormatCode(i16);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ToParamError<E> {
+    #[error("conversion from bytes to types failed: {0}")]
+    FromSql(Box<dyn std::error::Error + Sync + Send>),
+    #[error(transparent)]
+    Utf8(#[from] Utf8Error),
+    #[error("parse error: {0}")]
+    Parse(E),
+}
+
+fn from_type_and_format<'a, E, T: FromSql<'a> + FromStr<Err = E>>(
+    t: &Type,
+    b: &'a [u8],
+    format_code: FormatCode,
+) -> Result<T, ToParamError<E>>
+// where
+//     FromStr::Err =,
+{
+    Ok(match format_code {
+        FormatCode::Text => {
+            T::from_str(std::str::from_utf8(b)?).map_err(|e| ToParamError::<E>::Parse(e))?
+        }
+        FormatCode::Binary => T::from_sql(t, b).map_err(ToParamError::FromSql)?,
+    })
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Unsupported data type: {0}")]
+struct UnsupportedSqliteToPostgresType(String);
+
+impl From<UnsupportedSqliteToPostgresType> for PgWireBackendMessage {
+    fn from(value: UnsupportedSqliteToPostgresType) -> Self {
+        PgWireBackendMessage::ErrorResponse(value.into())
+    }
+}
+
+impl From<UnsupportedSqliteToPostgresType> for ErrorResponse {
+    fn from(value: UnsupportedSqliteToPostgresType) -> Self {
+        ErrorInfo::new("ERROR".to_owned(), "42846".to_owned(), value.to_string()).into()
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
+    Ok(match name.to_uppercase().as_ref() {
+        "ANY" => Type::ANY,
+        "INT" | "INTEGER" => Type::INT8,
+        "DATETIME" => Type::TIMESTAMP,
+        "VARCHAR" => Type::VARCHAR,
+        "TEXT" => Type::TEXT,
+        "BINARY" | "BLOB" => Type::BYTEA,
+        "JSONB" => Type::JSONB,
+        "JSON" => Type::JSON,
+        "FLOAT" => Type::FLOAT8,
+        _ => return Err(UnsupportedSqliteToPostgresType(name.to_string())),
+    })
+}
+
+fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
     let actor_id = agent.actor_id();
 
     let ts = Timestamp::from(agent.clock().new_timestamp());
@@ -1744,7 +2067,7 @@ fn handle_commit(agent: &Agent, conn: &Connection, commit_stmt: &str) -> rusqlit
         .query_row([db_version], |row| row.get(0))?;
 
     if !has_changes {
-        conn.execute_batch(commit_stmt)?;
+        conn.execute_batch("COMMIT")?;
         return Ok(());
     }
 
@@ -1784,7 +2107,7 @@ fn handle_commit(agent: &Agent, conn: &Connection, commit_stmt: &str) -> rusqlit
 
     debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
-    conn.execute_batch(commit_stmt)?;
+    conn.execute_batch("COMMIT")?;
 
     trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
@@ -1924,11 +2247,11 @@ fn handle_lhs_rhs(lhs: &Expr, rhs: &Expr) -> Option<SqliteName> {
     }
 }
 
-fn extract_param(
-    schema: &Schema,
+fn extract_param<'a>(
+    schema: &'a Schema,
     expr: &Expr,
-    tables: &HashMap<String, &Table>,
-    params: &mut Vec<SqliteType>,
+    tables: &HashMap<String, &'a Table>,
+    params: &mut Vec<(SqliteType, Option<&'a str>)>,
 ) {
     match expr {
         // expr BETWEEN expr AND expr
@@ -1948,7 +2271,7 @@ fn extract_param(
                         // find the first one to match
                         for (_, table) in tables.iter() {
                             if let Some(col) = table.columns.get(&id.0) {
-                                params.push(col.sql_type);
+                                params.push(col.sql_type());
                                 break;
                             }
                         }
@@ -1966,11 +2289,14 @@ fn extract_param(
                             };
 
                             if let Some(col) = table.columns.get(col_name) {
-                                params.push(col.sql_type);
+                                params.push(col.sql_type());
                             }
                         }
                     }
                 }
+            } else {
+                extract_param(schema, lhs, tables, params);
+                extract_param(schema, rhs, tables, params);
             }
         }
 
@@ -2024,7 +2350,7 @@ fn extract_param(
                                 // find the first one to match
                                 for (_, table) in tables.iter() {
                                     if let Some(col) = table.columns.get(&id.0) {
-                                        params.push(col.sql_type);
+                                        params.push(col.sql_type());
                                         break;
                                     }
                                 }
@@ -2034,7 +2360,7 @@ fn extract_param(
                             | SqliteName::DoublyQualified(_, tbl_name, col_name) => {
                                 if let Some(table) = tables.get(&tbl_name.0) {
                                     if let Some(col) = table.columns.get(&col_name.0) {
-                                        params.push(col.sql_type);
+                                        params.push(col.sql_type());
                                     }
                                 }
                             }
@@ -2116,7 +2442,11 @@ fn rem_first_and_last(value: &str) -> &str {
     chars.as_str()
 }
 
-fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>) {
+fn handle_select<'a>(
+    schema: &'a Schema,
+    select: &Select,
+    params: &mut Vec<(SqliteType, Option<&'a str>)>,
+) {
     let tables = match &select.body.select {
         OneSelect::Select {
             columns,
@@ -2140,7 +2470,7 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
                 if let ResultColumn::Expr(expr, _) = col {
                     // TODO: check against table if we can...
                     if is_param(expr) {
-                        params.push(SqliteType::Text);
+                        params.push((SqliteType::Text, None));
                     }
                 }
             }
@@ -2150,7 +2480,7 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
             for values in values_values.iter() {
                 for value in values.iter() {
                     if is_param(value) {
-                        params.push(SqliteType::Text);
+                        params.push((SqliteType::Text, None));
                     }
                 }
             }
@@ -2160,14 +2490,14 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
     if let Some(limit) = &select.limit {
         if is_param(&limit.expr) {
             trace!("limit was a param (variable), pushing Integer type");
-            params.push(SqliteType::Integer);
+            params.push((SqliteType::Integer, None));
         } else {
             extract_param(schema, &limit.expr, &tables, params);
         }
         if let Some(offset) = &limit.offset {
             if is_param(offset) {
                 trace!("offset was a param (variable), pushing Integer type");
-                params.push(SqliteType::Integer);
+                params.push((SqliteType::Integer, None));
             } else {
                 extract_param(schema, offset, &tables, params);
             }
@@ -2178,7 +2508,7 @@ fn handle_select(schema: &Schema, select: &Select, params: &mut Vec<SqliteType>)
 fn handle_from<'a>(
     schema: &'a Schema,
     from: &FromClause,
-    params: &mut Vec<SqliteType>,
+    params: &mut Vec<(SqliteType, Option<&'a str>)>,
 ) -> HashMap<String, &'a Table> {
     let mut tables: HashMap<String, &Table> = HashMap::new();
     if let Some(select) = from.select.as_deref() {
@@ -2240,10 +2570,10 @@ fn handle_from<'a>(
     tables
 }
 
-fn parameter_types(schema: &Schema, cmd: &Cmd) -> Vec<SqliteType> {
+fn parameter_types<'a>(schema: &'a Schema, cmd: &ParsedCmd) -> Vec<(SqliteType, Option<&'a str>)> {
     let mut params = vec![];
 
-    if let Cmd::Stmt(stmt) = cmd {
+    if let ParsedCmd::Sqlite(Cmd::Stmt(stmt)) = cmd {
         match stmt {
             Stmt::Select(select) => handle_select(schema, select, &mut params),
             Stmt::Delete {
@@ -2280,7 +2610,7 @@ fn parameter_types(schema: &Schema, cmd: &Cmd) -> Vec<SqliteType> {
                                                 table.columns.get_index(i).map(|(_name, col)| col)
                                             };
                                             if let Some(col) = col {
-                                                params.push(col.sql_type);
+                                                params.push(col.sql_type());
                                             }
                                         }
                                     }

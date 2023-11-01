@@ -23,12 +23,11 @@ unsafe impl<'vtab> VTab<'vtab> for PgRangeTable {
             base: sqlite3_vtab::default(),
         };
 
-        for arg in args {
-            println!("arg {:?}", std::str::from_utf8(arg));
-        }
+        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
 
         Ok((
-            "CREATE TABLE pg_range (
+            format!(
+                "CREATE TABLE {table_name} (
                 rngtypid 	INTEGER,
                 rngsubtype	INTEGER,
                 rngmultitypid	INTEGER,
@@ -37,7 +36,7 @@ unsafe impl<'vtab> VTab<'vtab> for PgRangeTable {
                 rngcanonical	TEXT,
                 rngsubdiff	TEXT
 		    )"
-            .into(),
+            ),
             vtab,
         ))
     }
@@ -57,8 +56,6 @@ unsafe impl<'vtab> VTab<'vtab> for PgRangeTable {
 pub struct PgRangeTableCursor<'vtab> {
     /// Base class. Must be first
     base: sqlite3_vtab_cursor,
-    /// The rowid
-    row_id: i64,
     phantom: PhantomData<&'vtab PgRangeTable>,
 }
 
@@ -69,12 +66,10 @@ unsafe impl VTabCursor for PgRangeTableCursor<'_> {
         _idx_str: Option<&str>,
         _args: &Values<'_>,
     ) -> rusqlite::Result<()> {
-        self.row_id = 1;
         Ok(())
     }
 
     fn next(&mut self) -> rusqlite::Result<()> {
-        self.row_id += 1;
         Ok(())
     }
 
@@ -87,6 +82,6 @@ unsafe impl VTabCursor for PgRangeTableCursor<'_> {
     }
 
     fn rowid(&self) -> rusqlite::Result<i64> {
-        Ok(self.row_id)
+        Ok(1)
     }
 }

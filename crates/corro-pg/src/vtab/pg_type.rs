@@ -4,6 +4,7 @@ use postgres_types::Type;
 use rusqlite::vtab::{
     sqlite3_vtab, sqlite3_vtab_cursor, IndexInfo, VTab, VTabConnection, VTabCursor, Values,
 };
+use tracing::debug;
 
 #[repr(C)]
 pub struct PgTypeTable {
@@ -24,12 +25,13 @@ unsafe impl<'vtab> VTab<'vtab> for PgTypeTable {
             base: sqlite3_vtab::default(),
         };
 
-        for arg in args {
-            println!("arg {:?}", std::str::from_utf8(arg));
-        }
+        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+
+        debug!("creating table w/ name: {table_name}");
 
         Ok((
-            "CREATE TABLE pg_type (
+            format!(
+                "CREATE TABLE {table_name} (
 			oid            INTEGER,
 			typname        TEXT,
 			typnamespace   INTEGER,
@@ -62,7 +64,7 @@ unsafe impl<'vtab> VTab<'vtab> for PgTypeTable {
 			typdefault     TEXT,
 			typacl         TEXT
 		)"
-            .into(),
+            ),
             vtab,
         ))
     }
@@ -115,6 +117,9 @@ impl PgType {
             Type::VARCHAR => -1,
             Type::FLOAT4 => 4,
             Type::FLOAT8 => 8,
+            Type::TIMESTAMP => 8,
+            Type::JSON => -1,
+            Type::JSONB => -1,
             _ => {
                 // TODO: not default...
                 Default::default()
@@ -132,6 +137,9 @@ impl PgType {
             Type::VARCHAR => false,
             Type::FLOAT4 => true,
             Type::FLOAT8 => true,
+            Type::TIMESTAMP => true,
+            Type::JSON => false,
+            Type::JSONB => false,
             _ => {
                 // TODO: not default...
                 Default::default()
@@ -152,6 +160,9 @@ impl PgType {
             Type::VARCHAR => "S",
             Type::FLOAT4 => "N",
             Type::FLOAT8 => "N",
+            Type::TIMESTAMP => "D",
+            Type::JSON => "U",
+            Type::JSONB => "U",
             _ => {
                 // TODO: not default...
                 Default::default()
@@ -252,6 +263,9 @@ const PG_TYPES: &[PgType] = &[
     // REAL
     PgType(Type::FLOAT4),
     PgType(Type::FLOAT8),
+    PgType(Type::TIMESTAMP),
+    PgType(Type::JSON),
+    PgType(Type::JSONB),
 ];
 
 unsafe impl VTabCursor for PgTypeTableCursor<'_> {
@@ -320,5 +334,72 @@ unsafe impl VTabCursor for PgTypeTableCursor<'_> {
 
     fn rowid(&self) -> rusqlite::Result<i64> {
         Ok(self.row_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::vtab::eponymous_only_module;
+
+    use super::*;
+
+    #[test]
+    fn query_pg_type() -> rusqlite::Result<()> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        conn.create_module("pg_type", eponymous_only_module::<PgTypeTable>(), None)?;
+
+        let mut prepped = conn.prepare("SELECT * FROM pg_type;")?;
+        let mut rows = prepped.query([])?;
+
+        let mut idx = 0;
+        loop {
+            let row = match rows.next()? {
+                Some(row) => row,
+                None => break,
+            };
+
+            let pg_type = &PG_TYPES[idx];
+
+            assert_eq!(row.get::<_, u32>(0)?, pg_type.oid());
+            assert_eq!(row.get::<_, String>(1)?, pg_type.typname());
+            assert_eq!(row.get::<_, String>(2)?, pg_type.typnamespace());
+            assert_eq!(row.get::<_, String>(3)?, pg_type.typowner());
+            assert_eq!(row.get::<_, i16>(4)?, pg_type.typlen());
+            assert_eq!(row.get::<_, bool>(5)?, pg_type.typbyval());
+            assert_eq!(row.get::<_, String>(6)?, pg_type.typtype());
+            assert_eq!(row.get::<_, String>(7)?, pg_type.typcategory());
+            assert_eq!(row.get::<_, bool>(8)?, pg_type.typispreferred());
+            assert_eq!(row.get::<_, bool>(9)?, pg_type.typisdefined());
+            assert_eq!(row.get::<_, String>(10)?, pg_type.typdelim());
+            assert_eq!(row.get::<_, i64>(11)?, pg_type.typrelid());
+            assert_eq!(row.get::<_, String>(12)?, pg_type.typelem());
+            assert_eq!(row.get::<_, String>(13)?, pg_type.typarray());
+            assert_eq!(row.get::<_, String>(14)?, pg_type.typinput());
+            assert_eq!(row.get::<_, String>(15)?, pg_type.typoutput());
+            assert_eq!(row.get::<_, String>(16)?, pg_type.typreceive());
+            assert_eq!(row.get::<_, String>(17)?, pg_type.typsend());
+            assert_eq!(row.get::<_, String>(18)?, pg_type.typmodin());
+            assert_eq!(row.get::<_, String>(19)?, pg_type.typmodout());
+            assert_eq!(row.get::<_, String>(20)?, pg_type.typanalyze());
+            assert_eq!(row.get::<_, String>(21)?, pg_type.typalign());
+            assert_eq!(row.get::<_, String>(22)?, pg_type.typstorage());
+            assert_eq!(row.get::<_, bool>(23)?, pg_type.typnotnull());
+            assert_eq!(row.get::<_, String>(24)?, pg_type.typbasetype());
+            assert_eq!(row.get::<_, i32>(25)?, pg_type.typtypmod());
+            assert_eq!(row.get::<_, i32>(26)?, pg_type.typndims());
+            assert_eq!(row.get::<_, String>(27)?, pg_type.typcollation());
+            // assert_eq!(row.get::<_, String>(28)?, pg_type.typdefaultbin(), );
+            assert_eq!(
+                row.get::<_, Option<String>>(29)?.as_deref(),
+                pg_type.typdefault()
+            );
+            // assert_eq!(row.get::<_, String>(30)?, pg_type.typacl(), );
+
+            idx += 1;
+        }
+
+        assert_eq!(idx, PG_TYPES.len());
+
+        Ok(())
     }
 }

@@ -832,11 +832,13 @@ dependencies = [
  "corro-types",
  "fallible-iterator",
  "futures",
+ "hex",
  "pgwire",
  "postgres-types",
  "rusqlite",
  "spawn",
  "sqlite3-parser",
+ "sqlparser",
  "tempfile",
  "thiserror",
  "time",
@@ -3634,6 +3636,15 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.39.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743b4dc2cbde11890ccb254a8fc9d537fa41b36da00de2a1c5e9848c9bc42bd7"
+dependencies = [
+ "log",
 ]
 
 [[package]]
