@@ -663,6 +663,8 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
         schema
     };
 
+    new_schema.constrain()?;
+
     block_in_place(|| {
         let tx = conn.transaction()?;
 
