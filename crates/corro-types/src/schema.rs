@@ -236,8 +236,8 @@ pub enum ApplySchemaError {
     ConstrainedSchema(#[from] ConstrainedSchemaError),
     #[error("won't drop table without the destructive flag set (table: '{0}')")]
     DropTableWithoutDestructiveFlag(String),
-    #[error("won't drop table without the destructive flag set (table: '{0}', column: '{1}')")]
-    DropColumnWithoutDestructiveFlag(String, String),
+    #[error("won't remove column without the destructive flag set (table: '{0}', column: '{1}')")]
+    RemoveColumnWithoutDestructiveFlag(String, String),
     #[error("can't add a primary key (table: '{0}', column: '{1}')")]
     AddPrimaryKey(String, String),
     #[error("can't modify primary keys (table: '{0}')")]
@@ -411,7 +411,7 @@ pub fn apply_schema(
         debug!("dropped cols: {dropped_cols:?}");
 
         if let Some(col_name) = dropped_cols.into_iter().next() {
-            return Err(ApplySchemaError::DropColumnWithoutDestructiveFlag(
+            return Err(ApplySchemaError::RemoveColumnWithoutDestructiveFlag(
                 name.clone(),
                 col_name.clone(),
             ));
