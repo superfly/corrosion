@@ -4,6 +4,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
+use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
 use rusqlite::{Connection, Transaction};
@@ -655,10 +656,8 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), SchemaE
                             options,
                         },
                 } => {
-                    schema.tables.insert(
-                        tbl_name.name.0.clone(),
-                        prepare_table(tbl_name, columns, constraints.as_ref(), options),
-                    );
+                    let table = prepare_table(tbl_name, columns, constraints.as_ref(), options);
+                    schema.tables.insert(table.name.clone(), table);
                     trace!("inserted table: {}", tbl_name.name.0);
                 }
                 Stmt::CreateIndex {
@@ -669,12 +668,16 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), SchemaE
                     where_clause,
                     ..
                 } => {
-                    if let Some(table) = schema.tables.get_mut(tbl_name.0.as_str()) {
+                    let tbl_name =
+                        unquote(tbl_name.0.as_str()).unwrap_or_else(|_| tbl_name.0.clone());
+                    let idx_name = unquote(idx_name.name.0.as_str())
+                        .unwrap_or_else(|_| idx_name.name.0.clone());
+                    if let Some(table) = schema.tables.get_mut(tbl_name.as_str()) {
                         table.indexes.insert(
-                            idx_name.name.0.clone(),
+                            idx_name.clone(),
                             Index {
-                                name: idx_name.name.0.clone(),
-                                tbl_name: tbl_name.0.clone(),
+                                name: idx_name,
+                                tbl_name,
                                 columns: columns.to_vec(),
                                 where_clause: where_clause.clone(),
                                 unique: *unique,
@@ -682,8 +685,8 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), SchemaE
                         );
                     } else {
                         return Err(SchemaError::IndexWithoutTable {
-                            tbl_name: tbl_name.0.clone(),
-                            name: idx_name.name.0.clone(),
+                            tbl_name: tbl_name.clone(),
+                            name: idx_name.clone(),
                         });
                     }
                 }
@@ -721,7 +724,9 @@ fn prepare_table(
                         columns
                             .iter()
                             .filter_map(|col| match &col.expr {
-                                Expr::Id(id) => Some(id.0.clone()),
+                                Expr::Id(id) => {
+                                    Some(unquote(&id.0).unwrap_or_else(|_| id.0.clone()))
+                                }
                                 _ => None,
                             })
                             .collect::<IndexSet<_>>(),
@@ -737,12 +742,12 @@ fn prepare_table(
                         matches!(named.constraint, ColumnConstraint::PrimaryKey { .. })
                     })
                 })
-                .map(|def| def.col_name.0.clone())
+                .map(|def| unquote(&def.col_name.0).unwrap_or_else(|_| def.col_name.0.clone()))
                 .collect()
         });
 
     Table {
-        name: tbl_name.name.0.clone(),
+        name: unquote(&tbl_name.name.0).unwrap_or_else(|_| tbl_name.name.0.clone()),
         indexes: IndexMap::new(),
         columns: columns
             .iter()
@@ -769,10 +774,12 @@ fn prepare_table(
 
                 let primary_key = pk.contains(&def.col_name.0);
 
+                let col_name = unquote(&def.col_name.0).unwrap_or_else(|_| def.col_name.0.clone());
+
                 (
-                    def.col_name.0.clone(),
+                    col_name.clone(),
                     Column {
-                        name: def.col_name.0.clone(),
+                        name: col_name.clone(),
                         sql_type: match def.col_type.as_ref().map(|t| t.name.to_ascii_uppercase()) {
                             // 1. If the declared type contains the string "INT" then it is assigned INTEGER affinity.
                             Some(s) if s.contains("INT") => (SqliteType::Integer, Some(s)),
