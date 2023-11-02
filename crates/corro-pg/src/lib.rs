@@ -739,7 +739,7 @@ pub async fn start(
                                                         _ => Type::TEXT,
                                                     },
                                                     (SqliteType::Numeric, Some(src)) => match src {
-                                                        "BOOLEAN" => Type::BOOL,
+                                                        "BOOLEAN" | "BOOL" => Type::BOOL,
                                                         _ => Type::FLOAT8,
                                                     },
                                                     (SqliteType::Numeric, src) => match src {
