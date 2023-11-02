@@ -172,7 +172,7 @@ enum Prepared {
         sql: String,
         param_types: Vec<Type>,
         fields: Vec<FieldInfo>,
-        tag: StmtTag,
+        cmd: ParsedCmd,
     },
 }
 
@@ -184,7 +184,7 @@ enum Portal<'a> {
         stmt_name: CompactString,
         stmt: Statement<'a>,
         result_formats: Vec<FieldFormat>,
-        tag: StmtTag,
+        cmd: ParsedCmd,
     },
 }
 
@@ -781,7 +781,7 @@ pub async fn start(
                                                 sql: parse.query().clone(),
                                                 param_types,
                                                 fields,
-                                                tag: parsed_cmd.tag(),
+                                                cmd: parsed_cmd,
                                             },
                                         );
                                     }
@@ -994,7 +994,7 @@ pub async fn start(
                                     Some(Prepared::NonEmpty {
                                         sql,
                                         param_types,
-                                        tag,
+                                        cmd,
                                         ..
                                     }) => {
                                         let mut prepped = match conn.prepare(sql) {
@@ -1270,7 +1270,7 @@ pub async fn start(
                                                     .copied()
                                                     .map(FieldFormat::from)
                                                     .collect(),
-                                                tag: *tag,
+                                                cmd: cmd.clone(),
                                             },
                                         );
                                     }
@@ -1298,7 +1298,7 @@ pub async fn start(
                             }
                             PgWireFrontendMessage::Execute(execute) => {
                                 let name = execute.name().as_deref().unwrap_or("");
-                                let (prepped, result_formats, tag) = match portals.get_mut(name) {
+                                let (prepped, result_formats, cmd) = match portals.get_mut(name) {
                                     Some(Portal::Empty { .. }) => {
                                         trace!("empty portal");
                                         back_tx.blocking_send(
@@ -1315,9 +1315,9 @@ pub async fn start(
                                     Some(Portal::Parsed {
                                         stmt,
                                         result_formats,
-                                        tag,
+                                        cmd,
                                         ..
-                                    }) => (stmt, result_formats, tag),
+                                    }) => (stmt, result_formats, cmd),
                                     None => {
                                         back_tx.blocking_send(
                                             (
@@ -1340,162 +1340,39 @@ pub async fn start(
 
                                 trace!("non-empty portal!");
 
-                                // TODO: maybe we don't need to recompute this...
-                                let mut fields = vec![];
-                                for (i, col) in prepped.columns().into_iter().enumerate() {
-                                    let col_type =
-                                        match name_to_type(col.decl_type().unwrap_or("text")) {
-                                            Ok(t) => t,
-                                            Err(e) => {
-                                                back_tx.blocking_send(
-                                                    (
-                                                        PgWireBackendMessage::ErrorResponse(
-                                                            e.into(),
-                                                        ),
-                                                        true,
-                                                    )
-                                                        .into(),
-                                                )?;
-                                                discard_until_sync = true;
-                                                continue 'outer;
-                                            }
-                                        };
-                                    fields.push(FieldInfo::new(
-                                        col.name().to_string(),
-                                        None,
-                                        None,
-                                        col_type,
-                                        result_formats.get(i).copied().unwrap_or(FieldFormat::Text),
-                                    ));
-                                }
-
-                                trace!("fields: {fields:?}");
-
-                                let schema = Arc::new(fields);
-
-                                let mut rows = prepped.raw_query();
-                                let ncols = schema.len();
-
                                 let max_rows = *execute.max_rows();
                                 let max_rows = if max_rows == 0 {
                                     usize::MAX
                                 } else {
                                     max_rows as usize
                                 };
-                                let mut count = 0;
 
-                                trace!("starting loop");
+                                if let Err(e) = handle_execute(
+                                    &agent,
+                                    &conn,
+                                    prepped,
+                                    result_formats,
+                                    cmd,
+                                    &mut open_tx,
+                                    max_rows,
+                                    &back_tx,
+                                ) {
+                                    back_tx.blocking_send(BackendResponse::Message {
+                                        message: e.try_into()?,
+                                        flush: true,
+                                    })?;
 
-                                loop {
-                                    if count >= max_rows {
-                                        trace!("attained max rows");
-                                        // forget the Rows iterator here so as to not reset the statement!
-                                        std::mem::forget(rows);
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::PortalSuspended(
-                                                    PortalSuspended::new(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        continue 'outer;
-                                    }
-                                    let row = match rows.next() {
-                                        Ok(Some(row)) => {
-                                            trace!("got a row: {row:?}");
-                                            row
-                                        }
-                                        Ok(None) => {
-                                            trace!("done w/ rows");
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "ERROR".to_owned(),
-                                                            "XX000".to_owned(),
-                                                            e.to_string(),
-                                                        )
-                                                        .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-                                            discard_until_sync = true;
-                                            continue 'outer;
-                                        }
-                                    };
-                                    count += 1;
-                                    let mut encoder = DataRowEncoder::new(schema.clone());
-                                    for idx in 0..ncols {
-                                        let data = row.get_ref_unwrap::<usize>(idx);
-                                        match data {
-                                            ValueRef::Null => {
-                                                encoder.encode_field(&None::<i8>).unwrap()
-                                            }
-                                            ValueRef::Integer(i) => {
-                                                encoder.encode_field(&i).unwrap();
-                                            }
-                                            ValueRef::Real(f) => {
-                                                encoder.encode_field(&f).unwrap();
-                                            }
-                                            ValueRef::Text(t) => {
-                                                encoder
-                                                    .encode_field(
-                                                        &String::from_utf8_lossy(t).as_ref(),
-                                                    )
-                                                    .unwrap();
-                                            }
-                                            ValueRef::Blob(b) => {
-                                                encoder.encode_field(&b).unwrap();
-                                            }
-                                        }
-                                    }
-                                    match encoder.finish() {
-                                        Ok(data_row) => {
-                                            back_tx.blocking_send(
-                                                (PgWireBackendMessage::DataRow(data_row), false)
-                                                    .into(),
-                                            )?;
-                                        }
-                                        Err(e) => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "ERROR".to_owned(),
-                                                            "XX000".to_owned(),
-                                                            e.to_string(),
-                                                        )
-                                                        .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-                                            discard_until_sync = true;
-                                            continue 'outer;
-                                        }
-                                    }
+                                    discard_until_sync = true;
+
+                                    send_ready(
+                                        &agent,
+                                        &conn,
+                                        &mut open_tx,
+                                        discard_until_sync,
+                                        &back_tx,
+                                    )?;
+                                    continue;
                                 }
-
-                                trace!("done w/ rows, computing tag: {tag:?}");
-
-                                // done!
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::CommandComplete(
-                                            (*tag).into_command_complete(count, &conn),
-                                        ),
-                                        true,
-                                    )
-                                        .into(),
-                                )?;
                             }
                             PgWireFrontendMessage::Query(query) => {
                                 let parsed_query = match parse_query(query.query()) {
@@ -1746,6 +1623,22 @@ pub async fn start(
 
                 if let Err(e) = res {
                     error!("connection failed: {e}");
+                    _ = back_tx
+                        .send(
+                            (
+                                PgWireBackendMessage::ErrorResponse(
+                                    ErrorInfo::new(
+                                        "FATAL".to_owned(),
+                                        "XX000".to_owned(),
+                                        e.to_string(),
+                                    )
+                                    .into(),
+                                ),
+                                true,
+                            )
+                                .into(),
+                        )
+                        .await;
                 }
 
                 Ok::<_, BoxError>(())
@@ -1841,6 +1734,139 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn handle_execute<'conn>(
+    agent: &Agent,
+    conn: &'conn Connection,
+    prepped: &mut Statement<'conn>,
+    result_formats: &[FieldFormat],
+    cmd: &ParsedCmd,
+    open_tx: &mut Option<OpenTx>,
+    max_rows: usize,
+    back_tx: &Sender<BackendResponse>,
+) -> Result<(), QueryError> {
+    // TODO: maybe we don't need to recompute this...
+    let mut fields = vec![];
+    for (i, col) in prepped.columns().into_iter().enumerate() {
+        let col_type = name_to_type(col.decl_type().unwrap_or("text"))?;
+
+        fields.push(FieldInfo::new(
+            col.name().to_string(),
+            None,
+            None,
+            col_type,
+            result_formats.get(i).copied().unwrap_or(FieldFormat::Text),
+        ));
+    }
+
+    trace!("fields: {fields:?}");
+
+    let schema = Arc::new(fields);
+
+    // we need to know because we'll commit it right away
+    let mut opened_implicit_tx = false;
+
+    if open_tx.is_none() {
+        if !cmd.is_begin() && !prepped.readonly() {
+            // NOT in a tx and statement mutates DB...
+            conn.execute_batch("BEGIN")?;
+            *open_tx = Some(OpenTx::Implicit);
+            opened_implicit_tx = true;
+        } else if cmd.is_begin() {
+            conn.execute_batch("BEGIN")?;
+            *open_tx = Some(OpenTx::Explicit);
+        }
+    }
+
+    let mut count = 0;
+
+    if cmd.is_commit() {
+        handle_commit(agent, conn)?;
+        *open_tx = None;
+    } else {
+        let mut rows = prepped.raw_query();
+        let ncols = schema.len();
+        loop {
+            if count >= max_rows {
+                trace!("attained max rows");
+                // forget the Rows iterator here so as to not reset the statement!
+                std::mem::forget(rows);
+                back_tx
+                    .blocking_send(
+                        (
+                            PgWireBackendMessage::PortalSuspended(PortalSuspended::new()),
+                            true,
+                        )
+                            .into(),
+                    )
+                    .map_err(|_| QueryError::BackendResponseSendFailed)?;
+                return Ok(());
+            }
+
+            let row = match rows.next()? {
+                Some(row) => {
+                    trace!("got a row: {row:?}");
+                    row
+                }
+                None => {
+                    trace!("done w/ rows");
+                    break;
+                }
+            };
+
+            count += 1;
+
+            let mut encoder = DataRowEncoder::new(schema.clone());
+            for idx in 0..ncols {
+                let data = row.get_ref_unwrap::<usize>(idx);
+                match data {
+                    ValueRef::Null => encoder.encode_field(&None::<i8>).unwrap(),
+                    ValueRef::Integer(i) => {
+                        encoder.encode_field(&i).unwrap();
+                    }
+                    ValueRef::Real(f) => {
+                        encoder.encode_field(&f).unwrap();
+                    }
+                    ValueRef::Text(t) => {
+                        encoder
+                            .encode_field(&String::from_utf8_lossy(t).as_ref())
+                            .unwrap();
+                    }
+                    ValueRef::Blob(b) => {
+                        encoder.encode_field(&b).unwrap();
+                    }
+                }
+            }
+
+            let data_row = encoder.finish()?;
+            back_tx
+                .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
+                .map_err(|_| QueryError::BackendResponseSendFailed)?;
+        }
+
+        if opened_implicit_tx {
+            handle_commit(agent, conn)?;
+            *open_tx = None;
+        }
+    }
+
+    let tag = cmd.tag();
+    trace!("done w/ rows, computing tag: {tag:?}");
+
+    // done!
+    back_tx
+        .blocking_send(
+            (
+                PgWireBackendMessage::CommandComplete(tag.into_command_complete(count, conn)),
+                true,
+            )
+                .into(),
+        )
+        .map_err(|_| QueryError::BackendResponseSendFailed)?;
+
+    Ok(())
+}
+
 fn handle_query(
     agent: &Agent,
     conn: &Connection,
@@ -1892,9 +1918,8 @@ fn handle_query(
     }
 
     let count = if cmd.is_commit() {
-        *open_tx = None;
-
         handle_commit(agent, conn)?;
+        *open_tx = None;
         0
     } else {
         let mut prepped = if cmd.is_begin() {
@@ -2061,6 +2086,7 @@ fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
 }
 
 fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
+    println!("HANDLE COMMIT");
     let actor_id = agent.actor_id();
 
     let ts = Timestamp::from(agent.clock().new_timestamp());
@@ -2735,6 +2761,11 @@ mod tests {
 
             let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
             println!("CHANGE ROW: {row:?}");
+
+            let row = client
+                .query_one("SELECT * FROM __corro_bookkeeping", &[])
+                .await?;
+            println!("BK ROW: {row:?}");
 
             client
                 .batch_execute("SELECT 1; SELECT 2; SELECT 3;")
