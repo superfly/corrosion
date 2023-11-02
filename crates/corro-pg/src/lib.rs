@@ -322,6 +322,7 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
                 for stmt in stmts {
                     cmds.push_back(ParsedCmd::Postgres(stmt));
                 }
+                break;
             }
         }
     }
@@ -1514,6 +1515,13 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
+                                        send_ready(
+                                            &agent,
+                                            &conn,
+                                            &mut open_tx,
+                                            discard_until_sync,
+                                            &back_tx,
+                                        )?;
                                         continue;
                                     }
                                 };
@@ -1529,15 +1537,12 @@ pub async fn start(
                                             .into(),
                                     )?;
 
-                                    let ready_status = if open_tx.is_some() {
-                                        ReadyForQuery::new(READY_STATUS_TRANSACTION_BLOCK)
-                                    } else {
-                                        ReadyForQuery::new(READY_STATUS_IDLE)
-                                    };
-
-                                    back_tx.blocking_send(
-                                        (PgWireBackendMessage::ReadyForQuery(ready_status), true)
-                                            .into(),
+                                    send_ready(
+                                        &agent,
+                                        &conn,
+                                        &mut open_tx,
+                                        discard_until_sync,
+                                        &back_tx,
                                     )?;
                                     continue;
                                 }
@@ -1586,20 +1591,24 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
+                                        send_ready(
+                                            &agent,
+                                            &conn,
+                                            &mut open_tx,
+                                            discard_until_sync,
+                                            &back_tx,
+                                        )?;
                                         continue;
                                     }
                                     trace!("committed IMPLICIT tx");
                                 }
 
-                                let ready_status = if open_tx.is_some() {
-                                    ReadyForQuery::new(READY_STATUS_TRANSACTION_BLOCK)
-                                } else {
-                                    ReadyForQuery::new(READY_STATUS_IDLE)
-                                };
-
-                                back_tx.blocking_send(
-                                    (PgWireBackendMessage::ReadyForQuery(ready_status), true)
-                                        .into(),
+                                send_ready(
+                                    &agent,
+                                    &conn,
+                                    &mut open_tx,
+                                    discard_until_sync,
+                                    &back_tx,
                                 )?;
                             }
                             PgWireFrontendMessage::Terminate(_) => {
