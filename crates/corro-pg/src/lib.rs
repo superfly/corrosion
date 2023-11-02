@@ -1928,7 +1928,7 @@ fn handle_query(
         let ncols = schema.len();
 
         let mut count = 0;
-        while let Ok(Some(row)) = rows.next() {
+        while let Some(row) = rows.next()? {
             count += 1;
             let mut encoder = DataRowEncoder::new(schema.clone());
             for idx in 0..ncols {
@@ -2358,8 +2358,13 @@ fn extract_param<'a>(
                             SqliteName::Name(_) => {}
                             SqliteName::Qualified(tbl_name, col_name)
                             | SqliteName::DoublyQualified(_, tbl_name, col_name) => {
+                                let col_name = if col_name.0.starts_with('"') {
+                                    rem_first_and_last(&col_name.0)
+                                } else {
+                                    &col_name.0
+                                };
                                 if let Some(table) = tables.get(&tbl_name.0) {
-                                    if let Some(col) = table.columns.get(&col_name.0) {
+                                    if let Some(col) = table.columns.get(col_name) {
                                         params.push(col.sql_type());
                                     }
                                 }
