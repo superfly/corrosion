@@ -11,7 +11,7 @@ use corro_types::agent::{Agent, KnownDbVersion, KnownVersion, PartialVersion, Sp
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
-use corro_types::change::{row_to_change, Change};
+use corro_types::change::{row_to_change, Change, ChunkedChanges};
 use corro_types::config::{GossipConfig, TlsClientConfig};
 use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
@@ -38,7 +38,6 @@ use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::agent::SyncRecvError;
-use crate::api::public::ChunkedChanges;
 use crate::transport::{Transport, TransportError};
 
 use corro_types::{

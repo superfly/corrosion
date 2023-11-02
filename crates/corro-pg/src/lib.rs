@@ -14,13 +14,16 @@ use bytes::Buf;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, KnownDbVersion},
-    broadcast::Timestamp,
+    broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset, Timestamp},
+    change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     config::PgConfig,
     schema::{parse_sql, Schema, SchemaError, SqliteType, Table},
     sqlite::SqlitePoolError,
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
+use itertools::Itertools;
+use metrics::counter;
 use pgwire::{
     api::{
         results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
@@ -2073,7 +2076,7 @@ impl From<UnsupportedSqliteToPostgresType> for ErrorResponse {
 fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
     Ok(match name.to_uppercase().as_ref() {
         "ANY" => Type::ANY,
-        "INT" | "INTEGER" => Type::INT8,
+        "INT" | "INTEGER" | "BIGINT" => Type::INT8,
         "DATETIME" => Type::TIMESTAMP,
         "VARCHAR" => Type::VARCHAR,
         "TEXT" => Type::TEXT,
@@ -2156,6 +2159,67 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
     );
 
     drop(book_writer);
+
+    spawn_counted({
+        let agent = agent.clone();
+        async move {
+            let conn = agent.pool().read().await?;
+
+            block_in_place(|| {
+                // TODO: make this more generic so both sync and local changes can use it.
+                let mut prepped = conn.prepare_cached(r#"
+                SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl
+                    FROM crsql_changes
+                    WHERE site_id IS NULL
+                      AND db_version = ?
+                    ORDER BY seq ASC
+            "#)?;
+                let rows = prepped.query_map([db_version], row_to_change)?;
+                let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_BYTE_SIZE);
+                for changes_seqs in chunked {
+                    match changes_seqs {
+                        Ok((changes, seqs)) => {
+                            for (table_name, count) in
+                                changes.iter().counts_by(|change| &change.table)
+                            {
+                                counter!("corro.changes.committed", count as u64, "table" => table_name.to_string(), "source" => "local");
+                            }
+
+                            trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
+
+                            let tx_bcast = agent.tx_bcast().clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tx_bcast
+                                    .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
+                                        ChangeV1 {
+                                            actor_id,
+                                            changeset: Changeset::Full {
+                                                version,
+                                                changes,
+                                                seqs,
+                                                last_seq,
+                                                ts,
+                                            },
+                                        },
+                                    )))
+                                    .await
+                                {
+                                    error!("could not send change message for broadcast: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                            break;
+                        }
+                    }
+                }
+                Ok::<_, rusqlite::Error>(())
+            })?;
+
+            Ok::<_, BoxError>(())
+        }
+    });
 
     spawn_counted({
         let agent = agent.clone();
