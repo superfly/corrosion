@@ -275,7 +275,7 @@ impl MatcherHandle {
         db_version: i64,
     ) -> Result<(), MatcherError> {
         let mut prepped = conn.prepare_cached(
-            "SELECT \"table\", DISTINCT(pk) FROM crsql_changes WHERE db_version = ? ORDER BY seq GROUP BY \"table\"",
+            "SELECT DISTINCT \"table\", pk FROM crsql_changes WHERE db_version = ? GROUP BY \"table\" ORDER BY seq",
         )?;
 
         let rows = prepped.query_map([db_version], |row| {
@@ -619,7 +619,7 @@ impl Matcher {
     async fn run_restore(mut self, conn: Connection) {
         let init_res = block_in_place(|| {
             let mut prepped = conn.prepare(&format!(
-                "SELECT MAX(__corro_rowid) FROM {}",
+                "SELECT COALESCE(MAX(__corro_rowid), 0) FROM {}",
                 self.qualified_table_name
             ))?;
             self.last_rowid = prepped

@@ -468,7 +468,7 @@ pub async fn catch_up_sub(
                 None => {
                     let max_row_id: RowId = tx
                         .prepare(&format!(
-                            "SELECT MAX(__corro_rowid) FROM {}",
+                            "SELECT COALESCE(MAX(__corro_rowid), 0) FROM {}",
                             matcher.table_name()
                         ))?
                         .query_row([], |row| row.get(0))?;
