@@ -145,10 +145,12 @@ pub async fn process_sub_channel(
                 break;
             },
             _ = subs_check.tick() => {
-                deadline = if tx.receiver_count() == 0 {
-                    Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)))
+                if tx.receiver_count() == 0 {
+                    if deadline.is_none() {
+                        deadline = Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)));
+                    }
                 } else {
-                    None
+                    deadline = None;
                 };
                 continue;
             },
