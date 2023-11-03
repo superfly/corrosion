@@ -317,7 +317,7 @@ impl MatcherHandle {
     }
 
     pub fn cleanup(self) {
-        if let Err(e) = self.0.cmd_tx.blocking_send(MatcherCmd::Cleanup) {
+        if let Err(e) = self.0.cmd_tx.try_send(MatcherCmd::Cleanup) {
             error!("could not send cleanup command to matcher: {e}");
         }
     }
