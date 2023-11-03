@@ -195,6 +195,10 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 conn.execute("DELETE FROM __corro_members;", [])?;
 
                 conn.execute_batch(
+                    "DROP TABLE __corro_consul_services; DROP TABLE __corro_consul_checks;",
+                )?;
+
+                conn.execute_batch(
                     r#"
                     PRAGMA journal_mode = WAL; -- so the restore can be done online
                     PRAGMA wal_checkpoint(TRUNCATE);
