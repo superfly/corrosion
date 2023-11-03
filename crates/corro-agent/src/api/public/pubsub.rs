@@ -60,7 +60,7 @@ async fn sub_by_id(
             // ensure this goes!
             bcast_cache.write().await.remove(&id);
             if let Some(handle) = agent.matchers().write().remove(&id) {
-                handle.cleanup();
+                tokio::spawn(handle.cleanup());
             }
 
             return hyper::Response::builder()
@@ -194,7 +194,7 @@ pub async fn process_sub_channel(
     };
 
     // clean up the subscription
-    handle.cleanup();
+    handle.cleanup().await;
 }
 
 fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<Option<String>> {

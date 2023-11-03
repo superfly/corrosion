@@ -316,8 +316,8 @@ impl MatcherHandle {
         &self.0.col_names
     }
 
-    pub fn cleanup(self) {
-        if let Err(e) = self.0.cmd_tx.try_send(MatcherCmd::Cleanup) {
+    pub async fn cleanup(self) {
+        if let Err(e) = self.0.cmd_tx.send(MatcherCmd::Cleanup).await {
             error!("could not send cleanup command to matcher: {e}");
         }
     }
@@ -1594,7 +1594,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let handle = Matcher::create(id, &schema, matcher_conn, tx, sql)?;
 
-        handle.cleanup();
+        handle.cleanup().await;
 
         Ok(())
     }

@@ -212,7 +212,7 @@ impl Agent {
 
         for id in matchers_to_delete {
             if let Some(handle) = self.matchers().write().remove(&id) {
-                handle.cleanup();
+                tokio::spawn(handle.cleanup());
             }
         }
     }

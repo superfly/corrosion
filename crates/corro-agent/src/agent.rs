@@ -2278,7 +2278,7 @@ pub fn process_subs(agent: &Agent, changeset: &[Change]) {
 
     for id in matchers_to_delete {
         if let Some(handle) = agent.matchers().write().remove(&id) {
-            handle.cleanup();
+            tokio::spawn(handle.cleanup());
         }
     }
 }
