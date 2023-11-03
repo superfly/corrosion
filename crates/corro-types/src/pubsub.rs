@@ -20,7 +20,9 @@ use sqlite3_parser::{
     lexer::sql::Parser,
 };
 use tokio::{sync::mpsc, task::block_in_place};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
+use tripwire::{Outcome, PreemptibleFutureExt};
 use uuid::Uuid;
 
 use crate::{
@@ -718,11 +720,35 @@ impl Matcher {
             query_cols.push(format!("col_{i}"));
         }
 
+        let int_handle = conn.get_interrupt_handle();
+
+        let cancel = CancellationToken::new();
+        tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                match tokio::time::sleep(Duration::from_secs(15))
+                    .preemptible(cancel.cancelled())
+                    .await
+                {
+                    Outcome::Completed(_) => {
+                        warn!("subscription query deadline reached, interrupting!");
+                        int_handle.interrupt();
+                        // no need to send any query event, it should bubble up properly and if not
+                        // then it means the conn was not interrupted in time which is also fine
+                    }
+                    Outcome::Preempted(_) => {
+                        debug!("deadline was canceled, not interrupting query");
+                    }
+                }
+            }
+        });
+
         let res = block_in_place(|| {
+            let _drop_guard = cancel.drop_guard();
             let tx = conn.transaction()?;
 
             let mut stmt_str = Cmd::Stmt(self.query.clone()).to_string();
-            stmt_str.pop();
+            stmt_str.pop(); // remove trailing `;`
 
             let mut tmp_cols = self
                 .pks
