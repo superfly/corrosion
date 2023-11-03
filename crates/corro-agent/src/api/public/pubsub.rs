@@ -118,7 +118,11 @@ pub async fn process_sub_channel(
 ) {
     let mut buf = BytesMut::new();
 
-    let mut deadline = None;
+    let mut deadline = if tx.receiver_count() == 0 {
+        Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)))
+    } else {
+        None
+    };
 
     // even if there are no more subscribers
     // useful for queries that don't change often so we can cleanup...
