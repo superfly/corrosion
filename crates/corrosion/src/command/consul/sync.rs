@@ -479,52 +479,43 @@ async fn execute(
     let mut svc_to_upsert = vec![];
     let mut svc_to_delete = vec![];
 
-        for op in svcs {
-            match op {
-                ConsulServiceOp::Upsert { svc, hash } => {
-                    svc_to_upsert.push((svc.id.clone(), hash));
-                    append_upsert_service_statements(&mut statements, node, svc, hash, updated_at);
-                },
-                ConsulServiceOp::Delete { id } => {
-                    svc_to_delete.push(id.clone());
+    for op in svcs {
+        match op {
+            ConsulServiceOp::Upsert { svc, hash } => {
+                svc_to_upsert.push((svc.id.clone(), hash));
+                append_upsert_service_statements(&mut statements, node, svc, hash, updated_at);
+            },
+            ConsulServiceOp::Delete { id } => {
+                svc_to_delete.push(id.clone());
 
-                    statements.push(Statement::WithParams("DELETE FROM __corro_consul_services WHERE id = ?;".into(),vec![
-            
-            id.clone().into(),
-        ]));
-        statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),vec![
-            
-            node.into(),
-            id.into(),
-        ]));
-                },
-            }
+                statements.push(Statement::WithParams("DELETE FROM __corro_consul_services WHERE id = ?;".into(),vec![id.clone().into()]));
+                statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),vec![node.into(),id.into(),]));
+            },
         }
-    
+    }
 
+    // delete everything that's wrong in the DB! this is useful on restore from a backup...
+    statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND id NOT IN (SELECT id FROM __corro_consul_services)".into(), vec![node.into()]));
+    
     let mut check_to_upsert = vec![];
     let mut check_to_delete = vec![];
 
-        for op in checks {
-            match op {
-                ConsulCheckOp::Upsert { check, hash } => {
-                    check_to_upsert.push((check.id.clone(), hash));
-                    append_upsert_check_statements(&mut statements, node, check, hash, updated_at);
-                },
-                ConsulCheckOp::Delete { id } => {
-                    check_to_delete.push(id.clone());
-                    statements.push(Statement::WithParams("DELETE FROM __corro_consul_checks WHERE id = ?;".into(),vec![
-            
-            id.clone().into(),
-        ]));
-        statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),vec![
-            
-            node.into(),
-            id.into(),
-        ]));
-                },
-            }
+    for op in checks {
+        match op {
+            ConsulCheckOp::Upsert { check, hash } => {
+                check_to_upsert.push((check.id.clone(), hash));
+                append_upsert_check_statements(&mut statements, node, check, hash, updated_at);
+            },
+            ConsulCheckOp::Delete { id } => {
+                check_to_delete.push(id.clone());
+                statements.push(Statement::WithParams("DELETE FROM __corro_consul_checks WHERE id = ?;".into(),vec![id.clone().into(),]));
+                statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),vec![node.into(),id.into()]));
+            },
         }
+    }
+
+    // delete everything that's wrong in the DB! this is useful on restore from a backup...
+    statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND id NOT IN (SELECT id FROM __corro_consul_checks)".into(), vec![node.into()]));
     
 
     if !statements.is_empty() {
