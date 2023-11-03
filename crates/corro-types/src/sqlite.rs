@@ -125,9 +125,13 @@ pub(crate) fn setup_conn(conn: &mut Connection, attach: &AttachMap) -> Result<()
 
     for (path, name) in attach.iter() {
         conn.execute_batch(&format!(
-            "ATTACH DATABASE {} AS {}",
+            "ATTACH DATABASE {} AS {};
+            PRAGMA {}.journal_mode = WAL;
+            PRAGMA {}.synchronous = NORMAL;",
             enquote('\'', path.as_str()),
-            name
+            name,
+            name,
+            name,
         ))?;
     }
 
