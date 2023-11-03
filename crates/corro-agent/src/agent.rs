@@ -1773,7 +1773,7 @@ async fn process_fully_buffered_changes(
 
             if let Some(db_version) = db_version {
                 // TODO: write changes into a queueing table
-                process_subs_by_db_version(agent, &conn, db_version);
+                agent.process_subs_by_db_version(&conn, db_version);
             }
 
             true
@@ -2277,29 +2277,31 @@ pub fn process_subs(agent: &Agent, changeset: &[Change]) {
     }
 
     for id in matchers_to_delete {
-        agent.matchers().write().remove(&id);
-    }
-}
-
-pub fn process_subs_by_db_version(agent: &Agent, conn: &Connection, db_version: i64) {
-    trace!("process subs by db version...");
-
-    let mut matchers_to_delete = vec![];
-
-    {
-        let matchers = agent.matchers().read();
-        for (id, matcher) in matchers.iter() {
-            if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
-                error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
-                matchers_to_delete.push(*id);
-            }
+        if let Some(handle) = agent.matchers().write().remove(&id) {
+            handle.cleanup();
         }
     }
-
-    for id in matchers_to_delete {
-        agent.matchers().write().remove(&id);
-    }
 }
+
+// pub fn process_subs_by_db_version(agent: &Agent, conn: &Connection, db_version: i64) {
+//     trace!("process subs by db version...");
+
+//     let mut matchers_to_delete = vec![];
+
+//     {
+//         let matchers = agent.matchers().read();
+//         for (id, matcher) in matchers.iter() {
+//             if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
+//                 error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
+//                 matchers_to_delete.push(*id);
+//             }
+//         }
+//     }
+
+//     for id in matchers_to_delete {
+//         agent.matchers().write().remove(&id);
+//     }
+// }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncClientError {

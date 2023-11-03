@@ -211,7 +211,9 @@ impl Agent {
         }
 
         for id in matchers_to_delete {
-            self.matchers().write().remove(&id);
+            if let Some(handle) = self.matchers().write().remove(&id) {
+                handle.cleanup();
+            }
         }
     }
 }

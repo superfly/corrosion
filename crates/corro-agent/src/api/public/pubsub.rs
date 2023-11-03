@@ -59,7 +59,9 @@ async fn sub_by_id(
         None => {
             // ensure this goes!
             bcast_cache.write().await.remove(&id);
-            agent.matchers().write().remove(&id);
+            if let Some(handle) = agent.matchers().write().remove(&id) {
+                handle.cleanup();
+            }
 
             return hyper::Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -191,19 +193,8 @@ pub async fn process_sub_channel(
         }
     };
 
-    // get a dedicated connection
-    let conn = match agent.pool().dedicated() {
-        Ok(conn) => conn,
-        Err(e) => {
-            error!("could not acquire dedicated connection for subscription cleanup: {e}");
-            return;
-        }
-    };
-
     // clean up the subscription
-    if let Err(e) = handle.cleanup(conn) {
-        error!("could not properly cleanup subscription: {e}");
-    }
+    handle.cleanup();
 }
 
 fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<Option<String>> {

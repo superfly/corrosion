@@ -224,6 +224,7 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError
 
 pub enum MatcherCmd {
     ProcessChange(IndexMap<CompactString, Vec<Vec<SqliteValue>>>),
+    Cleanup,
 }
 
 #[derive(Clone)]
@@ -315,18 +316,10 @@ impl MatcherHandle {
         &self.0.col_names
     }
 
-    pub fn cleanup(self, mut conn: Connection) -> rusqlite::Result<()> {
-        let tx = conn.transaction()?;
-
-        tx.prepare(&format!(
-            "DROP TABLE {}; DROP TABLE {}",
-            self.table_name(),
-            self.changes_table_name()
-        ))?
-        .execute(())?;
-        tx.prepare("DELETE FROM subscriptions.subs WHERE id = ?")?
-            .execute([self.0.id])?;
-        Ok(())
+    pub fn cleanup(self) {
+        if let Err(e) = self.0.cmd_tx.blocking_send(MatcherCmd::Cleanup) {
+            error!("could not send cleanup command to matcher: {e}");
+        }
     }
 }
 
@@ -645,6 +638,20 @@ impl Matcher {
         self.cmd_loop(conn).await
     }
 
+    fn handle_cleanup(&self, conn: &mut Connection) -> rusqlite::Result<()> {
+        let tx = conn.transaction()?;
+
+        tx.prepare(&format!(
+            "DROP TABLE {}; DROP TABLE {}",
+            self.qualified_table_name, self.qualified_changes_table_name
+        ))?
+        .execute(())?;
+        tx.prepare("DELETE FROM subscriptions.subs WHERE id = ?")?
+            .execute([self.id])?;
+
+        Ok(())
+    }
+
     async fn cmd_loop(mut self, mut conn: Connection) {
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
         loop {
@@ -672,6 +679,12 @@ impl Matcher {
                             }
                             error!("could not handle change: {e}");
                         }
+                    }
+                    MatcherCmd::Cleanup => {
+                        if let Err(e) = block_in_place(|| self.handle_cleanup(&mut conn)) {
+                            error!("could not handle cleanup: {e}");
+                        }
+                        break;
                     }
                 },
                 Branch::PurgeOldChanges => {
@@ -1581,14 +1594,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let handle = Matcher::create(id, &schema, matcher_conn, tx, sql)?;
 
-        let mut cleanup_conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
-
-        setup_conn(
-            &mut cleanup_conn,
-            &[(subscriptions_db_path, "subscriptions".into())].into(),
-        )?;
-
-        handle.cleanup(cleanup_conn)?;
+        handle.cleanup();
 
         Ok(())
     }
