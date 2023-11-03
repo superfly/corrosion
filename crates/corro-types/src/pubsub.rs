@@ -20,7 +20,7 @@ use sqlite3_parser::{
     lexer::sql::Parser,
 };
 use tokio::{sync::mpsc, task::block_in_place};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt};
 use uuid::Uuid;
@@ -720,31 +720,7 @@ impl Matcher {
             query_cols.push(format!("col_{i}"));
         }
 
-        let int_handle = conn.get_interrupt_handle();
-
-        let cancel = CancellationToken::new();
-        tokio::spawn({
-            let cancel = cancel.clone();
-            async move {
-                match tokio::time::sleep(Duration::from_secs(15))
-                    .preemptible(cancel.cancelled())
-                    .await
-                {
-                    Outcome::Completed(_) => {
-                        warn!("subscription query deadline reached, interrupting!");
-                        int_handle.interrupt();
-                        // no need to send any query event, it should bubble up properly and if not
-                        // then it means the conn was not interrupted in time which is also fine
-                    }
-                    Outcome::Preempted(_) => {
-                        debug!("deadline was canceled, not interrupting query");
-                    }
-                }
-            }
-        });
-
         let res = block_in_place(|| {
-            let _drop_guard = cancel.drop_guard();
             let tx = conn.transaction()?;
 
             let mut stmt_str = Cmd::Stmt(self.query.clone()).to_string();
@@ -762,30 +738,52 @@ impl Matcher {
                 tmp_cols.push(col_name.clone());
             }
 
-            let insert_into = format!(
-                "INSERT INTO {} ({}) {} RETURNING __corro_rowid,{}",
-                self.qualified_table_name,
-                tmp_cols.join(","),
-                stmt_str,
-                query_cols.join(","),
-            );
-
             let mut last_rowid = 0;
 
             let elapsed = {
-                let mut prepped = tx.prepare(&insert_into)?;
+                println!("select stmt: {stmt_str:?}");
 
+                let mut select = tx.prepare(&stmt_str)?;
                 let start = Instant::now();
-                let mut rows = prepped.query(())?;
+                let mut select_rows = {
+                    let _guard = interrupt_deadline_guard(&tx, Duration::from_secs(15));
+                    select.query(())?
+                };
                 let elapsed = start.elapsed();
 
+                let insert_into = format!(
+                    "INSERT INTO {} ({}) VALUES ({}) RETURNING __corro_rowid,{}",
+                    self.qualified_table_name,
+                    tmp_cols.join(","),
+                    tmp_cols
+                        .iter()
+                        .map(|_| "?".to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    query_cols.join(","),
+                );
+                println!("insert stmt: {insert_into:?}");
+
+                let mut insert = tx.prepare(&insert_into)?;
+
+                // reusable cells buffer
+                let mut cells = Vec::with_capacity(tmp_cols.len());
+
                 loop {
-                    match rows.next() {
+                    match select_rows.next() {
                         Ok(Some(row)) => {
-                            let rowid: i64 = row.get(0)?;
-                            let cells = (1..=query_cols.len())
-                                .map(|i| row.get::<_, SqliteValue>(i))
-                                .collect::<rusqlite::Result<Vec<_>>>()?;
+                            for i in 0..tmp_cols.len() {
+                                cells.push(row.get::<_, rusqlite::types::Value>(i)?);
+                            }
+                            println!("cells: {cells:?}");
+                            let (rowid, cells) =
+                                insert.query_row(params_from_iter(cells.drain(..)), |row| {
+                                    let rowid: i64 = row.get(0)?;
+                                    let cells = (1..=query_cols.len())
+                                        .map(|i| row.get::<_, SqliteValue>(i))
+                                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                                    Ok((rowid, cells))
+                                })?;
 
                             if let Err(e) = self
                                 .evt_tx
@@ -1056,6 +1054,31 @@ impl Matcher {
 
         Ok(())
     }
+}
+
+fn interrupt_deadline_guard(conn: &Connection, dur: Duration) -> DropGuard {
+    let int_handle = conn.get_interrupt_handle();
+    let cancel = CancellationToken::new();
+    tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            match tokio::time::sleep(dur)
+                .preemptible(cancel.cancelled())
+                .await
+            {
+                Outcome::Completed(_) => {
+                    warn!("subscription query deadline reached, interrupting!");
+                    int_handle.interrupt();
+                    // no need to send any query event, it should bubble up properly and if not
+                    // then it means the conn was not interrupted in time which is also fine
+                }
+                Outcome::Preempted(_) => {
+                    debug!("deadline was canceled, not interrupting query");
+                }
+            }
+        }
+    });
+    cancel.drop_guard()
 }
 
 #[derive(Debug, Default, Clone)]
