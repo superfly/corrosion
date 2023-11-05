@@ -646,15 +646,13 @@ impl Matcher {
         let tx = conn.transaction()?;
 
         info!(sub_id = %self.id, "Dropping tables {}, {}", self.qualified_table_name, self.qualified_changes_table_name);
-        tx.prepare(&format!(
+        tx.execute_batch(&format!(
             "DROP TABLE {}; DROP TABLE {}",
             self.qualified_table_name, self.qualified_changes_table_name
-        ))?
-        .execute(())?;
+        ))?;
 
         info!(sub_id = %self.id, "Dropping subs entry in DB");
-        tx.prepare("DELETE FROM subscriptions.subs WHERE id = ?")?
-            .execute([self.id])?;
+        tx.execute("DELETE FROM subscriptions.subs WHERE id = ?", [self.id])?;
 
         tx.commit()?;
 
