@@ -224,7 +224,6 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError
 
 pub enum MatcherCmd {
     ProcessChange(IndexMap<CompactString, Vec<Vec<SqliteValue>>>),
-    Cleanup,
 }
 
 #[derive(Clone)]
@@ -237,6 +236,7 @@ struct InnerMatcherHandle {
     qualified_table_name: String,
     qualified_changes_table_name: String,
     col_names: Vec<CompactString>,
+    cancel: CancellationToken,
 }
 
 impl MatcherHandle {
@@ -317,9 +317,8 @@ impl MatcherHandle {
     }
 
     pub async fn cleanup(self) {
-        if let Err(e) = self.0.cmd_tx.send(MatcherCmd::Cleanup).await {
-            error!(sub_id = %self.0.id, "could not send cleanup command to matcher: {e}");
-        }
+        self.0.cancel.cancel();
+        info!(sub_id = %self.0.id, "Canceled subscription");
     }
 }
 
@@ -337,6 +336,7 @@ pub struct Matcher {
     pub cmd_rx: mpsc::Receiver<MatcherCmd>,
     pub col_names: Vec<CompactString>,
     pub last_rowid: i64,
+    cancel: CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +495,7 @@ impl Matcher {
         let qualified_changes_table_name = format!("subscriptions.changes_{}", id.as_simple());
 
         let (cmd_tx, cmd_rx) = mpsc::channel(512);
+        let cancel = CancellationToken::new();
 
         let handle = MatcherHandle(Arc::new(InnerMatcherHandle {
             id,
@@ -503,6 +504,7 @@ impl Matcher {
             qualified_table_name: qualified_table_name.clone(),
             qualified_changes_table_name: qualified_changes_table_name.clone(),
             col_names: col_names.clone(),
+            cancel: cancel.clone(),
         }));
 
         let matcher = Self {
@@ -518,6 +520,7 @@ impl Matcher {
             cmd_rx,
             col_names,
             last_rowid: 0,
+            cancel,
         };
 
         Ok((matcher, handle))
@@ -660,6 +663,7 @@ impl Matcher {
 
     async fn cmd_loop(mut self, mut conn: Connection) {
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
+
         loop {
             enum Branch {
                 Cmd(MatcherCmd),
@@ -668,6 +672,10 @@ impl Matcher {
 
             let branch = tokio::select! {
                 biased;
+                _ = self.cancel.cancelled() => {
+                    info!(sub_id = %self.id, "Acknowledge subscription cancellation, breaking loop.");
+                    break;
+                }
                 Some(req) = self.cmd_rx.recv() => Branch::Cmd(req),
                 _ = purge_changes_interval.tick() => Branch::PurgeOldChanges,
                 else => {
@@ -686,13 +694,6 @@ impl Matcher {
                             }
                             error!("could not handle change: {e}");
                         }
-                    }
-                    MatcherCmd::Cleanup => {
-                        info!(sub_id = %self.id, "received cleanup command, processing...");
-                        if let Err(e) = block_in_place(|| self.handle_cleanup(&mut conn)) {
-                            error!("could not handle cleanup: {e}");
-                        }
-                        break;
                     }
                 },
                 Branch::PurgeOldChanges => {
@@ -724,6 +725,10 @@ impl Matcher {
         }
 
         debug!(id = %self.id, "matcher loop is done");
+
+        if let Err(e) = block_in_place(|| self.handle_cleanup(&mut conn)) {
+            error!("could not handle cleanup: {e}");
+        }
     }
 
     async fn run(mut self, mut conn: Connection) {
