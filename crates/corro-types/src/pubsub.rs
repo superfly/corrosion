@@ -318,7 +318,7 @@ impl MatcherHandle {
 
     pub async fn cleanup(self) {
         if let Err(e) = self.0.cmd_tx.send(MatcherCmd::Cleanup).await {
-            error!("could not send cleanup command to matcher: {e}");
+            error!(sub_id = %self.0.id, "could not send cleanup command to matcher: {e}");
         }
     }
 }
@@ -685,6 +685,7 @@ impl Matcher {
                         }
                     }
                     MatcherCmd::Cleanup => {
+                        info!(sub_id = %self.id, "received cleanup command, processing...");
                         if let Err(e) = block_in_place(|| self.handle_cleanup(&mut conn)) {
                             error!("could not handle cleanup: {e}");
                         }
