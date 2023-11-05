@@ -639,13 +639,17 @@ impl Matcher {
     }
 
     fn handle_cleanup(&self, conn: &mut Connection) -> rusqlite::Result<()> {
+        info!(sub_id = %self.id, "Attempting to cleanup...");
         let tx = conn.transaction()?;
 
+        info!(sub_id = %self.id, "Dropping tables {}, {}", self.qualified_table_name, self.qualified_changes_table_name);
         tx.prepare(&format!(
             "DROP TABLE {}; DROP TABLE {}",
             self.qualified_table_name, self.qualified_changes_table_name
         ))?
         .execute(())?;
+
+        info!(sub_id = %self.id, "Dropping subs entry in DB");
         tx.prepare("DELETE FROM subscriptions.subs WHERE id = ?")?
             .execute([self.id])?;
 

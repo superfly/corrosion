@@ -2265,22 +2265,10 @@ fn process_single_version(
 pub fn process_subs(agent: &Agent, changeset: &[Change]) {
     trace!("process subs...");
 
-    let mut matchers_to_delete = vec![];
-
-    {
-        let matchers = agent.matchers().read();
-        for (id, matcher) in matchers.iter() {
-            if let Err(e) = matcher.process_change(changeset) {
-                error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
-                matchers_to_delete.push(*id);
-            }
-        }
-    }
-
-    for id in matchers_to_delete {
-        if let Some(handle) = agent.matchers().write().remove(&id) {
-            info!(sub_id = %id, "Removed subscription from process_subs");
-            tokio::spawn(handle.cleanup());
+    let matchers = agent.matchers().read();
+    for (id, matcher) in matchers.iter() {
+        if let Err(e) = matcher.process_change(changeset) {
+            error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
         }
     }
 }

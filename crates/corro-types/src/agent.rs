@@ -198,22 +198,10 @@ impl Agent {
     pub fn process_subs_by_db_version(&self, conn: &Connection, db_version: i64) {
         trace!("process subs by db version...");
 
-        let mut matchers_to_delete = vec![];
-
-        {
-            let matchers = self.matchers().read();
-            for (id, matcher) in matchers.iter() {
-                if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
-                    error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
-                    matchers_to_delete.push(*id);
-                }
-            }
-        }
-
-        for id in matchers_to_delete {
-            if let Some(handle) = self.matchers().write().remove(&id) {
-                info!(sub_id = %id, "Removed subscription from process_subs_by_db_version");
-                tokio::spawn(handle.cleanup());
+        let matchers = self.matchers().read();
+        for (id, matcher) in matchers.iter() {
+            if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
+                error!("could not process change w/ matcher {id}, maybe probably defunct! {e}");
             }
         }
     }
