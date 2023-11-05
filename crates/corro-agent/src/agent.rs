@@ -388,6 +388,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             let (evt_tx, evt_rx) = channel(512);
             match Matcher::restore(id, &agent.schema().read(), conn, evt_tx, &sql) {
                 Ok(handle) => {
+                    info!(sub_id = %id, "Restored subscription");
                     agent.matchers().write().insert(id, handle);
                     let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
                     tokio::spawn(process_sub_channel(
@@ -2278,6 +2279,7 @@ pub fn process_subs(agent: &Agent, changeset: &[Change]) {
 
     for id in matchers_to_delete {
         if let Some(handle) = agent.matchers().write().remove(&id) {
+            info!(sub_id = %id, "Removed subscription from process_subs");
             tokio::spawn(handle.cleanup());
         }
     }

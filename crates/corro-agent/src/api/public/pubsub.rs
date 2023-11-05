@@ -60,6 +60,7 @@ async fn sub_by_id(
             // ensure this goes!
             bcast_cache.write().await.remove(&id);
             if let Some(handle) = agent.matchers().write().remove(&id) {
+                info!(sub_id = %id, "Removed subscription from sub_by_id");
                 tokio::spawn(handle.cleanup());
             }
 
@@ -186,9 +187,12 @@ pub async fn process_sub_channel(
 
     // remove and get handle from the agent's "matchers"
     let handle = match agent.matchers().write().remove(&id) {
-        Some(h) => h,
+        Some(h) => {
+            info!(sub_id = %id, "Removed subscription from process_sub_channel");
+            h
+        }
         None => {
-            warn!("subscription handle was already gone. odd!");
+            warn!(sub_id = %id, "subscription handle was already gone. odd!");
             return;
         }
     };

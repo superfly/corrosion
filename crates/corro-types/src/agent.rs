@@ -212,6 +212,7 @@ impl Agent {
 
         for id in matchers_to_delete {
             if let Some(handle) = self.matchers().write().remove(&id) {
+                info!(sub_id = %id, "Removed subscription from process_subs_by_db_version");
                 tokio::spawn(handle.cleanup());
             }
         }
