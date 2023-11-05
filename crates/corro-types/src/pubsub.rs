@@ -653,6 +653,8 @@ impl Matcher {
         tx.prepare("DELETE FROM subscriptions.subs WHERE id = ?")?
             .execute([self.id])?;
 
+        tx.commit()?;
+
         Ok(())
     }
 
@@ -669,6 +671,7 @@ impl Matcher {
                 Some(req) = self.cmd_rx.recv() => Branch::Cmd(req),
                 _ = purge_changes_interval.tick() => Branch::PurgeOldChanges,
                 else => {
+                    info!(sub_id = %self.id, "Subscription command loop is done!");
                     break;
                 }
             };
