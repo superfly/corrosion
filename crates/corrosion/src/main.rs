@@ -186,13 +186,17 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 for table in tables {
                     let n = conn.execute(
                         &format!("UPDATE \"{table}\" SET site_id = ? WHERE site_id IS NULL"),
-                        [ordinal],
+                        [ordinal],  
                     )?;
                     debug!("updated {n} rows in {table}");
                 }
 
                 // clear __corro_members, this state is per actor
                 conn.execute("DELETE FROM __corro_members;", [])?;
+
+                conn.execute_batch(
+                    "DROP TABLE __corro_consul_services; DROP TABLE __corro_consul_checks;",
+                )?;
 
                 conn.execute_batch(
                     r#"

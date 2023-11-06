@@ -833,6 +833,8 @@ dependencies = [
  "fallible-iterator",
  "futures",
  "hex",
+ "itertools",
+ "metrics",
  "pgwire",
  "postgres-types",
  "rusqlite",

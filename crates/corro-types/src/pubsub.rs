@@ -10,8 +10,11 @@ use compact_str::{CompactString, ToCompactString};
 use corro_api_types::{Change, ChangeId, ColumnType, RowId, SqliteValue, SqliteValueRef};
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
-use indexmap::IndexMap;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction};
+use indexmap::{IndexMap, IndexSet};
+use rusqlite::{
+    params, params_from_iter, types::FromSqlError, Connection, OptionalExtension, ToSql,
+    Transaction,
+};
 use sqlite3_parser::{
     ast::{
         As, Cmd, Expr, JoinConstraint, Name, OneSelect, Operator, QualifiedName, ResultColumn,
@@ -19,8 +22,13 @@ use sqlite3_parser::{
     },
     lexer::sql::Parser,
 };
-use tokio::{sync::mpsc, task::block_in_place};
+use tokio::{
+    sync::mpsc::{self},
+    task::block_in_place,
+};
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, trace, warn};
+use tripwire::{Outcome, PreemptibleFutureExt};
 use uuid::Uuid;
 
 use crate::{
@@ -221,7 +229,7 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError
 }
 
 pub enum MatcherCmd {
-    ProcessChange(IndexMap<CompactString, Vec<Vec<SqliteValue>>>),
+    ProcessChange(MatchCandidates),
 }
 
 #[derive(Clone)]
@@ -234,37 +242,52 @@ struct InnerMatcherHandle {
     qualified_table_name: String,
     qualified_changes_table_name: String,
     col_names: Vec<CompactString>,
+    cancel: CancellationToken,
 }
 
+struct MatchableChange<'a> {
+    table: &'a str,
+    pk: &'a [u8],
+    column: &'a str,
+}
+
+type MatchCandidates = IndexMap<CompactString, IndexSet<Vec<u8>>>;
+
 impl MatcherHandle {
-    fn process_changes_from_iter<I, T, P>(&self, iter: I) -> Result<(), MatcherError>
-    where
-        I: Iterator<Item = rusqlite::Result<(T, P)>>,
-        T: AsRef<str>,
-        P: AsRef<[u8]>,
-    {
-        let mut candidates: IndexMap<CompactString, Vec<Vec<SqliteValue>>> = IndexMap::new();
-
-        let filtered = iter
-            .flatten()
-            .filter(|(table, _)| self.0.parsed.table_columns.contains_key(table.as_ref()));
-
-        for (table, pk) in filtered {
-            let pks = unpack_columns(pk.as_ref())?
-                .into_iter()
-                .map(|v| v.to_owned())
-                .collect();
-            if let Some(v) = candidates.get_mut(table.as_ref()) {
-                v.push(pks);
-            } else {
-                candidates.insert(table.as_ref().to_compact_string(), vec![pks]);
-            }
+    fn filter_matchable_change(
+        &self,
+        candidates: &mut MatchCandidates,
+        change: MatchableChange,
+    ) -> Result<(), MatcherError> {
+        // don't double process the same pk
+        if candidates
+            .get(change.table)
+            .map(|pks| pks.contains(change.pk))
+            .unwrap_or_default()
+        {
+            return Ok(());
         }
 
-        self.0
-            .cmd_tx
-            .try_send(MatcherCmd::ProcessChange(candidates))
-            .map_err(|_| MatcherError::ChangeQueueClosedOrFull)?;
+        // don't consider changes that don't have both the table + col in the matcher query
+        if !self
+            .0
+            .parsed
+            .table_columns
+            .get(change.table)
+            .map(|cols| change.column == "-1" || cols.contains(change.column))
+            .unwrap_or_default()
+        {
+            return Ok(());
+        }
+
+        if let Some(v) = candidates.get_mut(change.table) {
+            v.insert(change.pk.to_vec());
+        } else {
+            candidates.insert(
+                change.table.to_compact_string(),
+                [change.pk.to_vec()].into(),
+            );
+        }
 
         Ok(())
     }
@@ -274,23 +297,62 @@ impl MatcherHandle {
         conn: &Connection,
         db_version: i64,
     ) -> Result<(), MatcherError> {
+        let mut candidates = MatchCandidates::new();
+
         let mut prepped = conn.prepare_cached(
-            "SELECT \"table\", DISTINCT(pk) FROM crsql_changes WHERE db_version = ? ORDER BY seq GROUP BY \"table\"",
+            "SELECT DISTINCT \"table\", pk, cid FROM crsql_changes WHERE db_version = ? GROUP BY \"table\" ORDER BY seq",
         )?;
 
-        let rows = prepped.query_map([db_version], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
+        let mut rows = prepped.query([db_version])?;
 
-        self.process_changes_from_iter(rows)
+        loop {
+            let row = match rows.next()? {
+                Some(row) => row,
+                None => break,
+            };
+
+            self.filter_matchable_change(
+                &mut candidates,
+                MatchableChange {
+                    table: row.get_ref(0)?.as_str()?,
+                    pk: row.get_ref(1)?.as_blob()?,
+                    column: row.get_ref(2)?.as_str()?,
+                },
+            )?;
+        }
+
+        if !candidates.is_empty() {
+            self.0
+                .cmd_tx
+                .try_send(MatcherCmd::ProcessChange(candidates))
+                .map_err(|_| MatcherError::ChangeQueueClosedOrFull)?;
+        }
+
+        Ok(())
     }
 
-    pub fn process_change(&self, changes: &[Change]) -> Result<(), MatcherError> {
-        self.process_changes_from_iter(
-            changes
-                .iter()
-                .map(|change| Ok((change.table.as_str(), change.pk.as_slice()))),
-        )
+    pub fn process_changeset(&self, changes: &[Change]) -> Result<(), MatcherError> {
+        let mut candidates = MatchCandidates::new();
+
+        for change in changes.iter() {
+            self.filter_matchable_change(
+                &mut candidates,
+                MatchableChange {
+                    table: &change.table,
+                    pk: &change.pk,
+                    column: &change.cid,
+                },
+            )?;
+        }
+
+        if !candidates.is_empty() {
+            self.0
+                .cmd_tx
+                .try_send(MatcherCmd::ProcessChange(candidates))
+                .map_err(|_| MatcherError::ChangeQueueClosedOrFull)?;
+        }
+
+        Ok(())
     }
 
     pub fn id(&self) -> Uuid {
@@ -313,18 +375,9 @@ impl MatcherHandle {
         &self.0.col_names
     }
 
-    pub fn cleanup(self, mut conn: Connection) -> rusqlite::Result<()> {
-        let tx = conn.transaction()?;
-
-        tx.prepare(&format!(
-            "DROP TABLE {}; DROP TABLE {}",
-            self.table_name(),
-            self.changes_table_name()
-        ))?
-        .execute(())?;
-        tx.prepare("DELETE FROM subscriptions.subs WHERE id = ?")?
-            .execute([self.0.id])?;
-        Ok(())
+    pub async fn cleanup(self) {
+        self.0.cancel.cancel();
+        info!(sub_id = %self.0.id, "Canceled subscription");
     }
 }
 
@@ -342,6 +395,7 @@ pub struct Matcher {
     pub cmd_rx: mpsc::Receiver<MatcherCmd>,
     pub col_names: Vec<CompactString>,
     pub last_rowid: i64,
+    cancel: CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +554,7 @@ impl Matcher {
         let qualified_changes_table_name = format!("subscriptions.changes_{}", id.as_simple());
 
         let (cmd_tx, cmd_rx) = mpsc::channel(512);
+        let cancel = CancellationToken::new();
 
         let handle = MatcherHandle(Arc::new(InnerMatcherHandle {
             id,
@@ -508,6 +563,7 @@ impl Matcher {
             qualified_table_name: qualified_table_name.clone(),
             qualified_changes_table_name: qualified_changes_table_name.clone(),
             col_names: col_names.clone(),
+            cancel: cancel.clone(),
         }));
 
         let matcher = Self {
@@ -523,6 +579,7 @@ impl Matcher {
             cmd_rx,
             col_names,
             last_rowid: 0,
+            cancel,
         };
 
         Ok((matcher, handle))
@@ -619,7 +676,7 @@ impl Matcher {
     async fn run_restore(mut self, conn: Connection) {
         let init_res = block_in_place(|| {
             let mut prepped = conn.prepare(&format!(
-                "SELECT MAX(__corro_rowid) FROM {}",
+                "SELECT COALESCE(MAX(__corro_rowid), 0) FROM {}",
                 self.qualified_table_name
             ))?;
             self.last_rowid = prepped
@@ -643,35 +700,83 @@ impl Matcher {
         self.cmd_loop(conn).await
     }
 
+    fn handle_cleanup(&self, conn: &mut Connection) -> rusqlite::Result<()> {
+        info!(sub_id = %self.id, "Attempting to cleanup...");
+        let tx = conn.transaction()?;
+
+        info!(sub_id = %self.id, "Dropping tables {}, {}", self.qualified_table_name, self.qualified_changes_table_name);
+        tx.execute_batch(&format!(
+            "DROP TABLE {}; DROP TABLE {}",
+            self.qualified_table_name, self.qualified_changes_table_name
+        ))?;
+
+        info!(sub_id = %self.id, "Dropping subs entry in DB");
+        tx.execute("DELETE FROM subscriptions.subs WHERE id = ?", [self.id])?;
+
+        tx.commit()?;
+
+        Ok(())
+    }
+
     async fn cmd_loop(mut self, mut conn: Connection) {
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
+
+        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(100));
+
+        let mut process_buf = Vec::new();
+        let mut count = 0;
+
         loop {
             enum Branch {
-                Cmd(MatcherCmd),
+                ProcessChanges,
                 PurgeOldChanges,
             }
 
             let branch = tokio::select! {
                 biased;
-                Some(req) = self.cmd_rx.recv() => Branch::Cmd(req),
+                _ = self.cancel.cancelled() => {
+                    info!(sub_id = %self.id, "Acknowledge subscription cancellation, breaking loop.");
+                    break;
+                }
+                Some(req) = self.cmd_rx.recv() => match req {
+                    MatcherCmd::ProcessChange(candidates) => {
+                        count += candidates.values().map(|pks| pks.len()).sum::<usize>();
+                        process_buf.push(candidates);
+                        if count >= 200 {
+                            Branch::ProcessChanges
+                        } else {
+                            continue;
+                        }
+                    }
+                },
+                _ = process_changes_interval.tick() => Branch::ProcessChanges,
                 _ = purge_changes_interval.tick() => Branch::PurgeOldChanges,
                 else => {
+                    info!(sub_id = %self.id, "Subscription command loop is done!");
                     break;
                 }
             };
 
             match branch {
-                Branch::Cmd(req) => match req {
-                    MatcherCmd::ProcessChange(candidates) => {
-                        if let Err(e) = block_in_place(|| self.handle_change(&mut conn, candidates))
-                        {
-                            if matches!(e, MatcherError::EventReceiverClosed) {
-                                break;
-                            }
-                            error!("could not handle change: {e}");
-                        }
+                Branch::ProcessChanges => {
+                    if process_buf.is_empty() {
+                        continue;
                     }
-                },
+
+                    if let Err(e) =
+                        block_in_place(|| self.handle_change(&mut conn, process_buf.drain(..)))
+                    {
+                        if matches!(e, MatcherError::EventReceiverClosed) {
+                            break;
+                        }
+                        error!("could not handle change: {e}");
+                    }
+
+                    // just in case...
+                    process_buf.clear();
+
+                    count = 0;
+                }
                 Branch::PurgeOldChanges => {
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
@@ -701,6 +806,17 @@ impl Matcher {
         }
 
         debug!(id = %self.id, "matcher loop is done");
+
+        if !process_buf.is_empty() {
+            if let Err(e) = block_in_place(|| self.handle_change(&mut conn, process_buf.drain(..)))
+            {
+                error!("could not handle change after loop broken: {e}");
+            }
+        }
+
+        if let Err(e) = block_in_place(|| self.handle_cleanup(&mut conn)) {
+            error!("could not handle cleanup: {e}");
+        }
     }
 
     async fn run(mut self, mut conn: Connection) {
@@ -722,7 +838,7 @@ impl Matcher {
             let tx = conn.transaction()?;
 
             let mut stmt_str = Cmd::Stmt(self.query.clone()).to_string();
-            stmt_str.pop();
+            stmt_str.pop(); // remove trailing `;`
 
             let mut tmp_cols = self
                 .pks
@@ -736,30 +852,52 @@ impl Matcher {
                 tmp_cols.push(col_name.clone());
             }
 
-            let insert_into = format!(
-                "INSERT INTO {} ({}) {} RETURNING __corro_rowid,{}",
-                self.qualified_table_name,
-                tmp_cols.join(","),
-                stmt_str,
-                query_cols.join(","),
-            );
-
             let mut last_rowid = 0;
 
             let elapsed = {
-                let mut prepped = tx.prepare(&insert_into)?;
+                println!("select stmt: {stmt_str:?}");
 
+                let mut select = tx.prepare(&stmt_str)?;
                 let start = Instant::now();
-                let mut rows = prepped.query(())?;
+                let mut select_rows = {
+                    let _guard = interrupt_deadline_guard(&tx, Duration::from_secs(15));
+                    select.query(())?
+                };
                 let elapsed = start.elapsed();
 
+                let insert_into = format!(
+                    "INSERT INTO {} ({}) VALUES ({}) RETURNING __corro_rowid,{}",
+                    self.qualified_table_name,
+                    tmp_cols.join(","),
+                    tmp_cols
+                        .iter()
+                        .map(|_| "?".to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    query_cols.join(","),
+                );
+                println!("insert stmt: {insert_into:?}");
+
+                let mut insert = tx.prepare(&insert_into)?;
+
+                // reusable cells buffer
+                let mut cells = Vec::with_capacity(tmp_cols.len());
+
                 loop {
-                    match rows.next() {
+                    match select_rows.next() {
                         Ok(Some(row)) => {
-                            let rowid: i64 = row.get(0)?;
-                            let cells = (1..=query_cols.len())
-                                .map(|i| row.get::<_, SqliteValue>(i))
-                                .collect::<rusqlite::Result<Vec<_>>>()?;
+                            for i in 0..tmp_cols.len() {
+                                cells.push(row.get::<_, rusqlite::types::Value>(i)?);
+                            }
+                            println!("cells: {cells:?}");
+                            let (rowid, cells) =
+                                insert.query_row(params_from_iter(cells.drain(..)), |row| {
+                                    let rowid: i64 = row.get(0)?;
+                                    let cells = (1..=query_cols.len())
+                                        .map(|i| row.get::<_, SqliteValue>(i))
+                                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                                    Ok((rowid, cells))
+                                })?;
 
                             if let Err(e) = self
                                 .evt_tx
@@ -824,38 +962,46 @@ impl Matcher {
         self.cmd_loop(conn).await
     }
 
-    fn handle_change(
+    fn handle_change<I: Iterator<Item = MatchCandidates>>(
         &mut self,
         conn: &mut Connection,
-        candidates: IndexMap<CompactString, Vec<Vec<SqliteValue>>>,
+        candidates: I,
     ) -> Result<(), MatcherError> {
         let tx = conn.transaction()?;
 
-        let tables = candidates.keys().cloned().collect::<Vec<_>>();
+        let mut tables = IndexSet::new();
 
-        for (table, pks) in candidates {
-            let tmp_table_name = format!("subscription_{}_{table}", self.id.as_simple());
+        for candidates in candidates {
+            for (table, pks) in candidates {
+                let pks = pks
+                    .iter()
+                    .map(|pk| unpack_columns(pk))
+                    .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
 
-            // create a temporary table to mix and match the data
-            tx.prepare_cached(
-                // TODO: cache the statement's string somewhere, it's always the same!
-                &format!(
-                    "CREATE TEMP TABLE {tmp_table_name} ({})",
-                    self.pks
-                        .get(table.as_str())
-                        .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
-                        .to_vec()
-                        .join(",")
-                ),
-            )?
-            .execute(())?;
+                let tmp_table_name = format!("subscription_{}_{table}", self.id.as_simple());
+                if tables.insert(table.clone()) {
+                    // create a temporary table to mix and match the data
+                    tx.prepare_cached(
+                        // TODO: cache the statement's string somewhere, it's always the same!
+                        &format!(
+                            "CREATE TEMP TABLE IF NOT EXISTS {tmp_table_name} ({})",
+                            self.pks
+                                .get(table.as_str())
+                                .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
+                                .to_vec()
+                                .join(",")
+                        ),
+                    )?
+                    .execute(())?;
+                }
 
-            for pks in pks {
-                tx.prepare_cached(&format!(
-                    "INSERT INTO {tmp_table_name} VALUES ({})",
-                    (0..pks.len()).map(|_i| "?").collect::<Vec<_>>().join(",")
-                ))?
-                .execute(params_from_iter(pks))?;
+                for pks in pks {
+                    tx.prepare_cached(&format!(
+                        "INSERT INTO {tmp_table_name} VALUES ({})",
+                        (0..pks.len()).map(|_i| "?").collect::<Vec<_>>().join(",")
+                    ))?
+                    .execute(params_from_iter(pks))?;
+                }
             }
         }
 
@@ -1017,7 +1163,7 @@ impl Matcher {
         for table in tables {
             // TODO: reduce mistakes by computing this table name once
             tx.prepare_cached(&format!(
-                "DROP TABLE subscription_{}_{table}",
+                "DROP TABLE IF EXISTS subscription_{}_{table}",
                 self.id.as_simple(),
             ))?
             .execute(())?;
@@ -1030,6 +1176,31 @@ impl Matcher {
 
         Ok(())
     }
+}
+
+fn interrupt_deadline_guard(conn: &Connection, dur: Duration) -> DropGuard {
+    let int_handle = conn.get_interrupt_handle();
+    let cancel = CancellationToken::new();
+    tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            match tokio::time::sleep(dur)
+                .preemptible(cancel.cancelled())
+                .await
+            {
+                Outcome::Completed(_) => {
+                    warn!("subscription query deadline reached, interrupting!");
+                    int_handle.interrupt();
+                    // no need to send any query event, it should bubble up properly and if not
+                    // then it means the conn was not interrupted in time which is also fine
+                }
+                Outcome::Preempted(_) => {
+                    debug!("deadline was canceled, not interrupting query");
+                }
+            }
+        }
+    });
+    cancel.drop_guard()
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1442,6 +1613,8 @@ pub enum MatcherError {
     Unpack(#[from] UnpackError),
     #[error("did not insert subscription")]
     InsertSub,
+    #[error(transparent)]
+    FromSql(#[from] FromSqlError),
 }
 
 pub fn migrate_subs(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -1532,14 +1705,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let handle = Matcher::create(id, &schema, matcher_conn, tx, sql)?;
 
-        let mut cleanup_conn = rusqlite::Connection::open(&db_path).expect("could not open conn");
-
-        setup_conn(
-            &mut cleanup_conn,
-            &[(subscriptions_db_path, "subscriptions".into())].into(),
-        )?;
-
-        handle.cleanup(cleanup_conn)?;
+        handle.cleanup().await;
 
         Ok(())
     }
@@ -1750,6 +1916,7 @@ mod tests {
             let matcher = Matcher::create(id, &schema, matcher_conn, tx, sql).unwrap();
 
             println!("matcher created w/ id: {}", id.as_simple());
+            println!("parsed: {:?}", matcher.0.parsed);
 
             assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Columns(_)));
 
@@ -1791,7 +1958,7 @@ mod tests {
             };
 
             println!("processing change...");
-            matcher.process_change(changes.as_slice()).unwrap();
+            matcher.process_changeset(changes.as_slice()).unwrap();
             println!("processed changes");
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
@@ -1825,14 +1992,18 @@ mod tests {
                 changes
             };
 
-            matcher.process_change(changes.as_slice()).unwrap();
+            matcher.process_changeset(changes.as_slice()).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
+
+            println!("waiting for a change (A)");
 
             assert_eq!(
                 rx.recv().await.unwrap(),
                 QueryEvent::Change(ChangeType::Delete, RowId(1), cells, ChangeId(2))
             );
+
+            println!("got change (A)");
 
             // update the second row
             {
@@ -1857,14 +2028,18 @@ mod tests {
                 changes
             };
 
-            matcher.process_change(changes.as_slice()).unwrap();
+            matcher.process_changeset(changes.as_slice()).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
+
+            println!("waiting for a change (B)");
 
             assert_eq!(
                 rx.recv().await.unwrap(),
                 QueryEvent::Change(ChangeType::Update, RowId(2), cells, ChangeId(3))
             );
+
+            println!("got change (B)");
 
             // lots of operations
 
@@ -1919,7 +2094,7 @@ mod tests {
                 changes
             };
 
-            matcher.process_change(changes.as_slice()).unwrap();
+            matcher.process_changeset(changes.as_slice()).unwrap();
 
             let start = Instant::now();
             for _ in range {

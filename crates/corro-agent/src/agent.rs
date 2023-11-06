@@ -150,87 +150,112 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     {
         debug!("getting read-only conn for pull bookkeeping rows");
-        let conn = pool.read().await?;
+        let mut conn = pool.write_priority().await?;
 
         debug!("getting bookkept rows");
 
-        let mut prepped = conn.prepare_cached(
-            "SELECT actor_id, start_version, end_version, db_version, last_seq, ts
+        let mut cleared_rows: BTreeMap<ActorId, usize> = BTreeMap::new();
+
+        {
+            let mut prepped = conn.prepare_cached(
+                "SELECT actor_id, start_version, end_version, db_version, last_seq, ts
                 FROM __corro_bookkeeping",
-        )?;
-        let mut rows = prepped.query([])?;
+            )?;
+            let mut rows = prepped.query([])?;
 
-        loop {
-            let row = rows.next()?;
-            match row {
-                None => break,
-                Some(row) => {
-                    let ranges = bk.entry(row.get(0)?).or_default();
-                    let start_v = row.get(1)?;
-                    let end_v: Option<i64> = row.get(2)?;
-                    ranges.insert_many(
-                        start_v..=end_v.unwrap_or(start_v),
-                        match row.get(3)? {
-                            Some(db_version) => KnownDbVersion::Current {
-                                db_version,
-                                last_seq: row.get(4)?,
-                                ts: row.get(5)?,
+            loop {
+                let row = rows.next()?;
+                match row {
+                    None => break,
+                    Some(row) => {
+                        let actor_id = row.get(0)?;
+                        let ranges = bk.entry(actor_id).or_default();
+                        let start_v = row.get(1)?;
+                        let end_v: Option<i64> = row.get(2)?;
+                        ranges.insert_many(
+                            start_v..=end_v.unwrap_or(start_v),
+                            match row.get(3)? {
+                                Some(db_version) => KnownDbVersion::Current {
+                                    db_version,
+                                    last_seq: row.get(4)?,
+                                    ts: row.get(5)?,
+                                },
+                                None => {
+                                    *cleared_rows.entry(actor_id).or_default() += 1;
+                                    KnownDbVersion::Cleared
+                                }
                             },
-                            None => KnownDbVersion::Cleared,
-                        },
-                    );
+                        );
+                    }
                 }
             }
-        }
 
-        let mut partials: HashMap<(ActorId, i64), (RangeInclusiveSet<i64>, i64, Timestamp)> =
-            HashMap::new();
+            let mut partials: HashMap<(ActorId, i64), (RangeInclusiveSet<i64>, i64, Timestamp)> =
+                HashMap::new();
 
-        debug!("getting seq bookkept rows");
+            debug!("getting seq bookkept rows");
 
-        let mut prepped = conn.prepare_cached(
-            "SELECT site_id, version, start_seq, end_seq, last_seq, ts
+            let mut prepped = conn.prepare_cached(
+                "SELECT site_id, version, start_seq, end_seq, last_seq, ts
                 FROM __corro_seq_bookkeeping",
-        )?;
-        let mut rows = prepped.query([])?;
+            )?;
+            let mut rows = prepped.query([])?;
 
-        loop {
-            let row = rows.next()?;
-            match row {
-                None => break,
-                Some(row) => {
-                    let (range, last_seq, ts) =
-                        partials.entry((row.get(0)?, row.get(1)?)).or_default();
+            loop {
+                let row = rows.next()?;
+                match row {
+                    None => break,
+                    Some(row) => {
+                        let (range, last_seq, ts) =
+                            partials.entry((row.get(0)?, row.get(1)?)).or_default();
 
-                    range.insert(row.get(2)?..=row.get(3)?);
-                    *last_seq = row.get(4)?;
-                    *ts = row.get(5)?;
+                        range.insert(row.get(2)?..=row.get(3)?);
+                        *last_seq = row.get(4)?;
+                        *ts = row.get(5)?;
+                    }
+                }
+            }
+
+            debug!("filling up partial known versions");
+
+            for ((actor_id, version), (seqs, last_seq, ts)) in partials {
+                debug!(%actor_id, version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
+                let ranges = bk.entry(actor_id).or_default();
+
+                if let Some(known) = ranges.get(&version) {
+                    warn!(%actor_id, version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
+
+                    let mut conn = pool.write_priority().await?;
+                    let tx = conn.transaction()?;
+                    clear_buffered_meta(&tx, actor_id, version..=version)?;
+                    tx.commit()?;
+                    continue;
+                }
+
+                let gaps_count = seqs.gaps(&(0..=last_seq)).count();
+                ranges.insert(version, KnownDbVersion::Partial { seqs, last_seq, ts });
+
+                if gaps_count == 0 {
+                    info!(%actor_id, version, "found fully buffered, unapplied, changes! scheduling apply");
+                    tx_apply.send((actor_id, version)).await?;
                 }
             }
         }
 
-        debug!("filling up partial known versions");
-
-        for ((actor_id, version), (seqs, last_seq, ts)) in partials {
-            debug!(%actor_id, version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
-            let ranges = bk.entry(actor_id).or_default();
-
-            if let Some(known) = ranges.get(&version) {
-                warn!(%actor_id, version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
-
-                let mut conn = pool.write_priority().await?;
-                let tx = conn.transaction()?;
-                clear_buffered_meta(&tx, actor_id, version..=version)?;
-                tx.commit()?;
-                continue;
-            }
-
-            let gaps_count = seqs.gaps(&(0..=last_seq)).count();
-            ranges.insert(version, KnownDbVersion::Partial { seqs, last_seq, ts });
-
-            if gaps_count == 0 {
-                info!(%actor_id, version, "found fully buffered, unapplied, changes! scheduling apply");
-                tx_apply.send((actor_id, version)).await?;
+        for (actor_id, booked) in bk.iter() {
+            if let Some(clear_count) = cleared_rows.get(actor_id).copied() {
+                if clear_count > booked.cleared.len() {
+                    warn!(%actor_id, "cleared bookkept rows count ({clear_count}) in DB was bigger than in-memory entries count ({}), compacting...", booked.cleared.len());
+                    let tx = conn.transaction()?;
+                    let deleted = tx.execute("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND end_version IS NOT NULL", [actor_id])?;
+                    info!("deleted {deleted} rows that had an end_version");
+                    let mut inserted = 0;
+                    for range in booked.cleared.iter() {
+                        inserted += tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?)", params![actor_id, range.start(), range.end()])?;
+                    }
+                    info!("inserted {inserted} cleared version rows");
+                    tx.commit()?;
+                }
             }
         }
     }
@@ -363,6 +388,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             let (evt_tx, evt_rx) = channel(512);
             match Matcher::restore(id, &agent.schema().read(), conn, evt_tx, &sql) {
                 Ok(handle) => {
+                    info!(sub_id = %id, "Restored subscription");
                     agent.matchers().write().insert(id, handle);
                     let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
                     tokio::spawn(process_sub_channel(
@@ -1119,9 +1145,6 @@ fn collect_metrics(agent: &Agent, transport: &Transport) {
         {
             Ok(count) => {
                 gauge!("corro.db.table.rows.total", count as f64, "table" => table.clone());
-                // if count <= MAX_COUNT_TO_HASH {
-                //     low_count_tables.push(table);
-                // }
             }
             Err(e) => {
                 error!("could not query count for table {table}: {e}");
@@ -1224,11 +1247,11 @@ fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>>
     }
 
     let to_clear_query = format!(
-        "SELECT DISTINCT(db_version) FROM __corro_bookkeeping WHERE db_version IS NOT NULL
+        "SELECT DISTINCT db_version FROM __corro_bookkeeping WHERE db_version IS NOT NULL
             EXCEPT SELECT db_version FROM ({});",
         tables
             .iter()
-            .map(|table| format!("SELECT DISTINCT(db_version) FROM {table}"))
+            .map(|table| format!("SELECT DISTINCT db_version FROM {table}"))
             .collect::<Vec<_>>()
             .join(" UNION ")
     );
@@ -1547,7 +1570,25 @@ fn store_empty_changeset(
     versions: RangeInclusive<i64>,
 ) -> Result<usize, rusqlite::Error> {
     // first, delete "current" versions, they're now gone!
-    let deleted = tx.prepare_cached("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND start_version >= ? AND start_version <= ? AND end_version IS NULL")?.execute(params![actor_id, versions.start(), versions.end()])?;
+    let deleted = tx
+        .prepare_cached(
+            "
+        DELETE FROM __corro_bookkeeping 
+            WHERE
+                actor_id = ?
+            AND start_version >= ?
+            AND start_version <= ?
+            AND (
+                end_version IS NULL
+             OR end_version <= ? -- collapse start..=end ranges
+            )",
+        )?
+        .execute(params![
+            actor_id,
+            versions.start(),
+            versions.end(),
+            versions.end()
+        ])?;
 
     if deleted > 0 {
         debug!("deleted {deleted} still-live versions from database's bookkeeping");
@@ -1730,7 +1771,7 @@ async fn process_fully_buffered_changes(
 
             if let Some(db_version) = db_version {
                 // TODO: write changes into a queueing table
-                process_subs_by_db_version(agent, &conn, db_version);
+                agent.process_subs_by_db_version(&conn, db_version);
             }
 
             true
@@ -2221,42 +2262,33 @@ fn process_single_version(
 pub fn process_subs(agent: &Agent, changeset: &[Change]) {
     trace!("process subs...");
 
-    let mut matchers_to_delete = vec![];
-
-    {
-        let matchers = agent.matchers().read();
-        for (id, matcher) in matchers.iter() {
-            if let Err(e) = matcher.process_change(changeset) {
-                error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
-                matchers_to_delete.push(*id);
-            }
+    let matchers = agent.matchers().read();
+    for (id, matcher) in matchers.iter() {
+        if let Err(e) = matcher.process_changeset(changeset) {
+            error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
         }
-    }
-
-    for id in matchers_to_delete {
-        agent.matchers().write().remove(&id);
     }
 }
 
-pub fn process_subs_by_db_version(agent: &Agent, conn: &Connection, db_version: i64) {
-    trace!("process subs by db version...");
+// pub fn process_subs_by_db_version(agent: &Agent, conn: &Connection, db_version: i64) {
+//     trace!("process subs by db version...");
 
-    let mut matchers_to_delete = vec![];
+//     let mut matchers_to_delete = vec![];
 
-    {
-        let matchers = agent.matchers().read();
-        for (id, matcher) in matchers.iter() {
-            if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
-                error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
-                matchers_to_delete.push(*id);
-            }
-        }
-    }
+//     {
+//         let matchers = agent.matchers().read();
+//         for (id, matcher) in matchers.iter() {
+//             if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
+//                 error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
+//                 matchers_to_delete.push(*id);
+//             }
+//         }
+//     }
 
-    for id in matchers_to_delete {
-        agent.matchers().write().remove(&id);
-    }
-}
+//     for id in matchers_to_delete {
+//         agent.matchers().write().remove(&id);
+//     }
+// }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncClientError {
@@ -3235,7 +3267,7 @@ pub mod tests {
         }
 
         {
-            let mut prepped = conn.prepare("SELECT DISTINCT(db_version) FROM foo2__crsql_clock UNION SELECT DISTINCT(db_version) FROM foo__crsql_clock;")?;
+            let mut prepped = conn.prepare("SELECT DISTINCT db_version FROM foo2__crsql_clock UNION SELECT DISTINCT db_version FROM foo__crsql_clock;")?;
             let mut rows = prepped.query([])?;
 
             while let Ok(Some(row)) = rows.next() {

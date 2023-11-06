@@ -59,7 +59,10 @@ async fn sub_by_id(
         None => {
             // ensure this goes!
             bcast_cache.write().await.remove(&id);
-            agent.matchers().write().remove(&id);
+            if let Some(handle) = agent.matchers().write().remove(&id) {
+                info!(sub_id = %id, "Removed subscription from sub_by_id");
+                tokio::spawn(handle.cleanup());
+            }
 
             return hyper::Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -118,7 +121,11 @@ pub async fn process_sub_channel(
 ) {
     let mut buf = BytesMut::new();
 
-    let mut deadline = None;
+    let mut deadline = if tx.receiver_count() == 0 {
+        Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)))
+    } else {
+        None
+    };
 
     // even if there are no more subscribers
     // useful for queries that don't change often so we can cleanup...
@@ -141,10 +148,12 @@ pub async fn process_sub_channel(
                 break;
             },
             _ = subs_check.tick() => {
-                deadline = if tx.receiver_count() == 0 {
-                    Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)))
+                if tx.receiver_count() == 0 {
+                    if deadline.is_none() {
+                        deadline = Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)));
+                    }
                 } else {
-                    None
+                    deadline = None;
                 };
                 continue;
             },
@@ -178,26 +187,18 @@ pub async fn process_sub_channel(
 
     // remove and get handle from the agent's "matchers"
     let handle = match agent.matchers().write().remove(&id) {
-        Some(h) => h,
-        None => {
-            warn!("subscription handle was already gone. odd!");
-            return;
+        Some(h) => {
+            info!(sub_id = %id, "Removed subscription from process_sub_channel");
+            h
         }
-    };
-
-    // get a dedicated connection
-    let conn = match agent.pool().dedicated() {
-        Ok(conn) => conn,
-        Err(e) => {
-            error!("could not acquire dedicated connection for subscription cleanup: {e}");
+        None => {
+            warn!(sub_id = %id, "subscription handle was already gone. odd!");
             return;
         }
     };
 
     // clean up the subscription
-    if let Err(e) = handle.cleanup(conn) {
-        error!("could not properly cleanup subscription: {e}");
-    }
+    handle.cleanup().await;
 }
 
 fn expanded_statement(conn: &Connection, stmt: &Statement) -> rusqlite::Result<Option<String>> {
@@ -468,7 +469,7 @@ pub async fn catch_up_sub(
                 None => {
                     let max_row_id: RowId = tx
                         .prepare(&format!(
-                            "SELECT MAX(__corro_rowid) FROM {}",
+                            "SELECT COALESCE(MAX(__corro_rowid), 0) FROM {}",
                             matcher.table_name()
                         ))?
                         .query_row([], |row| row.get(0))?;
@@ -553,7 +554,7 @@ pub async fn upsert_sub(
 
     let matcher_id = Uuid::new_v4();
 
-    let matcher = Matcher::create(matcher_id, &agent.schema().read(), conn, evt_tx, &stmt)?;
+    let handle = Matcher::create(matcher_id, &agent.schema().read(), conn, evt_tx, &stmt)?;
 
     let (sub_tx, sub_rx) = broadcast::channel(10240);
 
@@ -561,7 +562,7 @@ pub async fn upsert_sub(
     bcast_write.insert(matcher_id, sub_tx.clone());
 
     {
-        agent.matchers().write().insert(matcher_id, matcher);
+        agent.matchers().write().insert(matcher_id, handle);
     }
 
     tokio::spawn(forward_sub_to_sender(None, sub_rx, tx));
