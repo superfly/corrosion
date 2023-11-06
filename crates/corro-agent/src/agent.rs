@@ -1145,9 +1145,6 @@ fn collect_metrics(agent: &Agent, transport: &Transport) {
         {
             Ok(count) => {
                 gauge!("corro.db.table.rows.total", count as f64, "table" => table.clone());
-                // if count <= MAX_COUNT_TO_HASH {
-                //     low_count_tables.push(table);
-                // }
             }
             Err(e) => {
                 error!("could not query count for table {table}: {e}");

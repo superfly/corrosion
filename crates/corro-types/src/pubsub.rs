@@ -10,7 +10,7 @@ use compact_str::{CompactString, ToCompactString};
 use corro_api_types::{Change, ChangeId, ColumnType, RowId, SqliteValue, SqliteValueRef};
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction};
 use sqlite3_parser::{
     ast::{
@@ -19,7 +19,10 @@ use sqlite3_parser::{
     },
     lexer::sql::Parser,
 };
-use tokio::{sync::mpsc, task::block_in_place};
+use tokio::{
+    sync::mpsc::{self},
+    task::block_in_place,
+};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt};
@@ -662,9 +665,14 @@ impl Matcher {
     async fn cmd_loop(mut self, mut conn: Connection) {
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
 
+        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(100));
+
+        let mut process_buf = Vec::new();
+        let mut count = 0;
+
         loop {
             enum Branch {
-                Cmd(MatcherCmd),
+                ProcessChanges,
                 PurgeOldChanges,
             }
 
@@ -674,7 +682,18 @@ impl Matcher {
                     info!(sub_id = %self.id, "Acknowledge subscription cancellation, breaking loop.");
                     break;
                 }
-                Some(req) = self.cmd_rx.recv() => Branch::Cmd(req),
+                Some(req) = self.cmd_rx.recv() => match req {
+                    MatcherCmd::ProcessChange(candidates) => {
+                        count += candidates.values().map(|pks| pks.len()).sum::<usize>();
+                        process_buf.push(candidates);
+                        if count >= 200 {
+                            Branch::ProcessChanges
+                        } else {
+                            continue;
+                        }
+                    }
+                },
+                _ = process_changes_interval.tick() => Branch::ProcessChanges,
                 _ = purge_changes_interval.tick() => Branch::PurgeOldChanges,
                 else => {
                     info!(sub_id = %self.id, "Subscription command loop is done!");
@@ -683,17 +702,25 @@ impl Matcher {
             };
 
             match branch {
-                Branch::Cmd(req) => match req {
-                    MatcherCmd::ProcessChange(candidates) => {
-                        if let Err(e) = block_in_place(|| self.handle_change(&mut conn, candidates))
-                        {
-                            if matches!(e, MatcherError::EventReceiverClosed) {
-                                break;
-                            }
-                            error!("could not handle change: {e}");
-                        }
+                Branch::ProcessChanges => {
+                    if process_buf.is_empty() {
+                        continue;
                     }
-                },
+
+                    if let Err(e) =
+                        block_in_place(|| self.handle_change(&mut conn, process_buf.drain(..)))
+                    {
+                        if matches!(e, MatcherError::EventReceiverClosed) {
+                            break;
+                        }
+                        error!("could not handle change: {e}");
+                    }
+
+                    // just in case...
+                    process_buf.clear();
+
+                    count = 0;
+                }
                 Branch::PurgeOldChanges => {
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
@@ -723,6 +750,13 @@ impl Matcher {
         }
 
         debug!(id = %self.id, "matcher loop is done");
+
+        if !process_buf.is_empty() {
+            if let Err(e) = block_in_place(|| self.handle_change(&mut conn, process_buf.drain(..)))
+            {
+                error!("could not handle change after loop broken: {e}");
+            }
+        }
 
         if let Err(e) = block_in_place(|| self.handle_cleanup(&mut conn)) {
             error!("could not handle cleanup: {e}");
@@ -872,38 +906,41 @@ impl Matcher {
         self.cmd_loop(conn).await
     }
 
-    fn handle_change(
+    fn handle_change<I: Iterator<Item = IndexMap<CompactString, Vec<Vec<SqliteValue>>>>>(
         &mut self,
         conn: &mut Connection,
-        candidates: IndexMap<CompactString, Vec<Vec<SqliteValue>>>,
+        candidates: I,
     ) -> Result<(), MatcherError> {
         let tx = conn.transaction()?;
 
-        let tables = candidates.keys().cloned().collect::<Vec<_>>();
+        let mut tables = IndexSet::new();
 
-        for (table, pks) in candidates {
-            let tmp_table_name = format!("subscription_{}_{table}", self.id.as_simple());
+        for candidates in candidates {
+            for (table, pks) in candidates {
+                let tmp_table_name = format!("subscription_{}_{table}", self.id.as_simple());
+                if tables.insert(table.clone()) {
+                    // create a temporary table to mix and match the data
+                    tx.prepare_cached(
+                        // TODO: cache the statement's string somewhere, it's always the same!
+                        &format!(
+                            "CREATE TEMP TABLE IF NOT EXISTS {tmp_table_name} ({})",
+                            self.pks
+                                .get(table.as_str())
+                                .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
+                                .to_vec()
+                                .join(",")
+                        ),
+                    )?
+                    .execute(())?;
+                }
 
-            // create a temporary table to mix and match the data
-            tx.prepare_cached(
-                // TODO: cache the statement's string somewhere, it's always the same!
-                &format!(
-                    "CREATE TEMP TABLE {tmp_table_name} ({})",
-                    self.pks
-                        .get(table.as_str())
-                        .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
-                        .to_vec()
-                        .join(",")
-                ),
-            )?
-            .execute(())?;
-
-            for pks in pks {
-                tx.prepare_cached(&format!(
-                    "INSERT INTO {tmp_table_name} VALUES ({})",
-                    (0..pks.len()).map(|_i| "?").collect::<Vec<_>>().join(",")
-                ))?
-                .execute(params_from_iter(pks))?;
+                for pks in pks {
+                    tx.prepare_cached(&format!(
+                        "INSERT INTO {tmp_table_name} VALUES ({})",
+                        (0..pks.len()).map(|_i| "?").collect::<Vec<_>>().join(",")
+                    ))?
+                    .execute(params_from_iter(pks))?;
+                }
             }
         }
 
