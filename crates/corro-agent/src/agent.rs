@@ -2264,7 +2264,7 @@ pub fn process_subs(agent: &Agent, changeset: &[Change]) {
 
     let matchers = agent.matchers().read();
     for (id, matcher) in matchers.iter() {
-        if let Err(e) = matcher.process_change(changeset) {
+        if let Err(e) = matcher.process_changeset(changeset) {
             error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
         }
     }
