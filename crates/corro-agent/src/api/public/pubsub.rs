@@ -554,7 +554,7 @@ pub async fn upsert_sub(
 
     let matcher_id = Uuid::new_v4();
 
-    let matcher = Matcher::create(matcher_id, &agent.schema().read(), conn, evt_tx, &stmt)?;
+    let handle = Matcher::create(matcher_id, &agent.schema().read(), conn, evt_tx, &stmt)?;
 
     let (sub_tx, sub_rx) = broadcast::channel(10240);
 
@@ -562,7 +562,7 @@ pub async fn upsert_sub(
     bcast_write.insert(matcher_id, sub_tx.clone());
 
     {
-        agent.matchers().write().insert(matcher_id, matcher);
+        agent.matchers().write().insert(matcher_id, handle);
     }
 
     tokio::spawn(forward_sub_to_sender(None, sub_rx, tx));

@@ -1163,7 +1163,7 @@ impl Matcher {
         for table in tables {
             // TODO: reduce mistakes by computing this table name once
             tx.prepare_cached(&format!(
-                "DROP TABLE subscription_{}_{table}",
+                "DROP TABLE IF EXISTS subscription_{}_{table}",
                 self.id.as_simple(),
             ))?
             .execute(())?;
