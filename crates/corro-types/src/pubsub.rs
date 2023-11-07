@@ -819,7 +819,7 @@ impl Matcher {
         }
     }
 
-    async fn run(mut self, mut conn: Connection) {
+    async fn run(mut self, conn: Connection) {
         if let Err(e) = self
             .evt_tx
             .send(QueryEvent::Columns(self.col_names.clone()))
@@ -835,8 +835,6 @@ impl Matcher {
         }
 
         let res = block_in_place(|| {
-            let tx = conn.transaction()?;
-
             let mut stmt_str = Cmd::Stmt(self.query.clone()).to_string();
             stmt_str.pop(); // remove trailing `;`
 
@@ -857,10 +855,10 @@ impl Matcher {
             let elapsed = {
                 println!("select stmt: {stmt_str:?}");
 
-                let mut select = tx.prepare(&stmt_str)?;
+                let mut select = conn.prepare(&stmt_str)?;
                 let start = Instant::now();
                 let mut select_rows = {
-                    let _guard = interrupt_deadline_guard(&tx, Duration::from_secs(15));
+                    let _guard = interrupt_deadline_guard(&conn, Duration::from_secs(15));
                     select.query(())?
                 };
                 let elapsed = start.elapsed();
@@ -878,7 +876,7 @@ impl Matcher {
                 );
                 println!("insert stmt: {insert_into:?}");
 
-                let mut insert = tx.prepare(&insert_into)?;
+                let mut insert = conn.prepare(&insert_into)?;
 
                 // reusable cells buffer
                 let mut cells = Vec::with_capacity(tmp_cols.len());
@@ -920,8 +918,6 @@ impl Matcher {
                 }
                 elapsed
             };
-
-            tx.commit()?;
 
             self.last_rowid = last_rowid;
 
@@ -967,8 +963,6 @@ impl Matcher {
         conn: &mut Connection,
         candidates: I,
     ) -> Result<(), MatcherError> {
-        let tx = conn.transaction()?;
-
         let mut tables = IndexSet::new();
 
         for candidates in candidates {
@@ -981,10 +975,10 @@ impl Matcher {
                 let tmp_table_name = format!("subscription_{}_{table}", self.id.as_simple());
                 if tables.insert(table.clone()) {
                     // create a temporary table to mix and match the data
-                    tx.prepare_cached(
+                    conn.prepare_cached(
                         // TODO: cache the statement's string somewhere, it's always the same!
                         &format!(
-                            "CREATE TEMP TABLE IF NOT EXISTS {tmp_table_name} ({})",
+                            "CREATE TEMP TABLE {tmp_table_name} ({})",
                             self.pks
                                 .get(table.as_str())
                                 .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
@@ -996,7 +990,7 @@ impl Matcher {
                 }
 
                 for pks in pks {
-                    tx.prepare_cached(&format!(
+                    conn.prepare_cached(&format!(
                         "INSERT INTO {tmp_table_name} VALUES ({})",
                         (0..pks.len()).map(|_i| "?").collect::<Vec<_>>().join(",")
                     ))?
@@ -1059,7 +1053,7 @@ impl Matcher {
 
             // println!("sql: {sql}");
 
-            let insert_prepped = tx.prepare_cached(&sql)?;
+            let insert_prepped = conn.prepare_cached(&sql)?;
 
             let sql = format!(
                 "
@@ -1088,9 +1082,9 @@ impl Matcher {
                 actual_cols.join(",")
             );
 
-            let delete_prepped = tx.prepare_cached(&sql)?;
+            let delete_prepped = conn.prepare_cached(&sql)?;
 
-            let mut change_insert_stmt = tx.prepare_cached(&format!(
+            let mut change_insert_stmt = conn.prepare_cached(&format!(
                 "INSERT INTO {} (__corro_rowid, {CHANGE_TYPE_COL}, {}) VALUES (?, ?, {}) RETURNING {CHANGE_ID_COL}",
                 self.qualified_changes_table_name,
                 actual_cols.join(","),
@@ -1162,15 +1156,13 @@ impl Matcher {
         // clean up temporary tables immediately
         for table in tables {
             // TODO: reduce mistakes by computing this table name once
-            tx.prepare_cached(&format!(
+            conn.prepare_cached(&format!(
                 "DROP TABLE IF EXISTS subscription_{}_{table}",
                 self.id.as_simple(),
             ))?
             .execute(())?;
             trace!("cleaned up subscription_{}_{table}", self.id.as_simple());
         }
-
-        tx.commit()?;
 
         self.last_rowid = new_last_rowid;
 
