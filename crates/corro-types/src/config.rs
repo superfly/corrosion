@@ -75,8 +75,8 @@ impl DbConfig {
             .unwrap_or_else(|| {
                 self.path
                     .parent()
-                    .map(|parent| parent.join("subscriptions.db"))
-                    .unwrap_or_else(|| "/subscriptions.db".into())
+                    .map(|parent| parent.join("subscriptions"))
+                    .unwrap_or_else(|| "/subscriptions".into())
             })
     }
 }
