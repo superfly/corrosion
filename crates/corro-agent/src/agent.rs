@@ -348,19 +348,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     let mut matcher_bcast_cache = MatcherBroadcastCache::default();
 
     {
-        // open database and set its journal to WAL
-        let subscriptions_db_path = agent.config().db.subscriptions_path();
         let rows = {
-            let conn = rusqlite::Connection::open(&subscriptions_db_path)?;
-            conn.execute_batch(
-                r#"
-                    PRAGMA journal_mode = WAL;
-                    PRAGMA synchronous = NORMAL;
-                "#,
-            )?;
-
-            let res = conn
-                .prepare("SELECT id, sql FROM subs")?
+            let res = agent
+                .pool()
+                .read()
+                .await?
+                .prepare("SELECT id, sql FROM __corro_subs")?
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<(uuid::Uuid, String)>>>()?;
 
@@ -374,7 +367,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             let (evt_tx, evt_rx) = channel(512);
             match Matcher::restore(
                 id,
-                subscriptions_db_path.clone(),
+                agent.config().db.subscriptions_path(),
                 &agent.schema().read(),
                 conn,
                 evt_tx,

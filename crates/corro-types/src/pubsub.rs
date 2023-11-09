@@ -18,7 +18,7 @@ use indexmap::{IndexMap, IndexSet};
 use rusqlite::{
     params, params_from_iter,
     types::{FromSqlError, ValueRef},
-    Connection, OptionalExtension, ToSql, Transaction,
+    Connection, OptionalExtension, ToSql,
 };
 use speedy::{Readable, Writable};
 use sqlite3_parser::{
@@ -41,7 +41,6 @@ use uuid::Uuid;
 use crate::{
     api::QueryEvent,
     schema::{Schema, Table},
-    sqlite::Migration,
 };
 
 pub use corro_api_types::sqlite::ChangeType;
@@ -2017,33 +2016,6 @@ pub enum MatcherError {
     FromSql(#[from] FromSqlError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-}
-
-pub fn migrate_subs(conn: &mut Connection) -> rusqlite::Result<()> {
-    let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
-        init_subs_migration as fn(&Transaction) -> rusqlite::Result<()>,
-    )];
-
-    crate::sqlite::migrate(conn, migrations)
-}
-
-fn init_subs_migration(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        r#"
-            -- key/value for internal corrosion data (e.g. 'schema_version' => INT)
-            CREATE TABLE __corro_state (key TEXT NOT NULL PRIMARY KEY, value);
-
-            -- where subscriptions are stored
-            CREATE TABLE subs (
-                id BLOB PRIMARY KEY NOT NULL,
-                sql TEXT NOT NULL
-            ) WITHOUT ROWID;
-
-            CREATE INDEX subs_sql ON subs (sql);
-        "#,
-    )?;
-
-    Ok(())
 }
 
 #[cfg(test)]
