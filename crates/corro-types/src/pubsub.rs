@@ -530,6 +530,9 @@ impl Matcher {
         sql: &str,
     ) -> Result<(Matcher, MatcherHandle), MatcherError> {
         let sub_path = subs_path.join(id.as_simple().to_string());
+
+        info!("Initializing subscription at {sub_path}");
+
         std::fs::create_dir_all(&sub_path)?;
 
         let sub_db_path = sub_path.join(SUB_DB_PATH);
