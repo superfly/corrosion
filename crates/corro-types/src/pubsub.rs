@@ -1,12 +1,11 @@
 use std::{
     cmp,
     collections::{HashMap, HashSet},
-    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut};
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
 use corro_api_types::{
@@ -20,7 +19,6 @@ use rusqlite::{
     types::{FromSqlError, ValueRef},
     Connection, OptionalExtension, ToSql,
 };
-use speedy::{Readable, Writable};
 use sqlite3_parser::{
     ast::{
         As, Cmd, Expr, JoinConstraint, Name, OneSelect, Operator, QualifiedName, ResultColumn,
@@ -30,10 +28,7 @@ use sqlite3_parser::{
 };
 use sqlite_pool::RusqlitePool;
 use tokio::{sync::mpsc, task::block_in_place};
-use tokio_util::{
-    codec::{Decoder, Encoder, LengthDelimitedCodec},
-    sync::{CancellationToken, DropGuard},
-};
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt};
 use uuid::Uuid;
@@ -501,8 +496,7 @@ pub struct Matcher {
     pub col_names: Vec<ColumnName>,
     pub last_rowid: i64,
     conn: Connection,
-    queue_tx: yaque::Sender,
-    queue_rx: yaque::Receiver,
+    base_path: Utf8PathBuf,
     cancel: CancellationToken,
 }
 
@@ -518,7 +512,6 @@ const CHANGE_TYPE_COL: &str = "type";
 pub const QUERY_TABLE_NAME: &str = "query";
 
 const SUB_DB_PATH: &str = "sub.sqlite";
-const SUB_QUEUE_PATH: &str = "queue";
 
 impl Matcher {
     fn new(
@@ -536,9 +529,6 @@ impl Matcher {
         std::fs::create_dir_all(&sub_path)?;
 
         let sub_db_path = sub_path.join(SUB_DB_PATH);
-        let sub_queue_path = sub_path.join(SUB_QUEUE_PATH);
-
-        let (queue_tx, queue_rx) = yaque::channel(&sub_queue_path)?;
 
         let col_names: Vec<ColumnName> = {
             state_conn
@@ -673,7 +663,7 @@ impl Matcher {
                 MatcherStmt {
                     new_query,
                     temp_query: format!(
-                        "SELECT {} FROM __corro_sub.query WHERE ({}) IN subscription_{}_{}",
+                        "SELECT {} FROM query WHERE ({}) IN subscription_{}_{}",
                         tmp_cols.join(","),
                         pk_cols,
                         id.as_simple(),
@@ -710,9 +700,7 @@ impl Matcher {
             col_names,
             last_rowid: 0,
             conn,
-            // queue: Arc::new(queue),
-            queue_tx,
-            queue_rx,
+            base_path: sub_path,
             cancel,
         };
 
@@ -850,6 +838,10 @@ impl Matcher {
         tx.commit()?;
         state_tx.commit()?;
 
+        if let Err(e) = std::fs::remove_dir_all(&self.base_path) {
+            error!(sub_id = %self.id, "could not delete subscription base path {} due to: {e}", self.base_path);
+        }
+
         Ok(())
     }
 
@@ -859,9 +851,6 @@ impl Matcher {
 
         let mut process_buf = Vec::new();
         let mut count = 0;
-
-        let mut buf = BytesMut::new();
-        let mut codec = LengthDelimitedCodec::new();
 
         loop {
             enum Branch {
@@ -914,11 +903,6 @@ impl Matcher {
                     process_buf.clear();
 
                     count = 0;
-
-                    if let Err(e) = self.drain_queue(&mut buf, &mut codec).await {
-                        error!("error draining queue: {e}");
-                        // TODO: bomb?
-                    }
                 }
                 Branch::PurgeOldChanges => {
                     let res = block_in_place(|| {
@@ -949,271 +933,16 @@ impl Matcher {
         debug!(id = %self.id, "matcher loop is done");
 
         if !process_buf.is_empty() {
-            match block_in_place(|| self.handle_change(&mut state_conn, process_buf.drain(..))) {
-                Ok(_) => {
-                    if let Err(e) = self.drain_queue(&mut buf, &mut codec).await {
-                        error!("error draining queue: {e}");
-                        // TODO: bomb?
-                    }
-                }
-                Err(e) => {
-                    error!("could not handle change after loop broken: {e}");
-                }
+            if let Err(e) =
+                block_in_place(|| self.handle_change(&mut state_conn, process_buf.drain(..)))
+            {
+                error!("could not handle change after loop broken: {e}");
             }
         }
 
         if let Err(e) = block_in_place(|| self.handle_cleanup(&mut state_conn)) {
             error!("could not handle cleanup: {e}");
         }
-    }
-
-    async fn drain_queue(
-        &mut self,
-        buf: &mut BytesMut,
-        codec: &mut LengthDelimitedCodec,
-    ) -> Result<(), MatcherError> {
-        // TODO: cache these!
-        let mut actual_cols = vec![];
-
-        let mut tmp_cols = self
-            .pks
-            .values()
-            .flatten()
-            .cloned()
-            .collect::<Vec<String>>();
-
-        let pks_count = tmp_cols.len();
-
-        let pks_comma_joined = tmp_cols.join(",");
-        let pks_vars_comma_joined = (0..tmp_cols.len())
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-
-        for i in 0..(self.parsed.columns.len()) {
-            let col_name = format!("col_{i}");
-            tmp_cols.push(col_name.clone());
-            actual_cols.push(col_name);
-        }
-
-        let tmp_cols_comma_joined = tmp_cols.join(",");
-        let vars_comma_joined = (0..tmp_cols.len())
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let actual_comma_joined = actual_cols.join(",");
-        let actual_vars_comma_joined = (0..actual_cols.len())
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let excluded = (0..(self.parsed.columns.len()))
-            .map(|i| format!("col_{i} = excluded.col_{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let mut eoq = None;
-
-        loop {
-            let timeout = tokio::time::sleep(Duration::from_millis(100));
-            tokio::pin!(timeout);
-            match self.queue_rx.recv_timeout(timeout).await {
-                Ok(Some(recv_guard)) => {
-                    {
-                        let raw = recv_guard.try_into_inner()?;
-                        buf.extend_from_slice(&raw);
-                    }
-
-                    let mut events = vec![];
-
-                    let res = block_in_place(|| {
-                        let tx = self.conn.transaction()?;
-                        {
-                            let mut upsert_stmt = tx
-                                .prepare_cached(&format!(
-                                    "INSERT INTO query ({tmp_cols_comma_joined}) VALUES ({vars_comma_joined})
-                                    ON CONFLICT({pks_comma_joined})
-                                        DO UPDATE SET
-                                            {excluded}
-                                    RETURNING __corro_rowid,{actual_comma_joined}"
-                                ))?;
-
-                            let mut delete_stmt = tx
-                                .prepare_cached(&format!(
-                                    "DELETE FROM query WHERE ({pks_comma_joined}) IN (VALUES ({pks_vars_comma_joined})) RETURNING __corro_rowid,{actual_comma_joined}"
-                                ))?;
-
-                            let mut change_insert_stmt = tx.prepare_cached(&format!(
-                                "INSERT INTO changes (__corro_rowid, {CHANGE_TYPE_COL}, {actual_comma_joined}) VALUES (?, ?, {actual_vars_comma_joined}) RETURNING {CHANGE_ID_COL}"
-                            ))?;
-
-                            let mut insert_stmt = tx.prepare_cached(&format!("INSERT INTO query ({tmp_cols_comma_joined}) VALUES ({vars_comma_joined}) RETURNING __corro_rowid"))?;
-
-                            loop {
-                                match codec.decode(buf) {
-                                    Ok(Some(single_buf)) => {
-                                        match QueuedEvent::read_from_buffer(&single_buf) {
-                                            Ok(event) => {
-                                                events.push(event);
-                                            }
-                                            Err(e) => {
-                                                error!("could not read queued event: {e}");
-                                                // TODO: bomb!
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        error!("could not decoded queued message: {e}");
-                                        // TODO: bomb!
-                                    }
-                                }
-                            }
-
-                            for event in events {
-                                match event {
-                                    // might arrive out of order, so we store it for later
-                                    QueuedEvent::EndOfQuery { time } => {
-                                        eoq = Some(time);
-                                    }
-
-                                    // an initial row!
-                                    QueuedEvent::Row { mut cells } => {
-                                        println!("cells: {cells:?}");
-                                        let rowid = insert_stmt
-                                            .query_row(params_from_iter(cells.iter()), |row| {
-                                                row.get::<_, RowId>(0)
-                                            })?;
-
-                                        if let Err(e) = self.evt_tx.blocking_send(QueryEvent::Row(
-                                            rowid,
-                                            cells.drain(pks_count..).collect(),
-                                        )) {
-                                            error!("could not send back row: {e}");
-                                            return Err(MatcherError::EventReceiverClosed);
-                                        }
-                                        println!("sent event!");
-
-                                        self.last_rowid = cmp::max(rowid.0, self.last_rowid);
-                                    }
-
-                                    QueuedEvent::Changes { cells, is_delete } => {
-                                        println!("handling change cells: {cells:?}, is_delete? {is_delete}");
-                                        let stmt = if is_delete {
-                                            &mut delete_stmt
-                                        } else {
-                                            &mut upsert_stmt
-                                        };
-
-                                        for (i, cell) in cells.iter().enumerate() {
-                                            stmt.raw_bind_parameter(i + 1, cell)?;
-                                        }
-
-                                        println!("running stmt");
-                                        let mut rows = stmt.raw_query();
-                                        while let Ok(Some(row)) = rows.next() {
-                                            let rowid: RowId = row.get(0)?;
-
-                                            let change_type = if is_delete {
-                                                ChangeType::Delete
-                                            } else if rowid.0 > self.last_rowid {
-                                                ChangeType::Insert
-                                            } else {
-                                                ChangeType::Update
-                                            };
-
-                                            let change_type_u8 = change_type as u8;
-
-                                            self.last_rowid = cmp::max(self.last_rowid, rowid.0);
-
-                                            match (1..=actual_cols.len())
-                                                .map(|i| row.get::<_, SqliteValue>(i))
-                                                .collect::<rusqlite::Result<Vec<_>>>()
-                                            {
-                                                Ok(cells) => {
-                                                    let mut changes_cells: Vec<&dyn ToSql> =
-                                                        vec![&rowid, &change_type_u8];
-                                                    for cell in cells.iter() {
-                                                        trace!("inserting event cell: {cell:?}");
-                                                        changes_cells.push(cell);
-                                                    }
-                                                    trace!(
-                                                        "inserting changes... cols: {}",
-                                                        changes_cells.len()
-                                                    );
-
-                                                    println!("inserting change!");
-                                                    let change_id: ChangeId = change_insert_stmt
-                                                        .query_row(
-                                                            params_from_iter(changes_cells),
-                                                            |row| row.get(0),
-                                                        )?;
-
-                                                    trace!("got change id: {change_id}");
-
-                                                    if let Err(e) = self.evt_tx.blocking_send(
-                                                        QueryEvent::Change(
-                                                            change_type,
-                                                            rowid,
-                                                            cells,
-                                                            change_id,
-                                                        ),
-                                                    ) {
-                                                        debug!("could not send back row to matcher sub sender: {e}");
-                                                        return Err(
-                                                            MatcherError::EventReceiverClosed,
-                                                        );
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        "could not deserialize row's cells: {e}"
-                                                    );
-                                                    // TODO: bomb?
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        tx.commit()?;
-                        Ok(())
-                    });
-
-                    if let Err(e) = res {
-                        if matches!(e, MatcherError::EventReceiverClosed) {
-                            break;
-                        }
-                        error!("could not write changes: {e}");
-                    }
-                }
-                Ok(None) => {
-                    break;
-                }
-                Err(e) => {
-                    error!("could not poll events queue: {e:?}");
-                    // TODO: bomb!
-                    break;
-                }
-            }
-        }
-
-        if let Some(time) = eoq.take() {
-            self.evt_tx
-                .send(QueryEvent::EndOfQuery {
-                    time,
-                    change_id: None,
-                })
-                .await
-                .map_err(|_| MatcherError::EventReceiverClosed)?;
-        }
-
-        Ok(())
     }
 
     async fn run(mut self, state_conn: Connection) {
@@ -1231,11 +960,9 @@ impl Matcher {
             query_cols.push(format!("col_{i}"));
         }
 
-        let mut ser_buf = BytesMut::new();
-        let mut codec = LengthDelimitedCodec::new();
-        let mut buf = BytesMut::new();
-
         let res = block_in_place(|| {
+            let tx = self.conn.transaction()?;
+
             let mut stmt_str = Cmd::Stmt(self.query.clone()).to_string();
             stmt_str.pop(); // remove trailing `;`
 
@@ -1251,7 +978,16 @@ impl Matcher {
                 tmp_cols.push(col_name.clone());
             }
 
-            {
+            let mut last_rowid = 0;
+
+            // ensure drop and recreate
+            tx.execute_batch(&format!(
+                "DROP TABLE IF EXISTS state_rows;
+                            CREATE TEMP TABLE state_rows ({})",
+                tmp_cols.join(",")
+            ))?;
+
+            let elapsed = {
                 println!("select stmt: {stmt_str:?}");
 
                 let mut select = state_conn.prepare(&stmt_str)?;
@@ -1262,65 +998,54 @@ impl Matcher {
                 };
                 let elapsed = start.elapsed();
 
+                let insert_into = format!(
+                    "INSERT INTO query ({}) VALUES ({}) RETURNING __corro_rowid,{}",
+                    tmp_cols.join(","),
+                    tmp_cols
+                        .iter()
+                        .map(|_| "?".to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    query_cols.join(","),
+                );
+                trace!("insert stmt: {insert_into:?}");
+
+                let mut insert = tx.prepare(&insert_into)?;
+
                 loop {
                     match select_rows.next() {
                         Ok(Some(row)) => {
-                            let cells = (0..tmp_cols.len())
-                                .map(|i| row.get_ref(i).map(SqliteValueRef::from))
+                            for i in 0..tmp_cols.len() {
+                                insert.raw_bind_parameter(
+                                    i + 1,
+                                    SqliteValueRef::from(row.get_ref(i)?),
+                                )?;
+                            }
+
+                            let mut rows = insert.raw_query();
+
+                            let row = match rows.next()? {
+                                Some(row) => row,
+                                None => continue,
+                            };
+
+                            let rowid = row.get(0)?;
+                            let cells = (1..=query_cols.len())
+                                .map(|i| row.get::<_, SqliteValue>(i))
                                 .collect::<rusqlite::Result<Vec<_>>>()?;
-                            println!("selected cells: {cells:?}");
 
-                            if let Err(e) = (QueuedEventRef::Row { cells })
-                                .write_to_stream((&mut ser_buf).writer())
+                            if let Err(e) = self
+                                .evt_tx
+                                .blocking_send(QueryEvent::Row(RowId(rowid), cells))
                             {
-                                // NOTE: this should never happen...
-                                error!("could not serialize queue message: {e}");
-                                // TODO: bomb!
-                                break;
+                                error!("could not send back row: {e}");
+                                return Err(MatcherError::EventReceiverClosed);
                             }
 
-                            if let Err(e) = codec.encode(ser_buf.split().freeze(), &mut buf) {
-                                // NOTE: this should never happen...
-                                error!("could not encode queue message: {e}");
-                                // TODO: bomb!
-                                break;
-                            }
-
-                            if buf.len() >= 8096 {
-                                if let Err(e) = self.queue_tx.try_send(buf.split().freeze()) {
-                                    error!("could not enqueue message to queue: {e}");
-                                    // TODO: bomb!
-                                    break;
-                                }
-                            }
+                            last_rowid = cmp::max(rowid, last_rowid);
                         }
                         Ok(None) => {
                             // done!
-                            if let Err(e) = (QueuedEventRef::EndOfQuery {
-                                time: elapsed.as_secs_f64(),
-                            })
-                            .write_to_stream((&mut ser_buf).writer())
-                            {
-                                // NOTE: this should never happen...
-                                error!("could not serialize queue message: {e}");
-                                // TODO: bomb!
-                                break;
-                            }
-
-                            if let Err(e) = codec.encode(ser_buf.split().freeze(), &mut buf) {
-                                // NOTE: this should never happen...
-                                error!("could not encode queue message: {e}");
-                                // TODO: bomb!
-                                break;
-                            }
-
-                            if buf.len() >= 8096 {
-                                if let Err(e) = self.queue_tx.try_send(buf.split().freeze()) {
-                                    error!("could not enqueue message to queue: {e}");
-                                    // TODO: bomb!
-                                    break;
-                                }
-                            }
                             break;
                         }
                         Err(e) => {
@@ -1328,22 +1053,42 @@ impl Matcher {
                         }
                     }
                 }
+                elapsed
+            };
 
-                println!("done w/ initial query");
+            tx.execute_batch("DROP TABLE IF EXISTS state_rows;")?;
 
-                if !buf.is_empty() {
-                    // write the last bits...
-                    if let Err(e) = self.queue_tx.try_send(buf.split().freeze()) {
-                        error!("could not enqueue message to queue: {e}");
-                        // TODO: bomb!
-                    }
-                }
-            }
+            tx.commit()?;
 
-            Ok::<_, MatcherError>(())
+            self.last_rowid = last_rowid;
+
+            Ok::<_, MatcherError>(elapsed)
         });
 
         println!("done w/ block_in_place for initial query");
+
+        match res {
+            Ok(elapsed) => {
+                if let Err(e) = self
+                    .evt_tx
+                    .send(QueryEvent::EndOfQuery {
+                        time: elapsed.as_secs_f64(),
+                        change_id: Some(ChangeId(0)),
+                    })
+                    .await
+                {
+                    error!("could not return end of query event: {e}");
+                    return;
+                }
+            }
+            Err(e) => {
+                _ = self
+                    .evt_tx
+                    .send(QueryEvent::Error(e.to_compact_string()))
+                    .await;
+                return;
+            }
+        }
 
         if let Err(e) = res {
             _ = self
@@ -1351,12 +1096,6 @@ impl Matcher {
                 .send(QueryEvent::Error(e.to_compact_string()))
                 .await;
             return;
-        }
-
-        println!("draining queue!");
-        if let Err(e) = self.drain_queue(&mut buf, &mut codec).await {
-            error!("error draining queue: {e}");
-            // TODO: bomb?
         }
 
         self.cmd_loop(state_conn).await
@@ -1369,6 +1108,7 @@ impl Matcher {
     ) -> Result<(), MatcherError> {
         let mut tables = IndexSet::new();
 
+        let tx = self.conn.transaction()?;
         for candidates in candidates {
             for (table, pks) in candidates {
                 let pks = pks
@@ -1379,19 +1119,20 @@ impl Matcher {
                 let tmp_table_name = format!("subscription_{}_{table}", self.id.as_simple());
                 if tables.insert(table.clone()) {
                     // create a temporary table to mix and match the data
-                    state_conn
-                        .prepare_cached(
-                            // TODO: cache the statement's string somewhere, it's always the same!
-                            &format!(
-                                "CREATE TEMP TABLE {tmp_table_name} ({})",
-                                self.pks
-                                    .get(table.as_str())
-                                    .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
-                                    .to_vec()
-                                    .join(",")
-                            ),
-                        )?
-                        .execute(())?;
+                    tx.prepare_cached(
+                        // TODO: cache the statement's string somewhere, it's always the same!
+                        // NOTE: this can't be an actual CREATE TEMP TABLE or it won't be visible
+                        //       from the state db
+                        &format!(
+                            "CREATE TABLE {tmp_table_name} ({})",
+                            self.pks
+                                .get(table.as_str())
+                                .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
+                                .to_vec()
+                                .join(",")
+                        ),
+                    )?
+                    .execute(())?;
                 }
 
                 for pks in pks {
@@ -1399,185 +1140,215 @@ impl Matcher {
                         "inserting in temp table for {table}, pks {:?}",
                         pks.iter().map(|pk| pk.to_owned()).collect::<Vec<_>>()
                     );
-                    state_conn
-                        .prepare_cached(&format!(
-                            "INSERT INTO {tmp_table_name} VALUES ({})",
-                            (0..pks.len()).map(|_i| "?").collect::<Vec<_>>().join(",")
-                        ))?
-                        .execute(params_from_iter(pks))?;
+                    tx.prepare_cached(&format!(
+                        "INSERT INTO {tmp_table_name} VALUES ({})",
+                        (0..pks.len()).map(|_i| "?").collect::<Vec<_>>().join(",")
+                    ))?
+                    .execute(params_from_iter(pks))?;
                 }
             }
         }
+        // commit so it is visible to the other db!
+        tx.commit()?;
 
-        let mut seen_pks = HashSet::new();
+        let mut actual_cols = vec![];
 
-        let mut ser_buf = BytesMut::new();
-        let mut codec = LengthDelimitedCodec::new();
-        let mut buf = BytesMut::new();
+        let pk_cols = self
+            .pks
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<String>>();
 
-        for table in tables.iter() {
-            let stmt = match self.statements.get(table.as_str()) {
-                Some(stmt) => stmt,
-                None => {
-                    warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
-                    continue;
-                }
-            };
+        let mut tmp_cols = pk_cols.clone();
+        for i in 0..(self.parsed.columns.len()) {
+            let col_name = format!("col_{i}");
+            tmp_cols.push(col_name.clone());
+            actual_cols.push(col_name);
+        }
 
-            let mut actual_cols = vec![];
-            let mut tmp_cols = self
-                .pks
-                .values()
-                .flatten()
-                .cloned()
-                .collect::<Vec<String>>();
-            for i in 0..(self.parsed.columns.len()) {
-                let col_name = format!("col_{i}");
-                tmp_cols.push(col_name.clone());
-                actual_cols.push(col_name);
-            }
+        // start a new tx
+        let tx = self.conn.transaction()?;
 
-            let sql = format!(
-                "SELECT * FROM (
-                    {}
-                    EXCEPT
-                    {}
-                ) WHERE 1",
-                // insert into
-                stmt.new_query,
-                stmt.temp_query,
-            );
+        // ensure drop and recreate
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS state_results;
+            CREATE TEMP TABLE state_results ({})",
+            tmp_cols.join(",")
+        ))?;
 
-            trace!("Insert SQL: {sql}");
+        let mut new_last_rowid = self.last_rowid;
 
-            let insert_prepped = state_conn.prepare_cached(&sql)?;
+        {
+            let mut tmp_insert_prepped = tx.prepare_cached(&format!(
+                "INSERT INTO state_results VALUES ({})",
+                (0..tmp_cols.len())
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))?;
 
-            let sql = format!(
-                "
-                SELECT {} FROM (
-                    {}
-                    EXCEPT
-                    {}
-                )
-                ",
-                // delete from
-                self.pks
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect::<Vec<String>>()
-                    .join(","),
-                stmt.temp_query,
-                stmt.new_query,
-            );
+            for table in tables.iter() {
+                let stmt = match self.statements.get(table.as_str()) {
+                    Some(stmt) => stmt,
+                    None => {
+                        warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
+                        continue;
+                    }
+                };
 
-            trace!("Delete SQL: {sql}");
+                trace!("SELECT SQL: {}", stmt.new_query);
 
-            let delete_prepped = state_conn.prepare_cached(&sql)?;
+                let mut prepped = state_conn.prepare_cached(&stmt.new_query)?;
 
-            for (is_delete, mut prepped) in [(false, insert_prepped), (true, delete_prepped)] {
                 let col_count = prepped.column_count();
 
                 let mut rows = prepped.raw_query();
 
-                while let Ok(Some(row)) = rows.next() {
-                    match (0..col_count)
-                        .map(|i| row.get_ref(i).map(SqliteValueRef::from))
-                        .collect::<rusqlite::Result<Vec<_>>>()
-                    {
-                        Ok(cells) => {
-                            let mut hasher = seahash::SeaHasher::new();
-                            for cell in cells.iter() {
-                                cell.hash(&mut hasher);
-                            }
-                            if !seen_pks.insert(hasher.finish()) {
-                                continue;
-                            }
-                            trace!("queueing changes cells: {cells:?}, is_delete? {is_delete}");
-                            if let Err(e) = (QueuedEventRef::Changes { cells, is_delete })
-                                .write_to_stream((&mut ser_buf).writer())
-                            {
-                                // NOTE: this should never happen...
-                                error!("could not serialize queue message: {e}");
-                                // TODO: bomb!
-                                return Ok(());
-                            }
-
-                            if let Err(e) = codec.encode(ser_buf.split().freeze(), &mut buf) {
-                                // NOTE: this should never happen...
-                                error!("could not encode queue message: {e}");
-                                // TODO: bomb!
-                                return Ok(());
-                            }
-
-                            if buf.len() >= 8096 {
-                                if let Err(e) = self.queue_tx.try_send(buf.split().freeze()) {
-                                    error!("could not enqueue message to queue: {e}");
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // NOTE: this should never happen...
-                            error!("could not deserialize row's cells: {e}");
-                            // TODO: bomb!
-                            return Ok(());
-                        }
+                // insert each row in the other DB...
+                while let Some(row) = rows.next()? {
+                    for i in 0..col_count {
+                        tmp_insert_prepped
+                            .raw_bind_parameter(i + 1, SqliteValueRef::from(row.get_ref(i)?))?;
                     }
+                    tmp_insert_prepped.raw_execute()?;
                 }
 
-                if !buf.is_empty() {
-                    // write the last bits...
-                    if let Err(e) = self.queue_tx.try_send(buf.split().freeze()) {
-                        error!("could not enqueue message to queue: {e}");
-                        return Ok(());
+                let sql = format!(
+                    "INSERT INTO query ({})
+                    SELECT * FROM (
+                        SELECT * FROM state_results
+                        EXCEPT
+                        {}
+                    ) WHERE 1
+                ON CONFLICT({})
+                    DO UPDATE SET
+                        {}
+                RETURNING __corro_rowid,{}",
+                    // insert into
+                    tmp_cols.join(","),
+                    stmt.temp_query,
+                    pk_cols.join(","),
+                    (0..(self.parsed.columns.len()))
+                        .map(|i| format!("col_{i} = excluded.col_{i}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    actual_cols.join(",")
+                );
+
+                trace!("INSERT SQL: {sql}");
+
+                let insert_prepped = tx.prepare_cached(&sql)?;
+
+                let sql = format!(
+                    "
+                    DELETE FROM query WHERE ({}) in (SELECT {} FROM (
+                        {}
+                        EXCEPT
+                        SELECT * FROM state_results
+                    )) RETURNING __corro_rowid,{}
+                ",
+                    // delete from
+                    pk_cols.join(","),
+                    pk_cols.join(","),
+                    stmt.temp_query,
+                    actual_cols.join(",")
+                );
+
+                trace!("DELETE SQL: {sql}");
+
+                let delete_prepped = tx.prepare_cached(&sql)?;
+
+                let mut change_insert_stmt = tx.prepare_cached(&format!(
+                "INSERT INTO changes (__corro_rowid, {CHANGE_TYPE_COL}, {}) VALUES (?, ?, {}) RETURNING {CHANGE_ID_COL}",
+                actual_cols.join(","),
+                (0..actual_cols.len())
+                    .map(|_i| "?")
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))?;
+
+                for (mut change_type, mut prepped) in [
+                    (None, insert_prepped),
+                    (Some(ChangeType::Delete), delete_prepped),
+                ] {
+                    let col_count = prepped.column_count();
+
+                    let mut rows = prepped.raw_query();
+
+                    while let Ok(Some(row)) = rows.next() {
+                        let rowid: RowId = row.get(0)?;
+
+                        let change_type = change_type.take().unwrap_or({
+                            if rowid.0 > self.last_rowid {
+                                ChangeType::Insert
+                            } else {
+                                ChangeType::Update
+                            }
+                        });
+
+                        let change_type_u8 = change_type as u8;
+
+                        new_last_rowid = cmp::max(new_last_rowid, rowid.0);
+
+                        match (1..col_count)
+                            .map(|i| row.get::<_, SqliteValue>(i))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                        {
+                            Ok(cells) => {
+                                let mut changes_cells: Vec<&dyn ToSql> =
+                                    vec![&rowid, &change_type_u8];
+                                for cell in cells.iter() {
+                                    trace!("inserting event cell: {cell:?}");
+                                    changes_cells.push(cell);
+                                }
+                                trace!("inserting changes... cols: {}", changes_cells.len());
+
+                                let change_id: ChangeId = change_insert_stmt
+                                    .query_row(params_from_iter(changes_cells), |row| row.get(0))?;
+
+                                trace!("got change id: {change_id}");
+
+                                if let Err(e) = self.evt_tx.blocking_send(QueryEvent::Change(
+                                    change_type,
+                                    rowid,
+                                    cells,
+                                    change_id,
+                                )) {
+                                    debug!("could not send back row to matcher sub sender: {e}");
+                                    return Err(MatcherError::EventReceiverClosed);
+                                }
+                            }
+                            Err(e) => {
+                                error!("could not deserialize row's cells: {e}");
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
-        }
 
-        // clean up temporary tables immediately
-        for table in tables {
-            // TODO: reduce mistakes by computing this table name once
-            state_conn
-                .prepare_cached(&format!(
+            // clean that up
+            tx.execute_batch("DROP TABLE state_results")?;
+
+            // clean up temporary tables immediately
+            for table in tables {
+                // TODO: reduce mistakes by computing this table name once
+                tx.prepare_cached(&format!(
                     "DROP TABLE IF EXISTS subscription_{}_{table}",
                     self.id.as_simple(),
                 ))?
                 .execute(())?;
-            trace!("cleaned up subscription_{}_{table}", self.id.as_simple());
+                trace!("cleaned up subscription_{}_{table}", self.id.as_simple());
+            }
         }
+
+        tx.commit()?;
+
+        self.last_rowid = new_last_rowid;
 
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, Writable)]
-enum QueuedEventRef<'a> {
-    Row {
-        cells: Vec<SqliteValueRef<'a>>,
-    },
-    EndOfQuery {
-        time: f64,
-    },
-    Changes {
-        cells: Vec<SqliteValueRef<'a>>,
-        is_delete: bool,
-    },
-}
-
-#[derive(Debug, Clone, Readable, Writable)]
-enum QueuedEvent {
-    Row {
-        cells: Vec<SqliteValue>,
-    },
-    EndOfQuery {
-        time: f64,
-    },
-    Changes {
-        cells: Vec<SqliteValue>,
-        is_delete: bool,
-    },
 }
 
 fn interrupt_deadline_guard(conn: &Connection, dur: Duration) -> DropGuard {
@@ -1970,7 +1741,10 @@ fn table_to_expr(
                 .collect(),
         ),
         false,
-        QualifiedName::single(Name(format!("subscription_{}_{table}", id.as_simple()))),
+        QualifiedName::fullname(
+            Name("__corro_sub".into()),
+            Name(format!("subscription_{}_{table}", id.as_simple())),
+        ),
         None,
     );
 
