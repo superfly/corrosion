@@ -1,7 +1,10 @@
 use rusqlite::types::{FromSql, FromSqlError};
 use serde::{Deserialize, Serialize};
+use speedy::{Readable, Writable};
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, strum::FromRepr)]
+#[derive(
+    Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Readable, Writable, strum::FromRepr,
+)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum ChangeType {

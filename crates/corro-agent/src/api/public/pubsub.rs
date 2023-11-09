@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    io::Write,
-    sync::Arc,
-    task::Poll,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, io::Write, sync::Arc, task::Poll, time::Duration};
 
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -12,7 +6,6 @@ use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::Agent,
     api::{ChangeId, QueryEvent, QueryEventMeta, RowId, Statement},
-    change::SqliteValue,
     pubsub::{Matcher, MatcherError, MatcherHandle, NormalizeStatementError},
     sqlite::SqlitePoolError,
 };
@@ -79,7 +72,7 @@ async fn sub_by_id(
 
     let (evt_tx, evt_rx) = mpsc::channel(512);
 
-    tokio::spawn(catch_up_sub(agent, matcher, from, rx, evt_tx));
+    tokio::spawn(catch_up_sub(matcher, from, rx, evt_tx));
 
     let (tx, body) = hyper::Body::channel();
 
@@ -323,55 +316,34 @@ fn catch_up_sub_anew(
     buf: &mut BytesMut,
     evt_tx: &mpsc::Sender<Bytes>,
 ) -> Result<(), CatchUpError> {
-    let mut query_cols = vec![];
-    for i in 0..(matcher.parsed_columns().len()) {
-        query_cols.push(format!("col_{i}"));
+    let (q_tx, mut q_rx) = mpsc::channel(10240);
+
+    tokio::spawn({
+        let evt_tx = evt_tx.clone();
+        async move {
+            let mut buf = BytesMut::new();
+            while let Some(event) = q_rx.recv().await {
+                match make_query_event_bytes(&mut buf, event) {
+                    Ok((b, _)) => {
+                        if let Err(e) = evt_tx.send(b).await {
+                            error!("could not send catching up event bytes: {e}");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!("could not serialize catching up event: {e}");
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    if let Err(e) = matcher.all_rows(tx, q_tx) {
+        evt_tx.blocking_send(
+            make_query_event_bytes(buf, QueryEvent::Error(e.to_compact_string()))?.0,
+        )?;
     }
-    let mut prepped = tx.prepare_cached(&format!(
-        "SELECT __corro_rowid,{} FROM {}",
-        query_cols.join(","),
-        matcher.table_name()
-    ))?;
-    let col_count = prepped.column_count();
-
-    evt_tx.blocking_send(
-        make_query_event_bytes(buf, QueryEvent::Columns(matcher.col_names().to_vec()))?.0,
-    )?;
-
-    let start = Instant::now();
-    let mut rows = prepped.query(())?;
-    let elapsed = start.elapsed();
-
-    loop {
-        let row = match rows.next()? {
-            Some(row) => row,
-            None => break,
-        };
-        let rowid = row.get(0)?;
-
-        let cells = (1..col_count)
-            .map(|i| row.get::<_, SqliteValue>(i))
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        evt_tx.blocking_send(make_query_event_bytes(buf, QueryEvent::Row(rowid, cells))?.0)?;
-    }
-
-    evt_tx.blocking_send(
-        make_query_event_bytes(
-            buf,
-            QueryEvent::EndOfQuery {
-                time: elapsed.as_secs_f64(),
-                change_id: Some(
-                    tx.prepare(&format!(
-                        "SELECT COALESCE(MAX(id),0) FROM {}",
-                        matcher.changes_table_name()
-                    ))?
-                    .query_row([], |row| row.get(0))?,
-                ),
-            },
-        )?
-        .0,
-    )?;
 
     Ok(())
 }
@@ -383,36 +355,32 @@ fn catch_up_sub_from(
     buf: &mut BytesMut,
     evt_tx: &mpsc::Sender<Bytes>,
 ) -> Result<(), CatchUpError> {
-    let mut query_cols = vec![];
-    for i in 0..(matcher.parsed_columns().len()) {
-        query_cols.push(format!("col_{i}"));
-    }
+    let (q_tx, mut q_rx) = mpsc::channel(10240);
 
-    let mut prepped = tx.prepare_cached(&format!(
-        "SELECT id, type, __corro_rowid, {} FROM {} WHERE id > ?",
-        query_cols.join(","),
-        matcher.changes_table_name()
-    ))?;
+    tokio::spawn({
+        let evt_tx = evt_tx.clone();
+        async move {
+            let mut buf = BytesMut::new();
+            while let Some(event) = q_rx.recv().await {
+                match make_query_event_bytes(&mut buf, event) {
+                    Ok((b, _)) => {
+                        if let Err(e) = evt_tx.send(b).await {
+                            error!("could not send catching up event bytes: {e}");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!("could not serialize catching up event: {e}");
+                        return;
+                    }
+                }
+            }
+        }
+    });
 
-    let col_count = prepped.column_count();
-
-    let mut rows = prepped.query([from])?;
-
-    loop {
-        let row = match rows.next()? {
-            Some(row) => row,
-            None => break,
-        };
-        let id = row.get(0)?;
-        let change_type = row.get(1)?;
-        let rowid = row.get(2)?;
-
-        let cells = (3..col_count)
-            .map(|i| row.get::<_, SqliteValue>(i))
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
+    if let Err(e) = matcher.changes_since(from, tx, q_tx) {
         evt_tx.blocking_send(
-            make_query_event_bytes(buf, QueryEvent::Change(change_type, rowid, cells, id))?.0,
+            make_query_event_bytes(buf, QueryEvent::Error(e.to_compact_string()))?.0,
         )?;
     }
 
@@ -426,7 +394,6 @@ enum LastQueryEvent {
 }
 
 pub async fn catch_up_sub(
-    agent: Agent,
     matcher: MatcherHandle,
     from: Option<ChangeId>,
     sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
@@ -444,35 +411,27 @@ pub async fn catch_up_sub(
     let last_query_event = {
         let mut buf = BytesMut::new();
 
-        let mut conn = match agent.pool().dedicated() {
-            Ok(conn) => conn,
-            Err(e) => {
-                evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await?;
-                return Ok(());
-            }
-        };
+        // let mut conn = match matcher.pool().get().await? {
+        //     Ok(conn) => conn,
+        //     Err(e) => {
+        //         evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await?;
+        //         return Ok(());
+        //     }
+        // };
+
+        let mut conn = matcher.pool().get().await?;
 
         let res = block_in_place(|| {
             let tx = conn.transaction()?; // read transaction
             let last_query_event = match from {
                 Some(from) => {
-                    let max_change_id: ChangeId = tx
-                        .prepare(&format!(
-                            "SELECT COALESCE(MAX(id), 0) FROM {}",
-                            matcher.changes_table_name()
-                        ))?
-                        .query_row([], |row| row.get(0))?;
+                    let max_change_id = matcher.max_change_id(&tx)?;
                     catch_up_sub_from(&tx, matcher, from, &mut buf, &evt_tx)?;
                     debug!("sub caught up to their 'from' of {from:?}");
                     LastQueryEvent::Change(max_change_id)
                 }
                 None => {
-                    let max_row_id: RowId = tx
-                        .prepare(&format!(
-                            "SELECT COALESCE(MAX(__corro_rowid), 0) FROM {}",
-                            matcher.table_name()
-                        ))?
-                        .query_row([], |row| row.get(0))?;
+                    let max_row_id = matcher.max_row_id(&tx)?;
                     catch_up_sub_anew(&tx, matcher, &mut buf, &evt_tx)?;
                     debug!("sub caught up from scratch");
                     LastQueryEvent::Row(max_row_id)
@@ -536,7 +495,7 @@ pub async fn upsert_sub(
         if let Some(matcher) = maybe_matcher {
             debug!("found matcher handle");
             let rx = sender.subscribe();
-            tokio::spawn(catch_up_sub(agent.clone(), matcher, from, rx, tx));
+            tokio::spawn(catch_up_sub(matcher, from, rx, tx));
             return Ok(matcher_id);
         } else {
             cache_write.remove(&stmt);
@@ -554,7 +513,14 @@ pub async fn upsert_sub(
 
     let matcher_id = Uuid::new_v4();
 
-    let handle = Matcher::create(matcher_id, &agent.schema().read(), conn, evt_tx, &stmt)?;
+    let handle = Matcher::create(
+        matcher_id,
+        agent.config().db.subscriptions_path(),
+        &agent.schema().read(),
+        conn,
+        evt_tx,
+        &stmt,
+    )?;
 
     let (sub_tx, sub_rx) = broadcast::channel(10240);
 

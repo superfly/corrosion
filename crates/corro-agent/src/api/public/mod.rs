@@ -5,7 +5,7 @@ use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
-    api::{row_to_change, ExecResponse, ExecResult, QueryEvent, Statement},
+    api::{row_to_change, ExecResponse, ExecResult, QueryEvent, Statement, ColumnName},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{ChunkedChanges, SqliteValue, MAX_CHANGES_BYTE_SIZE},
     schema::{apply_schema, parse_sql},
@@ -354,7 +354,7 @@ async fn build_query_rows_response(
                 prepped
                     .columns()
                     .into_iter()
-                    .map(|col| col.name().to_compact_string())
+                    .map(|col| ColumnName(col.name().to_compact_string()))
                     .collect(),
             )) {
                 error!("could not send back columns: {e}");

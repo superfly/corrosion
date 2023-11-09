@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{Connection, InterruptHandle};
+use rusqlite::{Connection, InterruptHandle, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, RwLock as TokioRwLock,
@@ -41,7 +41,7 @@ use crate::{
     config::Config,
     pubsub::MatcherHandle,
     schema::Schema,
-    sqlite::{rusqlite_to_crsqlite, setup_conn, AttachMap, CrConn, SqlitePool, SqlitePoolError},
+    sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn, Migration, SqlitePool, SqlitePoolError},
 };
 
 use super::members::Members;
@@ -207,13 +207,126 @@ impl Agent {
     }
 }
 
+pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    let migrations: Vec<Box<dyn Migration>> = vec![
+        Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(v0_2_0_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(v0_2_0_1_migration as fn(&Transaction) -> rusqlite::Result<()>),
+    ];
+
+    crate::sqlite::migrate(conn, migrations)
+}
+
+fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+            -- key/value for internal corrosion data (e.g. 'schema_version' => INT)
+            CREATE TABLE __corro_state (key TEXT NOT NULL PRIMARY KEY, value);
+
+            -- internal bookkeeping
+            CREATE TABLE __corro_bookkeeping (
+                actor_id BLOB NOT NULL,
+                start_version INTEGER NOT NULL,
+                end_version INTEGER,
+                db_version INTEGER,
+
+                last_seq INTEGER,
+
+                ts TEXT,
+
+                PRIMARY KEY (actor_id, start_version)
+            ) WITHOUT ROWID;
+
+            -- internal per-db-version seq bookkeeping
+            CREATE TABLE __corro_seq_bookkeeping (
+                -- remote actor / site id
+                site_id BLOB NOT NULL,
+                -- remote internal version
+                version INTEGER NOT NULL,
+                
+                -- start and end seq for this bookkept record
+                start_seq INTEGER NOT NULL,
+                end_seq INTEGER NOT NULL,
+
+                last_seq INTEGER NOT NULL,
+
+                -- timestamp, need to propagate...
+                ts TEXT NOT NULL,
+
+                PRIMARY KEY (site_id, version, start_seq)
+            ) WITHOUT ROWID;
+
+            -- buffered changes (similar schema as crsql_changes)
+            CREATE TABLE __corro_buffered_changes (
+                "table" TEXT NOT NULL,
+                pk BLOB NOT NULL,
+                cid TEXT NOT NULL,
+                val ANY, -- shouldn't matter I don't think
+                col_version INTEGER NOT NULL,
+                db_version INTEGER NOT NULL,
+                site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
+                seq INTEGER NOT NULL,
+                cl INTEGER NOT NULL, -- causal length
+
+                version INTEGER NOT NULL,
+
+                PRIMARY KEY (site_id, db_version, version, seq)
+            ) WITHOUT ROWID;
+            
+            -- SWIM memberships
+            CREATE TABLE __corro_members (
+                actor_id BLOB PRIMARY KEY NOT NULL,
+                address TEXT NOT NULL,
+            
+                state TEXT NOT NULL DEFAULT 'down',
+                foca_state JSON,
+
+                rtts JSON DEFAULT '[]'
+            ) WITHOUT ROWID;
+
+            -- tracked corrosion schema
+            CREATE TABLE __corro_schema (
+                tbl_name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                sql TEXT NOT NULL,
+            
+                source TEXT NOT NULL,
+            
+                PRIMARY KEY (tbl_name, type, name)
+            ) WITHOUT ROWID;
+        "#,
+    )?;
+
+    Ok(())
+}
+
+fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "
+        CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version);
+        ",
+    )
+}
+
+fn v0_2_0_1_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "
+        -- where subscriptions are stored
+        CREATE TABLE __corro_subs (
+            id BLOB PRIMARY KEY NOT NULL,
+            sql TEXT NOT NULL
+        ) WITHOUT ROWID;
+    ",
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct SplitPool(Arc<SplitPoolInner>);
 
 #[derive(Debug)]
 struct SplitPoolInner {
     path: PathBuf,
-    attachments: HashMap<Utf8PathBuf, compact_str::CompactString>,
 
     read: SqlitePool,
     write: SqlitePool,
@@ -252,9 +365,8 @@ pub enum SplitPoolCreateError {
 }
 
 impl SplitPool {
-    pub async fn create<P: AsRef<Path>, P2: AsRef<Path>>(
+    pub async fn create<P: AsRef<Path>>(
         path: P,
-        subscriptions_path: P2,
         tripwire: Tripwire,
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
@@ -271,25 +383,13 @@ impl SplitPool {
 
         Ok(Self::new(
             path.as_ref().to_owned(),
-            vec![(
-                subscriptions_path.as_ref().display().to_string().into(),
-                "subscriptions".into(),
-            )]
-            .into_iter()
-            .collect(),
             ro_pool,
             rw_pool,
             tripwire,
         ))
     }
 
-    fn new(
-        path: PathBuf,
-        attachments: AttachMap,
-        read: SqlitePool,
-        write: SqlitePool,
-        mut tripwire: Tripwire,
-    ) -> Self {
+    fn new(path: PathBuf, read: SqlitePool, write: SqlitePool, mut tripwire: Tripwire) -> Self {
         let (priority_tx, mut priority_rx) = channel(256);
         let (normal_tx, mut normal_rx) = channel(512);
         let (low_tx, mut low_rx) = channel(1024);
@@ -323,7 +423,6 @@ impl SplitPool {
 
         Self(Arc::new(SplitPoolInner {
             path,
-            attachments,
             read,
             write,
             priority_tx,
@@ -373,7 +472,7 @@ impl SplitPool {
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn dedicated(&self) -> rusqlite::Result<Connection> {
         let mut conn = rusqlite::Connection::open(&self.0.path)?;
-        setup_conn(&mut conn, &self.0.attachments)?;
+        setup_conn(&mut conn)?;
         Ok(conn)
     }
 

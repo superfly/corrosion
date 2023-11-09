@@ -27,8 +27,8 @@ use arc_swap::ArcSwap;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
-        Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion, PartialVersion,
-        SplitPool,
+        migrate, Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion,
+        PartialVersion, SplitPool,
     },
     broadcast::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset,
@@ -37,9 +37,9 @@ use corro_types::{
     change::Change,
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members, Rtt},
-    pubsub::{migrate_subs, Matcher},
+    pubsub::Matcher,
     schema::init_schema,
-    sqlite::{CrConn, Migration, SqlitePoolError},
+    sqlite::{CrConn, SqlitePoolError},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
 };
 
@@ -117,13 +117,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     info!("Actor ID: {}", actor_id);
 
-    let subscriptions_db_path = conf.db.subscriptions_db_path();
-
-    if let Some(parent) = subscriptions_db_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
-    let pool = SplitPool::create(&conf.db.path, &subscriptions_db_path, tripwire.clone()).await?;
+    let pool = SplitPool::create(&conf.db.path, tripwire.clone()).await?;
 
     let schema = {
         let mut conn = pool.write_priority().await?;
@@ -132,17 +126,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         schema.constrain()?;
         schema
     };
-
-    {
-        let mut conn = rusqlite::Connection::open(&subscriptions_db_path)?;
-        conn.execute_batch(
-            r#"
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-            "#,
-        )?;
-        migrate_subs(&mut conn)?;
-    }
 
     let (tx_apply, rx_apply) = channel(10240);
 
@@ -324,10 +307,15 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
     let (agent, opts) = setup(conf, tripwire.clone()).await?;
 
-    tokio::spawn(run(agent.clone(), opts).inspect(|res| match res {
-        Ok(_) => info!("corrosion agent run is done"),
-        Err(e) => error!("running corrosion agent failed: {e}"),
-    }));
+    tokio::spawn({
+        let agent = agent.clone();
+        async move {
+            match run(agent, opts).await {
+                Ok(_) => info!("corrosion agent run is done"),
+                Err(e) => error!("running corrosion agent failed: {e}"),
+            }
+        }
+    });
 
     Ok(agent)
 }
@@ -361,17 +349,15 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     {
         // open database and set its journal to WAL
+        let subscriptions_db_path = agent.config().db.subscriptions_path();
         let rows = {
-            let subscriptions_db_path = agent.config().db.subscriptions_db_path();
-            let mut conn = rusqlite::Connection::open(&subscriptions_db_path)?;
+            let conn = rusqlite::Connection::open(&subscriptions_db_path)?;
             conn.execute_batch(
                 r#"
                     PRAGMA journal_mode = WAL;
                     PRAGMA synchronous = NORMAL;
                 "#,
             )?;
-
-            migrate_subs(&mut conn)?;
 
             let res = conn
                 .prepare("SELECT id, sql FROM subs")?
@@ -386,7 +372,14 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         for (id, sql) in rows {
             let conn = block_in_place(|| agent.pool().dedicated())?;
             let (evt_tx, evt_rx) = channel(512);
-            match Matcher::restore(id, &agent.schema().read(), conn, evt_tx, &sql) {
+            match Matcher::restore(
+                id,
+                subscriptions_db_path.clone(),
+                &agent.schema().read(),
+                conn,
+                evt_tx,
+                &sql,
+            ) {
                 Ok(handle) => {
                     info!(sub_id = %id, "Restored subscription");
                     agent.matchers().write().insert(id, handle);
@@ -2664,107 +2657,6 @@ async fn process_completed_empties(
     );
 
     Ok(())
-}
-
-pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
-    let migrations: Vec<Box<dyn Migration>> = vec![
-        Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
-        Box::new(v0_2_0_migration as fn(&Transaction) -> rusqlite::Result<()>),
-    ];
-
-    corro_types::sqlite::migrate(conn, migrations)
-}
-
-fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        r#"
-            -- key/value for internal corrosion data (e.g. 'schema_version' => INT)
-            CREATE TABLE __corro_state (key TEXT NOT NULL PRIMARY KEY, value);
-
-            -- internal bookkeeping
-            CREATE TABLE __corro_bookkeeping (
-                actor_id BLOB NOT NULL,
-                start_version INTEGER NOT NULL,
-                end_version INTEGER,
-                db_version INTEGER,
-
-                last_seq INTEGER,
-
-                ts TEXT,
-
-                PRIMARY KEY (actor_id, start_version)
-            ) WITHOUT ROWID;
-
-            -- internal per-db-version seq bookkeeping
-            CREATE TABLE __corro_seq_bookkeeping (
-                -- remote actor / site id
-                site_id BLOB NOT NULL,
-                -- remote internal version
-                version INTEGER NOT NULL,
-                
-                -- start and end seq for this bookkept record
-                start_seq INTEGER NOT NULL,
-                end_seq INTEGER NOT NULL,
-
-                last_seq INTEGER NOT NULL,
-
-                -- timestamp, need to propagate...
-                ts TEXT NOT NULL,
-
-                PRIMARY KEY (site_id, version, start_seq)
-            ) WITHOUT ROWID;
-
-            -- buffered changes (similar schema as crsql_changes)
-            CREATE TABLE __corro_buffered_changes (
-                "table" TEXT NOT NULL,
-                pk BLOB NOT NULL,
-                cid TEXT NOT NULL,
-                val ANY, -- shouldn't matter I don't think
-                col_version INTEGER NOT NULL,
-                db_version INTEGER NOT NULL,
-                site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
-                seq INTEGER NOT NULL,
-                cl INTEGER NOT NULL, -- causal length
-
-                version INTEGER NOT NULL,
-
-                PRIMARY KEY (site_id, db_version, version, seq)
-            ) WITHOUT ROWID;
-            
-            -- SWIM memberships
-            CREATE TABLE __corro_members (
-                actor_id BLOB PRIMARY KEY NOT NULL,
-                address TEXT NOT NULL,
-            
-                state TEXT NOT NULL DEFAULT 'down',
-                foca_state JSON,
-
-                rtts JSON DEFAULT '[]'
-            ) WITHOUT ROWID;
-
-            -- tracked corrosion schema
-            CREATE TABLE __corro_schema (
-                tbl_name TEXT NOT NULL,
-                type TEXT NOT NULL,
-                name TEXT NOT NULL,
-                sql TEXT NOT NULL,
-            
-                source TEXT NOT NULL,
-            
-                PRIMARY KEY (tbl_name, type, name)
-            ) WITHOUT ROWID;
-        "#,
-    )?;
-
-    Ok(())
-}
-
-fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        "
-        CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version);
-    ",
-    )
 }
 
 #[cfg(test)]

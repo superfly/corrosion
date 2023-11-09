@@ -30,6 +30,7 @@ rand = { workspace = true }
 rangemap = { workspace = true }
 rcgen = { workspace = true }
 rusqlite = { workspace = true }
+seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
@@ -45,3 +46,7 @@ tripwire = { version = "0.1.0-alpha.0", path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }
 sqlite-pool = { path = "../sqlite-pool" }
+yaque = { version = "0.6.6" }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

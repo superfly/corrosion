@@ -1,11 +1,12 @@
 use std::{
+    borrow::Borrow,
     collections::HashMap,
     fmt::{self, Write},
     hash::Hash,
     ops::Deref,
 };
 
-use compact_str::{CompactString, ToCompactString};
+use compact_str::CompactString;
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
     Row, ToSql,
@@ -21,7 +22,7 @@ pub mod sqlite;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryEvent {
-    Columns(Vec<CompactString>),
+    Columns(Vec<ColumnName>),
     Row(RowId, Vec<SqliteValue>),
     #[serde(rename = "eoq")]
     EndOfQuery {
@@ -55,7 +56,9 @@ pub enum QueryEventMeta {
 }
 
 /// RowId newtype to differentiate from ChangeId
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Readable, Writable, PartialEq, Eq, Ord, PartialOrd,
+)]
 #[serde(transparent)]
 pub struct RowId(pub i64);
 
@@ -87,7 +90,20 @@ impl ToSql for RowId {
 }
 
 /// ChangeId newtype to differentiate from RowId
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    Readable,
+    Writable,
+    PartialEq,
+    Eq,
+    Ord,
+    PartialOrd,
+)]
 #[serde(transparent)]
 pub struct ChangeId(pub i64);
 
@@ -206,56 +222,58 @@ pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(untagged)]
-pub enum SqliteValueRef<'a> {
-    Null,
-    Integer(i64),
-    Real(f64),
-    Text(&'a str),
-    Blob(&'a [u8]),
-}
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct SqliteValueRef<'a>(pub ValueRef<'a>);
 
 impl<'a> SqliteValueRef<'a> {
     pub fn is_null(&self) -> bool {
-        matches!(self, SqliteValueRef::Null)
+        matches!(self.0, ValueRef::Null)
     }
 
-    pub fn as_integer(&self) -> Option<&i64> {
-        match self {
-            SqliteValueRef::Integer(i) => Some(i),
-            _ => None,
-        }
+    pub fn as_integer(&self) -> Option<i64> {
+        self.0.as_i64().ok()
     }
 
-    pub fn as_real(&self) -> Option<&f64> {
-        match self {
-            SqliteValueRef::Real(f) => Some(f),
-            _ => None,
-        }
+    pub fn as_real(&self) -> Option<f64> {
+        self.0.as_f64().ok()
     }
 
     pub fn as_text(&self) -> Option<&str> {
-        match self {
-            SqliteValueRef::Text(s) => Some(s),
-            _ => None,
-        }
+        self.0.as_str().ok()
     }
 
     pub fn as_blob(&self) -> Option<&[u8]> {
-        match self {
-            SqliteValueRef::Blob(b) => Some(b),
-            _ => None,
-        }
+        self.0.as_blob().ok()
     }
 
     pub fn to_owned(&self) -> SqliteValue {
-        match self {
-            SqliteValueRef::Null => SqliteValue::Null,
-            SqliteValueRef::Integer(v) => SqliteValue::Integer(*v),
-            SqliteValueRef::Real(v) => SqliteValue::Real(Real(*v)),
-            SqliteValueRef::Text(v) => SqliteValue::Text((*v).to_compact_string()),
-            SqliteValueRef::Blob(v) => SqliteValue::Blob(v.to_smallvec()),
+        match self.0 {
+            ValueRef::Null => SqliteValue::Null,
+            ValueRef::Integer(v) => SqliteValue::Integer(v),
+            ValueRef::Real(v) => SqliteValue::Real(Real(v)),
+            ValueRef::Text(v) => SqliteValue::Text(CompactString::from_utf8_lossy(v)),
+            ValueRef::Blob(v) => SqliteValue::Blob(v.to_smallvec()),
+        }
+    }
+}
+
+impl<'a> Hash for SqliteValueRef<'a> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(&self.0).hash(state);
+        match self.0 {
+            ValueRef::Null => {}
+            ValueRef::Integer(v) => {
+                v.hash(state);
+            }
+            ValueRef::Real(v) => {
+                integer_decode(v).hash(state);
+            }
+            ValueRef::Text(v) => {
+                v.hash(state);
+            }
+            ValueRef::Blob(v) => {
+                v.hash(state);
+            }
         }
     }
 }
@@ -369,13 +387,13 @@ impl ToSql for SqliteParam {
 
 impl<'a> ToSql for SqliteValueRef<'a> {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'a>> {
-        Ok(match self {
-            SqliteValueRef::Null => ToSqlOutput::Owned(Value::Null),
-            SqliteValueRef::Integer(i) => ToSqlOutput::Owned(Value::Integer(*i)),
-            SqliteValueRef::Real(f) => ToSqlOutput::Owned(Value::Real(*f)),
-            SqliteValueRef::Text(t) => ToSqlOutput::Borrowed(ValueRef::Text(t.as_bytes())),
-            SqliteValueRef::Blob(b) => ToSqlOutput::Borrowed(ValueRef::Blob(b)),
-        })
+        Ok(ToSqlOutput::Borrowed(self.0))
+    }
+}
+
+impl<'a> From<ValueRef<'a>> for SqliteValueRef<'a> {
+    fn from(value: ValueRef<'a>) -> Self {
+        Self(value)
     }
 }
 
@@ -476,11 +494,11 @@ impl SqliteValue {
 
     pub fn as_ref(&self) -> SqliteValueRef {
         match self {
-            SqliteValue::Null => SqliteValueRef::Null,
-            SqliteValue::Integer(i) => SqliteValueRef::Integer(*i),
-            SqliteValue::Real(r) => SqliteValueRef::Real(r.0),
-            SqliteValue::Text(s) => SqliteValueRef::Text(s.as_str()),
-            SqliteValue::Blob(v) => SqliteValueRef::Blob(v.as_slice()),
+            SqliteValue::Null => SqliteValueRef(ValueRef::Null),
+            SqliteValue::Integer(i) => SqliteValueRef(ValueRef::Integer(*i)),
+            SqliteValue::Real(r) => SqliteValueRef(ValueRef::Real(r.0)),
+            SqliteValue::Text(s) => SqliteValueRef(ValueRef::Text(s.as_bytes())),
+            SqliteValue::Blob(v) => SqliteValueRef(ValueRef::Blob(v.as_slice())),
         }
     }
 
@@ -643,6 +661,45 @@ where
     }
 }
 
+impl<'a, C> Writable<C> for SqliteValueRef<'a>
+where
+    C: Context,
+{
+    #[inline]
+    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
+        match self {
+            SqliteValueRef(ValueRef::Null) => writer.write_u8(0),
+            SqliteValueRef(ValueRef::Integer(i)) => {
+                1u8.write_to(writer)?;
+                i.write_to(writer)
+            }
+            SqliteValueRef(ValueRef::Real(f)) => {
+                2u8.write_to(writer)?;
+                f.write_to(writer)
+            }
+            SqliteValueRef(ValueRef::Text(s)) => {
+                3u8.write_to(writer)?;
+                (*s).write_to(writer)
+            }
+            SqliteValueRef(ValueRef::Blob(b)) => {
+                4u8.write_to(writer)?;
+                (*b).write_to(writer)
+            }
+        }
+    }
+
+    #[inline]
+    fn bytes_needed(&self) -> Result<usize, C::Error> {
+        Ok(1 + match self {
+            SqliteValueRef(ValueRef::Null) => 0,
+            SqliteValueRef(ValueRef::Integer(i)) => <i64 as Writable<C>>::bytes_needed(i)?,
+            SqliteValueRef(ValueRef::Real(f)) => <f64 as Writable<C>>::bytes_needed(f)?,
+            SqliteValueRef(ValueRef::Text(s)) => <[u8] as Writable<C>>::bytes_needed(s)?,
+            SqliteValueRef(ValueRef::Blob(b)) => <[u8] as Writable<C>>::bytes_needed(b)?,
+        })
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct TableName(pub CompactString);
@@ -650,6 +707,25 @@ pub struct TableName(pub CompactString);
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct ColumnName(pub CompactString);
+
+impl Borrow<str> for ColumnName {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<[u8]> for ColumnName {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl From<&str> for ColumnName {
+    fn from(value: &str) -> Self {
+        ColumnName(value.into())
+    }
+}
 
 impl Deref for TableName {
     type Target = CompactString;

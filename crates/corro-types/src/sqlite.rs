@@ -1,12 +1,5 @@
-use std::{
-    collections::HashMap,
-    ops::{Deref, DerefMut},
-};
+use std::ops::{Deref, DerefMut};
 
-// use bb8::ManageConnection;
-use camino::Utf8PathBuf;
-use compact_str::CompactString;
-use enquote::enquote;
 use once_cell::sync::Lazy;
 use rusqlite::{params, Connection, Transaction};
 use sqlite_pool::SqliteConn;
@@ -44,7 +37,7 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
 
 pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     init_cr_conn(&mut conn)?;
-    setup_conn(&mut conn, &HashMap::new())?;
+    setup_conn(&mut conn)?;
     Ok(CrConn(conn))
 }
 
@@ -111,9 +104,7 @@ fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-pub type AttachMap = HashMap<Utf8PathBuf, CompactString>;
-
-pub(crate) fn setup_conn(conn: &mut Connection, attach: &AttachMap) -> Result<(), rusqlite::Error> {
+pub(crate) fn setup_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     // WAL journal mode and synchronous NORMAL for best performance / crash resilience compromise
     conn.execute_batch(
         r#"
@@ -122,18 +113,6 @@ pub(crate) fn setup_conn(conn: &mut Connection, attach: &AttachMap) -> Result<()
             PRAGMA recursive_triggers = ON;
         "#,
     )?;
-
-    for (path, name) in attach.iter() {
-        conn.execute_batch(&format!(
-            "ATTACH DATABASE {} AS {};
-            PRAGMA {}.journal_mode = WAL;
-            PRAGMA {}.synchronous = NORMAL;",
-            enquote('\'', path.as_str()),
-            name,
-            name,
-            name,
-        ))?;
-    }
 
     Ok(())
 }
