@@ -2186,6 +2186,11 @@ mod tests {
 
             println!("got change (B)");
 
+            // process the same and check that it doesn't produce a change again!
+            matcher.process_changeset(changes.as_slice()).unwrap();
+
+            assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+
             // lots of operations
 
             let range = 4u32..1000u32;
