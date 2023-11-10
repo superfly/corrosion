@@ -17,7 +17,7 @@ use indexmap::{IndexMap, IndexSet};
 use rusqlite::{
     params, params_from_iter,
     types::{FromSqlError, ValueRef},
-    Connection, OptionalExtension, ToSql,
+    Connection, OptionalExtension,
 };
 use sqlite3_parser::{
     ast::{
@@ -732,12 +732,14 @@ impl Matcher {
     ) -> Result<MatcherHandle, MatcherError> {
         let (mut matcher, handle) = Self::new(id, subs_path, schema, &state_conn, evt_tx, sql)?;
 
-        let mut tmp_cols = matcher
+        let pk_cols = matcher
             .pks
             .values()
             .flatten()
             .cloned()
             .collect::<Vec<String>>();
+
+        let mut tmp_cols = pk_cols.clone();
 
         let mut actual_cols = vec![];
 
@@ -754,7 +756,7 @@ impl Matcher {
                 "
                 CREATE TABLE query (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {columns});
 
-                CREATE UNIQUE INDEX index_{id}_pk ON query ({pks});
+                CREATE UNIQUE INDEX index_{id}_pk ON query ({pks_coalesced});
 
                 CREATE TABLE changes (
                     {CHANGE_ID_COL} INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -765,11 +767,9 @@ impl Matcher {
             ",
                 columns = tmp_cols.join(","),
                 id = id.as_simple(),
-                pks = matcher
-                    .pks
-                    .values()
-                    .flatten()
-                    .cloned()
+                pks_coalesced = pk_cols
+                    .iter()
+                    .map(|pk| format!("coalesce({pk}, \"\")"))
                     .collect::<Vec<_>>()
                     .join(","),
                 actual_columns = actual_cols.join(","),
@@ -1215,25 +1215,29 @@ impl Matcher {
                 }
 
                 let sql = format!(
-                    "INSERT INTO query ({})
-                    SELECT * FROM (
-                        SELECT * FROM state_results
-                        EXCEPT
-                        {}
-                    ) WHERE 1
-                ON CONFLICT({})
-                    DO UPDATE SET
-                        {}
-                RETURNING __corro_rowid,{}",
+                    "INSERT INTO query ({insert_cols})
+                        SELECT * FROM (
+                            SELECT * FROM state_results
+                            EXCEPT
+                            {query_query}
+                        ) WHERE 1
+                        ON CONFLICT({conflict_clause})
+                            DO UPDATE SET
+                                {excluded}
+                        RETURNING __corro_rowid,{return_cols}",
                     // insert into
-                    tmp_cols.join(","),
-                    stmt.temp_query,
-                    pk_cols.join(","),
-                    (0..(self.parsed.columns.len()))
+                    insert_cols = tmp_cols.join(","),
+                    query_query = stmt.temp_query,
+                    conflict_clause = pk_cols
+                        .iter()
+                        .map(|pk| format!("coalesce({pk},\"\")"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    excluded = (0..(self.parsed.columns.len()))
                         .map(|i| format!("col_{i} = excluded.col_{i}"))
                         .collect::<Vec<_>>()
                         .join(","),
-                    actual_cols.join(",")
+                    return_cols = actual_cols.join(",")
                 );
 
                 trace!("INSERT SQL: {sql}");
@@ -1242,17 +1246,17 @@ impl Matcher {
 
                 let sql = format!(
                     "
-                    DELETE FROM query WHERE ({}) in (SELECT {} FROM (
-                        {}
+                    DELETE FROM query WHERE ({pks}) IN (SELECT {select_pks} FROM (
+                        {query_query}
                         EXCEPT
                         SELECT * FROM state_results
-                    )) RETURNING __corro_rowid,{}
+                    )) RETURNING __corro_rowid,{return_cols}
                 ",
                     // delete from
-                    pk_cols.join(","),
-                    pk_cols.join(","),
-                    stmt.temp_query,
-                    actual_cols.join(",")
+                    pks = pk_cols.join(","),
+                    select_pks = pk_cols.join(","),
+                    query_query = stmt.temp_query,
+                    return_cols = actual_cols.join(",")
                 );
 
                 trace!("DELETE SQL: {sql}");
@@ -1287,8 +1291,6 @@ impl Matcher {
                             }
                         });
 
-                        let change_type_u8 = change_type as u8;
-
                         new_last_rowid = cmp::max(new_last_rowid, rowid.0);
 
                         match (1..col_count)
@@ -1296,16 +1298,19 @@ impl Matcher {
                             .collect::<rusqlite::Result<Vec<_>>>()
                         {
                             Ok(cells) => {
-                                let mut changes_cells: Vec<&dyn ToSql> =
-                                    vec![&rowid, &change_type_u8];
-                                for cell in cells.iter() {
-                                    trace!("inserting event cell: {cell:?}");
-                                    changes_cells.push(cell);
+                                change_insert_stmt.raw_bind_parameter(1, rowid)?;
+                                change_insert_stmt.raw_bind_parameter(2, change_type)?;
+                                for (i, cell) in cells.iter().enumerate() {
+                                    // increment index by 3 because that's where we're starting...
+                                    change_insert_stmt.raw_bind_parameter(i + 3, cell)?;
                                 }
-                                trace!("inserting changes... cols: {}", changes_cells.len());
 
-                                let change_id: ChangeId = change_insert_stmt
-                                    .query_row(params_from_iter(changes_cells), |row| row.get(0))?;
+                                let mut change_rows = change_insert_stmt.raw_query();
+
+                                let change_id: ChangeId = change_rows
+                                    .next()?
+                                    .ok_or(MatcherError::NoChangeInserted)?
+                                    .get(0)?;
 
                                 trace!("got change id: {change_id}");
 
@@ -1783,6 +1788,8 @@ pub enum MatcherError {
     MissingPrimaryKeys,
     #[error("change queue has been closed or is full")]
     ChangeQueueClosedOrFull,
+    #[error("no change was inserted, this is not supposed to happen")]
+    NoChangeInserted,
     #[error("change receiver is closed")]
     EventReceiverClosed,
     #[error(transparent)]

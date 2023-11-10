@@ -1,4 +1,7 @@
-use rusqlite::types::{FromSql, FromSqlError};
+use rusqlite::{
+    types::{FromSql, FromSqlError},
+    ToSql,
+};
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 
@@ -22,5 +25,13 @@ impl FromSql for ChangeType {
             .ok_or_else(|| FromSqlError::OutOfRange(i))?),
             _ => Err(FromSqlError::InvalidType),
         }
+    }
+}
+
+impl ToSql for ChangeType {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::Owned(
+            rusqlite::types::Value::Integer((*self as u8) as i64),
+        ))
     }
 }
