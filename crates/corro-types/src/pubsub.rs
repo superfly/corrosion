@@ -14,6 +14,7 @@ use corro_api_types::{
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
+use parking_lot::{Condvar, Mutex};
 use rusqlite::{
     params, params_from_iter,
     types::{FromSqlError, ValueRef},
@@ -231,8 +232,22 @@ pub enum MatcherCmd {
     ProcessChange(MatchCandidates),
 }
 
+pub enum MatcherState {
+    Querying,
+    Running,
+}
+
+impl MatcherState {
+    fn is_running(&self) -> bool {
+        matches!(self, MatcherState::Running)
+    }
+}
+
 #[derive(Clone)]
-pub struct MatcherHandle(Arc<InnerMatcherHandle>);
+pub struct MatcherHandle {
+    inner: Arc<InnerMatcherHandle>,
+    state: StateLock,
+}
 
 struct InnerMatcherHandle {
     id: Uuid,
@@ -268,7 +283,7 @@ impl MatcherHandle {
 
         // don't consider changes that don't have both the table + col in the matcher query
         if !self
-            .0
+            .inner
             .parsed
             .table_columns
             .get(change.table)
@@ -320,7 +335,7 @@ impl MatcherHandle {
         }
 
         if !candidates.is_empty() {
-            self.0
+            self.inner
                 .cmd_tx
                 .try_send(MatcherCmd::ProcessChange(candidates))
                 .map_err(|_| MatcherError::ChangeQueueClosedOrFull)?;
@@ -344,7 +359,7 @@ impl MatcherHandle {
         }
 
         if !candidates.is_empty() {
-            self.0
+            self.inner
                 .cmd_tx
                 .try_send(MatcherCmd::ProcessChange(candidates))
                 .map_err(|_| MatcherError::ChangeQueueClosedOrFull)?;
@@ -354,32 +369,42 @@ impl MatcherHandle {
     }
 
     pub fn id(&self) -> Uuid {
-        self.0.id
+        self.inner.id
     }
 
     pub fn parsed_columns(&self) -> &[ResultColumn] {
-        &self.0.parsed.columns
+        &self.inner.parsed.columns
     }
 
     pub fn col_names(&self) -> &[ColumnName] {
-        &self.0.col_names
+        &self.inner.col_names
     }
 
     pub async fn cleanup(self) {
-        self.0.cancel.cancel();
-        info!(sub_id = %self.0.id, "Canceled subscription");
+        self.inner.cancel.cancel();
+        info!(sub_id = %self.inner.id, "Canceled subscription");
     }
 
     pub fn pool(&self) -> &RusqlitePool {
-        &self.0.pool
+        &self.inner.pool
+    }
+
+    fn wait_for_running_state(&self) {
+        let (lock, cvar) = &*self.state;
+        let mut state = lock.lock();
+        while !state.is_running() {
+            cvar.wait(&mut state);
+        }
     }
 
     pub fn max_change_id(&self, conn: &Connection) -> rusqlite::Result<ChangeId> {
+        self.wait_for_running_state();
         let mut prepped = conn.prepare_cached("SELECT COALESCE(MAX(id), 0) FROM changes")?;
         prepped.query_row([], |row| row.get(0))
     }
 
     pub fn max_row_id(&self, conn: &Connection) -> rusqlite::Result<RowId> {
+        self.wait_for_running_state();
         let mut prepped =
             conn.prepare_cached("SELECT COALESCE(MAX(__corro_rowid), 0) FROM query")?;
         prepped.query_row([], |row| row.get(0))
@@ -391,6 +416,7 @@ impl MatcherHandle {
         conn: &Connection,
         tx: mpsc::Sender<QueryEvent>,
     ) -> rusqlite::Result<()> {
+        self.wait_for_running_state();
         let mut query_cols = vec![];
         for i in 0..(self.parsed_columns().len()) {
             query_cols.push(format!("col_{i}"));
@@ -431,6 +457,7 @@ impl MatcherHandle {
         conn: &Connection,
         tx: mpsc::Sender<QueryEvent>,
     ) -> rusqlite::Result<()> {
+        self.wait_for_running_state();
         let mut query_cols = vec![];
         for i in 0..(self.parsed_columns().len()) {
             query_cols.push(format!("col_{i}"));
@@ -485,6 +512,8 @@ impl MatcherHandle {
     }
 }
 
+type StateLock = Arc<(Mutex<MatcherState>, Condvar)>;
+
 pub struct Matcher {
     pub id: Uuid,
     pub query: Stmt,
@@ -498,6 +527,7 @@ pub struct Matcher {
     conn: Connection,
     base_path: Utf8PathBuf,
     cancel: CancellationToken,
+    state: StateLock,
 }
 
 #[derive(Debug, Clone)]
@@ -676,18 +706,23 @@ impl Matcher {
         let (cmd_tx, cmd_rx) = mpsc::channel(512);
         let cancel = CancellationToken::new();
 
-        let handle = MatcherHandle(Arc::new(InnerMatcherHandle {
-            id,
-            pool: sqlite_pool::Config::new(sub_db_path.into_std_path_buf())
-                .max_size(5)
-                .read_only()
-                .create_pool()
-                .expect("could not build pool, this can't fail because we specified a runtime"),
-            cmd_tx,
-            parsed: parsed.clone(),
-            col_names: col_names.clone(),
-            cancel: cancel.clone(),
-        }));
+        let state = Arc::new((Mutex::new(MatcherState::Querying), Condvar::new()));
+
+        let handle = MatcherHandle {
+            inner: Arc::new(InnerMatcherHandle {
+                id,
+                pool: sqlite_pool::Config::new(sub_db_path.into_std_path_buf())
+                    .max_size(5)
+                    .read_only()
+                    .create_pool()
+                    .expect("could not build pool, this can't fail because we specified a runtime"),
+                cmd_tx,
+                parsed: parsed.clone(),
+                col_names: col_names.clone(),
+                cancel: cancel.clone(),
+            }),
+            state: state.clone(),
+        };
 
         let matcher = Self {
             id,
@@ -702,6 +737,7 @@ impl Matcher {
             conn,
             base_path: sub_path,
             cancel,
+            state,
         };
 
         Ok((matcher, handle))
@@ -846,6 +882,13 @@ impl Matcher {
     }
 
     async fn cmd_loop(mut self, mut state_conn: Connection) {
+        {
+            let (lock, cvar) = &*self.state;
+            let mut state = lock.lock();
+            *state = MatcherState::Running;
+            cvar.notify_all();
+        }
+
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
         let mut process_changes_interval = tokio::time::interval(Duration::from_millis(100));
 
@@ -2061,7 +2104,7 @@ mod tests {
             .unwrap();
 
             println!("matcher created w/ id: {}", id.as_simple());
-            println!("parsed: {:?}", matcher.0.parsed);
+            println!("parsed: {:?}", matcher.inner.parsed);
 
             assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Columns(_)));
 
