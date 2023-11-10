@@ -311,13 +311,14 @@ fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
 
 fn v0_2_0_1_migration(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
-        "
+        r#"
         -- where subscriptions are stored
         CREATE TABLE __corro_subs (
             id BLOB PRIMARY KEY NOT NULL,
-            sql TEXT NOT NULL
+            sql TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'created'
         ) WITHOUT ROWID;
-    ",
+    "#,
     )
 }
 

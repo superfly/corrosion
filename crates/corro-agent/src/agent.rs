@@ -353,16 +353,22 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 .pool()
                 .read()
                 .await?
-                .prepare("SELECT id, sql FROM __corro_subs")?
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<(uuid::Uuid, String)>>>()?;
+                .prepare("SELECT id, sql, state FROM __corro_subs")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<(uuid::Uuid, String, String)>>>()?;
 
             // the let is required or else we get a lifetime error
             #[allow(clippy::let_and_return)]
             res
         };
 
-        for (id, sql) in rows {
+        let mut to_cleanup = vec![];
+
+        for (id, sql, state) in rows {
+            if state != "running" {
+                to_cleanup.push(id);
+                continue;
+            }
             let conn = block_in_place(|| agent.pool().dedicated())?;
             let (evt_tx, evt_rx) = channel(512);
             match Matcher::restore(
@@ -389,6 +395,18 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 Err(e) => {
                     error!("could not restore subscription {id}: {e}");
                 }
+            }
+        }
+
+        if !to_cleanup.is_empty() {
+            let conn = agent.pool().write_priority().await?;
+            for id in to_cleanup {
+                info!(sub_id = %id, "Cleaning up unclean subscription");
+                Matcher::cleanup(
+                    id,
+                    Matcher::sub_path(agent.config().db.subscriptions_path().as_path(), id),
+                    &conn,
+                )?;
             }
         }
     };

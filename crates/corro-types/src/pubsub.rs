@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::{Buf, BufMut};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use compact_str::{CompactString, ToCompactString};
 use corro_api_types::{
     Change, ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef,
@@ -233,7 +233,7 @@ pub enum MatcherCmd {
 }
 
 pub enum MatcherState {
-    Querying,
+    Created,
     Running,
 }
 
@@ -552,7 +552,7 @@ impl Matcher {
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
     ) -> Result<(Matcher, MatcherHandle), MatcherError> {
-        let sub_path = subs_path.join(id.as_simple().to_string());
+        let sub_path = Self::sub_path(subs_path.as_path(), id);
 
         info!("Initializing subscription at {sub_path}");
 
@@ -706,7 +706,7 @@ impl Matcher {
         let (cmd_tx, cmd_rx) = mpsc::channel(512);
         let cancel = CancellationToken::new();
 
-        let state = Arc::new((Mutex::new(MatcherState::Querying), Condvar::new()));
+        let state = Arc::new((Mutex::new(MatcherState::Created), Condvar::new()));
 
         let handle = MatcherHandle {
             inner: Arc::new(InnerMatcherHandle {
@@ -741,6 +741,27 @@ impl Matcher {
         };
 
         Ok((matcher, handle))
+    }
+
+    pub fn cleanup(
+        id: Uuid,
+        sub_path: Utf8PathBuf,
+        state_conn: &Connection,
+    ) -> rusqlite::Result<()> {
+        info!(sub_id = %id, "Attempting to cleanup...");
+
+        info!(sub_id = %id, "Dropping subs entry in DB");
+        state_conn.execute("DELETE FROM __corro_subs WHERE id = ?", [id])?;
+
+        if let Err(e) = std::fs::remove_dir_all(&sub_path) {
+            error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
+        }
+
+        Ok(())
+    }
+
+    pub fn sub_path(subs_path: &Utf8Path, id: Uuid) -> Utf8PathBuf {
+        subs_path.join(id.as_simple().to_string())
     }
 
     pub fn restore(
@@ -860,27 +881,6 @@ impl Matcher {
         self.cmd_loop(state_conn).await
     }
 
-    fn handle_cleanup(&mut self, state_conn: &mut Connection) -> rusqlite::Result<()> {
-        info!(sub_id = %self.id, "Attempting to cleanup...");
-        let state_tx = state_conn.transaction()?;
-        let tx = self.conn.transaction()?;
-
-        info!(sub_id = %self.id, "Dropping sub tables");
-        tx.execute_batch("DROP TABLE query; DROP TABLE changes")?;
-
-        info!(sub_id = %self.id, "Dropping subs entry in DB");
-        state_tx.execute("DELETE FROM __corro_subs WHERE id = ?", [self.id])?;
-
-        tx.commit()?;
-        state_tx.commit()?;
-
-        if let Err(e) = std::fs::remove_dir_all(&self.base_path) {
-            error!(sub_id = %self.id, "could not delete subscription base path {} due to: {e}", self.base_path);
-        }
-
-        Ok(())
-    }
-
     async fn cmd_loop(mut self, mut state_conn: Connection) {
         {
             let (lock, cvar) = &*self.state;
@@ -983,7 +983,9 @@ impl Matcher {
             }
         }
 
-        if let Err(e) = block_in_place(|| self.handle_cleanup(&mut state_conn)) {
+        if let Err(e) =
+            block_in_place(|| Self::cleanup(self.id, self.base_path.clone(), &state_conn))
+        {
             error!("could not handle cleanup: {e}");
         }
     }
@@ -1102,6 +1104,11 @@ impl Matcher {
             tx.execute_batch("DROP TABLE IF EXISTS state_rows;")?;
 
             tx.commit()?;
+
+            state_conn.execute(
+                "UPDATE __corro_subs SET state = 'running' WHERE id = ?",
+                [self.id],
+            )?;
 
             self.last_rowid = last_rowid;
 
