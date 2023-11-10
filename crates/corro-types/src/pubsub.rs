@@ -1224,6 +1224,7 @@ impl Matcher {
                         ON CONFLICT({conflict_clause})
                             DO UPDATE SET
                                 {excluded}
+                            WHERE {excluded_not_same}
                         RETURNING __corro_rowid,{return_cols}",
                     // insert into
                     insert_cols = tmp_cols.join(","),
@@ -1237,6 +1238,10 @@ impl Matcher {
                         .map(|i| format!("col_{i} = excluded.col_{i}"))
                         .collect::<Vec<_>>()
                         .join(","),
+                    excluded_not_same = (0..(self.parsed.columns.len()))
+                        .map(|i| format!("col_{i} IS NOT excluded.col_{i}"))
+                        .collect::<Vec<_>>()
+                        .join(" OR "),
                     return_cols = actual_cols.join(",")
                 );
 
