@@ -21,7 +21,7 @@ use rangemap::RangeInclusiveSet;
 use rusqlite::{Connection, InterruptHandle, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
-    OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, RwLock as TokioRwLock,
+    watch, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, RwLock as TokioRwLock,
     RwLockReadGuard as TokioRwLockReadGuard, RwLockWriteGuard as TokioRwLockWriteGuard,
 };
 use tokio::{
@@ -32,7 +32,7 @@ use tokio::{
     },
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info, trace, Instrument};
+use tracing::{debug, error, info, Instrument};
 use tripwire::Tripwire;
 
 use crate::{
@@ -61,6 +61,7 @@ pub struct AgentConfig {
     pub clock: Arc<uhlc::HLC>,
     pub bookie: Bookie,
 
+    pub tx_db_version: watch::Sender<i64>,
     pub tx_bcast: Sender<BroadcastInput>,
     pub tx_apply: Sender<(ActorId, i64)>,
     pub tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
@@ -81,6 +82,7 @@ pub struct AgentInner {
     clock: Arc<uhlc::HLC>,
     bookie: Bookie,
     subs: RwLock<Subs>,
+    tx_db_version: watch::Sender<i64>,
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
@@ -107,6 +109,7 @@ impl Agent {
             clock: config.clock,
             bookie: config.bookie,
             subs: RwLock::new(subs),
+            tx_db_version: config.tx_db_version,
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             tx_empty: config.tx_empty,
@@ -195,15 +198,14 @@ impl Agent {
         &self.0.limits
     }
 
-    pub fn process_subs_by_db_version(&self, conn: &Connection, db_version: i64) {
-        trace!("process subs by db version...");
-
-        let matchers = self.matchers().read();
-        for (id, matcher) in matchers.iter() {
-            if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
-                error!("could not process change w/ matcher {id}, maybe probably defunct! {e}");
-            }
+    pub fn change_db_version(&self, db_version: i64) {
+        if let Err(_e) = self.0.tx_db_version.send(db_version) {
+            debug!("could not change db version, all receivers likely dropped");
         }
+    }
+
+    pub fn rx_db_version(&self) -> watch::Receiver<i64> {
+        self.0.tx_db_version.subscribe()
     }
 }
 

@@ -704,6 +704,25 @@ where
 #[serde(transparent)]
 pub struct TableName(pub CompactString);
 
+impl fmt::Display for TableName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Borrow<str> for TableName {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<&str> for TableName {
+    fn from(value: &str) -> Self {
+        TableName(value.into())
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct ColumnName(pub CompactString);

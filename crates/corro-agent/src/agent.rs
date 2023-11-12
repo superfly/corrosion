@@ -34,7 +34,6 @@ use corro_types::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset,
         ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
-    change::Change,
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members, Rtt},
     pubsub::Matcher,
@@ -64,7 +63,10 @@ use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
     net::TcpListener,
-    sync::mpsc::{channel, Receiver, Sender},
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        watch,
+    },
     task::block_in_place,
     time::{error::Elapsed, sleep, timeout},
 };
@@ -89,6 +91,7 @@ pub struct AgentOptions {
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
     pub api_listener: TcpListener,
+    pub rx_db_version: watch::Receiver<i64>,
     pub rx_bcast: Receiver<BroadcastInput>,
     pub rx_apply: Receiver<(ActorId, i64)>,
     pub rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
@@ -264,6 +267,12 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             .build(),
     );
 
+    let (tx_db_version, rx_db_version) = {
+        let conn = pool.read().await?;
+        let db_version = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+        watch::channel(db_version)
+    };
+
     let (tx_bcast, rx_bcast) = channel(10240);
     let (tx_empty, rx_empty) = channel(10240);
     let (tx_changes, rx_changes) = channel(5192);
@@ -274,6 +283,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         gossip_server_endpoint,
         transport,
         api_listener,
+        rx_db_version,
         rx_bcast,
         rx_apply,
         rx_empty,
@@ -292,6 +302,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         config: ArcSwap::from_pointee(conf),
         clock,
         bookie,
+        tx_db_version,
         tx_bcast,
         tx_apply,
         tx_empty,
@@ -327,6 +338,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         transport,
         api_listener,
         mut tripwire,
+        rx_db_version,
         rx_bcast,
         rx_apply,
         rx_empty,
@@ -369,7 +381,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 to_cleanup.push(id);
                 continue;
             }
-            let conn = block_in_place(|| agent.pool().dedicated())?;
+            let conn = block_in_place(|| agent.pool().client_dedicated())?;
             let (evt_tx, evt_rx) = channel(512);
             match Matcher::restore(
                 id,
@@ -378,6 +390,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 conn,
                 evt_tx,
                 &sql,
+                rx_db_version.clone(),
+                tripwire.clone(),
             ) {
                 Ok(handle) => {
                     info!(sub_id = %id, "Restored subscription");
@@ -1774,8 +1788,7 @@ async fn process_fully_buffered_changes(
             drop(bookedw);
 
             if let Some(db_version) = db_version {
-                // TODO: write changes into a queueing table
-                agent.process_subs_by_db_version(&conn, db_version);
+                agent.change_db_version(db_version);
             }
 
             true
@@ -2008,8 +2021,11 @@ pub async fn process_multiple_changes(
             }
         }
 
+        if let Some(db_version) = last_db_version {
+            agent.change_db_version(db_version);
+        }
+
         for (actor_id, changeset, src) in changesets {
-            process_subs(agent, changeset.changes());
             if matches!(src, ChangeSource::Broadcast) && !changeset.is_empty() {
                 if let Err(_e) =
                     agent
@@ -2262,37 +2278,6 @@ fn process_single_version(
 
     Ok((known, changeset))
 }
-
-pub fn process_subs(agent: &Agent, changeset: &[Change]) {
-    trace!("process subs...");
-
-    let matchers = agent.matchers().read();
-    for (id, matcher) in matchers.iter() {
-        if let Err(e) = matcher.process_changeset(changeset) {
-            error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
-        }
-    }
-}
-
-// pub fn process_subs_by_db_version(agent: &Agent, conn: &Connection, db_version: i64) {
-//     trace!("process subs by db version...");
-
-//     let mut matchers_to_delete = vec![];
-
-//     {
-//         let matchers = agent.matchers().read();
-//         for (id, matcher) in matchers.iter() {
-//             if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
-//                 error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
-//                 matchers_to_delete.push(*id);
-//             }
-//         }
-//     }
-
-//     for id in matchers_to_delete {
-//         agent.matchers().write().remove(&id);
-//     }
-// }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncClientError {

@@ -858,6 +858,7 @@ version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dcbc8dd22992b785a0375e7065168b3a3b95599d3ffe2cf3d5d4a752278fdaba"
 dependencies = [
+ "indexmap",
  "memoffset 0.8.0",
  "smallvec",
  "speedy-derive",
@@ -938,6 +939,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "spawn",
  "sqlite-pool",
  "sqlite3-parser",
  "tempfile",

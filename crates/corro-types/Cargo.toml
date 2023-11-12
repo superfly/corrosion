@@ -8,7 +8,6 @@ license = "MIT"
 [dependencies]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
-deadpool = { workspace = true }
 bytes = { workspace = true }
 camino = { workspace = true }
 circular-buffer = "0.1.3"
@@ -16,6 +15,7 @@ compact_str = { workspace = true }
 config = { workspace = true }
 consul-client = { version = "0.1.0-alpha.0", path = "../consul-client" }
 corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
+deadpool = { workspace = true }
 enquote = { workspace = true }
 fallible-iterator = { workspace = true }
 foca = { workspace = true } 
@@ -34,7 +34,9 @@ seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
+spawn = { path = "../spawn" }
 speedy = { workspace = true }
+sqlite-pool = { path = "../sqlite-pool" }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true } 
@@ -45,7 +47,6 @@ tracing = { workspace = true }
 tripwire = { version = "0.1.0-alpha.0", path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }
-sqlite-pool = { path = "../sqlite-pool" }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

@@ -18,7 +18,6 @@ use corro_types::{
     change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     config::PgConfig,
     schema::{parse_sql, Schema, SchemaError, SqliteType, Table},
-    sqlite::SqlitePoolError,
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
@@ -2221,14 +2220,7 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
         }
     });
 
-    spawn_counted({
-        let agent = agent.clone();
-        async move {
-            let conn = agent.pool().read().await?;
-            block_in_place(|| agent.process_subs_by_db_version(&conn, db_version));
-            Ok::<_, SqlitePoolError>(())
-        }
-    });
+    agent.change_db_version(db_version);
 
     Ok(())
 }

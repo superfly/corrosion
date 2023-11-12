@@ -19,6 +19,7 @@ use tokio::{
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
 use tokio_util::sync::PollSender;
 use tracing::{debug, error, info, warn};
+use tripwire::Tripwire;
 use uuid::Uuid;
 
 #[derive(Default, Deserialize)]
@@ -477,6 +478,7 @@ pub async fn upsert_sub(
     stmt: Statement,
     from: Option<ChangeId>,
     tx: mpsc::Sender<Bytes>,
+    tripwire: Tripwire,
 ) -> Result<Uuid, MatcherUpsertError> {
     let stmt = expand_sql(agent, &stmt).await?;
 
@@ -507,7 +509,7 @@ pub async fn upsert_sub(
         return Err(MatcherUpsertError::SubFromWithoutMatcher);
     }
 
-    let conn = agent.pool().dedicated()?;
+    let conn = agent.pool().client_dedicated()?;
 
     let (evt_tx, evt_rx) = mpsc::channel(512);
 
@@ -520,6 +522,8 @@ pub async fn upsert_sub(
         conn,
         evt_tx,
         &stmt,
+        agent.rx_db_version(),
+        tripwire,
     )?;
 
     let (sub_tx, sub_rx) = broadcast::channel(10240);
@@ -547,6 +551,7 @@ pub async fn api_v1_subs(
     Extension(agent): Extension<Agent>,
     Extension(sub_cache): Extension<SharedMatcherIdCache>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
+    Extension(tripwire): Extension<Tripwire>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
@@ -560,6 +565,7 @@ pub async fn api_v1_subs(
         stmt,
         params.from,
         forward_tx,
+        tripwire,
     )
     .await
     {
@@ -767,7 +773,7 @@ mod tests {
                 .gossip_addr("127.0.0.1:0".parse()?)
                 .api_addr("127.0.0.1:0".parse()?)
                 .build()?,
-            tripwire,
+            tripwire.clone(),
         )
         .await?;
 
@@ -806,6 +812,7 @@ mod tests {
                 Extension(agent.clone()),
                 Extension(cache.clone()),
                 Extension(bcast_cache.clone()),
+                Extension(tripwire.clone()),
                 axum::extract::Query(SubParams::default()),
                 axum::Json(Statement::Simple("select * from tests".into())),
             )
@@ -895,6 +902,7 @@ mod tests {
                 Extension(agent.clone()),
                 Extension(cache.clone()),
                 Extension(bcast_cache.clone()),
+                Extension(tripwire.clone()),
                 axum::extract::Query(SubParams {
                     from: Some(1.into()),
                 }),
@@ -955,6 +963,7 @@ mod tests {
                 Extension(agent.clone()),
                 Extension(cache.clone()),
                 Extension(bcast_cache.clone()),
+                Extension(tripwire.clone()),
                 axum::extract::Query(SubParams::default()),
                 axum::Json(Statement::Simple("select * from tests".into())),
             )
@@ -1024,6 +1033,7 @@ mod tests {
             Extension(agent.clone()),
             Extension(cache.clone()),
             Extension(bcast_cache.clone()),
+            Extension(tripwire.clone()),
             axum::extract::Query(SubParams {
                 from: Some(1.into()),
             }),
