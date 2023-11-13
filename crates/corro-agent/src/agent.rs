@@ -58,7 +58,9 @@ use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    named_params, params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction,
+};
 use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
@@ -1022,45 +1024,46 @@ async fn clear_overwritten_versions(agent: Agent) {
         info!("Starting compaction...");
         let start = Instant::now();
 
-        let mut to_check: BTreeMap<i64, (ActorId, i64)> = BTreeMap::new();
+        let bookie_clone = {
+            bookie
+                .read("gather_booked_for_compaction")
+                .await
+                .iter()
+                .map(|(actor_id, booked)| (*actor_id, booked.clone()))
+                .collect::<HashMap<ActorId, _>>()
+        };
 
-        {
-            let booked = bookie.read("clear_overwritten_versions").await;
-            for (actor_id, booked) in booked.iter() {
-                let versions = {
-                    match timeout(
-                        Duration::from_secs(1),
-                        booked.read(format!(
-                            "clear_overwritten_versions:{}",
-                            actor_id.as_simple()
-                        )),
-                    )
-                    .await
-                    {
-                        Ok(booked) => booked.current_versions(),
-                        Err(_) => {
-                            info!(%actor_id, "timed out acquiring read lock on bookkeeping, skipping for now");
-                            continue;
-                        }
+        let mut inserted = 0;
+        let mut deleted = 0;
+
+        for (actor_id, booked) in bookie_clone {
+            let mut versions = {
+                match timeout(
+                    Duration::from_secs(1),
+                    booked.read(format!(
+                        "clear_overwritten_versions:{}",
+                        actor_id.as_simple()
+                    )),
+                )
+                .await
+                {
+                    Ok(booked) => booked.current_versions(),
+                    Err(_) => {
+                        info!(%actor_id, "timed out acquiring read lock on bookkeeping, skipping for now");
+                        continue;
                     }
-                };
-                if versions.is_empty() {
-                    continue;
                 }
-                for (db_v, v) in versions {
-                    to_check.insert(db_v, (*actor_id, v));
-                }
+            };
+
+            if versions.is_empty() {
+                continue;
             }
-        }
 
-        debug!("got actors and their versions");
-
-        let cleared_versions: BTreeSet<i64> = {
-            match pool.read().await {
+            let cleared_versions = match pool.read().await {
                 Ok(mut conn) => {
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
-                        find_cleared_db_versions(&tx)
+                        find_cleared_db_versions(&tx, &actor_id)
                     });
                     match res {
                         Ok(cleared) => cleared,
@@ -1074,54 +1077,42 @@ async fn clear_overwritten_versions(agent: Agent) {
                     error!("could not get read connection: {e}");
                     continue;
                 }
-            }
-        };
-
-        let mut to_clear_by_actor: BTreeMap<ActorId, Vec<(i64, i64)>> = BTreeMap::new();
-
-        for db_v in cleared_versions {
-            if let Some((actor_id, v)) = to_check.remove(&db_v) {
-                to_clear_by_actor
-                    .entry(actor_id)
-                    .or_default()
-                    .push((db_v, v));
-            }
-        }
-
-        let mut deleted = 0;
-        let mut inserted = 0;
-
-        for (actor_id, to_clear) in to_clear_by_actor {
-            info!(%actor_id, "Clearing {} versions", to_clear.len());
-            let booked = {
-                bookie
-                    .write(format!("to_clear_get_booked:{}", actor_id.as_simple()))
-                    .await
-                    .for_actor(actor_id)
             };
 
-            let mut bookedw = booked
-                .write(format!("clearing:{}", actor_id.as_simple()))
-                .await;
+            let mut to_clear = Vec::new();
 
-            for (_db_v, v) in to_clear.iter() {
-                if bookedw.contains_current(v) {
-                    bookedw.insert(*v, KnownDbVersion::Cleared);
-                    deleted += 1;
+            for db_v in cleared_versions {
+                if let Some(v) = versions.remove(&db_v) {
+                    to_clear.push((db_v, v))
                 }
             }
 
-            for range in to_clear
-                .iter()
-                .filter_map(|(_, v)| bookedw.cleared.get(v))
-                .dedup()
-            {
-                if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
-                    error!("could not schedule version to be cleared: {e}");
-                } else {
-                    inserted += 1;
+            if !to_clear.is_empty() {
+                let mut bookedw = booked
+                    .write(format!("clearing:{}", actor_id.as_simple()))
+                    .await;
+
+                for (_db_v, v) in to_clear.iter() {
+                    if bookedw.contains_current(v) {
+                        bookedw.insert(*v, KnownDbVersion::Cleared);
+                        deleted += 1;
+                    }
+                }
+
+                for range in to_clear
+                    .iter()
+                    .filter_map(|(_, v)| bookedw.cleared.get(v))
+                    .dedup()
+                {
+                    if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
+                        error!("could not schedule version to be cleared: {e}");
+                    } else {
+                        inserted += 1;
+                    }
                 }
             }
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
         info!(
@@ -1256,7 +1247,23 @@ pub async fn handle_change(agent: &Agent, bcast: BroadcastV1, bcast_msg_tx: &Sen
 }
 
 #[tracing::instrument(skip_all)]
-fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>> {
+fn find_cleared_db_versions(
+    tx: &Transaction,
+    actor_id: &ActorId,
+) -> rusqlite::Result<BTreeSet<i64>> {
+    let clock_site_id: Option<i64> = match tx
+        .prepare_cached("SELECT ordinal FROM crsql_site_id WHERE site_id = ?")?
+        .query_row([actor_id], |row| row.get(0))
+        .optional()?
+    {
+        Some(0) => None, // this is the current crsql_site_id which is going to be NULL in clock tables
+        Some(ordinal) => Some(ordinal),
+        None => {
+            warn!(actor_id = %actor_id, "could not find crsql ordinal for actor");
+            return Ok(Default::default());
+        }
+    };
+
     let tables = tx
         .prepare_cached(
             "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'",
@@ -1268,23 +1275,29 @@ fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>>
         return Ok(BTreeSet::new());
     }
 
+    let mut params: Vec<&dyn ToSql> = vec![actor_id];
     let to_clear_query = format!(
-        "SELECT DISTINCT db_version FROM __corro_bookkeeping WHERE db_version IS NOT NULL
+        "SELECT DISTINCT db_version FROM __corro_bookkeeping WHERE actor_id = ? AND db_version IS NOT NULL
             EXCEPT SELECT db_version FROM ({});",
         tables
             .iter()
-            .map(|table| format!("SELECT DISTINCT db_version FROM {table}"))
+            .map(|table| {
+                params.push(&clock_site_id);
+                format!("SELECT DISTINCT db_version FROM {table} WHERE site_id IS ?")
+            })
             .collect::<Vec<_>>()
             .join(" UNION ")
     );
 
     let start = Instant::now();
+
     let cleared_db_versions: BTreeSet<i64> = tx
         .prepare_cached(&to_clear_query)?
-        .query_map([], |row| row.get(0))?
+        .query_map(params_from_iter(params.into_iter()), |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
 
     info!(
+        actor_id = %actor_id,
         "Aggregated {} DB versions to clear in {:?}",
         cleared_db_versions.len(),
         start.elapsed()
@@ -3130,6 +3143,9 @@ pub mod tests {
 
             CREATE TABLE foo2 (a INTEGER NOT NULL PRIMARY KEY, b INTEGER);
             SELECT crsql_as_crr('foo2');
+
+            CREATE INDEX fooclock ON foo__crsql_clock (site_id, db_version);
+            CREATE INDEX foo2clock ON foo2__crsql_clock (site_id, db_version);
             ",
         )?;
 
@@ -3153,23 +3169,37 @@ pub mod tests {
             let mut prepped = conn.prepare("SELECT * FROM __corro_bookkeeping")?;
             let mut rows = prepped.query([])?;
 
+            println!("bookkeeping rows:");
             while let Ok(Some(row)) = rows.next() {
                 println!("row: {row:?}");
             }
         }
 
         {
-            let mut prepped = conn.prepare("SELECT DISTINCT db_version FROM foo2__crsql_clock UNION SELECT DISTINCT db_version FROM foo__crsql_clock;")?;
+            let mut prepped = conn
+                .prepare("SELECT * FROM foo2__crsql_clock UNION SELECT * FROM foo__crsql_clock;")?;
             let mut rows = prepped.query([])?;
 
+            println!("all clock rows:");
+            while let Ok(Some(row)) = rows.next() {
+                println!("row: {row:?}");
+            }
+        }
+
+        {
+            let mut prepped = conn.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT db_version FROM foo2__crsql_clock WHERE site_id IS ? UNION SELECT DISTINCT db_version FROM foo__crsql_clock WHERE site_id IS ?;")?;
+            let mut rows = prepped.query([rusqlite::types::Null, rusqlite::types::Null])?;
+
+            println!("matching clock rows:");
             while let Ok(Some(row)) = rows.next() {
                 println!("row: {row:?}");
             }
         }
 
         let tx = conn.transaction()?;
+        let actor_id: ActorId = tx.query_row("SELECT crsql_site_id()", [], |row| row.get(0))?;
 
-        let to_clear = find_cleared_db_versions(&tx)?;
+        let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
 
         println!("to_clear: {to_clear:?}");
 
@@ -3179,7 +3209,7 @@ pub mod tests {
         tx.execute("DELETE FROM __corro_bookkeeping WHERE db_version = 1", [])?;
         tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) SELECT crsql_site_id(), 1, 1", [])?;
 
-        let to_clear = find_cleared_db_versions(&tx)?;
+        let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
@@ -3190,14 +3220,14 @@ pub mod tests {
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = find_cleared_db_versions(&tx)?;
+        let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = find_cleared_db_versions(&tx)?;
+        let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
 
         assert!(to_clear.contains(&2));
         assert!(!to_clear.contains(&3));
@@ -3208,7 +3238,7 @@ pub mod tests {
             "UPDATE __corro_bookkeeping SET end_version = 2 WHERE start_version = 1;",
             [],
         )?;
-        let to_clear = find_cleared_db_versions(&tx)?;
+        let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
 
         assert!(to_clear.is_empty());
 
