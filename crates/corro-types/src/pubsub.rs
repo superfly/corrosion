@@ -838,7 +838,7 @@ impl Matcher {
         mut last_db_version: i64,
         mut tripwire: Tripwire,
     ) {
-        trace!("in cmd_loop");
+        trace!("in cmd_loop, last db version: {last_db_version}");
         {
             let (lock, cvar) = &*self.state;
             let mut state = lock.lock();
@@ -1330,13 +1330,13 @@ impl Matcher {
                 let delete_prepped = tx.prepare_cached(&sql)?;
 
                 let mut change_insert_stmt = tx.prepare_cached(&format!(
-                "INSERT INTO changes (__corro_rowid, {CHANGE_TYPE_COL}, {}) VALUES (?, ?, {}) RETURNING {CHANGE_ID_COL}",
-                actual_cols.join(","),
-                (0..actual_cols.len())
-                    .map(|_i| "?")
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ))?;
+                    "INSERT INTO changes (__corro_rowid, {CHANGE_TYPE_COL}, {}) VALUES (?, ?, {}) RETURNING {CHANGE_ID_COL}",
+                    actual_cols.join(","),
+                    (0..actual_cols.len())
+                        .map(|_i| "?")
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ))?;
 
                 for (mut change_type, mut prepped) in [
                     (None, insert_prepped),
@@ -1417,7 +1417,11 @@ impl Matcher {
             [end_db_version],
         )?;
 
+        trace!("inserted new db version: {end_db_version}");
+
         tx.commit()?;
+
+        trace!("committed!");
 
         self.last_rowid = new_last_rowid;
 
@@ -2131,6 +2135,8 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(1);
 
+        let mut last_change_id = None;
+
         {
             let (db_v_tx, db_v_rx) = watch::channel(0);
             let matcher = Matcher::create(
@@ -2301,9 +2307,13 @@ mod tests {
 
             let start = Instant::now();
             for _ in range {
-                assert!(rx.recv().await.is_some());
-                // FIXME: test ordering... it's actually not right!
+                if let QueryEvent::Change(change_type, _, _, change_id) = rx.recv().await.unwrap() {
+                    assert_eq!(change_type, ChangeType::Insert);
+                    last_change_id = Some(change_id);
+                }
             }
+
+            assert_eq!(last_change_id, Some(ChangeId(999)));
 
             println!("took: {:?}", start.elapsed());
             {
@@ -2351,6 +2361,8 @@ mod tests {
             tx.commit().unwrap();
         }
 
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
         let (db_v_tx, db_v_rx) = watch::channel(0);
         let db_v = conn
             .query_row("SELECT crsql_db_version()", [], |row| row.get(0))
@@ -2370,7 +2382,7 @@ mod tests {
                 subscriptions_path.clone(),
                 &schema,
                 matcher_conn,
-                tx,
+                tx.clone(),
                 sql,
                 db_v_rx,
                 tripwire,
@@ -2379,9 +2391,50 @@ mod tests {
 
             println!("matcher restored w/ id: {}", id.as_simple());
 
-            let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
+            let (catch_up_tx, mut catch_up_rx) = mpsc::channel(1);
+
+            tokio::spawn({
+                let matcher = matcher.clone();
+                async move {
+                    let mut conn = matcher.pool().get().await.unwrap();
+                    block_in_place(|| {
+                        let conn_tx = conn.transaction()?;
+
+                        println!(
+                            "max change id: {}",
+                            matcher.max_change_id(&conn_tx).unwrap()
+                        );
+                        matcher.all_rows(&conn_tx, catch_up_tx)?;
+                        Ok::<_, rusqlite::Error>(())
+                    })
+                }
+            });
+
+            assert!(matches!(
+                catch_up_rx.recv().await.unwrap(),
+                QueryEvent::Columns(_)
+            ));
+
+            let mut rows_count = 0;
+            let mut eoq_change_id = None;
+
+            while eoq_change_id.is_none() {
+                match catch_up_rx.recv().await.unwrap() {
+                    QueryEvent::EndOfQuery { change_id, .. } => eoq_change_id = Some(change_id),
+                    QueryEvent::Row(_, _) => rows_count += 1,
+                    QueryEvent::Change(_, _, _, _) => {
+                        panic!("received a change intertwined w/ rows");
+                    }
+                    _ => {}
+                }
+            }
+
+            assert_eq!(rows_count, 997);
+            assert_eq!(eoq_change_id, Some(Some(ChangeId(999))));
 
             println!("waiting for a change (A)");
+
+            let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
             assert_eq!(
                 rx.recv().await.unwrap(),

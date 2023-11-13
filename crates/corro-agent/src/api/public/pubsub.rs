@@ -5,7 +5,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::Agent,
-    api::{ChangeId, QueryEvent, QueryEventMeta, RowId, Statement},
+    api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
     pubsub::{Matcher, MatcherError, MatcherHandle, NormalizeStatementError},
     sqlite::SqlitePoolError,
 };
@@ -313,7 +313,7 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
 
 fn catch_up_sub_anew(
     tx: &Transaction,
-    matcher: MatcherHandle,
+    matcher: &MatcherHandle,
     buf: &mut BytesMut,
     evt_tx: &mpsc::Sender<Bytes>,
 ) -> Result<(), CatchUpError> {
@@ -351,7 +351,7 @@ fn catch_up_sub_anew(
 
 fn catch_up_sub_from(
     tx: &Transaction, // read transaction
-    matcher: MatcherHandle,
+    matcher: &MatcherHandle,
     from: ChangeId,
     buf: &mut BytesMut,
     evt_tx: &mpsc::Sender<Bytes>,
@@ -388,12 +388,6 @@ fn catch_up_sub_from(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum LastQueryEvent {
-    Row(RowId),
-    Change(ChangeId),
-}
-
 pub async fn catch_up_sub(
     matcher: MatcherHandle,
     from: Option<ChangeId>,
@@ -409,40 +403,31 @@ pub async fn catch_up_sub(
         evt_tx.clone(),
     ));
 
-    let last_query_event = {
+    let last_change_id = {
         let mut buf = BytesMut::new();
-
-        // let mut conn = match matcher.pool().get().await? {
-        //     Ok(conn) => conn,
-        //     Err(e) => {
-        //         evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await?;
-        //         return Ok(());
-        //     }
-        // };
 
         let mut conn = matcher.pool().get().await?;
 
         let res = block_in_place(|| {
             let tx = conn.transaction()?; // read transaction
-            let last_query_event = match from {
+            let max_change_id = matcher.max_change_id(&tx)?;
+            match from {
                 Some(from) => {
-                    let max_change_id = matcher.max_change_id(&tx)?;
-                    catch_up_sub_from(&tx, matcher, from, &mut buf, &evt_tx)?;
+                    catch_up_sub_from(&tx, &matcher, from, &mut buf, &evt_tx)?;
                     debug!("sub caught up to their 'from' of {from:?}");
-                    LastQueryEvent::Change(max_change_id)
                 }
                 None => {
-                    let max_row_id = matcher.max_row_id(&tx)?;
-                    catch_up_sub_anew(&tx, matcher, &mut buf, &evt_tx)?;
+                    catch_up_sub_anew(&tx, &matcher, &mut buf, &evt_tx)?;
+                    // make sure we're all caught up to the max change id seen in this tx
+                    catch_up_sub_from(&tx, &matcher, max_change_id, &mut buf, &evt_tx)?;
                     debug!("sub caught up from scratch");
-                    LastQueryEvent::Row(max_row_id)
                 }
-            };
-            Ok(last_query_event)
+            }
+            Ok(max_change_id)
         });
 
         match res {
-            Ok(last_query_event) => last_query_event,
+            Ok(last_change_id) => last_change_id,
             Err(e) => {
                 match e {
                     CatchUpError::Sqlite(e) => {
@@ -460,7 +445,7 @@ pub async fn catch_up_sub(
         }
     };
 
-    if let Err(_e) = ready_tx.send(last_query_event) {
+    if let Err(_e) = ready_tx.send(last_change_id) {
         warn!("subscriber catch up readiness receiver was gone, aborting...");
         return Ok(());
     }
@@ -585,7 +570,7 @@ pub async fn api_v1_subs(
 const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 
 async fn forward_sub_to_sender(
-    ready: Option<oneshot::Receiver<LastQueryEvent>>,
+    ready: Option<oneshot::Receiver<ChangeId>>,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     tx: mpsc::Sender<Bytes>,
 ) {
@@ -593,12 +578,12 @@ async fn forward_sub_to_sender(
     if let Some(mut ready) = ready {
         let mut events_buf = vec![];
 
-        let last_query_event = loop {
+        let last_change_id = loop {
             tokio::select! {
                 biased;
                 ready_res = &mut ready => match ready_res {
-                    Ok(last_query_event) => {
-                        break last_query_event;
+                    Ok(last_change_id) => {
+                        break last_change_id;
                     },
                     Err(_e) => {
                         _ = tx.send(error_to_query_event_bytes(&mut buf, "sub ready channel closed")).await;
@@ -606,8 +591,11 @@ async fn forward_sub_to_sender(
                     }
                 },
                 query_evt_res = sub_rx.recv() => match query_evt_res {
-                    Ok(query_evt) => {
-                        events_buf.push(query_evt);
+                    Ok((buf, QueryEventMeta::Change(change_id))) => {
+                        events_buf.push((buf, change_id));
+                    },
+                    Ok(_) => {
+                        // skipping this...
                     },
                     Err(e) => {
                         _ = tx.send(error_to_query_event_bytes(&mut buf, e)).await;
@@ -623,45 +611,19 @@ async fn forward_sub_to_sender(
             }
         };
 
-        let mut skipped = 0;
         let mut sent = 0;
 
-        for (bytes, meta) in events_buf {
-            // prevent sending duplicate query events by comparing the last sent event
-            // w/ buffered events
-            match (meta, last_query_event) {
-                // already sent this change!
-                (QueryEventMeta::Change(change_id), LastQueryEvent::Change(last_change_id))
-                    if last_change_id >= change_id =>
-                {
-                    skipped += 1;
-                    continue;
+        for (bytes, change_id) in events_buf {
+            if change_id > last_change_id {
+                if let Err(_e) = tx.send(bytes).await {
+                    warn!("could not send buffered events to subscriber, receiver must be gone!");
+                    return;
                 }
-                // already sent this row!
-                (QueryEventMeta::Row(row_id), LastQueryEvent::Row(last_row_id))
-                    if last_row_id >= row_id =>
-                {
-                    skipped += 1;
-                    continue;
-                }
-                // buffered a row, which is slightly unexpected,
-                // but we shouldn't send rows if we're expecting changes only
-                (QueryEventMeta::Row(_), LastQueryEvent::Change(_)) => {
-                    skipped += 1;
-                    continue;
-                }
-                _ => {
-                    // nothing to do.
-                }
+                sent += 1;
             }
-            if let Err(_e) = tx.send(bytes).await {
-                warn!("could not send buffered events to subscriber, receiver must be gone!");
-                return;
-            }
-            sent += 0;
         }
 
-        debug!("sent {sent} buffered events, skipped: {skipped}");
+        debug!("sent {sent} buffered events");
     }
 
     let chunker = tokio_stream::wrappers::BroadcastStream::new(sub_rx)
