@@ -130,7 +130,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         schema
     };
 
-    let (tx_apply, rx_apply) = channel(10240);
+    let (tx_apply, rx_apply) = channel(20480);
 
     let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 
@@ -219,11 +219,18 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 }
 
                 let gaps_count = seqs.gaps(&(0..=last_seq)).count();
+
                 ranges.insert(version, KnownDbVersion::Partial { seqs, last_seq, ts });
 
                 if gaps_count == 0 {
                     info!(%actor_id, version, "found fully buffered, unapplied, changes! scheduling apply");
-                    tx_apply.send((actor_id, version)).await?;
+                    // spawn this because it can block if the channel gets full, nothing is draining it yet!
+                    tokio::spawn({
+                        let tx_apply = tx_apply.clone();
+                        async move {
+                            let _ = tx_apply.send((actor_id, version)).await;
+                        }
+                    });
                 }
             }
         }
