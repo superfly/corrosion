@@ -211,10 +211,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 if let Some(known) = ranges.get(&version) {
                     warn!(%actor_id, version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
 
-                    let mut conn = pool.write_priority().await?;
-                    let tx = conn.transaction()?;
-                    clear_buffered_meta(&tx, actor_id, version..=version)?;
-                    tx.commit()?;
+                    clear_buffered_meta(&conn, actor_id, version..=version)?;
                     continue;
                 }
 
@@ -1642,18 +1639,18 @@ fn store_empty_changeset(
 }
 
 fn clear_buffered_meta(
-    tx: &Transaction,
+    conn: &Connection,
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
 ) -> rusqlite::Result<()> {
     // remove all buffered changes for cleanup purposes
-    let count = tx
+    let count = conn
         .prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ?")?
         .execute(params![actor_id, versions.start(), versions.end()])?;
     debug!(%actor_id, ?versions, "deleted {count} buffered changes");
 
     // delete all bookkept sequences for this version
-    let count = tx
+    let count = conn
         .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?")?
         .execute(params![actor_id, versions.start(), versions.end()])?;
     debug!(%actor_id, ?versions, "deleted {count} sequences in bookkeeping");
