@@ -51,7 +51,7 @@ use axum::{
 };
 use bytes::Bytes;
 use foca::{Member, Notification};
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use itertools::Itertools;
 use metrics::{counter, gauge, histogram, increment_counter};
@@ -2539,9 +2539,11 @@ async fn write_empties_loop(
             _ = &mut tripwire => break
         }
 
-        if let Err(e) = process_completed_empties(&agent, &mut empties).await {
-            error!("could not process empties: {e}");
-        }
+        let empties_to_process = std::mem::take(&mut empties);
+        spawn_counted(
+            process_completed_empties(agent.clone(), empties_to_process)
+                .inspect_err(|e| error!("could not process empties: {e}")),
+        );
     }
     info!("Draining empty versions to process...");
     // drain empties channel
@@ -2551,7 +2553,7 @@ async fn write_empties_loop(
 
     if !empties.is_empty() {
         info!("Inserting last unprocessed empties before shut down");
-        if let Err(e) = process_completed_empties(&agent, &mut empties).await {
+        if let Err(e) = process_completed_empties(agent, empties).await {
             error!("could not process empties: {e}");
         }
     }
@@ -2645,8 +2647,8 @@ async fn sync_loop(
 
 #[tracing::instrument(skip_all, err)]
 async fn process_completed_empties(
-    agent: &Agent,
-    empties: &mut BTreeMap<ActorId, RangeInclusiveSet<i64>>,
+    agent: Agent,
+    empties: BTreeMap<ActorId, RangeInclusiveSet<i64>>,
 ) -> eyre::Result<()> {
     debug!(
         "processing empty versions (count: {})",
@@ -2656,7 +2658,7 @@ async fn process_completed_empties(
     let mut inserted = 0;
 
     let start = Instant::now();
-    while let Some((actor_id, empties)) = empties.pop_first() {
+    for (actor_id, empties) in empties {
         let v = empties.into_iter().collect::<Vec<_>>();
 
         for ranges in v.chunks(50) {
