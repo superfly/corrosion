@@ -129,6 +129,14 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         migrate(&mut conn)?;
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
+
+        info!("Ensuring clock table indexes for fast compaction");
+        let start = Instant::now();
+        for table in schema.tables.keys() {
+            conn.execute_batch(&format!("CREATE INDEX IF NOT EXISTS corro_{table}__crsql_clock_site_id_dbv ON {table}__crsql_clock (site_id, db_version);"))?;
+        }
+        info!("Ensured indexes in {:?}", start.elapsed());
+
         schema
     };
 
@@ -1036,6 +1044,8 @@ async fn clear_overwritten_versions(agent: Agent) {
         let mut inserted = 0;
         let mut deleted = 0;
 
+        let mut db_elapsed = Duration::new(0, 0);
+
         for (actor_id, booked) in bookie_clone {
             let mut versions = {
                 match timeout(
@@ -1061,12 +1071,22 @@ async fn clear_overwritten_versions(agent: Agent) {
 
             let cleared_versions = match pool.read().await {
                 Ok(mut conn) => {
+                    let start = Instant::now();
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
                         find_cleared_db_versions(&tx, &actor_id)
                     });
+                    db_elapsed += start.elapsed();
                     match res {
-                        Ok(cleared) => cleared,
+                        Ok(cleared) => {
+                            debug!(
+                                actor_id = %actor_id,
+                                "Aggregated {} DB versions to clear in {:?}",
+                                cleared.len(),
+                                start.elapsed()
+                            );
+                            cleared
+                        }
                         Err(e) => {
                             error!("could not get cleared versions: {e}");
                             continue;
@@ -1116,7 +1136,7 @@ async fn clear_overwritten_versions(agent: Agent) {
         }
 
         info!(
-            "Compaction done, cleared {} DB bookkeeping table rows in {:?}",
+            "Compaction done, cleared {} DB bookkeeping table rows (wall time: {:?}, db time: {db_elapsed:?})",
             deleted - inserted,
             start.elapsed()
         );
@@ -1289,19 +1309,10 @@ fn find_cleared_db_versions(
             .join(" UNION ")
     );
 
-    let start = Instant::now();
-
     let cleared_db_versions: BTreeSet<i64> = tx
         .prepare_cached(&to_clear_query)?
         .query_map(params_from_iter(params.into_iter()), |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-
-    info!(
-        actor_id = %actor_id,
-        "Aggregated {} DB versions to clear in {:?}",
-        cleared_db_versions.len(),
-        start.elapsed()
-    );
 
     Ok(cleared_db_versions)
 }
