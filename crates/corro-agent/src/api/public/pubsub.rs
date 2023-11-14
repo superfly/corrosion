@@ -6,7 +6,7 @@ use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::Agent,
     api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
-    pubsub::{Matcher, MatcherError, MatcherHandle, NormalizeStatementError},
+    pubsub::{MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
     sqlite::SqlitePoolError,
 };
 use futures::{future::poll_fn, ready, Stream};
@@ -29,22 +29,22 @@ pub struct SubParams {
 }
 
 pub async fn api_v1_sub_by_id(
-    Extension(agent): Extension<Agent>,
+    Extension(subs): Extension<SubsManager>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
-    sub_by_id(agent, id, params.from, &bcast_cache).await
+    sub_by_id(&subs, id, params.from, &bcast_cache).await
 }
 
 async fn sub_by_id(
-    agent: Agent,
+    subs: &SubsManager,
     id: Uuid,
     from: Option<ChangeId>,
     bcast_cache: &SharedMatcherBroadcastCache,
 ) -> hyper::Response<hyper::Body> {
     let (matcher, rx) = match bcast_cache.read().await.get(&id).and_then(|tx| {
-        agent.matchers().read().get(&id).cloned().map(|matcher| {
+        subs.get(&id).map(|matcher| {
             debug!("found matcher by id {id}");
             (matcher, tx.subscribe())
         })
@@ -53,7 +53,7 @@ async fn sub_by_id(
         None => {
             // ensure this goes!
             bcast_cache.write().await.remove(&id);
-            if let Some(handle) = agent.matchers().write().remove(&id) {
+            if let Some(handle) = subs.remove(&id) {
                 info!(sub_id = %id, "Removed subscription from sub_by_id");
                 tokio::spawn(handle.cleanup());
             }
@@ -108,7 +108,7 @@ const MAX_UNSUB_TIME: Duration = Duration::from_secs(300);
 const RECEIVERS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 pub async fn process_sub_channel(
-    agent: Agent,
+    subs: SubsManager,
     id: Uuid,
     tx: broadcast::Sender<(Bytes, QueryEventMeta)>,
     mut evt_rx: mpsc::Receiver<QueryEvent>,
@@ -180,7 +180,7 @@ pub async fn process_sub_channel(
     debug!("subscription query channel done");
 
     // remove and get handle from the agent's "matchers"
-    let handle = match agent.matchers().write().remove(&id) {
+    let handle = match subs.remove(&id) {
         Some(h) => {
             info!(sub_id = %id, "Removed subscription from process_sub_channel");
             h
@@ -253,14 +253,16 @@ pub enum MatcherUpsertError {
     Matcher(#[from] MatcherError),
     #[error("a `from` query param was supplied, but no existing subscription found")]
     SubFromWithoutMatcher,
+    #[error("found a subscription, but missing broadcaster")]
+    MissingBroadcaster,
 }
 
 impl MatcherUpsertError {
     fn status_code(&self) -> StatusCode {
         match self {
-            MatcherUpsertError::Pool(_) | MatcherUpsertError::CouldNotExpand => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            MatcherUpsertError::Pool(_)
+            | MatcherUpsertError::CouldNotExpand
+            | MatcherUpsertError::MissingBroadcaster => StatusCode::INTERNAL_SERVER_ERROR,
             MatcherUpsertError::Sqlite(_)
             | MatcherUpsertError::NormalizeStatement(_)
             | MatcherUpsertError::Matcher(_)
@@ -281,8 +283,6 @@ impl From<MatcherUpsertError> for hyper::Response<hyper::Body> {
             .expect("could not build error response")
     }
 }
-pub type MatcherIdCache = HashMap<String, Uuid>;
-pub type SharedMatcherIdCache = Arc<TokioRwLock<MatcherIdCache>>;
 pub type MatcherBroadcastCache = HashMap<Uuid, broadcast::Sender<(Bytes, QueryEventMeta)>>;
 pub type SharedMatcherBroadcastCache = Arc<TokioRwLock<MatcherBroadcastCache>>;
 
@@ -458,7 +458,7 @@ pub async fn catch_up_sub(
 
 pub async fn upsert_sub(
     agent: &Agent,
-    cache: &SharedMatcherIdCache,
+    subs: &SubsManager,
     bcast_cache: &SharedMatcherBroadcastCache,
     stmt: Statement,
     from: Option<ChangeId>,
@@ -467,74 +467,52 @@ pub async fn upsert_sub(
 ) -> Result<Uuid, MatcherUpsertError> {
     let stmt = expand_sql(agent, &stmt).await?;
 
-    let mut cache_write = cache.write().await;
     let mut bcast_write = bcast_cache.write().await;
 
-    let maybe_matcher = cache_write
-        .get(&stmt)
-        .and_then(|id| bcast_write.get(id).map(|sender| (*id, sender)));
-
-    if let Some((matcher_id, sender)) = maybe_matcher {
-        debug!("found matcher id {matcher_id} w/ sender");
-        let maybe_matcher = (sender.receiver_count() > 0)
-            .then(|| agent.matchers().read().get(&matcher_id).cloned())
-            .flatten();
-        if let Some(matcher) = maybe_matcher {
-            debug!("found matcher handle");
-            let rx = sender.subscribe();
-            tokio::spawn(catch_up_sub(matcher, from, rx, tx));
-            return Ok(matcher_id);
-        } else {
-            cache_write.remove(&stmt);
-            bcast_write.remove(&matcher_id);
-        }
-    }
-
-    if from.is_some() {
-        return Err(MatcherUpsertError::SubFromWithoutMatcher);
-    }
-
-    let conn = agent.pool().client_dedicated()?;
-
-    let (evt_tx, evt_rx) = mpsc::channel(512);
-
-    let matcher_id = Uuid::new_v4();
-
-    let handle = Matcher::create(
-        matcher_id,
-        agent.config().db.subscriptions_path(),
-        &agent.schema().read(),
-        conn,
-        evt_tx,
+    let (handle, maybe_created) = subs.get_or_insert(
         &stmt,
+        &agent.config().db.subscriptions_path(),
+        &agent.schema().read(),
+        agent.pool(),
         agent.rx_db_version(),
         tripwire,
     )?;
 
-    let (sub_tx, sub_rx) = broadcast::channel(10240);
+    if let Some(created) = maybe_created {
+        if from.is_some() {
+            return Err(MatcherUpsertError::SubFromWithoutMatcher);
+        }
 
-    cache_write.insert(stmt, matcher_id);
-    bcast_write.insert(matcher_id, sub_tx.clone());
+        let (sub_tx, sub_rx) = broadcast::channel(10240);
 
-    {
-        agent.matchers().write().insert(matcher_id, handle);
+        tokio::spawn(forward_sub_to_sender(None, sub_rx, tx));
+
+        bcast_write.insert(handle.id(), sub_tx.clone());
+
+        tokio::spawn(process_sub_channel(
+            subs.clone(),
+            handle.id(),
+            sub_tx,
+            created.evt_rx,
+        ));
+
+        Ok(handle.id())
+    } else {
+        let id = handle.id();
+        let sub_tx = bcast_write
+            .get(&id)
+            .cloned()
+            .ok_or(MatcherUpsertError::MissingBroadcaster)?;
+        debug!("found matcher handle");
+
+        tokio::spawn(catch_up_sub(handle, from, sub_tx.subscribe(), tx));
+        Ok(id)
     }
-
-    tokio::spawn(forward_sub_to_sender(None, sub_rx, tx));
-
-    tokio::spawn(process_sub_channel(
-        agent.clone(),
-        matcher_id,
-        sub_tx,
-        evt_rx,
-    ));
-
-    Ok(matcher_id)
 }
 
 pub async fn api_v1_subs(
     Extension(agent): Extension<Agent>,
-    Extension(sub_cache): Extension<SharedMatcherIdCache>,
+    Extension(subs): Extension<SubsManager>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
     Extension(tripwire): Extension<Tripwire>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
@@ -545,7 +523,7 @@ pub async fn api_v1_subs(
 
     let matcher_id = match upsert_sub(
         &agent,
-        &sub_cache,
+        &subs,
         &bcast_cache,
         stmt,
         params.from,
@@ -766,13 +744,13 @@ mod tests {
 
         assert!(body.0.results.len() == 2);
 
-        let cache: SharedMatcherIdCache = Default::default();
+        let subs = SubsManager::default();
         let bcast_cache: SharedMatcherBroadcastCache = Default::default();
 
         {
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(cache.clone()),
+                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
                 axum::extract::Query(SubParams::default()),
@@ -862,7 +840,7 @@ mod tests {
 
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(cache.clone()),
+                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
                 axum::extract::Query(SubParams {
@@ -923,7 +901,7 @@ mod tests {
 
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(cache.clone()),
+                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
                 axum::extract::Query(SubParams::default()),
@@ -993,7 +971,7 @@ mod tests {
 
         let mut res = api_v1_subs(
             Extension(agent.clone()),
-            Extension(cache.clone()),
+            Extension(subs.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
             axum::extract::Query(SubParams {

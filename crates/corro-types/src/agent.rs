@@ -39,14 +39,11 @@ use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     config::Config,
-    pubsub::MatcherHandle,
     schema::Schema,
     sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn, Migration, SqlitePool, SqlitePoolError},
 };
 
 use super::members::Members;
-
-pub type Subs = BTreeMap<uuid::Uuid, MatcherHandle>;
 
 #[derive(Clone)]
 pub struct Agent(Arc<AgentInner>);
@@ -81,7 +78,6 @@ pub struct AgentInner {
     members: RwLock<Members>,
     clock: Arc<uhlc::HLC>,
     bookie: Bookie,
-    subs: RwLock<Subs>,
     tx_db_version: watch::Sender<i64>,
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
@@ -98,7 +94,7 @@ pub struct Limits {
 }
 
 impl Agent {
-    pub fn new_w_subs(config: AgentConfig, subs: Subs) -> Self {
+    pub fn new(config: AgentConfig) -> Self {
         Self(Arc::new(AgentInner {
             actor_id: config.actor_id,
             pool: config.pool,
@@ -108,7 +104,6 @@ impl Agent {
             members: config.members,
             clock: config.clock,
             bookie: config.bookie,
-            subs: RwLock::new(subs),
             tx_db_version: config.tx_db_version,
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
@@ -120,10 +115,6 @@ impl Agent {
                 sync: Arc::new(Semaphore::new(3)),
             },
         }))
-    }
-
-    pub fn new(config: AgentConfig) -> Self {
-        Self::new_w_subs(config, Default::default())
     }
 
     /// Return a borrowed [SqlitePool]
@@ -176,10 +167,6 @@ impl Agent {
 
     pub fn schema(&self) -> &RwLock<Schema> {
         &self.0.schema
-    }
-
-    pub fn matchers(&self) -> &RwLock<Subs> {
-        &self.0.subs
     }
 
     pub fn db_path(&self) -> Utf8PathBuf {

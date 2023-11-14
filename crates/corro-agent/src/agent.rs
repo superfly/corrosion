@@ -13,10 +13,7 @@ use crate::{
         peer::{gossip_server_endpoint, parallel_sync, serve_sync, SyncError},
         public::{
             api_v1_db_schema, api_v1_queries, api_v1_transactions,
-            pubsub::{
-                api_v1_sub_by_id, api_v1_subs, process_sub_channel, MatcherBroadcastCache,
-                MatcherIdCache,
-            },
+            pubsub::{api_v1_sub_by_id, api_v1_subs, process_sub_channel, MatcherBroadcastCache},
         },
     },
     broadcast::runtime_loop,
@@ -36,7 +33,7 @@ use corro_types::{
     },
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members, Rtt},
-    pubsub::Matcher,
+    pubsub::{Matcher, SubsManager},
     schema::init_schema,
     sqlite::{CrConn, SqlitePoolError},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
@@ -361,17 +358,9 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rtt_rx,
     } = opts;
 
-    if let Some(pg_conf) = agent.config().api.pg.clone() {
-        info!("Starting PostgreSQL wire-compatible server");
-        let pg_server = corro_pg::start(agent.clone(), pg_conf, tripwire.clone()).await?;
-        info!(
-            "Started PostgreSQL wire-compatible server, listening at {}",
-            pg_server.local_addr
-        );
-    }
+    let subs = SubsManager::default();
 
-    let mut matcher_id_cache = MatcherIdCache::default();
-    let mut matcher_bcast_cache = MatcherBroadcastCache::default();
+    let mut subs_bcast_cache = MatcherBroadcastCache::default();
 
     {
         let rows = {
@@ -395,35 +384,35 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 to_cleanup.push(id);
                 continue;
             }
-            let conn = block_in_place(|| agent.pool().client_dedicated())?;
-            let (evt_tx, evt_rx) = channel(512);
-            match Matcher::restore(
+
+            let (_, created) = match subs.restore(
                 id,
-                agent.config().db.subscriptions_path(),
-                &agent.schema().read(),
-                conn,
-                evt_tx,
                 &sql,
+                &agent.config().db.subscriptions_path(),
+                &agent.schema().read(),
+                agent.pool(),
                 rx_db_version.clone(),
                 tripwire.clone(),
             ) {
-                Ok(handle) => {
-                    info!(sub_id = %id, "Restored subscription");
-                    agent.matchers().write().insert(id, handle);
-                    let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
-                    tokio::spawn(process_sub_channel(
-                        agent.clone(),
-                        id,
-                        sub_tx.clone(),
-                        evt_rx,
-                    ));
-                    matcher_id_cache.insert(sql, id);
-                    matcher_bcast_cache.insert(id, sub_tx);
-                }
+                Ok(res) => res,
                 Err(e) => {
                     error!("could not restore subscription {id}: {e}");
+                    to_cleanup.push(id);
+                    continue;
                 }
-            }
+            };
+
+            info!(sub_id = %id, "Restored subscription");
+
+            let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
+            tokio::spawn(process_sub_channel(
+                subs.clone(),
+                id,
+                sub_tx.clone(),
+                created.evt_rx,
+            ));
+
+            subs_bcast_cache.insert(id, sub_tx);
         }
 
         if !to_cleanup.is_empty() {
@@ -439,8 +428,16 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         }
     };
 
-    let matcher_id_cache = Arc::new(tokio::sync::RwLock::new(matcher_id_cache));
-    let matcher_bcast_cache = Arc::new(tokio::sync::RwLock::new(matcher_bcast_cache));
+    let subs_bcast_cache = Arc::new(tokio::sync::RwLock::new(subs_bcast_cache));
+
+    if let Some(pg_conf) = agent.config().api.pg.clone() {
+        info!("Starting PostgreSQL wire-compatible server");
+        let pg_server = corro_pg::start(agent.clone(), pg_conf, tripwire.clone()).await?;
+        info!(
+            "Started PostgreSQL wire-compatible server, listening at {}",
+            pg_server.local_addr
+        );
+    }
 
     let (to_send_tx, to_send_rx) = channel(10240);
     let (notifications_tx, notifications_rx) = channel(10240);
@@ -928,8 +925,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
                 .layer(Extension(agent.clone()))
-                .layer(Extension(matcher_id_cache))
-                .layer(Extension(matcher_bcast_cache))
+                .layer(Extension(subs_bcast_cache))
+                .layer(Extension(subs))
                 .layer(Extension(tripwire.clone())),
         )
         .layer(DefaultBodyLimit::disable())

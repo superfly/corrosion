@@ -1,6 +1,6 @@
 use std::{
     cmp,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -14,7 +14,7 @@ use corro_api_types::{
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::{
     params, params_from_iter,
     types::{FromSqlError, ValueRef},
@@ -39,6 +39,7 @@ use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 use uuid::Uuid;
 
 use crate::{
+    agent::SplitPool,
     api::QueryEvent,
     schema::{Schema, Table},
     sqlite::CrConn,
@@ -233,6 +234,134 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError
     Ok(ret)
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct SubsManager(Arc<RwLock<InnerSubsManager>>);
+
+#[derive(Debug, Default)]
+struct InnerSubsManager {
+    handles: BTreeMap<Uuid, MatcherHandle>,
+    queries: HashMap<String, Uuid>,
+}
+
+// tools to bootstrap a new subscriber
+pub struct MatcherCreated {
+    pub evt_rx: mpsc::Receiver<QueryEvent>,
+}
+
+const SUB_EVENT_CHANNEL_CAP: usize = 512;
+
+impl SubsManager {
+    pub fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
+        self.0.read().get(id)
+    }
+
+    pub fn get_by_query(&self, sql: &str) -> Option<MatcherHandle> {
+        self.0.read().get_by_query(sql)
+    }
+
+    pub fn get_or_insert(
+        &self,
+        sql: &str,
+        subs_path: &Utf8Path,
+        schema: &Schema,
+        pool: &SplitPool,
+        rx_db_version: watch::Receiver<i64>,
+        tripwire: Tripwire,
+    ) -> Result<(MatcherHandle, Option<MatcherCreated>), MatcherError> {
+        if let Some(handle) = self.get_by_query(sql) {
+            return Ok((handle, None));
+        }
+
+        let mut inner = self.0.write();
+        if let Some(handle) = inner.get_by_query(sql) {
+            return Ok((handle, None));
+        }
+
+        let id = Uuid::new_v4();
+        let (evt_tx, evt_rx) = mpsc::channel(SUB_EVENT_CHANNEL_CAP);
+
+        let handle = Matcher::create(
+            id,
+            subs_path.to_path_buf(),
+            schema,
+            pool.client_dedicated()?,
+            evt_tx,
+            sql,
+            rx_db_version,
+            tripwire,
+        )?;
+
+        inner.handles.insert(id, handle.clone());
+        inner.queries.insert(sql.to_owned(), id);
+
+        Ok((handle, Some(MatcherCreated { evt_rx })))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        &self,
+        id: Uuid,
+        sql: &str,
+        subs_path: &Utf8Path,
+        schema: &Schema,
+        pool: &SplitPool,
+        rx_db_version: watch::Receiver<i64>,
+        tripwire: Tripwire,
+    ) -> Result<(MatcherHandle, MatcherCreated), MatcherError> {
+        let mut inner = self.0.write();
+
+        if inner.handles.contains_key(&id) {
+            return Err(MatcherError::CannotRestoreExisting);
+        }
+        if let Some(other_id) = inner.queries.get(sql) {
+            warn!("found an already-restored subscription for the provided SQL query, prev id: {other_id}");
+            return Err(MatcherError::CannotRestoreExisting);
+        }
+
+        let (evt_tx, evt_rx) = mpsc::channel(SUB_EVENT_CHANNEL_CAP);
+
+        let handle = Matcher::restore(
+            id,
+            subs_path.to_path_buf(),
+            schema,
+            pool.client_dedicated()?,
+            evt_tx,
+            sql,
+            rx_db_version,
+            tripwire,
+        )?;
+
+        inner.handles.insert(id, handle.clone());
+        inner.queries.insert(sql.to_owned(), id);
+
+        Ok((handle, MatcherCreated { evt_rx }))
+    }
+
+    pub fn remove(&self, id: &Uuid) -> Option<MatcherHandle> {
+        let mut inner = self.0.write();
+        inner.remove(id)
+    }
+}
+
+impl InnerSubsManager {
+    fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
+        self.handles.get(id).cloned()
+    }
+
+    fn get_by_query(&self, sql: &str) -> Option<MatcherHandle> {
+        self.queries
+            .get(sql)
+            .and_then(|id| self.handles.get(id).cloned())
+    }
+
+    fn remove(&mut self, id: &Uuid) -> Option<MatcherHandle> {
+        let handle = self.handles.remove(id)?;
+        self.queries.remove(&handle.inner.sql);
+        Some(handle)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum MatcherState {
     Created,
     Running,
@@ -244,14 +373,16 @@ impl MatcherState {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MatcherHandle {
     inner: Arc<InnerMatcherHandle>,
     state: StateLock,
 }
 
+#[derive(Debug)]
 struct InnerMatcherHandle {
     id: Uuid,
+    sql: String,
     pool: sqlite_pool::RusqlitePool,
     parsed: ParsedSelect,
     col_names: Vec<ColumnName>,
@@ -597,6 +728,7 @@ impl Matcher {
         let handle = MatcherHandle {
             inner: Arc::new(InnerMatcherHandle {
                 id,
+                sql: sql.to_owned(),
                 pool: sqlite_pool::Config::new(sub_db_path.into_std_path_buf())
                     .max_size(5)
                     .read_only()
@@ -1873,6 +2005,8 @@ pub enum MatcherError {
     ChangesetEncode(#[from] speedy::Error),
     #[error("queue is full")]
     QueueFull,
+    #[error("cannot restore existing subscription")]
+    CannotRestoreExisting,
 }
 
 #[cfg(test)]
@@ -1901,40 +2035,35 @@ mod tests {
 
         let sql = "SELECT sandwich FROM sw WHERE pk=\"mad\"";
 
-        let id = Uuid::new_v4();
+        let subs = SubsManager::default();
 
         let tmpdir = tempfile::tempdir()?;
         let db_path = tmpdir.path().join("test.db");
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let mut state_conn = CrConn::init(rusqlite::Connection::open(&db_path)?)?;
-        println!("created base conn");
-
-        setup_conn(&mut state_conn)?;
-        migrate(&mut state_conn)?;
-        println!("setup base conn");
-
+        let pool = SplitPool::create(db_path, tripwire.clone()).await?;
         {
-            let tx = state_conn.transaction()?;
+            let mut conn = pool.write_priority().await?;
+            setup_conn(&mut conn)?;
+            migrate(&mut conn)?;
+            let tx = conn.transaction()?;
             apply_schema(&tx, &Schema::default(), &mut schema)?;
             tx.commit()?;
         }
 
-        let (_v_tx, v_rx) = watch::channel(0);
+        let (_tx_db_version, rx_db_version) = watch::channel(0);
 
-        let (tx, _rx) = mpsc::channel(100);
-        let handle = Matcher::create(
-            id,
-            subscriptions_path,
-            &schema,
-            state_conn,
-            tx,
+        let (handle, maybe_created) = subs.get_or_insert(
             sql,
-            v_rx,
-            tripwire,
+            subscriptions_path.as_path(),
+            &schema,
+            &pool,
+            rx_db_version,
+            tripwire.clone(),
         )?;
-        println!("created matcher");
+
+        assert!(maybe_created.is_some());
 
         handle.cleanup().await;
 
@@ -2027,22 +2156,19 @@ mod tests {
           ";
 
         let mut schema = parse_sql(schema_sql).unwrap();
+        let subs = SubsManager::default();
 
         let tmpdir = tempfile::tempdir().unwrap();
         let db_path = tmpdir.path().join("test.db");
-
-        let mut conn =
-            CrConn::init(rusqlite::Connection::open(&db_path).expect("could not open conn"))
-                .expect("could not init crsql");
-
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        setup_conn(&mut conn).unwrap();
-
-        migrate(&mut conn).unwrap();
+        let pool = SplitPool::create(&db_path, tripwire.clone()).await.unwrap();
+        let mut conn = pool.write_priority().await.unwrap();
 
         {
+            setup_conn(&mut conn).unwrap();
+            migrate(&mut conn).unwrap();
             let tx = conn.transaction().unwrap();
             apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
             tx.commit().unwrap();
@@ -2125,33 +2251,31 @@ mod tests {
             }
         }
 
-        let id = Uuid::new_v4();
-
         let mut matcher_conn =
             CrConn::init(rusqlite::Connection::open(&db_path).expect("could not open conn"))
                 .expect("could not init crconn");
 
         setup_conn(&mut matcher_conn).unwrap();
 
-        let (tx, mut rx) = mpsc::channel(1);
-
         let mut last_change_id = None;
 
-        {
+        let id = {
             let (db_v_tx, db_v_rx) = watch::channel(0);
-            let matcher = Matcher::create(
-                id,
-                subscriptions_path.clone(),
-                &schema,
-                matcher_conn,
-                tx.clone(),
-                sql,
-                db_v_rx,
-                tripwire.clone(),
-            )
-            .unwrap();
 
-            println!("matcher created w/ id: {}", id.as_simple());
+            let (matcher, maybe_created) = subs
+                .get_or_insert(
+                    sql,
+                    subscriptions_path.as_path(),
+                    &schema,
+                    &pool,
+                    db_v_rx,
+                    tripwire.clone(),
+                )
+                .unwrap();
+
+            let mut rx = maybe_created.unwrap().evt_rx;
+
+            println!("matcher created w/ id: {}", matcher.id().as_simple());
             println!("parsed: {:?}", matcher.inner.parsed);
 
             assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Columns(_)));
@@ -2347,7 +2471,9 @@ mod tests {
                     println!("{}", s.join(", "));
                 }
             }
-        }
+            subs.remove(&matcher.id());
+            matcher.id()
+        };
 
         // delete a record while nothing is matching
         {
@@ -2370,26 +2496,21 @@ mod tests {
         println!("changing to db version: {db_v}, expecting delete");
         db_v_tx.send(db_v).unwrap();
 
-        let mut matcher_conn =
-            CrConn::init(rusqlite::Connection::open(&db_path).expect("could not open conn"))
-                .expect("could not init crconn");
-
-        setup_conn(&mut matcher_conn).unwrap();
-
         {
-            let matcher = Matcher::restore(
-                id,
-                subscriptions_path.clone(),
-                &schema,
-                matcher_conn,
-                tx.clone(),
-                sql,
-                db_v_rx,
-                tripwire,
-            )
-            .unwrap();
+            let (matcher, created) = subs
+                .restore(
+                    id,
+                    sql,
+                    &subscriptions_path,
+                    &schema,
+                    &pool,
+                    db_v_rx,
+                    tripwire.clone(),
+                )
+                .unwrap();
+            let mut rx = created.evt_rx;
 
-            println!("matcher restored w/ id: {}", id.as_simple());
+            println!("matcher restored w/ id: {}", matcher.id().as_simple());
 
             let (catch_up_tx, mut catch_up_rx) = mpsc::channel(1);
 
