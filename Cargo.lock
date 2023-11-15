@@ -827,6 +827,7 @@ name = "corro-pg"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "compact_str 0.7.0",
  "corro-tests",
  "corro-types",
@@ -843,7 +844,6 @@ dependencies = [
  "sqlparser",
  "tempfile",
  "thiserror",
- "time",
  "tokio",
  "tokio-postgres",
  "tokio-util",
@@ -3172,6 +3172,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "549b9d036d571d42e6e85d1c1425e2ac83491075078ca9a15be021c56b1641f2"
 dependencies = [
  "bitflags 2.3.2",
+ "chrono",
  "fallible-iterator",
  "fallible-streaming-iterator",
  "hashlink",

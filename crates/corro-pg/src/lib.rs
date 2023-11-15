@@ -11,6 +11,7 @@ use std::{
 };
 
 use bytes::Buf;
+use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, KnownDbVersion},
@@ -728,29 +729,34 @@ pub async fn start(
                                             .filter_map(|oid| Type::from_oid(*oid))
                                             .collect();
 
+                                        println!("params? {param_types:?}");
+
                                         if param_types.len() != prepped.parameter_count() {
                                             param_types = parameter_types(&schema, &parsed_cmd)
                                                 .into_iter()
-                                                .map(|param| match param {
-                                                    (SqliteType::Null, _) => unreachable!(),
-                                                    (SqliteType::Text, src) => match src {
-                                                        Some("JSON") => Type::JSON,
-                                                        _ => Type::TEXT,
-                                                    },
-                                                    (SqliteType::Numeric, Some(src)) => match src {
-                                                        "BOOLEAN" | "BOOL" => Type::BOOL,
-                                                        _ => Type::FLOAT8,
-                                                    },
-                                                    (SqliteType::Numeric, src) => match src {
-                                                        Some("DATETIME") => Type::TIMESTAMP,
-                                                        _ => Type::FLOAT8,
-                                                    },
-                                                    (SqliteType::Integer, _src) => Type::INT8,
-                                                    (SqliteType::Real, _src) => Type::FLOAT8,
-                                                    (SqliteType::Blob, src) => match src {
-                                                        Some("JSONB") => Type::JSONB,
-                                                        _ => Type::BYTEA,
-                                                    },
+                                                .map(|param| {
+                                                    println!("got param: {param:?}");
+                                                    match param {
+                                                        (SqliteType::Null, _) => unreachable!(),
+                                                        (SqliteType::Text, src) => match src {
+                                                            Some("JSON") => Type::JSON,
+                                                            _ => Type::TEXT,
+                                                        },
+                                                        (SqliteType::Numeric, Some(src)) => {
+                                                            match src {
+                                                                "BOOLEAN" | "BOOL" => Type::BOOL,
+                                                                "DATETIME" => Type::TIMESTAMP,
+                                                                _ => Type::FLOAT8,
+                                                            }
+                                                        }
+                                                        (SqliteType::Numeric, None) => Type::FLOAT8,
+                                                        (SqliteType::Integer, _src) => Type::INT8,
+                                                        (SqliteType::Real, _src) => Type::FLOAT8,
+                                                        (SqliteType::Blob, src) => match src {
+                                                            Some("JSONB") => Type::JSONB,
+                                                            _ => Type::BYTEA,
+                                                        },
+                                                    }
                                                 })
                                                 .collect();
                                         }
@@ -1220,6 +1226,25 @@ pub async fn start(
                                                                     .as_deref()
                                                                     .unwrap_or(b),
                                                             )?;
+                                                        }
+
+                                                        t @ &Type::TIMESTAMP => {
+                                                            let dt = match format_code {
+                                                                FormatCode::Text => {
+                                                                    let s =
+                                                                        String::from_utf8_lossy(b);
+                                                                    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f").map_err(ToParamError::Parse)?
+                                                                }
+                                                                FormatCode::Binary => {
+                                                                    NaiveDateTime::from_sql(t, b)
+                                                                        .map_err(
+                                                                            ToParamError::<
+                                                                                chrono::format::ParseError
+                                                                            >::FromSql,
+                                                                        )?
+                                                                }
+                                                            };
+                                                            prepped.raw_bind_parameter(idx, dt)?;
                                                         }
 
                                                         // t @ &Type::TIMESTAMP => {
@@ -1750,7 +1775,8 @@ fn handle_execute<'conn>(
     // TODO: maybe we don't need to recompute this...
     let mut fields = vec![];
     for (i, col) in prepped.columns().into_iter().enumerate() {
-        let col_type = name_to_type(col.decl_type().unwrap_or("text"))?;
+        trace!("col decl_type: {:?}", col.decl_type());
+        let col_type = name_to_type(col.decl_type().unwrap_or("any"))?;
 
         fields.push(FieldInfo::new(
             col.name().to_string(),
@@ -1787,7 +1813,6 @@ fn handle_execute<'conn>(
         *open_tx = None;
     } else {
         let mut rows = prepped.raw_query();
-        let ncols = schema.len();
         loop {
             if count >= max_rows {
                 trace!("attained max rows");
@@ -1819,24 +1844,88 @@ fn handle_execute<'conn>(
             count += 1;
 
             let mut encoder = DataRowEncoder::new(schema.clone());
-            for idx in 0..ncols {
-                let data = row.get_ref_unwrap::<usize>(idx);
-                match data {
-                    ValueRef::Null => encoder.encode_field(&None::<i8>).unwrap(),
-                    ValueRef::Integer(i) => {
-                        encoder.encode_field(&i).unwrap();
+            for (idx, field) in schema.iter().enumerate() {
+                trace!("processing field: {field:?}");
+                let format = *field.format();
+                match field.datatype() {
+                    &Type::ANY => {
+                        let data = row.get_ref_unwrap(idx);
+                        match data {
+                            ValueRef::Null => encoder
+                                .encode_field_with_type_and_format(&None::<i8>, &Type::ANY, format)
+                                .unwrap(),
+                            ValueRef::Integer(i) => {
+                                encoder
+                                    .encode_field_with_type_and_format(&i, &Type::INT8, format)
+                                    .unwrap();
+                            }
+                            ValueRef::Real(f) => {
+                                encoder
+                                    .encode_field_with_type_and_format(&f, &Type::FLOAT8, format)
+                                    .unwrap();
+                            }
+                            ValueRef::Text(t) => {
+                                encoder
+                                    .encode_field_with_type_and_format(
+                                        &String::from_utf8_lossy(t).as_ref(),
+                                        &Type::TEXT,
+                                        format,
+                                    )
+                                    .unwrap();
+                            }
+                            ValueRef::Blob(b) => {
+                                encoder
+                                    .encode_field_with_type_and_format(&b, &Type::BYTEA, format)
+                                    .unwrap();
+                            }
+                        }
                     }
-                    ValueRef::Real(f) => {
-                        encoder.encode_field(&f).unwrap();
-                    }
-                    ValueRef::Text(t) => {
+                    t @ &Type::INT8 => {
                         encoder
-                            .encode_field(&String::from_utf8_lossy(t).as_ref())
+                            .encode_field_with_type_and_format(
+                                &row.get::<_, Option<i64>>(idx)?,
+                                t,
+                                format,
+                            )
                             .unwrap();
                     }
-                    ValueRef::Blob(b) => {
-                        encoder.encode_field(&b).unwrap();
+                    t @ &Type::TIMESTAMP => {
+                        encoder
+                            .encode_field_with_type_and_format(
+                                &row.get::<_, Option<NaiveDateTime>>(idx)?,
+                                t,
+                                format,
+                            )
+                            .unwrap();
                     }
+                    t @ &Type::VARCHAR | t @ &Type::TEXT | t @ &Type::JSON => {
+                        encoder
+                            .encode_field_with_type_and_format(
+                                &row.get::<_, Option<String>>(idx)?,
+                                t,
+                                format,
+                            )
+                            .unwrap();
+                    }
+                    t @ &Type::BYTEA | t @ &Type::JSONB => {
+                        encoder
+                            .encode_field_with_type_and_format(
+                                &row.get::<_, Option<Vec<u8>>>(idx)?,
+                                t,
+                                format,
+                            )
+                            .unwrap();
+                    }
+                    t @ &Type::FLOAT8 => {
+                        encoder
+                            .encode_field_with_type_and_format(
+                                &row.get::<_, Option<f64>>(idx)?,
+                                t,
+                                format,
+                            )
+                            .unwrap();
+                    }
+                    _ => return Err(UnsupportedSqliteToPostgresType(field.name().clone()).into()),
                 }
             }
 
@@ -2757,6 +2846,7 @@ fn parameter_types<'a>(schema: &'a Schema, cmd: &ParsedCmd) -> Vec<(SqliteType, 
 
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, Utc};
     use corro_tests::launch_test_agent;
     use spawn::wait_for_all_pending_handles;
     use tokio_postgres::NoTls;
@@ -2769,7 +2859,28 @@ mod tests {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
-        let ta = launch_test_agent(|builder| builder.build(), tripwire.clone()).await?;
+        let tmpdir = tempfile::tempdir()?;
+
+        tokio::fs::write(
+            tmpdir.path().join("kitchensink.sql"),
+            "
+            CREATE TABLE kitchensink (
+                id PRIMARY KEY NOT NULL,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+        ",
+        )
+        .await?;
+
+        let ta = launch_test_agent(
+            |builder| {
+                builder
+                    .add_schema_path(tmpdir.path().display().to_string())
+                    .build()
+            },
+            tripwire.clone(),
+        )
+        .await?;
 
         let server = start(
             ta.agent.clone(),
@@ -2876,6 +2987,23 @@ mod tests {
             println!("t.id: {:?}", row.try_get::<_, i64>(0));
             println!("t.text: {:?}", row.try_get::<_, String>(1));
             println!("t2text: {:?}", row.try_get::<_, String>(2));
+
+            let now: DateTime<Utc> = Utc::now();
+            let now = NaiveDateTime::new(now.date_naive(), now.time());
+            println!("NOW: {now:?}");
+
+            let row = client
+                .query_one(
+                    "INSERT INTO kitchensink (id, updated_at) VALUES (1, ?) RETURNING updated_at",
+                    &[&now],
+                )
+                .await?;
+
+            println!("ROW: {row:?}");
+            let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
+            println!("updated_at: {updated_at:?}");
+
+            assert_eq!(now, updated_at);
         }
 
         tripwire_tx.send(()).await.ok();

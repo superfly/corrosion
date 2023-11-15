@@ -19,12 +19,12 @@ spawn = { path = "../spawn" }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-time = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tripwire = { path = "../tripwire" }
 sqlparser = { version = "0.39.0" }
+chrono = { version = "0.4.31" }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
