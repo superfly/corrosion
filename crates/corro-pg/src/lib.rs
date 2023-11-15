@@ -2989,7 +2989,7 @@ mod tests {
             println!("t2text: {:?}", row.try_get::<_, String>(2));
 
             let now: DateTime<Utc> = Utc::now();
-            let now = NaiveDateTime::new(now.date_naive(), now.time());
+            let now = NaiveDateTime::from_timestamp_micros(now.timestamp_micros()).unwrap();
             println!("NOW: {now:?}");
 
             let row = client
