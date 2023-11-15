@@ -294,6 +294,8 @@ pub enum CatchUpError {
     Send(#[from] mpsc::error::SendError<Bytes>),
     #[error(transparent)]
     SerdeJson(#[from] serde_json::Error),
+    #[error(transparent)]
+    Matcher(#[from] MatcherError),
 }
 
 fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> Bytes {
@@ -314,9 +316,8 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
 fn catch_up_sub_anew(
     tx: &Transaction,
     matcher: &MatcherHandle,
-    buf: &mut BytesMut,
     evt_tx: &mpsc::Sender<Bytes>,
-) -> Result<(), CatchUpError> {
+) -> Result<ChangeId, CatchUpError> {
     let (q_tx, mut q_rx) = mpsc::channel(10240);
 
     tokio::spawn({
@@ -340,13 +341,7 @@ fn catch_up_sub_anew(
         }
     });
 
-    if let Err(e) = matcher.all_rows(tx, q_tx) {
-        evt_tx.blocking_send(
-            make_query_event_bytes(buf, QueryEvent::Error(e.to_compact_string()))?.0,
-        )?;
-    }
-
-    Ok(())
+    matcher.all_rows(tx, q_tx).map_err(CatchUpError::from)
 }
 
 fn catch_up_sub_from(
@@ -410,14 +405,18 @@ pub async fn catch_up_sub(
 
         let res = block_in_place(|| {
             let tx = conn.transaction()?; // read transaction
-            let max_change_id = matcher.max_change_id(&tx)?;
+            let mut max_change_id = matcher.max_change_id(&tx)?;
             match from {
                 Some(from) => {
                     catch_up_sub_from(&tx, &matcher, from, &mut buf, &evt_tx)?;
                     debug!("sub caught up to their 'from' of {from:?}");
                 }
                 None => {
-                    catch_up_sub_anew(&tx, &matcher, &mut buf, &evt_tx)?;
+                    let new_max_change_id = catch_up_sub_anew(&tx, &matcher, &evt_tx)?;
+                    if new_max_change_id != max_change_id {
+                        warn!(sub_id = %matcher.id(), "wrong assumption about sqlite transaction, max change id differed! prev: {max_change_id:?}, new: {new_max_change_id:?}");
+                        max_change_id = new_max_change_id;
+                    }
                     // make sure we're all caught up to the max change id seen in this tx
                     catch_up_sub_from(&tx, &matcher, max_change_id, &mut buf, &evt_tx)?;
                     debug!("sub caught up from scratch");
@@ -438,6 +437,10 @@ pub async fn catch_up_sub(
                     }
                     CatchUpError::Send(_) => {
                         // can't send
+                    }
+                    CatchUpError::Matcher(_) => {
+                        // upstream error
+                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
                     }
                 }
                 return Ok(());

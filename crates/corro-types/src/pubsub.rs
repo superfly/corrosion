@@ -480,7 +480,7 @@ impl MatcherHandle {
         &self,
         conn: &Connection,
         tx: mpsc::Sender<QueryEvent>,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<ChangeId, MatcherError> {
         self.wait_for_running_state();
         let mut query_cols = vec![];
         for i in 0..(self.parsed_columns().len()) {
@@ -493,11 +493,8 @@ impl MatcherHandle {
 
         let col_count = prepped.column_count();
 
-        if let Err(e) = tx.blocking_send(QueryEvent::Columns(self.col_names().to_vec())) {
-            error!("could not send rows to channel: {e}");
-            // TODO: bomb!
-            return Ok(());
-        }
+        tx.blocking_send(QueryEvent::Columns(self.col_names().to_vec()))
+            .map_err(|_| MatcherError::EventReceiverClosed)?;
 
         let start = Instant::now();
         let mut rows = prepped.query([])?;
@@ -509,30 +506,26 @@ impl MatcherHandle {
                 None => break,
             };
 
-            if let Err(e) = tx.blocking_send(QueryEvent::Row(
+            tx.blocking_send(QueryEvent::Row(
                 row.get(0)?,
                 (1..col_count)
                     .map(|i| row.get::<_, SqliteValue>(i))
                     .collect::<rusqlite::Result<Vec<_>>>()?,
-            )) {
-                error!("could not send row to channel: {e}");
-                return Ok(());
-            }
+            ))
+            .map_err(|_| MatcherError::EventReceiverClosed)?;
         }
 
-        if let Err(e) = tx.blocking_send(QueryEvent::EndOfQuery {
+        let max_change_id = conn
+            .prepare("SELECT COALESCE(MAX(id),0) FROM changes")?
+            .query_row([], |row| row.get(0))?;
+
+        tx.blocking_send(QueryEvent::EndOfQuery {
             time: elapsed.as_secs_f64(),
-            change_id: Some(
-                conn.prepare("SELECT COALESCE(MAX(id),0) FROM changes")?
-                    .query_row([], |row| row.get(0))?,
-            ),
-        }) {
-            error!("could not send end-of-query to channel: {e}");
-            // TODO: bomb!
-            return Ok(());
-        }
+            change_id: Some(max_change_id),
+        })
+        .map_err(|_| MatcherError::EventReceiverClosed)?;
 
-        Ok(())
+        Ok(max_change_id)
     }
 }
 
@@ -2009,6 +2002,12 @@ pub enum MatcherError {
     CannotRestoreExisting,
 }
 
+impl MatcherError {
+    pub fn is_event_recv_closed(&self) -> bool {
+        matches!(self, MatcherError::EventReceiverClosed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
@@ -2526,7 +2525,7 @@ mod tests {
                             matcher.max_change_id(&conn_tx).unwrap()
                         );
                         matcher.all_rows(&conn_tx, catch_up_tx)?;
-                        Ok::<_, rusqlite::Error>(())
+                        Ok::<_, MatcherError>(())
                     })
                 }
             });
