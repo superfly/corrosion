@@ -729,13 +729,13 @@ pub async fn start(
                                             .filter_map(|oid| Type::from_oid(*oid))
                                             .collect();
 
-                                        println!("params? {param_types:?}");
+                                        debug!("params types {param_types:?}");
 
                                         if param_types.len() != prepped.parameter_count() {
                                             param_types = parameter_types(&schema, &parsed_cmd)
                                                 .into_iter()
                                                 .map(|param| {
-                                                    println!("got param: {param:?}");
+                                                    trace!("got param: {param:?}");
                                                     match param {
                                                         (SqliteType::Null, _) => unreachable!(),
                                                         (SqliteType::Text, src) => match src {
@@ -1033,7 +1033,7 @@ pub async fn start(
                                             prepped.parameter_count()
                                         );
 
-                                        trace!("param types: {param_types:?}");
+                                        debug!("bind param types: {param_types:?}");
 
                                         let mut format_codes = match bind
                                             .parameter_format_codes()
@@ -2177,7 +2177,7 @@ fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
 }
 
 fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
-    println!("HANDLE COMMIT");
+    trace!("HANDLE COMMIT");
     let actor_id = agent.actor_id();
 
     let ts = Timestamp::from(agent.clock().new_timestamp());
