@@ -10,7 +10,7 @@ use corro_types::{
     sqlite::SqlitePoolError,
 };
 use futures::{future::poll_fn, ready, Stream};
-use rusqlite::{Connection, Transaction};
+use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
     sync::{broadcast, mpsc, oneshot, RwLock as TokioRwLock},
@@ -314,7 +314,7 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
 }
 
 fn catch_up_sub_anew(
-    tx: &Transaction,
+    conn: &Connection,
     matcher: &MatcherHandle,
     evt_tx: &mpsc::Sender<Bytes>,
 ) -> Result<ChangeId, CatchUpError> {
@@ -341,11 +341,11 @@ fn catch_up_sub_anew(
         }
     });
 
-    matcher.all_rows(tx, q_tx).map_err(CatchUpError::from)
+    matcher.all_rows(conn, q_tx).map_err(CatchUpError::from)
 }
 
 fn catch_up_sub_from(
-    tx: &Transaction, // read transaction
+    conn: &Connection, // read transaction
     matcher: &MatcherHandle,
     from: ChangeId,
     buf: &mut BytesMut,
@@ -374,7 +374,7 @@ fn catch_up_sub_from(
         }
     });
 
-    if let Err(e) = matcher.changes_since(from, tx, q_tx) {
+    if let Err(e) = matcher.changes_since(from, conn, q_tx) {
         evt_tx.blocking_send(
             make_query_event_bytes(buf, QueryEvent::Error(e.to_compact_string()))?.0,
         )?;
@@ -404,23 +404,29 @@ pub async fn catch_up_sub(
         let mut conn = matcher.pool().get().await?;
 
         let res = block_in_place(|| {
-            let tx = conn.transaction()?; // read transaction
-            let mut max_change_id = matcher.max_change_id(&tx)?;
-            match from {
-                Some(from) => {
-                    catch_up_sub_from(&tx, &matcher, from, &mut buf, &evt_tx)?;
-                    debug!("sub caught up to their 'from' of {from:?}");
-                }
-                None => {
-                    let new_max_change_id = catch_up_sub_anew(&tx, &matcher, &evt_tx)?;
-                    if new_max_change_id != max_change_id {
-                        warn!(sub_id = %matcher.id(), "wrong assumption about sqlite transaction, max change id differed! prev: {max_change_id:?}, new: {new_max_change_id:?}");
-                        max_change_id = new_max_change_id;
+            let max_change_id = {
+                let tx = conn.transaction()?; // read transaction
+                let mut max_change_id = matcher.max_change_id(&tx)?;
+                match from {
+                    Some(from) => {
+                        catch_up_sub_from(&tx, &matcher, from, &mut buf, &evt_tx)?;
+                        debug!("sub caught up to their 'from' of {from:?}");
                     }
-                    // make sure we're all caught up to the max change id seen in this tx
-                    catch_up_sub_from(&tx, &matcher, max_change_id, &mut buf, &evt_tx)?;
-                    debug!("sub caught up from scratch");
+                    None => {
+                        let new_max_change_id = catch_up_sub_anew(&tx, &matcher, &evt_tx)?;
+                        if new_max_change_id != max_change_id {
+                            warn!(sub_id = %matcher.id(), "wrong assumption about sqlite transaction, max change id differed! prev: {max_change_id:?}, new: {new_max_change_id:?}");
+                            max_change_id = new_max_change_id;
+                        }
+                        debug!("sub caught up from scratch");
+                    }
                 }
+                max_change_id
+            };
+            if from.is_none() {
+                let tx = conn.transaction()?;
+                // make sure we're all caught up to the max change id seen in this tx
+                catch_up_sub_from(&tx, &matcher, max_change_id, &mut buf, &evt_tx)?;
             }
             Ok(max_change_id)
         });
