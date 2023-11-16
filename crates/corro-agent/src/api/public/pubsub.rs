@@ -94,11 +94,11 @@ async fn sub_by_id(
 
 fn make_query_event_bytes(
     buf: &mut BytesMut,
-    query_evt: QueryEvent,
+    query_evt: &QueryEvent,
 ) -> serde_json::Result<(Bytes, QueryEventMeta)> {
     {
         let mut writer = buf.writer();
-        serde_json::to_writer(&mut writer, &query_evt)?;
+        serde_json::to_writer(&mut writer, query_evt)?;
 
         // NOTE: I think that's infaillible...
         writer
@@ -144,7 +144,7 @@ pub async fn process_sub_channel(
             biased;
             Some(query_evt) = evt_rx.recv() => query_evt,
             _ = deadline_check => {
-                info!("All subscribers for {id} are gone and didn't come back within {MAX_UNSUB_TIME:?}");
+                info!(sub_id = %id, "All listeners for subscription are gone and didn't come back within {MAX_UNSUB_TIME:?}");
                 break;
             },
             _ = subs_check.tick() => {
@@ -162,7 +162,7 @@ pub async fn process_sub_channel(
             }
         };
 
-        let is_still_active = match make_query_event_bytes(&mut buf, query_evt) {
+        let is_still_active = match make_query_event_bytes(&mut buf, &query_evt) {
             Ok(b) => tx.send(b).is_ok(),
             Err(e) => {
                 _ = tx.send((
@@ -176,7 +176,7 @@ pub async fn process_sub_channel(
         if is_still_active {
             deadline = None;
         } else {
-            debug!("no active subscribers");
+            warn!(sub_id = %id, "no active listeners to receive subscription event: {query_evt:?}");
             if deadline.is_none() {
                 deadline = Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)));
             }
@@ -333,7 +333,7 @@ fn catch_up_sub_anew(
         async move {
             let mut buf = BytesMut::new();
             while let Some(event) = q_rx.recv().await {
-                match make_query_event_bytes(&mut buf, event) {
+                match make_query_event_bytes(&mut buf, &event) {
                     Ok((b, _)) => {
                         if let Err(e) = evt_tx.send(b).await {
                             error!("could not send catching up event bytes: {e}");
@@ -365,7 +365,7 @@ fn catch_up_sub_from(
         async move {
             let mut buf = BytesMut::new();
             while let Some(event) = q_rx.recv().await {
-                match make_query_event_bytes(&mut buf, event) {
+                match make_query_event_bytes(&mut buf, &event) {
                     Ok((b, _)) => {
                         if let Err(e) = evt_tx.send(b).await {
                             error!("could not send catching up event bytes: {e}");
@@ -402,6 +402,8 @@ pub async fn catch_up_sub(
             let (buf, meta) = sub_rx.recv().await?;
             if let QueryEventMeta::Change(change_id) = meta {
                 events_buf.push_back((buf, change_id));
+            } else {
+                warn!(sub_id = %matcher.id(), "wasn't expecting a non-change here! got meta: {meta:?}");
             }
             if events_buf.len() > MAX_EVENTS_BUFFER_SIZE {
                 return Err::<(), _>(eyre::eyre!("catching up too slowly, gave up after buffering {MAX_EVENTS_BUFFER_SIZE} events"));
