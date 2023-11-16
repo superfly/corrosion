@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Write, sync::Arc, task::Poll, time::Duration};
+use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -9,7 +9,7 @@ use corro_types::{
     pubsub::{MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
     sqlite::SqlitePoolError,
 };
-use futures::{future::poll_fn, ready};
+use futures::future::poll_fn;
 use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
@@ -82,7 +82,7 @@ async fn sub_by_id(
 
     let (tx, body) = hyper::Body::channel();
 
-    tokio::spawn(forward_bytes_to_body_sender(evt_rx, tx));
+    tokio::spawn(forward_bytes_to_body_sender(id, evt_rx, tx));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -616,7 +616,7 @@ pub async fn catch_up_sub(
         }
     };
 
-    forward_sub_to_sender(sub_rx, evt_tx).await
+    forward_sub_to_sender(matcher.id(), sub_rx, evt_tx).await
 }
 
 pub async fn upsert_sub(
@@ -648,7 +648,7 @@ pub async fn upsert_sub(
 
         let (sub_tx, sub_rx) = broadcast::channel(10240);
 
-        tokio::spawn(forward_sub_to_sender(sub_rx, tx));
+        tokio::spawn(forward_sub_to_sender(handle.id(), sub_rx, tx));
 
         bcast_write.insert(handle.id(), sub_tx.clone());
 
@@ -700,7 +700,7 @@ pub async fn api_v1_subs(
         Err(e) => return hyper::Response::<hyper::Body>::from(e),
     };
 
-    tokio::spawn(forward_bytes_to_body_sender(forward_rx, tx));
+    tokio::spawn(forward_bytes_to_body_sender(matcher_id, forward_rx, tx));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -712,20 +712,33 @@ pub async fn api_v1_subs(
 const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 
 async fn forward_sub_to_sender(
+    sub_id: Uuid,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     tx: mpsc::Sender<Bytes>,
+) {
+    while let Ok((event_buf, _meta)) = sub_rx.recv().await {
+        if let Err(e) = tx.send(event_buf).await {
+            warn!(%sub_id, "could not send subscription event to channel: {e}");
+            return;
+        }
+    }
+    info!(%sub_id, "events subcription ran out");
+}
+
+async fn forward_bytes_to_body_sender(
+    sub_id: Uuid,
+    mut rx: mpsc::Receiver<Bytes>,
+    mut tx: hyper::body::Sender,
 ) {
     let mut buf = BytesMut::new();
 
     let send_deadline = tokio::time::sleep(Duration::from_millis(10));
     tokio::pin!(send_deadline);
 
-    // let mut tx = PollSender::new(tx);
-
     loop {
         let to_send = tokio::select! {
             biased;
-            Ok((event_buf, _meta)) = sub_rx.recv() => {
+            Some(event_buf) = rx.recv() => {
                 buf.extend_from_slice(&event_buf);
                 if buf.len() >= 64*1024 {
                     buf.split().freeze()
@@ -737,8 +750,8 @@ async fn forward_sub_to_sender(
                 if !buf.is_empty() {
                     buf.split().freeze()
                 } else {
-                    if tx.is_closed() {
-                        warn!("sender was closed, stopping event broadcast sends");
+                    if let Err(e) = poll_fn(|cx| tx.poll_ready(cx)).await {
+                        warn!(%sub_id, error = %e, "body sender was closed or errored, stopping event broadcast sends");
                         return;
                     }
                     send_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(10));
@@ -748,42 +761,14 @@ async fn forward_sub_to_sender(
             else => break,
         };
 
-        if let Err(e) = tx.send(to_send).await {
-            warn!("could not forward subscription query event to receiver: {e}");
+        if let Err(e) = tx.send_data(to_send).await {
+            warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
             return;
         }
     }
     if !buf.is_empty() {
-        if let Err(e) = tx.send(buf.freeze()).await {
-            warn!("could not forward subscription query event to receiver: {e}");
-        }
-    }
-}
-
-async fn forward_bytes_to_body_sender(mut rx: mpsc::Receiver<Bytes>, mut tx: hyper::body::Sender) {
-    loop {
-        let res = {
-            poll_fn(|cx| {
-                ready!(tx.poll_ready(cx))?;
-                Poll::Ready(Ok::<_, hyper::Error>(ready!(rx.poll_recv(cx))))
-            })
-            .await
-        };
-        match res {
-            Ok(Some(b)) => {
-                if let Err(e) = tx.send_data(b).await {
-                    error!("could not send query event data through body: {e}");
-                    break;
-                }
-            }
-            Ok(None) => {
-                // done...
-                break;
-            }
-            Err(e) => {
-                debug!("body was not ready anymore: {e}");
-                break;
-            }
+        if let Err(e) = tx.send_data(buf.freeze()).await {
+            warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
         }
     }
 }
