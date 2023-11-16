@@ -320,10 +320,17 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
     buf.split().freeze()
 }
 
+fn error_to_query_event_bytes_with_meta<E: ToCompactString>(
+    buf: &mut BytesMut,
+    e: E,
+) -> (Bytes, QueryEventMeta) {
+    (error_to_query_event_bytes(buf, e), QueryEventMeta::Error)
+}
+
 fn catch_up_sub_anew(
     conn: &Connection,
     matcher: &MatcherHandle,
-    evt_tx: &mpsc::Sender<Bytes>,
+    evt_tx: &mpsc::Sender<(Bytes, QueryEventMeta)>,
 ) -> Result<ChangeId, CatchUpError> {
     let (q_tx, mut q_rx) = mpsc::channel(10240);
 
@@ -334,7 +341,7 @@ fn catch_up_sub_anew(
             while let Some(event) = q_rx.recv().await {
                 match make_query_event_bytes(&mut buf, &event) {
                     Ok((b, _)) => {
-                        if let Err(e) = evt_tx.send(b).await {
+                        if let Err(e) = evt_tx.send((b, event.meta())).await {
                             error!("could not send catching up event bytes: {e}");
                             return;
                         }
@@ -355,7 +362,7 @@ fn catch_up_sub_from(
     conn: &Connection, // read transaction
     matcher: &MatcherHandle,
     from: ChangeId,
-    evt_tx: &mpsc::Sender<Bytes>,
+    evt_tx: &mpsc::Sender<(Bytes, QueryEventMeta)>,
 ) -> Result<ChangeId, CatchUpError> {
     let (q_tx, mut q_rx) = mpsc::channel(10240);
 
@@ -366,7 +373,7 @@ fn catch_up_sub_from(
             while let Some(event) = q_rx.recv().await {
                 match make_query_event_bytes(&mut buf, &event) {
                     Ok((b, _)) => {
-                        if let Err(e) = evt_tx.send(b).await {
+                        if let Err(e) = evt_tx.send((b, event.meta())).await {
                             error!("could not send catching up event bytes: {e}");
                             return;
                         }
@@ -389,7 +396,7 @@ pub async fn catch_up_sub(
     matcher: MatcherHandle,
     params: SubParams,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
-    evt_tx: mpsc::Sender<Bytes>,
+    evt_tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
 ) {
     debug!("catching up sub {} params: {:?}", matcher.id(), params);
 
@@ -428,7 +435,9 @@ pub async fn catch_up_sub(
         let mut conn = match matcher.pool().get().await {
             Ok(conn) => conn,
             Err(e) => {
-                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                _ = evt_tx
+                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                    .await;
                 return;
             }
         };
@@ -458,20 +467,28 @@ pub async fn catch_up_sub(
             Err(e) => {
                 match e {
                     CatchUpError::Pool(e) => {
-                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                        _ = evt_tx
+                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                            .await;
                     }
                     CatchUpError::Sqlite(e) => {
-                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                        _ = evt_tx
+                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                            .await;
                     }
                     CatchUpError::SerdeJson(e) => {
-                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                        _ = evt_tx
+                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                            .await;
                     }
                     CatchUpError::Send(_) => {
                         // can't send
                     }
                     CatchUpError::Matcher(_) => {
                         // upstream error
-                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                        _ = evt_tx
+                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                            .await;
                     }
                 }
                 return;
@@ -503,7 +520,7 @@ pub async fn catch_up_sub(
             TryRecvError::Disconnected => {
                 // abnormal
                 _ = evt_tx
-                    .send(error_to_query_event_bytes(
+                    .send(error_to_query_event_bytes_with_meta(
                         &mut buf,
                         "exceeded events buffer",
                     ))
@@ -523,7 +540,9 @@ pub async fn catch_up_sub(
                 let mut conn = match matcher.pool().get().await {
                     Ok(conn) => conn,
                     Err(e) => {
-                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                        _ = evt_tx
+                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                            .await;
                         return;
                     }
                 };
@@ -541,20 +560,28 @@ pub async fn catch_up_sub(
                     Err(e) => {
                         match e {
                             CatchUpError::Pool(e) => {
-                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                                _ = evt_tx
+                                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                                    .await;
                             }
                             CatchUpError::Sqlite(e) => {
-                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                                _ = evt_tx
+                                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                                    .await;
                             }
                             CatchUpError::SerdeJson(e) => {
-                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                                _ = evt_tx
+                                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                                    .await;
                             }
                             CatchUpError::Send(_) => {
                                 // can't send
                             }
                             CatchUpError::Matcher(_) => {
                                 // upstream error
-                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                                _ = evt_tx
+                                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                                    .await;
                             }
                         }
                         return;
@@ -568,7 +595,7 @@ pub async fn catch_up_sub(
         }
         if change_id > min_change_id {
             _ = evt_tx
-                .send(error_to_query_event_bytes(
+                .send(error_to_query_event_bytes_with_meta(
                     &mut buf,
                     "could not catch up to changes in 5 attempts",
                 ))
@@ -583,7 +610,10 @@ pub async fn catch_up_sub(
         info!(sub_id = %matcher.id(), "had a pending event we popped from the queue, id: {change_id:?} (last change id: {last_change_id:?})");
         if change_id > last_change_id {
             info!(sub_id = %matcher.id(), "change was more recent, sending!");
-            if let Err(_e) = evt_tx.send(event_buf).await {
+            if let Err(_e) = evt_tx
+                .send((event_buf, QueryEventMeta::Change(change_id)))
+                .await
+            {
                 warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
                 return;
             }
@@ -597,7 +627,10 @@ pub async fn catch_up_sub(
         info!(sub_id = %matcher.id(), "processing buffered change, id: {change_id:?} (last change id: {last_change_id:?})");
         if change_id > last_change_id {
             info!(sub_id = %matcher.id(), "change was more recent, sending!");
-            if let Err(_e) = evt_tx.send(event_buf).await {
+            if let Err(_e) = evt_tx
+                .send((event_buf, QueryEventMeta::Change(change_id)))
+                .await
+            {
                 warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
                 return;
             }
@@ -607,11 +640,15 @@ pub async fn catch_up_sub(
     let sub_rx = match queue_task.await {
         Ok(Ok(sub_rx)) => sub_rx,
         Ok(Err(e)) => {
-            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+            _ = evt_tx
+                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                .await;
             return;
         }
         Err(e) => {
-            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+            _ = evt_tx
+                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                .await;
             return;
         }
     };
@@ -625,7 +662,7 @@ pub async fn upsert_sub(
     bcast_cache: &SharedMatcherBroadcastCache,
     stmt: Statement,
     params: SubParams,
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
     tripwire: Tripwire,
 ) -> Result<Uuid, MatcherUpsertError> {
     let stmt = expand_sql(agent, &stmt).await?;
@@ -714,11 +751,11 @@ const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 async fn forward_sub_to_sender(
     sub_id: Uuid,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
 ) {
     info!(%sub_id, "forwarding subscription events to a sender");
-    while let Ok((event_buf, _meta)) = sub_rx.recv().await {
-        if let Err(e) = tx.send(event_buf).await {
+    while let Ok((event_buf, meta)) = sub_rx.recv().await {
+        if let Err(e) = tx.send((event_buf, meta)).await {
             warn!(%sub_id, "could not send subscription event to channel: {e}");
             return;
         }
@@ -728,7 +765,7 @@ async fn forward_sub_to_sender(
 
 async fn forward_bytes_to_body_sender(
     sub_id: Uuid,
-    mut rx: mpsc::Receiver<Bytes>,
+    mut rx: mpsc::Receiver<(Bytes, QueryEventMeta)>,
     mut tx: hyper::body::Sender,
 ) {
     let mut buf = BytesMut::new();
@@ -736,10 +773,24 @@ async fn forward_bytes_to_body_sender(
     let send_deadline = tokio::time::sleep(Duration::from_millis(10));
     tokio::pin!(send_deadline);
 
+    let mut last_change_id = ChangeId(0);
+
     loop {
         let to_send = tokio::select! {
             biased;
-            Some(event_buf) = rx.recv() => {
+            Some((event_buf, meta)) = rx.recv() => {
+                match meta {
+                    QueryEventMeta::EndOfQuery(Some(change_id)) |
+                    QueryEventMeta::Change(change_id) => {
+                        if !last_change_id.is_zero() && change_id > last_change_id + 1 {
+                            warn!(%sub_id, "non-contiguous change id received: {change_id:?}, last seen: {last_change_id:?}");
+                        }
+                        last_change_id = change_id;
+                    },
+                    _ => {
+                        // do nothing
+                    }
+                }
                 buf.extend_from_slice(&event_buf);
                 if buf.len() >= 64*1024 {
                     buf.split().freeze()
