@@ -6,7 +6,7 @@ use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::Agent,
     api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
-    pubsub::{MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
+    pubsub::{MatcherCreated, MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
     sqlite::SqlitePoolError,
 };
 use futures::future::poll_fn;
@@ -18,7 +18,7 @@ use tokio::{
         mpsc::{self, error::TryRecvError},
         RwLock as TokioRwLock,
     },
-    task::block_in_place,
+    task::{block_in_place, JoinError},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -298,11 +298,13 @@ pub enum CatchUpError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
-    Send(#[from] mpsc::error::SendError<Bytes>),
+    Send(#[from] mpsc::error::SendError<(Bytes, QueryEventMeta)>),
     #[error(transparent)]
     SerdeJson(#[from] serde_json::Error),
     #[error(transparent)]
     Matcher(#[from] MatcherError),
+    #[error(transparent)]
+    Join(#[from] JoinError),
 }
 
 fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> Bytes {
@@ -320,76 +322,77 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
     buf.split().freeze()
 }
 
-fn catch_up_sub_anew(
-    conn: &Connection,
-    matcher: &MatcherHandle,
-    evt_tx: &mpsc::Sender<Bytes>,
-) -> Result<ChangeId, CatchUpError> {
-    let (q_tx, mut q_rx) = mpsc::channel(10240);
-
-    tokio::spawn({
-        let evt_tx = evt_tx.clone();
-        async move {
-            let mut buf = BytesMut::new();
-            while let Some(event) = q_rx.recv().await {
-                match make_query_event_bytes(&mut buf, &event) {
-                    Ok((b, _)) => {
-                        if let Err(e) = evt_tx.send(b).await {
-                            error!("could not send catching up event bytes: {e}");
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!("could not serialize catching up event: {e}");
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    matcher.all_rows(conn, q_tx).map_err(CatchUpError::from)
+fn error_to_query_event_bytes_with_meta<E: ToCompactString>(
+    buf: &mut BytesMut,
+    e: E,
+) -> (Bytes, QueryEventMeta) {
+    (error_to_query_event_bytes(buf, e), QueryEventMeta::Error)
 }
 
-fn catch_up_sub_from(
-    conn: &Connection, // read transaction
+async fn catch_up_sub_anew(
     matcher: &MatcherHandle,
-    from: ChangeId,
-    evt_tx: &mpsc::Sender<Bytes>,
+    evt_tx: &mpsc::Sender<(Bytes, QueryEventMeta)>,
 ) -> Result<ChangeId, CatchUpError> {
     let (q_tx, mut q_rx) = mpsc::channel(10240);
 
-    tokio::spawn({
+    let task = tokio::spawn({
         let evt_tx = evt_tx.clone();
         async move {
             let mut buf = BytesMut::new();
             while let Some(event) = q_rx.recv().await {
-                match make_query_event_bytes(&mut buf, &event) {
-                    Ok((b, _)) => {
-                        if let Err(e) = evt_tx.send(b).await {
-                            error!("could not send catching up event bytes: {e}");
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!("could not serialize catching up event: {e}");
-                        return;
-                    }
-                }
+                evt_tx
+                    .send(make_query_event_bytes(&mut buf, &event)?)
+                    .await?;
             }
+            Ok::<_, CatchUpError>(())
         }
     });
 
-    matcher
-        .changes_since(from, conn, q_tx)
-        .map_err(CatchUpError::from)
+    let last_change_id = {
+        let conn = matcher.pool().get().await?;
+        block_in_place(|| matcher.all_rows(&conn, q_tx))?
+    };
+
+    task.await??;
+
+    Ok(last_change_id)
+}
+
+async fn catch_up_sub_from(
+    matcher: &MatcherHandle,
+    from: ChangeId,
+    evt_tx: &mpsc::Sender<(Bytes, QueryEventMeta)>,
+) -> Result<ChangeId, CatchUpError> {
+    let (q_tx, mut q_rx) = mpsc::channel(10240);
+
+    let task = tokio::spawn({
+        let evt_tx = evt_tx.clone();
+        async move {
+            let mut buf = BytesMut::new();
+            while let Some(event) = q_rx.recv().await {
+                evt_tx
+                    .send(make_query_event_bytes(&mut buf, &event)?)
+                    .await?;
+            }
+            Ok::<_, CatchUpError>(())
+        }
+    });
+
+    let last_change_id = {
+        let conn = matcher.pool().get().await?;
+        block_in_place(|| matcher.changes_since(from, &conn, q_tx))?
+    };
+
+    task.await??;
+
+    Ok(last_change_id)
 }
 
 pub async fn catch_up_sub(
     matcher: MatcherHandle,
     params: SubParams,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
-    evt_tx: mpsc::Sender<Bytes>,
+    evt_tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
 ) {
     debug!("catching up sub {} params: {:?}", matcher.id(), params);
 
@@ -425,54 +428,33 @@ pub async fn catch_up_sub(
     });
 
     let mut last_change_id = {
-        let mut conn = match matcher.pool().get().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                return;
+        let res = match params.from {
+            Some(from) => catch_up_sub_from(&matcher, from, &evt_tx).await,
+            None => {
+                if params.skip_rows {
+                    let conn = match matcher.pool().get().await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            _ = evt_tx
+                                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                                .await;
+                            return;
+                        }
+                    };
+                    block_in_place(|| matcher.max_change_id(&conn)).map_err(CatchUpError::from)
+                } else {
+                    catch_up_sub_anew(&matcher, &evt_tx).await
+                }
             }
         };
-
-        let res = block_in_place(|| {
-            let tx = conn.transaction()?; // read transaction
-            match params.from {
-                Some(from) => {
-                    let change_id = catch_up_sub_from(&tx, &matcher, from, &evt_tx)?;
-                    debug!("sub caught up to their 'from' of {from:?}");
-                    Ok(change_id)
-                }
-                None => {
-                    if params.skip_rows {
-                        Ok(matcher.max_change_id(&tx)?)
-                    } else {
-                        let change_id = catch_up_sub_anew(&tx, &matcher, &evt_tx)?;
-                        debug!("sub caught up from scratch");
-                        Ok(change_id)
-                    }
-                }
-            }
-        });
 
         match res {
             Ok(change_id) => change_id,
             Err(e) => {
-                match e {
-                    CatchUpError::Pool(e) => {
-                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                    }
-                    CatchUpError::Sqlite(e) => {
-                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                    }
-                    CatchUpError::SerdeJson(e) => {
-                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                    }
-                    CatchUpError::Send(_) => {
-                        // can't send
-                    }
-                    CatchUpError::Matcher(_) => {
-                        // upstream error
-                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                    }
+                if !matches!(e, CatchUpError::Send(_)) {
+                    _ = evt_tx
+                        .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                        .await;
                 }
                 return;
             }
@@ -503,7 +485,7 @@ pub async fn catch_up_sub(
             TryRecvError::Disconnected => {
                 // abnormal
                 _ = evt_tx
-                    .send(error_to_query_event_bytes(
+                    .send(error_to_query_event_bytes_with_meta(
                         &mut buf,
                         "exceeded events buffer",
                     ))
@@ -520,42 +502,15 @@ pub async fn catch_up_sub(
                 // missed some updates!
                 info!(sub_id = %matcher.id(), "attempt #{} to catch up subcription from change id: {change_id:?} (last: {last_change_id:?})", i+1);
 
-                let mut conn = match matcher.pool().get().await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                        return;
-                    }
-                };
-
-                let res = block_in_place(|| {
-                    let tx = conn.transaction()?; // read transaction
-                    let new_last_change_id =
-                        catch_up_sub_from(&tx, &matcher, last_change_id, &evt_tx)?;
-                    debug!(sub_id = %matcher.id(), "sub caught up to the last max change id we got! {last_change_id:?} -> {new_last_change_id:?}");
-                    Ok(new_last_change_id)
-                });
+                let res = catch_up_sub_from(&matcher, last_change_id, &evt_tx).await;
 
                 match res {
                     Ok(new_last_change_id) => last_change_id = new_last_change_id,
                     Err(e) => {
-                        match e {
-                            CatchUpError::Pool(e) => {
-                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                            }
-                            CatchUpError::Sqlite(e) => {
-                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                            }
-                            CatchUpError::SerdeJson(e) => {
-                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                            }
-                            CatchUpError::Send(_) => {
-                                // can't send
-                            }
-                            CatchUpError::Matcher(_) => {
-                                // upstream error
-                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                            }
+                        if !matches!(e, CatchUpError::Send(_)) {
+                            _ = evt_tx
+                                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                                .await;
                         }
                         return;
                     }
@@ -568,7 +523,7 @@ pub async fn catch_up_sub(
         }
         if change_id > min_change_id {
             _ = evt_tx
-                .send(error_to_query_event_bytes(
+                .send(error_to_query_event_bytes_with_meta(
                     &mut buf,
                     "could not catch up to changes in 5 attempts",
                 ))
@@ -583,7 +538,10 @@ pub async fn catch_up_sub(
         info!(sub_id = %matcher.id(), "had a pending event we popped from the queue, id: {change_id:?} (last change id: {last_change_id:?})");
         if change_id > last_change_id {
             info!(sub_id = %matcher.id(), "change was more recent, sending!");
-            if let Err(_e) = evt_tx.send(event_buf).await {
+            if let Err(_e) = evt_tx
+                .send((event_buf, QueryEventMeta::Change(change_id)))
+                .await
+            {
                 warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
                 return;
             }
@@ -597,7 +555,10 @@ pub async fn catch_up_sub(
         info!(sub_id = %matcher.id(), "processing buffered change, id: {change_id:?} (last change id: {last_change_id:?})");
         if change_id > last_change_id {
             info!(sub_id = %matcher.id(), "change was more recent, sending!");
-            if let Err(_e) = evt_tx.send(event_buf).await {
+            if let Err(_e) = evt_tx
+                .send((event_buf, QueryEventMeta::Change(change_id)))
+                .await
+            {
                 warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
                 return;
             }
@@ -607,11 +568,15 @@ pub async fn catch_up_sub(
     let sub_rx = match queue_task.await {
         Ok(Ok(sub_rx)) => sub_rx,
         Ok(Err(e)) => {
-            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+            _ = evt_tx
+                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                .await;
             return;
         }
         Err(e) => {
-            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+            _ = evt_tx
+                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                .await;
             return;
         }
     };
@@ -620,27 +585,13 @@ pub async fn catch_up_sub(
 }
 
 pub async fn upsert_sub(
-    agent: &Agent,
+    handle: MatcherHandle,
+    maybe_created: Option<MatcherCreated>,
     subs: &SubsManager,
-    bcast_cache: &SharedMatcherBroadcastCache,
-    stmt: Statement,
+    bcast_write: &mut MatcherBroadcastCache,
     params: SubParams,
-    tx: mpsc::Sender<Bytes>,
-    tripwire: Tripwire,
+    tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
 ) -> Result<Uuid, MatcherUpsertError> {
-    let stmt = expand_sql(agent, &stmt).await?;
-
-    let mut bcast_write = bcast_cache.write().await;
-
-    let (handle, maybe_created) = subs.get_or_insert(
-        &stmt,
-        &agent.config().db.subscriptions_path(),
-        &agent.schema().read(),
-        agent.pool(),
-        agent.rx_db_version(),
-        tripwire,
-    )?;
-
     if let Some(created) = maybe_created {
         if params.from.is_some() {
             return Err(MatcherUpsertError::SubFromWithoutMatcher);
@@ -682,25 +633,45 @@ pub async fn api_v1_subs(
     axum::extract::Query(params): axum::extract::Query<SubParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
+    let stmt = match expand_sql(&agent, &stmt).await {
+        Ok(stmt) => stmt,
+        Err(e) => return hyper::Response::<hyper::Body>::from(e),
+    };
+
+    let mut bcast_write = bcast_cache.write().await;
+
+    let upsert_res = subs.get_or_insert(
+        &stmt,
+        &agent.config().db.subscriptions_path(),
+        &agent.schema().read(),
+        agent.pool(),
+        agent.rx_db_version(),
+        tripwire,
+    );
+
+    let (handle, maybe_created) = match upsert_res {
+        Ok(res) => res,
+        Err(e) => return hyper::Response::<hyper::Body>::from(MatcherUpsertError::from(e)),
+    };
+
     let (tx, body) = hyper::Body::channel();
     let (forward_tx, forward_rx) = mpsc::channel(10240);
 
+    tokio::spawn(forward_bytes_to_body_sender(handle.id(), forward_rx, tx));
+
     let matcher_id = match upsert_sub(
-        &agent,
+        handle,
+        maybe_created,
         &subs,
-        &bcast_cache,
-        stmt,
+        &mut bcast_write,
         params,
         forward_tx,
-        tripwire,
     )
     .await
     {
         Ok(id) => id,
         Err(e) => return hyper::Response::<hyper::Body>::from(e),
     };
-
-    tokio::spawn(forward_bytes_to_body_sender(matcher_id, forward_rx, tx));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -714,11 +685,11 @@ const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 async fn forward_sub_to_sender(
     sub_id: Uuid,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
 ) {
     info!(%sub_id, "forwarding subscription events to a sender");
-    while let Ok((event_buf, _meta)) = sub_rx.recv().await {
-        if let Err(e) = tx.send(event_buf).await {
+    while let Ok((event_buf, meta)) = sub_rx.recv().await {
+        if let Err(e) = tx.send((event_buf, meta)).await {
             warn!(%sub_id, "could not send subscription event to channel: {e}");
             return;
         }
@@ -728,7 +699,7 @@ async fn forward_sub_to_sender(
 
 async fn forward_bytes_to_body_sender(
     sub_id: Uuid,
-    mut rx: mpsc::Receiver<Bytes>,
+    mut rx: mpsc::Receiver<(Bytes, QueryEventMeta)>,
     mut tx: hyper::body::Sender,
 ) {
     let mut buf = BytesMut::new();
@@ -736,10 +707,28 @@ async fn forward_bytes_to_body_sender(
     let send_deadline = tokio::time::sleep(Duration::from_millis(10));
     tokio::pin!(send_deadline);
 
+    let mut last_change_id = ChangeId(0);
+
     loop {
         let to_send = tokio::select! {
             biased;
-            Some(event_buf) = rx.recv() => {
+            Some((event_buf, meta)) = rx.recv() => {
+                match meta {
+                    QueryEventMeta::EndOfQuery(Some(change_id)) |
+                    QueryEventMeta::Change(change_id) => {
+                        if !last_change_id.is_zero() && change_id > last_change_id + 1 {
+                            warn!(%sub_id, "non-contiguous change id (> + 1) received: {change_id:?}, last seen: {last_change_id:?}");
+                        } else if !last_change_id.is_zero() && change_id == last_change_id {
+                            warn!(%sub_id, "duplicate change id received: {change_id:?}, last seen: {last_change_id:?}");
+                        } else if change_id < last_change_id {
+                            warn!(%sub_id, "smaller change id received: {change_id:?}, last seen: {last_change_id:?}");
+                        }
+                        last_change_id = change_id;
+                    },
+                    _ => {
+                        // do nothing
+                    }
+                }
                 buf.extend_from_slice(&event_buf);
                 if buf.len() >= 64*1024 {
                     buf.split().freeze()

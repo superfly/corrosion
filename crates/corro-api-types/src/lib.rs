@@ -39,7 +39,7 @@ impl QueryEvent {
         match self {
             QueryEvent::Columns(_) => QueryEventMeta::Columns,
             QueryEvent::Row(rowid, _) => QueryEventMeta::Row(*rowid),
-            QueryEvent::EndOfQuery { .. } => QueryEventMeta::EndOfQuery,
+            QueryEvent::EndOfQuery { change_id, .. } => QueryEventMeta::EndOfQuery(*change_id),
             QueryEvent::Change(_, _, _, id) => QueryEventMeta::Change(*id),
             QueryEvent::Error(_) => QueryEventMeta::Error,
         }
@@ -50,7 +50,7 @@ impl QueryEvent {
 pub enum QueryEventMeta {
     Columns,
     Row(RowId),
-    EndOfQuery,
+    EndOfQuery(Option<ChangeId>),
     Change(ChangeId),
     Error,
 }
@@ -106,6 +106,12 @@ impl ToSql for RowId {
 )]
 #[serde(transparent)]
 pub struct ChangeId(pub i64);
+
+impl ChangeId {
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
 
 impl fmt::Display for ChangeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
