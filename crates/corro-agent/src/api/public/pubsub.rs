@@ -476,7 +476,20 @@ pub async fn catch_up_sub(
         }
     };
 
-    if let Some((_buf, change_id)) = events_buf.get(0) {
+    let last_received_change_id = match events_buf.get(0) {
+        Some((_buf, change_id)) => Some(*change_id),
+        None => {
+            let last_change_id_sent = matcher.last_change_id_sent();
+            if last_change_id_sent.0 <= last_change_id.0 {
+                None
+            } else {
+                Some(last_change_id_sent)
+            }
+        }
+    };
+
+    if let Some(change_id) = last_received_change_id {
+        debug!(sub_id = %matcher.id(), "got a change to check: {change_id:?}");
         for _ in 0..5 {
             if change_id.0 > last_change_id.0 + 1 {
                 // missed some updates!

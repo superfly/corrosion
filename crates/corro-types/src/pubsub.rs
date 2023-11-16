@@ -387,6 +387,7 @@ struct InnerMatcherHandle {
     parsed: ParsedSelect,
     col_names: Vec<ColumnName>,
     cancel: CancellationToken,
+    last_change_rx: watch::Receiver<ChangeId>,
 }
 
 type MatchCandidates = IndexMap<TableName, IndexSet<Vec<u8>>>;
@@ -425,6 +426,10 @@ impl MatcherHandle {
         self.wait_for_running_state();
         let mut prepped = conn.prepare_cached("SELECT COALESCE(MAX(id), 0) FROM changes")?;
         prepped.query_row([], |row| row.get(0))
+    }
+
+    pub fn last_change_id_sent(&self) -> ChangeId {
+        *self.inner.last_change_rx.borrow()
     }
 
     pub fn max_row_id(&self, conn: &Connection) -> rusqlite::Result<RowId> {
@@ -552,6 +557,7 @@ pub struct Matcher {
     cancel: CancellationToken,
     state: StateLock,
     db_version_rx: watch::Receiver<i64>,
+    last_change_tx: watch::Sender<ChangeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -725,6 +731,8 @@ impl Matcher {
 
         let state = Arc::new((Mutex::new(MatcherState::Created), Condvar::new()));
 
+        let (last_change_tx, last_change_rx) = watch::channel(ChangeId(0));
+
         let handle = MatcherHandle {
             inner: Arc::new(InnerMatcherHandle {
                 id,
@@ -737,6 +745,7 @@ impl Matcher {
                 parsed: parsed.clone(),
                 col_names: col_names.clone(),
                 cancel: cancel.clone(),
+                last_change_rx,
             }),
             state: state.clone(),
         };
@@ -755,6 +764,7 @@ impl Matcher {
             cancel,
             state,
             db_version_rx,
+            last_change_tx,
         };
 
         Ok((matcher, handle))
@@ -943,6 +953,13 @@ impl Matcher {
                 (),
                 |row| row.get(0),
             )?;
+
+            let max_change_id = self
+                .conn
+                .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM changes")?
+                .query_row([], |row| row.get(0))?;
+
+            _ = self.last_change_tx.send(max_change_id);
 
             Ok::<_, rusqlite::Error>(db_version)
         });
@@ -1139,7 +1156,7 @@ impl Matcher {
             let state_tx = state_conn.transaction()?;
 
             let elapsed = {
-                println!("select stmt: {stmt_str:?}");
+                debug!("select stmt: {stmt_str:?}");
 
                 let mut select = state_tx.prepare(&stmt_str)?;
                 let start = Instant::now();
@@ -1521,6 +1538,7 @@ impl Matcher {
                                     debug!("could not send back row to matcher sub sender: {e}");
                                     return Err(MatcherError::EventReceiverClosed);
                                 }
+                                _ = self.last_change_tx.send(change_id);
                             }
                             Err(e) => {
                                 error!("could not deserialize row's cells: {e}");
