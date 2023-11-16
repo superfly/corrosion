@@ -6,7 +6,7 @@ use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::Agent,
     api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
-    pubsub::{MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
+    pubsub::{MatcherCreated, MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
     sqlite::SqlitePoolError,
 };
 use futures::future::poll_fn;
@@ -657,27 +657,13 @@ pub async fn catch_up_sub(
 }
 
 pub async fn upsert_sub(
-    agent: &Agent,
+    handle: MatcherHandle,
+    maybe_created: Option<MatcherCreated>,
     subs: &SubsManager,
-    bcast_cache: &SharedMatcherBroadcastCache,
-    stmt: Statement,
+    bcast_write: &mut MatcherBroadcastCache,
     params: SubParams,
     tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
-    tripwire: Tripwire,
 ) -> Result<Uuid, MatcherUpsertError> {
-    let stmt = expand_sql(agent, &stmt).await?;
-
-    let mut bcast_write = bcast_cache.write().await;
-
-    let (handle, maybe_created) = subs.get_or_insert(
-        &stmt,
-        &agent.config().db.subscriptions_path(),
-        &agent.schema().read(),
-        agent.pool(),
-        agent.rx_db_version(),
-        tripwire,
-    )?;
-
     if let Some(created) = maybe_created {
         if params.from.is_some() {
             return Err(MatcherUpsertError::SubFromWithoutMatcher);
@@ -719,25 +705,45 @@ pub async fn api_v1_subs(
     axum::extract::Query(params): axum::extract::Query<SubParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
+    let stmt = match expand_sql(&agent, &stmt).await {
+        Ok(stmt) => stmt,
+        Err(e) => return hyper::Response::<hyper::Body>::from(e),
+    };
+
+    let mut bcast_write = bcast_cache.write().await;
+
+    let upsert_res = subs.get_or_insert(
+        &stmt,
+        &agent.config().db.subscriptions_path(),
+        &agent.schema().read(),
+        agent.pool(),
+        agent.rx_db_version(),
+        tripwire,
+    );
+
+    let (handle, maybe_created) = match upsert_res {
+        Ok(res) => res,
+        Err(e) => return hyper::Response::<hyper::Body>::from(MatcherUpsertError::from(e)),
+    };
+
     let (tx, body) = hyper::Body::channel();
     let (forward_tx, forward_rx) = mpsc::channel(10240);
 
+    tokio::spawn(forward_bytes_to_body_sender(handle.id(), forward_rx, tx));
+
     let matcher_id = match upsert_sub(
-        &agent,
+        handle,
+        maybe_created,
         &subs,
-        &bcast_cache,
-        stmt,
+        &mut bcast_write,
         params,
         forward_tx,
-        tripwire,
     )
     .await
     {
         Ok(id) => id,
         Err(e) => return hyper::Response::<hyper::Body>::from(e),
     };
-
-    tokio::spawn(forward_bytes_to_body_sender(matcher_id, forward_rx, tx));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
