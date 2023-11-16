@@ -476,7 +476,10 @@ pub async fn catch_up_sub(
         }
     };
 
-    let last_received_change_id = match events_buf.get(0) {
+    let min_change_id = last_change_id + 1;
+    info!(sub_id = %matcher.id(), "minimum expected change id: {min_change_id:?}");
+
+    let last_sub_change_id = match events_buf.get(0) {
         Some((_buf, change_id)) => {
             info!(sub_id = %matcher.id(), "last change id received by subscription: {change_id:?}");
             Some(*change_id)
@@ -488,12 +491,13 @@ pub async fn catch_up_sub(
                     events_buf.push_back((event_buf, change_id));
                     Some(change_id)
                 } else {
+                    warn!(sub_id = %matcher.id(), "did not receive a change event: {meta:?}");
                     None
                 }
             } else {
                 let last_change_id_sent = matcher.last_change_id_sent();
                 info!(sub_id = %matcher.id(), "last change id sent by subscription: {last_change_id_sent:?}");
-                if last_change_id_sent.0 <= last_change_id.0 {
+                if last_change_id_sent <= last_change_id {
                     None
                 } else {
                     Some(last_change_id_sent)
@@ -502,10 +506,10 @@ pub async fn catch_up_sub(
         }
     };
 
-    if let Some(change_id) = last_received_change_id {
+    if let Some(change_id) = last_sub_change_id {
         debug!(sub_id = %matcher.id(), "got a change to check: {change_id:?}");
         for i in 0..5 {
-            if change_id.0 > last_change_id.0 + 1 {
+            if change_id > min_change_id {
                 // missed some updates!
                 info!(sub_id = %matcher.id(), "attempt #{} to catch up subcription from change id: {change_id:?} (last: {last_change_id:?})", i+1);
 
@@ -521,7 +525,7 @@ pub async fn catch_up_sub(
                     let tx = conn.transaction()?; // read transaction
                     let new_last_change_id =
                         catch_up_sub_from(&tx, &matcher, last_change_id, &evt_tx)?;
-                    debug!("sub caught up to the last max change id we got! {last_change_id:?} -> {new_last_change_id:?}");
+                    debug!(sub_id = %matcher.id(), "sub caught up to the last max change id we got! {last_change_id:?} -> {new_last_change_id:?}");
                     Ok(new_last_change_id)
                 });
 
@@ -555,7 +559,7 @@ pub async fn catch_up_sub(
             // sleep 100 millis
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if change_id.0 > last_change_id.0 + 1 {
+        if change_id > min_change_id {
             _ = evt_tx
                 .send(error_to_query_event_bytes(
                     &mut buf,
@@ -566,9 +570,10 @@ pub async fn catch_up_sub(
         }
     }
 
-    info!(sub_id = %matcher.id(), "subscription is caught up, no gaps in change id. last change id: {last_change_id:?}, last_received_change_id: {last_received_change_id:?}");
+    info!(sub_id = %matcher.id(), "subscription is caught up, no gaps in change id. last change id: {last_change_id:?}, last_sub_change_id: {last_sub_change_id:?}");
 
     for (bytes, change_id) in events_buf {
+        info!(sub_id = %matcher.id(), "processing buffered change, id: {change_id:?}");
         if change_id > last_change_id {
             if let Err(_e) = evt_tx.send(bytes).await {
                 warn!("could not send buffered events to subscriber, receiver must be gone!");

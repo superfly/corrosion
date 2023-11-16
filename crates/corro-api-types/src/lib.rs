@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     fmt::{self, Write},
     hash::Hash,
-    ops::Deref,
+    ops::{AddAssign, Deref},
 };
 
 use compact_str::CompactString;
@@ -131,6 +131,34 @@ impl FromSql for ChangeId {
 impl ToSql for ChangeId {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         self.0.to_sql()
+    }
+}
+
+impl AddAssign<i64> for ChangeId {
+    fn add_assign(&mut self, rhs: i64) {
+        self.0 += rhs
+    }
+}
+
+impl AddAssign<Self> for ChangeId {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0
+    }
+}
+
+impl std::ops::Add<i64> for ChangeId {
+    type Output = ChangeId;
+
+    fn add(self, rhs: i64) -> Self::Output {
+        ChangeId(self.0 + rhs)
+    }
+}
+
+impl std::ops::Add<Self> for ChangeId {
+    type Output = ChangeId;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        ChangeId(self.0 + rhs.0)
     }
 }
 
