@@ -1,10 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    io::Write,
-    sync::Arc,
-    task::Poll,
-    time::Duration,
-};
+use std::{collections::HashMap, io::Write, sync::Arc, task::Poll, time::Duration};
 
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -19,9 +13,14 @@ use futures::{future::poll_fn, ready};
 use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
-    sync::{broadcast, mpsc, RwLock as TokioRwLock},
+    sync::{
+        broadcast,
+        mpsc::{self, error::TryRecvError},
+        RwLock as TokioRwLock,
+    },
     task::block_in_place,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
@@ -395,26 +394,46 @@ pub async fn catch_up_sub(
     debug!("catching up sub {} params: {:?}", matcher.id(), params);
 
     let mut buf = BytesMut::new();
-    let mut events_buf = VecDeque::new();
 
-    let sub_fut = async {
-        loop {
-            let (buf, meta) = sub_rx.recv().await?;
-            if let QueryEventMeta::Change(change_id) = meta {
-                events_buf.push_back((buf, change_id));
-            } else {
-                warn!(sub_id = %matcher.id(), "wasn't expecting a non-change here! got meta: {meta:?}");
+    // buffer events while we catch up...
+    let (queue_tx, mut queue_rx) = mpsc::channel(10240);
+
+    let cancel = CancellationToken::new();
+    // just in case...
+    let _drop_guard = cancel.clone().drop_guard();
+
+    let queue_task = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            loop {
+                let (buf, meta) = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    },
+                    Ok(res) = sub_rx.recv() => res,
+                    else => break
+                };
+
+                if let QueryEventMeta::Change(change_id) = meta {
+                    if let Err(_e) = queue_tx.try_send((buf, change_id)) {
+                        return Err(eyre::eyre!("catching up too slowly, gave up after buffering {MAX_EVENTS_BUFFER_SIZE} events"));
+                    }
+                }
             }
-            if events_buf.len() > MAX_EVENTS_BUFFER_SIZE {
-                return Err::<(), _>(eyre::eyre!("catching up too slowly, gave up after buffering {MAX_EVENTS_BUFFER_SIZE} events"));
-            }
+            Ok(sub_rx)
         }
-    };
+    });
 
-    let catch_up_fut = async {
-        let mut conn = matcher.pool().get().await?;
+    let mut last_change_id = {
+        let mut conn = match matcher.pool().get().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                return;
+            }
+        };
 
-        block_in_place(|| {
+        let res = block_in_place(|| {
             let tx = conn.transaction()?; // read transaction
             match params.from {
                 Some(from) => {
@@ -432,46 +451,30 @@ pub async fn catch_up_sub(
                     }
                 }
             }
-        })
-    };
+        });
 
-    let mut last_change_id = tokio::select! {
-        res = sub_fut => {
-            // if this finishes first, then we should return
-            match res {
-                Ok(_) => {
-                    _ = evt_tx.send(error_to_query_event_bytes(&mut buf, "subscription channel returned early, aborting")).await;
-                },
-                Err(e) => {
-                    _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                }
-            }
-            return;
-        },
-        res = catch_up_fut => {
-            match res {
-                Ok(change_id) => change_id,
-                Err(e) => {
-                    match e {
-                        CatchUpError::Pool(e) => {
-                            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                        }
-                        CatchUpError::Sqlite(e) => {
-                            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                        }
-                        CatchUpError::SerdeJson(e) => {
-                            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                        }
-                        CatchUpError::Send(_) => {
-                            // can't send
-                        }
-                        CatchUpError::Matcher(_) => {
-                            // upstream error
-                            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                        }
+        match res {
+            Ok(change_id) => change_id,
+            Err(e) => {
+                match e {
+                    CatchUpError::Pool(e) => {
+                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
                     }
-                    return;
+                    CatchUpError::Sqlite(e) => {
+                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                    }
+                    CatchUpError::SerdeJson(e) => {
+                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                    }
+                    CatchUpError::Send(_) => {
+                        // can't send
+                    }
+                    CatchUpError::Matcher(_) => {
+                        // upstream error
+                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                    }
                 }
+                return;
             }
         }
     };
@@ -479,22 +482,16 @@ pub async fn catch_up_sub(
     let min_change_id = last_change_id + 1;
     info!(sub_id = %matcher.id(), "minimum expected change id: {min_change_id:?}");
 
-    let last_sub_change_id = match events_buf.get(0) {
-        Some((_buf, change_id)) => {
+    let mut pending_event = None;
+
+    let last_sub_change_id = match queue_rx.try_recv() {
+        Ok((event_buf, change_id)) => {
             info!(sub_id = %matcher.id(), "last change id received by subscription: {change_id:?}");
-            Some(*change_id)
+            pending_event = Some((event_buf, change_id));
+            Some(change_id)
         }
-        None => {
-            if let Ok((event_buf, meta)) = sub_rx.try_recv() {
-                if let QueryEventMeta::Change(change_id) = meta {
-                    info!(sub_id = %matcher.id(), "received a change event, using it as last change id to catch up to: {change_id:?}");
-                    events_buf.push_back((event_buf, change_id));
-                    Some(change_id)
-                } else {
-                    warn!(sub_id = %matcher.id(), "did not receive a change event: {meta:?}");
-                    None
-                }
-            } else {
+        Err(e) => match e {
+            TryRecvError::Empty => {
                 let last_change_id_sent = matcher.last_change_id_sent();
                 info!(sub_id = %matcher.id(), "last change id sent by subscription: {last_change_id_sent:?}");
                 if last_change_id_sent <= last_change_id {
@@ -503,7 +500,17 @@ pub async fn catch_up_sub(
                     Some(last_change_id_sent)
                 }
             }
-        }
+            TryRecvError::Disconnected => {
+                // abnormal
+                _ = evt_tx
+                    .send(error_to_query_event_bytes(
+                        &mut buf,
+                        "exceeded events buffer",
+                    ))
+                    .await;
+                return;
+            }
+        },
     };
 
     if let Some(change_id) = last_sub_change_id {
@@ -570,18 +577,44 @@ pub async fn catch_up_sub(
         }
     }
 
-    info!(sub_id = %matcher.id(), "subscription is caught up, no gaps in change id. last change id: {last_change_id:?}, last_sub_change_id: {last_sub_change_id:?}, buffered events len: {}", events_buf.len());
+    info!(sub_id = %matcher.id(), "subscription is caught up, no gaps in change id. last change id: {last_change_id:?}, last_sub_change_id: {last_sub_change_id:?}");
 
-    for (bytes, change_id) in events_buf {
-        info!(sub_id = %matcher.id(), "processing buffered change, id: {change_id:?} (last change id: {last_change_id:?})");
+    if let Some((event_buf, change_id)) = pending_event {
+        info!(sub_id = %matcher.id(), "had a pending event we popped from the queue, id: {change_id:?} (last change id: {last_change_id:?})");
         if change_id > last_change_id {
             info!(sub_id = %matcher.id(), "change was more recent, sending!");
-            if let Err(_e) = evt_tx.send(bytes).await {
-                warn!("could not send buffered events to subscriber, receiver must be gone!");
+            if let Err(_e) = evt_tx.send(event_buf).await {
+                warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
                 return;
             }
         }
     }
+
+    // cancel queue task!
+    cancel.cancel();
+
+    while let Some((event_buf, change_id)) = queue_rx.recv().await {
+        info!(sub_id = %matcher.id(), "processing buffered change, id: {change_id:?} (last change id: {last_change_id:?})");
+        if change_id > last_change_id {
+            info!(sub_id = %matcher.id(), "change was more recent, sending!");
+            if let Err(_e) = evt_tx.send(event_buf).await {
+                warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
+                return;
+            }
+        }
+    }
+
+    let sub_rx = match queue_task.await {
+        Ok(Ok(sub_rx)) => sub_rx,
+        Ok(Err(e)) => {
+            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+            return;
+        }
+        Err(e) => {
+            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+            return;
+        }
+    };
 
     forward_sub_to_sender(sub_rx, evt_tx).await
 }
