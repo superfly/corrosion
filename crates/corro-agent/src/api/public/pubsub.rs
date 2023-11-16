@@ -783,7 +783,11 @@ async fn forward_bytes_to_body_sender(
                     QueryEventMeta::EndOfQuery(Some(change_id)) |
                     QueryEventMeta::Change(change_id) => {
                         if !last_change_id.is_zero() && change_id > last_change_id + 1 {
-                            warn!(%sub_id, "non-contiguous change id received: {change_id:?}, last seen: {last_change_id:?}");
+                            warn!(%sub_id, "non-contiguous change id (> + 1) received: {change_id:?}, last seen: {last_change_id:?}");
+                        } else if !last_change_id.is_zero() && change_id == last_change_id {
+                            warn!(%sub_id, "duplicate change id received: {change_id:?}, last seen: {last_change_id:?}");
+                        } else if change_id < last_change_id {
+                            warn!(%sub_id, "smaller change id received: {change_id:?}, last seen: {last_change_id:?}");
                         }
                         last_change_id = change_id;
                     },
