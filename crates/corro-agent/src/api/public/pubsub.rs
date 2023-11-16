@@ -175,14 +175,14 @@ pub async fn process_sub_channel(
         if is_still_active {
             deadline = None;
         } else {
-            warn!(sub_id = %id, "no active listeners to receive subscription event: {query_evt:?}");
+            debug!(sub_id = %id, "no active listeners to receive subscription event: {query_evt:?}");
             if deadline.is_none() {
                 deadline = Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)));
             }
         }
     }
 
-    debug!("subscription query channel done");
+    warn!(sub_id = %id, "subscription query channel done");
 
     // remove and get handle from the agent's "matchers"
     let handle = match subs.remove(&id) {
@@ -716,6 +716,7 @@ async fn forward_sub_to_sender(
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     tx: mpsc::Sender<Bytes>,
 ) {
+    info!(%sub_id, "forwarding subscription events to a sender");
     while let Ok((event_buf, _meta)) = sub_rx.recv().await {
         if let Err(e) = tx.send(event_buf).await {
             warn!(%sub_id, "could not send subscription event to channel: {e}");
