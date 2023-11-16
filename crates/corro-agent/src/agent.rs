@@ -13,10 +13,7 @@ use crate::{
         peer::{gossip_server_endpoint, parallel_sync, serve_sync, SyncError},
         public::{
             api_v1_db_schema, api_v1_queries, api_v1_transactions,
-            pubsub::{
-                api_v1_sub_by_id, api_v1_subs, process_sub_channel, MatcherBroadcastCache,
-                MatcherIdCache,
-            },
+            pubsub::{api_v1_sub_by_id, api_v1_subs, process_sub_channel, MatcherBroadcastCache},
         },
     },
     broadcast::runtime_loop,
@@ -27,19 +24,18 @@ use arc_swap::ArcSwap;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
-        Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion, PartialVersion,
-        SplitPool,
+        migrate, Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion,
+        PartialVersion, SplitPool,
     },
     broadcast::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset,
         ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
-    change::Change,
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members, Rtt},
-    pubsub::{migrate_subs, Matcher},
+    pubsub::{Matcher, SubsManager},
     schema::init_schema,
-    sqlite::{CrConn, Migration, SqlitePoolError},
+    sqlite::{CrConn, SqlitePoolError},
     sync::{generate_sync, SyncMessageDecodeError, SyncMessageEncodeError},
 };
 
@@ -52,19 +48,24 @@ use axum::{
 };
 use bytes::Bytes;
 use foca::{Member, Notification};
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use itertools::Itertools;
 use metrics::{counter, gauge, histogram, increment_counter};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    named_params, params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction,
+};
 use spawn::spawn_counted;
 use speedy::Readable;
 use tokio::{
     net::TcpListener,
-    sync::mpsc::{channel, Receiver, Sender},
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        watch, Semaphore,
+    },
     task::block_in_place,
     time::{error::Elapsed, sleep, timeout},
 };
@@ -89,6 +90,7 @@ pub struct AgentOptions {
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
     pub api_listener: TcpListener,
+    pub rx_db_version: watch::Receiver<i64>,
     pub rx_bcast: Receiver<BroadcastInput>,
     pub rx_apply: Receiver<(ActorId, i64)>,
     pub rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
@@ -117,34 +119,27 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     info!("Actor ID: {}", actor_id);
 
-    let subscriptions_db_path = conf.db.subscriptions_db_path();
+    let write_sema = Arc::new(Semaphore::new(1));
 
-    if let Some(parent) = subscriptions_db_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
-    let pool = SplitPool::create(&conf.db.path, &subscriptions_db_path, tripwire.clone()).await?;
+    let pool = SplitPool::create(&conf.db.path, write_sema.clone(), tripwire.clone()).await?;
 
     let schema = {
         let mut conn = pool.write_priority().await?;
         migrate(&mut conn)?;
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
+
+        info!("Ensuring clock table indexes for fast compaction");
+        let start = Instant::now();
+        for table in schema.tables.keys() {
+            conn.execute_batch(&format!("CREATE INDEX IF NOT EXISTS corro_{table}__crsql_clock_site_id_dbv ON {table}__crsql_clock (site_id, db_version);"))?;
+        }
+        info!("Ensured indexes in {:?}", start.elapsed());
+
         schema
     };
 
-    {
-        let mut conn = rusqlite::Connection::open(&subscriptions_db_path)?;
-        conn.execute_batch(
-            r#"
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-            "#,
-        )?;
-        migrate_subs(&mut conn)?;
-    }
-
-    let (tx_apply, rx_apply) = channel(10240);
+    let (tx_apply, rx_apply) = channel(20480);
 
     let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 
@@ -225,19 +220,23 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 if let Some(known) = ranges.get(&version) {
                     warn!(%actor_id, version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
 
-                    let mut conn = pool.write_priority().await?;
-                    let tx = conn.transaction()?;
-                    clear_buffered_meta(&tx, actor_id, version..=version)?;
-                    tx.commit()?;
+                    clear_buffered_meta(&conn, actor_id, version..=version)?;
                     continue;
                 }
 
                 let gaps_count = seqs.gaps(&(0..=last_seq)).count();
+
                 ranges.insert(version, KnownDbVersion::Partial { seqs, last_seq, ts });
 
                 if gaps_count == 0 {
                     info!(%actor_id, version, "found fully buffered, unapplied, changes! scheduling apply");
-                    tx_apply.send((actor_id, version)).await?;
+                    // spawn this because it can block if the channel gets full, nothing is draining it yet!
+                    tokio::spawn({
+                        let tx_apply = tx_apply.clone();
+                        async move {
+                            let _ = tx_apply.send((actor_id, version)).await;
+                        }
+                    });
                 }
             }
         }
@@ -281,6 +280,12 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             .build(),
     );
 
+    let (tx_db_version, rx_db_version) = {
+        let conn = pool.read().await?;
+        let db_version = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+        watch::channel(db_version)
+    };
+
     let (tx_bcast, rx_bcast) = channel(10240);
     let (tx_empty, rx_empty) = channel(10240);
     let (tx_changes, rx_changes) = channel(5192);
@@ -291,6 +296,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         gossip_server_endpoint,
         transport,
         api_listener,
+        rx_db_version,
         rx_bcast,
         rx_apply,
         rx_empty,
@@ -309,11 +315,13 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         config: ArcSwap::from_pointee(conf),
         clock,
         bookie,
+        tx_db_version,
         tx_bcast,
         tx_apply,
         tx_empty,
         tx_changes,
         tx_foca,
+        write_sema,
         schema: RwLock::new(schema),
         tripwire,
     });
@@ -324,10 +332,15 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 pub async fn start(conf: Config, tripwire: Tripwire) -> eyre::Result<Agent> {
     let (agent, opts) = setup(conf, tripwire.clone()).await?;
 
-    tokio::spawn(run(agent.clone(), opts).inspect(|res| match res {
-        Ok(_) => info!("corrosion agent run is done"),
-        Err(e) => error!("running corrosion agent failed: {e}"),
-    }));
+    tokio::spawn({
+        let agent = agent.clone();
+        async move {
+            match run(agent, opts).await {
+                Ok(_) => info!("corrosion agent run is done"),
+                Err(e) => error!("running corrosion agent failed: {e}"),
+            }
+        }
+    });
 
     Ok(agent)
 }
@@ -339,6 +352,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         transport,
         api_listener,
         mut tripwire,
+        rx_db_version,
         rx_bcast,
         rx_apply,
         rx_empty,
@@ -346,6 +360,78 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rx_foca,
         rtt_rx,
     } = opts;
+
+    let subs = SubsManager::default();
+
+    let mut subs_bcast_cache = MatcherBroadcastCache::default();
+
+    {
+        let rows = {
+            let res = agent
+                .pool()
+                .read()
+                .await?
+                .prepare("SELECT id, sql, state FROM __corro_subs")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<(uuid::Uuid, String, String)>>>()?;
+
+            // the let is required or else we get a lifetime error
+            #[allow(clippy::let_and_return)]
+            res
+        };
+
+        let mut to_cleanup = vec![];
+
+        for (id, sql, state) in rows {
+            if state != "running" {
+                to_cleanup.push(id);
+                continue;
+            }
+
+            let (_, created) = match subs.restore(
+                id,
+                &sql,
+                &agent.config().db.subscriptions_path(),
+                &agent.schema().read(),
+                agent.pool(),
+                rx_db_version.clone(),
+                tripwire.clone(),
+            ) {
+                Ok(res) => res,
+                Err(e) => {
+                    error!("could not restore subscription {id}: {e}");
+                    to_cleanup.push(id);
+                    continue;
+                }
+            };
+
+            info!(sub_id = %id, "Restored subscription");
+
+            let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
+            tokio::spawn(process_sub_channel(
+                subs.clone(),
+                id,
+                sub_tx.clone(),
+                created.evt_rx,
+            ));
+
+            subs_bcast_cache.insert(id, sub_tx);
+        }
+
+        if !to_cleanup.is_empty() {
+            let conn = agent.pool().write_priority().await?;
+            for id in to_cleanup {
+                info!(sub_id = %id, "Cleaning up unclean subscription");
+                Matcher::cleanup(
+                    id,
+                    Matcher::sub_path(agent.config().db.subscriptions_path().as_path(), id),
+                    &conn,
+                )?;
+            }
+        }
+    };
+
+    let subs_bcast_cache = Arc::new(tokio::sync::RwLock::new(subs_bcast_cache));
 
     if let Some(pg_conf) = agent.config().api.pg.clone() {
         info!("Starting PostgreSQL wire-compatible server");
@@ -355,60 +441,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             pg_server.local_addr
         );
     }
-
-    let mut matcher_id_cache = MatcherIdCache::default();
-    let mut matcher_bcast_cache = MatcherBroadcastCache::default();
-
-    {
-        // open database and set its journal to WAL
-        let rows = {
-            let subscriptions_db_path = agent.config().db.subscriptions_db_path();
-            let mut conn = rusqlite::Connection::open(&subscriptions_db_path)?;
-            conn.execute_batch(
-                r#"
-                    PRAGMA journal_mode = WAL;
-                    PRAGMA synchronous = NORMAL;
-                "#,
-            )?;
-
-            migrate_subs(&mut conn)?;
-
-            let res = conn
-                .prepare("SELECT id, sql FROM subs")?
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<(uuid::Uuid, String)>>>()?;
-
-            // the let is required or else we get a lifetime error
-            #[allow(clippy::let_and_return)]
-            res
-        };
-
-        for (id, sql) in rows {
-            let conn = block_in_place(|| agent.pool().dedicated())?;
-            let (evt_tx, evt_rx) = channel(512);
-            match Matcher::restore(id, &agent.schema().read(), conn, evt_tx, &sql) {
-                Ok(handle) => {
-                    info!(sub_id = %id, "Restored subscription");
-                    agent.matchers().write().insert(id, handle);
-                    let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
-                    tokio::spawn(process_sub_channel(
-                        agent.clone(),
-                        id,
-                        sub_tx.clone(),
-                        evt_rx,
-                    ));
-                    matcher_id_cache.insert(sql, id);
-                    matcher_bcast_cache.insert(id, sub_tx);
-                }
-                Err(e) => {
-                    error!("could not restore subscription {id}: {e}");
-                }
-            }
-        }
-    };
-
-    let matcher_id_cache = Arc::new(tokio::sync::RwLock::new(matcher_id_cache));
-    let matcher_bcast_cache = Arc::new(tokio::sync::RwLock::new(matcher_bcast_cache));
 
     let (to_send_tx, to_send_rx) = channel(10240);
     let (notifications_tx, notifications_rx) = channel(10240);
@@ -896,8 +928,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             tower::ServiceBuilder::new()
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
                 .layer(Extension(agent.clone()))
-                .layer(Extension(matcher_id_cache))
-                .layer(Extension(matcher_bcast_cache))
+                .layer(Extension(subs_bcast_cache))
+                .layer(Extension(subs))
                 .layer(Extension(tripwire.clone())),
         )
         .layer(DefaultBodyLimit::disable())
@@ -1000,48 +1032,61 @@ async fn clear_overwritten_versions(agent: Agent) {
         info!("Starting compaction...");
         let start = Instant::now();
 
-        let mut to_check: BTreeMap<i64, (ActorId, i64)> = BTreeMap::new();
+        let bookie_clone = {
+            bookie
+                .read("gather_booked_for_compaction")
+                .await
+                .iter()
+                .map(|(actor_id, booked)| (*actor_id, booked.clone()))
+                .collect::<HashMap<ActorId, _>>()
+        };
 
-        {
-            let booked = bookie.read("clear_overwritten_versions").await;
-            for (actor_id, booked) in booked.iter() {
-                let versions = {
-                    match timeout(
-                        Duration::from_secs(1),
-                        booked.read(format!(
-                            "clear_overwritten_versions:{}",
-                            actor_id.as_simple()
-                        )),
-                    )
-                    .await
-                    {
-                        Ok(booked) => booked.current_versions(),
-                        Err(_) => {
-                            info!(%actor_id, "timed out acquiring read lock on bookkeeping, skipping for now");
-                            continue;
-                        }
+        let mut inserted = 0;
+        let mut deleted = 0;
+
+        let mut db_elapsed = Duration::new(0, 0);
+
+        for (actor_id, booked) in bookie_clone {
+            let mut versions = {
+                match timeout(
+                    Duration::from_secs(1),
+                    booked.read(format!(
+                        "clear_overwritten_versions:{}",
+                        actor_id.as_simple()
+                    )),
+                )
+                .await
+                {
+                    Ok(booked) => booked.current_versions(),
+                    Err(_) => {
+                        info!(%actor_id, "timed out acquiring read lock on bookkeeping, skipping for now");
+                        continue;
                     }
-                };
-                if versions.is_empty() {
-                    continue;
                 }
-                for (db_v, v) in versions {
-                    to_check.insert(db_v, (*actor_id, v));
-                }
+            };
+
+            if versions.is_empty() {
+                continue;
             }
-        }
 
-        debug!("got actors and their versions");
-
-        let cleared_versions: BTreeSet<i64> = {
-            match pool.read().await {
+            let cleared_versions = match pool.read().await {
                 Ok(mut conn) => {
+                    let start = Instant::now();
                     let res = block_in_place(|| {
                         let tx = conn.transaction()?;
-                        find_cleared_db_versions(&tx)
+                        find_cleared_db_versions(&tx, &actor_id)
                     });
+                    db_elapsed += start.elapsed();
                     match res {
-                        Ok(cleared) => cleared,
+                        Ok(cleared) => {
+                            debug!(
+                                actor_id = %actor_id,
+                                "Aggregated {} DB versions to clear in {:?}",
+                                cleared.len(),
+                                start.elapsed()
+                            );
+                            cleared
+                        }
                         Err(e) => {
                             error!("could not get cleared versions: {e}");
                             continue;
@@ -1052,58 +1097,46 @@ async fn clear_overwritten_versions(agent: Agent) {
                     error!("could not get read connection: {e}");
                     continue;
                 }
-            }
-        };
-
-        let mut to_clear_by_actor: BTreeMap<ActorId, Vec<(i64, i64)>> = BTreeMap::new();
-
-        for db_v in cleared_versions {
-            if let Some((actor_id, v)) = to_check.remove(&db_v) {
-                to_clear_by_actor
-                    .entry(actor_id)
-                    .or_default()
-                    .push((db_v, v));
-            }
-        }
-
-        let mut deleted = 0;
-        let mut inserted = 0;
-
-        for (actor_id, to_clear) in to_clear_by_actor {
-            info!(%actor_id, "Clearing {} versions", to_clear.len());
-            let booked = {
-                bookie
-                    .write(format!("to_clear_get_booked:{}", actor_id.as_simple()))
-                    .await
-                    .for_actor(actor_id)
             };
 
-            let mut bookedw = booked
-                .write(format!("clearing:{}", actor_id.as_simple()))
-                .await;
+            let mut to_clear = Vec::new();
 
-            for (_db_v, v) in to_clear.iter() {
-                if bookedw.contains_current(v) {
-                    bookedw.insert(*v, KnownDbVersion::Cleared);
-                    deleted += 1;
+            for db_v in cleared_versions {
+                if let Some(v) = versions.remove(&db_v) {
+                    to_clear.push((db_v, v))
                 }
             }
 
-            for range in to_clear
-                .iter()
-                .filter_map(|(_, v)| bookedw.cleared.get(v))
-                .dedup()
-            {
-                if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
-                    error!("could not schedule version to be cleared: {e}");
-                } else {
-                    inserted += 1;
+            if !to_clear.is_empty() {
+                let mut bookedw = booked
+                    .write(format!("clearing:{}", actor_id.as_simple()))
+                    .await;
+
+                for (_db_v, v) in to_clear.iter() {
+                    if bookedw.contains_current(v) {
+                        bookedw.insert(*v, KnownDbVersion::Cleared);
+                        deleted += 1;
+                    }
+                }
+
+                for range in to_clear
+                    .iter()
+                    .filter_map(|(_, v)| bookedw.cleared.get(v))
+                    .dedup()
+                {
+                    if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
+                        error!("could not schedule version to be cleared: {e}");
+                    } else {
+                        inserted += 1;
+                    }
                 }
             }
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
         info!(
-            "Compaction done, cleared {} DB bookkeeping table rows in {:?}",
+            "Compaction done, cleared {} DB bookkeeping table rows (wall time: {:?}, db time: {db_elapsed:?})",
             deleted - inserted,
             start.elapsed()
         );
@@ -1234,7 +1267,23 @@ pub async fn handle_change(agent: &Agent, bcast: BroadcastV1, bcast_msg_tx: &Sen
 }
 
 #[tracing::instrument(skip_all)]
-fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>> {
+fn find_cleared_db_versions(
+    tx: &Transaction,
+    actor_id: &ActorId,
+) -> rusqlite::Result<BTreeSet<i64>> {
+    let clock_site_id: Option<i64> = match tx
+        .prepare_cached("SELECT ordinal FROM crsql_site_id WHERE site_id = ?")?
+        .query_row([actor_id], |row| row.get(0))
+        .optional()?
+    {
+        Some(0) => None, // this is the current crsql_site_id which is going to be NULL in clock tables
+        Some(ordinal) => Some(ordinal),
+        None => {
+            warn!(actor_id = %actor_id, "could not find crsql ordinal for actor");
+            return Ok(Default::default());
+        }
+    };
+
     let tables = tx
         .prepare_cached(
             "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'",
@@ -1246,27 +1295,24 @@ fn find_cleared_db_versions(tx: &Transaction) -> rusqlite::Result<BTreeSet<i64>>
         return Ok(BTreeSet::new());
     }
 
+    let mut params: Vec<&dyn ToSql> = vec![actor_id];
     let to_clear_query = format!(
-        "SELECT DISTINCT db_version FROM __corro_bookkeeping WHERE db_version IS NOT NULL
+        "SELECT DISTINCT db_version FROM __corro_bookkeeping WHERE actor_id = ? AND db_version IS NOT NULL
             EXCEPT SELECT db_version FROM ({});",
         tables
             .iter()
-            .map(|table| format!("SELECT DISTINCT db_version FROM {table}"))
+            .map(|table| {
+                params.push(&clock_site_id);
+                format!("SELECT DISTINCT db_version FROM {table} WHERE site_id IS ?")
+            })
             .collect::<Vec<_>>()
             .join(" UNION ")
     );
 
-    let start = Instant::now();
     let cleared_db_versions: BTreeSet<i64> = tx
         .prepare_cached(&to_clear_query)?
-        .query_map([], |row| row.get(0))?
+        .query_map(params_from_iter(params.into_iter()), |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-
-    info!(
-        "Aggregated {} DB versions to clear in {:?}",
-        cleared_db_versions.len(),
-        start.elapsed()
-    );
 
     Ok(cleared_db_versions)
 }
@@ -1617,18 +1663,18 @@ fn store_empty_changeset(
 }
 
 fn clear_buffered_meta(
-    tx: &Transaction,
+    conn: &Connection,
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
 ) -> rusqlite::Result<()> {
     // remove all buffered changes for cleanup purposes
-    let count = tx
+    let count = conn
         .prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ?")?
         .execute(params![actor_id, versions.start(), versions.end()])?;
     debug!(%actor_id, ?versions, "deleted {count} buffered changes");
 
     // delete all bookkept sequences for this version
-    let count = tx
+    let count = conn
         .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?")?
         .execute(params![actor_id, versions.start(), versions.end()])?;
     debug!(%actor_id, ?versions, "deleted {count} sequences in bookkeeping");
@@ -1770,8 +1816,7 @@ async fn process_fully_buffered_changes(
             drop(bookedw);
 
             if let Some(db_version) = db_version {
-                // TODO: write changes into a queueing table
-                agent.process_subs_by_db_version(&conn, db_version);
+                agent.change_db_version(db_version);
             }
 
             true
@@ -2004,8 +2049,11 @@ pub async fn process_multiple_changes(
             }
         }
 
+        if let Some(db_version) = last_db_version {
+            agent.change_db_version(db_version);
+        }
+
         for (actor_id, changeset, src) in changesets {
-            process_subs(agent, changeset.changes());
             if matches!(src, ChangeSource::Broadcast) && !changeset.is_empty() {
                 if let Err(_e) =
                     agent
@@ -2259,37 +2307,6 @@ fn process_single_version(
     Ok((known, changeset))
 }
 
-pub fn process_subs(agent: &Agent, changeset: &[Change]) {
-    trace!("process subs...");
-
-    let matchers = agent.matchers().read();
-    for (id, matcher) in matchers.iter() {
-        if let Err(e) = matcher.process_changeset(changeset) {
-            error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
-        }
-    }
-}
-
-// pub fn process_subs_by_db_version(agent: &Agent, conn: &Connection, db_version: i64) {
-//     trace!("process subs by db version...");
-
-//     let mut matchers_to_delete = vec![];
-
-//     {
-//         let matchers = agent.matchers().read();
-//         for (id, matcher) in matchers.iter() {
-//             if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
-//                 error!("could not process change w/ matcher {id}, it is probably defunct! {e}");
-//                 matchers_to_delete.push(*id);
-//             }
-//         }
-//     }
-
-//     for id in matchers_to_delete {
-//         agent.matchers().write().remove(&id);
-//     }
-// }
-
 #[derive(Debug, thiserror::Error)]
 pub enum SyncClientError {
     #[error("bad status code: {0}")]
@@ -2522,9 +2539,11 @@ async fn write_empties_loop(
             _ = &mut tripwire => break
         }
 
-        if let Err(e) = process_completed_empties(&agent, &mut empties).await {
-            error!("could not process empties: {e}");
-        }
+        let empties_to_process = std::mem::take(&mut empties);
+        spawn_counted(
+            process_completed_empties(agent.clone(), empties_to_process)
+                .inspect_err(|e| error!("could not process empties: {e}")),
+        );
     }
     info!("Draining empty versions to process...");
     // drain empties channel
@@ -2534,7 +2553,7 @@ async fn write_empties_loop(
 
     if !empties.is_empty() {
         info!("Inserting last unprocessed empties before shut down");
-        if let Err(e) = process_completed_empties(&agent, &mut empties).await {
+        if let Err(e) = process_completed_empties(agent, empties).await {
             error!("could not process empties: {e}");
         }
     }
@@ -2628,8 +2647,8 @@ async fn sync_loop(
 
 #[tracing::instrument(skip_all, err)]
 async fn process_completed_empties(
-    agent: &Agent,
-    empties: &mut BTreeMap<ActorId, RangeInclusiveSet<i64>>,
+    agent: Agent,
+    empties: BTreeMap<ActorId, RangeInclusiveSet<i64>>,
 ) -> eyre::Result<()> {
     debug!(
         "processing empty versions (count: {})",
@@ -2639,7 +2658,7 @@ async fn process_completed_empties(
     let mut inserted = 0;
 
     let start = Instant::now();
-    while let Some((actor_id, empties)) = empties.pop_first() {
+    for (actor_id, empties) in empties {
         let v = empties.into_iter().collect::<Vec<_>>();
 
         for ranges in v.chunks(50) {
@@ -2664,107 +2683,6 @@ async fn process_completed_empties(
     );
 
     Ok(())
-}
-
-pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
-    let migrations: Vec<Box<dyn Migration>> = vec![
-        Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
-        Box::new(v0_2_0_migration as fn(&Transaction) -> rusqlite::Result<()>),
-    ];
-
-    corro_types::sqlite::migrate(conn, migrations)
-}
-
-fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        r#"
-            -- key/value for internal corrosion data (e.g. 'schema_version' => INT)
-            CREATE TABLE __corro_state (key TEXT NOT NULL PRIMARY KEY, value);
-
-            -- internal bookkeeping
-            CREATE TABLE __corro_bookkeeping (
-                actor_id BLOB NOT NULL,
-                start_version INTEGER NOT NULL,
-                end_version INTEGER,
-                db_version INTEGER,
-
-                last_seq INTEGER,
-
-                ts TEXT,
-
-                PRIMARY KEY (actor_id, start_version)
-            ) WITHOUT ROWID;
-
-            -- internal per-db-version seq bookkeeping
-            CREATE TABLE __corro_seq_bookkeeping (
-                -- remote actor / site id
-                site_id BLOB NOT NULL,
-                -- remote internal version
-                version INTEGER NOT NULL,
-                
-                -- start and end seq for this bookkept record
-                start_seq INTEGER NOT NULL,
-                end_seq INTEGER NOT NULL,
-
-                last_seq INTEGER NOT NULL,
-
-                -- timestamp, need to propagate...
-                ts TEXT NOT NULL,
-
-                PRIMARY KEY (site_id, version, start_seq)
-            ) WITHOUT ROWID;
-
-            -- buffered changes (similar schema as crsql_changes)
-            CREATE TABLE __corro_buffered_changes (
-                "table" TEXT NOT NULL,
-                pk BLOB NOT NULL,
-                cid TEXT NOT NULL,
-                val ANY, -- shouldn't matter I don't think
-                col_version INTEGER NOT NULL,
-                db_version INTEGER NOT NULL,
-                site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
-                seq INTEGER NOT NULL,
-                cl INTEGER NOT NULL, -- causal length
-
-                version INTEGER NOT NULL,
-
-                PRIMARY KEY (site_id, db_version, version, seq)
-            ) WITHOUT ROWID;
-            
-            -- SWIM memberships
-            CREATE TABLE __corro_members (
-                actor_id BLOB PRIMARY KEY NOT NULL,
-                address TEXT NOT NULL,
-            
-                state TEXT NOT NULL DEFAULT 'down',
-                foca_state JSON,
-
-                rtts JSON DEFAULT '[]'
-            ) WITHOUT ROWID;
-
-            -- tracked corrosion schema
-            CREATE TABLE __corro_schema (
-                tbl_name TEXT NOT NULL,
-                type TEXT NOT NULL,
-                name TEXT NOT NULL,
-                sql TEXT NOT NULL,
-            
-                source TEXT NOT NULL,
-            
-                PRIMARY KEY (tbl_name, type, name)
-            ) WITHOUT ROWID;
-        "#,
-    )?;
-
-    Ok(())
-}
-
-fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        "
-        CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version);
-    ",
-    )
 }
 
 #[cfg(test)]
@@ -3238,6 +3156,9 @@ pub mod tests {
 
             CREATE TABLE foo2 (a INTEGER NOT NULL PRIMARY KEY, b INTEGER);
             SELECT crsql_as_crr('foo2');
+
+            CREATE INDEX fooclock ON foo__crsql_clock (site_id, db_version);
+            CREATE INDEX foo2clock ON foo2__crsql_clock (site_id, db_version);
             ",
         )?;
 
@@ -3261,23 +3182,37 @@ pub mod tests {
             let mut prepped = conn.prepare("SELECT * FROM __corro_bookkeeping")?;
             let mut rows = prepped.query([])?;
 
+            println!("bookkeeping rows:");
             while let Ok(Some(row)) = rows.next() {
                 println!("row: {row:?}");
             }
         }
 
         {
-            let mut prepped = conn.prepare("SELECT DISTINCT db_version FROM foo2__crsql_clock UNION SELECT DISTINCT db_version FROM foo__crsql_clock;")?;
+            let mut prepped = conn
+                .prepare("SELECT * FROM foo2__crsql_clock UNION SELECT * FROM foo__crsql_clock;")?;
             let mut rows = prepped.query([])?;
 
+            println!("all clock rows:");
+            while let Ok(Some(row)) = rows.next() {
+                println!("row: {row:?}");
+            }
+        }
+
+        {
+            let mut prepped = conn.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT db_version FROM foo2__crsql_clock WHERE site_id IS ? UNION SELECT DISTINCT db_version FROM foo__crsql_clock WHERE site_id IS ?;")?;
+            let mut rows = prepped.query([rusqlite::types::Null, rusqlite::types::Null])?;
+
+            println!("matching clock rows:");
             while let Ok(Some(row)) = rows.next() {
                 println!("row: {row:?}");
             }
         }
 
         let tx = conn.transaction()?;
+        let actor_id: ActorId = tx.query_row("SELECT crsql_site_id()", [], |row| row.get(0))?;
 
-        let to_clear = find_cleared_db_versions(&tx)?;
+        let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
 
         println!("to_clear: {to_clear:?}");
 
@@ -3287,7 +3222,7 @@ pub mod tests {
         tx.execute("DELETE FROM __corro_bookkeeping WHERE db_version = 1", [])?;
         tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) SELECT crsql_site_id(), 1, 1", [])?;
 
-        let to_clear = find_cleared_db_versions(&tx)?;
+        let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
@@ -3298,14 +3233,14 @@ pub mod tests {
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = find_cleared_db_versions(&tx)?;
+        let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let to_clear = find_cleared_db_versions(&tx)?;
+        let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
 
         assert!(to_clear.contains(&2));
         assert!(!to_clear.contains(&3));
@@ -3316,7 +3251,7 @@ pub mod tests {
             "UPDATE __corro_bookkeeping SET end_version = 2 WHERE start_version = 1;",
             [],
         )?;
-        let to_clear = find_cleared_db_versions(&tx)?;
+        let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
 
         assert!(to_clear.is_empty());
 

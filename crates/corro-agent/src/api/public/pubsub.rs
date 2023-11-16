@@ -1,56 +1,55 @@
-use std::{
-    collections::HashMap,
-    io::Write,
-    sync::Arc,
-    task::Poll,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::{format_compact, ToCompactString};
 use corro_types::{
     agent::Agent,
-    api::{ChangeId, QueryEvent, QueryEventMeta, RowId, Statement},
-    change::SqliteValue,
-    pubsub::{Matcher, MatcherError, MatcherHandle, NormalizeStatementError},
+    api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
+    pubsub::{MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
     sqlite::SqlitePoolError,
 };
-use futures::{future::poll_fn, ready, Stream};
-use rusqlite::{Connection, Transaction};
+use futures::future::poll_fn;
+use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
-    sync::{broadcast, mpsc, oneshot, RwLock as TokioRwLock},
+    sync::{
+        broadcast,
+        mpsc::{self, error::TryRecvError},
+        RwLock as TokioRwLock,
+    },
     task::block_in_place,
 };
-use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
-use tokio_util::sync::PollSender;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use tripwire::Tripwire;
 use uuid::Uuid;
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct SubParams {
     #[serde(default)]
     from: Option<ChangeId>,
+    #[serde(default)]
+    skip_rows: bool,
 }
 
 pub async fn api_v1_sub_by_id(
-    Extension(agent): Extension<Agent>,
+    Extension(subs): Extension<SubsManager>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
-    sub_by_id(agent, id, params.from, &bcast_cache).await
+    sub_by_id(&subs, id, params, &bcast_cache).await
 }
 
 async fn sub_by_id(
-    agent: Agent,
+    subs: &SubsManager,
     id: Uuid,
-    from: Option<ChangeId>,
+    params: SubParams,
     bcast_cache: &SharedMatcherBroadcastCache,
 ) -> hyper::Response<hyper::Body> {
     let (matcher, rx) = match bcast_cache.read().await.get(&id).and_then(|tx| {
-        agent.matchers().read().get(&id).cloned().map(|matcher| {
+        subs.get(&id).map(|matcher| {
             debug!("found matcher by id {id}");
             (matcher, tx.subscribe())
         })
@@ -59,7 +58,7 @@ async fn sub_by_id(
         None => {
             // ensure this goes!
             bcast_cache.write().await.remove(&id);
-            if let Some(handle) = agent.matchers().write().remove(&id) {
+            if let Some(handle) = subs.remove(&id) {
                 info!(sub_id = %id, "Removed subscription from sub_by_id");
                 tokio::spawn(handle.cleanup());
             }
@@ -79,11 +78,11 @@ async fn sub_by_id(
 
     let (evt_tx, evt_rx) = mpsc::channel(512);
 
-    tokio::spawn(catch_up_sub(agent, matcher, from, rx, evt_tx));
+    tokio::spawn(catch_up_sub(matcher, params, rx, evt_tx));
 
     let (tx, body) = hyper::Body::channel();
 
-    tokio::spawn(forward_bytes_to_body_sender(evt_rx, tx));
+    tokio::spawn(forward_bytes_to_body_sender(id, evt_rx, tx));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -94,11 +93,11 @@ async fn sub_by_id(
 
 fn make_query_event_bytes(
     buf: &mut BytesMut,
-    query_evt: QueryEvent,
+    query_evt: &QueryEvent,
 ) -> serde_json::Result<(Bytes, QueryEventMeta)> {
     {
         let mut writer = buf.writer();
-        serde_json::to_writer(&mut writer, &query_evt)?;
+        serde_json::to_writer(&mut writer, query_evt)?;
 
         // NOTE: I think that's infaillible...
         writer
@@ -114,7 +113,7 @@ const MAX_UNSUB_TIME: Duration = Duration::from_secs(300);
 const RECEIVERS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 pub async fn process_sub_channel(
-    agent: Agent,
+    subs: SubsManager,
     id: Uuid,
     tx: broadcast::Sender<(Bytes, QueryEventMeta)>,
     mut evt_rx: mpsc::Receiver<QueryEvent>,
@@ -144,7 +143,7 @@ pub async fn process_sub_channel(
             biased;
             Some(query_evt) = evt_rx.recv() => query_evt,
             _ = deadline_check => {
-                info!("All subscribers for {id} are gone and didn't come back within {MAX_UNSUB_TIME:?}");
+                info!(sub_id = %id, "All listeners for subscription are gone and didn't come back within {MAX_UNSUB_TIME:?}");
                 break;
             },
             _ = subs_check.tick() => {
@@ -162,7 +161,7 @@ pub async fn process_sub_channel(
             }
         };
 
-        let is_still_active = match make_query_event_bytes(&mut buf, query_evt) {
+        let is_still_active = match make_query_event_bytes(&mut buf, &query_evt) {
             Ok(b) => tx.send(b).is_ok(),
             Err(e) => {
                 _ = tx.send((
@@ -176,17 +175,17 @@ pub async fn process_sub_channel(
         if is_still_active {
             deadline = None;
         } else {
-            debug!("no active subscribers");
+            debug!(sub_id = %id, "no active listeners to receive subscription event: {query_evt:?}");
             if deadline.is_none() {
                 deadline = Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)));
             }
         }
     }
 
-    debug!("subscription query channel done");
+    warn!(sub_id = %id, "subscription query channel done");
 
     // remove and get handle from the agent's "matchers"
-    let handle = match agent.matchers().write().remove(&id) {
+    let handle = match subs.remove(&id) {
         Some(h) => {
             info!(sub_id = %id, "Removed subscription from process_sub_channel");
             h
@@ -259,14 +258,16 @@ pub enum MatcherUpsertError {
     Matcher(#[from] MatcherError),
     #[error("a `from` query param was supplied, but no existing subscription found")]
     SubFromWithoutMatcher,
+    #[error("found a subscription, but missing broadcaster")]
+    MissingBroadcaster,
 }
 
 impl MatcherUpsertError {
     fn status_code(&self) -> StatusCode {
         match self {
-            MatcherUpsertError::Pool(_) | MatcherUpsertError::CouldNotExpand => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            MatcherUpsertError::Pool(_)
+            | MatcherUpsertError::CouldNotExpand
+            | MatcherUpsertError::MissingBroadcaster => StatusCode::INTERNAL_SERVER_ERROR,
             MatcherUpsertError::Sqlite(_)
             | MatcherUpsertError::NormalizeStatement(_)
             | MatcherUpsertError::Matcher(_)
@@ -287,19 +288,21 @@ impl From<MatcherUpsertError> for hyper::Response<hyper::Body> {
             .expect("could not build error response")
     }
 }
-pub type MatcherIdCache = HashMap<String, Uuid>;
-pub type SharedMatcherIdCache = Arc<TokioRwLock<MatcherIdCache>>;
 pub type MatcherBroadcastCache = HashMap<Uuid, broadcast::Sender<(Bytes, QueryEventMeta)>>;
 pub type SharedMatcherBroadcastCache = Arc<TokioRwLock<MatcherBroadcastCache>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatchUpError {
     #[error(transparent)]
+    Pool(#[from] SqlitePoolError),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Send(#[from] mpsc::error::SendError<Bytes>),
     #[error(transparent)]
     SerdeJson(#[from] serde_json::Error),
+    #[error(transparent)]
+    Matcher(#[from] MatcherError),
 }
 
 fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> Bytes {
@@ -318,173 +321,145 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
 }
 
 fn catch_up_sub_anew(
-    tx: &Transaction,
-    matcher: MatcherHandle,
-    buf: &mut BytesMut,
+    conn: &Connection,
+    matcher: &MatcherHandle,
     evt_tx: &mpsc::Sender<Bytes>,
-) -> Result<(), CatchUpError> {
-    let mut query_cols = vec![];
-    for i in 0..(matcher.parsed_columns().len()) {
-        query_cols.push(format!("col_{i}"));
-    }
-    let mut prepped = tx.prepare_cached(&format!(
-        "SELECT __corro_rowid,{} FROM {}",
-        query_cols.join(","),
-        matcher.table_name()
-    ))?;
-    let col_count = prepped.column_count();
+) -> Result<ChangeId, CatchUpError> {
+    let (q_tx, mut q_rx) = mpsc::channel(10240);
 
-    evt_tx.blocking_send(
-        make_query_event_bytes(buf, QueryEvent::Columns(matcher.col_names().to_vec()))?.0,
-    )?;
+    tokio::spawn({
+        let evt_tx = evt_tx.clone();
+        async move {
+            let mut buf = BytesMut::new();
+            while let Some(event) = q_rx.recv().await {
+                match make_query_event_bytes(&mut buf, &event) {
+                    Ok((b, _)) => {
+                        if let Err(e) = evt_tx.send(b).await {
+                            error!("could not send catching up event bytes: {e}");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!("could not serialize catching up event: {e}");
+                        return;
+                    }
+                }
+            }
+        }
+    });
 
-    let start = Instant::now();
-    let mut rows = prepped.query(())?;
-    let elapsed = start.elapsed();
-
-    loop {
-        let row = match rows.next()? {
-            Some(row) => row,
-            None => break,
-        };
-        let rowid = row.get(0)?;
-
-        let cells = (1..col_count)
-            .map(|i| row.get::<_, SqliteValue>(i))
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        evt_tx.blocking_send(make_query_event_bytes(buf, QueryEvent::Row(rowid, cells))?.0)?;
-    }
-
-    evt_tx.blocking_send(
-        make_query_event_bytes(
-            buf,
-            QueryEvent::EndOfQuery {
-                time: elapsed.as_secs_f64(),
-                change_id: Some(
-                    tx.prepare(&format!(
-                        "SELECT COALESCE(MAX(id),0) FROM {}",
-                        matcher.changes_table_name()
-                    ))?
-                    .query_row([], |row| row.get(0))?,
-                ),
-            },
-        )?
-        .0,
-    )?;
-
-    Ok(())
+    matcher.all_rows(conn, q_tx).map_err(CatchUpError::from)
 }
 
 fn catch_up_sub_from(
-    tx: &Transaction, // read transaction
-    matcher: MatcherHandle,
+    conn: &Connection, // read transaction
+    matcher: &MatcherHandle,
     from: ChangeId,
-    buf: &mut BytesMut,
     evt_tx: &mpsc::Sender<Bytes>,
-) -> Result<(), CatchUpError> {
-    let mut query_cols = vec![];
-    for i in 0..(matcher.parsed_columns().len()) {
-        query_cols.push(format!("col_{i}"));
-    }
+) -> Result<ChangeId, CatchUpError> {
+    let (q_tx, mut q_rx) = mpsc::channel(10240);
 
-    let mut prepped = tx.prepare_cached(&format!(
-        "SELECT id, type, __corro_rowid, {} FROM {} WHERE id > ?",
-        query_cols.join(","),
-        matcher.changes_table_name()
-    ))?;
+    tokio::spawn({
+        let evt_tx = evt_tx.clone();
+        async move {
+            let mut buf = BytesMut::new();
+            while let Some(event) = q_rx.recv().await {
+                match make_query_event_bytes(&mut buf, &event) {
+                    Ok((b, _)) => {
+                        if let Err(e) = evt_tx.send(b).await {
+                            error!("could not send catching up event bytes: {e}");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!("could not serialize catching up event: {e}");
+                        return;
+                    }
+                }
+            }
+        }
+    });
 
-    let col_count = prepped.column_count();
-
-    let mut rows = prepped.query([from])?;
-
-    loop {
-        let row = match rows.next()? {
-            Some(row) => row,
-            None => break,
-        };
-        let id = row.get(0)?;
-        let change_type = row.get(1)?;
-        let rowid = row.get(2)?;
-
-        let cells = (3..col_count)
-            .map(|i| row.get::<_, SqliteValue>(i))
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        evt_tx.blocking_send(
-            make_query_event_bytes(buf, QueryEvent::Change(change_type, rowid, cells, id))?.0,
-        )?;
-    }
-
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum LastQueryEvent {
-    Row(RowId),
-    Change(ChangeId),
+    matcher
+        .changes_since(from, conn, q_tx)
+        .map_err(CatchUpError::from)
 }
 
 pub async fn catch_up_sub(
-    agent: Agent,
     matcher: MatcherHandle,
-    from: Option<ChangeId>,
-    sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
+    params: SubParams,
+    mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     evt_tx: mpsc::Sender<Bytes>,
-) -> eyre::Result<()> {
-    debug!("catching up sub {} from: {from:?}", matcher.id());
-    let (ready_tx, ready_rx) = oneshot::channel();
+) {
+    debug!("catching up sub {} params: {:?}", matcher.id(), params);
 
-    let forward_task = tokio::spawn(forward_sub_to_sender(
-        Some(ready_rx),
-        sub_rx,
-        evt_tx.clone(),
-    ));
+    let mut buf = BytesMut::new();
 
-    let last_query_event = {
-        let mut buf = BytesMut::new();
+    // buffer events while we catch up...
+    let (queue_tx, mut queue_rx) = mpsc::channel(10240);
 
-        let mut conn = match agent.pool().dedicated() {
+    let cancel = CancellationToken::new();
+    // just in case...
+    let _drop_guard = cancel.clone().drop_guard();
+
+    let queue_task = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            loop {
+                let (buf, meta) = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    },
+                    Ok(res) = sub_rx.recv() => res,
+                    else => break
+                };
+
+                if let QueryEventMeta::Change(change_id) = meta {
+                    if let Err(_e) = queue_tx.try_send((buf, change_id)) {
+                        return Err(eyre::eyre!("catching up too slowly, gave up after buffering {MAX_EVENTS_BUFFER_SIZE} events"));
+                    }
+                }
+            }
+            Ok(sub_rx)
+        }
+    });
+
+    let mut last_change_id = {
+        let mut conn = match matcher.pool().get().await {
             Ok(conn) => conn,
             Err(e) => {
-                evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await?;
-                return Ok(());
+                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                return;
             }
         };
 
         let res = block_in_place(|| {
             let tx = conn.transaction()?; // read transaction
-            let last_query_event = match from {
+            match params.from {
                 Some(from) => {
-                    let max_change_id: ChangeId = tx
-                        .prepare(&format!(
-                            "SELECT COALESCE(MAX(id), 0) FROM {}",
-                            matcher.changes_table_name()
-                        ))?
-                        .query_row([], |row| row.get(0))?;
-                    catch_up_sub_from(&tx, matcher, from, &mut buf, &evt_tx)?;
+                    let change_id = catch_up_sub_from(&tx, &matcher, from, &evt_tx)?;
                     debug!("sub caught up to their 'from' of {from:?}");
-                    LastQueryEvent::Change(max_change_id)
+                    Ok(change_id)
                 }
                 None => {
-                    let max_row_id: RowId = tx
-                        .prepare(&format!(
-                            "SELECT COALESCE(MAX(__corro_rowid), 0) FROM {}",
-                            matcher.table_name()
-                        ))?
-                        .query_row([], |row| row.get(0))?;
-                    catch_up_sub_anew(&tx, matcher, &mut buf, &evt_tx)?;
-                    debug!("sub caught up from scratch");
-                    LastQueryEvent::Row(max_row_id)
+                    if params.skip_rows {
+                        Ok(matcher.max_change_id(&tx)?)
+                    } else {
+                        let change_id = catch_up_sub_anew(&tx, &matcher, &evt_tx)?;
+                        debug!("sub caught up from scratch");
+                        Ok(change_id)
+                    }
                 }
-            };
-            Ok(last_query_event)
+            }
         });
 
         match res {
-            Ok(last_query_event) => last_query_event,
+            Ok(change_id) => change_id,
             Err(e) => {
                 match e {
+                    CatchUpError::Pool(e) => {
+                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                    }
                     CatchUpError::Sqlite(e) => {
                         _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
                     }
@@ -494,93 +469,216 @@ pub async fn catch_up_sub(
                     CatchUpError::Send(_) => {
                         // can't send
                     }
+                    CatchUpError::Matcher(_) => {
+                        // upstream error
+                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                    }
                 }
-                return Ok(());
+                return;
             }
         }
     };
 
-    if let Err(_e) = ready_tx.send(last_query_event) {
-        warn!("subscriber catch up readiness receiver was gone, aborting...");
-        return Ok(());
+    let min_change_id = last_change_id + 1;
+    info!(sub_id = %matcher.id(), "minimum expected change id: {min_change_id:?}");
+
+    let mut pending_event = None;
+
+    let last_sub_change_id = match queue_rx.try_recv() {
+        Ok((event_buf, change_id)) => {
+            info!(sub_id = %matcher.id(), "last change id received by subscription: {change_id:?}");
+            pending_event = Some((event_buf, change_id));
+            Some(change_id)
+        }
+        Err(e) => match e {
+            TryRecvError::Empty => {
+                let last_change_id_sent = matcher.last_change_id_sent();
+                info!(sub_id = %matcher.id(), "last change id sent by subscription: {last_change_id_sent:?}");
+                if last_change_id_sent <= last_change_id {
+                    None
+                } else {
+                    Some(last_change_id_sent)
+                }
+            }
+            TryRecvError::Disconnected => {
+                // abnormal
+                _ = evt_tx
+                    .send(error_to_query_event_bytes(
+                        &mut buf,
+                        "exceeded events buffer",
+                    ))
+                    .await;
+                return;
+            }
+        },
+    };
+
+    if let Some(change_id) = last_sub_change_id {
+        debug!(sub_id = %matcher.id(), "got a change to check: {change_id:?}");
+        for i in 0..5 {
+            if change_id > min_change_id {
+                // missed some updates!
+                info!(sub_id = %matcher.id(), "attempt #{} to catch up subcription from change id: {change_id:?} (last: {last_change_id:?})", i+1);
+
+                let mut conn = match matcher.pool().get().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                        return;
+                    }
+                };
+
+                let res = block_in_place(|| {
+                    let tx = conn.transaction()?; // read transaction
+                    let new_last_change_id =
+                        catch_up_sub_from(&tx, &matcher, last_change_id, &evt_tx)?;
+                    debug!(sub_id = %matcher.id(), "sub caught up to the last max change id we got! {last_change_id:?} -> {new_last_change_id:?}");
+                    Ok(new_last_change_id)
+                });
+
+                match res {
+                    Ok(new_last_change_id) => last_change_id = new_last_change_id,
+                    Err(e) => {
+                        match e {
+                            CatchUpError::Pool(e) => {
+                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                            }
+                            CatchUpError::Sqlite(e) => {
+                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                            }
+                            CatchUpError::SerdeJson(e) => {
+                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                            }
+                            CatchUpError::Send(_) => {
+                                // can't send
+                            }
+                            CatchUpError::Matcher(_) => {
+                                // upstream error
+                                _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+                            }
+                        }
+                        return;
+                    }
+                }
+            } else {
+                break;
+            }
+            // sleep 100 millis
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if change_id > min_change_id {
+            _ = evt_tx
+                .send(error_to_query_event_bytes(
+                    &mut buf,
+                    "could not catch up to changes in 5 attempts",
+                ))
+                .await;
+            return;
+        }
     }
 
-    // TODO: handle this spawn error?
-    _ = forward_task.await;
+    info!(sub_id = %matcher.id(), "subscription is caught up, no gaps in change id. last change id: {last_change_id:?}, last_sub_change_id: {last_sub_change_id:?}");
 
-    Ok(())
+    if let Some((event_buf, change_id)) = pending_event {
+        info!(sub_id = %matcher.id(), "had a pending event we popped from the queue, id: {change_id:?} (last change id: {last_change_id:?})");
+        if change_id > last_change_id {
+            info!(sub_id = %matcher.id(), "change was more recent, sending!");
+            if let Err(_e) = evt_tx.send(event_buf).await {
+                warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
+                return;
+            }
+        }
+    }
+
+    // cancel queue task!
+    cancel.cancel();
+
+    while let Some((event_buf, change_id)) = queue_rx.recv().await {
+        info!(sub_id = %matcher.id(), "processing buffered change, id: {change_id:?} (last change id: {last_change_id:?})");
+        if change_id > last_change_id {
+            info!(sub_id = %matcher.id(), "change was more recent, sending!");
+            if let Err(_e) = evt_tx.send(event_buf).await {
+                warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
+                return;
+            }
+        }
+    }
+
+    let sub_rx = match queue_task.await {
+        Ok(Ok(sub_rx)) => sub_rx,
+        Ok(Err(e)) => {
+            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+            return;
+        }
+        Err(e) => {
+            _ = evt_tx.send(error_to_query_event_bytes(&mut buf, e)).await;
+            return;
+        }
+    };
+
+    forward_sub_to_sender(matcher.id(), sub_rx, evt_tx).await
 }
 
 pub async fn upsert_sub(
     agent: &Agent,
-    cache: &SharedMatcherIdCache,
+    subs: &SubsManager,
     bcast_cache: &SharedMatcherBroadcastCache,
     stmt: Statement,
-    from: Option<ChangeId>,
+    params: SubParams,
     tx: mpsc::Sender<Bytes>,
+    tripwire: Tripwire,
 ) -> Result<Uuid, MatcherUpsertError> {
     let stmt = expand_sql(agent, &stmt).await?;
 
-    let mut cache_write = cache.write().await;
     let mut bcast_write = bcast_cache.write().await;
 
-    let maybe_matcher = cache_write
-        .get(&stmt)
-        .and_then(|id| bcast_write.get(id).map(|sender| (*id, sender)));
+    let (handle, maybe_created) = subs.get_or_insert(
+        &stmt,
+        &agent.config().db.subscriptions_path(),
+        &agent.schema().read(),
+        agent.pool(),
+        agent.rx_db_version(),
+        tripwire,
+    )?;
 
-    if let Some((matcher_id, sender)) = maybe_matcher {
-        debug!("found matcher id {matcher_id} w/ sender");
-        let maybe_matcher = (sender.receiver_count() > 0)
-            .then(|| agent.matchers().read().get(&matcher_id).cloned())
-            .flatten();
-        if let Some(matcher) = maybe_matcher {
-            debug!("found matcher handle");
-            let rx = sender.subscribe();
-            tokio::spawn(catch_up_sub(agent.clone(), matcher, from, rx, tx));
-            return Ok(matcher_id);
-        } else {
-            cache_write.remove(&stmt);
-            bcast_write.remove(&matcher_id);
+    if let Some(created) = maybe_created {
+        if params.from.is_some() {
+            return Err(MatcherUpsertError::SubFromWithoutMatcher);
         }
+
+        let (sub_tx, sub_rx) = broadcast::channel(10240);
+
+        tokio::spawn(forward_sub_to_sender(handle.id(), sub_rx, tx));
+
+        bcast_write.insert(handle.id(), sub_tx.clone());
+
+        tokio::spawn(process_sub_channel(
+            subs.clone(),
+            handle.id(),
+            sub_tx,
+            created.evt_rx,
+        ));
+
+        Ok(handle.id())
+    } else {
+        let id = handle.id();
+        let sub_tx = bcast_write
+            .get(&id)
+            .cloned()
+            .ok_or(MatcherUpsertError::MissingBroadcaster)?;
+        debug!("found matcher handle");
+
+        tokio::spawn(catch_up_sub(handle, params, sub_tx.subscribe(), tx));
+
+        Ok(id)
     }
-
-    if from.is_some() {
-        return Err(MatcherUpsertError::SubFromWithoutMatcher);
-    }
-
-    let conn = agent.pool().dedicated()?;
-
-    let (evt_tx, evt_rx) = mpsc::channel(512);
-
-    let matcher_id = Uuid::new_v4();
-
-    let handle = Matcher::create(matcher_id, &agent.schema().read(), conn, evt_tx, &stmt)?;
-
-    let (sub_tx, sub_rx) = broadcast::channel(10240);
-
-    cache_write.insert(stmt, matcher_id);
-    bcast_write.insert(matcher_id, sub_tx.clone());
-
-    {
-        agent.matchers().write().insert(matcher_id, handle);
-    }
-
-    tokio::spawn(forward_sub_to_sender(None, sub_rx, tx));
-
-    tokio::spawn(process_sub_channel(
-        agent.clone(),
-        matcher_id,
-        sub_tx,
-        evt_rx,
-    ));
-
-    Ok(matcher_id)
 }
 
 pub async fn api_v1_subs(
     Extension(agent): Extension<Agent>,
-    Extension(sub_cache): Extension<SharedMatcherIdCache>,
+    Extension(subs): Extension<SubsManager>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
+    Extension(tripwire): Extension<Tripwire>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
@@ -589,11 +687,12 @@ pub async fn api_v1_subs(
 
     let matcher_id = match upsert_sub(
         &agent,
-        &sub_cache,
+        &subs,
         &bcast_cache,
         stmt,
-        params.from,
+        params,
         forward_tx,
+        tripwire,
     )
     .await
     {
@@ -601,7 +700,7 @@ pub async fn api_v1_subs(
         Err(e) => return hyper::Response::<hyper::Body>::from(e),
     };
 
-    tokio::spawn(forward_bytes_to_body_sender(forward_rx, tx));
+    tokio::spawn(forward_bytes_to_body_sender(matcher_id, forward_rx, tx));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -613,158 +712,64 @@ pub async fn api_v1_subs(
 const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 
 async fn forward_sub_to_sender(
-    ready: Option<oneshot::Receiver<LastQueryEvent>>,
+    sub_id: Uuid,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     tx: mpsc::Sender<Bytes>,
 ) {
-    let mut buf = BytesMut::new();
-    if let Some(mut ready) = ready {
-        let mut events_buf = vec![];
-
-        let last_query_event = loop {
-            tokio::select! {
-                biased;
-                ready_res = &mut ready => match ready_res {
-                    Ok(last_query_event) => {
-                        break last_query_event;
-                    },
-                    Err(_e) => {
-                        _ = tx.send(error_to_query_event_bytes(&mut buf, "sub ready channel closed")).await;
-                        return;
-                    }
-                },
-                query_evt_res = sub_rx.recv() => match query_evt_res {
-                    Ok(query_evt) => {
-                        events_buf.push(query_evt);
-                    },
-                    Err(e) => {
-                        _ = tx.send(error_to_query_event_bytes(&mut buf, e)).await;
-                        return;
-                    }
-                },
-            }
-
-            if events_buf.len() > MAX_EVENTS_BUFFER_SIZE {
-                error!("subscriber could not catch up in time, buffered over {MAX_EVENTS_BUFFER_SIZE} events and bailed");
-                _ = tx.send(error_to_query_event_bytes(&mut buf, format!("catching up too slowly, gave up after buffering {MAX_EVENTS_BUFFER_SIZE} events"))).await;
-                return;
-            }
-        };
-
-        let mut skipped = 0;
-        let mut sent = 0;
-
-        for (bytes, meta) in events_buf {
-            // prevent sending duplicate query events by comparing the last sent event
-            // w/ buffered events
-            match (meta, last_query_event) {
-                // already sent this change!
-                (QueryEventMeta::Change(change_id), LastQueryEvent::Change(last_change_id))
-                    if last_change_id >= change_id =>
-                {
-                    skipped += 1;
-                    continue;
-                }
-                // already sent this row!
-                (QueryEventMeta::Row(row_id), LastQueryEvent::Row(last_row_id))
-                    if last_row_id >= row_id =>
-                {
-                    skipped += 1;
-                    continue;
-                }
-                // buffered a row, which is slightly unexpected,
-                // but we shouldn't send rows if we're expecting changes only
-                (QueryEventMeta::Row(_), LastQueryEvent::Change(_)) => {
-                    skipped += 1;
-                    continue;
-                }
-                _ => {
-                    // nothing to do.
-                }
-            }
-            if let Err(_e) = tx.send(bytes).await {
-                warn!("could not send buffered events to subscriber, receiver must be gone!");
-                return;
-            }
-            sent += 0;
-        }
-
-        debug!("sent {sent} buffered events, skipped: {skipped}");
-    }
-
-    let chunker = tokio_stream::wrappers::BroadcastStream::new(sub_rx)
-        .chunks_timeout(10, Duration::from_millis(10));
-
-    tokio::pin!(chunker);
-
-    let mut tx = PollSender::new(tx);
-
-    loop {
-        let res: Result<Option<Bytes>, BroadcastStreamRecvError> = poll_fn(|cx| {
-            if let Err(_e) = ready!(tx.poll_reserve(cx)) {
-                return Poll::Ready(Ok(None));
-            }
-            match ready!(chunker.as_mut().poll_next(cx)) {
-                Some(chunks) => {
-                    for chunk_res in chunks {
-                        let (chunk, _) = chunk_res?;
-                        buf.extend_from_slice(&chunk);
-                    }
-                    Poll::Ready(Ok(Some(buf.split().freeze())))
-                }
-                None => Poll::Ready(Ok(None)),
-            }
-        })
-        .await;
-
-        match res {
-            Ok(Some(b)) => {
-                if let Err(_e) = tx.send_item(b) {
-                    error!("could not forward subscription query event to receiver, channel is closed!");
-                    return;
-                }
-            }
-            Ok(None) => {
-                debug!("finished w/ broadcast");
-                break;
-            }
-            Err(e) => {
-                error!("could not receive subscription query event: {e}");
-                buf.clear();
-                // should be safe to send because the poll to reserve succeeded
-                if let Err(_e) = tx.send_item(error_to_query_event_bytes(&mut buf, e)) {
-                    debug!("could not send back subscription receive error! channel is closed");
-                }
-                return;
-            }
+    info!(%sub_id, "forwarding subscription events to a sender");
+    while let Ok((event_buf, _meta)) = sub_rx.recv().await {
+        if let Err(e) = tx.send(event_buf).await {
+            warn!(%sub_id, "could not send subscription event to channel: {e}");
+            return;
         }
     }
+    info!(%sub_id, "events subcription ran out");
 }
 
-async fn forward_bytes_to_body_sender(mut rx: mpsc::Receiver<Bytes>, mut tx: hyper::body::Sender) {
+async fn forward_bytes_to_body_sender(
+    sub_id: Uuid,
+    mut rx: mpsc::Receiver<Bytes>,
+    mut tx: hyper::body::Sender,
+) {
+    let mut buf = BytesMut::new();
+
+    let send_deadline = tokio::time::sleep(Duration::from_millis(10));
+    tokio::pin!(send_deadline);
+
     loop {
-        let res = {
-            poll_fn(|cx| {
-                ready!(tx.poll_ready(cx))?;
-                Poll::Ready(Ok::<_, hyper::Error>(ready!(rx.poll_recv(cx))))
-            })
-            .await
-        };
-        match res {
-            Ok(Some(b)) => {
-                if let Err(e) = tx.send_data(b).await {
-                    error!("could not send query event data through body: {e}");
-                    break;
+        let to_send = tokio::select! {
+            biased;
+            Some(event_buf) = rx.recv() => {
+                buf.extend_from_slice(&event_buf);
+                if buf.len() >= 64*1024 {
+                    buf.split().freeze()
+                } else {
+                    continue;
                 }
-            }
-            Ok(None) => {
-                // done...
-                break;
-            }
-            Err(e) => {
-                debug!("body was not ready anymore: {e}");
-                break;
-            }
+            },
+            _ = &mut send_deadline => {
+                if !buf.is_empty() {
+                    buf.split().freeze()
+                } else {
+                    if let Err(e) = poll_fn(|cx| tx.poll_ready(cx)).await {
+                        warn!(%sub_id, error = %e, "body sender was closed or errored, stopping event broadcast sends");
+                        return;
+                    }
+                    send_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(10));
+                    continue;
+                }
+            },
+            else => break,
+        };
+
+        if let Err(e) = tx.send_data(to_send).await {
+            warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
+            return;
+        }
+    }
+    if !buf.is_empty() {
+        if let Err(e) = tx.send_data(buf.freeze()).await {
+            warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
         }
     }
 }
@@ -801,7 +806,7 @@ mod tests {
                 .gossip_addr("127.0.0.1:0".parse()?)
                 .api_addr("127.0.0.1:0".parse()?)
                 .build()?,
-            tripwire,
+            tripwire.clone(),
         )
         .await?;
 
@@ -832,14 +837,15 @@ mod tests {
 
         assert!(body.0.results.len() == 2);
 
-        let cache: SharedMatcherIdCache = Default::default();
+        let subs = SubsManager::default();
         let bcast_cache: SharedMatcherBroadcastCache = Default::default();
 
         {
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(cache.clone()),
+                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
+                Extension(tripwire.clone()),
                 axum::extract::Query(SubParams::default()),
                 axum::Json(Statement::Simple("select * from tests".into())),
             )
@@ -927,10 +933,12 @@ mod tests {
 
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(cache.clone()),
+                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
+                Extension(tripwire.clone()),
                 axum::extract::Query(SubParams {
                     from: Some(1.into()),
+                    ..Default::default()
                 }),
                 axum::Json(Statement::Simple("select * from tests".into())),
             )
@@ -987,8 +995,9 @@ mod tests {
 
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(cache.clone()),
+                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
+                Extension(tripwire.clone()),
                 axum::extract::Query(SubParams::default()),
                 axum::Json(Statement::Simple("select * from tests".into())),
             )
@@ -1056,10 +1065,12 @@ mod tests {
 
         let mut res = api_v1_subs(
             Extension(agent.clone()),
-            Extension(cache.clone()),
+            Extension(subs.clone()),
             Extension(bcast_cache.clone()),
+            Extension(tripwire.clone()),
             axum::extract::Query(SubParams {
                 from: Some(1.into()),
+                ..Default::default()
             }),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
@@ -1097,6 +1108,97 @@ mod tests {
                 RowId(5),
                 vec!["service-id-5".into(), "service-name-5".into()],
                 ChangeId(3),
+            )
+        );
+
+        // skip rows!
+
+        let mut res = api_v1_subs(
+            Extension(agent.clone()),
+            Extension(subs.clone()),
+            Extension(bcast_cache.clone()),
+            Extension(tripwire.clone()),
+            axum::extract::Query(SubParams {
+                skip_rows: true,
+                ..Default::default()
+            }),
+            axum::Json(Statement::Simple("select * from tests".into())),
+        )
+        .await
+        .into_response();
+
+        if !res.status().is_success() {
+            let b = res.body_mut().data().await.unwrap().unwrap();
+            println!("body: {}", String::from_utf8_lossy(&b));
+        }
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut rows_from = RowsIter {
+            body: res.into_body(),
+            codec: LinesCodec::new(),
+            buf: BytesMut::new(),
+            done: false,
+        };
+
+        let (status_code, _) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::Json(vec![Statement::WithParams(
+                "insert into tests (id, text) values (?,?)".into(),
+                vec!["service-id-6".into(), "service-name-6".into()],
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        assert_eq!(
+            rows_from.recv().await.unwrap().unwrap(),
+            QueryEvent::Change(
+                ChangeType::Insert,
+                RowId(6),
+                vec!["service-id-6".into(), "service-name-6".into()],
+                ChangeId(4),
+            )
+        );
+
+        // skip rows AND from
+
+        let mut res = api_v1_subs(
+            Extension(agent.clone()),
+            Extension(subs.clone()),
+            Extension(bcast_cache.clone()),
+            Extension(tripwire.clone()),
+            axum::extract::Query(SubParams {
+                skip_rows: true,
+                from: Some(ChangeId(3)),
+            }),
+            axum::Json(Statement::Simple("select * from tests".into())),
+        )
+        .await
+        .into_response();
+
+        if !res.status().is_success() {
+            let b = res.body_mut().data().await.unwrap().unwrap();
+            println!("body: {}", String::from_utf8_lossy(&b));
+        }
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut rows_from = RowsIter {
+            body: res.into_body(),
+            codec: LinesCodec::new(),
+            buf: BytesMut::new(),
+            done: false,
+        };
+
+        assert_eq!(
+            rows_from.recv().await.unwrap().unwrap(),
+            QueryEvent::Change(
+                ChangeType::Insert,
+                RowId(6),
+                vec!["service-id-6".into(), "service-name-6".into()],
+                ChangeId(4),
             )
         );
 

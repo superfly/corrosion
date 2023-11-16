@@ -68,15 +68,15 @@ pub struct DbConfig {
 }
 
 impl DbConfig {
-    pub fn subscriptions_db_path(&self) -> Utf8PathBuf {
+    pub fn subscriptions_path(&self) -> Utf8PathBuf {
         self.subscriptions_path
             .as_ref()
             .cloned()
             .unwrap_or_else(|| {
                 self.path
                     .parent()
-                    .map(|parent| parent.join("subscriptions.db"))
-                    .unwrap_or_else(|| "/subscriptions.db".into())
+                    .map(|parent| parent.join("subscriptions"))
+                    .unwrap_or_else(|| "/subscriptions".into())
             })
     }
 }

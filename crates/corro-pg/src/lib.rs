@@ -11,6 +11,7 @@ use std::{
 };
 
 use bytes::Buf;
+use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, KnownDbVersion},
@@ -18,7 +19,6 @@ use corro_types::{
     change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     config::PgConfig,
     schema::{parse_sql, Schema, SchemaError, SqliteType, Table},
-    sqlite::SqlitePoolError,
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
@@ -57,7 +57,10 @@ use sqlparser::ast::Statement as PgStatement;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::mpsc::{channel, Sender},
+    sync::{
+        mpsc::{channel, Sender},
+        AcquireError, OwnedSemaphorePermit,
+    },
     task::block_in_place,
 };
 use tokio_util::{codec::Framed, sync::CancellationToken};
@@ -333,7 +336,91 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
     Ok(cmds)
 }
 
+#[derive(Debug, Default)]
 enum OpenTx {
+    Started {
+        kind: OpenTxKind,
+        write_permit: Option<OwnedSemaphorePermit>,
+    },
+    #[default]
+    Ended,
+}
+
+impl OpenTx {
+    fn implicit() -> Self {
+        Self::Started {
+            kind: OpenTxKind::Implicit,
+            write_permit: None,
+        }
+    }
+    fn explicit() -> Self {
+        Self::Started {
+            kind: OpenTxKind::Explicit,
+            write_permit: None,
+        }
+    }
+
+    fn is_writing(&self) -> bool {
+        matches!(
+            self,
+            OpenTx::Started {
+                write_permit: Some(_),
+                ..
+            }
+        )
+    }
+
+    fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
+        match self {
+            OpenTx::Started { write_permit, .. } => *write_permit = Some(permit),
+            OpenTx::Ended => {
+                // do nothing, maybe bomb?
+            }
+        }
+    }
+
+    fn is_implicit(&self) -> bool {
+        matches!(
+            self,
+            OpenTx::Started {
+                kind: OpenTxKind::Implicit,
+                ..
+            }
+        )
+    }
+    fn is_explicit(&self) -> bool {
+        matches!(
+            self,
+            OpenTx::Started {
+                kind: OpenTxKind::Explicit,
+                ..
+            }
+        )
+    }
+    fn is_ended(&self) -> bool {
+        matches!(self, OpenTx::Ended)
+    }
+
+    fn start_implicit(&mut self) {
+        *self = Self::implicit()
+    }
+
+    fn start_explicit(&mut self) {
+        *self = Self::explicit()
+    }
+
+    fn end(&mut self) -> Option<OwnedSemaphorePermit> {
+        let permit = match self {
+            OpenTx::Started { write_permit, .. } => write_permit.take(),
+            OpenTx::Ended => None,
+        };
+        *self = OpenTx::Ended;
+        permit
+    }
+}
+
+#[derive(Debug)]
+enum OpenTxKind {
     Implicit,
     Explicit,
 }
@@ -615,7 +702,7 @@ pub async fn start(
 
                     let mut discard_until_sync = false;
 
-                    let mut open_tx = None;
+                    let mut open_tx = OpenTx::default();
 
                     'outer: while let Some(msg) = front_rx.blocking_recv() {
                         debug!("msg: {msg:?}");
@@ -729,29 +816,34 @@ pub async fn start(
                                             .filter_map(|oid| Type::from_oid(*oid))
                                             .collect();
 
+                                        debug!("params types {param_types:?}");
+
                                         if param_types.len() != prepped.parameter_count() {
                                             param_types = parameter_types(&schema, &parsed_cmd)
                                                 .into_iter()
-                                                .map(|param| match param {
-                                                    (SqliteType::Null, _) => unreachable!(),
-                                                    (SqliteType::Text, src) => match src {
-                                                        Some("JSON") => Type::JSON,
-                                                        _ => Type::TEXT,
-                                                    },
-                                                    (SqliteType::Numeric, Some(src)) => match src {
-                                                        "BOOLEAN" | "BOOL" => Type::BOOL,
-                                                        _ => Type::FLOAT8,
-                                                    },
-                                                    (SqliteType::Numeric, src) => match src {
-                                                        Some("DATETIME") => Type::TIMESTAMP,
-                                                        _ => Type::FLOAT8,
-                                                    },
-                                                    (SqliteType::Integer, _src) => Type::INT8,
-                                                    (SqliteType::Real, _src) => Type::FLOAT8,
-                                                    (SqliteType::Blob, src) => match src {
-                                                        Some("JSONB") => Type::JSONB,
-                                                        _ => Type::BYTEA,
-                                                    },
+                                                .map(|param| {
+                                                    trace!("got param: {param:?}");
+                                                    match param {
+                                                        (SqliteType::Null, _) => unreachable!(),
+                                                        (SqliteType::Text, src) => match src {
+                                                            Some("JSON") => Type::JSON,
+                                                            _ => Type::TEXT,
+                                                        },
+                                                        (SqliteType::Numeric, Some(src)) => {
+                                                            match src {
+                                                                "BOOLEAN" | "BOOL" => Type::BOOL,
+                                                                "DATETIME" => Type::TIMESTAMP,
+                                                                _ => Type::FLOAT8,
+                                                            }
+                                                        }
+                                                        (SqliteType::Numeric, None) => Type::FLOAT8,
+                                                        (SqliteType::Integer, _src) => Type::INT8,
+                                                        (SqliteType::Real, _src) => Type::FLOAT8,
+                                                        (SqliteType::Blob, src) => match src {
+                                                            Some("JSONB") => Type::JSONB,
+                                                            _ => Type::BYTEA,
+                                                        },
+                                                    }
                                                 })
                                                 .collect();
                                         }
@@ -1028,7 +1120,7 @@ pub async fn start(
                                             prepped.parameter_count()
                                         );
 
-                                        trace!("param types: {param_types:?}");
+                                        debug!("bind param types: {param_types:?}");
 
                                         let mut format_codes = match bind
                                             .parameter_format_codes()
@@ -1221,6 +1313,25 @@ pub async fn start(
                                                                     .as_deref()
                                                                     .unwrap_or(b),
                                                             )?;
+                                                        }
+
+                                                        t @ &Type::TIMESTAMP => {
+                                                            let dt = match format_code {
+                                                                FormatCode::Text => {
+                                                                    let s =
+                                                                        String::from_utf8_lossy(b);
+                                                                    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f").map_err(ToParamError::Parse)?
+                                                                }
+                                                                FormatCode::Binary => {
+                                                                    NaiveDateTime::from_sql(t, b)
+                                                                        .map_err(
+                                                                            ToParamError::<
+                                                                                chrono::format::ParseError
+                                                                            >::FromSql,
+                                                                        )?
+                                                                }
+                                                            };
+                                                            prepped.raw_bind_parameter(idx, dt)?;
                                                         }
 
                                                         // t @ &Type::TIMESTAMP => {
@@ -1452,9 +1563,9 @@ pub async fn start(
                                 }
 
                                 // automatically commit an implicit tx
-                                if matches!(open_tx, Some(OpenTx::Implicit)) {
+                                if open_tx.is_implicit() {
                                     trace!("committing IMPLICIT tx");
-                                    open_tx = None;
+                                    let _permit = open_tx.end();
 
                                     if let Err(e) = handle_commit(&agent, &conn) {
                                         back_tx.blocking_send(
@@ -1659,33 +1770,31 @@ pub async fn start(
 fn send_ready(
     agent: &Agent,
     conn: &Connection,
-    open_tx: &mut Option<OpenTx>,
+    open_tx: &mut OpenTx,
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
-    let ready_status = match open_tx {
-        Some(OpenTx::Implicit) => {
-            if discard_until_sync {
-                // an error occured, rollback implicit tx!
-                warn!("receive Sync message w/ an error to send, rolling back implicit tx");
-                conn.execute_batch("ROLLBACK")?;
-            } else {
-                // no error, commit implicit tx
-                warn!("receive Sync message, committing implicit tx");
-                handle_commit(agent, conn)?;
-            }
-            *open_tx = None;
+    let ready_status = if open_tx.is_implicit() {
+        let _permit = open_tx.end(); // do this first, in case of failure
+        if discard_until_sync {
+            // an error occured, rollback implicit tx!
+            warn!("receive Sync message w/ an error to send, rolling back implicit tx");
+            conn.execute_batch("ROLLBACK")?;
+        } else {
+            // no error, commit implicit tx
+            warn!("receive Sync message, committing implicit tx");
+            handle_commit(agent, conn)?;
+        }
 
-            READY_STATUS_IDLE
+        READY_STATUS_IDLE
+    } else if open_tx.is_explicit() {
+        if discard_until_sync {
+            READY_STATUS_FAILED_TRANSACTION_BLOCK
+        } else {
+            READY_STATUS_TRANSACTION_BLOCK
         }
-        Some(OpenTx::Explicit) => {
-            if discard_until_sync {
-                READY_STATUS_FAILED_TRANSACTION_BLOCK
-            } else {
-                READY_STATUS_TRANSACTION_BLOCK
-            }
-        }
-        None => READY_STATUS_IDLE,
+    } else {
+        READY_STATUS_IDLE
     };
 
     back_tx.blocking_send(
@@ -1711,6 +1820,8 @@ enum QueryError {
     PgWire(#[from] PgWireError),
     #[error("backend response channel is closed")]
     BackendResponseSendFailed,
+    #[error("could not acquire write permit")]
+    PermitAcquire(#[from] AcquireError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1732,6 +1843,9 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
             QueryError::PgWire(e) => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
+            e @ QueryError::PermitAcquire(_) => {
+                ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e.to_string()).into()
+            }
             QueryError::BackendResponseSendFailed => return Err(ChannelClosed),
         }))
     }
@@ -1744,14 +1858,15 @@ fn handle_execute<'conn>(
     prepped: &mut Statement<'conn>,
     result_formats: &[FieldFormat],
     cmd: &ParsedCmd,
-    open_tx: &mut Option<OpenTx>,
+    open_tx: &mut OpenTx,
     max_rows: usize,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), QueryError> {
     // TODO: maybe we don't need to recompute this...
     let mut fields = vec![];
     for (i, col) in prepped.columns().into_iter().enumerate() {
-        let col_type = name_to_type(col.decl_type().unwrap_or("text"))?;
+        trace!("col decl_type: {:?}", col.decl_type());
+        let col_type = name_to_type(col.decl_type().unwrap_or("any"))?;
 
         fields.push(FieldInfo::new(
             col.name().to_string(),
@@ -1769,26 +1884,30 @@ fn handle_execute<'conn>(
     // we need to know because we'll commit it right away
     let mut opened_implicit_tx = false;
 
-    if open_tx.is_none() {
+    if open_tx.is_ended() {
         if !cmd.is_begin() && !prepped.readonly() {
             // NOT in a tx and statement mutates DB...
             conn.execute_batch("BEGIN")?;
-            *open_tx = Some(OpenTx::Implicit);
+
+            open_tx.start_implicit();
             opened_implicit_tx = true;
         } else if cmd.is_begin() {
             conn.execute_batch("BEGIN")?;
-            *open_tx = Some(OpenTx::Explicit);
+            open_tx.start_explicit();
         }
     }
 
     let mut count = 0;
 
     if cmd.is_commit() {
+        let _permit = open_tx.end();
         handle_commit(agent, conn)?;
-        *open_tx = None;
     } else {
+        if !open_tx.is_writing() && !prepped.readonly() {
+            trace!("statement writes, acquiring permit...");
+            open_tx.set_write_permit(agent.write_permit_blocking()?);
+        }
         let mut rows = prepped.raw_query();
-        let ncols = schema.len();
         loop {
             if count >= max_rows {
                 trace!("attained max rows");
@@ -1820,24 +1939,88 @@ fn handle_execute<'conn>(
             count += 1;
 
             let mut encoder = DataRowEncoder::new(schema.clone());
-            for idx in 0..ncols {
-                let data = row.get_ref_unwrap::<usize>(idx);
-                match data {
-                    ValueRef::Null => encoder.encode_field(&None::<i8>).unwrap(),
-                    ValueRef::Integer(i) => {
-                        encoder.encode_field(&i).unwrap();
+            for (idx, field) in schema.iter().enumerate() {
+                trace!("processing field: {field:?}");
+                let format = *field.format();
+                match field.datatype() {
+                    &Type::ANY => {
+                        let data = row.get_ref_unwrap(idx);
+                        match data {
+                            ValueRef::Null => encoder
+                                .encode_field_with_type_and_format(&None::<i8>, &Type::ANY, format)
+                                .unwrap(),
+                            ValueRef::Integer(i) => {
+                                encoder
+                                    .encode_field_with_type_and_format(&i, &Type::INT8, format)
+                                    .unwrap();
+                            }
+                            ValueRef::Real(f) => {
+                                encoder
+                                    .encode_field_with_type_and_format(&f, &Type::FLOAT8, format)
+                                    .unwrap();
+                            }
+                            ValueRef::Text(t) => {
+                                encoder
+                                    .encode_field_with_type_and_format(
+                                        &String::from_utf8_lossy(t).as_ref(),
+                                        &Type::TEXT,
+                                        format,
+                                    )
+                                    .unwrap();
+                            }
+                            ValueRef::Blob(b) => {
+                                encoder
+                                    .encode_field_with_type_and_format(&b, &Type::BYTEA, format)
+                                    .unwrap();
+                            }
+                        }
                     }
-                    ValueRef::Real(f) => {
-                        encoder.encode_field(&f).unwrap();
-                    }
-                    ValueRef::Text(t) => {
+                    t @ &Type::INT8 => {
                         encoder
-                            .encode_field(&String::from_utf8_lossy(t).as_ref())
+                            .encode_field_with_type_and_format(
+                                &row.get::<_, Option<i64>>(idx)?,
+                                t,
+                                format,
+                            )
                             .unwrap();
                     }
-                    ValueRef::Blob(b) => {
-                        encoder.encode_field(&b).unwrap();
+                    t @ &Type::TIMESTAMP => {
+                        encoder
+                            .encode_field_with_type_and_format(
+                                &row.get::<_, Option<NaiveDateTime>>(idx)?,
+                                t,
+                                format,
+                            )
+                            .unwrap();
                     }
+                    t @ &Type::VARCHAR | t @ &Type::TEXT | t @ &Type::JSON => {
+                        encoder
+                            .encode_field_with_type_and_format(
+                                &row.get::<_, Option<String>>(idx)?,
+                                t,
+                                format,
+                            )
+                            .unwrap();
+                    }
+                    t @ &Type::BYTEA | t @ &Type::JSONB => {
+                        encoder
+                            .encode_field_with_type_and_format(
+                                &row.get::<_, Option<Vec<u8>>>(idx)?,
+                                t,
+                                format,
+                            )
+                            .unwrap();
+                    }
+                    t @ &Type::FLOAT8 => {
+                        encoder
+                            .encode_field_with_type_and_format(
+                                &row.get::<_, Option<f64>>(idx)?,
+                                t,
+                                format,
+                            )
+                            .unwrap();
+                    }
+                    _ => return Err(UnsupportedSqliteToPostgresType(field.name().clone()).into()),
                 }
             }
 
@@ -1848,8 +2031,8 @@ fn handle_execute<'conn>(
         }
 
         if opened_implicit_tx {
+            let _permit = open_tx.end();
             handle_commit(agent, conn)?;
-            *open_tx = None;
         }
     }
 
@@ -1874,7 +2057,7 @@ fn handle_query(
     agent: &Agent,
     conn: &Connection,
     cmd: &ParsedCmd,
-    open_tx: &mut Option<OpenTx>,
+    open_tx: &mut OpenTx,
     back_tx: &Sender<BackendResponse>,
     send_row_desc: bool,
 ) -> Result<(), QueryError> {
@@ -1905,29 +2088,32 @@ fn handle_query(
     }
 
     // need to start an implicit transaction
-    if open_tx.is_none() && !cmd.is_begin() {
+    if open_tx.is_ended() && !cmd.is_begin() {
         conn.execute_batch("BEGIN")?;
         trace!("started IMPLICIT tx");
-        *open_tx = Some(OpenTx::Implicit);
-    }
-
-    // close the current implement tx first
-    if matches!(open_tx, Some(OpenTx::Implicit)) && cmd.is_begin() {
+        open_tx.start_implicit();
+    } else if open_tx.is_implicit() && cmd.is_begin() {
         trace!("committing IMPLICIT tx");
-        *open_tx = None;
+        let _permit = open_tx.end();
 
         handle_commit(agent, conn)?;
         trace!("committed IMPLICIT tx");
     }
 
-    let count = if cmd.is_commit() {
+    let count = if cmd.is_begin() {
+        conn.execute_batch("BEGIN")?;
+        open_tx.start_explicit();
+        0
+    } else if cmd.is_commit() {
+        let _permit = open_tx.end();
         handle_commit(agent, conn)?;
-        *open_tx = None;
+        0
+    } else if cmd.is_rollback() {
+        let _permit = open_tx.end();
+        conn.execute_batch("ROLLBACK")?;
         0
     } else {
-        let mut prepped = if cmd.is_begin() {
-            conn.prepare("BEGIN")?
-        } else if cmd.is_pg() {
+        let mut prepped = if cmd.is_pg() {
             return Err(QueryError::NotSqlite);
         } else {
             conn.prepare(&cmd.to_string())?
@@ -1960,6 +2146,11 @@ fn handle_query(
         }
 
         let schema = Arc::new(fields);
+
+        if !open_tx.is_writing() && !prepped.readonly() {
+            trace!("query statement writes, acquiring permit...");
+            open_tx.set_write_permit(agent.write_permit_blocking()?);
+        }
 
         let mut rows = prepped.raw_query();
         let ncols = schema.len();
@@ -2009,11 +2200,7 @@ fn handle_query(
     if cmd.is_begin() {
         trace!("setting EXPLICIT tx");
         // explicit tx
-        *open_tx = Some(OpenTx::Explicit)
-    } else if cmd.is_rollback() || cmd.is_commit() {
-        trace!("clearing current open tx");
-        // if this was a rollback, remove the current open tx
-        *open_tx = None;
+        open_tx.start_explicit();
     }
 
     Ok(())
@@ -2089,7 +2276,7 @@ fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
 }
 
 fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
-    println!("HANDLE COMMIT");
+    trace!("HANDLE COMMIT");
     let actor_id = agent.actor_id();
 
     let ts = Timestamp::from(agent.clock().new_timestamp());
@@ -2221,14 +2408,7 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
         }
     });
 
-    spawn_counted({
-        let agent = agent.clone();
-        async move {
-            let conn = agent.pool().read().await?;
-            block_in_place(|| agent.process_subs_by_db_version(&conn, db_version));
-            Ok::<_, SqlitePoolError>(())
-        }
-    });
+    agent.change_db_version(db_version);
 
     Ok(())
 }
@@ -2765,6 +2945,9 @@ fn parameter_types<'a>(schema: &'a Schema, cmd: &ParsedCmd) -> Vec<(SqliteType, 
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use chrono::{DateTime, Utc};
     use corro_tests::launch_test_agent;
     use spawn::wait_for_all_pending_handles;
     use tokio_postgres::NoTls;
@@ -2777,7 +2960,30 @@ mod tests {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
-        let ta = launch_test_agent(|builder| builder.build(), tripwire.clone()).await?;
+        let tmpdir = tempfile::tempdir()?;
+
+        tokio::fs::write(
+            tmpdir.path().join("kitchensink.sql"),
+            "
+            CREATE TABLE kitchensink (
+                id PRIMARY KEY NOT NULL,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+        ",
+        )
+        .await?;
+
+        let ta = launch_test_agent(
+            |builder| {
+                builder
+                    .add_schema_path(tmpdir.path().display().to_string())
+                    .build()
+            },
+            tripwire.clone(),
+        )
+        .await?;
+
+        let sema = ta.agent.write_sema().clone();
 
         let server = start(
             ta.agent.clone(),
@@ -2801,6 +3007,8 @@ mod tests {
             println!("client is ready!");
             tokio::spawn(client_conn);
 
+            let _permit = sema.acquire().await;
+
             println!("before prepare");
             let stmt = client.prepare("SELECT 1").await?;
             println!(
@@ -2810,7 +3018,10 @@ mod tests {
             );
 
             println!("before query");
-            let rows = client.query(&stmt, &[]).await?;
+            // add a timeout because the semaphore shouldn't block anything here
+            // it will fail if the semaphore prevents this query.
+            let rows = tokio::time::timeout(Duration::from_millis(100), client.query(&stmt, &[]))
+                .await??;
 
             println!("rows count: {}", rows.len());
             for row in rows {
@@ -2818,10 +3029,26 @@ mod tests {
             }
 
             println!("before execute");
-            let affected = client
-                .execute("INSERT INTO tests VALUES (1,2)", &[])
-                .await?;
-            println!("after execute, affected: {affected}");
+            let start = Instant::now();
+            let (affected_res, sema_elapsed) = tokio::join!(
+                async {
+                    let affected = client
+                        .execute("INSERT INTO tests VALUES (1,2)", &[])
+                        .await?;
+                    Ok::<_, tokio_postgres::Error>((affected, start.elapsed()))
+                },
+                async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    drop(_permit);
+                    start.elapsed()
+                }
+            );
+
+            let (affected, exec_elapsed) = affected_res?;
+
+            println!("after execute, affected: {affected}, sema elapsed: {sema_elapsed:?}, exec elapsed: {exec_elapsed:?}");
+
+            assert!(exec_elapsed > sema_elapsed);
 
             let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
             println!("CHANGE ROW: {row:?}");
@@ -2884,6 +3111,23 @@ mod tests {
             println!("t.id: {:?}", row.try_get::<_, i64>(0));
             println!("t.text: {:?}", row.try_get::<_, String>(1));
             println!("t2text: {:?}", row.try_get::<_, String>(2));
+
+            let now: DateTime<Utc> = Utc::now();
+            let now = NaiveDateTime::from_timestamp_micros(now.timestamp_micros()).unwrap();
+            println!("NOW: {now:?}");
+
+            let row = client
+                .query_one(
+                    "INSERT INTO kitchensink (id, updated_at) VALUES (1, ?) RETURNING updated_at",
+                    &[&now],
+                )
+                .await?;
+
+            println!("ROW: {row:?}");
+            let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
+            println!("updated_at: {updated_at:?}");
+
+            assert_eq!(now, updated_at);
         }
 
         tripwire_tx.send(()).await.ok();

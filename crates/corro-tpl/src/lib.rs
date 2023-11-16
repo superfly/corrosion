@@ -7,10 +7,10 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::Arc;
 
-use compact_str::CompactString;
 use compact_str::ToCompactString;
 use corro_client::sub::SubscriptionStream;
 use corro_client::CorrosionApiClient;
+use corro_types::api::ColumnName;
 use corro_types::api::QueryEvent;
 use corro_types::api::SqliteParam;
 use corro_types::api::Statement;
@@ -109,7 +109,7 @@ impl IntoIterator for QueryResponse {
 struct Row {
     #[allow(dead_code)]
     id: i64,
-    columns: Arc<IndexMap<CompactString, u16>>,
+    columns: Arc<IndexMap<ColumnName, u16>>,
     cells: Arc<Vec<SqliteValue>>,
 }
 
@@ -223,7 +223,7 @@ struct QueryResponseIter {
     body: OnceCell<SubscriptionStream>,
     handle: tokio::runtime::Handle,
     done: bool,
-    columns: Option<Arc<IndexMap<CompactString, u16>>>,
+    columns: Option<Arc<IndexMap<ColumnName, u16>>>,
 }
 
 impl QueryResponseIter {
@@ -665,7 +665,7 @@ fn write_json_rows_as_object<W: Write, F: Formatter>(
             .iter()
             .enumerate()
             .filter_map(|(i, (col, _))| row.cells.get(i).map(|value| (col, value)))
-            .collect::<IndexMap<&CompactString, &SqliteValue>>();
+            .collect::<IndexMap<&ColumnName, &SqliteValue>>();
 
         seq.serialize_element(&map)
             .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;

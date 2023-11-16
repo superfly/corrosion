@@ -5,7 +5,7 @@ use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError, KnownDbVersion},
-    api::{row_to_change, ExecResponse, ExecResult, QueryEvent, Statement},
+    api::{row_to_change, ColumnName, ExecResponse, ExecResult, QueryEvent, Statement},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{ChunkedChanges, SqliteValue, MAX_CHANGES_BYTE_SIZE},
     schema::{apply_schema, parse_sql},
@@ -26,8 +26,6 @@ use tokio::{
 use tracing::{debug, error, info, trace};
 
 use corro_types::broadcast::{BroadcastInput, BroadcastV1};
-
-use crate::agent::process_subs;
 
 pub mod pubsub;
 
@@ -112,6 +110,9 @@ where
             start.elapsed()
         };
 
+        // change the current db version, so that subscribers can catch up
+        agent.change_db_version(db_version);
+
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
         book_writer.insert(
@@ -148,7 +149,6 @@ where
                             {
                                 counter!("corro.changes.committed", count as u64, "table" => table_name.to_string(), "source" => "local");
                             }
-                            process_subs(&agent, &changes);
 
                             trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
@@ -354,7 +354,7 @@ async fn build_query_rows_response(
                 prepped
                     .columns()
                     .into_iter()
-                    .map(|col| col.name().to_compact_string())
+                    .map(|col| ColumnName(col.name().to_compact_string()))
                     .collect(),
             )) {
                 error!("could not send back columns: {e}");

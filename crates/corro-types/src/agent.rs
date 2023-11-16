@@ -18,11 +18,12 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{Connection, InterruptHandle};
+use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
-    OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, RwLock as TokioRwLock,
-    RwLockReadGuard as TokioRwLockReadGuard, RwLockWriteGuard as TokioRwLockWriteGuard,
+    watch, AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
+    RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
+    RwLockWriteGuard as TokioRwLockWriteGuard,
 };
 use tokio::{
     runtime::Handle,
@@ -32,21 +33,18 @@ use tokio::{
     },
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info, trace, Instrument};
+use tracing::{debug, error, info};
 use tripwire::Tripwire;
 
 use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     config::Config,
-    pubsub::MatcherHandle,
     schema::Schema,
-    sqlite::{rusqlite_to_crsqlite, setup_conn, AttachMap, CrConn, SqlitePool, SqlitePoolError},
+    sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn, Migration, SqlitePool, SqlitePoolError},
 };
 
 use super::members::Members;
-
-pub type Subs = BTreeMap<uuid::Uuid, MatcherHandle>;
 
 #[derive(Clone)]
 pub struct Agent(Arc<AgentInner>);
@@ -61,11 +59,14 @@ pub struct AgentConfig {
     pub clock: Arc<uhlc::HLC>,
     pub bookie: Bookie,
 
+    pub tx_db_version: watch::Sender<i64>,
     pub tx_bcast: Sender<BroadcastInput>,
     pub tx_apply: Sender<(ActorId, i64)>,
     pub tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
     pub tx_foca: Sender<FocaInput>,
+
+    pub write_sema: Arc<Semaphore>,
 
     pub schema: RwLock<Schema>,
     pub tripwire: Tripwire,
@@ -80,12 +81,13 @@ pub struct AgentInner {
     members: RwLock<Members>,
     clock: Arc<uhlc::HLC>,
     bookie: Bookie,
-    subs: RwLock<Subs>,
+    tx_db_version: watch::Sender<i64>,
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     tx_changes: Sender<(ChangeV1, ChangeSource)>,
     tx_foca: Sender<FocaInput>,
+    write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     limits: Limits,
 }
@@ -96,7 +98,7 @@ pub struct Limits {
 }
 
 impl Agent {
-    pub fn new_w_subs(config: AgentConfig, subs: Subs) -> Self {
+    pub fn new(config: AgentConfig) -> Self {
         Self(Arc::new(AgentInner {
             actor_id: config.actor_id,
             pool: config.pool,
@@ -106,21 +108,18 @@ impl Agent {
             members: config.members,
             clock: config.clock,
             bookie: config.bookie,
-            subs: RwLock::new(subs),
+            tx_db_version: config.tx_db_version,
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             tx_empty: config.tx_empty,
             tx_changes: config.tx_changes,
             tx_foca: config.tx_foca,
+            write_sema: config.write_sema,
             schema: config.schema,
             limits: Limits {
                 sync: Arc::new(Semaphore::new(3)),
             },
         }))
-    }
-
-    pub fn new(config: AgentConfig) -> Self {
-        Self::new_w_subs(config, Default::default())
     }
 
     /// Return a borrowed [SqlitePool]
@@ -163,6 +162,18 @@ impl Agent {
         &self.0.tx_foca
     }
 
+    pub fn write_sema(&self) -> &Arc<Semaphore> {
+        &self.0.write_sema
+    }
+
+    pub async fn write_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
+        self.0.write_sema.clone().acquire_owned().await
+    }
+
+    pub fn write_permit_blocking(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
+        Handle::current().block_on(self.0.write_sema.clone().acquire_owned())
+    }
+
     pub fn bookie(&self) -> &Bookie {
         &self.0.bookie
     }
@@ -173,10 +184,6 @@ impl Agent {
 
     pub fn schema(&self) -> &RwLock<Schema> {
         &self.0.schema
-    }
-
-    pub fn matchers(&self) -> &RwLock<Subs> {
-        &self.0.subs
     }
 
     pub fn db_path(&self) -> Utf8PathBuf {
@@ -195,16 +202,130 @@ impl Agent {
         &self.0.limits
     }
 
-    pub fn process_subs_by_db_version(&self, conn: &Connection, db_version: i64) {
-        trace!("process subs by db version...");
-
-        let matchers = self.matchers().read();
-        for (id, matcher) in matchers.iter() {
-            if let Err(e) = matcher.process_changes_from_db_version(conn, db_version) {
-                error!("could not process change w/ matcher {id}, maybe probably defunct! {e}");
-            }
+    pub fn change_db_version(&self, db_version: i64) {
+        if let Err(_e) = self.0.tx_db_version.send(db_version) {
+            debug!("could not change db version, all receivers likely dropped");
         }
     }
+
+    pub fn rx_db_version(&self) -> watch::Receiver<i64> {
+        self.0.tx_db_version.subscribe()
+    }
+}
+
+pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    let migrations: Vec<Box<dyn Migration>> = vec![
+        Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(v0_2_0_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(v0_2_0_1_migration as fn(&Transaction) -> rusqlite::Result<()>),
+    ];
+
+    crate::sqlite::migrate(conn, migrations)
+}
+
+fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+            -- key/value for internal corrosion data (e.g. 'schema_version' => INT)
+            CREATE TABLE __corro_state (key TEXT NOT NULL PRIMARY KEY, value);
+
+            -- internal bookkeeping
+            CREATE TABLE __corro_bookkeeping (
+                actor_id BLOB NOT NULL,
+                start_version INTEGER NOT NULL,
+                end_version INTEGER,
+                db_version INTEGER,
+
+                last_seq INTEGER,
+
+                ts TEXT,
+
+                PRIMARY KEY (actor_id, start_version)
+            ) WITHOUT ROWID;
+
+            -- internal per-db-version seq bookkeeping
+            CREATE TABLE __corro_seq_bookkeeping (
+                -- remote actor / site id
+                site_id BLOB NOT NULL,
+                -- remote internal version
+                version INTEGER NOT NULL,
+                
+                -- start and end seq for this bookkept record
+                start_seq INTEGER NOT NULL,
+                end_seq INTEGER NOT NULL,
+
+                last_seq INTEGER NOT NULL,
+
+                -- timestamp, need to propagate...
+                ts TEXT NOT NULL,
+
+                PRIMARY KEY (site_id, version, start_seq)
+            ) WITHOUT ROWID;
+
+            -- buffered changes (similar schema as crsql_changes)
+            CREATE TABLE __corro_buffered_changes (
+                "table" TEXT NOT NULL,
+                pk BLOB NOT NULL,
+                cid TEXT NOT NULL,
+                val ANY, -- shouldn't matter I don't think
+                col_version INTEGER NOT NULL,
+                db_version INTEGER NOT NULL,
+                site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
+                seq INTEGER NOT NULL,
+                cl INTEGER NOT NULL, -- causal length
+
+                version INTEGER NOT NULL,
+
+                PRIMARY KEY (site_id, db_version, version, seq)
+            ) WITHOUT ROWID;
+            
+            -- SWIM memberships
+            CREATE TABLE __corro_members (
+                actor_id BLOB PRIMARY KEY NOT NULL,
+                address TEXT NOT NULL,
+            
+                state TEXT NOT NULL DEFAULT 'down',
+                foca_state JSON,
+
+                rtts JSON DEFAULT '[]'
+            ) WITHOUT ROWID;
+
+            -- tracked corrosion schema
+            CREATE TABLE __corro_schema (
+                tbl_name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                sql TEXT NOT NULL,
+            
+                source TEXT NOT NULL,
+            
+                PRIMARY KEY (tbl_name, type, name)
+            ) WITHOUT ROWID;
+        "#,
+    )?;
+
+    Ok(())
+}
+
+fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "
+        CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version);
+        ",
+    )
+}
+
+fn v0_2_0_1_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+        -- where subscriptions are stored
+        CREATE TABLE __corro_subs (
+            id BLOB PRIMARY KEY NOT NULL,
+            sql TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'created'
+        ) WITHOUT ROWID;
+    "#,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -213,7 +334,7 @@ pub struct SplitPool(Arc<SplitPoolInner>);
 #[derive(Debug)]
 struct SplitPoolInner {
     path: PathBuf,
-    attachments: HashMap<Utf8PathBuf, compact_str::CompactString>,
+    write_sema: Arc<Semaphore>,
 
     read: SqlitePool,
     write: SqlitePool,
@@ -231,6 +352,8 @@ pub enum PoolError {
     QueueClosed,
     #[error("callback is closed")]
     CallbackClosed,
+    #[error("could not acquire write permit")]
+    Permit(#[from] AcquireError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -252,9 +375,9 @@ pub enum SplitPoolCreateError {
 }
 
 impl SplitPool {
-    pub async fn create<P: AsRef<Path>, P2: AsRef<Path>>(
+    pub async fn create<P: AsRef<Path>>(
         path: P,
-        subscriptions_path: P2,
+        write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
@@ -271,12 +394,7 @@ impl SplitPool {
 
         Ok(Self::new(
             path.as_ref().to_owned(),
-            vec![(
-                subscriptions_path.as_ref().display().to_string().into(),
-                "subscriptions".into(),
-            )]
-            .into_iter()
-            .collect(),
+            write_sema,
             ro_pool,
             rw_pool,
             tripwire,
@@ -285,7 +403,7 @@ impl SplitPool {
 
     fn new(
         path: PathBuf,
-        attachments: AttachMap,
+        write_sema: Arc<Semaphore>,
         read: SqlitePool,
         write: SqlitePool,
         mut tripwire: Tripwire,
@@ -323,7 +441,7 @@ impl SplitPool {
 
         Self(Arc::new(SplitPoolInner {
             path,
-            attachments,
+            write_sema,
             read,
             write,
             priority_tx,
@@ -373,7 +491,7 @@ impl SplitPool {
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn dedicated(&self) -> rusqlite::Result<Connection> {
         let mut conn = rusqlite::Connection::open(&self.0.path)?;
-        setup_conn(&mut conn, &self.0.attachments)?;
+        setup_conn(&mut conn)?;
         Ok(conn)
     }
 
@@ -413,46 +531,19 @@ impl SplitPool {
         histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
         let conn = self.0.write.get().await?;
 
-        tokio::spawn(
-            timeout_wait(
-                token.clone(),
-                conn.get_interrupt_handle(),
-                Duration::from_secs(30),
-                queue,
-            )
-            .in_current_span(),
+        let start = Instant::now();
+        let _permit = self.0.write_sema.clone().acquire_owned().await?;
+        histogram!(
+            "corro.sqlite.write_permit.acquisition.seconds",
+            start.elapsed().as_secs_f64()
         );
 
         Ok(WriteConn {
             conn,
             _drop_guard: token.drop_guard(),
+            _permit,
         })
     }
-}
-
-async fn timeout_wait(
-    token: CancellationToken,
-    _handle: InterruptHandle,
-    _timeout: Duration,
-    queue: &'static str,
-) {
-    let start = Instant::now();
-    token.cancelled().await;
-    histogram!("corro.sqlite.pool.execution.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
-    // tokio::select! {
-    //     biased;
-    //     _ = token.cancelled() => {
-    //         trace!("conn dropped before timeout");
-    //         histogram!("corro.sqlite.pool.execution.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
-    //         return;
-    //     },
-    //     _ = tokio::time::sleep(timeout) => {
-    //         warn!("conn execution timed out, interrupting!");
-    //     }
-    // }
-    // handle.interrupt();
-    // increment_tracker!("corro.sqlite.pool.execution.timeout");
-    // FIXME: do we need to cancel the token?
 }
 
 async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
@@ -469,6 +560,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
 pub struct WriteConn {
     conn: sqlite_pool::Connection<CrConn>,
     _drop_guard: DropGuard,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl Deref for WriteConn {
