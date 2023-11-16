@@ -439,18 +439,20 @@ impl MatcherHandle {
         since: ChangeId,
         conn: &Connection,
         tx: mpsc::Sender<QueryEvent>,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<ChangeId> {
         self.wait_for_running_state();
         let mut query_cols = vec![];
         for i in 0..(self.parsed_columns().len()) {
             query_cols.push(format!("col_{i}"));
         }
         let mut prepped = conn.prepare_cached(&format!(
-            "SELECT id, type, __corro_rowid, {} FROM changes WHERE id > ?",
+            "SELECT id, type, __corro_rowid, {} FROM changes WHERE id > ? ORDER BY id ASC",
             query_cols.join(",")
         ))?;
 
         let col_count = prepped.column_count();
+
+        let mut max_change_id = since;
 
         let mut rows = prepped.query([since])?;
 
@@ -460,20 +462,25 @@ impl MatcherHandle {
                 None => break,
             };
 
+            let change_id: ChangeId = row.get(0)?;
+            if change_id.0 > max_change_id.0 {
+                max_change_id = change_id;
+            }
+
             if let Err(e) = tx.blocking_send(QueryEvent::Change(
                 row.get(1)?,
                 row.get(2)?,
                 (3..col_count)
                     .map(|i| row.get::<_, SqliteValue>(i))
                     .collect::<rusqlite::Result<Vec<_>>>()?,
-                row.get(0)?,
+                change_id,
             )) {
                 error!("could not send change to channel: {e}");
                 break;
             }
         }
 
-        Ok(())
+        Ok(max_change_id)
     }
 
     pub fn all_rows(
