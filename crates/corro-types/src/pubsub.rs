@@ -2016,6 +2016,7 @@ mod tests {
     use corro_api_types::row_to_change;
     use rusqlite::params;
     use spawn::wait_for_all_pending_handles;
+    use tokio::sync::Semaphore;
 
     use crate::{
         agent::migrate,
@@ -2041,7 +2042,8 @@ mod tests {
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let pool = SplitPool::create(db_path, tripwire.clone()).await?;
+        let pool =
+            SplitPool::create(db_path, Arc::new(Semaphore::new(1)), tripwire.clone()).await?;
         {
             let mut conn = pool.write_priority().await?;
             setup_conn(&mut conn)?;
@@ -2162,7 +2164,9 @@ mod tests {
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let pool = SplitPool::create(&db_path, tripwire.clone()).await.unwrap();
+        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)), tripwire.clone())
+            .await
+            .unwrap();
         let mut conn = pool.write_priority().await.unwrap();
 
         {

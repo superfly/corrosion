@@ -18,11 +18,12 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{Connection, InterruptHandle, Transaction};
+use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
-    watch, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, RwLock as TokioRwLock,
-    RwLockReadGuard as TokioRwLockReadGuard, RwLockWriteGuard as TokioRwLockWriteGuard,
+    watch, AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
+    RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
+    RwLockWriteGuard as TokioRwLockWriteGuard,
 };
 use tokio::{
     runtime::Handle,
@@ -32,7 +33,7 @@ use tokio::{
     },
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info, Instrument};
+use tracing::{debug, error, info};
 use tripwire::Tripwire;
 
 use crate::{
@@ -65,6 +66,8 @@ pub struct AgentConfig {
     pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
     pub tx_foca: Sender<FocaInput>,
 
+    pub write_sema: Arc<Semaphore>,
+
     pub schema: RwLock<Schema>,
     pub tripwire: Tripwire,
 }
@@ -84,6 +87,7 @@ pub struct AgentInner {
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
     tx_changes: Sender<(ChangeV1, ChangeSource)>,
     tx_foca: Sender<FocaInput>,
+    write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     limits: Limits,
 }
@@ -110,6 +114,7 @@ impl Agent {
             tx_empty: config.tx_empty,
             tx_changes: config.tx_changes,
             tx_foca: config.tx_foca,
+            write_sema: config.write_sema,
             schema: config.schema,
             limits: Limits {
                 sync: Arc::new(Semaphore::new(3)),
@@ -155,6 +160,18 @@ impl Agent {
 
     pub fn tx_foca(&self) -> &Sender<FocaInput> {
         &self.0.tx_foca
+    }
+
+    pub fn write_sema(&self) -> &Arc<Semaphore> {
+        &self.0.write_sema
+    }
+
+    pub async fn write_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
+        self.0.write_sema.clone().acquire_owned().await
+    }
+
+    pub fn write_permit_blocking(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
+        Handle::current().block_on(self.0.write_sema.clone().acquire_owned())
     }
 
     pub fn bookie(&self) -> &Bookie {
@@ -317,6 +334,7 @@ pub struct SplitPool(Arc<SplitPoolInner>);
 #[derive(Debug)]
 struct SplitPoolInner {
     path: PathBuf,
+    write_sema: Arc<Semaphore>,
 
     read: SqlitePool,
     write: SqlitePool,
@@ -334,6 +352,8 @@ pub enum PoolError {
     QueueClosed,
     #[error("callback is closed")]
     CallbackClosed,
+    #[error("could not acquire write permit")]
+    Permit(#[from] AcquireError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -357,6 +377,7 @@ pub enum SplitPoolCreateError {
 impl SplitPool {
     pub async fn create<P: AsRef<Path>>(
         path: P,
+        write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
@@ -373,13 +394,20 @@ impl SplitPool {
 
         Ok(Self::new(
             path.as_ref().to_owned(),
+            write_sema,
             ro_pool,
             rw_pool,
             tripwire,
         ))
     }
 
-    fn new(path: PathBuf, read: SqlitePool, write: SqlitePool, mut tripwire: Tripwire) -> Self {
+    fn new(
+        path: PathBuf,
+        write_sema: Arc<Semaphore>,
+        read: SqlitePool,
+        write: SqlitePool,
+        mut tripwire: Tripwire,
+    ) -> Self {
         let (priority_tx, mut priority_rx) = channel(256);
         let (normal_tx, mut normal_rx) = channel(512);
         let (low_tx, mut low_rx) = channel(1024);
@@ -413,6 +441,7 @@ impl SplitPool {
 
         Self(Arc::new(SplitPoolInner {
             path,
+            write_sema,
             read,
             write,
             priority_tx,
@@ -502,46 +531,19 @@ impl SplitPool {
         histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
         let conn = self.0.write.get().await?;
 
-        tokio::spawn(
-            timeout_wait(
-                token.clone(),
-                conn.get_interrupt_handle(),
-                Duration::from_secs(30),
-                queue,
-            )
-            .in_current_span(),
+        let start = Instant::now();
+        let _permit = self.0.write_sema.clone().acquire_owned().await?;
+        histogram!(
+            "corro.sqlite.write_permit.acquisition.seconds",
+            start.elapsed().as_secs_f64()
         );
 
         Ok(WriteConn {
             conn,
             _drop_guard: token.drop_guard(),
+            _permit,
         })
     }
-}
-
-async fn timeout_wait(
-    token: CancellationToken,
-    _handle: InterruptHandle,
-    _timeout: Duration,
-    queue: &'static str,
-) {
-    let start = Instant::now();
-    token.cancelled().await;
-    histogram!("corro.sqlite.pool.execution.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
-    // tokio::select! {
-    //     biased;
-    //     _ = token.cancelled() => {
-    //         trace!("conn dropped before timeout");
-    //         histogram!("corro.sqlite.pool.execution.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
-    //         return;
-    //     },
-    //     _ = tokio::time::sleep(timeout) => {
-    //         warn!("conn execution timed out, interrupting!");
-    //     }
-    // }
-    // handle.interrupt();
-    // increment_tracker!("corro.sqlite.pool.execution.timeout");
-    // FIXME: do we need to cancel the token?
 }
 
 async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
@@ -558,6 +560,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
 pub struct WriteConn {
     conn: sqlite_pool::Connection<CrConn>,
     _drop_guard: DropGuard,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl Deref for WriteConn {

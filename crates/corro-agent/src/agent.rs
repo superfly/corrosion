@@ -64,7 +64,7 @@ use tokio::{
     net::TcpListener,
     sync::{
         mpsc::{channel, Receiver, Sender},
-        watch,
+        watch, Semaphore,
     },
     task::block_in_place,
     time::{error::Elapsed, sleep, timeout},
@@ -119,7 +119,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     info!("Actor ID: {}", actor_id);
 
-    let pool = SplitPool::create(&conf.db.path, tripwire.clone()).await?;
+    let write_sema = Arc::new(Semaphore::new(1));
+
+    let pool = SplitPool::create(&conf.db.path, write_sema.clone(), tripwire.clone()).await?;
 
     let schema = {
         let mut conn = pool.write_priority().await?;
@@ -319,6 +321,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_empty,
         tx_changes,
         tx_foca,
+        write_sema,
         schema: RwLock::new(schema),
         tripwire,
     });
