@@ -15,15 +15,13 @@ use corro_types::{
     pubsub::{MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
     sqlite::SqlitePoolError,
 };
-use futures::{future::poll_fn, ready, Stream};
+use futures::{future::poll_fn, ready};
 use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
     sync::{broadcast, mpsc, RwLock as TokioRwLock},
     task::block_in_place,
 };
-use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
-use tokio_util::sync::PollSender;
 use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
@@ -570,11 +568,12 @@ pub async fn catch_up_sub(
         }
     }
 
-    info!(sub_id = %matcher.id(), "subscription is caught up, no gaps in change id. last change id: {last_change_id:?}, last_sub_change_id: {last_sub_change_id:?}");
+    info!(sub_id = %matcher.id(), "subscription is caught up, no gaps in change id. last change id: {last_change_id:?}, last_sub_change_id: {last_sub_change_id:?}, buffered events len: {}", events_buf.len());
 
     for (bytes, change_id) in events_buf {
-        info!(sub_id = %matcher.id(), "processing buffered change, id: {change_id:?}");
+        info!(sub_id = %matcher.id(), "processing buffered change, id: {change_id:?} (last change id: {last_change_id:?})");
         if change_id > last_change_id {
+            info!(sub_id = %matcher.id(), "change was more recent, sending!");
             if let Err(_e) = evt_tx.send(bytes).await {
                 warn!("could not send buffered events to subscriber, receiver must be gone!");
                 return;
@@ -678,56 +677,50 @@ pub async fn api_v1_subs(
 const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 
 async fn forward_sub_to_sender(
-    sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
+    mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     tx: mpsc::Sender<Bytes>,
 ) {
     let mut buf = BytesMut::new();
 
-    let chunker = tokio_stream::wrappers::BroadcastStream::new(sub_rx)
-        .chunks_timeout(10, Duration::from_millis(10));
+    let send_deadline = tokio::time::sleep(Duration::from_millis(10));
+    tokio::pin!(send_deadline);
 
-    tokio::pin!(chunker);
-
-    let mut tx = PollSender::new(tx);
+    // let mut tx = PollSender::new(tx);
 
     loop {
-        let res: Result<Option<Bytes>, BroadcastStreamRecvError> = poll_fn(|cx| {
-            if let Err(_e) = ready!(tx.poll_reserve(cx)) {
-                return Poll::Ready(Ok(None));
-            }
-            match ready!(chunker.as_mut().poll_next(cx)) {
-                Some(chunks) => {
-                    for chunk_res in chunks {
-                        let (chunk, _) = chunk_res?;
-                        buf.extend_from_slice(&chunk);
+        let to_send = tokio::select! {
+            biased;
+            Ok((event_buf, _meta)) = sub_rx.recv() => {
+                buf.extend_from_slice(&event_buf);
+                if buf.len() >= 64*1024 {
+                    buf.split().freeze()
+                } else {
+                    continue;
+                }
+            },
+            _ = &mut send_deadline => {
+                if !buf.is_empty() {
+                    buf.split().freeze()
+                } else {
+                    if tx.is_closed() {
+                        warn!("sender was closed, stopping event broadcast sends");
+                        return;
                     }
-                    Poll::Ready(Ok(Some(buf.split().freeze())))
+                    send_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(10));
+                    continue;
                 }
-                None => Poll::Ready(Ok(None)),
-            }
-        })
-        .await;
+            },
+            else => break,
+        };
 
-        match res {
-            Ok(Some(b)) => {
-                if let Err(_e) = tx.send_item(b) {
-                    error!("could not forward subscription query event to receiver, channel is closed!");
-                    return;
-                }
-            }
-            Ok(None) => {
-                debug!("finished w/ broadcast");
-                break;
-            }
-            Err(e) => {
-                error!("could not receive subscription query event: {e}");
-                buf.clear();
-                // should be safe to send because the poll to reserve succeeded
-                if let Err(_e) = tx.send_item(error_to_query_event_bytes(&mut buf, e)) {
-                    debug!("could not send back subscription receive error! channel is closed");
-                }
-                return;
-            }
+        if let Err(e) = tx.send(to_send).await {
+            warn!("could not forward subscription query event to receiver: {e}");
+            return;
+        }
+    }
+    if !buf.is_empty() {
+        if let Err(e) = tx.send(buf.freeze()).await {
+            warn!("could not forward subscription query event to receiver: {e}");
         }
     }
 }
