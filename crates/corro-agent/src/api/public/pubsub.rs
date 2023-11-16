@@ -18,7 +18,7 @@ use tokio::{
         mpsc::{self, error::TryRecvError},
         RwLock as TokioRwLock,
     },
-    task::block_in_place,
+    task::{block_in_place, JoinError},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -298,11 +298,13 @@ pub enum CatchUpError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
-    Send(#[from] mpsc::error::SendError<Bytes>),
+    Send(#[from] mpsc::error::SendError<(Bytes, QueryEventMeta)>),
     #[error(transparent)]
     SerdeJson(#[from] serde_json::Error),
     #[error(transparent)]
     Matcher(#[from] MatcherError),
+    #[error(transparent)]
+    Join(#[from] JoinError),
 }
 
 fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> Bytes {
@@ -327,69 +329,63 @@ fn error_to_query_event_bytes_with_meta<E: ToCompactString>(
     (error_to_query_event_bytes(buf, e), QueryEventMeta::Error)
 }
 
-fn catch_up_sub_anew(
-    conn: &Connection,
+async fn catch_up_sub_anew(
     matcher: &MatcherHandle,
     evt_tx: &mpsc::Sender<(Bytes, QueryEventMeta)>,
 ) -> Result<ChangeId, CatchUpError> {
     let (q_tx, mut q_rx) = mpsc::channel(10240);
 
-    tokio::spawn({
+    let task = tokio::spawn({
         let evt_tx = evt_tx.clone();
         async move {
             let mut buf = BytesMut::new();
             while let Some(event) = q_rx.recv().await {
-                match make_query_event_bytes(&mut buf, &event) {
-                    Ok((b, _)) => {
-                        if let Err(e) = evt_tx.send((b, event.meta())).await {
-                            error!("could not send catching up event bytes: {e}");
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!("could not serialize catching up event: {e}");
-                        return;
-                    }
-                }
+                evt_tx
+                    .send(make_query_event_bytes(&mut buf, &event)?)
+                    .await?;
             }
+            Ok::<_, CatchUpError>(())
         }
     });
 
-    matcher.all_rows(conn, q_tx).map_err(CatchUpError::from)
+    let last_change_id = {
+        let conn = matcher.pool().get().await?;
+        block_in_place(|| matcher.all_rows(&conn, q_tx))?
+    };
+
+    task.await??;
+
+    Ok(last_change_id)
 }
 
-fn catch_up_sub_from(
-    conn: &Connection, // read transaction
+async fn catch_up_sub_from(
     matcher: &MatcherHandle,
     from: ChangeId,
     evt_tx: &mpsc::Sender<(Bytes, QueryEventMeta)>,
 ) -> Result<ChangeId, CatchUpError> {
     let (q_tx, mut q_rx) = mpsc::channel(10240);
 
-    tokio::spawn({
+    let task = tokio::spawn({
         let evt_tx = evt_tx.clone();
         async move {
             let mut buf = BytesMut::new();
             while let Some(event) = q_rx.recv().await {
-                match make_query_event_bytes(&mut buf, &event) {
-                    Ok((b, _)) => {
-                        if let Err(e) = evt_tx.send((b, event.meta())).await {
-                            error!("could not send catching up event bytes: {e}");
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!("could not serialize catching up event: {e}");
-                        return;
-                    }
-                }
+                evt_tx
+                    .send(make_query_event_bytes(&mut buf, &event)?)
+                    .await?;
             }
+            Ok::<_, CatchUpError>(())
         }
     });
 
-    matcher
-        .changes_since(from, conn, q_tx)
-        .map_err(CatchUpError::from)
+    let last_change_id = {
+        let conn = matcher.pool().get().await?;
+        block_in_place(|| matcher.changes_since(from, &conn, q_tx))?
+    };
+
+    task.await??;
+
+    Ok(last_change_id)
 }
 
 pub async fn catch_up_sub(
@@ -432,64 +428,33 @@ pub async fn catch_up_sub(
     });
 
     let mut last_change_id = {
-        let mut conn = match matcher.pool().get().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                _ = evt_tx
-                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                    .await;
-                return;
+        let res = match params.from {
+            Some(from) => catch_up_sub_from(&matcher, from, &evt_tx).await,
+            None => {
+                if params.skip_rows {
+                    let conn = match matcher.pool().get().await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            _ = evt_tx
+                                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                                .await;
+                            return;
+                        }
+                    };
+                    block_in_place(|| matcher.max_change_id(&conn)).map_err(CatchUpError::from)
+                } else {
+                    catch_up_sub_anew(&matcher, &evt_tx).await
+                }
             }
         };
-
-        let res = block_in_place(|| {
-            let tx = conn.transaction()?; // read transaction
-            match params.from {
-                Some(from) => {
-                    let change_id = catch_up_sub_from(&tx, &matcher, from, &evt_tx)?;
-                    debug!("sub caught up to their 'from' of {from:?}");
-                    Ok(change_id)
-                }
-                None => {
-                    if params.skip_rows {
-                        Ok(matcher.max_change_id(&tx)?)
-                    } else {
-                        let change_id = catch_up_sub_anew(&tx, &matcher, &evt_tx)?;
-                        debug!("sub caught up from scratch");
-                        Ok(change_id)
-                    }
-                }
-            }
-        });
 
         match res {
             Ok(change_id) => change_id,
             Err(e) => {
-                match e {
-                    CatchUpError::Pool(e) => {
-                        _ = evt_tx
-                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                            .await;
-                    }
-                    CatchUpError::Sqlite(e) => {
-                        _ = evt_tx
-                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                            .await;
-                    }
-                    CatchUpError::SerdeJson(e) => {
-                        _ = evt_tx
-                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                            .await;
-                    }
-                    CatchUpError::Send(_) => {
-                        // can't send
-                    }
-                    CatchUpError::Matcher(_) => {
-                        // upstream error
-                        _ = evt_tx
-                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                            .await;
-                    }
+                if !matches!(e, CatchUpError::Send(_)) {
+                    _ = evt_tx
+                        .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                        .await;
                 }
                 return;
             }
@@ -537,52 +502,15 @@ pub async fn catch_up_sub(
                 // missed some updates!
                 info!(sub_id = %matcher.id(), "attempt #{} to catch up subcription from change id: {change_id:?} (last: {last_change_id:?})", i+1);
 
-                let mut conn = match matcher.pool().get().await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        _ = evt_tx
-                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                            .await;
-                        return;
-                    }
-                };
-
-                let res = block_in_place(|| {
-                    let tx = conn.transaction()?; // read transaction
-                    let new_last_change_id =
-                        catch_up_sub_from(&tx, &matcher, last_change_id, &evt_tx)?;
-                    debug!(sub_id = %matcher.id(), "sub caught up to the last max change id we got! {last_change_id:?} -> {new_last_change_id:?}");
-                    Ok(new_last_change_id)
-                });
+                let res = catch_up_sub_from(&matcher, last_change_id, &evt_tx).await;
 
                 match res {
                     Ok(new_last_change_id) => last_change_id = new_last_change_id,
                     Err(e) => {
-                        match e {
-                            CatchUpError::Pool(e) => {
-                                _ = evt_tx
-                                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                                    .await;
-                            }
-                            CatchUpError::Sqlite(e) => {
-                                _ = evt_tx
-                                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                                    .await;
-                            }
-                            CatchUpError::SerdeJson(e) => {
-                                _ = evt_tx
-                                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                                    .await;
-                            }
-                            CatchUpError::Send(_) => {
-                                // can't send
-                            }
-                            CatchUpError::Matcher(_) => {
-                                // upstream error
-                                _ = evt_tx
-                                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                                    .await;
-                            }
+                        if !matches!(e, CatchUpError::Send(_)) {
+                            _ = evt_tx
+                                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                                .await;
                         }
                         return;
                     }
