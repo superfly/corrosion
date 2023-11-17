@@ -440,6 +440,7 @@ fn main() {
 
     if let Err(e) = rt.block_on(process_cli(cli)) {
         eprintln!("{e}");
+        std::process::exit(1);
     }
 }
 
