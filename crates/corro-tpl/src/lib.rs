@@ -349,7 +349,7 @@ impl QueryHandle {
             return Ok((body, true));
         }
 
-        Ok((self.client.subscription(self.id, None).await?, false))
+        Ok((self.client.subscription(self.id, false, None).await?, false))
     }
 }
 
@@ -513,7 +513,7 @@ impl Engine {
 
             debug!("sql function call {stmt:?}");
             let stream = tokio::runtime::Handle::current()
-                .block_on(client.subscribe(&stmt, None))
+                .block_on(client.subscribe(&stmt, false, None))
                 .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
 
             let id = stream.id();
