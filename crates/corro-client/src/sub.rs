@@ -86,7 +86,6 @@ pub enum SubscriptionError {
 impl SubscriptionStream {
     pub fn new(
         id: Uuid,
-        last_change_id: Option<ChangeId>,
         client: hyper::Client<HttpConnector, Body>,
         api_addr: SocketAddr,
         body: hyper::Body,
@@ -96,7 +95,7 @@ impl SubscriptionStream {
             client,
             api_addr,
             observed_eoq: false,
-            last_change_id,
+            last_change_id: None,
             stream: Some(FramedRead::new(
                 StreamReader::new(IoBodyStream { body }),
                 LinesBytesCodec::default(),

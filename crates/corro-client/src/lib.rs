@@ -105,7 +105,6 @@ impl CorrosionApiClient {
 
         Ok(SubscriptionStream::new(
             id,
-            from,
             self.api_client.clone(),
             self.api_addr,
             res.into_body(),
@@ -147,7 +146,6 @@ impl CorrosionApiClient {
 
         Ok(SubscriptionStream::new(
             id,
-            from,
             self.api_client.clone(),
             self.api_addr,
             res.into_body(),
