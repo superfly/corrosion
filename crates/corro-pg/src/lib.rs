@@ -2,7 +2,7 @@ pub mod sql_state;
 mod vtab;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fmt,
     future::poll_fn,
     net::SocketAddr,
@@ -18,7 +18,7 @@ use corro_types::{
     broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset, Timestamp},
     change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     config::PgConfig,
-    schema::{parse_sql, Schema, SchemaError, SqliteType, Table},
+    schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
@@ -50,8 +50,8 @@ use rusqlite::{
 };
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
-    As, Cmd, CreateTableBody, Expr, FromClause, Id, InsertBody, Name, OneSelect, ResultColumn,
-    Select, SelectTable, Stmt,
+    As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Name,
+    OneSelect, ResultColumn, Select, SelectTable, Stmt, With,
 };
 use sqlparser::ast::Statement as PgStatement;
 use tokio::{
@@ -820,10 +820,11 @@ pub async fn start(
 
                                         if param_types.len() != prepped.parameter_count() {
                                             param_types = parameter_types(&schema, &parsed_cmd)
+                                                .params
                                                 .into_iter()
                                                 .map(|param| {
                                                     trace!("got param: {param:?}");
-                                                    match param {
+                                                    match (param.sqlite_type, param.source) {
                                                         (SqliteType::Null, _) => unreachable!(),
                                                         (SqliteType::Text, src) => match src {
                                                             Some("JSON") => Type::JSON,
@@ -2443,8 +2444,22 @@ fn compute_schema(conn: &Connection) -> Result<Schema, SchemaError> {
     parse_sql(dump.as_str())
 }
 
-fn is_param(expr: &Expr) -> bool {
-    matches!(expr, Expr::Variable(_))
+#[derive(Debug)]
+enum ParamKind<'a> {
+    Named(&'a str),
+    Positional,
+}
+
+fn as_param(expr: &Expr) -> Option<ParamKind> {
+    if let Expr::Variable(name) = expr {
+        if name.is_empty() {
+            Some(ParamKind::Positional)
+        } else {
+            Some(ParamKind::Named(name.as_str()))
+        }
+    } else {
+        None
+    }
 }
 
 enum SqliteNameRef<'a> {
@@ -2516,21 +2531,26 @@ fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef> {
 //     }
 // }
 
-fn handle_lhs_rhs(lhs: &Expr, rhs: &Expr) -> Option<SqliteName> {
+fn handle_lhs_rhs<'stmt>(
+    lhs: &'stmt Expr,
+    rhs: &'stmt Expr,
+) -> Option<(SqliteName, ParamKind<'stmt>)> {
     match (
-        (expr_to_name(lhs), is_param(lhs)),
-        (expr_to_name(rhs), is_param(rhs)),
+        (expr_to_name(lhs), as_param(lhs)),
+        (expr_to_name(rhs), as_param(rhs)),
     ) {
-        ((Some(name), _), (_, true)) | ((_, true), (Some(name), _)) => Some(name.to_owned()),
+        ((Some(name), _), (_, Some(kind))) | ((_, Some(kind)), (Some(name), _)) => {
+            Some((name.to_owned(), kind))
+        }
         _ => None,
     }
 }
 
-fn extract_param<'a>(
-    schema: &'a Schema,
-    expr: &Expr,
-    tables: &HashMap<String, &'a Table>,
-    params: &mut Vec<(SqliteType, Option<&'a str>)>,
+fn extract_params<'schema, 'stmt>(
+    schema: &'schema Schema,
+    expr: &'stmt Expr,
+    tables: &HashMap<String, &'schema Table>,
+    params: &mut ParamsList<'stmt, 'schema>,
 ) {
     match expr {
         // expr BETWEEN expr AND expr
@@ -2543,14 +2563,19 @@ fn extract_param<'a>(
 
         // expr operator expr
         Expr::Binary(lhs, _, rhs) => {
-            if let Some(name) = handle_lhs_rhs(lhs, rhs) {
+            if let Some((name, kind)) = handle_lhs_rhs(lhs, rhs) {
                 match name {
                     // not aliased!
                     SqliteName::Id(id) => {
                         // find the first one to match
                         for (_, table) in tables.iter() {
                             if let Some(col) = table.columns.get(&id.0) {
-                                params.push(col.sql_type());
+                                let (sqlite_type, source) = col.sql_type();
+                                params.insert(Param {
+                                    kind,
+                                    sqlite_type,
+                                    source,
+                                });
                                 break;
                             }
                         }
@@ -2568,14 +2593,19 @@ fn extract_param<'a>(
                             };
 
                             if let Some(col) = table.columns.get(col_name) {
-                                params.push(col.sql_type());
+                                let (sqlite_type, source) = col.sql_type();
+                                params.insert(Param {
+                                    kind,
+                                    sqlite_type,
+                                    source,
+                                });
                             }
                         }
                     }
                 }
             } else {
-                extract_param(schema, lhs, tables, params);
-                extract_param(schema, rhs, tables, params);
+                extract_params(schema, lhs, tables, params);
+                extract_params(schema, rhs, tables, params);
             }
         }
 
@@ -2621,7 +2651,7 @@ fn extract_param<'a>(
         Expr::InList { lhs, not: _, rhs } => {
             if let Some(rhs) = rhs {
                 for expr in rhs.iter() {
-                    if let Some(name) = handle_lhs_rhs(lhs, expr) {
+                    if let Some((name, kind)) = handle_lhs_rhs(lhs, expr) {
                         trace!("HANDLED LHS RHS: {name:?}");
                         match name {
                             // not aliased!
@@ -2629,7 +2659,12 @@ fn extract_param<'a>(
                                 // find the first one to match
                                 for (_, table) in tables.iter() {
                                     if let Some(col) = table.columns.get(&id.0) {
-                                        params.push(col.sql_type());
+                                        let (sqlite_type, source) = col.sql_type();
+                                        params.insert(Param {
+                                            kind,
+                                            sqlite_type,
+                                            source,
+                                        });
                                         break;
                                     }
                                 }
@@ -2644,7 +2679,12 @@ fn extract_param<'a>(
                                 };
                                 if let Some(table) = tables.get(&tbl_name.0) {
                                     if let Some(col) = table.columns.get(col_name) {
-                                        params.push(col.sql_type());
+                                        let (sqlite_type, source) = col.sql_type();
+                                        params.insert(Param {
+                                            kind,
+                                            sqlite_type,
+                                            source,
+                                        });
                                     }
                                 }
                             }
@@ -2698,7 +2738,7 @@ fn extract_param<'a>(
         // ( expr, ... )
         Expr::Parenthesized(exprs) => {
             for expr in exprs.iter() {
-                extract_param(schema, expr, tables, params)
+                extract_params(schema, expr, tables, params)
             }
         }
 
@@ -2726,10 +2766,10 @@ fn rem_first_and_last(value: &str) -> &str {
     chars.as_str()
 }
 
-fn handle_select<'a>(
-    schema: &'a Schema,
-    select: &Select,
-    params: &mut Vec<(SqliteType, Option<&'a str>)>,
+fn handle_select<'schema, 'stmt>(
+    schema: &'schema Schema,
+    select: &'stmt Select,
+    params: &mut ParamsList<'stmt, 'schema>,
 ) {
     let tables = match &select.body.select {
         OneSelect::Select {
@@ -2744,7 +2784,7 @@ fn handle_select<'a>(
                 let tables = handle_from(schema, from, params);
                 if let Some(where_clause) = where_clause {
                     trace!("WHERE CLAUSE: {where_clause:?}");
-                    extract_param(schema, where_clause, &tables, params);
+                    extract_params(schema, where_clause, &tables, params);
                 }
                 tables
             } else {
@@ -2753,8 +2793,12 @@ fn handle_select<'a>(
             for col in columns.iter() {
                 if let ResultColumn::Expr(expr, _) = col {
                     // TODO: check against table if we can...
-                    if is_param(expr) {
-                        params.push((SqliteType::Text, None));
+                    if let Some(kind) = as_param(expr) {
+                        params.insert(Param {
+                            kind,
+                            sqlite_type: SqliteType::Text,
+                            source: None,
+                        });
                     }
                 }
             }
@@ -2763,8 +2807,12 @@ fn handle_select<'a>(
         OneSelect::Values(values_values) => {
             for values in values_values.iter() {
                 for value in values.iter() {
-                    if is_param(value) {
-                        params.push((SqliteType::Text, None));
+                    if let Some(kind) = as_param(value) {
+                        params.insert(Param {
+                            kind,
+                            sqlite_type: SqliteType::Text,
+                            source: None,
+                        });
                     }
                 }
             }
@@ -2772,28 +2820,15 @@ fn handle_select<'a>(
         }
     };
     if let Some(limit) = &select.limit {
-        if is_param(&limit.expr) {
-            trace!("limit was a param (variable), pushing Integer type");
-            params.push((SqliteType::Integer, None));
-        } else {
-            extract_param(schema, &limit.expr, &tables, params);
-        }
-        if let Some(offset) = &limit.offset {
-            if is_param(offset) {
-                trace!("offset was a param (variable), pushing Integer type");
-                params.push((SqliteType::Integer, None));
-            } else {
-                extract_param(schema, offset, &tables, params);
-            }
-        }
+        handle_limit(schema, limit, &tables, params);
     }
 }
 
-fn handle_from<'a>(
-    schema: &'a Schema,
-    from: &FromClause,
-    params: &mut Vec<(SqliteType, Option<&'a str>)>,
-) -> HashMap<String, &'a Table> {
+fn handle_from<'schema, 'stmt>(
+    schema: &'schema Schema,
+    from: &'stmt FromClause,
+    params: &mut ParamsList<'stmt, 'schema>,
+) -> HashMap<String, &'schema Table> {
     let mut tables: HashMap<String, &Table> = HashMap::new();
     if let Some(select) = from.select.as_deref() {
         match select {
@@ -2854,37 +2889,161 @@ fn handle_from<'a>(
     tables
 }
 
-fn parameter_types<'a>(schema: &'a Schema, cmd: &ParsedCmd) -> Vec<(SqliteType, Option<&'a str>)> {
-    let mut params = vec![];
+#[derive(Debug)]
+struct Param<'stmt, 'schema> {
+    kind: ParamKind<'stmt>,
+    sqlite_type: SqliteType,
+    source: Option<&'schema str>,
+}
+
+#[derive(Default, Debug)]
+struct ParamsList<'stmt, 'schema> {
+    params: Vec<Param<'stmt, 'schema>>,
+    named: BTreeSet<&'stmt str>,
+}
+
+impl<'stmt, 'schema> ParamsList<'stmt, 'schema> {
+    pub fn insert(&mut self, param: Param<'stmt, 'schema>) {
+        let should_push = if let ParamKind::Named(name) = &param.kind {
+            self.named.insert(*name)
+        } else {
+            true
+        };
+        if should_push {
+            self.params.push(param);
+        }
+    }
+}
+
+fn handle_limit<'schema, 'stmt>(
+    schema: &'schema Schema,
+    limit: &'stmt Limit,
+    tables: &HashMap<String, &'schema Table>,
+    params: &mut ParamsList<'stmt, 'schema>,
+) {
+    if let Some(kind) = as_param(&limit.expr) {
+        trace!("limit was a param (variable), pushing Integer type");
+        params.insert(Param {
+            kind,
+            sqlite_type: SqliteType::Integer,
+            source: None,
+        });
+    } else {
+        extract_params(schema, &limit.expr, tables, params);
+    }
+    if let Some(offset) = &limit.offset {
+        if let Some(kind) = as_param(offset) {
+            trace!("offset was a param (variable), pushing Integer type");
+            params.insert(Param {
+                kind,
+                sqlite_type: SqliteType::Integer,
+                source: None,
+            });
+        } else {
+            extract_params(schema, offset, tables, params);
+        }
+    }
+}
+
+fn handle_with<'schema, 'stmt>(
+    schema: &'schema Schema,
+    with: &'stmt With,
+    params: &mut ParamsList<'stmt, 'schema>,
+) -> Vec<Table> {
+    let mut tables = vec![];
+    for cte in with.ctes.iter() {
+        handle_select(schema, &cte.select, params);
+        tables.push(Table {
+            name: cte.tbl_name.0.clone(),
+            pk: Default::default(),
+            columns: cte
+                .columns
+                .as_ref()
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|col| {
+                            (
+                                col.col_name.0.clone(),
+                                Column {
+                                    name: col.col_name.0.clone(),
+                                    sql_type: (SqliteType::Text, None), // no idea!
+                                    nullable: false,
+                                    default_value: None,
+                                    generated: None,
+                                    primary_key: false,
+                                    raw: ColumnDefinition {
+                                        col_name: col.col_name.clone(),
+                                        col_type: None,
+                                        constraints: vec![],
+                                    },
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            indexes: Default::default(),
+            raw: CreateTableBody::AsSelect(cte.select.clone()),
+        })
+    }
+    tables
+}
+
+fn parameter_types<'schema, 'stmt>(
+    schema: &'schema Schema,
+    cmd: &'stmt ParsedCmd,
+) -> ParamsList<'stmt, 'schema> {
+    let mut params = ParamsList::default();
 
     if let ParsedCmd::Sqlite(Cmd::Stmt(stmt)) = cmd {
         match stmt {
             Stmt::Select(select) => handle_select(schema, select, &mut params),
             Stmt::Delete {
+                with,
                 tbl_name,
-                where_clause: Some(where_clause),
+                where_clause,
+                limit,
                 ..
             } => {
+                if let Some(with) = with {
+                    // TODO: do something w/ the accumulated tables?
+                    handle_with(schema, with, &mut params);
+                }
+
                 let mut tables = HashMap::new();
                 if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
                     tables.insert(tbl_name.name.0.clone(), tbl);
                 }
-                extract_param(schema, where_clause, &tables, &mut params);
+                if let Some(where_clause) = where_clause {
+                    extract_params(schema, where_clause, &tables, &mut params);
+                }
+
+                if let Some(limit) = limit {
+                    handle_limit(schema, limit, &tables, &mut params);
+                }
             }
             Stmt::Insert {
+                with,
                 tbl_name,
                 columns,
                 body,
                 ..
             } => {
                 trace!("GOT AN INSERT TO {tbl_name:?} on columns: {columns:?} w/ body: {body:?}");
+
+                if let Some(with) = with {
+                    // TODO: do something w/ the accumulated tables?
+                    handle_with(schema, with, &mut params);
+                }
+
                 if let Some(table) = schema.tables.get(&tbl_name.name.0) {
                     match body {
                         InsertBody::Select(select, _) => {
                             if let OneSelect::Values(values_values) = &select.body.select {
                                 for values in values_values.iter() {
                                     for (i, expr) in values.iter().enumerate() {
-                                        if is_param(expr) {
+                                        if let Some(kind) = as_param(expr) {
                                             // specified columns
                                             let col = if let Some(columns) = columns {
                                                 columns
@@ -2894,7 +3053,12 @@ fn parameter_types<'a>(schema: &'a Schema, cmd: &ParsedCmd) -> Vec<(SqliteType, 
                                                 table.columns.get_index(i).map(|(_name, col)| col)
                                             };
                                             if let Some(col) = col {
-                                                params.push(col.sql_type());
+                                                let (sqlite_type, source) = col.sql_type();
+                                                params.insert(Param {
+                                                    kind,
+                                                    sqlite_type,
+                                                    source,
+                                                });
                                             }
                                         }
                                     }
@@ -2910,28 +3074,61 @@ fn parameter_types<'a>(schema: &'a Schema, cmd: &ParsedCmd) -> Vec<(SqliteType, 
                 }
             }
             Stmt::Update {
-                with: _,
+                with,
                 or_conflict: _,
                 tbl_name,
                 indexed: _,
-                sets: _,
+                sets,
                 from,
                 where_clause,
                 returning: _,
                 order_by: _,
-                limit: _,
+                limit,
             } => {
-                let mut tables = if let Some(from) = from {
-                    handle_from(schema, from, &mut params)
-                } else {
-                    Default::default()
-                };
-                if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
-                    tables.insert(tbl_name.name.0.clone(), tbl);
+                if let Some(with) = with {
+                    // TODO: do something w/ the accumulated tables?
+                    handle_with(schema, with, &mut params);
                 }
+
+                let mut tables: HashMap<String, &'schema Table> = Default::default();
+
+                let table = if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
+                    tables.insert(tbl_name.name.0.clone(), tbl);
+                    Some(tbl)
+                } else {
+                    None
+                };
+
+                for set in sets.iter() {
+                    if let Some(kind) = as_param(&set.expr) {
+                        let (sqlite_type, source) = if let Some(col) =
+                            set.col_names.first().and_then(|first_col_name| {
+                                table.and_then(|table| table.columns.get(&first_col_name.0))
+                            }) {
+                            col.sql_type()
+                        } else {
+                            (SqliteType::Text, None)
+                        };
+                        params.insert(Param {
+                            kind,
+                            sqlite_type,
+                            source,
+                        });
+                    }
+                }
+
+                if let Some(from) = from {
+                    let from_tables = handle_from(schema, from, &mut params);
+
+                    tables.extend(from_tables);
+                }
+
                 if let Some(where_clause) = where_clause {
                     trace!("WHERE CLAUSE: {where_clause:?}");
-                    extract_param(schema, where_clause, &tables, &mut params);
+                    extract_params(schema, where_clause, &tables, &mut params);
+                }
+                if let Some(limit) = limit {
+                    handle_limit(schema, limit, &tables, &mut params);
                 }
             }
             _ => {
@@ -2966,7 +3163,8 @@ mod tests {
             tmpdir.path().join("kitchensink.sql"),
             "
             CREATE TABLE kitchensink (
-                id PRIMARY KEY NOT NULL,
+                id BIGINT PRIMARY KEY NOT NULL,
+                other_ts DATETIME,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
         ",
@@ -3118,8 +3316,8 @@ mod tests {
 
             let row = client
                 .query_one(
-                    "INSERT INTO kitchensink (id, updated_at) VALUES (1, ?) RETURNING updated_at",
-                    &[&now],
+                    "INSERT INTO kitchensink (other_ts, id, updated_at) VALUES (?1, ?2, ?1) RETURNING updated_at",
+                    &[&now, &1i64],
                 )
                 .await?;
 
@@ -3128,6 +3326,23 @@ mod tests {
             println!("updated_at: {updated_at:?}");
 
             assert_eq!(now, updated_at);
+
+            let future: DateTime<Utc> = Utc::now() + Duration::from_secs(1);
+            let future = NaiveDateTime::from_timestamp_micros(future.timestamp_micros()).unwrap();
+            println!("NOW: {future:?}");
+
+            let row = client
+                .query_one(
+                    "UPDATE kitchensink SET other_ts = $ts, updated_at = $ts WHERE id = $id AND updated_at > ? RETURNING updated_at",
+                    &[&future, &1i64, &(now - Duration::from_secs(1))],
+                )
+                .await?;
+
+            println!("ROW: {row:?}");
+            let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
+            println!("updated_at: {updated_at:?}");
+
+            assert_eq!(future, updated_at);
         }
 
         tripwire_tx.send(()).await.ok();
