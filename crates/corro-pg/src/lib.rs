@@ -18,7 +18,7 @@ use corro_types::{
     broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset, Timestamp},
     change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     config::PgConfig,
-    schema::{parse_sql, Schema, SchemaError, SqliteType, Table},
+    schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
@@ -50,8 +50,8 @@ use rusqlite::{
 };
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
-    As, Cmd, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Name, OneSelect,
-    ResultColumn, Select, SelectTable, Stmt,
+    As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Name,
+    OneSelect, ResultColumn, Select, SelectTable, Stmt, With,
 };
 use sqlparser::ast::Statement as PgStatement;
 use tokio::{
@@ -2945,6 +2945,51 @@ fn handle_limit<'schema, 'stmt>(
     }
 }
 
+fn handle_with<'schema, 'stmt>(
+    schema: &'schema Schema,
+    with: &'stmt With,
+    params: &mut ParamsList<'stmt, 'schema>,
+) -> Vec<Table> {
+    let mut tables = vec![];
+    for cte in with.ctes.iter() {
+        handle_select(schema, &cte.select, params);
+        tables.push(Table {
+            name: cte.tbl_name.0.clone(),
+            pk: Default::default(),
+            columns: cte
+                .columns
+                .as_ref()
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|col| {
+                            (
+                                col.col_name.0.clone(),
+                                Column {
+                                    name: col.col_name.0.clone(),
+                                    sql_type: (SqliteType::Text, None), // no idea!
+                                    nullable: false,
+                                    default_value: None,
+                                    generated: None,
+                                    primary_key: false,
+                                    raw: ColumnDefinition {
+                                        col_name: col.col_name.clone(),
+                                        col_type: None,
+                                        constraints: vec![],
+                                    },
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            indexes: Default::default(),
+            raw: CreateTableBody::AsSelect(cte.select.clone()),
+        })
+    }
+    tables
+}
+
 fn parameter_types<'schema, 'stmt>(
     schema: &'schema Schema,
     cmd: &'stmt ParsedCmd,
@@ -2955,11 +3000,17 @@ fn parameter_types<'schema, 'stmt>(
         match stmt {
             Stmt::Select(select) => handle_select(schema, select, &mut params),
             Stmt::Delete {
+                with,
                 tbl_name,
                 where_clause,
                 limit,
                 ..
             } => {
+                if let Some(with) = with {
+                    // TODO: do something w/ the accumulated tables?
+                    handle_with(schema, with, &mut params);
+                }
+
                 let mut tables = HashMap::new();
                 if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
                     tables.insert(tbl_name.name.0.clone(), tbl);
@@ -2973,12 +3024,19 @@ fn parameter_types<'schema, 'stmt>(
                 }
             }
             Stmt::Insert {
+                with,
                 tbl_name,
                 columns,
                 body,
                 ..
             } => {
                 trace!("GOT AN INSERT TO {tbl_name:?} on columns: {columns:?} w/ body: {body:?}");
+
+                if let Some(with) = with {
+                    // TODO: do something w/ the accumulated tables?
+                    handle_with(schema, with, &mut params);
+                }
+
                 if let Some(table) = schema.tables.get(&tbl_name.name.0) {
                     match body {
                         InsertBody::Select(select, _) => {
@@ -3016,7 +3074,7 @@ fn parameter_types<'schema, 'stmt>(
                 }
             }
             Stmt::Update {
-                with: _,
+                with,
                 or_conflict: _,
                 tbl_name,
                 indexed: _,
@@ -3027,6 +3085,11 @@ fn parameter_types<'schema, 'stmt>(
                 order_by: _,
                 limit,
             } => {
+                if let Some(with) = with {
+                    // TODO: do something w/ the accumulated tables?
+                    handle_with(schema, with, &mut params);
+                }
+
                 let mut tables: HashMap<String, &'schema Table> = Default::default();
 
                 let table = if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
