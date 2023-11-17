@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap},
     net::SocketAddr,
     num::NonZeroU32,
     pin::Pin,
@@ -31,7 +31,7 @@ use tracing::{debug, error, log::info, trace, warn};
 use tripwire::Tripwire;
 
 use corro_types::{
-    actor::Actor,
+    actor::{Actor, ActorId},
     agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
     members::MemberEvent,
@@ -142,12 +142,16 @@ pub fn runtime_loop(
                     .chunks_timeout(1000, Duration::from_secs(2));
             tokio::pin!(member_events_chunks);
 
+            let mut last_states: HashMap<ActorId, foca::Member<Actor>> = HashMap::new();
+            let mut check_last_states_every = tokio::time::interval(Duration::from_secs(60));
+
             #[derive(EnumDiscriminants)]
             #[strum_discriminants(derive(strum::IntoStaticStr))]
             enum Branch {
                 Foca(FocaInput),
                 HandleTimer(Timer<Actor>, Instant),
                 MemberEvents(Vec<Result<MemberEvent, BroadcastStreamRecvError>>),
+                DiffMembers,
                 Metrics,
                 Tripped,
             }
@@ -176,7 +180,7 @@ pub fn runtime_loop(
                             break;
                         }
                     },
-                    evts =  member_events_chunks.next(), if !member_events_done && !tripped => match evts {
+                    evts = member_events_chunks.next(), if !member_events_done && !tripped => match evts {
                         Some(evts) if !evts.is_empty() => Branch::MemberEvents(evts),
                         Some(_) => {
                             continue;
@@ -189,6 +193,9 @@ pub fn runtime_loop(
                     _ = metrics_interval.tick() => {
                         Branch::Metrics
                     },
+                    _ = check_last_states_every.tick() => {
+                        Branch::DiffMembers
+                    }
                     _ = &mut tripwire, if !tripped => {
                         tripped = true;
                         Branch::Tripped
@@ -375,13 +382,16 @@ pub fn runtime_loop(
                                     let foca_state = foca
                                         .iter_membership_state()
                                         .find(|member| member.id().id() == actor.id())
-                                        .and_then(|member| match serde_json::to_string(member) {
-                                            Ok(foca_state) => Some(foca_state),
-                                            Err(e) => {
-                                                error!(
+                                        .and_then(|member| {
+                                            last_states.insert(actor.id(), member.clone());
+                                            match serde_json::to_string(member) {
+                                                Ok(foca_state) => Some(foca_state),
+                                                Err(e) => {
+                                                    error!(
                                                     "could not serialize foca member state: {e}"
                                                 );
-                                                None
+                                                    None
+                                                }
                                             }
                                         });
                                     foca_state
@@ -503,6 +513,67 @@ pub fn runtime_loop(
                             );
                         }
                         gauge!("corro.gossip.cluster_size", last_cluster_size.get() as f64);
+                    }
+                    Branch::DiffMembers => {
+                        let to_update = foca
+                            .iter_membership_state()
+                            .filter_map(|member| match last_states.entry(member.id().id()) {
+                                Entry::Occupied(mut entry) => {
+                                    if entry.get() != member {
+                                        entry.insert(member.clone());
+                                        Some(member.clone())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Entry::Vacant(entry) => {
+                                    entry.insert(member.clone());
+                                    Some(member.clone())
+                                }
+                            })
+                            .collect::<Vec<_>>();
+
+                        let pool = agent.pool().clone();
+                        tokio::spawn(async move {
+                            let mut conn = match pool.write_low().await {
+                                Ok(conn) => conn,
+                                Err(e) => {
+                                    error!(
+                                        "could not acquire a r/w conn to process member events: {e}"
+                                    );
+                                    return;
+                                }
+                            };
+
+                            let res = block_in_place(|| {
+                                let tx = conn.transaction()?;
+
+                                for member in to_update {
+                                    let up_down = match member.state() {
+                                        foca::State::Down => "down",
+                                        _ => "up",
+                                    };
+                                    let foca_state = serde_json::to_string(&member).unwrap();
+                                    tx.prepare_cached("UPDATE __corro_members SET foca_state = ? AND state = ? WHERE actor_id = ? AND incarnation >= ?")?
+                                    .execute(params![
+                                        foca_state,
+                                        up_down,
+                                        member.id().id(),
+                                        member.incarnation()
+                                    ])?;
+                                }
+
+                                tx.commit()?;
+
+                                Ok::<_, rusqlite::Error>(())
+                            });
+
+                            if let Err(e) = res {
+                                error!(
+                                    "could not insert state changes from SWIM cluster into sqlite: {e}"
+                                );
+                            }
+                        });
                     }
                 }
 

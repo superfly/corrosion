@@ -1490,7 +1490,8 @@ async fn generate_bootstrap(
         // fallback to in-db nodes
         let conn = pool.read().await?;
         addrs = block_in_place(|| {
-            let mut prepped = conn.prepare("SELECT address FROM __corro_members LIMIT 5")?;
+            let mut prepped =
+                conn.prepare("SELECT address FROM __corro_members ORDER BY RANDOM() LIMIT 5")?;
             let node_addrs = prepped.query_map([], |row| row.get::<_, String>(0))?;
             Ok::<_, rusqlite::Error>(
                 node_addrs
