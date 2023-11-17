@@ -65,12 +65,17 @@ impl CorrosionApiClient {
     pub async fn subscribe(
         &self,
         statement: &Statement,
+        skip_rows: bool,
         from: Option<ChangeId>,
     ) -> Result<SubscriptionStream, Error> {
         let p_and_q: PathAndQuery = if let Some(change_id) = from {
-            format!("/v1/subscriptions?from={}", change_id.0).try_into()?
+            format!(
+                "/v1/subscriptions?skip_rows={}&from={}",
+                skip_rows, change_id.0
+            )
+            .try_into()?
         } else {
-            PathAndQuery::from_static("/v1/subscriptions")
+            format!("/v1/subscriptions?skip_rows={}", skip_rows).try_into()?
         };
         let url = hyper::Uri::builder()
             .scheme("http")
@@ -110,12 +115,17 @@ impl CorrosionApiClient {
     pub async fn subscription(
         &self,
         id: Uuid,
+        skip_rows: bool,
         from: Option<ChangeId>,
     ) -> Result<SubscriptionStream, Error> {
         let p_and_q: PathAndQuery = if let Some(change_id) = from {
-            format!("/v1/subscriptions/{id}?from={}", change_id.0).try_into()?
+            format!(
+                "/v1/subscriptions/{id}?skip_rows={}&from={}",
+                skip_rows, change_id.0
+            )
+            .try_into()?
         } else {
-            format!("/v1/subscriptions/{id}").try_into()?
+            format!("/v1/subscriptions/{id}?skip_rows={}", skip_rows).try_into()?
         };
         let url = hyper::Uri::builder()
             .scheme("http")

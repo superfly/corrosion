@@ -58,7 +58,7 @@ pub struct SubscriptionStream {
     client: hyper::Client<HttpConnector, Body>,
     api_addr: SocketAddr,
     observed_eoq: bool,
-    last_change_id: ChangeId,
+    last_change_id: Option<ChangeId>,
     stream: Option<FramedBody>,
     backoff: Option<Pin<Box<Sleep>>>,
     backoff_count: u32,
@@ -96,7 +96,7 @@ impl SubscriptionStream {
             client,
             api_addr,
             observed_eoq: false,
-            last_change_id: last_change_id.unwrap_or_default(),
+            last_change_id,
             stream: Some(FramedRead::new(
                 StreamReader::new(IoBodyStream { body }),
                 LinesBytesCodec::default(),
@@ -135,15 +135,13 @@ impl SubscriptionStream {
                 Ok(evt) => {
                     if let QueryEvent::EndOfQuery { change_id, .. } = &evt {
                         self.observed_eoq = true;
-                        if let Some(change_id) = change_id {
-                            self.last_change_id = *change_id;
-                        }
+                        self.last_change_id = *change_id;
                     }
                     if let QueryEvent::Change(_, _, _, change_id) = &evt {
-                        if self.last_change_id.0 + 1 != change_id.0 {
+                        if matches!(self.last_change_id, Some(id) if id.0 + 1 != change_id.0) {
                             return Poll::Ready(Some(Err(SubscriptionError::MissedChange)));
                         }
-                        self.last_change_id = *change_id;
+                        self.last_change_id = Some(*change_id);
                     }
                     Poll::Ready(Some(Ok(evt)))
                 }
@@ -194,7 +192,9 @@ impl SubscriptionStream {
                     .method(hyper::Method::GET)
                     .uri(format!(
                         "http://{}/v1/subscriptions/{}?from={}",
-                        self.api_addr, self.id, self.last_change_id
+                        self.api_addr,
+                        self.id,
+                        self.last_change_id.unwrap_or_default()
                     ))
                     .header(hyper::header::ACCEPT, "application/json")
                     .body(hyper::Body::empty())?;
