@@ -1020,14 +1020,8 @@ async fn clear_overwritten_versions(agent: Agent) {
     let pool = agent.pool();
     let bookie = agent.bookie();
 
-    let mut interval = Duration::new(0, 0);
-
     loop {
-        sleep(interval).await;
-
-        if interval != COMPACT_BOOKED_INTERVAL {
-            interval = COMPACT_BOOKED_INTERVAL;
-        }
+        sleep(COMPACT_BOOKED_INTERVAL).await;
 
         info!("Starting compaction...");
         let start = Instant::now();
