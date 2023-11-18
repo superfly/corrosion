@@ -533,6 +533,15 @@ pub fn runtime_loop(
                             })
                             .collect::<Vec<_>>();
 
+                        if to_update.is_empty() {
+                            continue;
+                        }
+
+                        info!(
+                            "Scheduling cluster membership state update for {} members",
+                            to_update.len()
+                        );
+
                         let pool = agent.pool().clone();
                         tokio::spawn(async move {
                             let mut conn = match pool.write_low().await {
@@ -545,6 +554,8 @@ pub fn runtime_loop(
                                 }
                             };
 
+                            let mut upserted = 0;
+
                             let res = block_in_place(|| {
                                 let tx = conn.transaction()?;
 
@@ -554,7 +565,7 @@ pub fn runtime_loop(
                                         _ => "up",
                                     };
                                     let foca_state = serde_json::to_string(&member).unwrap();
-                                    tx.prepare_cached("UPDATE __corro_members SET foca_state = ? AND state = ? WHERE actor_id = ? AND incarnation >= ?")?
+                                    upserted += tx.prepare_cached("UPDATE __corro_members SET foca_state = ? AND state = ? WHERE actor_id = ? AND incarnation >= ?")?
                                     .execute(params![
                                         foca_state,
                                         up_down,
@@ -573,6 +584,8 @@ pub fn runtime_loop(
                                     "could not insert state changes from SWIM cluster into sqlite: {e}"
                                 );
                             }
+
+                            info!("Upserted {upserted} membership states");
                         });
                     }
                 }
