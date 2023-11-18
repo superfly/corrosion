@@ -566,12 +566,18 @@ pub fn runtime_loop(
                                         _ => "up",
                                     };
                                     let foca_state = serde_json::to_string(&member).unwrap();
-                                    upserted += tx.prepare_cached("UPDATE __corro_members SET foca_state = ? AND state = ? WHERE actor_id = ? AND json_extract(foca_state, 'incarnation') >= ?")?
+                                    upserted += tx.prepare_cached("
+                                    INSERT INTO __corro_members (actor_id, foca_state, state)
+                                        VALUES                  (?,        ?,          ?)
+                                        ON CONFLICT (actor_id)
+                                            DO UPDATE SET
+                                                foca_state = excluded.foca_state,
+                                                state = excluded.state
+                                            WHERE COALESCE(json_extract(foca_state, '$.incarnation'), 0) <= COALESCE(json_extract(excluded.foca_state, '$.incarnation'), 1)")?
                                     .execute(params![
+                                        member.id().id(),
                                         foca_state,
                                         up_down,
-                                        member.id().id(),
-                                        member.incarnation()
                                     ])?;
                                 }
 
