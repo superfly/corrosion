@@ -269,6 +269,7 @@ pub fn runtime_loop(
                                             {
                                                 warn!("could not clear all corro members before re-inserting them: {e}");
                                             }
+
                                             let db_res = tx.prepare_cached(
                                                     "
                                                 INSERT INTO __corro_members (actor_id, address, state, foca_state, rtts)
@@ -565,7 +566,7 @@ pub fn runtime_loop(
                                         _ => "up",
                                     };
                                     let foca_state = serde_json::to_string(&member).unwrap();
-                                    upserted += tx.prepare_cached("UPDATE __corro_members SET foca_state = ? AND state = ? WHERE actor_id = ? AND incarnation >= ?")?
+                                    upserted += tx.prepare_cached("UPDATE __corro_members SET foca_state = ? AND state = ? WHERE actor_id = ? AND json_extract(foca_state, 'incarnation') >= ?")?
                                     .execute(params![
                                         foca_state,
                                         up_down,
