@@ -568,7 +568,7 @@ pub fn runtime_loop(
                                     let foca_state = serde_json::to_string(&member).unwrap();
                                     upserted += tx.prepare_cached("
                                     INSERT INTO __corro_members (actor_id, address, foca_state, state)
-                                        VALUES                  (?,        ?,       ?           ?)
+                                        VALUES                  (?,        ?,       ?,          ?)
                                         ON CONFLICT (actor_id)
                                             DO UPDATE SET
                                                 foca_state = excluded.foca_state,
