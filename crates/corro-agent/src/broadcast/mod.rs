@@ -567,15 +567,17 @@ pub fn runtime_loop(
                                     };
                                     let foca_state = serde_json::to_string(&member).unwrap();
                                     upserted += tx.prepare_cached("
-                                    INSERT INTO __corro_members (actor_id, foca_state, state)
-                                        VALUES                  (?,        ?,          ?)
+                                    INSERT INTO __corro_members (actor_id, address, foca_state, state)
+                                        VALUES                  (?,        ?,       ?           ?)
                                         ON CONFLICT (actor_id)
                                             DO UPDATE SET
                                                 foca_state = excluded.foca_state,
+                                                address = excluded.address,
                                                 state = excluded.state
                                             WHERE COALESCE(json_extract(foca_state, '$.incarnation'), 0) <= COALESCE(json_extract(excluded.foca_state, '$.incarnation'), 1)")?
                                     .execute(params![
                                         member.id().id(),
+                                        member.id().addr().to_string(),
                                         foca_state,
                                         up_down,
                                     ])?;
