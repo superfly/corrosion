@@ -975,6 +975,7 @@ pub struct BookedVersions {
     pub cleared: RangeInclusiveSet<i64>,
     pub current: BTreeMap<i64, CurrentVersion>,
     pub partials: BTreeMap<i64, PartialVersion>,
+    sync_need: RangeInclusiveSet<i64>,
 }
 
 impl BookedVersions {
@@ -1041,6 +1042,14 @@ impl BookedVersions {
     }
 
     pub fn insert_many(&mut self, versions: RangeInclusive<i64>, known_version: KnownDbVersion) {
+        // detect if a new gap has formed!
+        let last_known = self.last().unwrap_or(1);
+        let new_gap = if *versions.start() > last_known {
+            Some((last_known + 1)..=*versions.start())
+        } else {
+            None
+        };
+
         match known_version {
             KnownDbVersion::Partial { seqs, last_seq, ts } => {
                 self.partials
@@ -1067,17 +1076,18 @@ impl BookedVersions {
                     self.partials.remove(&version);
                     self.current.remove(&version);
                 }
-                self.cleared.insert(versions);
+                self.cleared.insert(versions.clone());
             }
         }
+        if let Some(new_gap) = new_gap {
+            // a new gap has formed, let's add that to the needed versions
+            self.sync_need.insert(new_gap);
+        }
+        self.sync_need.remove(versions);
     }
 
-    pub fn all_versions(&self) -> RangeInclusiveSet<i64> {
-        let mut versions = self.cleared.clone();
-        versions.extend(self.current.keys().map(|key| *key..=*key));
-        versions.extend(self.partials.keys().map(|key| *key..=*key));
-
-        versions
+    pub fn sync_need(&self) -> &RangeInclusiveSet<i64> {
+        &self.sync_need
     }
 }
 
@@ -1087,7 +1097,22 @@ pub type BookedInner = Arc<CountedTokioRwLock<BookedVersions>>;
 pub struct Booked(BookedInner);
 
 impl Booked {
-    fn new(versions: BookedVersions, registry: LockRegistry) -> Self {
+    fn new(mut versions: BookedVersions, registry: LockRegistry) -> Self {
+        // pre-compute sync needs
+        let mut sync_need = RangeInclusiveSet::new();
+        if let Some(last) = versions.last() {
+            sync_need.insert(1..=last);
+            for range in versions.cleared.iter() {
+                sync_need.remove(range.clone());
+            }
+            for v in versions.current.keys() {
+                sync_need.remove(*v..=*v);
+            }
+            for v in versions.partials.keys() {
+                sync_need.remove(*v..=*v);
+            }
+        }
+        versions.sync_need = sync_need;
         Self(Arc::new(CountedTokioRwLock::new(registry, versions)))
     }
 
