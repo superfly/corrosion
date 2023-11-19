@@ -26,7 +26,7 @@ use tokio::{
     time::interval,
 };
 use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
-use tokio_util::codec::{Encoder, LengthDelimitedCodec};
+use tokio_util::codec::Encoder;
 use tracing::{debug, error, log::info, trace, warn};
 use tripwire::Tripwire;
 
@@ -34,6 +34,7 @@ use corro_types::{
     actor::Actor,
     agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
+    codec::Crc32LengthDelimitedCodec,
     members::MemberEvent,
 };
 
@@ -520,7 +521,7 @@ pub fn runtime_loop(
     tokio::spawn(async move {
         const BROADCAST_CUTOFF: usize = 64 * 1024;
 
-        let mut bcast_codec = LengthDelimitedCodec::new();
+        let mut bcast_codec = Crc32LengthDelimitedCodec::default();
 
         let mut bcast_buf = BytesMut::new();
         let mut local_bcast_buf = BytesMut::new();
@@ -613,9 +614,7 @@ pub fn runtime_loop(
                     trace!("ser buf len: {}", ser_buf.len());
 
                     if is_local {
-                        if let Err(e) =
-                            bcast_codec.encode(ser_buf.split().freeze(), &mut single_bcast_buf)
-                        {
+                        if let Err(e) = bcast_codec.encode(ser_buf.split(), &mut single_bcast_buf) {
                             error!("could not encode local broadcast: {e}");
                             single_bcast_buf.clear();
                             continue;

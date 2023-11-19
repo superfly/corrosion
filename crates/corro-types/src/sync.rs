@@ -5,13 +5,14 @@ use opentelemetry::propagation::{Extractor, Injector};
 use rangemap::RangeInclusiveSet;
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
-use tokio_util::codec::{Decoder, LengthDelimitedCodec};
+use tokio_util::codec::Decoder;
 use tracing::warn;
 
 use crate::{
     actor::ActorId,
     agent::{Booked, Bookie},
     broadcast::{ChangeV1, Timestamp},
+    codec::Crc32LengthDelimitedCodec,
 };
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
@@ -351,7 +352,7 @@ impl SyncMessage {
     }
 
     pub fn decode(
-        codec: &mut LengthDelimitedCodec,
+        codec: &mut Crc32LengthDelimitedCodec,
         buf: &mut BytesMut,
     ) -> Result<Option<Self>, SyncMessageDecodeError> {
         Ok(match codec.decode(buf)? {

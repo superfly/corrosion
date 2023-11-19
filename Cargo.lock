@@ -920,6 +920,7 @@ dependencies = [
  "consul-client",
  "corro-api-types",
  "corro-speedy",
+ "crc32fast",
  "deadpool",
  "enquote",
  "fallible-iterator",

@@ -47,6 +47,7 @@ tracing = { workspace = true }
 tripwire = { version = "0.1.0-alpha.0", path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }
+crc32fast = { version = "1.3.2" }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

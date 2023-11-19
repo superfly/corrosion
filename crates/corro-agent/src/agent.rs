@@ -31,6 +31,7 @@ use corro_types::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset,
         ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
+    codec::Crc32LengthDelimitedCodec,
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
     members::{MemberEvent, Members, Rtt},
     pubsub::{Matcher, SubsManager},
@@ -70,7 +71,7 @@ use tokio::{
     time::{error::Elapsed, sleep, timeout},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
-use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
+use tokio_util::codec::FramedRead;
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
@@ -596,8 +597,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 tokio::spawn({
                                     let process_uni_tx = process_uni_tx.clone();
                                     async move {
-                                        let mut framed =
-                                            FramedRead::new(rx, LengthDelimitedCodec::new());
+                                        let mut framed = FramedRead::new(
+                                            rx,
+                                            Crc32LengthDelimitedCodec::default(),
+                                        );
 
                                         loop {
                                             match StreamExt::next(&mut framed).await {
@@ -664,7 +667,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                                 let agent = agent.clone();
                                 async move {
                                     let mut framed =
-                                        FramedRead::new(rx, LengthDelimitedCodec::new());
+                                        FramedRead::new(rx, Crc32LengthDelimitedCodec::default());
 
                                     loop {
                                         match timeout(

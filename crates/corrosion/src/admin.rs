@@ -1,14 +1,14 @@
 use std::path::Path;
 
 use corro_admin::{Command, LogLevel, Response};
+use corro_types::codec::Crc32LengthDelimitedCodec;
 use futures::{SinkExt, TryStreamExt};
 use tokio::net::UnixStream;
 use tokio_serde::{formats::Json, Framed};
-use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{error, event};
 
 type FramedStream = Framed<
-    tokio_util::codec::Framed<UnixStream, LengthDelimitedCodec>,
+    tokio_util::codec::Framed<UnixStream, Crc32LengthDelimitedCodec>,
     Response,
     Command,
     Json<Response, Command>,
@@ -23,7 +23,7 @@ impl AdminConn {
         let stream = UnixStream::connect(path).await?;
         Ok(Self {
             stream: Framed::new(
-                tokio_util::codec::Framed::new(stream, LengthDelimitedCodec::new()),
+                tokio_util::codec::Framed::new(stream, Crc32LengthDelimitedCodec::default()),
                 Json::default(),
             ),
         })
