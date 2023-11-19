@@ -1942,6 +1942,13 @@ pub async fn process_multiple_changes(
                             },
                         )
                     } else {
+                        if let Some(seqs) = change.seqs() {
+                            if seqs.end() < seqs.start() {
+                                warn!(%actor_id, versions = ?change.versions(), "received an invalid change, seqs end is smaller than seqs start: {seqs:?}");
+                                continue;
+                            }
+                        }
+
                         let (known, changeset) = match process_single_version(
                             &tx,
                             last_db_version,
