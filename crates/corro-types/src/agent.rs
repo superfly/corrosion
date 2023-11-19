@@ -976,6 +976,7 @@ pub struct BookedVersions {
     pub current: BTreeMap<i64, CurrentVersion>,
     pub partials: BTreeMap<i64, PartialVersion>,
     sync_need: RangeInclusiveSet<i64>,
+    last: Option<i64>,
 }
 
 impl BookedVersions {
@@ -1026,15 +1027,7 @@ impl BookedVersions {
     }
 
     pub fn last(&self) -> Option<i64> {
-        std::cmp::max(
-            // TODO: we probably don't need to traverse all of that...
-            //       maybe use `skip` based on the len
-            self.cleared.iter().map(|k| *k.end()).max(),
-            std::cmp::max(
-                self.current.last_key_value().map(|(k, _)| *k),
-                self.partials.last_key_value().map(|(k, _)| *k),
-            ),
-        )
+        self.last
     }
 
     pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
@@ -1042,14 +1035,6 @@ impl BookedVersions {
     }
 
     pub fn insert_many(&mut self, versions: RangeInclusive<i64>, known_version: KnownDbVersion) {
-        // detect if a new gap has formed!
-        let last_known = self.last().unwrap_or(1);
-        let new_gap = if *versions.start() > last_known {
-            Some((last_known + 1)..=*versions.start())
-        } else {
-            None
-        };
-
         match known_version {
             KnownDbVersion::Partial { seqs, last_seq, ts } => {
                 self.partials
@@ -1079,10 +1064,21 @@ impl BookedVersions {
                 self.cleared.insert(versions.clone());
             }
         }
-        if let Some(new_gap) = new_gap {
-            // a new gap has formed, let's add that to the needed versions
-            self.sync_need.insert(new_gap);
+
+        // update last known version
+        let old_last = self
+            .last
+            .replace(std::cmp::max(
+                *versions.end(),
+                self.last.unwrap_or_default(),
+            ))
+            .unwrap_or_default();
+
+        if old_last < *versions.start() {
+            // add these as needed!
+            self.sync_need.insert((old_last + 1)..=*versions.start());
         }
+
         self.sync_need.remove(versions);
     }
 
@@ -1097,22 +1093,7 @@ pub type BookedInner = Arc<CountedTokioRwLock<BookedVersions>>;
 pub struct Booked(BookedInner);
 
 impl Booked {
-    fn new(mut versions: BookedVersions, registry: LockRegistry) -> Self {
-        // pre-compute sync needs
-        let mut sync_need = RangeInclusiveSet::new();
-        if let Some(last) = versions.last() {
-            sync_need.insert(1..=last);
-            for range in versions.cleared.iter() {
-                sync_need.remove(range.clone());
-            }
-            for v in versions.current.keys() {
-                sync_need.remove(*v..=*v);
-            }
-            for v in versions.partials.keys() {
-                sync_need.remove(*v..=*v);
-            }
-        }
-        versions.sync_need = sync_need;
+    fn new(versions: BookedVersions, registry: LockRegistry) -> Self {
         Self(Arc::new(CountedTokioRwLock::new(registry, versions)))
     }
 
