@@ -44,7 +44,7 @@ parking_lot = { version = "0.12.1" }
 pin-project-lite = "0.2.9"
 quinn = "0.10.2"
 quinn-proto = "0.10.5"
-quinn-plaintext = { git = "https://github.com/jeromegn/quinn-plaintext", branch = "checksum" }
+quinn-plaintext = { version = "0.2.0" }
 quoted-string = "0.6.1"
 rand = { version = "0.8.5", features = ["small_rng"] }
 rangemap = { version = "1.4.0" }

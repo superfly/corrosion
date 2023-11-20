@@ -2958,11 +2958,11 @@ dependencies = [
 
 [[package]]
 name = "quinn-plaintext"
-version = "0.1.1"
-source = "git+https://github.com/jeromegn/quinn-plaintext?branch=checksum#2582578be6d5d85f79aa8c9cfd961b9c32aa7dab"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb0e784540a62e207fafa749f17a80ea1c67a59b9d5b30c9083a97bcc42d6eea"
 dependencies = [
  "bytes",
- "quinn",
  "quinn-proto",
  "seahash",
  "tracing",
