@@ -4,7 +4,6 @@ use camino::Utf8PathBuf;
 use corro_types::{
     agent::{Agent, LockKind, LockMeta, LockState},
     broadcast::{FocaCmd, FocaInput},
-    codec::Crc32LengthDelimitedCodec,
     sqlite::SqlitePoolError,
     sync::generate_sync,
 };
@@ -17,6 +16,7 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_serde::{formats::Json, Framed};
+use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
 
@@ -134,7 +134,7 @@ pub enum Response {
 }
 
 type FramedStream = Framed<
-    tokio_util::codec::Framed<UnixStream, Crc32LengthDelimitedCodec>,
+    tokio_util::codec::Framed<UnixStream, LengthDelimitedCodec>,
     Command,
     Response,
     Json<Command, Response>,
@@ -166,7 +166,7 @@ async fn handle_conn(
 ) -> Result<(), AdminError> {
     // wrap in stream in line delimited json decoder
     let mut stream: FramedStream = tokio_serde::Framed::new(
-        tokio_util::codec::Framed::new(stream, Crc32LengthDelimitedCodec::default()),
+        tokio_util::codec::Framed::new(stream, LengthDelimitedCodec::new()),
         Json::<Command, Response>::default(),
     );
 

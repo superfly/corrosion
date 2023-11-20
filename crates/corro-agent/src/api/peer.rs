@@ -33,7 +33,7 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_stream::StreamExt as TokioStreamExt;
 // use tokio_stream::StreamExt as TokioStreamExt;
-use tokio_util::codec::{Encoder, FramedRead};
+use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -43,7 +43,6 @@ use crate::transport::{Transport, TransportError};
 use corro_types::{
     actor::ActorId,
     agent::{Booked, Bookie},
-    codec::Crc32LengthDelimitedCodec,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -834,7 +833,7 @@ fn chunk_range(
 }
 
 fn encode_sync_msg(
-    codec: &mut Crc32LengthDelimitedCodec,
+    codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
     send_buf: &mut BytesMut,
     msg: SyncMessage,
@@ -842,14 +841,14 @@ fn encode_sync_msg(
     msg.write_to_stream(encode_buf.writer())
         .map_err(SyncMessageEncodeError::from)?;
 
-    let data = encode_buf.split();
+    let data = encode_buf.split().freeze();
     trace!("encoded sync message, len: {}", data.len());
     codec.encode(data, send_buf)?;
     Ok(())
 }
 
 async fn encode_write_bipayload_msg(
-    codec: &mut Crc32LengthDelimitedCodec,
+    codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
     send_buf: &mut BytesMut,
     msg: BiPayload,
@@ -861,7 +860,7 @@ async fn encode_write_bipayload_msg(
 }
 
 fn encode_bipayload_msg(
-    codec: &mut Crc32LengthDelimitedCodec,
+    codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
     send_buf: &mut BytesMut,
     msg: BiPayload,
@@ -869,12 +868,12 @@ fn encode_bipayload_msg(
     msg.write_to_stream(encode_buf.writer())
         .map_err(SyncMessageEncodeError::from)?;
 
-    codec.encode(encode_buf.split(), send_buf)?;
+    codec.encode(encode_buf.split().freeze(), send_buf)?;
     Ok(())
 }
 
 async fn encode_write_sync_msg(
-    codec: &mut Crc32LengthDelimitedCodec,
+    codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
     send_buf: &mut BytesMut,
     msg: SyncMessage,
@@ -943,13 +942,13 @@ pub async fn parallel_sync(
                 *actor_id,
                 *addr,
                 async {
-                    let mut codec = Crc32LengthDelimitedCodec::default();
+                    let mut codec = LengthDelimitedCodec::new();
                     let mut send_buf = BytesMut::new();
                     let mut encode_buf = BytesMut::new();
 
                     let actor_id = *actor_id;
                     let (mut tx, rx) = transport.open_bi(*addr).await?;
-                    let mut read = FramedRead::new(rx, Crc32LengthDelimitedCodec::default());
+                    let mut read = FramedRead::new(rx, LengthDelimitedCodec::new());
 
                     encode_write_bipayload_msg(
                         &mut codec,
@@ -1100,7 +1099,7 @@ pub async fn parallel_sync(
 
     tokio::spawn(async move {
         // reusable buffers and constructs
-        let mut codec = Crc32LengthDelimitedCodec::default();
+        let mut codec = LengthDelimitedCodec::new();
         let mut send_buf = BytesMut::new();
         let mut encode_buf = BytesMut::new();
 
@@ -1283,7 +1282,7 @@ pub async fn serve_sync(
     agent: &Agent,
     their_actor_id: ActorId,
     trace_ctx: SyncTraceContextV1,
-    mut read: FramedRead<RecvStream, Crc32LengthDelimitedCodec>,
+    mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
     let context =
@@ -1291,7 +1290,7 @@ pub async fn serve_sync(
     tracing::Span::current().set_parent(context);
 
     debug!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "received sync request");
-    let mut codec = Crc32LengthDelimitedCodec::default();
+    let mut codec = LengthDelimitedCodec::new();
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
 
