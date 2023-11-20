@@ -2959,12 +2959,12 @@ dependencies = [
 [[package]]
 name = "quinn-plaintext"
 version = "0.1.1"
-source = "git+https://github.com/jeromegn/quinn-plaintext?branch=checksum#64ff0f118f535edce8142700114ccf4bd676d801"
+source = "git+https://github.com/jeromegn/quinn-plaintext?branch=checksum#2582578be6d5d85f79aa8c9cfd961b9c32aa7dab"
 dependencies = [
- "ahash 0.8.6",
  "bytes",
  "quinn",
  "quinn-proto",
+ "seahash",
  "tracing",
 ]
 
