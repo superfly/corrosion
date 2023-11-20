@@ -2637,6 +2637,7 @@ fn extract_params<'schema, 'stmt>(
             distinctness: _,
             args: _,
             filter_over: _,
+            order_by: _,
         } => {}
 
         Expr::FunctionCallStar {
