@@ -975,6 +975,8 @@ pub struct BookedVersions {
     pub cleared: RangeInclusiveSet<i64>,
     pub current: BTreeMap<i64, CurrentVersion>,
     pub partials: BTreeMap<i64, PartialVersion>,
+    sync_need: RangeInclusiveSet<i64>,
+    last: Option<i64>,
 }
 
 impl BookedVersions {
@@ -1025,15 +1027,7 @@ impl BookedVersions {
     }
 
     pub fn last(&self) -> Option<i64> {
-        std::cmp::max(
-            // TODO: we probably don't need to traverse all of that...
-            //       maybe use `skip` based on the len
-            self.cleared.iter().map(|k| *k.end()).max(),
-            std::cmp::max(
-                self.current.last_key_value().map(|(k, _)| *k),
-                self.partials.last_key_value().map(|(k, _)| *k),
-            ),
-        )
+        self.last
     }
 
     pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
@@ -1067,17 +1061,29 @@ impl BookedVersions {
                     self.partials.remove(&version);
                     self.current.remove(&version);
                 }
-                self.cleared.insert(versions);
+                self.cleared.insert(versions.clone());
             }
         }
+
+        // update last known version
+        let old_last = self
+            .last
+            .replace(std::cmp::max(
+                *versions.end(),
+                self.last.unwrap_or_default(),
+            ))
+            .unwrap_or_default();
+
+        if old_last < *versions.start() {
+            // add these as needed!
+            self.sync_need.insert((old_last + 1)..=*versions.start());
+        }
+
+        self.sync_need.remove(versions);
     }
 
-    pub fn all_versions(&self) -> RangeInclusiveSet<i64> {
-        let mut versions = self.cleared.clone();
-        versions.extend(self.current.keys().map(|key| *key..=*key));
-        versions.extend(self.partials.keys().map(|key| *key..=*key));
-
-        versions
+    pub fn sync_need(&self) -> &RangeInclusiveSet<i64> {
+        &self.sync_need
     }
 }
 

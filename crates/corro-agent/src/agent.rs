@@ -1732,11 +1732,11 @@ async fn process_fully_buffered_changes(
 
         info!(%actor_id, version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
-        let max_db_version: Option<i64> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional()?;
+        let max_db_version: Option<Option<i64>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional()?;
 
         let start = Instant::now();
 
-        if let Some(max_db_version) = max_db_version {
+        if let Some(max_db_version) = max_db_version.flatten() {
             // insert all buffered changes into crsql_changes directly from the buffered changes table
             let count = tx
             .prepare_cached(
@@ -1942,6 +1942,13 @@ pub async fn process_multiple_changes(
                             },
                         )
                     } else {
+                        if let Some(seqs) = change.seqs() {
+                            if seqs.end() < seqs.start() {
+                                warn!(%actor_id, versions = ?change.versions(), "received an invalid change, seqs start is greater than seqs end: {seqs:?}");
+                                continue;
+                            }
+                        }
+
                         let (known, changeset) = match process_single_version(
                             &tx,
                             last_db_version,
