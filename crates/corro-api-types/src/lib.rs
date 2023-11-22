@@ -638,14 +638,7 @@ where
                     CompactString::from_utf8_unchecked(reader.read_vec(len)?)
                 })
             }
-            4 => {
-                let len = reader.read_u32()? as usize;
-                let mut vec = SmallVec::with_capacity(len);
-
-                reader.read_bytes(&mut vec)?;
-
-                SqliteValue::Blob(vec)
-            }
+            4 => SqliteValue::Blob(Readable::read_from(reader)?),
             _ => return Err(speedy::Error::custom("unknown SqliteValue variant").into()),
         })
     }
@@ -678,7 +671,7 @@ where
             }
             SqliteValue::Blob(b) => {
                 4u8.write_to(writer)?;
-                b.as_slice().write_to(writer)
+                b.write_to(writer)
             }
         }
     }
