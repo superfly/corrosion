@@ -1898,6 +1898,7 @@ pub async fn process_multiple_changes(
                 let mut seen = RangeInclusiveMap::new();
 
                 for (change, src) in changes {
+                    trace!("handling a single changeset: {change:?}");
                     let seqs = change.seqs();
                     if booked_write.contains_all(change.versions(), change.seqs()) {
                         trace!(

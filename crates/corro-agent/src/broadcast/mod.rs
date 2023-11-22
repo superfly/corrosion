@@ -472,7 +472,7 @@ pub fn runtime_loop(
                         });
                     }
                     Branch::HandleTimer(timer, seq) => {
-                        trace!("handling Branch::HandleTimer");
+                        // trace!("handling Branch::HandleTimer");
                         let mut v = vec![(timer, seq)];
 
                         // drain the channel, in case there's a race among timers
@@ -695,6 +695,7 @@ pub fn runtime_loop(
                         BroadcastInput::Rebroadcast(bcast) => (bcast, false),
                         BroadcastInput::AddBroadcast(bcast) => (bcast, true),
                     };
+                    trace!("adding broadcast: {bcast:?}, local? {is_local}");
 
                     if let Err(e) = UniPayload::V1(UniPayloadV1::Broadcast(bcast.clone()))
                         .write_to_stream((&mut ser_buf).writer())
