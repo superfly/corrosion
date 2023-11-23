@@ -572,10 +572,20 @@ fn diff_member_states(
     foca: &Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, NoCustomBroadcast>,
     last_states: &mut HashMap<ActorId, (foca::Member<Actor>, Option<u64>)>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let foca_states = foca
-        .iter_membership_state()
-        .map(|member| (member.id().id(), member))
-        .collect::<HashMap<_, _>>();
+    let mut foca_states = HashMap::new();
+    for member in foca.iter_membership_state() {
+        match foca_states.entry(member.id().id()) {
+            Entry::Occupied(mut entry) => {
+                let prev: &mut &foca::Member<Actor> = entry.get_mut();
+                if prev.id().ts() < member.id().ts() {
+                    *prev = member;
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(member);
+            }
+        }
+    }
 
     let members = agent.members().read();
 
