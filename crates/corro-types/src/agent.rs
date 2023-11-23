@@ -63,6 +63,7 @@ pub struct AgentConfig {
     pub tx_bcast: Sender<BroadcastInput>,
     pub tx_apply: Sender<(ActorId, i64)>,
     pub tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
+    pub tx_clear_buf: Sender<(ActorId, RangeInclusive<i64>)>,
     pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
     pub tx_foca: Sender<FocaInput>,
 
@@ -85,6 +86,7 @@ pub struct AgentInner {
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
+    tx_clear_buf: Sender<(ActorId, RangeInclusive<i64>)>,
     tx_changes: Sender<(ChangeV1, ChangeSource)>,
     tx_foca: Sender<FocaInput>,
     write_sema: Arc<Semaphore>,
@@ -112,6 +114,7 @@ impl Agent {
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             tx_empty: config.tx_empty,
+            tx_clear_buf: config.tx_clear_buf,
             tx_changes: config.tx_changes,
             tx_foca: config.tx_foca,
             write_sema: config.write_sema,
@@ -156,6 +159,10 @@ impl Agent {
 
     pub fn tx_empty(&self) -> &Sender<(ActorId, RangeInclusive<i64>)> {
         &self.0.tx_empty
+    }
+
+    pub fn tx_clear_buf(&self) -> &Sender<(ActorId, RangeInclusive<i64>)> {
+        &self.0.tx_clear_buf
     }
 
     pub fn tx_foca(&self) -> &Sender<FocaInput> {

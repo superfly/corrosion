@@ -1,6 +1,6 @@
 use std::{
     cmp,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     convert::Infallible,
     net::SocketAddr,
     ops::RangeInclusive,
@@ -94,6 +94,7 @@ pub struct AgentOptions {
     pub rx_bcast: Receiver<BroadcastInput>,
     pub rx_apply: Receiver<(ActorId, i64)>,
     pub rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
+    pub rx_clear_buf: Receiver<(ActorId, RangeInclusive<i64>)>,
     pub rx_changes: Receiver<(ChangeV1, ChangeSource)>,
     pub rx_foca: Receiver<FocaInput>,
     pub rtt_rx: Receiver<(SocketAddr, Duration)>,
@@ -140,6 +141,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     };
 
     let (tx_apply, rx_apply) = channel(20480);
+    let (tx_clear_buf, rx_clear_buf) = channel(10240);
 
     let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 
@@ -220,7 +222,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 if let Some(known) = ranges.get(&version) {
                     warn!(%actor_id, version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
 
-                    clear_buffered_meta(&conn, actor_id, version..=version)?;
+                    _ = tx_clear_buf.try_send((actor_id, version..=version));
                     continue;
                 }
 
@@ -300,6 +302,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         rx_bcast,
         rx_apply,
         rx_empty,
+        rx_clear_buf,
         rx_changes,
         rx_foca,
         rtt_rx,
@@ -319,6 +322,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_bcast,
         tx_apply,
         tx_empty,
+        tx_clear_buf,
         tx_changes,
         tx_foca,
         write_sema,
@@ -356,6 +360,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rx_bcast,
         rx_apply,
         rx_empty,
+        rx_clear_buf,
         rx_changes,
         rx_foca,
         rtt_rx,
@@ -945,15 +950,21 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     spawn_counted(handle_changes(agent.clone(), rx_changes, tripwire.clone()));
 
+    spawn_counted(write_empties_loop(
+        agent.clone(),
+        rx_empty,
+        tripwire.clone(),
+    ));
+
+    spawn_counted(clear_buffered_meta_loop(
+        agent.clone(),
+        rx_clear_buf,
+        tripwire.clone(),
+    ));
+
     spawn_counted(
-        sync_loop(
-            agent.clone(),
-            transport.clone(),
-            rx_apply,
-            rx_empty,
-            tripwire.clone(),
-        )
-        .inspect(|_| info!("corrosion agent sync loop is done")),
+        sync_loop(agent.clone(), transport.clone(), rx_apply, tripwire.clone())
+            .inspect(|_| info!("corrosion agent sync loop is done")),
     );
 
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
@@ -1631,40 +1642,7 @@ fn store_empty_changeset(
         )?
         .execute(params![actor_id, versions.start(), versions.end()])?;
 
-    // remove any buffered data or seqs bookkeeping for these versions
-    clear_buffered_meta(tx, actor_id, versions)?;
-
     Ok(inserted)
-}
-
-fn clear_buffered_meta(
-    conn: &Connection,
-    actor_id: ActorId,
-    versions: RangeInclusive<i64>,
-) -> rusqlite::Result<()> {
-    loop {
-        // remove all buffered changes for cleanup purposes
-        let count = conn
-        .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT 1000)")?
-        .execute(params![actor_id, versions.start(), versions.end()])?;
-        if count == 0 {
-            break;
-        }
-        debug!(%actor_id, ?versions, "deleted {count} buffered changes");
-    }
-
-    loop {
-        // delete all bookkept sequences for this version
-        let count = conn
-        .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT 1000)")?
-        .execute(params![actor_id, versions.start(), versions.end()])?;
-        if count == 0 {
-            break;
-        }
-        debug!(%actor_id, ?versions, "deleted {count} sequences in bookkeeping");
-    }
-
-    Ok(())
 }
 
 #[tracing::instrument(skip(agent), err)]
@@ -1740,7 +1718,9 @@ async fn process_fully_buffered_changes(
             info!(%actor_id, version, "No buffered rows, skipped insertion into crsql_changes");
         }
 
-        clear_buffered_meta(&tx, actor_id, version..=version)?;
+        if let Err(e) = agent.tx_clear_buf().try_send((actor_id, version..=version)) {
+            error!("could not schedule buffered data clear: {e}");
+        }
 
         let rows_impacted: i64 = tx
             .prepare_cached("SELECT crsql_rows_impacted()")?
@@ -1781,7 +1761,9 @@ async fn process_fully_buffered_changes(
                 ts,
             })
         } else {
-            store_empty_changeset(&tx, actor_id, version..=version)?;
+            if let Err(e) = agent.tx_empty().try_send((actor_id, version..=version)) {
+                error!(%actor_id, "could not schedule empties for clear: {e}");
+            }
 
             debug!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
             Some(KnownDbVersion::Cleared)
@@ -1936,6 +1918,7 @@ pub async fn process_multiple_changes(
                         }
 
                         let (known, changeset) = match process_single_version(
+                            agent,
                             &tx,
                             last_db_version,
                             change,
@@ -1993,7 +1976,9 @@ pub async fn process_multiple_changes(
                     }
                     KnownDbVersion::Cleared => {
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
-                        store_empty_changeset(&tx, *actor_id, versions.clone())?;
+                        if let Err(e) = agent.tx_empty().try_send((*actor_id, versions.clone())) {
+                            error!("could not schedule version to be cleared: {e}");
+                        }
                     }
                 }
                 debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserted bookkeeping row");
@@ -2257,9 +2242,6 @@ fn process_complete_version(
         )
     };
 
-    // in case we got both buffered data and a complete set of changes
-    clear_buffered_meta(tx, actor_id, version..=version)?;
-
     for (table_name, count) in changes_per_table {
         counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
     }
@@ -2267,8 +2249,22 @@ fn process_complete_version(
     Ok::<_, rusqlite::Error>((known_version, new_changeset))
 }
 
-#[tracing::instrument(skip(tx, last_db_version, change), err)]
+fn check_buffered_meta_to_clear(
+    conn: &Connection,
+    actor_id: ActorId,
+    versions: RangeInclusive<i64>,
+) -> rusqlite::Result<bool> {
+    let should_clear: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))?;
+    if should_clear {
+        return Ok(true);
+    }
+
+    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+}
+
+#[tracing::instrument(skip_all, err)]
 fn process_single_version(
+    agent: &Agent,
     tx: &Transaction,
     last_db_version: Option<i64>,
     change: ChangeV1,
@@ -2281,7 +2277,7 @@ fn process_single_version(
     let versions = changeset.versions();
 
     let (known, changeset) = if changeset.is_complete() {
-        process_complete_version(
+        let (known, changeset) = process_complete_version(
             tx,
             actor_id,
             last_db_version,
@@ -2289,7 +2285,18 @@ fn process_single_version(
             changeset
                 .into_parts()
                 .expect("no changeset parts, this shouldn't be happening!"),
-        )?
+        )?;
+
+        if check_buffered_meta_to_clear(tx, actor_id, changeset.versions())? {
+            if let Err(e) = agent
+                .tx_clear_buf()
+                .try_send((actor_id, changeset.versions()))
+            {
+                error!("could not schedule buffered meta clear: {e}");
+            }
+        }
+
+        (known, changeset)
     } else {
         let parts = changeset.into_parts().unwrap();
         let known = process_incomplete_version(tx, actor_id, &parts)?;
@@ -2552,11 +2559,76 @@ async fn write_empties_loop(
     }
 }
 
+const TO_CLEAR_COUNT: usize = 1000;
+
+async fn clear_buffered_meta_loop(
+    agent: Agent,
+    mut rx_partials: Receiver<(ActorId, RangeInclusive<i64>)>,
+    mut tripwire: Tripwire,
+) {
+    let mut to_clear: VecDeque<(ActorId, RangeInclusive<i64>)> = VecDeque::new();
+
+    loop {
+        let conn = tokio::select! {
+            conn_res = agent.pool().write_low(), if !to_clear.is_empty() => match conn_res {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!("could not get conn for to clear buffered meta: {e}");
+                    break;
+                }
+            },
+            maybe_partial = rx_partials.recv() => match maybe_partial {
+                Some((actor_id, versions)) => {
+                    to_clear.push_back((actor_id, versions));
+                    continue;
+                },
+                None => {
+                    debug!("partials clear queue is done");
+                    break;
+                }
+            },
+            _ = &mut tripwire => break
+        };
+
+        let (actor_id, versions) = match to_clear.pop_front() {
+            Some(popped) => popped,
+            None => {
+                warn!("did not pop a partial buffered version range to clear");
+                continue;
+            }
+        };
+
+        let res = block_in_place(|| {
+            let mut count = conn
+            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+            .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+            count += conn
+            .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+            .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+            Ok::<_, rusqlite::Error>(count)
+        });
+
+        match res {
+            Ok(count) => {
+                if count >= TO_CLEAR_COUNT {
+                    // we haven't fully cleared these versions, push back to the front!
+                    to_clear.push_front((actor_id, versions));
+                }
+            }
+            Err(e) => {
+                error!(%actor_id, "could not clear buffered meta for versions {versions:?}: {e}");
+                to_clear.push_front((actor_id, versions));
+            }
+        }
+    }
+}
+
 async fn sync_loop(
     agent: Agent,
     transport: Transport,
     mut rx_apply: Receiver<(ActorId, i64)>,
-    rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
     mut tripwire: Tripwire,
 ) {
     let mut sync_backoff = backoff::Backoff::new(0)
@@ -2564,13 +2636,6 @@ async fn sync_loop(
         .iter();
     let next_sync_at = tokio::time::sleep(sync_backoff.next().unwrap());
     tokio::pin!(next_sync_at);
-
-    // TODO: move this elsewhere, doesn't have be spawned here...
-    spawn_counted(write_empties_loop(
-        agent.clone(),
-        rx_empty,
-        tripwire.clone(),
-    ));
 
     loop {
         enum Branch {
@@ -2661,6 +2726,9 @@ async fn process_completed_empties(
 
                 for range in ranges {
                     inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
+                    if let Err(e) = agent.tx_clear_buf().try_send((actor_id, range.clone())) {
+                        error!(%actor_id, "could not schedule buffered meta clear: {e}");
+                    }
                 }
 
                 tx.commit()?;
