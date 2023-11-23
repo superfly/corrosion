@@ -599,6 +599,8 @@ fn diff_member_states(
         to_delete.len()
     );
 
+    let updated_at = time::OffsetDateTime::now_utc();
+
     let pool = agent.pool().clone();
     Some(tokio::spawn(async move {
         let mut conn = match pool.write_low().await {
@@ -614,7 +616,6 @@ fn diff_member_states(
 
         let res = block_in_place(|| {
             let tx = conn.transaction()?;
-            let updated_at = time::OffsetDateTime::now_utc();
 
             for (member, rtt_min) in to_update {
                 let foca_state = serde_json::to_string(&member).unwrap();
@@ -644,8 +645,10 @@ fn diff_member_states(
 
             for id in to_delete {
                 deleted += tx
-                    .prepare_cached("DELETE FROM __corro_members WHERE actor_id = ?")?
-                    .execute([id])?;
+                    .prepare_cached(
+                        "DELETE FROM __corro_members WHERE actor_id = ? AND updated_at < ?",
+                    )?
+                    .execute(params![id, updated_at])?;
             }
 
             tx.commit()?;
