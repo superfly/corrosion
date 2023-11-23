@@ -334,8 +334,12 @@ fn v0_2_0_2_migration(tx: &Transaction) -> rusqlite::Result<()> {
         r#"
         -- remove state
         ALTER TABLE __corro_members DROP COLUMN state;
+        -- remove rtts
+        ALTER TABLE __corro_members DROP COLUMN rtts;
         -- add computed rtt_min
         ALTER TABLE __corro_members ADD COLUMN rtt_min INTEGER;
+        -- add updated_at
+        ALTER TABLE __corro_members ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP;
     "#,
     )
 }

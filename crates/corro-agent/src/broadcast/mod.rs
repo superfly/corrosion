@@ -35,7 +35,6 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
-    members::Rtt,
 };
 
 use crate::transport::Transport;
@@ -544,7 +543,7 @@ pub fn runtime_loop(
 fn diff_member_states(
     agent: &Agent,
     foca: &Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, NoCustomBroadcast>,
-    last_states: &mut HashMap<ActorId, (foca::Member<Actor>, Option<Rtt>)>,
+    last_states: &mut HashMap<ActorId, (foca::Member<Actor>, Option<u64>)>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let foca_states = foca
         .iter_membership_state()
@@ -557,20 +556,23 @@ fn diff_member_states(
         .iter()
         .filter_map(|(id, member)| {
             let member = *member;
-            let rtt = members.rtts.get(&member.id().addr());
+            let rtt = members
+                .rtts
+                .get(&member.id().addr())
+                .and_then(|rtts| rtts.buf.iter().min().copied());
             match last_states.entry(*id) {
                 Entry::Occupied(mut entry) => {
                     let (prev_member, prev_rtt) = entry.get();
-                    if prev_member != member || prev_rtt.as_ref() != rtt {
-                        entry.insert((member.clone(), rtt.cloned()));
-                        Some((member.clone(), rtt.cloned()))
+                    if prev_member != member || *prev_rtt != rtt {
+                        entry.insert((member.clone(), rtt));
+                        Some((member.clone(), rtt))
                     } else {
                         None
                     }
                 }
                 Entry::Vacant(entry) => {
-                    entry.insert((member.clone(), rtt.cloned()));
-                    Some((member.clone(), rtt.cloned()))
+                    entry.insert((member.clone(), rtt));
+                    Some((member.clone(), rtt))
                 }
             }
         })
@@ -612,41 +614,32 @@ fn diff_member_states(
 
         let res = block_in_place(|| {
             let tx = conn.transaction()?;
+            let updated_at = time::OffsetDateTime::now_utc();
 
-            for (member, rtts) in to_update {
+            for (member, rtt_min) in to_update {
                 let foca_state = serde_json::to_string(&member).unwrap();
 
-                let rtt_min = rtts
-                    .as_ref()
-                    .and_then(|rtts| rtts.buf.iter().min().copied());
-
-                let rtts = serde_json::Value::Array(
-                    rtts.map(|rtt| {
-                        rtt.buf
-                            .into_iter()
-                            .map(serde_json::Value::from)
-                            .collect::<Vec<serde_json::Value>>()
-                    })
-                    .unwrap_or_default(),
-                );
-
-                upserted += tx.prepare_cached("
-                    INSERT INTO __corro_members (actor_id, address, foca_state, rtts, rtt_min)
-                        VALUES                  (?,        ?,       ?,          ?,    ?)
+                upserted += tx
+                    .prepare_cached(
+                        "
+                    INSERT INTO __corro_members (actor_id, address, foca_state, rtt_min, updated_at)
+                        VALUES                  (?,        ?,       ?,          ?,       ?)
                         ON CONFLICT (actor_id)
                             DO UPDATE SET
                                 foca_state = excluded.foca_state,
                                 address = excluded.address,
-                                rtts = excluded.rtts,
-                                rtt_min = excluded.rtt_min
-                            WHERE rtts != excluded.rtts OR COALESCE(json_extract(foca_state, '$.incarnation'), 0) <= COALESCE(json_extract(excluded.foca_state, '$.incarnation'), 1)
-                ")?.execute(params![
-                    member.id().id(),
-                    member.id().addr().to_string(),
-                    foca_state,
-                    rtts,
-                    rtt_min
-                ])?;
+                                rtt_min = excluded.rtt_min,
+                                updated_at = excluded.updated_at
+                            WHERE excluded.updated_at > updated_at
+                ",
+                    )?
+                    .execute(params![
+                        member.id().id(),
+                        member.id().addr().to_string(),
+                        foca_state,
+                        rtt_min,
+                        updated_at
+                    ])?;
             }
 
             for id in to_delete {

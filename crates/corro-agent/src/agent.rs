@@ -32,7 +32,7 @@ use corro_types::{
         ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
-    members::{Members, Rtt},
+    members::Members,
     pubsub::{Matcher, SubsManager},
     schema::init_schema,
     sqlite::{CrConn, SqlitePoolError},
@@ -784,25 +784,24 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let states = match agent.pool().read().await {
         Ok(conn) => block_in_place(|| {
-            match conn.prepare("SELECT address,foca_state,rtts FROM __corro_members") {
+            match conn.prepare("SELECT address,foca_state FROM __corro_members") {
                 Ok(mut prepped) => {
                     match prepped
                     .query_map([], |row| Ok((
                             row.get::<_, String>(0)?.parse().map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
-                            row.get::<_, String>(1)?,
-                            serde_json::from_str(&row.get::<_, String>(2)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?
+                            row.get::<_, String>(1)?
                         ))
                     )
-                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<(SocketAddr, String, Vec<u64>)>>>())
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<(SocketAddr, String)>>>())
                 {
                     Ok(members) => {
-                        members.into_iter().filter_map(|(address, state, rtts)| match serde_json::from_str::<foca::Member<Actor>>(state.as_str()) {
-                            Ok(fs) => Some((address, fs, rtts)),
+                        members.into_iter().filter_map(|(address, state)| match serde_json::from_str::<foca::Member<Actor>>(state.as_str()) {
+                            Ok(fs) => Some((address, fs)),
                             Err(e) => {
                                 error!("could not deserialize foca member state: {e} (json: {state})");
                                 None
                             }
-                        }).collect::<Vec<(SocketAddr, Member<Actor>, Vec<u64>)>>()
+                        }).collect::<Vec<(SocketAddr, Member<Actor>)>>()
                     }
                     Err(e) => {
                         error!("could not query for foca member states: {e}");
@@ -828,12 +827,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         {
             // block to drop the members write lock
             let mut members = agent.members().write();
-            for (address, foca_state, rtts) in states {
-                let mut rtt = Rtt::default();
-                for v in rtts {
-                    rtt.buf.push_back(v);
-                }
-                members.rtts.insert(address, rtt);
+            for (address, foca_state) in states {
                 members.by_addr.insert(address, foca_state.id().id());
                 if matches!(foca_state.state(), foca::State::Suspect) {
                     continue;

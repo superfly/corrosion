@@ -32,7 +32,7 @@ impl MemberState {
 
 const RING_BUCKETS: [Range<u64>; 6] = [0..5, 5..15, 15..50, 50..100, 100..200, 200..300];
 
-#[derive(Debug, Default, PartialEq, Eq, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Rtt {
     pub buf: CircularBuffer<20, u64>,
 }
