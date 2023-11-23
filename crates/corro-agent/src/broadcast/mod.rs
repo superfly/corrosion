@@ -87,6 +87,31 @@ impl TimerSpawner {
     }
 }
 
+fn handle_timer(
+    foca: &mut Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, NoCustomBroadcast>,
+    runtime: &mut DispatchRuntime<Actor>,
+    timer_rx: &mut Receiver<(Timer<Actor>, Instant)>,
+    timer: Timer<Actor>,
+    seq: Instant,
+) {
+    // trace!("handling Branch::HandleTimer");
+    let mut v = vec![(timer, seq)];
+
+    // drain the channel, in case there's a race among timers
+    while let Ok((timer, seq)) = timer_rx.try_recv() {
+        v.push((timer, seq));
+    }
+
+    // sort by instant these were scheduled
+    v.sort_by(|a, b| a.1.cmp(&b.1));
+
+    for (timer, _) in v {
+        if let Err(e) = foca.handle_timer(timer, &mut *runtime) {
+            error!("foca: error handling timer: {e}");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn runtime_loop(
     actor: Actor,
@@ -146,24 +171,14 @@ pub fn runtime_loop(
                 HandleTimer(Timer<Actor>, Instant),
                 DiffMembers,
                 Metrics,
-                Tripped,
             }
 
-            let mut tripped = false;
-
-            let mut remaining = None;
-
             loop {
-                if let Some(remaining) = remaining.as_mut() {
-                    if *remaining == 0 {
-                        break;
-                    }
-                    *remaining -= 1;
-                    info!("{remaining} remaining loop iterations for the foca runtime");
-                }
-
                 let branch = tokio::select! {
                     biased;
+                    _ = &mut tripwire => {
+                        break
+                    },
                     timer = timer_rx.recv() => match timer {
                         Some((timer, seq)) => {
                             Branch::HandleTimer(timer, seq)
@@ -185,30 +200,15 @@ pub fn runtime_loop(
                     _ = metrics_interval.tick() => {
                         Branch::Metrics
                     },
-                    _ = diff_last_states_every.tick(), if !tripped => {
+                    _ = diff_last_states_every.tick() => {
                         Branch::DiffMembers
                     }
-                    _ = &mut tripwire, if !tripped => {
-                        tripped = true;
-                        Branch::Tripped
-                    },
                 };
 
                 let start = Instant::now();
                 let discriminant = BranchDiscriminants::from(&branch);
 
                 match branch {
-                    Branch::Tripped => {
-                        trace!("handling Branch::Tripped");
-
-                        // leave the cluster gracefully
-                        if let Err(e) = foca.leave_cluster(&mut runtime) {
-                            error!("could not leave cluster: {e}");
-                        }
-
-                        // let's do 10 extra loop iterations
-                        remaining = Some(2);
-                    }
                     Branch::Foca(input) => match input {
                         FocaInput::Announce(actor) => {
                             trace!("handling FocaInput::Announce");
@@ -260,22 +260,7 @@ pub fn runtime_loop(
                         },
                     },
                     Branch::HandleTimer(timer, seq) => {
-                        // trace!("handling Branch::HandleTimer");
-                        let mut v = vec![(timer, seq)];
-
-                        // drain the channel, in case there's a race among timers
-                        while let Ok((timer, seq)) = timer_rx.try_recv() {
-                            v.push((timer, seq));
-                        }
-
-                        // sort by instant these were scheduled
-                        v.sort_by(|a, b| a.1.cmp(&b.1));
-
-                        for (timer, _) in v {
-                            if let Err(e) = foca.handle_timer(timer, &mut runtime) {
-                                error!("foca: error handling timer: {e}");
-                            }
-                        }
+                        handle_timer(&mut foca, &mut runtime, &mut timer_rx, timer, seq);
                     }
                     Branch::Metrics => {
                         trace!("handling Branch::Metrics");
@@ -315,7 +300,49 @@ pub fn runtime_loop(
                 }
             }
 
-            info!("foca is done");
+            info!("foca loop is done, leaving cluster");
+
+            // leave the cluster gracefully
+            if let Err(e) = foca.leave_cluster(&mut runtime) {
+                error!("could not leave cluster: {e}");
+            }
+
+            let leave_deadline = tokio::time::sleep(Duration::from_secs(5));
+            tokio::pin!(leave_deadline);
+
+            let mut foca_done = false;
+            let mut timer_done = false;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut leave_deadline => {
+                        break;
+                    },
+                    timer = timer_rx.recv(), if !timer_done => match timer {
+                        Some((timer, seq)) => {
+                            handle_timer(&mut foca, &mut runtime, &mut timer_rx, timer, seq);
+                        },
+                        None => {
+                            timer_done = true;
+                        }
+                    },
+                    input = rx_foca.recv(), if !foca_done => match input {
+                        Some(FocaInput::Data(data)) => {
+                            _ = foca.handle_data(&data, &mut runtime);
+                        },
+                        None => {
+                            foca_done = true
+                        }
+                        _ => {
+
+                        }
+                    },
+                    else => {
+                        break;
+                    }
+                }
+            }
 
             if let Some(handle) = diff_member_states(&agent, &foca, &mut last_states) {
                 info!("Waiting on task to update member states...");
@@ -629,7 +656,7 @@ fn diff_member_states(
                             DO UPDATE SET
                                 foca_state = excluded.foca_state,
                                 address = excluded.address,
-                                rtt_min = CASE excluded.rtt_min WHEN NULL rtt_min ELSE excluded.rtt_min END,
+                                rtt_min = CASE excluded.rtt_min WHEN NULL THEN rtt_min ELSE excluded.rtt_min END,
                                 updated_at = excluded.updated_at
                             WHERE excluded.updated_at > updated_at
                 ",
