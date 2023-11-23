@@ -1642,17 +1642,27 @@ fn clear_buffered_meta(
     actor_id: ActorId,
     versions: RangeInclusive<i64>,
 ) -> rusqlite::Result<()> {
-    // remove all buffered changes for cleanup purposes
-    let count = conn
-        .prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ?")?
+    loop {
+        // remove all buffered changes for cleanup purposes
+        let count = conn
+        .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT 1000)")?
         .execute(params![actor_id, versions.start(), versions.end()])?;
-    debug!(%actor_id, ?versions, "deleted {count} buffered changes");
+        if count == 0 {
+            break;
+        }
+        debug!(%actor_id, ?versions, "deleted {count} buffered changes");
+    }
 
-    // delete all bookkept sequences for this version
-    let count = conn
-        .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?")?
+    loop {
+        // delete all bookkept sequences for this version
+        let count = conn
+        .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT 1000)")?
         .execute(params![actor_id, versions.start(), versions.end()])?;
-    debug!(%actor_id, ?versions, "deleted {count} sequences in bookkeeping");
+        if count == 0 {
+            break;
+        }
+        debug!(%actor_id, ?versions, "deleted {count} sequences in bookkeeping");
+    }
 
     Ok(())
 }
