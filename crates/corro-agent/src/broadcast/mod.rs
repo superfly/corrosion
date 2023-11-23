@@ -208,7 +208,7 @@ pub fn runtime_loop(
                         }
 
                         // let's do 10 extra loop iterations
-                        remaining = Some(10);
+                        remaining = Some(2);
                     }
                     Branch::Foca(input) => match input {
                         FocaInput::Announce(actor) => {
