@@ -2599,20 +2599,20 @@ async fn clear_buffered_meta_loop(
         };
 
         let res = block_in_place(|| {
-            let mut count = conn
+            let buf_count = conn
             .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
-            count += conn
+            let seq_count = conn
             .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
-            Ok::<_, rusqlite::Error>(count)
+            Ok::<_, rusqlite::Error>((buf_count, seq_count))
         });
 
         match res {
-            Ok(count) => {
-                if count >= TO_CLEAR_COUNT {
+            Ok((buf_count, seq_count)) => {
+                if buf_count >= TO_CLEAR_COUNT || seq_count >= TO_CLEAR_COUNT {
                     // we haven't fully cleared these versions, push back to the front!
                     to_clear.push_front((actor_id, versions));
                 }
