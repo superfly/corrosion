@@ -631,7 +631,7 @@ fn diff_member_states(
                                 address = excluded.address,
                                 rtt_min = excluded.rtt_min,
                                 updated_at = excluded.updated_at
-                            WHERE excluded.updated_at > updated_at
+                            WHERE excluded.updated_at > COALESCE(updated_at, 0)
                 ",
                     )?
                     .execute(params![
