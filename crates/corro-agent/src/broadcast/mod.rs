@@ -7,8 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bincode::DefaultOptions;
 use bytes::{BufMut, Bytes, BytesMut};
-use foca::{Foca, NoCustomBroadcast, Notification, Timer};
+use foca::{BincodeCodec, Foca, NoCustomBroadcast, Notification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future,
@@ -25,7 +26,7 @@ use tokio::{
     task::{block_in_place, LocalSet},
     time::interval,
 };
-use tokio_stream::{wrappers::errors::BroadcastStreamRecvError, StreamExt};
+use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
 use tracing::{debug, error, log::info, trace, warn};
 use tripwire::Tripwire;
@@ -34,7 +35,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
-    members::MemberEvent,
+    members::Rtt,
 };
 
 use crate::transport::Transport;
@@ -94,7 +95,6 @@ pub fn runtime_loop(
     transport: Transport,
     mut rx_foca: Receiver<FocaInput>,
     mut rx_bcast: Receiver<BroadcastInput>,
-    member_events: tokio::sync::broadcast::Receiver<MemberEvent>,
     to_send_tx: Sender<(Actor, Bytes)>,
     notifications_tx: Sender<Notification<Actor>>,
     mut tripwire: Tripwire,
@@ -137,29 +137,32 @@ pub fn runtime_loop(
             let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
             let mut last_cluster_size = unsafe { NonZeroU32::new_unchecked(1) };
 
-            let member_events_chunks =
-                tokio_stream::wrappers::BroadcastStream::new(member_events.resubscribe())
-                    .chunks_timeout(1000, Duration::from_secs(2));
-            tokio::pin!(member_events_chunks);
-
-            let mut last_states: HashMap<ActorId, foca::Member<Actor>> = HashMap::new();
-            let mut check_last_states_every = tokio::time::interval(Duration::from_secs(60));
+            let mut last_states = HashMap::new();
+            let mut diff_last_states_every = tokio::time::interval(Duration::from_secs(60));
 
             #[derive(EnumDiscriminants)]
             #[strum_discriminants(derive(strum::IntoStaticStr))]
             enum Branch {
                 Foca(FocaInput),
                 HandleTimer(Timer<Actor>, Instant),
-                MemberEvents(Vec<Result<MemberEvent, BroadcastStreamRecvError>>),
                 DiffMembers,
                 Metrics,
                 Tripped,
             }
 
             let mut tripped = false;
-            let mut member_events_done = false;
+
+            let mut remaining = None;
 
             loop {
+                if let Some(remaining) = remaining.as_mut() {
+                    if *remaining == 0 {
+                        break;
+                    }
+                    *remaining -= 1;
+                    info!("{remaining} remaining loop iterations for the foca runtime");
+                }
+
                 let branch = tokio::select! {
                     biased;
                     timer = timer_rx.recv() => match timer {
@@ -180,20 +183,10 @@ pub fn runtime_loop(
                             break;
                         }
                     },
-                    evts = member_events_chunks.next(), if !member_events_done && !tripped => match evts {
-                        Some(evts) if !evts.is_empty() => Branch::MemberEvents(evts),
-                        Some(_) => {
-                            continue;
-                        }
-                        None => {
-                            member_events_done = true;
-                            continue;
-                        }
-                    },
                     _ = metrics_interval.tick() => {
                         Branch::Metrics
                     },
-                    _ = check_last_states_every.tick() => {
+                    _ = diff_last_states_every.tick(), if !tripped => {
                         Branch::DiffMembers
                     }
                     _ = &mut tripwire, if !tripped => {
@@ -208,114 +201,14 @@ pub fn runtime_loop(
                 match branch {
                     Branch::Tripped => {
                         trace!("handling Branch::Tripped");
-                        // collect all current states
-
-                        let states: Vec<_> = {
-                            let members = agent.members().read();
-
-                            foca.iter_membership_state()
-                                .filter_map(|member| {
-                                    let id = member.id().id();
-                                    let addr = member.id().addr();
-                                    match serde_json::to_string(member) {
-                                        Ok(foca_state) => Some((
-                                            id,
-                                            addr,
-                                            if members.get(&id).is_some() {
-                                                "up"
-                                            } else {
-                                                "down"
-                                            },
-                                            foca_state,
-                                            serde_json::Value::Array(
-                                                members
-                                                    .rtts
-                                                    .get(&addr)
-                                                    .map(|rtt| {
-                                                        rtt.buf
-                                                            .iter()
-                                                            .copied()
-                                                            .map(serde_json::Value::from)
-                                                            .collect::<Vec<serde_json::Value>>()
-                                                    })
-                                                    .unwrap_or_default(),
-                                            ),
-                                        )),
-                                        Err(e) => {
-                                            error!("could not serialize foca member state: {e}");
-                                            None
-                                        }
-                                    }
-                                })
-                                .collect()
-                        };
 
                         // leave the cluster gracefully
-
                         if let Err(e) = foca.leave_cluster(&mut runtime) {
                             error!("could not leave cluster: {e}");
                         }
 
-                        // write the states to the DB for a faster rejoin
-
-                        {
-                            match agent.pool().write_priority().await {
-                                Ok(mut conn) => block_in_place(|| match conn.transaction() {
-                                    Ok(tx) => {
-                                        for (id, address, state, foca_state, rtts) in states {
-                                            if let Err(e) = tx
-                                                .prepare_cached("DELETE FROM __corro_members;")
-                                                .and_then(|mut prepped| prepped.execute([]))
-                                            {
-                                                warn!("could not clear all corro members before re-inserting them: {e}");
-                                            }
-
-                                            let db_res = tx.prepare_cached(
-                                                    "
-                                                INSERT INTO __corro_members (actor_id, address, state, foca_state, rtts)
-                                                    VALUES (?, ?, ?, ?, ?)
-                                                ON CONFLICT (actor_id) DO UPDATE SET
-                                                    address = excluded.address,
-                                                    state = excluded.state,
-                                                    foca_state = excluded.foca_state,
-                                                    rtts = excluded.rtts;
-                                            ",
-                                                )
-                                                .and_then(|mut prepped| {
-                                                    prepped.execute(params![
-                                                        id,
-                                                        address.to_string(),
-                                                        state,
-                                                        foca_state,
-                                                        rtts
-                                                    ])
-                                                });
-
-                                            if let Err(e) = db_res {
-                                                error!("could not upsert member state: {e}");
-                                            }
-                                        }
-                                        if let Err(e) = tx.commit() {
-                                            error!("could not commit member states upsert tx: {e}");
-                                        }
-                                    }
-
-                                    Err(e) => {
-                                        error!("could not start transaction to update member events: {e}");
-                                    }
-                                }),
-                                Err(e) => {
-                                    error!(
-                                    "could not acquire a r/w conn to process member events: {e}"
-                                );
-                                }
-                            }
-                        }
-
-                        // extra time for leave message to propagate
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-
-                        break;
+                        // let's do 10 extra loop iterations
+                        remaining = Some(10);
                     }
                     Branch::Foca(input) => match input {
                         FocaInput::Announce(actor) => {
@@ -367,110 +260,6 @@ pub fn runtime_loop(
                             }
                         },
                     },
-                    Branch::MemberEvents(evts) => {
-                        trace!("handling Branch::MemberEvents");
-                        let splitted: Vec<_> = evts
-                            .iter()
-                            .flatten()
-                            .fold(HashMap::new(), |mut acc, evt| {
-                                acc.insert(evt.actor(), evt.as_str());
-                                acc
-                            })
-                            .into_iter()
-                            .filter_map(|(actor, evt)| {
-                                let foca_state = {
-                                    // need to bind this...
-                                    let foca_state = foca
-                                        .iter_membership_state()
-                                        .find(|member| member.id().id() == actor.id())
-                                        .and_then(|member| {
-                                            last_states.insert(actor.id(), member.clone());
-                                            match serde_json::to_string(member) {
-                                                Ok(foca_state) => Some(foca_state),
-                                                Err(e) => {
-                                                    error!(
-                                                    "could not serialize foca member state: {e}"
-                                                );
-                                                    None
-                                                }
-                                            }
-                                        });
-                                    foca_state
-                                };
-
-                                foca_state
-                                    .map(|foca_state| (actor.id(), actor.addr(), evt, foca_state))
-                            })
-                            .collect();
-
-                        let agent = agent.clone();
-                        tokio::spawn(async move {
-                            let mut conn = match agent.pool().write_low().await {
-                                Ok(conn) => conn,
-                                Err(e) => {
-                                    error!(
-                                        "could not acquire a r/w conn to process member events: {e}"
-                                    );
-                                    return;
-                                }
-                            };
-
-                            let res = block_in_place(|| {
-                                let tx = conn.transaction()?;
-
-                                let members = agent.members().read();
-
-                                for (id, address, state, foca_state) in splitted {
-                                    trace!(
-                                        "updating {id} {address} as {state} w/ state: {foca_state:?}",
-                                    );
-
-                                    let rtts = serde_json::Value::Array(
-                                        members
-                                            .rtts
-                                            .get(&address)
-                                            .map(|rtt| {
-                                                rtt.buf
-                                                    .iter()
-                                                    .copied()
-                                                    .map(serde_json::Value::from)
-                                                    .collect::<Vec<serde_json::Value>>()
-                                            })
-                                            .unwrap_or_default(),
-                                    );
-
-                                    let upserted = tx.prepare_cached("INSERT INTO __corro_members (actor_id, address, state, foca_state, rtts)
-                                            VALUES (?, ?, ?, ?, ?)
-                                        ON CONFLICT (actor_id) DO UPDATE SET
-                                            address = excluded.address,
-                                            state = excluded.state,
-                                            foca_state = excluded.foca_state,
-                                            rtts = excluded.rtts;")?
-                                    .execute(params![
-                                        id,
-                                        address.to_string(),
-                                        state,
-                                        foca_state,
-                                        rtts
-                                    ])?;
-
-                                    if upserted != 1 {
-                                        warn!("did not update member");
-                                    }
-                                }
-
-                                tx.commit()?;
-
-                                Ok::<_, rusqlite::Error>(())
-                            });
-
-                            if let Err(e) = res {
-                                error!(
-                                    "could not insert state changes from SWIM cluster into sqlite: {e}"
-                                );
-                            }
-                        });
-                    }
                     Branch::HandleTimer(timer, seq) => {
                         // trace!("handling Branch::HandleTimer");
                         let mut v = vec![(timer, seq)];
@@ -516,86 +305,7 @@ pub fn runtime_loop(
                         gauge!("corro.gossip.cluster_size", last_cluster_size.get() as f64);
                     }
                     Branch::DiffMembers => {
-                        let to_update = foca
-                            .iter_membership_state()
-                            .filter_map(|member| match last_states.entry(member.id().id()) {
-                                Entry::Occupied(mut entry) => {
-                                    if entry.get() != member {
-                                        entry.insert(member.clone());
-                                        Some(member.clone())
-                                    } else {
-                                        None
-                                    }
-                                }
-                                Entry::Vacant(entry) => {
-                                    entry.insert(member.clone());
-                                    Some(member.clone())
-                                }
-                            })
-                            .collect::<Vec<_>>();
-
-                        if to_update.is_empty() {
-                            continue;
-                        }
-
-                        info!(
-                            "Scheduling cluster membership state update for {} members",
-                            to_update.len()
-                        );
-
-                        let pool = agent.pool().clone();
-                        tokio::spawn(async move {
-                            let mut conn = match pool.write_low().await {
-                                Ok(conn) => conn,
-                                Err(e) => {
-                                    error!(
-                                        "could not acquire a r/w conn to process member events: {e}"
-                                    );
-                                    return;
-                                }
-                            };
-
-                            let mut upserted = 0;
-
-                            let res = block_in_place(|| {
-                                let tx = conn.transaction()?;
-
-                                for member in to_update {
-                                    let up_down = match member.state() {
-                                        foca::State::Down => "down",
-                                        _ => "up",
-                                    };
-                                    let foca_state = serde_json::to_string(&member).unwrap();
-                                    upserted += tx.prepare_cached("
-                                    INSERT INTO __corro_members (actor_id, address, foca_state, state)
-                                        VALUES                  (?,        ?,       ?,          ?)
-                                        ON CONFLICT (actor_id)
-                                            DO UPDATE SET
-                                                foca_state = excluded.foca_state,
-                                                address = excluded.address,
-                                                state = excluded.state
-                                            WHERE COALESCE(json_extract(foca_state, '$.incarnation'), 0) <= COALESCE(json_extract(excluded.foca_state, '$.incarnation'), 1)")?
-                                    .execute(params![
-                                        member.id().id(),
-                                        member.id().addr().to_string(),
-                                        foca_state,
-                                        up_down,
-                                    ])?;
-                                }
-
-                                tx.commit()?;
-
-                                Ok::<_, rusqlite::Error>(())
-                            });
-
-                            if let Err(e) = res {
-                                error!(
-                                    "could not insert state changes from SWIM cluster into sqlite: {e}"
-                                );
-                            }
-
-                            info!("Upserted {upserted} membership states");
-                        });
+                        diff_member_states(&agent, &foca, &mut last_states);
                     }
                 }
 
@@ -607,6 +317,13 @@ pub fn runtime_loop(
             }
 
             info!("foca is done");
+
+            if let Some(handle) = diff_member_states(&agent, &foca, &mut last_states) {
+                info!("Waiting on task to update member states...");
+                if let Err(e) = handle.await {
+                    error!("could not await task to update member states: {e}");
+                }
+            }
         }
     });
 
@@ -822,6 +539,133 @@ pub fn runtime_loop(
         }
         info!("broadcasts are done");
     });
+}
+
+fn diff_member_states(
+    agent: &Agent,
+    foca: &Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, NoCustomBroadcast>,
+    last_states: &mut HashMap<ActorId, (foca::Member<Actor>, Option<Rtt>)>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let foca_states = foca
+        .iter_membership_state()
+        .map(|member| (member.id().id(), member))
+        .collect::<HashMap<_, _>>();
+
+    let members = agent.members().read();
+
+    let to_update = foca_states
+        .iter()
+        .filter_map(|(id, member)| {
+            let member = *member;
+            let rtt = members.rtts.get(&member.id().addr());
+            match last_states.entry(*id) {
+                Entry::Occupied(mut entry) => {
+                    let (prev_member, prev_rtt) = entry.get();
+                    if prev_member != member || prev_rtt.as_ref() != rtt {
+                        entry.insert((member.clone(), rtt.cloned()));
+                        Some((member.clone(), rtt.cloned()))
+                    } else {
+                        None
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert((member.clone(), rtt.cloned()));
+                    Some((member.clone(), rtt.cloned()))
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut to_delete = vec![];
+
+    last_states.retain(|id, _v| {
+        if foca_states.contains_key(id) {
+            true
+        } else {
+            to_delete.push(*id);
+            false
+        }
+    });
+
+    if to_update.is_empty() && to_delete.is_empty() {
+        return None;
+    }
+
+    info!(
+        "Scheduling cluster membership state update for {} members (delete: {})",
+        to_update.len(),
+        to_delete.len()
+    );
+
+    let pool = agent.pool().clone();
+    Some(tokio::spawn(async move {
+        let mut conn = match pool.write_low().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!("could not acquire a r/w conn to process member events: {e}");
+                return;
+            }
+        };
+
+        let mut upserted = 0;
+        let mut deleted = 0;
+
+        let res = block_in_place(|| {
+            let tx = conn.transaction()?;
+
+            for (member, rtts) in to_update {
+                let foca_state = serde_json::to_string(&member).unwrap();
+
+                let rtt_min = rtts
+                    .as_ref()
+                    .and_then(|rtts| rtts.buf.iter().min().copied());
+
+                let rtts = serde_json::Value::Array(
+                    rtts.map(|rtt| {
+                        rtt.buf
+                            .into_iter()
+                            .map(serde_json::Value::from)
+                            .collect::<Vec<serde_json::Value>>()
+                    })
+                    .unwrap_or_default(),
+                );
+
+                upserted += tx.prepare_cached("
+                    INSERT INTO __corro_members (actor_id, address, foca_state, rtts, rtt_min)
+                        VALUES                  (?,        ?,       ?,          ?,    ?)
+                        ON CONFLICT (actor_id)
+                            DO UPDATE SET
+                                foca_state = excluded.foca_state,
+                                address = excluded.address,
+                                rtts = excluded.rtts,
+                                rtt_min = excluded.rtt_min
+                            WHERE rtts != excluded.rtts OR COALESCE(json_extract(foca_state, '$.incarnation'), 0) <= COALESCE(json_extract(excluded.foca_state, '$.incarnation'), 1)
+                ")?.execute(params![
+                    member.id().id(),
+                    member.id().addr().to_string(),
+                    foca_state,
+                    rtts,
+                    rtt_min
+                ])?;
+            }
+
+            for id in to_delete {
+                deleted += tx
+                    .prepare_cached("DELETE FROM __corro_members WHERE actor_id = ?")?
+                    .execute([id])?;
+            }
+
+            tx.commit()?;
+
+            Ok::<_, rusqlite::Error>(())
+        });
+
+        if let Err(e) = res {
+            error!("could not insert state changes from SWIM cluster into sqlite: {e}");
+        }
+
+        info!("Membership states changed! upserted: {upserted}, deleted {deleted}");
+    }))
 }
 
 fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {

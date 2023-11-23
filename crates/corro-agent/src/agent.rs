@@ -32,7 +32,7 @@ use corro_types::{
         ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
-    members::{MemberEvent, Members, Rtt},
+    members::{Members, Rtt},
     pubsub::{Matcher, SubsManager},
     schema::init_schema,
     sqlite::{CrConn, SqlitePoolError},
@@ -121,7 +121,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let write_sema = Arc::new(Semaphore::new(1));
 
-    let pool = SplitPool::create(&conf.db.path, write_sema.clone(), tripwire.clone()).await?;
+    let pool = SplitPool::create(&conf.db.path, write_sema.clone()).await?;
 
     let schema = {
         let mut conn = pool.write_priority().await?;
@@ -449,8 +449,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
-    let (member_events_tx, member_events_rx) = tokio::sync::broadcast::channel::<MemberEvent>(512);
-
     runtime_loop(
         Actor::new(
             actor_id,
@@ -461,7 +459,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         transport.clone(),
         rx_foca,
         rx_bcast,
-        member_events_rx.resubscribe(),
         to_send_tx,
         notifications_tx,
         tripwire.clone(),
@@ -527,7 +524,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     let conn = match connecting.await {
                         Ok(conn) => conn,
                         Err(e) => {
-                            error!("could not connection from {remote_addr}: {e}");
+                            error!("could not handshake connection from {remote_addr}: {e}");
                             return;
                         }
                     };
@@ -968,11 +965,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
 
     tokio::spawn(handle_gossip_to_send(transport.clone(), to_send_rx));
-    tokio::spawn(handle_notifications(
-        agent.clone(),
-        notifications_rx,
-        member_events_tx,
-    ));
+    tokio::spawn(handle_notifications(agent.clone(), notifications_rx));
     tokio::spawn(metrics_loop(agent.clone(), transport));
 
     tokio::spawn(handle_broadcasts(agent.clone(), bcast_rx));
@@ -1351,11 +1344,7 @@ async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>) {
     }
 }
 
-async fn handle_notifications(
-    agent: Agent,
-    mut notification_rx: Receiver<Notification<Actor>>,
-    member_events: tokio::sync::broadcast::Sender<MemberEvent>,
-) {
+async fn handle_notifications(agent: Agent, mut notification_rx: Receiver<Notification<Actor>>) {
     while let Some(notification) = notification_rx.recv().await {
         trace!("handle notification");
         match notification {
@@ -1373,8 +1362,6 @@ async fn handle_notifications(
                             error!("could not send new foca cluster size: {e}");
                         }
                     }
-
-                    member_events.send(MemberEvent::Up(actor.clone())).ok();
                 } else if !same {
                     // had a older timestamp!
                     if let Err(e) = agent
@@ -1405,7 +1392,6 @@ async fn handle_notifications(
                             error!("could not send new foca cluster size: {e}");
                         }
                     }
-                    member_events.send(MemberEvent::Down(actor.clone())).ok();
                 }
                 increment_counter!("corro.swim.notification", "type" => "memberdown");
             }
