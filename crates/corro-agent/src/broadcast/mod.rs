@@ -629,7 +629,7 @@ fn diff_member_states(
                             DO UPDATE SET
                                 foca_state = excluded.foca_state,
                                 address = excluded.address,
-                                rtt_min = excluded.rtt_min,
+                                rtt_min = CASE excluded.rtt_min WHEN NULL rtt_min ELSE excluded.rtt_min END,
                                 updated_at = excluded.updated_at
                             WHERE excluded.updated_at > updated_at
                 ",
