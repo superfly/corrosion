@@ -30,7 +30,8 @@ use sqlite3_parser::{
 };
 use sqlite_pool::RusqlitePool;
 use tokio::{
-    sync::{mpsc, watch},
+    runtime::Handle,
+    sync::{mpsc, watch, AcquireError, Semaphore},
     task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -266,6 +267,7 @@ impl SubsManager {
         schema: &Schema,
         pool: &SplitPool,
         rx_db_version: watch::Receiver<i64>,
+        write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) -> Result<(MatcherHandle, Option<MatcherCreated>), MatcherError> {
         if let Some(handle) = self.get_by_query(sql) {
@@ -288,6 +290,7 @@ impl SubsManager {
             evt_tx,
             sql,
             rx_db_version,
+            write_sema,
             tripwire,
         )?;
 
@@ -306,6 +309,7 @@ impl SubsManager {
         schema: &Schema,
         pool: &SplitPool,
         rx_db_version: watch::Receiver<i64>,
+        write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) -> Result<(MatcherHandle, MatcherCreated), MatcherError> {
         let mut inner = self.0.write();
@@ -328,6 +332,7 @@ impl SubsManager {
             evt_tx,
             sql,
             rx_db_version,
+            write_sema,
             tripwire,
         )?;
 
@@ -774,11 +779,17 @@ impl Matcher {
         id: Uuid,
         sub_path: Utf8PathBuf,
         state_conn: &Connection,
+        write_sema: Option<Arc<Semaphore>>,
     ) -> rusqlite::Result<()> {
         info!(sub_id = %id, "Attempting to cleanup...");
 
         info!(sub_id = %id, "Dropping subs entry in DB");
-        state_conn.execute("DELETE FROM __corro_subs WHERE id = ?", [id])?;
+        {
+            // ignore error here for convenience
+            let _permit =
+                write_sema.map(|write_sema| Handle::current().block_on(write_sema.acquire_owned()));
+            state_conn.execute("DELETE FROM __corro_subs WHERE id = ?", [id])?;
+        }
 
         if let Err(e) = std::fs::remove_dir_all(&sub_path) {
             error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
@@ -800,6 +811,7 @@ impl Matcher {
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
         db_version_rx: watch::Receiver<i64>,
+        write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) -> Result<MatcherHandle, MatcherError> {
         let (matcher, handle) = Self::new(
@@ -812,7 +824,7 @@ impl Matcher {
             db_version_rx,
         )?;
 
-        spawn_counted(matcher.run_restore(state_conn, tripwire));
+        spawn_counted(matcher.run_restore(state_conn, write_sema, tripwire));
 
         Ok(handle)
     }
@@ -826,6 +838,7 @@ impl Matcher {
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
         db_version_rx: watch::Receiver<i64>,
+        write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) -> Result<MatcherHandle, MatcherError> {
         let (mut matcher, handle) = Self::new(
@@ -911,32 +924,42 @@ impl Matcher {
             }
             trace!("inserted sub columns");
 
-            let state_tx = state_conn.transaction()?;
-            trace!("created state transaction");
-            let inserted = state_tx.execute(
-                "INSERT INTO __corro_subs (id, sql) VALUES (?, ?);",
-                params![id, sql],
-            )?;
-            trace!("inserted into __corro_subs");
+            let inserted = {
+                let _permit = Handle::current().block_on(write_sema.acquire())?;
+                let state_tx = state_conn.transaction()?;
+                trace!("created state transaction");
+                let inserted = state_tx.execute(
+                    "INSERT INTO __corro_subs (id, sql) VALUES (?, ?);",
+                    params![id, sql],
+                )?;
+                trace!("inserted into __corro_subs");
 
-            tx.commit()?;
-            trace!("committed subscription");
-            state_tx.commit()?;
+                tx.commit()?;
+                trace!("committed subscription");
+                state_tx.commit()?;
+                inserted
+            };
+
             trace!("committed state");
 
-            Ok::<_, rusqlite::Error>(inserted)
+            Ok::<_, MatcherError>(inserted)
         })?;
 
         if n != 1 {
             return Err(MatcherError::InsertSub);
         }
 
-        spawn_counted(matcher.run(state_conn, tripwire));
+        spawn_counted(matcher.run(state_conn, write_sema, tripwire));
 
         Ok(handle)
     }
 
-    async fn run_restore(mut self, state_conn: CrConn, tripwire: Tripwire) {
+    async fn run_restore(
+        mut self,
+        state_conn: CrConn,
+        write_sema: Arc<Semaphore>,
+        tripwire: Tripwire,
+    ) {
         let init_res = block_in_place(|| {
             self.last_rowid = self
                 .conn
@@ -978,12 +1001,14 @@ impl Matcher {
             }
         };
 
-        self.cmd_loop(state_conn, db_version, tripwire).await
+        self.cmd_loop(state_conn, write_sema, db_version, tripwire)
+            .await
     }
 
     async fn cmd_loop(
         mut self,
         mut state_conn: CrConn,
+        write_sema: Arc<Semaphore>,
         mut last_db_version: i64,
         mut tripwire: Tripwire,
     ) {
@@ -996,12 +1021,17 @@ impl Matcher {
         }
         trace!("set state!");
 
-        if let Err(e) = state_conn.execute_batch(&format!(
-            "ATTACH DATABASE {} AS __corro_sub",
-            enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
-        )) {
-            error!("could not ATTACH sub db as __corro_sub on state db: {e}");
-            return;
+        {
+            // if this fails for any reason, something is very wrong
+            let _permit = write_sema.acquire().await;
+
+            if let Err(e) = state_conn.execute_batch(&format!(
+                "ATTACH DATABASE {} AS __corro_sub",
+                enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
+            )) {
+                error!("could not ATTACH sub db as __corro_sub on state db: {e}");
+                return;
+            }
         }
 
         // initially check if we've missed versions!
@@ -1014,9 +1044,14 @@ impl Matcher {
                 if !matches!(e, MatcherError::EventReceiverClosed) {
                     error!("could not handle change: {e}");
                 }
-                if let Err(e) =
-                    block_in_place(|| Self::cleanup(self.id, self.base_path.clone(), &state_conn))
-                {
+                if let Err(e) = block_in_place(|| {
+                    Self::cleanup(
+                        self.id,
+                        self.base_path.clone(),
+                        &state_conn,
+                        Some(write_sema),
+                    )
+                }) {
                     error!("could not handle cleanup: {e}");
                 }
                 return;
@@ -1103,14 +1138,19 @@ impl Matcher {
 
         debug!(id = %self.id, "matcher loop is done");
 
-        if let Err(e) =
-            block_in_place(|| Self::cleanup(self.id, self.base_path.clone(), &state_conn))
-        {
+        if let Err(e) = block_in_place(|| {
+            Self::cleanup(
+                self.id,
+                self.base_path.clone(),
+                &state_conn,
+                Some(write_sema),
+            )
+        }) {
             error!("could not handle cleanup: {e}");
         }
     }
 
-    async fn run(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
+    async fn run(mut self, mut state_conn: CrConn, write_sema: Arc<Semaphore>, tripwire: Tripwire) {
         if let Err(e) = self
             .evt_tx
             .send(QueryEvent::Columns(self.col_names.clone()))
@@ -1236,12 +1276,15 @@ impl Matcher {
 
             tx.commit()?;
 
-            state_tx.execute(
-                "UPDATE __corro_subs SET state = 'running' WHERE id = ?",
-                [self.id],
-            )?;
+            {
+                let _permit = Handle::current().block_on(write_sema.acquire())?;
+                state_tx.execute(
+                    "UPDATE __corro_subs SET state = 'running' WHERE id = ?",
+                    [self.id],
+                )?;
 
-            state_tx.commit()?;
+                state_tx.commit()?;
+            }
 
             self.last_rowid = last_rowid;
 
@@ -1278,7 +1321,8 @@ impl Matcher {
             }
         };
 
-        self.cmd_loop(state_conn, db_version, tripwire).await
+        self.cmd_loop(state_conn, write_sema, db_version, tripwire)
+            .await
     }
 
     fn handle_change(
@@ -2025,6 +2069,8 @@ pub enum MatcherError {
     QueueFull,
     #[error("cannot restore existing subscription")]
     CannotRestoreExisting,
+    #[error("could not acquire write permit")]
+    WritePermitAcquire(#[from] AcquireError),
 }
 
 impl MatcherError {
@@ -2085,6 +2131,7 @@ mod tests {
             &schema,
             &pool,
             rx_db_version,
+            Arc::new(Semaphore::new(1)),
             tripwire.clone(),
         )?;
 
@@ -2179,6 +2226,8 @@ mod tests {
               PRIMARY KEY (machine_id, id)
           );
           ";
+
+        let write_sema = Arc::new(Semaphore::new(1));
 
         let mut schema = parse_sql(schema_sql).unwrap();
         let subs = SubsManager::default();
@@ -2296,6 +2345,7 @@ mod tests {
                     &schema,
                     &pool,
                     db_v_rx,
+                    write_sema.clone(),
                     tripwire.clone(),
                 )
                 .unwrap();
@@ -2532,6 +2582,7 @@ mod tests {
                     &schema,
                     &pool,
                     db_v_rx,
+                    write_sema.clone(),
                     tripwire.clone(),
                 )
                 .unwrap();

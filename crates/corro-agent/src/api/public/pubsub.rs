@@ -646,6 +646,7 @@ pub async fn api_v1_subs(
         &agent.schema().read(),
         agent.pool(),
         agent.rx_db_version(),
+        agent.write_sema().clone(),
         tripwire,
     );
 

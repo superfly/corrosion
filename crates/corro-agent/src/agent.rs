@@ -400,6 +400,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 &agent.schema().read(),
                 agent.pool(),
                 rx_db_version.clone(),
+                agent.write_sema().clone(),
                 tripwire.clone(),
             ) {
                 Ok(res) => res,
@@ -431,6 +432,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     id,
                     Matcher::sub_path(agent.config().db.subscriptions_path().as_path(), id),
                     &conn,
+                    None,
                 )?;
             }
         }
