@@ -52,7 +52,7 @@ impl Transport {
         rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
     ) -> eyre::Result<Self> {
         let mut endpoints = vec![];
-        for _ in 0..4 {
+        for _ in 0..8 {
             endpoints.push(gossip_client_endpoint(config).await?);
         }
         Ok(Self(Arc::new(TransportInner {

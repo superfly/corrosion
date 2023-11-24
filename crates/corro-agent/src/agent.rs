@@ -32,7 +32,7 @@ use corro_types::{
         ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
     },
     config::{AuthzConfig, Config, DEFAULT_GOSSIP_PORT},
-    members::{MemberEvent, Members, Rtt},
+    members::Members,
     pubsub::{Matcher, SubsManager},
     schema::init_schema,
     sqlite::{CrConn, SqlitePoolError},
@@ -94,6 +94,7 @@ pub struct AgentOptions {
     pub rx_bcast: Receiver<BroadcastInput>,
     pub rx_apply: Receiver<(ActorId, i64)>,
     pub rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
+    pub rx_clear_buf: Receiver<(ActorId, RangeInclusive<i64>)>,
     pub rx_changes: Receiver<(ChangeV1, ChangeSource)>,
     pub rx_foca: Receiver<FocaInput>,
     pub rtt_rx: Receiver<(SocketAddr, Duration)>,
@@ -121,7 +122,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let write_sema = Arc::new(Semaphore::new(1));
 
-    let pool = SplitPool::create(&conf.db.path, write_sema.clone(), tripwire.clone()).await?;
+    let pool = SplitPool::create(&conf.db.path, write_sema.clone()).await?;
 
     let schema = {
         let mut conn = pool.write_priority().await?;
@@ -140,6 +141,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     };
 
     let (tx_apply, rx_apply) = channel(20480);
+    let (tx_clear_buf, rx_clear_buf) = channel(10240);
 
     let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 
@@ -220,7 +222,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 if let Some(known) = ranges.get(&version) {
                     warn!(%actor_id, version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
 
-                    clear_buffered_meta(&conn, actor_id, version..=version)?;
+                    _ = tx_clear_buf.try_send((actor_id, version..=version));
                     continue;
                 }
 
@@ -300,6 +302,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         rx_bcast,
         rx_apply,
         rx_empty,
+        rx_clear_buf,
         rx_changes,
         rx_foca,
         rtt_rx,
@@ -319,6 +322,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_bcast,
         tx_apply,
         tx_empty,
+        tx_clear_buf,
         tx_changes,
         tx_foca,
         write_sema,
@@ -356,6 +360,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rx_bcast,
         rx_apply,
         rx_empty,
+        rx_clear_buf,
         rx_changes,
         rx_foca,
         rtt_rx,
@@ -449,8 +454,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
-    let (member_events_tx, member_events_rx) = tokio::sync::broadcast::channel::<MemberEvent>(512);
-
     runtime_loop(
         Actor::new(
             actor_id,
@@ -461,7 +464,6 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         transport.clone(),
         rx_foca,
         rx_bcast,
-        member_events_rx.resubscribe(),
         to_send_tx,
         notifications_tx,
         tripwire.clone(),
@@ -527,7 +529,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                     let conn = match connecting.await {
                         Ok(conn) => conn,
                         Err(e) => {
-                            error!("could not connection from {remote_addr}: {e}");
+                            error!("could not handshake connection from {remote_addr}: {e}");
                             return;
                         }
                     };
@@ -787,25 +789,24 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     let states = match agent.pool().read().await {
         Ok(conn) => block_in_place(|| {
-            match conn.prepare("SELECT address,foca_state,rtts FROM __corro_members") {
+            match conn.prepare("SELECT address,foca_state FROM __corro_members") {
                 Ok(mut prepped) => {
                     match prepped
                     .query_map([], |row| Ok((
                             row.get::<_, String>(0)?.parse().map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
-                            row.get::<_, String>(1)?,
-                            serde_json::from_str(&row.get::<_, String>(2)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?
+                            row.get::<_, String>(1)?
                         ))
                     )
-                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<(SocketAddr, String, Vec<u64>)>>>())
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<(SocketAddr, String)>>>())
                 {
                     Ok(members) => {
-                        members.into_iter().filter_map(|(address, state, rtts)| match serde_json::from_str::<foca::Member<Actor>>(state.as_str()) {
-                            Ok(fs) => Some((address, fs, rtts)),
+                        members.into_iter().filter_map(|(address, state)| match serde_json::from_str::<foca::Member<Actor>>(state.as_str()) {
+                            Ok(fs) => Some((address, fs)),
                             Err(e) => {
                                 error!("could not deserialize foca member state: {e} (json: {state})");
                                 None
                             }
-                        }).collect::<Vec<(SocketAddr, Member<Actor>, Vec<u64>)>>()
+                        }).collect::<Vec<(SocketAddr, Member<Actor>)>>()
                     }
                     Err(e) => {
                         error!("could not query for foca member states: {e}");
@@ -831,12 +832,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         {
             // block to drop the members write lock
             let mut members = agent.members().write();
-            for (address, foca_state, rtts) in states {
-                let mut rtt = Rtt::default();
-                for v in rtts {
-                    rtt.buf.push_back(v);
-                }
-                members.rtts.insert(address, rtt);
+            for (address, foca_state) in states {
                 members.by_addr.insert(address, foca_state.id().id());
                 if matches!(foca_state.state(), foca::State::Suspect) {
                     continue;
@@ -954,25 +950,23 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
     spawn_counted(handle_changes(agent.clone(), rx_changes, tripwire.clone()));
 
+    spawn_counted(write_empties_loop(
+        agent.clone(),
+        rx_empty,
+        tripwire.clone(),
+    ));
+
+    tokio::spawn(clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
+
     spawn_counted(
-        sync_loop(
-            agent.clone(),
-            transport.clone(),
-            rx_apply,
-            rx_empty,
-            tripwire.clone(),
-        )
-        .inspect(|_| info!("corrosion agent sync loop is done")),
+        sync_loop(agent.clone(), transport.clone(), rx_apply, tripwire.clone())
+            .inspect(|_| info!("corrosion agent sync loop is done")),
     );
 
     let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
 
     tokio::spawn(handle_gossip_to_send(transport.clone(), to_send_rx));
-    tokio::spawn(handle_notifications(
-        agent.clone(),
-        notifications_rx,
-        member_events_tx,
-    ));
+    tokio::spawn(handle_notifications(agent.clone(), notifications_rx));
     tokio::spawn(metrics_loop(agent.clone(), transport));
 
     tokio::spawn(handle_broadcasts(agent.clone(), bcast_rx));
@@ -1020,14 +1014,8 @@ async fn clear_overwritten_versions(agent: Agent) {
     let pool = agent.pool();
     let bookie = agent.bookie();
 
-    let mut interval = Duration::new(0, 0);
-
     loop {
-        sleep(interval).await;
-
-        if interval != COMPACT_BOOKED_INTERVAL {
-            interval = COMPACT_BOOKED_INTERVAL;
-        }
+        sleep(COMPACT_BOOKED_INTERVAL).await;
 
         info!("Starting compaction...");
         let start = Instant::now();
@@ -1357,11 +1345,7 @@ async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>) {
     }
 }
 
-async fn handle_notifications(
-    agent: Agent,
-    mut notification_rx: Receiver<Notification<Actor>>,
-    member_events: tokio::sync::broadcast::Sender<MemberEvent>,
-) {
+async fn handle_notifications(agent: Agent, mut notification_rx: Receiver<Notification<Actor>>) {
     while let Some(notification) = notification_rx.recv().await {
         trace!("handle notification");
         match notification {
@@ -1379,8 +1363,6 @@ async fn handle_notifications(
                             error!("could not send new foca cluster size: {e}");
                         }
                     }
-
-                    member_events.send(MemberEvent::Up(actor.clone())).ok();
                 } else if !same {
                     // had a older timestamp!
                     if let Err(e) = agent
@@ -1411,7 +1393,6 @@ async fn handle_notifications(
                             error!("could not send new foca cluster size: {e}");
                         }
                     }
-                    member_events.send(MemberEvent::Down(actor.clone())).ok();
                 }
                 increment_counter!("corro.swim.notification", "type" => "memberdown");
             }
@@ -1490,7 +1471,8 @@ async fn generate_bootstrap(
         // fallback to in-db nodes
         let conn = pool.read().await?;
         addrs = block_in_place(|| {
-            let mut prepped = conn.prepare("SELECT address FROM __corro_members LIMIT 5")?;
+            let mut prepped =
+                conn.prepare("SELECT address FROM __corro_members ORDER BY RANDOM() LIMIT 5")?;
             let node_addrs = prepped.query_map([], |row| row.get::<_, String>(0))?;
             Ok::<_, rusqlite::Error>(
                 node_addrs
@@ -1656,30 +1638,7 @@ fn store_empty_changeset(
         )?
         .execute(params![actor_id, versions.start(), versions.end()])?;
 
-    // remove any buffered data or seqs bookkeeping for these versions
-    clear_buffered_meta(tx, actor_id, versions)?;
-
     Ok(inserted)
-}
-
-fn clear_buffered_meta(
-    conn: &Connection,
-    actor_id: ActorId,
-    versions: RangeInclusive<i64>,
-) -> rusqlite::Result<()> {
-    // remove all buffered changes for cleanup purposes
-    let count = conn
-        .prepare_cached("DELETE FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ?")?
-        .execute(params![actor_id, versions.start(), versions.end()])?;
-    debug!(%actor_id, ?versions, "deleted {count} buffered changes");
-
-    // delete all bookkept sequences for this version
-    let count = conn
-        .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?")?
-        .execute(params![actor_id, versions.start(), versions.end()])?;
-    debug!(%actor_id, ?versions, "deleted {count} sequences in bookkeeping");
-
-    Ok(())
 }
 
 #[tracing::instrument(skip(agent), err)]
@@ -1755,7 +1714,9 @@ async fn process_fully_buffered_changes(
             info!(%actor_id, version, "No buffered rows, skipped insertion into crsql_changes");
         }
 
-        clear_buffered_meta(&tx, actor_id, version..=version)?;
+        if let Err(e) = agent.tx_clear_buf().try_send((actor_id, version..=version)) {
+            error!("could not schedule buffered data clear: {e}");
+        }
 
         let rows_impacted: i64 = tx
             .prepare_cached("SELECT crsql_rows_impacted()")?
@@ -1796,7 +1757,9 @@ async fn process_fully_buffered_changes(
                 ts,
             })
         } else {
-            store_empty_changeset(&tx, actor_id, version..=version)?;
+            if let Err(e) = agent.tx_empty().try_send((actor_id, version..=version)) {
+                error!(%actor_id, "could not schedule empties for clear: {e}");
+            }
 
             debug!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
             Some(KnownDbVersion::Cleared)
@@ -1951,6 +1914,7 @@ pub async fn process_multiple_changes(
                         }
 
                         let (known, changeset) = match process_single_version(
+                            agent,
                             &tx,
                             last_db_version,
                             change,
@@ -2008,7 +1972,9 @@ pub async fn process_multiple_changes(
                     }
                     KnownDbVersion::Cleared => {
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
-                        store_empty_changeset(&tx, *actor_id, versions.clone())?;
+                        if let Err(e) = agent.tx_empty().try_send((*actor_id, versions.clone())) {
+                            error!("could not schedule version to be cleared: {e}");
+                        }
                     }
                 }
                 debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserted bookkeeping row");
@@ -2272,9 +2238,6 @@ fn process_complete_version(
         )
     };
 
-    // in case we got both buffered data and a complete set of changes
-    clear_buffered_meta(tx, actor_id, version..=version)?;
-
     for (table_name, count) in changes_per_table {
         counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
     }
@@ -2282,8 +2245,22 @@ fn process_complete_version(
     Ok::<_, rusqlite::Error>((known_version, new_changeset))
 }
 
-#[tracing::instrument(skip(tx, last_db_version, change), err)]
+fn check_buffered_meta_to_clear(
+    conn: &Connection,
+    actor_id: ActorId,
+    versions: RangeInclusive<i64>,
+) -> rusqlite::Result<bool> {
+    let should_clear: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))?;
+    if should_clear {
+        return Ok(true);
+    }
+
+    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+}
+
+#[tracing::instrument(skip_all, err)]
 fn process_single_version(
+    agent: &Agent,
     tx: &Transaction,
     last_db_version: Option<i64>,
     change: ChangeV1,
@@ -2296,7 +2273,7 @@ fn process_single_version(
     let versions = changeset.versions();
 
     let (known, changeset) = if changeset.is_complete() {
-        process_complete_version(
+        let (known, changeset) = process_complete_version(
             tx,
             actor_id,
             last_db_version,
@@ -2304,7 +2281,18 @@ fn process_single_version(
             changeset
                 .into_parts()
                 .expect("no changeset parts, this shouldn't be happening!"),
-        )?
+        )?;
+
+        if check_buffered_meta_to_clear(tx, actor_id, changeset.versions())? {
+            if let Err(e) = agent
+                .tx_clear_buf()
+                .try_send((actor_id, changeset.versions()))
+            {
+                error!("could not schedule buffered meta clear: {e}");
+            }
+        }
+
+        (known, changeset)
     } else {
         let parts = changeset.into_parts().unwrap();
         let known = process_incomplete_version(tx, actor_id, &parts)?;
@@ -2567,11 +2555,119 @@ async fn write_empties_loop(
     }
 }
 
+const TO_CLEAR_COUNT: usize = 1000;
+
+async fn clear_buffered_meta_loop(
+    agent: Agent,
+    mut rx_partials: Receiver<(ActorId, RangeInclusive<i64>)>,
+) {
+    while let Some((actor_id, versions)) = rx_partials.recv().await {
+        let pool = agent.pool().clone();
+        tokio::spawn(async move {
+            loop {
+                let res = {
+                    let conn = pool.write_low().await?;
+
+                    block_in_place(|| {
+                        let buf_count = conn
+                .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+                .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+                        let seq_count = conn
+                .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+                .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+                        Ok::<_, rusqlite::Error>((buf_count, seq_count))
+                    })
+                };
+
+                match res {
+                    Ok((buf_count, seq_count)) => {
+                        if buf_count + seq_count > 0 {
+                            info!(%actor_id, "cleared {} buffered meta rows for versions {versions:?}", buf_count + seq_count);
+                        }
+                        if buf_count < TO_CLEAR_COUNT && seq_count < TO_CLEAR_COUNT {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!(%actor_id, "could not clear buffered meta for versions {versions:?}: {e}");
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+
+            Ok::<_, eyre::Report>(())
+        });
+    }
+
+    // let mut to_clear: VecDeque<(ActorId, RangeInclusive<i64>)> = VecDeque::new();
+
+    // loop {
+    //     let conn = tokio::select! {
+    //         conn_res = agent.pool().write_low(), if !to_clear.is_empty() => match conn_res {
+    //             Ok(conn) => conn,
+    //             Err(e) => {
+    //                 error!("could not get conn for to clear buffered meta: {e}");
+    //                 break;
+    //             }
+    //         },
+    //         maybe_partial = rx_partials.recv() => match maybe_partial {
+    //             Some((actor_id, versions)) => {
+    //                 to_clear.push_back((actor_id, versions));
+    //                 continue;
+    //             },
+    //             None => {
+    //                 debug!("partials clear queue is done");
+    //                 break;
+    //             }
+    //         },
+    //         _ = &mut tripwire => break
+    //     };
+
+    //     let (actor_id, versions) = match to_clear.pop_front() {
+    //         Some(popped) => popped,
+    //         None => {
+    //             warn!("did not pop a partial buffered version range to clear");
+    //             continue;
+    //         }
+    //     };
+
+    //     let res = block_in_place(|| {
+    //         let buf_count = conn
+    //         .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+    //         .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+    //         let seq_count = conn
+    //         .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+    //         .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+    //         Ok::<_, rusqlite::Error>((buf_count, seq_count))
+    //     });
+
+    //     match res {
+    //         Ok((buf_count, seq_count)) => {
+    //             if buf_count + seq_count > 0 {
+    //                 info!(%actor_id, "cleared {} buffered meta rows for versions {versions:?}", buf_count + seq_count);
+    //             }
+    //             if buf_count >= TO_CLEAR_COUNT || seq_count >= TO_CLEAR_COUNT {
+    //                 // we haven't fully cleared these versions, push back to the front!
+    //                 to_clear.push_front((actor_id, versions));
+    //             }
+    //         }
+    //         Err(e) => {
+    //             error!(%actor_id, "could not clear buffered meta for versions {versions:?}: {e}");
+    //             to_clear.push_front((actor_id, versions));
+    //         }
+    //     }
+    // }
+}
+
 async fn sync_loop(
     agent: Agent,
     transport: Transport,
     mut rx_apply: Receiver<(ActorId, i64)>,
-    rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
     mut tripwire: Tripwire,
 ) {
     let mut sync_backoff = backoff::Backoff::new(0)
@@ -2579,13 +2675,6 @@ async fn sync_loop(
         .iter();
     let next_sync_at = tokio::time::sleep(sync_backoff.next().unwrap());
     tokio::pin!(next_sync_at);
-
-    // TODO: move this elsewhere, doesn't have be spawned here...
-    spawn_counted(write_empties_loop(
-        agent.clone(),
-        rx_empty,
-        tripwire.clone(),
-    ));
 
     loop {
         enum Branch {
@@ -2676,6 +2765,9 @@ async fn process_completed_empties(
 
                 for range in ranges {
                     inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
+                    if let Err(e) = agent.tx_clear_buf().try_send((actor_id, range.clone())) {
+                        error!(%actor_id, "could not schedule buffered meta clear: {e}");
+                    }
                 }
 
                 tx.commit()?;

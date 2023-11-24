@@ -2067,8 +2067,7 @@ mod tests {
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let pool =
-            SplitPool::create(db_path, Arc::new(Semaphore::new(1)), tripwire.clone()).await?;
+        let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1))).await?;
         {
             let mut conn = pool.write_priority().await?;
             setup_conn(&mut conn)?;
@@ -2189,7 +2188,7 @@ mod tests {
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)), tripwire.clone())
+        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)))
             .await
             .unwrap();
         let mut conn = pool.write_priority().await.unwrap();

@@ -33,7 +33,7 @@ use tokio::{
     },
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 use tripwire::Tripwire;
 
 use crate::{
@@ -63,6 +63,7 @@ pub struct AgentConfig {
     pub tx_bcast: Sender<BroadcastInput>,
     pub tx_apply: Sender<(ActorId, i64)>,
     pub tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
+    pub tx_clear_buf: Sender<(ActorId, RangeInclusive<i64>)>,
     pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
     pub tx_foca: Sender<FocaInput>,
 
@@ -85,6 +86,7 @@ pub struct AgentInner {
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
+    tx_clear_buf: Sender<(ActorId, RangeInclusive<i64>)>,
     tx_changes: Sender<(ChangeV1, ChangeSource)>,
     tx_foca: Sender<FocaInput>,
     write_sema: Arc<Semaphore>,
@@ -112,6 +114,7 @@ impl Agent {
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             tx_empty: config.tx_empty,
+            tx_clear_buf: config.tx_clear_buf,
             tx_changes: config.tx_changes,
             tx_foca: config.tx_foca,
             write_sema: config.write_sema,
@@ -156,6 +159,10 @@ impl Agent {
 
     pub fn tx_empty(&self) -> &Sender<(ActorId, RangeInclusive<i64>)> {
         &self.0.tx_empty
+    }
+
+    pub fn tx_clear_buf(&self) -> &Sender<(ActorId, RangeInclusive<i64>)> {
+        &self.0.tx_clear_buf
     }
 
     pub fn tx_foca(&self) -> &Sender<FocaInput> {
@@ -218,6 +225,7 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(v0_2_0_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(v0_2_0_1_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(v0_2_0_2_migration as fn(&Transaction) -> rusqlite::Result<()>),
     ];
 
     crate::sqlite::migrate(conn, migrations)
@@ -328,6 +336,21 @@ fn v0_2_0_1_migration(tx: &Transaction) -> rusqlite::Result<()> {
     )
 }
 
+fn v0_2_0_2_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+        -- remove state
+        ALTER TABLE __corro_members DROP COLUMN state;
+        -- remove rtts
+        ALTER TABLE __corro_members DROP COLUMN rtts;
+        -- add computed rtt_min
+        ALTER TABLE __corro_members ADD COLUMN rtt_min INTEGER;
+        -- add updated_at
+        ALTER TABLE __corro_members ADD COLUMN updated_at DATETIME NOT NULL DEFAULT 0;
+    "#,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct SplitPool(Arc<SplitPoolInner>);
 
@@ -378,7 +401,6 @@ impl SplitPool {
     pub async fn create<P: AsRef<Path>>(
         path: P,
         write_sema: Arc<Semaphore>,
-        tripwire: Tripwire,
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
             .max_size(1)
@@ -397,17 +419,10 @@ impl SplitPool {
             write_sema,
             ro_pool,
             rw_pool,
-            tripwire,
         ))
     }
 
-    fn new(
-        path: PathBuf,
-        write_sema: Arc<Semaphore>,
-        read: SqlitePool,
-        write: SqlitePool,
-        mut tripwire: Tripwire,
-    ) -> Self {
+    fn new(path: PathBuf, write_sema: Arc<Semaphore>, read: SqlitePool, write: SqlitePool) -> Self {
         let (priority_tx, mut priority_rx) = channel(256);
         let (normal_tx, mut normal_rx) = channel(512);
         let (low_tx, mut low_rx) = channel(1024);
@@ -417,24 +432,11 @@ impl SplitPool {
                 let tx: oneshot::Sender<CancellationToken> = tokio::select! {
                     biased;
 
-                    _ = &mut tripwire => {
-                        break
-                    }
-
                     Some(tx) = priority_rx.recv() => tx,
                     Some(tx) = normal_rx.recv() => tx,
                     Some(tx) = low_rx.recv() => tx,
                 };
 
-                wait_conn_drop(tx).await
-            }
-
-            info!("Write loop done, draining...");
-
-            // keep processing priority messages
-            // NOTE: using `recv` would wait indefinitely, this loop only waits until all
-            //       current conn requests are done
-            while let Ok(tx) = priority_rx.try_recv() {
                 wait_conn_drop(tx).await
             }
         });

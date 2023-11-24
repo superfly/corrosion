@@ -297,7 +297,14 @@ async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn:
         quinn::ClientConfig::new(Arc::new(client_crypto))
     };
 
-    client_config.transport_config(Arc::new(build_quinn_transport_config(config)));
+    let mut transport_config = build_quinn_transport_config(config);
+
+    // client should send keepalives!
+    transport_config.keep_alive_interval(Some(Duration::from_secs(
+        config.idle_timeout_secs as u64 / 2,
+    )));
+
+    client_config.transport_config(Arc::new(transport_config));
 
     Ok(client_config)
 }

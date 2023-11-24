@@ -30,7 +30,9 @@ impl MemberState {
     }
 }
 
-#[derive(Debug, Default)]
+const RING_BUCKETS: [Range<u64>; 6] = [0..5, 5..15, 15..50, 50..100, 100..200, 200..300];
+
+#[derive(Debug, Default, Clone)]
 pub struct Rtt {
     pub buf: CircularBuffer<20, u64>,
 }
@@ -116,7 +118,7 @@ impl Members {
                 })
             }) {
                 if let Some(state) = self.states.get_mut(actor_id) {
-                    for (ring, n) in BUCKETS.iter().enumerate() {
+                    for (ring, n) in RING_BUCKETS.iter().enumerate() {
                         if n.contains(&avg) {
                             state.ring = Some(ring as u8);
                             break;
@@ -131,28 +133,5 @@ impl Members {
         self.states
             .values()
             .filter_map(|v| v.ring.and_then(|ring| (ring == 0).then_some(v.addr)))
-    }
-}
-
-const BUCKETS: [Range<u64>; 6] = [0..5, 5..15, 15..50, 50..100, 100..200, 200..300];
-
-#[derive(Clone)]
-pub enum MemberEvent {
-    Up(Actor),
-    Down(Actor),
-}
-
-impl MemberEvent {
-    pub fn actor(&self) -> &Actor {
-        match self {
-            MemberEvent::Up(actor) => actor,
-            MemberEvent::Down(actor) => actor,
-        }
-    }
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MemberEvent::Up(_) => "up",
-            MemberEvent::Down(_) => "down",
-        }
     }
 }

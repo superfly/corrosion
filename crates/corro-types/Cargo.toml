@@ -10,7 +10,7 @@ arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 camino = { workspace = true }
-circular-buffer = "0.1.3"
+circular-buffer = "0.1.5"
 compact_str = { workspace = true }
 config = { workspace = true }
 consul-client = { version = "0.1.0-alpha.0", path = "../consul-client" }
