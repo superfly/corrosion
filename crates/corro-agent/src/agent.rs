@@ -2565,19 +2565,21 @@ async fn clear_buffered_meta_loop(
         let pool = agent.pool().clone();
         tokio::spawn(async move {
             loop {
-                let conn = pool.write_low().await?;
+                let res = {
+                    let conn = pool.write_low().await?;
 
-                let res = block_in_place(|| {
-                    let buf_count = conn
+                    block_in_place(|| {
+                        let buf_count = conn
                 .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
                 .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
-                    let seq_count = conn
+                        let seq_count = conn
                 .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
                 .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
-                    Ok::<_, rusqlite::Error>((buf_count, seq_count))
-                });
+                        Ok::<_, rusqlite::Error>((buf_count, seq_count))
+                    })
+                };
 
                 match res {
                     Ok((buf_count, seq_count)) => {
