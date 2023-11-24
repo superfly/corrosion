@@ -1,6 +1,6 @@
 use std::{
     cmp,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
     ops::RangeInclusive,
@@ -956,11 +956,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         tripwire.clone(),
     ));
 
-    spawn_counted(clear_buffered_meta_loop(
-        agent.clone(),
-        rx_clear_buf,
-        tripwire.clone(),
-    ));
+    tokio::spawn(clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
 
     spawn_counted(
         sync_loop(agent.clone(), transport.clone(), rx_apply, tripwire.clone())
@@ -2564,65 +2560,106 @@ const TO_CLEAR_COUNT: usize = 1000;
 async fn clear_buffered_meta_loop(
     agent: Agent,
     mut rx_partials: Receiver<(ActorId, RangeInclusive<i64>)>,
-    mut tripwire: Tripwire,
 ) {
-    let mut to_clear: VecDeque<(ActorId, RangeInclusive<i64>)> = VecDeque::new();
+    while let Some((actor_id, versions)) = rx_partials.recv().await {
+        let pool = agent.pool().clone();
+        tokio::spawn(async move {
+            loop {
+                let conn = pool.write_low().await?;
 
-    loop {
-        let conn = tokio::select! {
-            conn_res = agent.pool().write_low(), if !to_clear.is_empty() => match conn_res {
-                Ok(conn) => conn,
-                Err(e) => {
-                    error!("could not get conn for to clear buffered meta: {e}");
-                    break;
-                }
-            },
-            maybe_partial = rx_partials.recv() => match maybe_partial {
-                Some((actor_id, versions)) => {
-                    to_clear.push_back((actor_id, versions));
-                    continue;
-                },
-                None => {
-                    debug!("partials clear queue is done");
-                    break;
-                }
-            },
-            _ = &mut tripwire => break
-        };
+                let res = block_in_place(|| {
+                    let buf_count = conn
+                .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+                .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
-        let (actor_id, versions) = match to_clear.pop_front() {
-            Some(popped) => popped,
-            None => {
-                warn!("did not pop a partial buffered version range to clear");
-                continue;
+                    let seq_count = conn
+                .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+                .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+                    Ok::<_, rusqlite::Error>((buf_count, seq_count))
+                });
+
+                match res {
+                    Ok((buf_count, seq_count)) => {
+                        if buf_count + seq_count > 0 {
+                            info!(%actor_id, "cleared {} buffered meta rows for versions {versions:?}", buf_count + seq_count);
+                        }
+                        if buf_count < TO_CLEAR_COUNT && seq_count < TO_CLEAR_COUNT {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!(%actor_id, "could not clear buffered meta for versions {versions:?}: {e}");
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-        };
 
-        let res = block_in_place(|| {
-            let buf_count = conn
-            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
-            .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
-
-            let seq_count = conn
-            .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
-            .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
-
-            Ok::<_, rusqlite::Error>((buf_count, seq_count))
+            Ok::<_, eyre::Report>(())
         });
-
-        match res {
-            Ok((buf_count, seq_count)) => {
-                if buf_count >= TO_CLEAR_COUNT || seq_count >= TO_CLEAR_COUNT {
-                    // we haven't fully cleared these versions, push back to the front!
-                    to_clear.push_front((actor_id, versions));
-                }
-            }
-            Err(e) => {
-                error!(%actor_id, "could not clear buffered meta for versions {versions:?}: {e}");
-                to_clear.push_front((actor_id, versions));
-            }
-        }
     }
+
+    // let mut to_clear: VecDeque<(ActorId, RangeInclusive<i64>)> = VecDeque::new();
+
+    // loop {
+    //     let conn = tokio::select! {
+    //         conn_res = agent.pool().write_low(), if !to_clear.is_empty() => match conn_res {
+    //             Ok(conn) => conn,
+    //             Err(e) => {
+    //                 error!("could not get conn for to clear buffered meta: {e}");
+    //                 break;
+    //             }
+    //         },
+    //         maybe_partial = rx_partials.recv() => match maybe_partial {
+    //             Some((actor_id, versions)) => {
+    //                 to_clear.push_back((actor_id, versions));
+    //                 continue;
+    //             },
+    //             None => {
+    //                 debug!("partials clear queue is done");
+    //                 break;
+    //             }
+    //         },
+    //         _ = &mut tripwire => break
+    //     };
+
+    //     let (actor_id, versions) = match to_clear.pop_front() {
+    //         Some(popped) => popped,
+    //         None => {
+    //             warn!("did not pop a partial buffered version range to clear");
+    //             continue;
+    //         }
+    //     };
+
+    //     let res = block_in_place(|| {
+    //         let buf_count = conn
+    //         .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+    //         .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+    //         let seq_count = conn
+    //         .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+    //         .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+    //         Ok::<_, rusqlite::Error>((buf_count, seq_count))
+    //     });
+
+    //     match res {
+    //         Ok((buf_count, seq_count)) => {
+    //             if buf_count + seq_count > 0 {
+    //                 info!(%actor_id, "cleared {} buffered meta rows for versions {versions:?}", buf_count + seq_count);
+    //             }
+    //             if buf_count >= TO_CLEAR_COUNT || seq_count >= TO_CLEAR_COUNT {
+    //                 // we haven't fully cleared these versions, push back to the front!
+    //                 to_clear.push_front((actor_id, versions));
+    //             }
+    //         }
+    //         Err(e) => {
+    //             error!(%actor_id, "could not clear buffered meta for versions {versions:?}: {e}");
+    //             to_clear.push_front((actor_id, versions));
+    //         }
+    //     }
+    // }
 }
 
 async fn sync_loop(
