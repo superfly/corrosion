@@ -34,12 +34,12 @@ pub struct SubParams {
 }
 
 pub async fn api_v1_sub_by_id(
-    Extension(subs): Extension<SubsManager>,
+    Extension(agent): Extension<Agent>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
-    sub_by_id(&subs, id, params, &bcast_cache).await
+    sub_by_id(agent.subs_manager(), id, params, &bcast_cache).await
 }
 
 async fn sub_by_id(
@@ -627,7 +627,6 @@ pub async fn upsert_sub(
 
 pub async fn api_v1_subs(
     Extension(agent): Extension<Agent>,
-    Extension(subs): Extension<SubsManager>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
     Extension(tripwire): Extension<Tripwire>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
@@ -639,6 +638,8 @@ pub async fn api_v1_subs(
     };
 
     let mut bcast_write = bcast_cache.write().await;
+
+    let subs = agent.subs_manager();
 
     let upsert_res = subs.get_or_insert(
         &stmt,
@@ -826,13 +827,11 @@ mod tests {
 
         assert!(body.0.results.len() == 2);
 
-        let subs = SubsManager::default();
         let bcast_cache: SharedMatcherBroadcastCache = Default::default();
 
         {
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
                 axum::extract::Query(SubParams::default()),
@@ -922,7 +921,6 @@ mod tests {
 
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
                 axum::extract::Query(SubParams {
@@ -984,7 +982,6 @@ mod tests {
 
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
                 axum::extract::Query(SubParams::default()),
@@ -1054,7 +1051,6 @@ mod tests {
 
         let mut res = api_v1_subs(
             Extension(agent.clone()),
-            Extension(subs.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
             axum::extract::Query(SubParams {
@@ -1104,7 +1100,6 @@ mod tests {
 
         let mut res = api_v1_subs(
             Extension(agent.clone()),
-            Extension(subs.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
             axum::extract::Query(SubParams {
@@ -1155,7 +1150,6 @@ mod tests {
 
         let mut res = api_v1_subs(
             Extension(agent.clone()),
-            Extension(subs.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
             axum::extract::Query(SubParams {
