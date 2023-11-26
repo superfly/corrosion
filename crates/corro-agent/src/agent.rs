@@ -64,7 +64,7 @@ use tokio::{
     net::TcpListener,
     sync::{
         mpsc::{channel, Receiver, Sender},
-        watch, Semaphore,
+        Semaphore,
     },
     task::block_in_place,
     time::{error::Elapsed, sleep, timeout},
@@ -90,7 +90,6 @@ pub struct AgentOptions {
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
     pub api_listener: TcpListener,
-    pub rx_db_version: watch::Receiver<i64>,
     pub rx_bcast: Receiver<BroadcastInput>,
     pub rx_apply: Receiver<(ActorId, i64)>,
     pub rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
@@ -98,6 +97,7 @@ pub struct AgentOptions {
     pub rx_changes: Receiver<(ChangeV1, ChangeSource)>,
     pub rx_foca: Receiver<FocaInput>,
     pub rtt_rx: Receiver<(SocketAddr, Duration)>,
+    pub subs_manager: SubsManager,
     pub tripwire: Tripwire,
 }
 
@@ -282,23 +282,18 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             .build(),
     );
 
-    let (tx_db_version, rx_db_version) = {
-        let conn = pool.read().await?;
-        let db_version = conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
-        watch::channel(db_version)
-    };
-
     let (tx_bcast, rx_bcast) = channel(10240);
     let (tx_empty, rx_empty) = channel(10240);
     let (tx_changes, rx_changes) = channel(5192);
     let (tx_foca, rx_foca) = channel(10240);
+
+    let subs_manager = SubsManager::default();
 
     let opts = AgentOptions {
         actor_id,
         gossip_server_endpoint,
         transport,
         api_listener,
-        rx_db_version,
         rx_bcast,
         rx_apply,
         rx_empty,
@@ -306,6 +301,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         rx_changes,
         rx_foca,
         rtt_rx,
+        subs_manager: subs_manager.clone(),
         tripwire: tripwire.clone(),
     };
 
@@ -318,7 +314,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         config: ArcSwap::from_pointee(conf),
         clock,
         bookie,
-        tx_db_version,
         tx_bcast,
         tx_apply,
         tx_empty,
@@ -327,6 +322,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_foca,
         write_sema,
         schema: RwLock::new(schema),
+        subs_manager,
         tripwire,
     });
 
@@ -356,17 +352,15 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         transport,
         api_listener,
         mut tripwire,
-        rx_db_version,
         rx_bcast,
         rx_apply,
         rx_empty,
         rx_clear_buf,
         rx_changes,
         rx_foca,
+        subs_manager,
         rtt_rx,
     } = opts;
-
-    let subs = SubsManager::default();
 
     let mut subs_bcast_cache = MatcherBroadcastCache::default();
 
@@ -393,13 +387,12 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 continue;
             }
 
-            let (_, created) = match subs.restore(
+            let (_, created) = match subs_manager.restore(
                 id,
                 &sql,
                 &agent.config().db.subscriptions_path(),
                 &agent.schema().read(),
                 agent.pool(),
-                rx_db_version.clone(),
                 agent.write_sema().clone(),
                 tripwire.clone(),
             ) {
@@ -415,7 +408,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
             let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
             tokio::spawn(process_sub_channel(
-                subs.clone(),
+                subs_manager.clone(),
                 id,
                 sub_tx.clone(),
                 created.evt_rx,
@@ -927,7 +920,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
                 .layer(Extension(agent.clone()))
                 .layer(Extension(subs_bcast_cache))
-                .layer(Extension(subs))
+                .layer(Extension(subs_manager))
                 .layer(Extension(tripwire.clone())),
         )
         .layer(DefaultBodyLimit::disable())
@@ -1770,19 +1763,9 @@ async fn process_fully_buffered_changes(
         tx.commit()?;
 
         let inserted = if let Some(known_version) = known_version {
-            let db_version = if let KnownDbVersion::Current { db_version, .. } = &known_version {
-                Some(*db_version)
-            } else {
-                None
-            };
-
             bookedw.insert(version, known_version);
 
             drop(bookedw);
-
-            if let Some(db_version) = db_version {
-                agent.change_db_version(db_version);
-            }
 
             true
         } else {
@@ -1836,7 +1819,7 @@ pub async fn process_multiple_changes(
 
     let mut conn = agent.pool().write_normal().await?;
 
-    block_in_place(|| {
+    let changesets = block_in_place(|| {
         let start = Instant::now();
         let tx = conn.transaction()?;
 
@@ -1896,17 +1879,13 @@ pub async fn process_multiple_changes(
                     }
 
                     // optimizing this, insert later!
-                    let (known, changeset) = if change.is_complete() && change.is_empty() {
+                    let known = if change.is_complete() && change.is_empty() {
                         // we never want to block here
                         if let Err(e) = agent.tx_empty().try_send((actor_id, change.versions())) {
                             error!("could not send empty changed versions into channel: {e}");
                         }
-                        (
-                            KnownDbVersion::Cleared,
-                            Changeset::Empty {
-                                versions: change.versions(),
-                            },
-                        )
+
+                        KnownDbVersion::Cleared
                     } else {
                         if let Some(seqs) = change.seqs() {
                             if seqs.end() < seqs.start() {
@@ -1915,30 +1894,30 @@ pub async fn process_multiple_changes(
                             }
                         }
 
-                        let (known, changeset) = match process_single_version(
+                        let (known, versions) = match process_single_version(
                             agent,
                             &tx,
                             last_db_version,
                             change,
                         ) {
                             Ok((known, changeset)) => {
+                                let versions = changeset.versions();
                                 if let KnownDbVersion::Current { db_version, .. } = &known {
                                     last_db_version = Some(*db_version);
+                                    changesets.push((actor_id, changeset, *db_version, src));
                                 }
-                                (known, changeset)
+                                (known, versions)
                             }
                             Err(e) => {
                                 error!(%actor_id, ?versions, "could not process single change: {e}");
                                 continue;
                             }
                         };
-                        debug!(%actor_id, self_actor_id = %agent.actor_id(), versions = ?changeset.versions(), "got known to insert: {known:?}");
-                        (known, changeset)
+                        debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "got known to insert: {known:?}");
+                        known
                     };
 
                     seen.insert(versions.clone(), known.clone());
-
-                    changesets.push((actor_id, changeset, src));
                     knowns.entry(actor_id).or_default().push((versions, known));
                 }
             }
@@ -2025,27 +2004,27 @@ pub async fn process_multiple_changes(
             }
         }
 
-        if let Some(db_version) = last_db_version {
-            agent.change_db_version(db_version);
-        }
+        Ok::<_, ChangeError>(changesets)
+    })?;
 
-        for (actor_id, changeset, src) in changesets {
-            if matches!(src, ChangeSource::Broadcast) && !changeset.is_empty() {
-                if let Err(_e) =
-                    agent
-                        .tx_bcast()
-                        .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
-                            actor_id,
-                            changeset,
-                        })))
-                {
-                    debug!("broadcasts are full or done!");
-                }
+    for (actor_id, changeset, db_version, src) in changesets {
+        agent
+            .subs_manager()
+            .match_changes(changeset.changes(), db_version);
+
+        if matches!(src, ChangeSource::Broadcast) && !changeset.is_empty() {
+            if let Err(_e) =
+                agent
+                    .tx_bcast()
+                    .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
+                        actor_id,
+                        changeset,
+                    })))
+            {
+                debug!("broadcasts are full or done!");
             }
         }
-
-        Ok::<_, ChangeError>(())
-    })?;
+    }
 
     Ok(())
 }

@@ -21,7 +21,7 @@ use rangemap::RangeInclusiveSet;
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
-    watch, AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
+    AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
     RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
     RwLockWriteGuard as TokioRwLockWriteGuard,
 };
@@ -40,6 +40,7 @@ use crate::{
     actor::ActorId,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     config::Config,
+    pubsub::SubsManager,
     schema::Schema,
     sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn, Migration, SqlitePool, SqlitePoolError},
 };
@@ -59,7 +60,6 @@ pub struct AgentConfig {
     pub clock: Arc<uhlc::HLC>,
     pub bookie: Bookie,
 
-    pub tx_db_version: watch::Sender<i64>,
     pub tx_bcast: Sender<BroadcastInput>,
     pub tx_apply: Sender<(ActorId, i64)>,
     pub tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
@@ -70,6 +70,9 @@ pub struct AgentConfig {
     pub write_sema: Arc<Semaphore>,
 
     pub schema: RwLock<Schema>,
+
+    pub subs_manager: SubsManager,
+
     pub tripwire: Tripwire,
 }
 
@@ -82,7 +85,6 @@ pub struct AgentInner {
     members: RwLock<Members>,
     clock: Arc<uhlc::HLC>,
     bookie: Bookie,
-    tx_db_version: watch::Sender<i64>,
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, i64)>,
     tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
@@ -92,6 +94,7 @@ pub struct AgentInner {
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     limits: Limits,
+    subs_manager: SubsManager,
 }
 
 #[derive(Debug, Clone)]
@@ -110,7 +113,6 @@ impl Agent {
             members: config.members,
             clock: config.clock,
             bookie: config.bookie,
-            tx_db_version: config.tx_db_version,
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             tx_empty: config.tx_empty,
@@ -122,6 +124,7 @@ impl Agent {
             limits: Limits {
                 sync: Arc::new(Semaphore::new(3)),
             },
+            subs_manager: config.subs_manager,
         }))
     }
 
@@ -209,14 +212,8 @@ impl Agent {
         &self.0.limits
     }
 
-    pub fn change_db_version(&self, db_version: i64) {
-        if let Err(_e) = self.0.tx_db_version.send(db_version) {
-            debug!("could not change db version, all receivers likely dropped");
-        }
-    }
-
-    pub fn rx_db_version(&self) -> watch::Receiver<i64> {
-        self.0.tx_db_version.subscribe()
+    pub fn subs_manager(&self) -> &SubsManager {
+        &self.0.subs_manager
     }
 }
 

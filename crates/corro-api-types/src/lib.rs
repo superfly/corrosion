@@ -754,6 +754,12 @@ impl From<&str> for TableName {
 #[serde(transparent)]
 pub struct ColumnName(pub CompactString);
 
+impl ColumnName {
+    pub fn is_crsql_sentinel(&self) -> bool {
+        self.0 == "-1"
+    }
+}
+
 impl Borrow<str> for ColumnName {
     #[inline]
     fn borrow(&self) -> &str {

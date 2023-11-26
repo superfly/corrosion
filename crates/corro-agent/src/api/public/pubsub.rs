@@ -645,7 +645,6 @@ pub async fn api_v1_subs(
         &agent.config().db.subscriptions_path(),
         &agent.schema().read(),
         agent.pool(),
-        agent.rx_db_version(),
         agent.write_sema().clone(),
         tripwire,
     );

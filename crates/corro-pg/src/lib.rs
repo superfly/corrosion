@@ -2375,6 +2375,8 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
 
                             trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
+                            agent.subs_manager().match_changes(&changes, db_version);
+
                             let tx_bcast = agent.tx_bcast().clone();
                             tokio::spawn(async move {
                                 if let Err(e) = tx_bcast
@@ -2408,8 +2410,6 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
             Ok::<_, BoxError>(())
         }
     });
-
-    agent.change_db_version(db_version);
 
     Ok(())
 }

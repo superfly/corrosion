@@ -110,9 +110,6 @@ where
             start.elapsed()
         };
 
-        // change the current db version, so that subscribers can catch up
-        agent.change_db_version(db_version);
-
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
         book_writer.insert(
@@ -151,6 +148,8 @@ where
                             }
 
                             trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
+
+                            agent.subs_manager().match_changes(&changes, db_version);
 
                             let tx_bcast = agent.tx_bcast().clone();
                             tokio::spawn(async move {
