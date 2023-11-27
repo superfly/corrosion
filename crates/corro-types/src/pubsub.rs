@@ -1550,8 +1550,8 @@ impl Matcher {
                 ))?;
 
                 for (mut change_type, mut prepped) in [
-                    (Some(ChangeType::Delete), delete_prepped), // start w/ deletions
                     (None, insert_prepped),
+                    (Some(ChangeType::Delete), delete_prepped),
                 ] {
                     let col_count = prepped.column_count();
 
