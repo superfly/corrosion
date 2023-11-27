@@ -9,8 +9,7 @@ use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
 use compact_str::ToCompactString;
 use corro_api_types::{
-    row_to_change, Change, ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef,
-    TableName,
+    Change, ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
@@ -41,7 +40,6 @@ use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 use uuid::Uuid;
 
 use crate::{
-    actor::ActorId,
     agent::SplitPool,
     api::QueryEvent,
     schema::{Schema, Table},
@@ -1018,7 +1016,7 @@ impl Matcher {
 
     async fn run_restore(
         mut self,
-        mut state_conn: CrConn,
+        state_conn: CrConn,
         write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) {
@@ -1099,7 +1097,12 @@ impl Matcher {
             error!(sub_id = %self.id, "could not catch up: {e}");
         }
 
+        let mut last_db_version = 0;
+        let mut buf = MatchCandidates::new();
+        let mut buf_count = 0;
+
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
+        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(200));
 
         loop {
             enum Branch {
@@ -1115,7 +1118,26 @@ impl Matcher {
                     info!(sub_id = %self.id, "Acknowledged subscription cancellation, breaking loop.");
                     break;
                 }
-                Some(res) = self.changes_rx.recv() => Branch::NewCandidates(res),
+                Some((candidates, db_version)) = self.changes_rx.recv() => {
+                    for (table, pks) in  candidates {
+                        let buffed = buf.entry(table).or_default();
+                        for pk in pks {
+                            if buffed.insert(pk) {
+                                buf_count += 1;
+                            }
+                        }
+                    }
+                    last_db_version = db_version;
+
+                    if buf_count >= 200 {
+                        Branch::NewCandidates((std::mem::take(&mut buf), last_db_version))
+                    } else {
+                        continue;
+                    }
+                },
+                _ = process_changes_interval.tick() => {
+                    Branch::NewCandidates((std::mem::take(&mut buf), last_db_version))
+                },
                 _ = &mut tripwire => {
                     trace!("tripped cmd_loop, returning");
                     // just return!
@@ -1137,6 +1159,7 @@ impl Matcher {
                         }
                         break;
                     }
+                    buf_count = 0;
                 }
                 Branch::PurgeOldChanges => {
                     let res = block_in_place(|| {
@@ -1527,8 +1550,8 @@ impl Matcher {
                 ))?;
 
                 for (mut change_type, mut prepped) in [
+                    (Some(ChangeType::Delete), delete_prepped), // start w/ deletions
                     (None, insert_prepped),
-                    (Some(ChangeType::Delete), delete_prepped),
                 ] {
                     let col_count = prepped.column_count();
 
@@ -1594,7 +1617,7 @@ impl Matcher {
             // clean up temporary tables immediately
             for table in tables {
                 // TODO: reduce mistakes by computing this table name once
-                tx.prepare_cached(&format!("DROP TABLE IF EXISTS temp_{table}",))?
+                tx.prepare_cached(&format!("DROP TABLE temp_{table}",))?
                     .execute(())?;
                 trace!("cleaned up temp_{table}");
             }
@@ -2122,6 +2145,7 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use crate::{
+        actor::ActorId,
         agent::migrate,
         schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
