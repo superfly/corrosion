@@ -1097,12 +1097,14 @@ impl Matcher {
             error!(sub_id = %self.id, "could not catch up: {e}");
         }
 
-        let mut last_db_version = 0;
+        let mut last_db_version = None;
         let mut buf = MatchCandidates::new();
         let mut buf_count = 0;
 
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
-        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(200));
+
+        // max duration of aggregating candidates
+        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(400));
 
         loop {
             enum Branch {
@@ -1127,16 +1129,24 @@ impl Matcher {
                             }
                         }
                     }
-                    last_db_version = db_version;
+                    last_db_version = Some(db_version);
 
                     if buf_count >= 200 {
-                        Branch::NewCandidates((std::mem::take(&mut buf), last_db_version))
+                        if let Some(db_version) = last_db_version.take() {
+                            Branch::NewCandidates((std::mem::take(&mut buf), db_version))
+                        } else {
+                            continue;
+                        }
                     } else {
                         continue;
                     }
                 },
                 _ = process_changes_interval.tick() => {
-                    Branch::NewCandidates((std::mem::take(&mut buf), last_db_version))
+                    if let Some(db_version) = last_db_version.take(){
+                    Branch::NewCandidates((std::mem::take(&mut buf), db_version))
+                    } else {
+                        continue;
+                    }
                 },
                 _ = &mut tripwire => {
                     trace!("tripped cmd_loop, returning");
@@ -1398,7 +1408,7 @@ impl Matcher {
                     // NOTE: this can't be an actual CREATE TEMP TABLE or it won't be visible
                     //       from the state db
                     &format!(
-                        "CREATE TABLE {tmp_table_name} ({})",
+                        "CREATE TABLE IF NOT EXISTS {tmp_table_name} ({})",
                         self.pks
                             .get(table.as_str())
                             .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
@@ -1442,8 +1452,7 @@ impl Matcher {
 
         // ensure drop and recreate
         tx.execute_batch(&format!(
-            "DROP TABLE IF EXISTS state_results;
-            CREATE TEMP TABLE state_results ({})",
+            "CREATE TEMP TABLE IF NOT EXISTS state_results ({})",
             tmp_cols.join(",")
         ))?;
 
@@ -1612,12 +1621,12 @@ impl Matcher {
             }
 
             // clean that up
-            tx.execute_batch("DROP TABLE state_results")?;
+            tx.execute_batch("DELETE FROM state_results")?;
 
             // clean up temporary tables immediately
             for table in tables {
                 // TODO: reduce mistakes by computing this table name once
-                tx.prepare_cached(&format!("DROP TABLE temp_{table}",))?
+                tx.prepare_cached(&format!("DELETE FROM temp_{table}",))?
                     .execute(())?;
                 trace!("cleaned up temp_{table}");
             }
