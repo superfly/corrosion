@@ -379,7 +379,10 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             res
         };
 
+        let mut restored = HashSet::new();
         let mut to_cleanup = vec![];
+
+        let subs_path = agent.config().db.subscriptions_path();
 
         for (id, sql, state) in rows {
             if state != "running" {
@@ -390,7 +393,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             let (_, created) = match subs_manager.restore(
                 id,
                 &sql,
-                &agent.config().db.subscriptions_path(),
+                &subs_path,
                 &agent.schema().read(),
                 agent.pool(),
                 agent.write_sema().clone(),
@@ -406,6 +409,8 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
 
             info!(sub_id = %id, "Restored subscription");
 
+            restored.insert(id);
+
             let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
             tokio::spawn(process_sub_channel(
                 subs_manager.clone(),
@@ -417,16 +422,26 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             subs_bcast_cache.insert(id, sub_tx);
         }
 
+        if let Ok(mut dir) = tokio::fs::read_dir(&subs_path).await {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let path_str = entry.path().display().to_string();
+                info!("Looking at possibly cleaning up subscription {path_str}");
+                if let Some(sub_id_str) = path_str.strip_prefix(subs_path.as_str()) {
+                    if let Ok(sub_id) = sub_id_str.parse() {
+                        if restored.contains(&sub_id) {
+                            continue;
+                        }
+                        to_cleanup.push(sub_id);
+                    }
+                }
+            }
+        }
+
         if !to_cleanup.is_empty() {
             let conn = agent.pool().write_priority().await?;
             for id in to_cleanup {
                 info!(sub_id = %id, "Cleaning up unclean subscription");
-                Matcher::cleanup(
-                    id,
-                    Matcher::sub_path(agent.config().db.subscriptions_path().as_path(), id),
-                    &conn,
-                    None,
-                )?;
+                Matcher::cleanup(id, Matcher::sub_path(subs_path.as_path(), id), &conn, None)?;
             }
         }
     };

@@ -296,9 +296,12 @@ impl SubsManager {
             Ok(handle) => handle,
             Err(e) => {
                 let conn = pool.client_dedicated()?;
-                if let Err(e) =
-                    Matcher::cleanup(id, subs_path.join(id.to_string()), &conn, Some(write_sema))
-                {
+                if let Err(e) = Matcher::cleanup(
+                    id,
+                    Matcher::sub_path(subs_path, id),
+                    &conn,
+                    Some(write_sema),
+                ) {
                     error!("could not cleanup subscription: {e}");
                 }
 
