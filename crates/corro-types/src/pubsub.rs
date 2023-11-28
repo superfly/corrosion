@@ -701,7 +701,6 @@ impl Matcher {
             r#"
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
-                -- PRAGMA mmap_size = 536870912;
                 PRAGMA temp_store = memory;
             "#,
         )?;
@@ -953,6 +952,7 @@ impl Matcher {
         let n = block_in_place(|| {
             let tx = matcher.conn.transaction()?;
 
+            info!(sub_id = %id, "Creating subscription database schema");
             let create_temp_table = format!(
                 r#"
                 CREATE TABLE query (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {columns});
@@ -1007,18 +1007,21 @@ impl Matcher {
             trace!("inserted sub columns");
 
             let inserted = {
+                info!(sub_id = %id, "Acquiring permit to write to the state database");
                 let _permit = Handle::current().block_on(write_sema.clone().acquire_owned())?;
+                info!(sub_id = %id, "Acquired permit");
                 let state_tx = state_conn.transaction()?;
                 trace!("created state transaction");
                 let inserted = state_tx.execute(
                     "INSERT INTO __corro_subs (id, sql) VALUES (?, ?);",
                     params![id, sql],
                 )?;
-                trace!("inserted into __corro_subs");
+                info!(sub_id = %id, "Inserted in __corro_subs");
 
                 tx.commit()?;
                 trace!("committed subscription");
                 state_tx.commit()?;
+                info!(sub_id = %id, "Committed both initial state and subscription transactions");
                 inserted
             };
 
@@ -1042,6 +1045,7 @@ impl Matcher {
         write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) {
+        info!(sub_id = %self.id, "Restoring subscription");
         let init_res = block_in_place(|| {
             self.last_rowid = self
                 .conn
@@ -1076,12 +1080,13 @@ impl Matcher {
         write_sema: Arc<Semaphore>,
         mut tripwire: Tripwire,
     ) {
-        trace!("in cmd_loop");
+        info!(sub_id = %self.id, "Starting loop to run the subscription");
         {
             let (lock, cvar) = &*self.state;
             let mut state = lock.lock();
             *state = MatcherState::Running;
             cvar.notify_all();
+            info!(sub_id = %self.id, "Notified condvar that the subscription is 'running'");
         }
         trace!("set state!");
 
@@ -1237,6 +1242,7 @@ impl Matcher {
     }
 
     async fn run(mut self, mut state_conn: CrConn, write_sema: Arc<Semaphore>, tripwire: Tripwire) {
+        info!(sub_id = %self.id, "Running initial query");
         if let Err(e) = self
             .evt_tx
             .send(QueryEvent::Columns(self.col_names.clone()))
@@ -1360,6 +1366,7 @@ impl Matcher {
             tx.commit()?;
 
             {
+                info!(sub_id = %self.id, "Acquiring permit to update __corro_subs state");
                 let _permit = Handle::current().block_on(write_sema.clone().acquire_owned())?;
                 state_tx.execute(
                     "UPDATE __corro_subs SET state = 'running' WHERE id = ?",
