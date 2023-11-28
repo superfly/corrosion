@@ -665,7 +665,7 @@ pub async fn api_v1_subs(
     let matcher_id = match upsert_sub(
         handle,
         maybe_created,
-        &subs,
+        subs,
         &mut bcast_write,
         params,
         forward_tx,
@@ -761,7 +761,7 @@ async fn forward_bytes_to_body_sender(
     }
     if !buf.is_empty() {
         if let Err(e) = tx.send_data(buf.freeze()).await {
-            warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
+            warn!(%sub_id, "could not forward last subscription query event to receiver: {e}");
         }
     }
 }

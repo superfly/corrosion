@@ -864,18 +864,21 @@ impl Matcher {
         info!(sub_id = %id, "Attempting to cleanup...");
 
         info!(sub_id = %id, "Dropping subs entry in DB");
-        {
-            // ignore error here for convenience
-            let _permit =
-                write_sema.map(|write_sema| Handle::current().block_on(write_sema.acquire_owned()));
-            state_conn.execute("DELETE FROM __corro_subs WHERE id = ?", [id])?;
-        }
 
-        if let Err(e) = std::fs::remove_dir_all(&sub_path) {
-            error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
-        }
+        block_in_place(|| {
+            {
+                // ignore error here for convenience
+                let _permit = write_sema
+                    .map(|write_sema| Handle::current().block_on(write_sema.acquire_owned()));
+                state_conn.execute("DELETE FROM __corro_subs WHERE id = ?", [id])?;
+            }
 
-        Ok(())
+            if let Err(e) = std::fs::remove_dir_all(&sub_path) {
+                error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
+            }
+
+            Ok(())
+        })
     }
 
     pub fn sub_path(subs_path: &Utf8Path, id: Uuid) -> Utf8PathBuf {
@@ -987,7 +990,7 @@ impl Matcher {
             trace!("inserted sub columns");
 
             let inserted = {
-                let _permit = Handle::current().block_on(write_sema.acquire())?;
+                let _permit = Handle::current().block_on(write_sema.clone().acquire_owned())?;
                 let state_tx = state_conn.transaction()?;
                 trace!("created state transaction");
                 let inserted = state_tx.execute(
@@ -1067,15 +1070,17 @@ impl Matcher {
 
         {
             // if this fails for any reason, something is very wrong
-            let _permit = write_sema.acquire().await;
+            // let _permit = write_sema.clone().acquire_owned().await;
 
+            info!(sub_id = %self.id, "Attaching __corro_sub to state db");
             if let Err(e) = state_conn.execute_batch(&format!(
                 "ATTACH DATABASE {} AS __corro_sub",
                 enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
             )) {
-                error!("could not ATTACH sub db as __corro_sub on state db: {e}");
+                error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
                 return;
             }
+            info!(sub_id = %self.id, "Attached __corro_sub to state db");
         }
 
         let catch_up_res = block_in_place(|| {
@@ -1201,14 +1206,12 @@ impl Matcher {
 
         debug!(id = %self.id, "matcher loop is done");
 
-        if let Err(e) = block_in_place(|| {
-            Self::cleanup(
-                self.id,
-                self.base_path.clone(),
-                &state_conn,
-                Some(write_sema),
-            )
-        }) {
+        if let Err(e) = Self::cleanup(
+            self.id,
+            self.base_path.clone(),
+            &state_conn,
+            Some(write_sema),
+        ) {
             error!("could not handle cleanup: {e}");
         }
     }
@@ -1251,10 +1254,11 @@ impl Matcher {
             // ensure drop and recreate
             tx.execute_batch(&format!(
                 "DROP TABLE IF EXISTS state_rows;
-                            CREATE TEMP TABLE state_rows ({})",
+                CREATE TEMP TABLE state_rows ({})",
                 tmp_cols.join(",")
             ))?;
 
+            info!(sub_id = %self.id, "Starting state conn read transaction for initial query");
             // this is read transaction up until the end!
             let state_tx = state_conn.transaction()?;
 
@@ -1329,16 +1333,21 @@ impl Matcher {
 
             tx.execute_batch("DROP TABLE IF EXISTS state_rows;")?;
 
+            let db_version: i64 =
+                state_tx.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+            update_last_db_version(&tx, db_version)?;
+
             tx.commit()?;
 
             {
-                let _permit = Handle::current().block_on(write_sema.acquire())?;
+                let _permit = Handle::current().block_on(write_sema.clone().acquire_owned())?;
                 state_tx.execute(
                     "UPDATE __corro_subs SET state = 'running' WHERE id = ?",
                     [self.id],
                 )?;
 
                 state_tx.commit()?;
+                info!(sub_id = %self.id, "Done with initial state conn transaction for query");
             }
 
             self.last_rowid = last_rowid;

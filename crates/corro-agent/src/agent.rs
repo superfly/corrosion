@@ -2469,7 +2469,7 @@ async fn handle_changes(
             // drain and process current changes!
             #[allow(clippy::drain_collect)]
             if let Err(e) = process_multiple_changes(&agent, buf.drain(..).collect()).await {
-                error!("could not process multiple changes: {e}");
+                error!("could not process last multiple changes: {e}");
             }
 
             // reset count
