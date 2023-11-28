@@ -427,7 +427,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
                 let path_str = entry.path().display().to_string();
                 info!("Looking at possibly cleaning up subscription {path_str}");
                 if let Some(sub_id_str) = path_str.strip_prefix(subs_path.as_str()) {
-                    if let Ok(sub_id) = sub_id_str.parse() {
+                    if let Ok(sub_id) = sub_id_str.trim_matches('/').parse() {
                         if restored.contains(&sub_id) {
                             continue;
                         }
