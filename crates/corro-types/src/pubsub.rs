@@ -9,7 +9,7 @@ use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
 use compact_str::ToCompactString;
 use corro_api_types::{
-    ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
+    Change, ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
@@ -30,7 +30,8 @@ use sqlite3_parser::{
 };
 use sqlite_pool::RusqlitePool;
 use tokio::{
-    sync::{mpsc, watch},
+    runtime::Handle,
+    sync::{mpsc, watch, AcquireError, Semaphore},
     task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -265,7 +266,7 @@ impl SubsManager {
         subs_path: &Utf8Path,
         schema: &Schema,
         pool: &SplitPool,
-        rx_db_version: watch::Receiver<i64>,
+        write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) -> Result<(MatcherHandle, Option<MatcherCreated>), MatcherError> {
         if let Some(handle) = self.get_by_query(sql) {
@@ -280,16 +281,33 @@ impl SubsManager {
         let id = Uuid::new_v4();
         let (evt_tx, evt_rx) = mpsc::channel(SUB_EVENT_CHANNEL_CAP);
 
-        let handle = Matcher::create(
+        let handle_res = Matcher::create(
             id,
             subs_path.to_path_buf(),
             schema,
             pool.client_dedicated()?,
             evt_tx,
             sql,
-            rx_db_version,
+            write_sema.clone(),
             tripwire,
-        )?;
+        );
+
+        let handle = match handle_res {
+            Ok(handle) => handle,
+            Err(e) => {
+                let conn = pool.client_dedicated()?;
+                if let Err(e) = Matcher::cleanup(
+                    id,
+                    Matcher::sub_path(subs_path, id),
+                    &conn,
+                    Some(write_sema),
+                ) {
+                    error!("could not cleanup subscription: {e}");
+                }
+
+                return Err(e);
+            }
+        };
 
         inner.handles.insert(id, handle.clone());
         inner.queries.insert(sql.to_owned(), id);
@@ -305,7 +323,7 @@ impl SubsManager {
         subs_path: &Utf8Path,
         schema: &Schema,
         pool: &SplitPool,
-        rx_db_version: watch::Receiver<i64>,
+        write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) -> Result<(MatcherHandle, MatcherCreated), MatcherError> {
         let mut inner = self.0.write();
@@ -327,7 +345,7 @@ impl SubsManager {
             pool.client_dedicated()?,
             evt_tx,
             sql,
-            rx_db_version,
+            write_sema,
             tripwire,
         )?;
 
@@ -340,6 +358,55 @@ impl SubsManager {
     pub fn remove(&self, id: &Uuid) -> Option<MatcherHandle> {
         let mut inner = self.0.write();
         inner.remove(id)
+    }
+
+    pub fn match_changes(&self, changes: &[Change], db_version: i64) {
+        trace!(
+            db_version,
+            "trying to match changes to subscribers, len: {}",
+            changes.len()
+        );
+        if changes.is_empty() {
+            return;
+        }
+        let handles = {
+            let inner = self.0.read();
+            if inner.handles.is_empty() {
+                return;
+            }
+            inner.handles.clone()
+        };
+
+        for (id, handle) in handles.iter() {
+            trace!(sub_id = %id, db_version, "attempting to match changes to a subscription");
+            let mut candidates = MatchCandidates::new();
+            for change in changes.iter().map(MatchableChange::from) {
+                handle.filter_matchable_change(&mut candidates, change);
+            }
+
+            trace!(sub_id = %id, db_version, "found {} candidates", candidates.values().map(|pks| pks.len()).sum::<usize>());
+
+            if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
+                // TODO: log UUID
+                error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
+            }
+        }
+    }
+}
+
+struct MatchableChange<'a> {
+    table: &'a TableName,
+    pk: &'a [u8],
+    column: &'a ColumnName,
+}
+
+impl<'a> From<&'a Change> for MatchableChange<'a> {
+    fn from(value: &'a Change) -> Self {
+        MatchableChange {
+            table: &value.table,
+            pk: &value.pk,
+            column: &value.cid,
+        }
     }
 }
 
@@ -387,6 +454,7 @@ struct InnerMatcherHandle {
     parsed: ParsedSelect,
     col_names: Vec<ColumnName>,
     cancel: CancellationToken,
+    changes_tx: mpsc::Sender<(MatchCandidates, i64)>,
     last_change_rx: watch::Receiver<ChangeId>,
 }
 
@@ -539,6 +607,35 @@ impl MatcherHandle {
 
         Ok(max_change_id)
     }
+
+    fn filter_matchable_change(&self, candidates: &mut MatchCandidates, change: MatchableChange) {
+        // don't double process the same pk
+        if candidates
+            .get(change.table)
+            .map(|pks| pks.contains(change.pk))
+            .unwrap_or_default()
+        {
+            return;
+        }
+
+        // don't consider changes that don't have both the table + col in the matcher query
+        if !self
+            .inner
+            .parsed
+            .table_columns
+            .get(change.table.as_str())
+            .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
+            .unwrap_or_default()
+        {
+            return;
+        }
+
+        if let Some(v) = candidates.get_mut(change.table) {
+            v.insert(change.pk.to_vec());
+        } else {
+            candidates.insert(change.table.clone(), [change.pk.to_vec()].into());
+        }
+    }
 }
 
 type StateLock = Arc<(Mutex<MatcherState>, Condvar)>;
@@ -556,8 +653,8 @@ pub struct Matcher {
     base_path: Utf8PathBuf,
     cancel: CancellationToken,
     state: StateLock,
-    db_version_rx: watch::Receiver<i64>,
     last_change_tx: watch::Sender<ChangeId>,
+    changes_rx: mpsc::Receiver<(MatchCandidates, i64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -581,7 +678,6 @@ impl Matcher {
         state_conn: &Connection,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
-        db_version_rx: watch::Receiver<i64>,
     ) -> Result<(Matcher, MatcherHandle), MatcherError> {
         let sub_path = Self::sub_path(subs_path.as_path(), id);
 
@@ -605,6 +701,8 @@ impl Matcher {
             r#"
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
+                -- PRAGMA mmap_size = 536870912;
+                PRAGMA temp_store = memory;
             "#,
         )?;
 
@@ -733,6 +831,9 @@ impl Matcher {
 
         let (last_change_tx, last_change_rx) = watch::channel(ChangeId(0));
 
+        // big channel to not miss anything
+        let (changes_tx, changes_rx) = mpsc::channel(20480);
+
         let handle = MatcherHandle {
             inner: Arc::new(InnerMatcherHandle {
                 id,
@@ -746,6 +847,7 @@ impl Matcher {
                 col_names: col_names.clone(),
                 cancel: cancel.clone(),
                 last_change_rx,
+                changes_tx,
             }),
             state: state.clone(),
         };
@@ -763,8 +865,8 @@ impl Matcher {
             base_path: sub_path,
             cancel,
             state,
-            db_version_rx,
             last_change_tx,
+            changes_rx,
         };
 
         Ok((matcher, handle))
@@ -774,17 +876,26 @@ impl Matcher {
         id: Uuid,
         sub_path: Utf8PathBuf,
         state_conn: &Connection,
+        write_sema: Option<Arc<Semaphore>>,
     ) -> rusqlite::Result<()> {
         info!(sub_id = %id, "Attempting to cleanup...");
 
         info!(sub_id = %id, "Dropping subs entry in DB");
-        state_conn.execute("DELETE FROM __corro_subs WHERE id = ?", [id])?;
 
-        if let Err(e) = std::fs::remove_dir_all(&sub_path) {
-            error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
-        }
+        block_in_place(|| {
+            {
+                // ignore error here for convenience
+                let _permit = write_sema
+                    .map(|write_sema| Handle::current().block_on(write_sema.acquire_owned()));
+                state_conn.execute("DELETE FROM __corro_subs WHERE id = ?", [id])?;
+            }
 
-        Ok(())
+            if let Err(e) = std::fs::remove_dir_all(&sub_path) {
+                error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
+            }
+
+            Ok(())
+        })
     }
 
     pub fn sub_path(subs_path: &Utf8Path, id: Uuid) -> Utf8PathBuf {
@@ -799,20 +910,12 @@ impl Matcher {
         state_conn: CrConn,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
-        db_version_rx: watch::Receiver<i64>,
+        write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) -> Result<MatcherHandle, MatcherError> {
-        let (matcher, handle) = Self::new(
-            id,
-            subs_path,
-            schema,
-            &state_conn,
-            evt_tx,
-            sql,
-            db_version_rx,
-        )?;
+        let (matcher, handle) = Self::new(id, subs_path, schema, &state_conn, evt_tx, sql)?;
 
-        spawn_counted(matcher.run_restore(state_conn, tripwire));
+        spawn_counted(matcher.run_restore(state_conn, write_sema, tripwire));
 
         Ok(handle)
     }
@@ -825,18 +928,10 @@ impl Matcher {
         mut state_conn: CrConn,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
-        db_version_rx: watch::Receiver<i64>,
+        write_sema: Arc<Semaphore>,
         tripwire: Tripwire,
     ) -> Result<MatcherHandle, MatcherError> {
-        let (mut matcher, handle) = Self::new(
-            id,
-            subs_path,
-            schema,
-            &state_conn,
-            evt_tx,
-            sql,
-            db_version_rx,
-        )?;
+        let (mut matcher, handle) = Self::new(id, subs_path, schema, &state_conn, evt_tx, sql)?;
 
         let pk_cols = matcher
             .pks
@@ -911,32 +1006,42 @@ impl Matcher {
             }
             trace!("inserted sub columns");
 
-            let state_tx = state_conn.transaction()?;
-            trace!("created state transaction");
-            let inserted = state_tx.execute(
-                "INSERT INTO __corro_subs (id, sql) VALUES (?, ?);",
-                params![id, sql],
-            )?;
-            trace!("inserted into __corro_subs");
+            let inserted = {
+                let _permit = Handle::current().block_on(write_sema.clone().acquire_owned())?;
+                let state_tx = state_conn.transaction()?;
+                trace!("created state transaction");
+                let inserted = state_tx.execute(
+                    "INSERT INTO __corro_subs (id, sql) VALUES (?, ?);",
+                    params![id, sql],
+                )?;
+                trace!("inserted into __corro_subs");
 
-            tx.commit()?;
-            trace!("committed subscription");
-            state_tx.commit()?;
+                tx.commit()?;
+                trace!("committed subscription");
+                state_tx.commit()?;
+                inserted
+            };
+
             trace!("committed state");
 
-            Ok::<_, rusqlite::Error>(inserted)
+            Ok::<_, MatcherError>(inserted)
         })?;
 
         if n != 1 {
             return Err(MatcherError::InsertSub);
         }
 
-        spawn_counted(matcher.run(state_conn, tripwire));
+        spawn_counted(matcher.run(state_conn, write_sema, tripwire));
 
         Ok(handle)
     }
 
-    async fn run_restore(mut self, state_conn: CrConn, tripwire: Tripwire) {
+    async fn run_restore(
+        mut self,
+        state_conn: CrConn,
+        write_sema: Arc<Semaphore>,
+        tripwire: Tripwire,
+    ) {
         let init_res = block_in_place(|| {
             self.last_rowid = self
                 .conn
@@ -948,12 +1053,6 @@ impl Matcher {
                 .optional()?
                 .unwrap_or_default();
 
-            let db_version = self.conn.query_row(
-                "SELECT value FROM meta WHERE key = 'db_version'",
-                (),
-                |row| row.get(0),
-            )?;
-
             let max_change_id = self
                 .conn
                 .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM changes")?
@@ -961,33 +1060,23 @@ impl Matcher {
 
             _ = self.last_change_tx.send(max_change_id);
 
-            Ok::<_, rusqlite::Error>(db_version)
+            Ok::<_, MatcherError>(())
         });
 
-        let db_version = match init_res {
-            Ok(v) => v,
-            Err(e) => {
-                error!("could not initialize subscription: {e}");
-                _ = self
-                    .evt_tx
-                    .send(QueryEvent::Error(
-                        format!("could not init restored subscription: {e}").into(),
-                    ))
-                    .await;
-                return;
-            }
-        };
+        if let Err(e) = init_res {
+            error!(sub_id = %self.id, "could not re-initialize subscription: {e}");
+        }
 
-        self.cmd_loop(state_conn, db_version, tripwire).await
+        self.cmd_loop(state_conn, write_sema, tripwire).await
     }
 
     async fn cmd_loop(
         mut self,
         mut state_conn: CrConn,
-        mut last_db_version: i64,
+        write_sema: Arc<Semaphore>,
         mut tripwire: Tripwire,
     ) {
-        trace!("in cmd_loop, last db version: {last_db_version}");
+        trace!("in cmd_loop");
         {
             let (lock, cvar) = &*self.state;
             let mut state = lock.lock();
@@ -996,40 +1085,57 @@ impl Matcher {
         }
         trace!("set state!");
 
-        if let Err(e) = state_conn.execute_batch(&format!(
-            "ATTACH DATABASE {} AS __corro_sub",
-            enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
-        )) {
-            error!("could not ATTACH sub db as __corro_sub on state db: {e}");
-            return;
-        }
+        {
+            // if this fails for any reason, something is very wrong
+            // let _permit = write_sema.clone().acquire_owned().await;
 
-        // initially check if we've missed versions!
-        let current_db_version = { *self.db_version_rx.borrow_and_update() };
-
-        if current_db_version > last_db_version {
-            if let Err(e) = block_in_place(|| {
-                self.handle_change(&mut state_conn, last_db_version, current_db_version)
-            }) {
-                if !matches!(e, MatcherError::EventReceiverClosed) {
-                    error!("could not handle change: {e}");
-                }
-                if let Err(e) =
-                    block_in_place(|| Self::cleanup(self.id, self.base_path.clone(), &state_conn))
-                {
-                    error!("could not handle cleanup: {e}");
-                }
+            info!(sub_id = %self.id, "Attaching __corro_sub to state db");
+            if let Err(e) = state_conn.execute_batch(&format!(
+                "ATTACH DATABASE {} AS __corro_sub",
+                enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
+            ))
+            // .and_then(|_| state_conn.execute_batch("PRAGMA __corro_sub.mmap_size = 536870912;"))
+            {
+                error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
                 return;
             }
 
-            last_db_version = current_db_version;
+            info!(sub_id = %self.id, "Attached __corro_sub to state db");
         }
+
+        let catch_up_res = block_in_place(|| {
+            let db_version: i64 =
+                state_conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+
+            let last_db_version: i64 = self.conn.query_row(
+                "SELECT value FROM meta WHERE key = 'db_version'",
+                (),
+                |row| row.get(0),
+            )?;
+
+            if last_db_version < db_version {
+                self.handle_change(&mut state_conn, last_db_version, db_version)?;
+            }
+
+            Ok::<_, MatcherError>(())
+        });
+
+        if let Err(e) = catch_up_res {
+            error!(sub_id = %self.id, "could not catch up: {e}");
+        }
+
+        let mut last_db_version = None;
+        let mut buf = MatchCandidates::new();
+        let mut buf_count = 0;
 
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
 
+        // max duration of aggregating candidates
+        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(400));
+
         loop {
             enum Branch {
-                NewDbVersion(i64),
+                NewCandidates((MatchCandidates, i64)),
                 PurgeOldChanges,
             }
 
@@ -1041,18 +1147,32 @@ impl Matcher {
                     info!(sub_id = %self.id, "Acknowledged subscription cancellation, breaking loop.");
                     break;
                 }
-                res = self.db_version_rx.changed() => match res {
-                    Ok(_) => {
-                        let new_db_version = *self.db_version_rx.borrow();
-                        if new_db_version <= last_db_version {
+                Some((candidates, db_version)) = self.changes_rx.recv() => {
+                    for (table, pks) in  candidates {
+                        let buffed = buf.entry(table).or_default();
+                        for pk in pks {
+                            if buffed.insert(pk) {
+                                buf_count += 1;
+                            }
+                        }
+                    }
+                    last_db_version = Some(db_version);
+
+                    if buf_count >= 200 {
+                        if let Some(db_version) = last_db_version.take() {
+                            Branch::NewCandidates((std::mem::take(&mut buf), db_version))
+                        } else {
                             continue;
                         }
-                        Branch::NewDbVersion(new_db_version) // no need to borrow_and_update
-                    },
-                    Err(_) => {
-                        trace!("db version rx is done");
-                        // just return!
-                        return;
+                    } else {
+                        continue;
+                    }
+                },
+                _ = process_changes_interval.tick() => {
+                    if let Some(db_version) = last_db_version.take(){
+                    Branch::NewCandidates((std::mem::take(&mut buf), db_version))
+                    } else {
+                        continue;
                     }
                 },
                 _ = &mut tripwire => {
@@ -1061,19 +1181,22 @@ impl Matcher {
                     return;
                 }
                 _ = purge_changes_interval.tick() => Branch::PurgeOldChanges,
+                else => {
+                    return;
+                }
             };
 
             match branch {
-                Branch::NewDbVersion(v) => {
-                    if let Err(e) =
-                        block_in_place(|| self.handle_change(&mut state_conn, last_db_version, v))
-                    {
+                Branch::NewCandidates((candidates, db_version)) => {
+                    if let Err(e) = block_in_place(|| {
+                        self.handle_candidates(&mut state_conn, candidates, db_version)
+                    }) {
                         if !matches!(e, MatcherError::EventReceiverClosed) {
                             error!("could not handle change: {e}");
                         }
                         break;
                     }
-                    last_db_version = v;
+                    buf_count = 0;
                 }
                 Branch::PurgeOldChanges => {
                     let res = block_in_place(|| {
@@ -1103,14 +1226,17 @@ impl Matcher {
 
         debug!(id = %self.id, "matcher loop is done");
 
-        if let Err(e) =
-            block_in_place(|| Self::cleanup(self.id, self.base_path.clone(), &state_conn))
-        {
+        if let Err(e) = Self::cleanup(
+            self.id,
+            self.base_path.clone(),
+            &state_conn,
+            Some(write_sema),
+        ) {
             error!("could not handle cleanup: {e}");
         }
     }
 
-    async fn run(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
+    async fn run(mut self, mut state_conn: CrConn, write_sema: Arc<Semaphore>, tripwire: Tripwire) {
         if let Err(e) = self
             .evt_tx
             .send(QueryEvent::Columns(self.col_names.clone()))
@@ -1148,10 +1274,11 @@ impl Matcher {
             // ensure drop and recreate
             tx.execute_batch(&format!(
                 "DROP TABLE IF EXISTS state_rows;
-                            CREATE TEMP TABLE state_rows ({})",
+                CREATE TEMP TABLE state_rows ({})",
                 tmp_cols.join(",")
             ))?;
 
+            info!(sub_id = %self.id, "Starting state conn read transaction for initial query");
             // this is read transaction up until the end!
             let state_tx = state_conn.transaction()?;
 
@@ -1224,32 +1351,32 @@ impl Matcher {
                 elapsed
             };
 
-            // insert the current db version
+            tx.execute_batch("DROP TABLE IF EXISTS state_rows;")?;
+
             let db_version: i64 =
                 state_tx.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
-            tx.execute(
-                "INSERT INTO meta (key, value) VALUES ('db_version', ?)",
-                [db_version],
-            )?;
-
-            tx.execute_batch("DROP TABLE IF EXISTS state_rows;")?;
+            update_last_db_version(&tx, db_version)?;
 
             tx.commit()?;
 
-            state_tx.execute(
-                "UPDATE __corro_subs SET state = 'running' WHERE id = ?",
-                [self.id],
-            )?;
+            {
+                let _permit = Handle::current().block_on(write_sema.clone().acquire_owned())?;
+                state_tx.execute(
+                    "UPDATE __corro_subs SET state = 'running' WHERE id = ?",
+                    [self.id],
+                )?;
 
-            state_tx.commit()?;
+                state_tx.commit()?;
+                info!(sub_id = %self.id, "Done with initial state conn transaction for query");
+            }
 
             self.last_rowid = last_rowid;
 
-            Ok::<_, MatcherError>((elapsed, db_version))
+            Ok::<_, MatcherError>(elapsed)
         });
 
-        let db_version = match res {
-            Ok((elapsed, db_version)) => {
+        match res {
+            Ok(elapsed) => {
                 trace!(
                     "done w/ block_in_place for initial query, elapsed: {:?}",
                     elapsed
@@ -1265,8 +1392,6 @@ impl Matcher {
                     error!("could not return end of query event: {e}");
                     return;
                 }
-                trace!("sent EOQ");
-                db_version
             }
             Err(e) => {
                 debug!("could not complete initial query: {e}");
@@ -1278,41 +1403,19 @@ impl Matcher {
             }
         };
 
-        self.cmd_loop(state_conn, db_version, tripwire).await
+        self.cmd_loop(state_conn, write_sema, tripwire).await
     }
 
-    fn handle_change(
+    fn handle_candidates(
         &mut self,
         state_conn: &mut Connection,
-        start_db_version: i64,
-        end_db_version: i64,
+        candidates: MatchCandidates,
+        last_db_version: i64,
     ) -> Result<(), MatcherError> {
-        debug!(sub_id = %self.id, "handling change from version {start_db_version} to {end_db_version}");
         let mut tables = IndexSet::new();
 
-        let mut candidates = MatchCandidates::new();
-        {
-            let mut changes_prepped = state_conn.prepare_cached(
-                r#"
-            SELECT DISTINCT "table", pk
-                FROM crsql_changes
-                    WHERE db_version > ?
-                      AND db_version <= ? -- TODO: allow going way over...
-                      AND ("table", cid) IN __corro_sub.columns -- only care about table/columns touched by the query
-                    GROUP BY "table", pk
-        "#,
-            )?;
-
-            let mut rows = changes_prepped.query([start_db_version, end_db_version])?;
-            while let Ok(Some(row)) = rows.next() {
-                candidates
-                    .entry(row.get(0)?)
-                    .or_default()
-                    .insert(row.get(1)?);
-            }
-        }
-
         if candidates.is_empty() {
+            update_last_db_version(&self.conn, last_db_version)?;
             return Ok(());
         }
 
@@ -1336,7 +1439,7 @@ impl Matcher {
                     // NOTE: this can't be an actual CREATE TEMP TABLE or it won't be visible
                     //       from the state db
                     &format!(
-                        "CREATE TABLE {tmp_table_name} ({})",
+                        "CREATE TABLE IF NOT EXISTS {tmp_table_name} ({})",
                         self.pks
                             .get(table.as_str())
                             .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
@@ -1380,8 +1483,7 @@ impl Matcher {
 
         // ensure drop and recreate
         tx.execute_batch(&format!(
-            "DROP TABLE IF EXISTS state_results;
-            CREATE TEMP TABLE state_results ({})",
+            "CREATE TEMP TABLE IF NOT EXISTS state_results ({})",
             tmp_cols.join(",")
         ))?;
 
@@ -1550,24 +1652,20 @@ impl Matcher {
             }
 
             // clean that up
-            tx.execute_batch("DROP TABLE state_results")?;
+            tx.execute_batch("DELETE FROM state_results")?;
 
             // clean up temporary tables immediately
             for table in tables {
                 // TODO: reduce mistakes by computing this table name once
-                tx.prepare_cached(&format!("DROP TABLE IF EXISTS temp_{table}",))?
+                tx.prepare_cached(&format!("DELETE FROM temp_{table}",))?
                     .execute(())?;
                 trace!("cleaned up temp_{table}");
             }
         }
 
-        // update the current db version processed
-        tx.execute(
-            "INSERT OR REPLACE INTO meta (key,value) VALUES ('db_version', ?)",
-            [end_db_version],
-        )?;
+        update_last_db_version(&tx, last_db_version)?;
 
-        trace!("inserted new db version: {end_db_version}");
+        trace!("inserted new db version: {last_db_version}");
 
         tx.commit()?;
 
@@ -1577,6 +1675,47 @@ impl Matcher {
 
         Ok(())
     }
+
+    fn handle_change(
+        &mut self,
+        state_conn: &mut Connection,
+        start_db_version: i64,
+        end_db_version: i64,
+    ) -> Result<(), MatcherError> {
+        debug!(sub_id = %self.id, "handling change from version {start_db_version} to {end_db_version}");
+
+        let mut candidates = MatchCandidates::new();
+        {
+            let mut changes_prepped = state_conn.prepare_cached(
+                r#"
+            SELECT DISTINCT "table", pk
+                FROM crsql_changes
+                    WHERE db_version > ?
+                      AND db_version <= ? -- TODO: allow going over?
+                      AND ("table", cid) IN __corro_sub.columns -- only care about table/columns touched by the query
+                    GROUP BY "table", pk
+        "#,
+            )?;
+
+            let mut rows = changes_prepped.query([start_db_version, end_db_version])?;
+            while let Ok(Some(row)) = rows.next() {
+                candidates
+                    .entry(row.get(0)?)
+                    .or_default()
+                    .insert(row.get(1)?);
+            }
+        }
+
+        self.handle_candidates(state_conn, candidates, end_db_version)
+    }
+}
+
+fn update_last_db_version(conn: &Connection, last_db_version: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key,value) VALUES ('db_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value WHERE excluded.value > value",
+        [last_db_version],
+    )?;
+    Ok(())
 }
 
 fn interrupt_deadline_guard(conn: &Connection, dur: Duration) -> DropGuard {
@@ -2025,6 +2164,8 @@ pub enum MatcherError {
     QueueFull,
     #[error("cannot restore existing subscription")]
     CannotRestoreExisting,
+    #[error("could not acquire write permit")]
+    WritePermitAcquire(#[from] AcquireError),
 }
 
 impl MatcherError {
@@ -2044,6 +2185,7 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use crate::{
+        actor::ActorId,
         agent::migrate,
         schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
@@ -2077,14 +2219,12 @@ mod tests {
             tx.commit()?;
         }
 
-        let (_tx_db_version, rx_db_version) = watch::channel(0);
-
         let (handle, maybe_created) = subs.get_or_insert(
             sql,
             subscriptions_path.as_path(),
             &schema,
             &pool,
-            rx_db_version,
+            Arc::new(Semaphore::new(1)),
             tripwire.clone(),
         )?;
 
@@ -2179,6 +2319,8 @@ mod tests {
               PRIMARY KEY (machine_id, id)
           );
           ";
+
+        let write_sema = Arc::new(Semaphore::new(1));
 
         let mut schema = parse_sql(schema_sql).unwrap();
         let subs = SubsManager::default();
@@ -2287,7 +2429,7 @@ mod tests {
         let mut last_change_id = None;
 
         let id = {
-            let (db_v_tx, db_v_rx) = watch::channel(0);
+            // let (db_v_tx, db_v_rx) = watch::channel(0);
 
             let (matcher, maybe_created) = subs
                 .get_or_insert(
@@ -2295,7 +2437,7 @@ mod tests {
                     subscriptions_path.as_path(),
                     &schema,
                     &pool,
-                    db_v_rx,
+                    write_sema.clone(),
                     tripwire.clone(),
                 )
                 .unwrap();
@@ -2333,12 +2475,7 @@ mod tests {
             }
 
             println!("processing change...");
-            db_v_tx
-                .send(
-                    conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))
-                        .unwrap(),
-                )
-                .unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 2).unwrap();
             println!("processed changes");
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
@@ -2359,11 +2496,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            let db_v = conn
-                .query_row("SELECT crsql_db_version()", [], |row| row.get(0))
-                .unwrap();
-            println!("changing to db version: {db_v}, expecting delete");
-            db_v_tx.send(db_v).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 3).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
@@ -2386,11 +2519,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            let db_version = conn
-                .query_row("SELECT crsql_db_version()", [], |row| row.get(0))
-                .unwrap();
-
-            db_v_tx.send(db_version).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 4).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
@@ -2404,7 +2533,7 @@ mod tests {
             println!("got change (B)");
 
             // process the same and check that it doesn't produce a change again!
-            db_v_tx.send(db_version).unwrap();
+            // db_v_tx.send(db_version).unwrap();
 
             assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
 
@@ -2449,12 +2578,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            db_v_tx
-                .send(
-                    conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))
-                        .unwrap(),
-                )
-                .unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 5).unwrap();
 
             let start = Instant::now();
             for _ in range {
@@ -2516,13 +2640,6 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let (db_v_tx, db_v_rx) = watch::channel(0);
-        let db_v = conn
-            .query_row("SELECT crsql_db_version()", [], |row| row.get(0))
-            .unwrap();
-        println!("changing to db version: {db_v}, expecting delete");
-        db_v_tx.send(db_v).unwrap();
-
         {
             let (matcher, created) = subs
                 .restore(
@@ -2531,7 +2648,7 @@ mod tests {
                     &subscriptions_path,
                     &schema,
                     &pool,
-                    db_v_rx,
+                    write_sema.clone(),
                     tripwire.clone(),
                 )
                 .unwrap();
@@ -2595,5 +2712,29 @@ mod tests {
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
+    }
+
+    fn filter_changes_from_db(
+        matcher: &MatcherHandle,
+        state_conn: &Connection,
+        actor_id: Option<ActorId>,
+        db_version: i64,
+    ) -> rusqlite::Result<()> {
+        let mut candidates = MatchCandidates::new();
+
+        let mut prepped = state_conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl FROM crsql_changes WHERE site_id IS ? AND db_version = ? ORDER BY seq ASC"#)?;
+        let rows = prepped
+            .query_map(params![actor_id, db_version], row_to_change)
+            .unwrap();
+
+        for row in rows {
+            let change = row?;
+            matcher.filter_matchable_change(&mut candidates, (&change).into());
+        }
+
+        if let Err(e) = matcher.inner.changes_tx.try_send((candidates, db_version)) {
+            error!(sub_id = %matcher.inner.id, "could not send candidates to matcher: {e}");
+        }
+        Ok(())
     }
 }

@@ -34,12 +34,13 @@ pub struct SubParams {
 }
 
 pub async fn api_v1_sub_by_id(
-    Extension(subs): Extension<SubsManager>,
+    Extension(agent): Extension<Agent>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
+    Extension(tripwire): Extension<Tripwire>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
-    sub_by_id(&subs, id, params, &bcast_cache).await
+    sub_by_id(agent.subs_manager(), id, params, &bcast_cache, tripwire).await
 }
 
 async fn sub_by_id(
@@ -47,6 +48,7 @@ async fn sub_by_id(
     id: Uuid,
     params: SubParams,
     bcast_cache: &SharedMatcherBroadcastCache,
+    tripwire: Tripwire,
 ) -> hyper::Response<hyper::Body> {
     let (matcher, rx) = match bcast_cache.read().await.get(&id).and_then(|tx| {
         subs.get(&id).map(|matcher| {
@@ -82,7 +84,7 @@ async fn sub_by_id(
 
     let (tx, body) = hyper::Body::channel();
 
-    tokio::spawn(forward_bytes_to_body_sender(id, evt_rx, tx));
+    tokio::spawn(forward_bytes_to_body_sender(id, evt_rx, tx, tripwire));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -108,7 +110,7 @@ fn make_query_event_bytes(
     Ok((buf.split().freeze(), query_evt.meta()))
 }
 
-const MAX_UNSUB_TIME: Duration = Duration::from_secs(300);
+const MAX_UNSUB_TIME: Duration = Duration::from_secs(120);
 // this should be a fraction of the MAX_UNSUB_TIME
 const RECEIVERS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -627,7 +629,6 @@ pub async fn upsert_sub(
 
 pub async fn api_v1_subs(
     Extension(agent): Extension<Agent>,
-    Extension(subs): Extension<SubsManager>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
     Extension(tripwire): Extension<Tripwire>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
@@ -638,15 +639,19 @@ pub async fn api_v1_subs(
         Err(e) => return hyper::Response::<hyper::Body>::from(e),
     };
 
+    info!("Received subscription request for query: {stmt}");
+
     let mut bcast_write = bcast_cache.write().await;
+
+    let subs = agent.subs_manager();
 
     let upsert_res = subs.get_or_insert(
         &stmt,
         &agent.config().db.subscriptions_path(),
         &agent.schema().read(),
         agent.pool(),
-        agent.rx_db_version(),
-        tripwire,
+        agent.write_sema().clone(),
+        tripwire.clone(),
     );
 
     let (handle, maybe_created) = match upsert_res {
@@ -657,12 +662,17 @@ pub async fn api_v1_subs(
     let (tx, body) = hyper::Body::channel();
     let (forward_tx, forward_rx) = mpsc::channel(10240);
 
-    tokio::spawn(forward_bytes_to_body_sender(handle.id(), forward_rx, tx));
+    tokio::spawn(forward_bytes_to_body_sender(
+        handle.id(),
+        forward_rx,
+        tx,
+        tripwire,
+    ));
 
     let matcher_id = match upsert_sub(
         handle,
         maybe_created,
-        &subs,
+        subs,
         &mut bcast_write,
         params,
         forward_tx,
@@ -701,6 +711,7 @@ async fn forward_bytes_to_body_sender(
     sub_id: Uuid,
     mut rx: mpsc::Receiver<(Bytes, QueryEventMeta)>,
     mut tx: hyper::body::Sender,
+    mut tripwire: Tripwire,
 ) {
     let mut buf = BytesMut::new();
 
@@ -748,6 +759,9 @@ async fn forward_bytes_to_body_sender(
                     continue;
                 }
             },
+            _ = &mut tripwire => {
+                break;
+            }
             else => break,
         };
 
@@ -758,7 +772,7 @@ async fn forward_bytes_to_body_sender(
     }
     if !buf.is_empty() {
         if let Err(e) = tx.send_data(buf.freeze()).await {
-            warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
+            warn!(%sub_id, "could not forward last subscription query event to receiver: {e}");
         }
     }
 }
@@ -826,13 +840,11 @@ mod tests {
 
         assert!(body.0.results.len() == 2);
 
-        let subs = SubsManager::default();
         let bcast_cache: SharedMatcherBroadcastCache = Default::default();
 
         {
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
                 axum::extract::Query(SubParams::default()),
@@ -922,7 +934,6 @@ mod tests {
 
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
                 axum::extract::Query(SubParams {
@@ -984,7 +995,6 @@ mod tests {
 
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
-                Extension(subs.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
                 axum::extract::Query(SubParams::default()),
@@ -1054,7 +1064,6 @@ mod tests {
 
         let mut res = api_v1_subs(
             Extension(agent.clone()),
-            Extension(subs.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
             axum::extract::Query(SubParams {
@@ -1104,7 +1113,6 @@ mod tests {
 
         let mut res = api_v1_subs(
             Extension(agent.clone()),
-            Extension(subs.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
             axum::extract::Query(SubParams {
@@ -1155,7 +1163,6 @@ mod tests {
 
         let mut res = api_v1_subs(
             Extension(agent.clone()),
-            Extension(subs.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
             axum::extract::Query(SubParams {
