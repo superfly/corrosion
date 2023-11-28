@@ -637,6 +637,8 @@ pub async fn api_v1_subs(
         Err(e) => return hyper::Response::<hyper::Body>::from(e),
     };
 
+    info!("Received subscription request for query: {stmt}");
+
     let mut bcast_write = bcast_cache.write().await;
 
     let subs = agent.subs_manager();
