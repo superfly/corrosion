@@ -295,6 +295,7 @@ impl SubsManager {
         let handle = match handle_res {
             Ok(handle) => handle,
             Err(e) => {
+                error!(sub_id = %id, "could not create subscription: {e}");
                 let conn = pool.client_dedicated()?;
                 if let Err(e) = Matcher::cleanup(
                     id,
@@ -1285,89 +1286,91 @@ impl Matcher {
             ))?;
 
             info!(sub_id = %self.id, "Starting state conn read transaction for initial query");
-            // this is read transaction up until the end!
-            let state_tx = state_conn.transaction()?;
 
             let elapsed = {
-                debug!("select stmt: {stmt_str:?}");
-
-                let mut select = state_tx.prepare(&stmt_str)?;
-                let start = Instant::now();
-                let mut select_rows = {
-                    let _guard = interrupt_deadline_guard(&state_tx, Duration::from_secs(15));
-                    select.query(())?
-                };
-                let elapsed = start.elapsed();
-
-                let insert_into = format!(
-                    "INSERT INTO query ({}) VALUES ({}) RETURNING __corro_rowid,{}",
-                    tmp_cols.join(","),
-                    tmp_cols
-                        .iter()
-                        .map(|_| "?".to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    query_cols.join(","),
-                );
-                trace!("insert stmt: {insert_into:?}");
-
-                let mut insert = tx.prepare(&insert_into)?;
-
-                loop {
-                    match select_rows.next() {
-                        Ok(Some(row)) => {
-                            for i in 0..tmp_cols.len() {
-                                insert.raw_bind_parameter(
-                                    i + 1,
-                                    SqliteValueRef::from(row.get_ref(i)?),
-                                )?;
-                            }
-
-                            let mut rows = insert.raw_query();
-
-                            let row = match rows.next()? {
-                                Some(row) => row,
-                                None => continue,
-                            };
-
-                            let rowid = row.get(0)?;
-                            let cells = (1..=query_cols.len())
-                                .map(|i| row.get::<_, SqliteValue>(i))
-                                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-                            if let Err(e) = self
-                                .evt_tx
-                                .blocking_send(QueryEvent::Row(RowId(rowid), cells))
-                            {
-                                error!("could not send back row: {e}");
-                                return Err(MatcherError::EventReceiverClosed);
-                            }
-
-                            last_rowid = cmp::max(rowid, last_rowid);
-                        }
-                        Ok(None) => {
-                            // done!
-                            break;
-                        }
-                        Err(e) => {
-                            return Err(e.into());
-                        }
-                    }
-                }
-                elapsed
-            };
-
-            tx.execute_batch("DROP TABLE IF EXISTS state_rows;")?;
-
-            let db_version: i64 =
-                state_tx.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
-            update_last_db_version(&tx, db_version)?;
-
-            tx.commit()?;
-
-            {
                 info!(sub_id = %self.id, "Acquiring permit to update __corro_subs state");
                 let _permit = Handle::current().block_on(write_sema.clone().acquire_owned())?;
+
+                // this is read transaction up until the end!
+                let state_tx = state_conn.transaction()?;
+
+                let elapsed = {
+                    debug!("select stmt: {stmt_str:?}");
+
+                    let mut select = state_tx.prepare(&stmt_str)?;
+                    let start = Instant::now();
+                    let mut select_rows = {
+                        let _guard = interrupt_deadline_guard(&state_tx, Duration::from_secs(15));
+                        select.query(())?
+                    };
+                    let elapsed = start.elapsed();
+
+                    let insert_into = format!(
+                        "INSERT INTO query ({}) VALUES ({}) RETURNING __corro_rowid,{}",
+                        tmp_cols.join(","),
+                        tmp_cols
+                            .iter()
+                            .map(|_| "?".to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        query_cols.join(","),
+                    );
+                    trace!("insert stmt: {insert_into:?}");
+
+                    let mut insert = tx.prepare(&insert_into)?;
+
+                    loop {
+                        match select_rows.next() {
+                            Ok(Some(row)) => {
+                                for i in 0..tmp_cols.len() {
+                                    insert.raw_bind_parameter(
+                                        i + 1,
+                                        SqliteValueRef::from(row.get_ref(i)?),
+                                    )?;
+                                }
+
+                                let mut rows = insert.raw_query();
+
+                                let row = match rows.next()? {
+                                    Some(row) => row,
+                                    None => continue,
+                                };
+
+                                let rowid = row.get(0)?;
+                                let cells = (1..=query_cols.len())
+                                    .map(|i| row.get::<_, SqliteValue>(i))
+                                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                                if let Err(e) = self
+                                    .evt_tx
+                                    .blocking_send(QueryEvent::Row(RowId(rowid), cells))
+                                {
+                                    error!("could not send back row: {e}");
+                                    return Err(MatcherError::EventReceiverClosed);
+                                }
+
+                                last_rowid = cmp::max(rowid, last_rowid);
+                            }
+                            Ok(None) => {
+                                // done!
+                                break;
+                            }
+                            Err(e) => {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                    elapsed
+                };
+
+                tx.execute_batch("DROP TABLE IF EXISTS state_rows;")?;
+
+                let db_version: i64 =
+                    state_tx.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
+                update_last_db_version(&tx, db_version)?;
+
+                tx.commit()?;
+
                 state_tx.execute(
                     "UPDATE __corro_subs SET state = 'running' WHERE id = ?",
                     [self.id],
@@ -1375,7 +1378,9 @@ impl Matcher {
 
                 state_tx.commit()?;
                 info!(sub_id = %self.id, "Done with initial state conn transaction for query");
-            }
+
+                elapsed
+            };
 
             self.last_rowid = last_rowid;
 
