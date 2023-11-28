@@ -1073,13 +1073,17 @@ impl Matcher {
             // let _permit = write_sema.clone().acquire_owned().await;
 
             info!(sub_id = %self.id, "Attaching __corro_sub to state db");
-            if let Err(e) = state_conn.execute_batch(&format!(
-                "ATTACH DATABASE {} AS __corro_sub",
-                enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
-            )) {
+            if let Err(e) = state_conn
+                .execute_batch(&format!(
+                    "ATTACH DATABASE {} AS __corro_sub",
+                    enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
+                ))
+                .and_then(|_| state_conn.execute_batch("PRAGMA __corro_sub.mmap_size = 536870912;"))
+            {
                 error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
                 return;
             }
+
             info!(sub_id = %self.id, "Attached __corro_sub to state db");
         }
 
