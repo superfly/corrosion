@@ -281,16 +281,30 @@ impl SubsManager {
         let id = Uuid::new_v4();
         let (evt_tx, evt_rx) = mpsc::channel(SUB_EVENT_CHANNEL_CAP);
 
-        let handle = Matcher::create(
+        let handle_res = Matcher::create(
             id,
             subs_path.to_path_buf(),
             schema,
             pool.client_dedicated()?,
             evt_tx,
             sql,
-            write_sema,
+            write_sema.clone(),
             tripwire,
-        )?;
+        );
+
+        let handle = match handle_res {
+            Ok(handle) => handle,
+            Err(e) => {
+                let conn = pool.client_dedicated()?;
+                if let Err(e) =
+                    Matcher::cleanup(id, subs_path.join(id.to_string()), &conn, Some(write_sema))
+                {
+                    error!("could not cleanup subscription: {e}");
+                }
+
+                return Err(e);
+            }
+        };
 
         inner.handles.insert(id, handle.clone());
         inner.queries.insert(sql.to_owned(), id);
@@ -684,7 +698,7 @@ impl Matcher {
             r#"
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
-                PRAGMA mmap_size = 536870912;
+                -- PRAGMA mmap_size = 536870912;
                 PRAGMA temp_store = memory;
             "#,
         )?;
@@ -1073,12 +1087,11 @@ impl Matcher {
             // let _permit = write_sema.clone().acquire_owned().await;
 
             info!(sub_id = %self.id, "Attaching __corro_sub to state db");
-            if let Err(e) = state_conn
-                .execute_batch(&format!(
-                    "ATTACH DATABASE {} AS __corro_sub",
-                    enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
-                ))
-                .and_then(|_| state_conn.execute_batch("PRAGMA __corro_sub.mmap_size = 536870912;"))
+            if let Err(e) = state_conn.execute_batch(&format!(
+                "ATTACH DATABASE {} AS __corro_sub",
+                enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
+            ))
+            // .and_then(|_| state_conn.execute_batch("PRAGMA __corro_sub.mmap_size = 536870912;"))
             {
                 error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
                 return;
