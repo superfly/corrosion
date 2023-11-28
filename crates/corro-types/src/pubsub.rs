@@ -684,6 +684,8 @@ impl Matcher {
             r#"
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
+                PRAGMA mmap_size = 536870912;
+                PRAGMA temp_store = memory;
             "#,
         )?;
 
