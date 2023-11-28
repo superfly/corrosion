@@ -36,10 +36,11 @@ pub struct SubParams {
 pub async fn api_v1_sub_by_id(
     Extension(agent): Extension<Agent>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
+    Extension(tripwire): Extension<Tripwire>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
-    sub_by_id(agent.subs_manager(), id, params, &bcast_cache).await
+    sub_by_id(agent.subs_manager(), id, params, &bcast_cache, tripwire).await
 }
 
 async fn sub_by_id(
@@ -47,6 +48,7 @@ async fn sub_by_id(
     id: Uuid,
     params: SubParams,
     bcast_cache: &SharedMatcherBroadcastCache,
+    tripwire: Tripwire,
 ) -> hyper::Response<hyper::Body> {
     let (matcher, rx) = match bcast_cache.read().await.get(&id).and_then(|tx| {
         subs.get(&id).map(|matcher| {
@@ -82,7 +84,7 @@ async fn sub_by_id(
 
     let (tx, body) = hyper::Body::channel();
 
-    tokio::spawn(forward_bytes_to_body_sender(id, evt_rx, tx));
+    tokio::spawn(forward_bytes_to_body_sender(id, evt_rx, tx, tripwire));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -649,7 +651,7 @@ pub async fn api_v1_subs(
         &agent.schema().read(),
         agent.pool(),
         agent.write_sema().clone(),
-        tripwire,
+        tripwire.clone(),
     );
 
     let (handle, maybe_created) = match upsert_res {
@@ -660,7 +662,12 @@ pub async fn api_v1_subs(
     let (tx, body) = hyper::Body::channel();
     let (forward_tx, forward_rx) = mpsc::channel(10240);
 
-    tokio::spawn(forward_bytes_to_body_sender(handle.id(), forward_rx, tx));
+    tokio::spawn(forward_bytes_to_body_sender(
+        handle.id(),
+        forward_rx,
+        tx,
+        tripwire,
+    ));
 
     let matcher_id = match upsert_sub(
         handle,
@@ -704,6 +711,7 @@ async fn forward_bytes_to_body_sender(
     sub_id: Uuid,
     mut rx: mpsc::Receiver<(Bytes, QueryEventMeta)>,
     mut tx: hyper::body::Sender,
+    mut tripwire: Tripwire,
 ) {
     let mut buf = BytesMut::new();
 
@@ -751,6 +759,9 @@ async fn forward_bytes_to_body_sender(
                     continue;
                 }
             },
+            _ = &mut tripwire => {
+                break;
+            }
             else => break,
         };
 
