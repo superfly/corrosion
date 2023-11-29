@@ -145,8 +145,14 @@ pub async fn process_sub_channel(
             biased;
             Some(query_evt) = evt_rx.recv() => query_evt,
             _ = deadline_check => {
-                info!(sub_id = %id, "All listeners for subscription are gone and didn't come back within {MAX_UNSUB_TIME:?}");
-                break;
+                if tx.receiver_count() == 0 {
+                    info!(sub_id = %id, "All listeners for subscription are gone and didn't come back within {MAX_UNSUB_TIME:?}");
+                    break;
+                }
+
+                // reset the deadline if there are receivers!
+                deadline = None;
+                continue;
             },
             _ = subs_check.tick() => {
                 if tx.receiver_count() == 0 {
