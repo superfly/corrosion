@@ -372,8 +372,19 @@ impl SubsManager {
 
             if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
                 error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
-                if let Some(handle) = self.remove(id) {
-                    tokio::spawn(handle.cleanup());
+                match e {
+                    mpsc::error::TrySendError::Full(item) => {
+                        warn!("channel is full, falling back to async send");
+                        let changes_tx = handle.inner.changes_tx.clone();
+                        tokio::spawn(async move {
+                            _ = changes_tx.send(item).await;
+                        });
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        if let Some(handle) = self.remove(id) {
+                            tokio::spawn(handle.cleanup());
+                        }
+                    }
                 }
             }
         }
@@ -1019,7 +1030,7 @@ impl Matcher {
         Ok(handle)
     }
 
-    async fn run_restore(mut self, state_conn: CrConn, tripwire: Tripwire) {
+    async fn run_restore(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
         info!(sub_id = %self.id, "Restoring subscription");
         let init_res = block_in_place(|| {
             self.last_rowid = self
@@ -1044,36 +1055,12 @@ impl Matcher {
 
         if let Err(e) = init_res {
             error!(sub_id = %self.id, "could not re-initialize subscription: {e}");
+            return;
         }
 
-        self.cmd_loop(state_conn, tripwire).await
-    }
-
-    async fn cmd_loop(mut self, mut state_conn: CrConn, mut tripwire: Tripwire) {
-        info!(sub_id = %self.id, "Starting loop to run the subscription");
-        {
-            let (lock, cvar) = &*self.state;
-            let mut state = lock.lock();
-            *state = MatcherState::Running;
-            cvar.notify_all();
-            info!(sub_id = %self.id, "Notified condvar that the subscription is 'running'");
-        }
-        trace!("set state!");
-
-        {
-            info!(sub_id = %self.id, "Attaching __corro_sub to state db");
-            if let Err(e) = state_conn.execute_batch(&format!(
-                "ATTACH DATABASE {} AS __corro_sub",
-                enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
-            )) {
-                error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
-                _ = self.evt_tx.try_send(QueryEvent::Error(format_compact!(
-                    "could not ATTACH subscription db: {e}"
-                )));
-                return;
-            }
-
-            info!(sub_id = %self.id, "Attached __corro_sub to state db");
+        if let Err(e) = block_in_place(|| self.setup(&state_conn)) {
+            error!(sub_id = %self.id, "could not setup connection: {e}");
+            return;
         }
 
         let catch_up_res = block_in_place(|| {
@@ -1095,7 +1082,42 @@ impl Matcher {
 
         if let Err(e) = catch_up_res {
             error!(sub_id = %self.id, "could not catch up: {e}");
+            _ = self
+                .evt_tx
+                .try_send(QueryEvent::Error(e.to_compact_string()));
+            return;
         }
+
+        self.cmd_loop(state_conn, tripwire).await
+    }
+
+    fn setup(&self, state_conn: &Connection) -> rusqlite::Result<()> {
+        info!(sub_id = %self.id, "Attaching __corro_sub to state db");
+        if let Err(e) = state_conn.execute_batch(&format!(
+            "ATTACH DATABASE {} AS __corro_sub",
+            enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
+        )) {
+            error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
+            _ = self.evt_tx.try_send(QueryEvent::Error(format_compact!(
+                "could not ATTACH subscription db: {e}"
+            )));
+            return Err(e);
+        }
+
+        info!(sub_id = %self.id, "Attached __corro_sub to state db");
+        Ok(())
+    }
+
+    async fn cmd_loop(mut self, mut state_conn: CrConn, mut tripwire: Tripwire) {
+        info!(sub_id = %self.id, "Starting loop to run the subscription");
+        {
+            let (lock, cvar) = &*self.state;
+            let mut state = lock.lock();
+            *state = MatcherState::Running;
+            cvar.notify_all();
+            info!(sub_id = %self.id, "Notified condvar that the subscription is 'running'");
+        }
+        trace!("set state!");
 
         let mut last_db_version = None;
         let mut buf = MatchCandidates::new();
@@ -1220,6 +1242,11 @@ impl Matcher {
             query_cols.push(format!("col_{i}"));
         }
 
+        let mut first_buffered_db_version = None;
+
+        let mut candidates = MatchCandidates::new();
+        let mut last_db_version = None;
+
         let res = block_in_place(|| {
             let tx = self.conn.transaction()?;
 
@@ -1317,6 +1344,17 @@ impl Matcher {
                                 return Err(e.into());
                             }
                         }
+
+                        // drain this channel so it doesn't fill up
+                        while let Ok((new_candidates, db_version)) = self.changes_rx.try_recv() {
+                            last_db_version = Some(db_version);
+                            if first_buffered_db_version.is_none() {
+                                first_buffered_db_version = Some(db_version);
+                            }
+                            for (table, pks) in new_candidates {
+                                candidates.entry(table).or_default().extend(pks);
+                            }
+                        }
                     }
                 }
 
@@ -1333,7 +1371,7 @@ impl Matcher {
 
                 tx.commit()?;
 
-                elapsed
+                (elapsed, db_version)
             };
 
             self.last_rowid = last_rowid;
@@ -1341,8 +1379,8 @@ impl Matcher {
             Ok::<_, MatcherError>(elapsed)
         });
 
-        match res {
-            Ok(elapsed) => {
+        let db_version = match res {
+            Ok((elapsed, db_version)) => {
                 trace!(
                     "done w/ block_in_place for initial query, elapsed: {:?}",
                     elapsed
@@ -1358,6 +1396,7 @@ impl Matcher {
                     error!("could not return end of query event: {e}");
                     return;
                 }
+                db_version
             }
             Err(e) => {
                 debug!("could not complete initial query: {e}");
@@ -1368,6 +1407,36 @@ impl Matcher {
                 return;
             }
         };
+
+        if let Err(e) = block_in_place(|| self.setup(&state_conn)) {
+            error!(sub_id = %self.id, "could not setup connection: {e}");
+            return;
+        }
+
+        if let Some(first_db_version) = first_buffered_db_version {
+            if db_version < first_db_version {
+                if let Err(e) = block_in_place(|| {
+                    self.handle_change(&mut state_conn, db_version + 1, first_db_version - 1)
+                }) {
+                    error!("could not catch up from last db version {db_version} to first buffered db version {first_db_version}: {e}");
+                    _ = self
+                        .evt_tx
+                        .try_send(QueryEvent::Error(e.to_compact_string()));
+                    return;
+                }
+            }
+            if let Some(last_db_version) = last_db_version {
+                if let Err(e) = block_in_place(|| {
+                    self.handle_candidates(&mut state_conn, candidates, last_db_version)
+                }) {
+                    error!("could not catch up from buffered candidates: {e}");
+                    _ = self
+                        .evt_tx
+                        .try_send(QueryEvent::Error(e.to_compact_string()));
+                    return;
+                }
+            }
+        }
 
         self.cmd_loop(state_conn, tripwire).await
     }
