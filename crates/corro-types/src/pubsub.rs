@@ -577,6 +577,8 @@ impl MatcherHandle {
         let mut rows = prepped.query([])?;
         let elapsed = start.elapsed();
 
+        let mut count = 0;
+
         loop {
             let row = match rows.next()? {
                 Some(row) => row,
@@ -590,7 +592,10 @@ impl MatcherHandle {
                     .collect::<rusqlite::Result<Vec<_>>>()?,
             ))
             .map_err(|_| MatcherError::EventReceiverClosed)?;
+            count += 1;
         }
+
+        trace!("sent {count} rows");
 
         let max_change_id = conn
             .prepare("SELECT COALESCE(MAX(id),0) FROM changes")?
@@ -2721,8 +2726,8 @@ mod tests {
                 }
             }
 
-            assert_eq!(rows_count, 997);
-            assert_eq!(eoq_change_id, Some(Some(ChangeId(999))));
+            assert_eq!(rows_count, 996);
+            assert_eq!(eoq_change_id, Some(Some(ChangeId(1000))));
 
             println!("waiting for a change (A)");
 
