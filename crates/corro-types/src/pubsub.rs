@@ -7,7 +7,7 @@ use std::{
 
 use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
-use compact_str::ToCompactString;
+use compact_str::{format_compact, ToCompactString};
 use corro_api_types::{
     Change, ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
@@ -371,8 +371,10 @@ impl SubsManager {
             trace!(sub_id = %id, db_version, "found {} candidates", candidates.values().map(|pks| pks.len()).sum::<usize>());
 
             if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
-                // TODO: log UUID
                 error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
+                if let Some(_handle) = self.remove(&id) {
+                    // TODO: run Matcher::cleanup (need sub_path)
+                }
             }
         }
     }
@@ -1063,10 +1065,11 @@ impl Matcher {
             if let Err(e) = state_conn.execute_batch(&format!(
                 "ATTACH DATABASE {} AS __corro_sub",
                 enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
-            ))
-            // .and_then(|_| state_conn.execute_batch("PRAGMA __corro_sub.mmap_size = 536870912;"))
-            {
+            )) {
                 error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
+                _ = self.evt_tx.try_send(QueryEvent::Error(format_compact!(
+                    "could not ATTACH subscription db: {e}"
+                )));
                 return;
             }
 
@@ -1140,7 +1143,7 @@ impl Matcher {
                 },
                 _ = process_changes_interval.tick() => {
                     if let Some(db_version) = last_db_version.take(){
-                    Branch::NewCandidates((std::mem::take(&mut buf), db_version))
+                        Branch::NewCandidates((std::mem::take(&mut buf), db_version))
                     } else {
                         continue;
                     }
