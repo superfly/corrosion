@@ -372,8 +372,8 @@ impl SubsManager {
 
             if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
                 error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
-                if let Some(_handle) = self.remove(&id) {
-                    // TODO: run Matcher::cleanup (need sub_path)
+                if let Some(handle) = self.remove(id) {
+                    tokio::spawn(handle.cleanup());
                 }
             }
         }
