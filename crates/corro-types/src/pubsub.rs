@@ -805,23 +805,24 @@ impl Matcher {
                 tmp_cols.push(format!("col_{i}"));
             }
 
-            let pk_cols = pks
-                .get(tbl_name)
-                .cloned()
-                .ok_or(MatcherError::MissingPrimaryKeys)?
-                .to_vec()
-                .join(",");
+            let temp_query = format!(
+                "SELECT {} FROM query WHERE ({}) IN temp_{}",
+                tmp_cols.join(","),
+                pks.get(tbl_name)
+                    .cloned()
+                    .ok_or(MatcherError::MissingPrimaryKeys)?
+                    .to_vec()
+                    .join(","),
+                tbl_name,
+            );
+
+            info!(sub_id = %id, "modified query for table '{tbl_name}': {new_query}");
 
             statements.insert(
                 tbl_name.clone(),
                 MatcherStmt {
                     new_query,
-                    temp_query: format!(
-                        "SELECT {} FROM query WHERE ({}) IN temp_{}",
-                        tmp_cols.join(","),
-                        pk_cols,
-                        tbl_name,
-                    ),
+                    temp_query,
                 },
             );
         }
