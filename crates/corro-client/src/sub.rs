@@ -8,10 +8,11 @@ use std::{
 };
 
 use bytes::{Buf, Bytes, BytesMut};
-use corro_api_types::{ChangeId, QueryEvent};
+use corro_api_types::ChangeId;
 use futures::{ready, Future, Stream};
 use hyper::{client::HttpConnector, Body};
 use pin_project_lite::pin_project;
+use serde::de::DeserializeOwned;
 use tokio::time::{sleep, Sleep};
 use tokio_util::{
     codec::{Decoder, FramedRead, LinesCodecError},
@@ -19,6 +20,8 @@ use tokio_util::{
 };
 use tracing::error;
 use uuid::Uuid;
+
+use super::QueryEvent;
 
 pin_project! {
     pub struct IoBodyStream {
@@ -53,7 +56,7 @@ impl Stream for IoBodyStream {
 type IoBodyStreamReader = StreamReader<IoBodyStream, Bytes>;
 type FramedBody = FramedRead<IoBodyStreamReader, LinesBytesCodec>;
 
-pub struct SubscriptionStream {
+pub struct SubscriptionStream<T> {
     id: Uuid,
     client: hyper::Client<HttpConnector, Body>,
     api_addr: SocketAddr,
@@ -63,6 +66,7 @@ pub struct SubscriptionStream {
     backoff: Option<Pin<Box<Sleep>>>,
     backoff_count: u32,
     response: Option<hyper::client::ResponseFuture>,
+    _deser: std::marker::PhantomData<T>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -83,7 +87,10 @@ pub enum SubscriptionError {
     MaxRetryAttempts,
 }
 
-impl SubscriptionStream {
+impl<T> SubscriptionStream<T>
+where
+    T: DeserializeOwned + Unpin,
+{
     pub fn new(
         id: Uuid,
         client: hyper::Client<HttpConnector, Body>,
@@ -103,6 +110,7 @@ impl SubscriptionStream {
             backoff: None,
             backoff_count: 0,
             response: None,
+            _deser: Default::default(),
         }
     }
 
@@ -113,7 +121,7 @@ impl SubscriptionStream {
     fn poll_stream(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<QueryEvent, SubscriptionError>>> {
+    ) -> Poll<Option<Result<QueryEvent<T>, SubscriptionError>>> {
         let stream = loop {
             match self.stream.as_mut() {
                 None => match ready!(self.as_mut().poll_request(cx)) {
@@ -208,8 +216,11 @@ impl SubscriptionStream {
     }
 }
 
-impl Stream for SubscriptionStream {
-    type Item = Result<QueryEvent, SubscriptionError>;
+impl<T> Stream for SubscriptionStream<T>
+where
+    T: DeserializeOwned + Unpin,
+{
+    type Item = Result<QueryEvent<T>, SubscriptionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // first, check if we need to wait for a backoff...

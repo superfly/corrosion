@@ -2,12 +2,31 @@ pub mod sub;
 
 use std::{net::SocketAddr, ops::Deref, path::Path};
 
-use corro_api_types::{ChangeId, ExecResponse, ExecResult, Statement};
+use corro_api_types::{
+    sqlite::ChangeType, ChangeId, ColumnName, ExecResponse, ExecResult, RowId, SqliteValue,
+    Statement,
+};
 use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sub::SubscriptionStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryEvent<T> {
+    Columns(Vec<ColumnName>),
+    Row(RowId, T),
+    #[serde(rename = "eoq")]
+    EndOfQuery {
+        time: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        change_id: Option<ChangeId>,
+    },
+    Change(ChangeType, RowId, T, ChangeId),
+    Error(String),
+}
 
 #[derive(Clone)]
 pub struct CorrosionApiClient {
@@ -62,12 +81,12 @@ impl CorrosionApiClient {
         Ok(res.into_body())
     }
 
-    pub async fn subscribe(
+    pub async fn subscribe_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
         skip_rows: bool,
         from: Option<ChangeId>,
-    ) -> Result<SubscriptionStream, Error> {
+    ) -> Result<SubscriptionStream<T>, Error> {
         let p_and_q: PathAndQuery = if let Some(change_id) = from {
             format!(
                 "/v1/subscriptions?skip_rows={}&from={}",
@@ -111,12 +130,21 @@ impl CorrosionApiClient {
         ))
     }
 
-    pub async fn subscription(
+    pub async fn subscribe(
+        &self,
+        statement: &Statement,
+        skip_rows: bool,
+        from: Option<ChangeId>,
+    ) -> Result<SubscriptionStream<Vec<SqliteValue>>, Error> {
+        self.subscribe_typed(statement, skip_rows, from).await
+    }
+
+    pub async fn subscription_typed<T: DeserializeOwned + Unpin>(
         &self,
         id: Uuid,
         skip_rows: bool,
         from: Option<ChangeId>,
-    ) -> Result<SubscriptionStream, Error> {
+    ) -> Result<SubscriptionStream<T>, Error> {
         let p_and_q: PathAndQuery = if let Some(change_id) = from {
             format!(
                 "/v1/subscriptions/{id}?skip_rows={}&from={}",
@@ -150,6 +178,15 @@ impl CorrosionApiClient {
             self.api_addr,
             res.into_body(),
         ))
+    }
+
+    pub async fn subscription(
+        &self,
+        id: Uuid,
+        skip_rows: bool,
+        from: Option<ChangeId>,
+    ) -> Result<SubscriptionStream<Vec<SqliteValue>>, Error> {
+        self.subscription_typed(id, skip_rows, from).await
     }
 
     pub async fn execute(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {

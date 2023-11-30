@@ -815,6 +815,7 @@ dependencies = [
  "http",
  "hyper",
  "pin-project-lite",
+ "serde",
  "serde_json",
  "sqlite-pool",
  "thiserror",
