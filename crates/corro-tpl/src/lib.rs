@@ -9,9 +9,8 @@ use std::sync::Arc;
 
 use compact_str::ToCompactString;
 use corro_client::sub::SubscriptionStream;
-use corro_client::CorrosionApiClient;
+use corro_client::{CorrosionApiClient, QueryEvent};
 use corro_types::api::ColumnName;
-use corro_types::api::QueryEvent;
 use corro_types::api::SqliteParam;
 use corro_types::api::Statement;
 use corro_types::change::SqliteValue;
@@ -220,14 +219,16 @@ impl fmt::Display for SqliteValueWrap {
 
 struct QueryResponseIter {
     query: Arc<TokioRwLock<QueryHandle>>,
-    body: OnceCell<SubscriptionStream>,
+    body: OnceCell<SubscriptionStream<Vec<SqliteValue>>>,
     handle: tokio::runtime::Handle,
     done: bool,
     columns: Option<Arc<IndexMap<ColumnName, u16>>>,
 }
 
 impl QueryResponseIter {
-    pub async fn body(&mut self) -> Result<&mut SubscriptionStream, Box<EvalAltResult>> {
+    pub async fn body(
+        &mut self,
+    ) -> Result<&mut SubscriptionStream<Vec<SqliteValue>>, Box<EvalAltResult>> {
         self.body
             .get_or_try_init(|| async {
                 match self.query.write().await.body().await {
@@ -338,13 +339,15 @@ impl Iterator for QueryResponseIter {
 
 pub struct QueryHandle {
     id: Uuid,
-    stream: Option<SubscriptionStream>,
+    stream: Option<SubscriptionStream<Vec<SqliteValue>>>,
     client: CorrosionApiClient,
     state: TemplateState,
 }
 
 impl QueryHandle {
-    async fn body(&mut self) -> Result<(SubscriptionStream, bool), corro_client::Error> {
+    async fn body(
+        &mut self,
+    ) -> Result<(SubscriptionStream<Vec<SqliteValue>>, bool), corro_client::Error> {
         if let Some(body) = self.stream.take() {
             return Ok((body, true));
         }
@@ -407,7 +410,7 @@ fn write_sql_to_json<W: Write>(
 }
 
 async fn wait_for_rows(
-    mut rows: SubscriptionStream,
+    mut rows: SubscriptionStream<Vec<SqliteValue>>,
     tx: mpsc::Sender<TemplateCommand>,
     cancel: CancellationToken,
 ) {
