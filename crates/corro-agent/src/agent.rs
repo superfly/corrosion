@@ -1240,7 +1240,6 @@ fn find_cleared_db_versions(
         .query_row([actor_id], |row| row.get(0))
         .optional()?
     {
-        Some(0) => None, // this is the current crsql_site_id which is going to be NULL in clock tables
         Some(ordinal) => Some(ordinal),
         None => {
             warn!(actor_id = %actor_id, "could not find crsql ordinal for actor");
@@ -1267,7 +1266,7 @@ fn find_cleared_db_versions(
             .iter()
             .map(|table| {
                 params.push(&clock_site_id);
-                format!("SELECT DISTINCT db_version FROM {table} WHERE site_id IS ?")
+                format!("SELECT DISTINCT db_version FROM {table} WHERE site_id = ?")
             })
             .collect::<Vec<_>>()
             .join(" UNION ")
@@ -3135,14 +3134,9 @@ pub mod tests {
                 let conn = ta.agent.pool().read().await?;
                 let counts: HashMap<ActorId, i64> = conn
                     .prepare_cached(
-                        "SELECT COALESCE(site_id, crsql_site_id()), count(*) FROM crsql_changes GROUP BY site_id;",
+                        "SELECT site_id, count(*) FROM crsql_changes GROUP BY site_id;",
                     )?
-                    .query_map([], |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                        ))
-                    })?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
 
                 debug!("versions count: {counts:?}");
@@ -3262,8 +3256,8 @@ pub mod tests {
         }
 
         {
-            let mut prepped = conn.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT db_version FROM foo2__crsql_clock WHERE site_id IS ? UNION SELECT DISTINCT db_version FROM foo__crsql_clock WHERE site_id IS ?;")?;
-            let mut rows = prepped.query([rusqlite::types::Null, rusqlite::types::Null])?;
+            let mut prepped = conn.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT db_version FROM foo2__crsql_clock WHERE site_id = ? UNION SELECT DISTINCT db_version FROM foo__crsql_clock WHERE site_id = ?;")?;
+            let mut rows = prepped.query([0, 0])?;
 
             println!("matching clock rows:");
             while let Ok(Some(row)) = rows.next() {

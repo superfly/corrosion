@@ -2287,9 +2287,7 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
         .query_row((), |row| row.get(0))?;
 
     let has_changes: bool = conn
-        .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE site_id IS NULL AND db_version = ?);",
-        )?
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE db_version = ?);")?
         .query_row([db_version], |row| row.get(0))?;
 
     if !has_changes {
@@ -2305,9 +2303,7 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
     };
 
     let last_seq: i64 = conn
-        .prepare_cached(
-            "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
-        )?
+        .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
         .query_row([db_version], |row| row.get(0))?;
 
     let mut book_writer = booked.blocking_write("handle_write_tx(book_writer)");
@@ -2358,8 +2354,7 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
                 let mut prepped = conn.prepare_cached(r#"
                 SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl
                     FROM crsql_changes
-                    WHERE site_id IS NULL
-                      AND db_version = ?
+                    WHERE db_version = ?
                     ORDER BY seq ASC
             "#)?;
                 let rows = prepped.query_map([db_version], row_to_change)?;

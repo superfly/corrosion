@@ -390,23 +390,22 @@ fn handle_known_version(
                 // this is a read transaction!
                 let tx = conn.transaction()?;
 
-                let mut prepped = tx.prepare_cached(r#"
-                    SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl
+                let mut prepped = tx.prepare_cached(
+                    r#"
+                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                         FROM crsql_changes
-                        WHERE site_id IS ?
+                        WHERE site_id = ?
                         AND db_version = ?
                         AND seq >= ? AND seq <= ?
                         ORDER BY seq ASC
-                "#)?;
-                let site_id: Option<[u8; 16]> = (!is_local)
-                    .then_some(actor_id)
-                    .map(|actor_id| actor_id.to_bytes());
+                "#,
+                )?;
 
                 let start_seq = range_needed.start();
                 let end_seq = range_needed.end();
 
                 let rows = prepped.query_map(
-                    params![site_id, db_version, start_seq, end_seq],
+                    params![actor_id, db_version, start_seq, end_seq],
                     row_to_change,
                 )?;
 
