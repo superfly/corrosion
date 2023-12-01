@@ -817,6 +817,19 @@ impl Matcher {
             tx.execute_batch(&create_temp_table)?;
             trace!("created sub tables");
 
+            for (table, pks) in matcher.pks.iter() {
+                tx.execute(
+                    &format!(
+                        "CREATE INDEX index_{id}_{table}_pk ON query ({pks})",
+                        id = id.as_simple(),
+                        table = table,
+                        pks = pks.iter().cloned().collect::<Vec<_>>().join(","),
+                    ),
+                    [],
+                )?;
+            }
+            trace!("created query indexes");
+
             for (table, columns) in matcher.parsed.table_columns.iter() {
                 tx.execute(
                     r#"INSERT INTO columns ("table", cid) VALUES (?, '-1')"#,
