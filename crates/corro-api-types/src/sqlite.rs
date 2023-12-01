@@ -11,9 +11,9 @@ use speedy::{Readable, Writable};
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum ChangeType {
-    Insert,
-    Update,
-    Delete,
+    Insert = 0,
+    Update = 1,
+    Delete = 2,
 }
 
 impl FromSql for ChangeType {
