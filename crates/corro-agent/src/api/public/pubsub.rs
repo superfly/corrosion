@@ -589,7 +589,7 @@ pub async fn catch_up_sub(
         }
     };
 
-    forward_sub_to_sender(matcher.id(), sub_rx, evt_tx).await
+    forward_sub_to_sender(matcher.id(), sub_rx, evt_tx, params.skip_rows).await
 }
 
 pub async fn upsert_sub(
@@ -607,7 +607,12 @@ pub async fn upsert_sub(
 
         let (sub_tx, sub_rx) = broadcast::channel(10240);
 
-        tokio::spawn(forward_sub_to_sender(handle.id(), sub_rx, tx));
+        tokio::spawn(forward_sub_to_sender(
+            handle.id(),
+            sub_rx,
+            tx,
+            params.skip_rows,
+        ));
 
         bcast_write.insert(handle.id(), sub_tx.clone());
 
@@ -701,9 +706,18 @@ async fn forward_sub_to_sender(
     sub_id: Uuid,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
+    skip_rows: bool,
 ) {
     info!(%sub_id, "forwarding subscription events to a sender");
     while let Ok((event_buf, meta)) = sub_rx.recv().await {
+        if skip_rows
+            && matches!(
+                meta,
+                QueryEventMeta::Columns | QueryEventMeta::Row(_) | QueryEventMeta::EndOfQuery(_)
+            )
+        {
+            continue;
+        }
         if let Err(e) = tx.send((event_buf, meta)).await {
             warn!(%sub_id, "could not send subscription event to channel: {e}");
             return;

@@ -47,193 +47,6 @@ use crate::{
 
 pub use corro_api_types::sqlite::ChangeType;
 
-#[derive(Debug, thiserror::Error)]
-pub enum NormalizeStatementError {
-    #[error(transparent)]
-    Parse(#[from] sqlite3_parser::lexer::sql::Error),
-    #[error("unexpected statement: {0}")]
-    UnexpectedStatement(Cmd),
-    #[error("only 1 statement is supported")]
-    Multiple,
-    #[error("at least 1 statement is required")]
-    NoStatement,
-}
-
-pub fn normalize_sql(sql: &str) -> Result<String, NormalizeStatementError> {
-    let mut parser = Parser::new(sql.as_bytes());
-
-    let stmt = match parser.next()? {
-        Some(Cmd::Stmt(stmt)) => stmt,
-        Some(cmd) => {
-            return Err(NormalizeStatementError::UnexpectedStatement(cmd));
-        }
-        None => {
-            return Err(NormalizeStatementError::NoStatement);
-        }
-    };
-
-    if parser.next()?.is_some() {
-        return Err(NormalizeStatementError::Multiple);
-    }
-
-    Ok(Cmd::Stmt(stmt).to_string())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PackError {
-    #[error("abort")]
-    Abort,
-}
-
-pub fn pack_columns(args: &[SqliteValue]) -> Result<Vec<u8>, PackError> {
-    let mut buf = vec![];
-    /*
-     * Format:
-     * [num_columns:u8,...[(type(0-3),num_bytes?(3-7)):u8, length?:i32, ...bytes:u8[]]]
-     *
-     * The byte used for column type also encodes the number of bytes used for the integer.
-     * e.g.: (type(0-3),num_bytes?(3-7)):u8
-     * first 3 bits are type
-     * last 5 encode how long the following integer, if there is a following integer, is. 1, 2, 3, ... 8 bytes.
-     *
-     * Not packing an integer into the minimal number of bytes required is rather wasteful.
-     * E.g., the number `0` would take 8 bytes rather than 1 byte.
-     */
-    let len_result: Result<u8, _> = args.len().try_into();
-    if let Ok(len) = len_result {
-        buf.put_u8(len);
-        for value in args {
-            match value {
-                SqliteValue::Null => {
-                    buf.put_u8(ColumnType::Null as u8);
-                }
-                SqliteValue::Integer(val) => {
-                    let num_bytes_for_int = num_bytes_needed_i64(*val);
-                    let type_byte = num_bytes_for_int << 3 | (ColumnType::Integer as u8);
-                    buf.put_u8(type_byte);
-                    buf.put_int(*val, num_bytes_for_int as usize);
-                }
-                SqliteValue::Real(v) => {
-                    buf.put_u8(ColumnType::Float as u8);
-                    buf.put_f64(v.0);
-                }
-                SqliteValue::Text(value) => {
-                    let len = value.len() as i32;
-                    let num_bytes_for_len = num_bytes_needed_i32(len);
-                    let type_byte = num_bytes_for_len << 3 | (ColumnType::Text as u8);
-                    buf.put_u8(type_byte);
-                    buf.put_int(len as i64, num_bytes_for_len as usize);
-                    buf.put_slice(value.as_bytes());
-                }
-                SqliteValue::Blob(value) => {
-                    let len = value.len() as i32;
-                    let num_bytes_for_len = num_bytes_needed_i32(len);
-                    let type_byte = num_bytes_for_len << 3 | (ColumnType::Blob as u8);
-                    buf.put_u8(type_byte);
-                    buf.put_int(len as i64, num_bytes_for_len as usize);
-                    buf.put_slice(value);
-                }
-            }
-        }
-        Ok(buf)
-    } else {
-        Err(PackError::Abort)
-    }
-}
-
-fn num_bytes_needed_i64(val: i64) -> u8 {
-    if val & 0xFF00000000000000u64 as i64 != 0 {
-        8
-    } else if val & 0x00FF000000000000 != 0 {
-        7
-    } else if val & 0x0000FF0000000000 != 0 {
-        6
-    } else if val & 0x000000FF00000000 != 0 {
-        5
-    } else {
-        num_bytes_needed_i32(val as i32)
-    }
-}
-
-fn num_bytes_needed_i32(val: i32) -> u8 {
-    if val & 0xFF000000u32 as i32 != 0 {
-        4
-    } else if val & 0x00FF0000 != 0 {
-        3
-    } else if val & 0x0000FF00 != 0 {
-        2
-    } else if val * 0x000000FF != 0 {
-        1
-    } else {
-        0
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum UnpackError {
-    #[error("abort")]
-    Abort,
-    #[error("misuse")]
-    Misuse,
-}
-
-pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError> {
-    let mut ret = vec![];
-    let num_columns = buf.get_u8();
-
-    for _i in 0..num_columns {
-        if !buf.has_remaining() {
-            return Err(UnpackError::Abort);
-        }
-        let column_type_and_maybe_intlen = buf.get_u8();
-        let column_type = ColumnType::from_u8(column_type_and_maybe_intlen & 0x07);
-        let intlen = (column_type_and_maybe_intlen >> 3) as usize;
-
-        match column_type {
-            Some(ColumnType::Blob) => {
-                if buf.remaining() < intlen {
-                    return Err(UnpackError::Abort);
-                }
-                let len = buf.get_int(intlen) as usize;
-                if buf.remaining() < len {
-                    return Err(UnpackError::Abort);
-                }
-                ret.push(SqliteValueRef(ValueRef::Blob(&buf[0..len])));
-                buf.advance(len);
-            }
-            Some(ColumnType::Float) => {
-                if buf.remaining() < 8 {
-                    return Err(UnpackError::Abort);
-                }
-                ret.push(SqliteValueRef(ValueRef::Real(buf.get_f64())));
-            }
-            Some(ColumnType::Integer) => {
-                if buf.remaining() < intlen {
-                    return Err(UnpackError::Abort);
-                }
-                ret.push(SqliteValueRef(ValueRef::Integer(buf.get_int(intlen))));
-            }
-            Some(ColumnType::Null) => {
-                ret.push(SqliteValueRef(ValueRef::Null));
-            }
-            Some(ColumnType::Text) => {
-                if buf.remaining() < intlen {
-                    return Err(UnpackError::Abort);
-                }
-                let len = buf.get_int(intlen) as usize;
-                if buf.remaining() < len {
-                    return Err(UnpackError::Abort);
-                }
-                ret.push(SqliteValueRef(ValueRef::Text(&buf[0..len])));
-                buf.advance(len);
-            }
-            None => return Err(UnpackError::Misuse),
-        }
-    }
-
-    Ok(ret)
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct SubsManager(Arc<RwLock<InnerSubsManager>>);
 
@@ -1177,7 +990,7 @@ impl Matcher {
                     }
                 },
                 _ = &mut tripwire => {
-                    trace!("tripped cmd_loop, returning");
+                    trace!(sub_id = %self.id, "tripped cmd_loop, returning");
                     // just return!
                     return;
                 }
@@ -1194,7 +1007,6 @@ impl Matcher {
                     }) {
                         if !matches!(e, MatcherError::EventReceiverClosed) {
                             error!(sub_id = %self.id, "could not handle change: {e}");
-                            _ = self.evt_tx.try_send(QueryEvent::Error(e.to_compact_string()));
                         }
                         break;
                     }
@@ -1214,12 +1026,11 @@ impl Matcher {
                     });
 
                     match res {
-                        Ok(deleted) => info!(
-                            "Deleted {deleted} old changes row for subscription {}",
-                            self.id.as_simple()
-                        ),
+                        Ok(deleted) => {
+                            info!(sub_id = %self.id, "Deleted {deleted} old changes row")
+                        }
                         Err(e) => {
-                            error!("could not delete old changes: {e}");
+                            error!(sub_id = %self.id, "could not delete old changes: {e}");
                         }
                     }
                 }
@@ -1240,7 +1051,7 @@ impl Matcher {
             .send(QueryEvent::Columns(self.col_names.clone()))
             .await
         {
-            error!("could not send back columns, probably means no receivers! {e}");
+            error!(sub_id = %self.id, "could not send back columns, probably means no receivers! {e}");
             return;
         }
 
@@ -1333,11 +1144,10 @@ impl Matcher {
                                     .map(|i| row.get::<_, SqliteValue>(i))
                                     .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                                if let Err(e) = self
-                                    .evt_tx
-                                    .blocking_send(QueryEvent::Row(RowId(rowid), cells))
+                                if let Err(e) =
+                                    self.evt_tx.try_send(QueryEvent::Row(RowId(rowid), cells))
                                 {
-                                    error!("could not send back row: {e}");
+                                    error!(sub_id = %self.id, "could not send back row: {e}");
                                     return Err(MatcherError::EventReceiverClosed);
                                 }
 
@@ -1400,7 +1210,7 @@ impl Matcher {
                     })
                     .await
                 {
-                    error!("could not return end of query event: {e}");
+                    error!(sub_id = %self.id, "could not return end of query event: {e}");
                     return;
                 }
                 db_version
@@ -1411,6 +1221,7 @@ impl Matcher {
                     .evt_tx
                     .send(QueryEvent::Error(e.to_compact_string()))
                     .await;
+
                 return;
             }
         };
@@ -2218,6 +2029,193 @@ impl MatcherError {
     pub fn is_event_recv_closed(&self) -> bool {
         matches!(self, MatcherError::EventReceiverClosed)
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NormalizeStatementError {
+    #[error(transparent)]
+    Parse(#[from] sqlite3_parser::lexer::sql::Error),
+    #[error("unexpected statement: {0}")]
+    UnexpectedStatement(Cmd),
+    #[error("only 1 statement is supported")]
+    Multiple,
+    #[error("at least 1 statement is required")]
+    NoStatement,
+}
+
+pub fn normalize_sql(sql: &str) -> Result<String, NormalizeStatementError> {
+    let mut parser = Parser::new(sql.as_bytes());
+
+    let stmt = match parser.next()? {
+        Some(Cmd::Stmt(stmt)) => stmt,
+        Some(cmd) => {
+            return Err(NormalizeStatementError::UnexpectedStatement(cmd));
+        }
+        None => {
+            return Err(NormalizeStatementError::NoStatement);
+        }
+    };
+
+    if parser.next()?.is_some() {
+        return Err(NormalizeStatementError::Multiple);
+    }
+
+    Ok(Cmd::Stmt(stmt).to_string())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PackError {
+    #[error("abort")]
+    Abort,
+}
+
+pub fn pack_columns(args: &[SqliteValue]) -> Result<Vec<u8>, PackError> {
+    let mut buf = vec![];
+    /*
+     * Format:
+     * [num_columns:u8,...[(type(0-3),num_bytes?(3-7)):u8, length?:i32, ...bytes:u8[]]]
+     *
+     * The byte used for column type also encodes the number of bytes used for the integer.
+     * e.g.: (type(0-3),num_bytes?(3-7)):u8
+     * first 3 bits are type
+     * last 5 encode how long the following integer, if there is a following integer, is. 1, 2, 3, ... 8 bytes.
+     *
+     * Not packing an integer into the minimal number of bytes required is rather wasteful.
+     * E.g., the number `0` would take 8 bytes rather than 1 byte.
+     */
+    let len_result: Result<u8, _> = args.len().try_into();
+    if let Ok(len) = len_result {
+        buf.put_u8(len);
+        for value in args {
+            match value {
+                SqliteValue::Null => {
+                    buf.put_u8(ColumnType::Null as u8);
+                }
+                SqliteValue::Integer(val) => {
+                    let num_bytes_for_int = num_bytes_needed_i64(*val);
+                    let type_byte = num_bytes_for_int << 3 | (ColumnType::Integer as u8);
+                    buf.put_u8(type_byte);
+                    buf.put_int(*val, num_bytes_for_int as usize);
+                }
+                SqliteValue::Real(v) => {
+                    buf.put_u8(ColumnType::Float as u8);
+                    buf.put_f64(v.0);
+                }
+                SqliteValue::Text(value) => {
+                    let len = value.len() as i32;
+                    let num_bytes_for_len = num_bytes_needed_i32(len);
+                    let type_byte = num_bytes_for_len << 3 | (ColumnType::Text as u8);
+                    buf.put_u8(type_byte);
+                    buf.put_int(len as i64, num_bytes_for_len as usize);
+                    buf.put_slice(value.as_bytes());
+                }
+                SqliteValue::Blob(value) => {
+                    let len = value.len() as i32;
+                    let num_bytes_for_len = num_bytes_needed_i32(len);
+                    let type_byte = num_bytes_for_len << 3 | (ColumnType::Blob as u8);
+                    buf.put_u8(type_byte);
+                    buf.put_int(len as i64, num_bytes_for_len as usize);
+                    buf.put_slice(value);
+                }
+            }
+        }
+        Ok(buf)
+    } else {
+        Err(PackError::Abort)
+    }
+}
+
+fn num_bytes_needed_i64(val: i64) -> u8 {
+    if val & 0xFF00000000000000u64 as i64 != 0 {
+        8
+    } else if val & 0x00FF000000000000 != 0 {
+        7
+    } else if val & 0x0000FF0000000000 != 0 {
+        6
+    } else if val & 0x000000FF00000000 != 0 {
+        5
+    } else {
+        num_bytes_needed_i32(val as i32)
+    }
+}
+
+fn num_bytes_needed_i32(val: i32) -> u8 {
+    if val & 0xFF000000u32 as i32 != 0 {
+        4
+    } else if val & 0x00FF0000 != 0 {
+        3
+    } else if val & 0x0000FF00 != 0 {
+        2
+    } else if val * 0x000000FF != 0 {
+        1
+    } else {
+        0
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UnpackError {
+    #[error("abort")]
+    Abort,
+    #[error("misuse")]
+    Misuse,
+}
+
+pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError> {
+    let mut ret = vec![];
+    let num_columns = buf.get_u8();
+
+    for _i in 0..num_columns {
+        if !buf.has_remaining() {
+            return Err(UnpackError::Abort);
+        }
+        let column_type_and_maybe_intlen = buf.get_u8();
+        let column_type = ColumnType::from_u8(column_type_and_maybe_intlen & 0x07);
+        let intlen = (column_type_and_maybe_intlen >> 3) as usize;
+
+        match column_type {
+            Some(ColumnType::Blob) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                let len = buf.get_int(intlen) as usize;
+                if buf.remaining() < len {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef(ValueRef::Blob(&buf[0..len])));
+                buf.advance(len);
+            }
+            Some(ColumnType::Float) => {
+                if buf.remaining() < 8 {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef(ValueRef::Real(buf.get_f64())));
+            }
+            Some(ColumnType::Integer) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef(ValueRef::Integer(buf.get_int(intlen))));
+            }
+            Some(ColumnType::Null) => {
+                ret.push(SqliteValueRef(ValueRef::Null));
+            }
+            Some(ColumnType::Text) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                let len = buf.get_int(intlen) as usize;
+                if buf.remaining() < len {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef(ValueRef::Text(&buf[0..len])));
+                buf.advance(len);
+            }
+            None => return Err(UnpackError::Misuse),
+        }
+    }
+
+    Ok(ret)
 }
 
 #[cfg(test)]
