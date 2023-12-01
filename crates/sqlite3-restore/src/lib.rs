@@ -66,6 +66,19 @@ pub fn restore<P1: AsRef<Path>, P2: AsRef<Path>>(
         .create(true)
         .open(dst.as_ref())?;
 
+    let src_meta = src_db_file.metadata()?;
+    let dst_meta = dst_db_file.metadata()?;
+
+    if dst_meta.len() == 0 {
+        info!("destination is empty, just copying.");
+        copy_check(&mut src_db_file, &mut dst_db_file, src_meta.len())?;
+        return Ok(Restored {
+            old_len: dst_meta.len(),
+            new_len: src_meta.len(),
+            is_wal: false, // this is only useful in tests
+        });
+    }
+
     let mut dst_locked = lock_all(&mut dst_db_file, dst.as_ref(), timeout)?;
 
     let dst_journal_path = format!("{}-journal", dst.as_ref().display());
@@ -86,9 +99,6 @@ pub fn restore<P1: AsRef<Path>, P2: AsRef<Path>>(
         wal_file.set_len(0)?;
     }
 
-    let src_meta = src_db_file.metadata()?;
-    let dst_meta = dst_db_file.metadata()?;
-
     dst_db_file.seek(std::io::SeekFrom::Start(0))?;
     src_db_file.seek(std::io::SeekFrom::Start(0))?;
 
@@ -97,16 +107,7 @@ pub fn restore<P1: AsRef<Path>, P2: AsRef<Path>>(
         src.as_ref().display()
     );
 
-    let n = std::io::copy(&mut src_db_file, &mut dst_db_file)?;
-    if n != src_meta.len() {
-        return Err(Error::InconsistentCopy {
-            expected: src_meta.len(),
-            actual: n,
-        });
-    }
-
-    dst_db_file.set_len(src_meta.len())?;
-    dst_db_file.sync_all()?;
+    copy_check(&mut src_db_file, &mut dst_db_file, src_meta.len())?;
 
     if let Locked::Wal(ref mut dst_shm_file) = dst_locked {
         dst_shm_file.write_at(&[136], 0)?;
@@ -119,6 +120,21 @@ pub fn restore<P1: AsRef<Path>, P2: AsRef<Path>>(
         new_len: src_meta.len(),
         is_wal: dst_locked.is_wal(),
     })
+}
+
+fn copy_check(src: &mut File, dst: &mut File, len: u64) -> Result<(), Error> {
+    let n = std::io::copy(src, dst)?;
+    if n != len {
+        return Err(Error::InconsistentCopy {
+            expected: len,
+            actual: n,
+        });
+    }
+
+    dst.set_len(len)?;
+    dst.sync_all()?;
+
+    Ok(())
 }
 
 enum Locked {
