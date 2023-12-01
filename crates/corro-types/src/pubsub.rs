@@ -823,7 +823,7 @@ impl Matcher {
                         "CREATE INDEX index_{id}_{table}_pk ON query ({pks})",
                         id = id.as_simple(),
                         table = table,
-                        pks = pks.iter().cloned().collect::<Vec<_>>().join(","),
+                        pks = pks.to_vec().join(","),
                     ),
                     [],
                 )?;
@@ -1119,6 +1119,7 @@ impl Matcher {
                     select.query(())?
                 };
                 let elapsed = start.elapsed();
+                info!(sub_id = %self.id, "Initial query done in {elapsed:?}");
 
                 let insert_into = format!(
                     "INSERT INTO query ({}) VALUES ({}) RETURNING __corro_rowid,{}",
@@ -1167,6 +1168,7 @@ impl Matcher {
                                 last_rowid = cmp::max(rowid, last_rowid);
                             }
                             Ok(None) => {
+                                info!(sub_id = %self.id, "Done iterating through rows for initial query");
                                 // done!
                                 break;
                             }
@@ -1229,7 +1231,7 @@ impl Matcher {
                 db_version
             }
             Err(e) => {
-                debug!("could not complete initial query: {e}");
+                warn!(sub_id = %self.id, "could not complete initial query: {e}");
                 _ = self
                     .evt_tx
                     .send(QueryEvent::Error(e.to_compact_string()))
@@ -1246,10 +1248,11 @@ impl Matcher {
 
         if let Some(first_db_version) = first_buffered_db_version {
             if db_version < first_db_version {
+                info!(sub_id = %self.id, "processing missed changes between {db_version} and {first_db_version}");
                 if let Err(e) = block_in_place(|| {
                     self.handle_change(&mut state_conn, db_version + 1, first_db_version - 1)
                 }) {
-                    error!("could not catch up from last db version {db_version} to first buffered db version {first_db_version}: {e}");
+                    error!(sub_id = %self.id, "could not catch up from last db version {db_version} to first buffered db version {first_db_version}: {e}");
                     _ = self
                         .evt_tx
                         .try_send(QueryEvent::Error(e.to_compact_string()));
@@ -1257,10 +1260,11 @@ impl Matcher {
                 }
             }
             if let Some(last_db_version) = last_db_version {
+                info!(sub_id = %self.id, "handling buffered candidates while performing initial query");
                 if let Err(e) = block_in_place(|| {
                     self.handle_candidates(&mut state_conn, candidates, last_db_version)
                 }) {
-                    error!("could not catch up from buffered candidates: {e}");
+                    error!(sub_id = %self.id, "could not catch up from buffered candidates: {e}");
                     _ = self
                         .evt_tx
                         .try_send(QueryEvent::Error(e.to_compact_string()));
