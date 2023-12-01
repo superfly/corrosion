@@ -617,14 +617,14 @@ impl Matcher {
             let mut new_query = Cmd::Stmt(stmt).to_string();
             new_query.pop();
 
-            let mut tmp_cols = pks.values().flatten().cloned().collect::<Vec<String>>();
+            let mut all_cols = pks.values().flatten().cloned().collect::<Vec<String>>();
             for i in 0..(parsed.columns.len()) {
-                tmp_cols.push(format!("col_{i}"));
+                all_cols.push(format!("col_{i}"));
             }
 
             let temp_query = format!(
                 "SELECT {} FROM query WHERE ({}) IN temp_{tbl_name}",
-                tmp_cols.join(","),
+                all_cols.join(","),
                 pks.get(tbl_name)
                     .cloned()
                     .ok_or(MatcherError::MissingPrimaryKeys)?
@@ -768,14 +768,14 @@ impl Matcher {
             .cloned()
             .collect::<Vec<String>>();
 
-        let mut tmp_cols = pk_cols.clone();
+        let mut all_cols = pk_cols.clone();
 
-        let mut actual_cols = vec![];
+        let mut query_cols = vec![];
 
         for i in 0..(matcher.parsed.columns.len()) {
             let col_name = format!("col_{i}");
-            tmp_cols.push(col_name.clone());
-            actual_cols.push(col_name);
+            all_cols.push(col_name.clone());
+            query_cols.push(col_name);
         }
 
         block_in_place(|| {
@@ -807,14 +807,14 @@ impl Matcher {
                     PRIMARY KEY ("table", cid)
                 );
             "#,
-                columns = tmp_cols.join(","),
+                columns = all_cols.join(","),
                 id = id.as_simple(),
                 pks_coalesced = pk_cols
                     .iter()
                     .map(|pk| format!("coalesce({pk}, \"\")"))
                     .collect::<Vec<_>>()
                     .join(","),
-                actual_columns = actual_cols.join(","),
+                actual_columns = query_cols.join(","),
             );
 
             tx.execute_batch(&create_temp_table)?;
@@ -1087,7 +1087,7 @@ impl Matcher {
             let mut stmt_str = Cmd::Stmt(self.query.clone()).to_string();
             stmt_str.pop(); // remove trailing `;`
 
-            let mut tmp_cols = self
+            let mut all_cols = self
                 .pks
                 .values()
                 .flatten()
@@ -1096,7 +1096,7 @@ impl Matcher {
 
             for i in 0..(self.parsed.columns.len()) {
                 let col_name = format!("col_{i}");
-                tmp_cols.push(col_name.clone());
+                all_cols.push(col_name.clone());
             }
 
             let mut last_rowid = 0;
@@ -1105,7 +1105,7 @@ impl Matcher {
             tx.execute_batch(&format!(
                 "DROP TABLE IF EXISTS state_rows;
                     CREATE TEMP TABLE state_rows ({})",
-                tmp_cols.join(",")
+                all_cols.join(",")
             ))?;
 
             info!(sub_id = %self.id, "Starting state conn read transaction for initial query");
@@ -1126,8 +1126,8 @@ impl Matcher {
 
                 let insert_into = format!(
                     "INSERT INTO query ({}) VALUES ({}) RETURNING __corro_rowid,{}",
-                    tmp_cols.join(","),
-                    tmp_cols
+                    all_cols.join(","),
+                    all_cols
                         .iter()
                         .map(|_| "?".to_string())
                         .collect::<Vec<_>>()
@@ -1142,7 +1142,7 @@ impl Matcher {
                     loop {
                         match select_rows.next() {
                             Ok(Some(row)) => {
-                                for i in 0..tmp_cols.len() {
+                                for i in 0..all_cols.len() {
                                     insert.raw_bind_parameter(
                                         i + 1,
                                         SqliteValueRef::from(row.get_ref(i)?),
@@ -1335,7 +1335,7 @@ impl Matcher {
         tx.commit()?;
         trace!("committed temp pk tables");
 
-        let mut actual_cols = vec![];
+        let mut query_cols = vec![];
 
         let pk_cols = self
             .pks
@@ -1344,11 +1344,11 @@ impl Matcher {
             .cloned()
             .collect::<Vec<String>>();
 
-        let mut tmp_cols = pk_cols.clone();
+        let mut all_cols = pk_cols.clone();
         for i in 0..(self.parsed.columns.len()) {
             let col_name = format!("col_{i}");
-            tmp_cols.push(col_name.clone());
-            actual_cols.push(col_name);
+            all_cols.push(col_name.clone());
+            query_cols.push(col_name);
         }
 
         // start a new tx
@@ -1357,7 +1357,7 @@ impl Matcher {
         // ensure drop and recreate
         tx.execute_batch(&format!(
             "CREATE TEMP TABLE IF NOT EXISTS state_results ({})",
-            tmp_cols.join(",")
+            all_cols.join(",")
         ))?;
 
         let mut new_last_rowid = self.last_rowid;
@@ -1367,7 +1367,7 @@ impl Matcher {
             let state_tx = state_conn.transaction()?;
             let mut tmp_insert_prepped = tx.prepare_cached(&format!(
                 "INSERT INTO state_results VALUES ({})",
-                (0..tmp_cols.len())
+                (0..all_cols.len())
                     .map(|_| "?")
                     .collect::<Vec<_>>()
                     .join(",")
@@ -1412,7 +1412,7 @@ impl Matcher {
                             WHERE {excluded_not_same}
                         RETURNING __corro_rowid,{return_cols}",
                     // insert into
-                    insert_cols = tmp_cols.join(","),
+                    insert_cols = all_cols.join(","),
                     query_query = stmt.temp_query,
                     conflict_clause = pk_cols
                         .iter()
@@ -1427,7 +1427,7 @@ impl Matcher {
                         .map(|i| format!("col_{i} IS NOT excluded.col_{i}"))
                         .collect::<Vec<_>>()
                         .join(" OR "),
-                    return_cols = actual_cols.join(",")
+                    return_cols = query_cols.join(",")
                 );
 
                 trace!("INSERT SQL: {sql}");
@@ -1446,7 +1446,7 @@ impl Matcher {
                     pks = pk_cols.join(","),
                     select_pks = pk_cols.join(","),
                     query_query = stmt.temp_query,
-                    return_cols = actual_cols.join(",")
+                    return_cols = query_cols.join(",")
                 );
 
                 trace!("DELETE SQL: {sql}");
@@ -1455,14 +1455,14 @@ impl Matcher {
 
                 let mut change_insert_stmt = tx.prepare_cached(&format!(
                     "INSERT INTO changes (__corro_rowid, {CHANGE_TYPE_COL}, {}) VALUES (?, ?, {}) RETURNING {CHANGE_ID_COL}",
-                    actual_cols.join(","),
-                    (0..actual_cols.len())
+                    query_cols.join(","),
+                    (0..query_cols.len())
                         .map(|_i| "?")
                         .collect::<Vec<_>>()
                         .join(",")
                 ))?;
 
-                for (mut change_type, mut prepped) in [
+                for (change_type, mut prepped) in [
                     (None, insert_prepped),
                     (Some(ChangeType::Delete), delete_prepped),
                 ] {
@@ -1473,7 +1473,7 @@ impl Matcher {
                     while let Ok(Some(row)) = rows.next() {
                         let rowid: RowId = row.get(0)?;
 
-                        let change_type = change_type.take().unwrap_or({
+                        let change_type = change_type.clone().take().unwrap_or({
                             if rowid.0 > self.last_rowid {
                                 ChangeType::Insert
                             } else {
