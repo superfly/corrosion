@@ -56,7 +56,7 @@ where
 
     let start = Instant::now();
     block_in_place(move || {
-        let tx = conn.transaction()?;
+        let tx = conn.immediate_transaction()?;
 
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
@@ -548,7 +548,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     new_schema.constrain()?;
 
     block_in_place(|| {
-        let tx = conn.transaction()?;
+        let tx = conn.immediate_transaction()?;
 
         apply_schema(&tx, &schema_write, &mut new_schema)?;
 

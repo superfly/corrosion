@@ -652,7 +652,7 @@ fn diff_member_states(
         let mut deleted = 0;
 
         let res = block_in_place(|| {
-            let tx = conn.transaction()?;
+            let tx = conn.immediate_transaction()?;
 
             for (member, rtt_min) in to_update {
                 let foca_state = serde_json::to_string(&member).unwrap();

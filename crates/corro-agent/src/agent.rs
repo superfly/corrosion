@@ -247,7 +247,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             if let Some(clear_count) = cleared_rows.get(actor_id).copied() {
                 if clear_count > booked.cleared.len() {
                     warn!(%actor_id, "cleared bookkept rows count ({clear_count}) in DB was bigger than in-memory entries count ({}), compacting...", booked.cleared.len());
-                    let tx = conn.transaction()?;
+                    let tx = conn.immediate_transaction()?;
                     let deleted = tx.execute("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND end_version IS NOT NULL", [actor_id])?;
                     info!("deleted {deleted} rows that had an end_version");
                     let mut inserted = 0;
@@ -1037,7 +1037,7 @@ async fn clear_overwritten_versions(agent: Agent) {
                 Ok(mut conn) => {
                     let start = Instant::now();
                     let res = block_in_place(|| {
-                        let tx = conn.transaction()?;
+                        let tx = conn.immediate_transaction()?;
                         find_cleared_db_versions(&tx, &actor_id)
                     });
                     db_elapsed += start.elapsed();
@@ -1663,7 +1663,7 @@ async fn process_fully_buffered_changes(
             }
         };
 
-        let tx = conn.transaction()?;
+        let tx = conn.immediate_transaction()?;
 
         info!(%actor_id, version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
@@ -1802,7 +1802,7 @@ pub async fn process_multiple_changes(
 
     let changesets = block_in_place(|| {
         let start = Instant::now();
-        let tx = conn.transaction()?;
+        let tx = conn.immediate_transaction()?;
 
         let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
@@ -2723,7 +2723,7 @@ async fn process_completed_empties(
         for ranges in v.chunks(50) {
             let mut conn = agent.pool().write_low().await?;
             block_in_place(|| {
-                let tx = conn.transaction()?;
+                let tx = conn.immediate_transaction()?;
 
                 for range in ranges {
                     inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
@@ -3271,7 +3271,7 @@ pub mod tests {
             }
         }
 
-        let tx = conn.transaction()?;
+        let tx = conn.immediate_transaction()?;
         let actor_id: ActorId = tx.query_row("SELECT crsql_site_id()", [], |row| row.get(0))?;
 
         let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
@@ -3294,14 +3294,14 @@ pub mod tests {
 
         tx.commit()?;
 
-        let tx = conn.transaction()?;
+        let tx = conn.immediate_transaction()?;
         let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
         assert!(to_clear.is_empty());
 
         tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
         tx.commit()?;
 
-        let tx = conn.transaction()?;
+        let tx = conn.immediate_transaction()?;
         let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
 
         assert!(to_clear.contains(&2));
