@@ -300,6 +300,10 @@ impl MatcherHandle {
         }
     }
 
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.inner.cancel.clone()
+    }
+
     pub fn max_change_id(&self, conn: &Connection) -> rusqlite::Result<ChangeId> {
         self.wait_for_running_state();
         let mut prepped = conn.prepare_cached("SELECT COALESCE(MAX(id), 0) FROM changes")?;
@@ -619,14 +623,13 @@ impl Matcher {
             }
 
             let temp_query = format!(
-                "SELECT {} FROM query WHERE ({}) IN temp_{}",
+                "SELECT {} FROM query WHERE ({}) IN temp_{tbl_name}",
                 tmp_cols.join(","),
                 pks.get(tbl_name)
                     .cloned()
                     .ok_or(MatcherError::MissingPrimaryKeys)?
                     .to_vec()
                     .join(","),
-                tbl_name,
             );
 
             info!(sub_id = %id, "modified query for table '{tbl_name}': {new_query}");
@@ -1519,10 +1522,9 @@ impl Matcher {
                         }
                     }
                 }
+                // clean that up
+                tx.execute_batch("DELETE FROM state_results")?;
             }
-
-            // clean that up
-            tx.execute_batch("DELETE FROM state_results")?;
 
             // clean up temporary tables immediately
             for table in tables {
