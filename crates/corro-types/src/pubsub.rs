@@ -1193,7 +1193,8 @@ impl Matcher {
                         self.handle_candidates(&mut state_conn, candidates, db_version)
                     }) {
                         if !matches!(e, MatcherError::EventReceiverClosed) {
-                            error!("could not handle change: {e}");
+                            error!(sub_id = %self.id, "could not handle change: {e}");
+                            _ = self.evt_tx.try_send(QueryEvent::Error(e.to_compact_string()));
                         }
                         break;
                     }
