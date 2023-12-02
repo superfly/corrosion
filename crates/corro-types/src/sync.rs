@@ -11,6 +11,7 @@ use tracing::warn;
 use crate::{
     actor::ActorId,
     agent::{Booked, Bookie},
+    base::{CrsqlSeq, Version},
     broadcast::{ChangeV1, Timestamp},
 };
 
@@ -76,17 +77,17 @@ pub enum SyncRejectionV1 {
 #[derive(Debug, Default, Clone, PartialEq, Readable, Writable, Serialize, Deserialize)]
 pub struct SyncStateV1 {
     pub actor_id: ActorId,
-    pub heads: HashMap<ActorId, i64>,
-    pub need: HashMap<ActorId, Vec<RangeInclusive<i64>>>,
-    pub partial_need: HashMap<ActorId, HashMap<i64, Vec<RangeInclusive<i64>>>>,
+    pub heads: HashMap<ActorId, Version>,
+    pub need: HashMap<ActorId, Vec<RangeInclusive<Version>>>,
+    pub partial_need: HashMap<ActorId, HashMap<Version, Vec<RangeInclusive<CrsqlSeq>>>>,
 }
 
 impl SyncStateV1 {
-    pub fn need_len(&self) -> i64 {
+    pub fn need_len(&self) -> u64 {
         self.need
             .values()
             .flat_map(|v| v.iter().map(|range| (range.end() - range.start()) + 1))
-            .sum::<i64>()
+            .sum::<u64>()
             + (
                 self.partial_need
                     .values()
@@ -95,13 +96,13 @@ impl SyncStateV1 {
                             ranges.iter().map(|range| (range.end() - range.start()) + 1)
                         })
                     })
-                    .sum::<i64>()
+                    .sum::<u64>()
                     / 50
                 // this is how many chunks we're looking at, kind of random...
             )
     }
 
-    pub fn need_len_for_actor(&self, actor_id: &ActorId) -> i64 {
+    pub fn need_len_for_actor(&self, actor_id: &ActorId) -> u64 {
         self.need
             .get(actor_id)
             .map(|v| {
@@ -113,7 +114,7 @@ impl SyncStateV1 {
             + self
                 .partial_need
                 .get(actor_id)
-                .map(|partials| partials.len() as i64)
+                .map(|partials| partials.len() as u64)
                 .unwrap_or(0)
     }
 
@@ -203,9 +204,9 @@ impl SyncStateV1 {
                                             let end = cmp::min(range.end(), overlap.end());
                                             *start..=*end
                                         })
-                                        .collect::<Vec<RangeInclusive<i64>>>()
+                                        .collect::<Vec<RangeInclusive<CrsqlSeq>>>()
                                 })
-                                .collect::<Vec<RangeInclusive<i64>>>();
+                                .collect::<Vec<RangeInclusive<CrsqlSeq>>>();
 
                             if !seqs.is_empty() {
                                 needs
@@ -244,11 +245,11 @@ impl SyncStateV1 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum SyncNeedV1 {
     Full {
-        versions: RangeInclusive<i64>,
+        versions: RangeInclusive<Version>,
     },
     Partial {
-        version: i64,
-        seqs: Vec<RangeInclusive<i64>>,
+        version: Version,
+        seqs: Vec<RangeInclusive<CrsqlSeq>>,
     },
 }
 
@@ -400,7 +401,7 @@ mod tests {
 
         our_state
             .partial_need
-            .insert(actor1, [(9i64, vec![100..=120, 130..=132])].into());
+            .insert(actor1, [(9u64, vec![100..=120, 130..=132])].into());
 
         assert_eq!(
             our_state.compute_available_needs(&other_state),
@@ -421,7 +422,7 @@ mod tests {
 
         other_state
             .partial_need
-            .insert(actor1, [(9i64, vec![100..=110, 130..=130])].into());
+            .insert(actor1, [(9u64, vec![100..=110, 130..=130])].into());
 
         assert_eq!(
             our_state.compute_available_needs(&other_state),

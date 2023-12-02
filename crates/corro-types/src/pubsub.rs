@@ -14,6 +14,7 @@ use corro_api_types::{
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
+use metrics::counter;
 use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::{
     params_from_iter,
@@ -41,6 +42,7 @@ use uuid::Uuid;
 use crate::{
     agent::SplitPool,
     api::QueryEvent,
+    base::CrsqlDbVersion,
     schema::{Schema, Table},
     sqlite::CrConn,
 };
@@ -157,7 +159,7 @@ impl SubsManager {
         inner.remove(id)
     }
 
-    pub fn match_changes(&self, changes: &[Change], db_version: i64) {
+    pub fn match_changes(&self, changes: &[Change], db_version: CrsqlDbVersion) {
         trace!(
             db_version,
             "trying to match changes to subscribers, len: {}",
@@ -177,11 +179,19 @@ impl SubsManager {
         for (id, handle) in handles.iter() {
             trace!(sub_id = %id, db_version, "attempting to match changes to a subscription");
             let mut candidates = MatchCandidates::new();
+            let mut match_count = 0;
             for change in changes.iter().map(MatchableChange::from) {
-                handle.filter_matchable_change(&mut candidates, change);
+                if handle.filter_matchable_change(&mut candidates, change) {
+                    match_count += 1;
+                }
             }
 
-            trace!(sub_id = %id, db_version, "found {} candidates", candidates.values().map(|pks| pks.len()).sum::<usize>());
+            // metrics...
+            for (table, pks) in candidates.iter() {
+                counter!("corro.subs.changes.matched.count", pks.len() as u64, "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string());
+            }
+
+            trace!(sub_id = %id, db_version, "found {match_count} candidates");
 
             if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
                 error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
@@ -260,11 +270,12 @@ pub struct MatcherHandle {
 struct InnerMatcherHandle {
     id: Uuid,
     sql: String,
+    hash: String,
     pool: sqlite_pool::RusqlitePool,
     parsed: ParsedSelect,
     col_names: Vec<ColumnName>,
     cancel: CancellationToken,
-    changes_tx: mpsc::Sender<(MatchCandidates, i64)>,
+    changes_tx: mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>,
     last_change_rx: watch::Receiver<ChangeId>,
 }
 
@@ -427,14 +438,18 @@ impl MatcherHandle {
         Ok(max_change_id)
     }
 
-    fn filter_matchable_change(&self, candidates: &mut MatchCandidates, change: MatchableChange) {
+    fn filter_matchable_change(
+        &self,
+        candidates: &mut MatchCandidates,
+        change: MatchableChange,
+    ) -> bool {
         // don't double process the same pk
         if candidates
             .get(change.table)
             .map(|pks| pks.contains(change.pk))
             .unwrap_or_default()
         {
-            return;
+            return false;
         }
 
         // don't consider changes that don't have both the table + col in the matcher query
@@ -446,13 +461,14 @@ impl MatcherHandle {
             .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
             .unwrap_or_default()
         {
-            return;
+            return false;
         }
 
         if let Some(v) = candidates.get_mut(change.table) {
-            v.insert(change.pk.to_vec());
+            v.insert(change.pk.to_vec())
         } else {
             candidates.insert(change.table.clone(), [change.pk.to_vec()].into());
+            true
         }
     }
 }
@@ -461,6 +477,7 @@ type StateLock = Arc<(Mutex<MatcherState>, Condvar)>;
 
 pub struct Matcher {
     pub id: Uuid,
+    pub hash: String,
     pub query: Stmt,
     pub cached_statements: HashMap<String, MatcherStmt>,
     pub pks: IndexMap<String, Vec<String>>,
@@ -473,7 +490,7 @@ pub struct Matcher {
     cancel: CancellationToken,
     state: StateLock,
     last_change_tx: watch::Sender<ChangeId>,
-    changes_rx: mpsc::Receiver<(MatchCandidates, i64)>,
+    changes_rx: mpsc::Receiver<(MatchCandidates, CrsqlDbVersion)>,
 }
 
 #[derive(Debug, Clone)]
@@ -652,10 +669,13 @@ impl Matcher {
         // big channel to not miss anything
         let (changes_tx, changes_rx) = mpsc::channel(20480);
 
+        let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
+
         let handle = MatcherHandle {
             inner: Arc::new(InnerMatcherHandle {
                 id,
                 sql: sql.to_owned(),
+                hash: sql_hash.clone(),
                 pool: sqlite_pool::Config::new(sub_db_path.into_std_path_buf())
                     .max_size(5)
                     .read_only()
@@ -672,6 +692,7 @@ impl Matcher {
 
         let matcher = Self {
             id,
+            hash: sql_hash,
             query: stmt,
             cached_statements: statements,
             pks,
@@ -899,10 +920,10 @@ impl Matcher {
         }
 
         let catch_up_res = block_in_place(|| {
-            let db_version: i64 =
+            let db_version: CrsqlDbVersion =
                 state_conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
 
-            let last_db_version: i64 = self.conn.query_row(
+            let last_db_version: CrsqlDbVersion = self.conn.query_row(
                 "SELECT value FROM meta WHERE key = 'db_version'",
                 (),
                 |row| row.get(0),
@@ -965,7 +986,7 @@ impl Matcher {
 
         loop {
             enum Branch {
-                NewCandidates((MatchCandidates, i64)),
+                NewCandidates((MatchCandidates, CrsqlDbVersion)),
                 PurgeOldChanges,
             }
 
@@ -1195,7 +1216,7 @@ impl Matcher {
 
                 tx.execute_batch("DROP TABLE IF EXISTS state_rows;")?;
 
-                let db_version: i64 =
+                let db_version: CrsqlDbVersion =
                     state_tx.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
                 update_last_db_version(&tx, db_version)?;
 
@@ -1283,7 +1304,7 @@ impl Matcher {
         &mut self,
         state_conn: &mut Connection,
         candidates: MatchCandidates,
-        last_db_version: i64,
+        last_db_version: CrsqlDbVersion,
     ) -> Result<(), MatcherError> {
         let mut tables = IndexSet::new();
 
@@ -1551,8 +1572,8 @@ impl Matcher {
     fn handle_change(
         &mut self,
         state_conn: &mut Connection,
-        start_db_version: i64,
-        end_db_version: i64,
+        start_db_version: CrsqlDbVersion,
+        end_db_version: CrsqlDbVersion,
     ) -> Result<(), MatcherError> {
         debug!(sub_id = %self.id, "handling change from version {start_db_version} to {end_db_version}");
 
@@ -1582,7 +1603,10 @@ impl Matcher {
     }
 }
 
-fn update_last_db_version(conn: &Connection, last_db_version: i64) -> rusqlite::Result<()> {
+fn update_last_db_version(
+    conn: &Connection,
+    last_db_version: CrsqlDbVersion,
+) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO meta (key,value) VALUES ('db_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value WHERE excluded.value > value",
         [last_db_version],
@@ -2769,7 +2793,7 @@ mod tests {
         matcher: &MatcherHandle,
         state_conn: &Connection,
         actor_id: Option<ActorId>,
-        db_version: i64,
+        db_version: CrsqlDbVersion,
     ) -> rusqlite::Result<()> {
         let mut candidates = MatchCandidates::new();
 

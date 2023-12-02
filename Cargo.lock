@@ -928,6 +928,7 @@ dependencies = [
  "fallible-iterator 0.3.0",
  "foca",
  "futures",
+ "hex",
  "indexmap 2.1.0",
  "itertools",
  "metrics",

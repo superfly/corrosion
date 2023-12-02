@@ -22,6 +22,7 @@ use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
     actor::{Actor, ActorId},
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
     sync::SyncTraceContextV1,
 };
 
@@ -97,15 +98,15 @@ impl Deref for ChangeV1 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum Changeset {
     Empty {
-        versions: RangeInclusive<i64>,
+        versions: RangeInclusive<Version>,
     },
     Full {
-        version: i64,
+        version: Version,
         changes: Vec<Change>,
         // cr-sqlite sequences contained in this changeset
-        seqs: RangeInclusive<i64>,
+        seqs: RangeInclusive<CrsqlSeq>,
         // last cr-sqlite sequence for the complete changeset
-        last_seq: i64,
+        last_seq: CrsqlSeq,
         ts: Timestamp,
     },
 }
@@ -123,33 +124,33 @@ impl From<ChangesetParts> for Changeset {
 }
 
 pub struct ChangesetParts {
-    pub version: i64,
+    pub version: Version,
     pub changes: Vec<Change>,
-    pub seqs: RangeInclusive<i64>,
-    pub last_seq: i64,
+    pub seqs: RangeInclusive<CrsqlSeq>,
+    pub last_seq: CrsqlSeq,
     pub ts: Timestamp,
 }
 
 impl Changeset {
-    pub fn versions(&self) -> RangeInclusive<i64> {
+    pub fn versions(&self) -> RangeInclusive<Version> {
         match self {
             Changeset::Empty { versions } => versions.clone(),
             Changeset::Full { version, .. } => *version..=*version,
         }
     }
 
-    pub fn max_db_version(&self) -> Option<i64> {
+    pub fn max_db_version(&self) -> Option<CrsqlDbVersion> {
         self.changes().iter().map(|c| c.db_version).max()
     }
 
-    pub fn seqs(&self) -> Option<&RangeInclusive<i64>> {
+    pub fn seqs(&self) -> Option<&RangeInclusive<CrsqlSeq>> {
         match self {
             Changeset::Empty { .. } => None,
             Changeset::Full { seqs, .. } => Some(seqs),
         }
     }
 
-    pub fn last_seq(&self) -> Option<i64> {
+    pub fn last_seq(&self) -> Option<CrsqlSeq> {
         match self {
             Changeset::Empty { .. } => None,
             Changeset::Full { last_seq, .. } => Some(*last_seq),

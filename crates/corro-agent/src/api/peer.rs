@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
 use compact_str::format_compact;
-use corro_types::agent::{Agent, KnownDbVersion, KnownVersion, PartialVersion, SplitPool};
+use corro_types::agent::{
+    Agent, CurrentVersion, KnownDbVersion, KnownVersion, PartialVersion, SplitPool,
+};
+use corro_types::base::{CrsqlSeq, Version};
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
@@ -356,11 +359,11 @@ fn handle_known_version(
     conn: &mut Connection,
     actor_id: ActorId,
     is_local: bool,
-    version: i64,
+    version: Version,
     init_known: KnownDbVersion,
     booked: &Booked,
-    seqs_needed: Vec<RangeInclusive<i64>>,
-    last_seq: i64,
+    seqs_needed: Vec<RangeInclusive<CrsqlSeq>>,
+    last_seq: CrsqlSeq,
     ts: Timestamp,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
@@ -368,7 +371,7 @@ fn handle_known_version(
     let mut seqs_iter = seqs_needed.into_iter();
     while let Some(range_needed) = seqs_iter.by_ref().next() {
         match &init_known {
-            KnownDbVersion::Current { db_version, .. } => {
+            KnownDbVersion::Current(CurrentVersion { db_version, .. }) => {
                 let bw = booked.blocking_write(format_compact!(
                     "sync_handle_known[{version}]:{}",
                     actor_id.as_simple()
@@ -422,14 +425,14 @@ fn handle_known_version(
                     ts,
                 )?;
             }
-            KnownDbVersion::Partial { seqs, .. } => {
+            KnownDbVersion::Partial(PartialVersion { seqs, .. }) => {
                 let mut partial_seqs = seqs.clone();
                 let mut range_needed = range_needed.clone();
 
                 let mut last_sent_seq = None;
 
                 'outer: loop {
-                    let overlapping: Vec<RangeInclusive<i64>> =
+                    let overlapping: Vec<RangeInclusive<CrsqlSeq>> =
                         partial_seqs.overlapping(&range_needed).cloned().collect();
 
                     for range in overlapping {
@@ -486,7 +489,8 @@ fn handle_known_version(
                             drop(bw);
 
                             // restart the seqs_needed here!
-                            let mut seqs_needed: Vec<RangeInclusive<i64>> = seqs_iter.collect();
+                            let mut seqs_needed: Vec<RangeInclusive<CrsqlSeq>> =
+                                seqs_iter.collect();
                             if let Some(new_start_seq) = last_sent_seq.take() {
                                 range_needed = (new_start_seq + 1)..=*range_needed.end();
                             }
@@ -562,18 +566,18 @@ async fn process_version(
     pool: &SplitPool,
     actor_id: ActorId,
     is_local: bool,
-    version: i64,
+    version: Version,
     known_version: KnownDbVersion,
     booked: &Booked,
-    mut seqs_needed: Vec<RangeInclusive<i64>>,
+    mut seqs_needed: Vec<RangeInclusive<CrsqlSeq>>,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
     let mut conn = pool.read().await?;
 
     let (last_seq, ts) = {
         let (last_seq, ts) = match &known_version {
-            KnownDbVersion::Current { last_seq, ts, .. } => (*last_seq, *ts),
-            KnownDbVersion::Partial { last_seq, ts, .. } => (*last_seq, *ts),
+            KnownDbVersion::Current(CurrentVersion { last_seq, ts, .. }) => (*last_seq, *ts),
+            KnownDbVersion::Partial(PartialVersion { last_seq, ts, .. }) => (*last_seq, *ts),
             KnownDbVersion::Cleared => return Ok(()),
         };
         if seqs_needed.is_empty() {
@@ -607,8 +611,8 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     sender: &Sender<SyncMessage>,
     mut chunked: ChunkedChanges<I>,
     actor_id: ActorId,
-    version: i64,
-    last_seq: i64,
+    version: Version,
+    last_seq: CrsqlSeq,
     ts: Timestamp,
 ) -> eyre::Result<()> {
     let mut max_buf_size = chunked.max_buf_size();
@@ -715,7 +719,7 @@ async fn process_sync(
 
             let is_local = actor_id == local_actor_id;
 
-            let mut cleared: RangeInclusiveSet<i64> = RangeInclusiveSet::new();
+            let mut cleared: RangeInclusiveSet<Version> = RangeInclusiveSet::new();
 
             {
                 let read = booked.read("process_need(full)").await;
@@ -827,16 +831,13 @@ async fn process_sync(
 }
 
 fn chunk_range(
-    range: RangeInclusive<i64>,
-    chunk_size: i64,
-) -> impl Iterator<Item = RangeInclusive<i64>> {
-    range
-        .clone()
-        .step_by(chunk_size as usize)
-        .map(move |block_start| {
-            let block_end = (block_start + chunk_size).min(*range.end());
-            block_start..=block_end
-        })
+    range: RangeInclusive<u64>,
+    chunk_size: usize,
+) -> impl Iterator<Item = RangeInclusive<u64>> {
+    range.clone().step_by(chunk_size).map(move |block_start| {
+        let block_end = (block_start + chunk_size as u64).min(*range.end());
+        block_start..=block_end
+    })
 }
 
 fn encode_sync_msg(
@@ -1111,10 +1112,10 @@ pub async fn parallel_sync(
         let mut encode_buf = BytesMut::new();
 
         // already requested full versions
-        let mut req_full: HashMap<ActorId, RangeInclusiveSet<i64>> = HashMap::new();
+        let mut req_full: HashMap<ActorId, RangeInclusiveSet<Version>> = HashMap::new();
 
         // already requested partial version sequences
-        let mut req_partials: HashMap<(ActorId, i64), RangeInclusiveSet<i64>> = HashMap::new();
+        let mut req_partials: HashMap<(ActorId, Version), RangeInclusiveSet<CrsqlSeq>> = HashMap::new();
 
         let start = Instant::now();
 
@@ -1607,17 +1608,17 @@ mod tests {
         )
         .await?;
 
-        let known1 = KnownDbVersion::Current {
+        let known1 = KnownDbVersion::Current(CurrentVersion {
             db_version: 1,
             last_seq: 0,
             ts,
-        };
+        });
 
-        let known2 = KnownDbVersion::Current {
+        let known2 = KnownDbVersion::Current(CurrentVersion {
             db_version: 2,
             last_seq: 0, // original last seq
             ts,
-        };
+        });
 
         let booked = agent
             .bookie()

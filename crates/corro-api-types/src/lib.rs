@@ -218,8 +218,10 @@ pub struct Change {
     pub cid: ColumnName,
     pub val: SqliteValue,
     pub col_version: i64,
-    pub db_version: i64,
-    pub seq: i64,
+    // TODO: use CrsqlDbVersion
+    pub db_version: u64,
+    // TODO: use CrsqlSeq
+    pub seq: u64,
     pub site_id: [u8; 16],
     pub cl: i64,
 }

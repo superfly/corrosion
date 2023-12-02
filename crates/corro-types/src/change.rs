@@ -3,12 +3,14 @@ use std::{iter::Peekable, ops::RangeInclusive};
 pub use corro_api_types::{row_to_change, Change, SqliteValue};
 use tracing::trace;
 
+use crate::base::CrsqlSeq;
+
 pub struct ChunkedChanges<I: Iterator> {
     iter: Peekable<I>,
     changes: Vec<Change>,
-    last_pushed_seq: i64,
-    last_start_seq: i64,
-    last_seq: i64,
+    last_pushed_seq: CrsqlSeq,
+    last_start_seq: CrsqlSeq,
+    last_seq: CrsqlSeq,
     max_buf_size: usize,
     buffered_size: usize,
     done: bool,
@@ -18,7 +20,7 @@ impl<I> ChunkedChanges<I>
 where
     I: Iterator,
 {
-    pub fn new(iter: I, start_seq: i64, last_seq: i64, max_buf_size: usize) -> Self {
+    pub fn new(iter: I, start_seq: CrsqlSeq, last_seq: CrsqlSeq, max_buf_size: usize) -> Self {
         Self {
             iter: iter.peekable(),
             changes: vec![],
@@ -44,7 +46,7 @@ impl<I> Iterator for ChunkedChanges<I>
 where
     I: Iterator<Item = rusqlite::Result<Change>>,
 {
-    type Item = Result<(Vec<Change>, RangeInclusive<i64>), rusqlite::Error>;
+    type Item = Result<(Vec<Change>, RangeInclusive<CrsqlSeq>), rusqlite::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // previously marked as done because the Rows iterator returned None

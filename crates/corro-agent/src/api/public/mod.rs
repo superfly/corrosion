@@ -4,8 +4,9 @@ use axum::{response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
-    agent::{Agent, ChangeError, KnownDbVersion},
+    agent::{Agent, ChangeError, CurrentVersion, KnownDbVersion},
     api::{row_to_change, ColumnName, ExecResponse, ExecResult, QueryEvent, Statement},
+    base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{ChunkedChanges, SqliteValue, MAX_CHANGES_BYTE_SIZE},
     schema::{apply_schema, parse_sql},
@@ -63,7 +64,7 @@ where
 
         let ts = Timestamp::from(agent.clock().new_timestamp());
 
-        let db_version: i64 = tx
+        let db_version: CrsqlDbVersion = tx
             .prepare_cached("SELECT crsql_next_db_version()")?
             .query_row((), |row| row.get(0))?;
 
@@ -83,7 +84,7 @@ where
         let version = last_version + 1;
         trace!("version: {version}");
 
-        let last_seq: i64 = tx
+        let last_seq: CrsqlSeq = tx
             .prepare_cached(
                 "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
             )?
@@ -114,11 +115,11 @@ where
 
         book_writer.insert(
             version,
-            KnownDbVersion::Current {
+            KnownDbVersion::Current(CurrentVersion {
                 db_version,
                 last_seq,
                 ts,
-            },
+            }),
         );
         drop(book_writer);
 
