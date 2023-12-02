@@ -589,7 +589,7 @@ pub async fn catch_up_sub(
         }
     };
 
-    forward_sub_to_sender(matcher.id(), sub_rx, evt_tx, params.skip_rows).await
+    forward_sub_to_sender(matcher, sub_rx, evt_tx, params.skip_rows).await
 }
 
 pub async fn upsert_sub(
@@ -608,7 +608,7 @@ pub async fn upsert_sub(
         let (sub_tx, sub_rx) = broadcast::channel(10240);
 
         tokio::spawn(forward_sub_to_sender(
-            handle.id(),
+            handle.clone(),
             sub_rx,
             tx,
             params.skip_rows,
@@ -703,13 +703,28 @@ pub async fn api_v1_subs(
 const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 
 async fn forward_sub_to_sender(
-    sub_id: Uuid,
+    handle: MatcherHandle,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
     skip_rows: bool,
 ) {
-    info!(%sub_id, "forwarding subscription events to a sender");
-    while let Ok((event_buf, meta)) = sub_rx.recv().await {
+    info!(sub_id = %handle.id(), "forwarding subscription events to a sender");
+
+    loop {
+        let (event_buf, meta) = tokio::select! {
+            Ok((event_buf, meta)) = sub_rx.recv() => {
+                (event_buf, meta)
+            },
+            _ = handle.cancelled() => {
+                info!(sub_id = %handle.id(), "subscription cancelled, aborting forwarding bytes to subscriber");
+                return;
+            },
+            else => {
+                info!(sub_id = %handle.id(), "events subcription ran out");
+                return;
+            }
+        };
+
         if skip_rows
             && matches!(
                 meta,
@@ -719,11 +734,10 @@ async fn forward_sub_to_sender(
             continue;
         }
         if let Err(e) = tx.send((event_buf, meta)).await {
-            warn!(%sub_id, "could not send subscription event to channel: {e}");
+            warn!(sub_id = %handle.id(), "could not send subscription event to channel: {e}");
             return;
         }
     }
-    info!(%sub_id, "events subcription ran out");
 }
 
 async fn forward_bytes_to_body_sender(
