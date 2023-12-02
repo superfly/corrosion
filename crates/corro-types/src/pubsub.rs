@@ -33,7 +33,7 @@ use tokio::{
     sync::{mpsc, watch, AcquireError},
     task::block_in_place,
 };
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFuture};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 use uuid::Uuid;
@@ -300,8 +300,8 @@ impl MatcherHandle {
         }
     }
 
-    pub fn cancellation_token(&self) -> CancellationToken {
-        self.inner.cancel.clone()
+    pub fn cancelled(&self) -> WaitForCancellationFuture {
+        self.inner.cancel.cancelled()
     }
 
     pub fn max_change_id(&self, conn: &Connection) -> rusqlite::Result<ChangeId> {
