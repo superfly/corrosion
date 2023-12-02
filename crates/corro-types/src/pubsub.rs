@@ -484,7 +484,7 @@ pub struct Matcher {
     pub parsed: ParsedSelect,
     pub evt_tx: mpsc::Sender<QueryEvent>,
     pub col_names: Vec<ColumnName>,
-    pub last_rowid: i64,
+    pub last_rowid: u64,
     conn: Connection,
     base_path: Utf8PathBuf,
     cancel: CancellationToken,

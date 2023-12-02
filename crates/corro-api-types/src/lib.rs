@@ -60,7 +60,7 @@ pub enum QueryEventMeta {
     Debug, Clone, Copy, Serialize, Deserialize, Readable, Writable, PartialEq, Eq, Ord, PartialOrd,
 )]
 #[serde(transparent)]
-pub struct RowId(pub i64);
+pub struct RowId(pub u64);
 
 impl fmt::Display for RowId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -68,18 +68,15 @@ impl fmt::Display for RowId {
     }
 }
 
-impl From<i64> for RowId {
-    fn from(value: i64) -> Self {
+impl From<u64> for RowId {
+    fn from(value: u64) -> Self {
         Self(value)
     }
 }
 
 impl FromSql for RowId {
     fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        match value {
-            ValueRef::Integer(i) => Ok(i.into()),
-            _ => Err(FromSqlError::InvalidType),
-        }
+        u64::column_result(value).map(Self)
     }
 }
 
@@ -105,7 +102,7 @@ impl ToSql for RowId {
     PartialOrd,
 )]
 #[serde(transparent)]
-pub struct ChangeId(pub i64);
+pub struct ChangeId(pub u64);
 
 impl ChangeId {
     pub fn is_zero(&self) -> bool {
@@ -119,18 +116,15 @@ impl fmt::Display for ChangeId {
     }
 }
 
-impl From<i64> for ChangeId {
-    fn from(value: i64) -> Self {
+impl From<u64> for ChangeId {
+    fn from(value: u64) -> Self {
         Self(value)
     }
 }
 
 impl FromSql for ChangeId {
     fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        match value {
-            ValueRef::Integer(i) => Ok(i.into()),
-            _ => Err(FromSqlError::InvalidType),
-        }
+        u64::column_result(value).map(Self)
     }
 }
 
@@ -140,8 +134,8 @@ impl ToSql for ChangeId {
     }
 }
 
-impl AddAssign<i64> for ChangeId {
-    fn add_assign(&mut self, rhs: i64) {
+impl AddAssign<u64> for ChangeId {
+    fn add_assign(&mut self, rhs: u64) {
         self.0 += rhs
     }
 }
@@ -152,10 +146,10 @@ impl AddAssign<Self> for ChangeId {
     }
 }
 
-impl std::ops::Add<i64> for ChangeId {
+impl std::ops::Add<u64> for ChangeId {
     type Output = ChangeId;
 
-    fn add(self, rhs: i64) -> Self::Output {
+    fn add(self, rhs: u64) -> Self::Output {
         ChangeId(self.0 + rhs)
     }
 }
