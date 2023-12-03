@@ -1607,6 +1607,9 @@ fn store_empty_changeset(
                     -- range being inserted is partially contained within another
                     ( start_version <= :end AND end_version >= :end ) OR
 
+                    -- start_version = end + 1 (to collapse ranges)
+                    ( start_version = :end + 1 AND end_version IS NOT NULL ) OR
+
                     -- end_version = start - 1 (to collapse ranges)
                     ( end_version = :start - 1 )
                 )
@@ -3916,6 +3919,48 @@ pub mod tests {
                 actor_id,
                 start_version: Version(1),
                 end_version: Some(Version(14))
+            }
+        );
+
+        conn.execute(
+            "INSERT INTO __corro_bookkeeping (actor_id, start_version) VALUES (?, 15)",
+            [actor_id],
+        )?;
+        conn.execute(
+            "INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, 16, 18)",
+            [actor_id],
+        )?;
+
+        {
+            let tx = conn.transaction()?;
+            assert_eq!(
+                store_empty_changeset(&tx, actor_id, Version(15)..=Version(15))?,
+                1
+            );
+            tx.commit()?;
+        }
+
+        let rows = conn
+            .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+            .query_map([], |row| {
+                Ok(CorroBook {
+                    actor_id: row.get(0)?,
+                    start_version: row.get(1)?,
+                    end_version: row.get(2)?,
+                })
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        println!("rows: {rows:?}");
+
+        assert_eq!(rows.len(), 1);
+
+        assert_eq!(
+            rows[0],
+            CorroBook {
+                actor_id,
+                start_version: Version(1),
+                end_version: Some(Version(18))
             }
         );
 
