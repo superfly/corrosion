@@ -1591,7 +1591,7 @@ fn store_empty_changeset(
     versions: RangeInclusive<Version>,
 ) -> eyre::Result<usize> {
     // first, delete "current" versions, they're now gone!
-    let deleted: Vec<(Version, Option<Version>)> = conn
+    let deleted: Vec<RangeInclusive<Version>> = conn
         .prepare_cached(
             "
         DELETE FROM __corro_bookkeeping 
@@ -1618,7 +1618,10 @@ fn store_empty_changeset(
                 ":start": versions.start(),
                 ":end": versions.end(),
             ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                let start = row.get(0)?;
+                Ok(start..=row.get::<_, Option<Version>>(1)?.unwrap_or(start))
+            },
         )
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
 
@@ -1630,12 +1633,8 @@ fn store_empty_changeset(
     }
 
     // re-compute the ranges
-    let mut new_ranges = RangeInclusiveSet::new();
+    let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
     new_ranges.insert(versions);
-
-    for (start, end) in deleted {
-        new_ranges.insert(start..=end.unwrap_or(start));
-    }
 
     // we should never have deleted non-contiguous ranges, abort!
     if new_ranges.len() > 1 {
