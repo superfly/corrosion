@@ -38,6 +38,7 @@ use tripwire::Tripwire;
 
 use crate::{
     actor::ActorId,
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     config::Config,
     pubsub::SubsManager,
@@ -61,9 +62,9 @@ pub struct AgentConfig {
     pub bookie: Bookie,
 
     pub tx_bcast: Sender<BroadcastInput>,
-    pub tx_apply: Sender<(ActorId, i64)>,
-    pub tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
-    pub tx_clear_buf: Sender<(ActorId, RangeInclusive<i64>)>,
+    pub tx_apply: Sender<(ActorId, Version)>,
+    pub tx_empty: Sender<(ActorId, RangeInclusive<Version>)>,
+    pub tx_clear_buf: Sender<(ActorId, RangeInclusive<Version>)>,
     pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
     pub tx_foca: Sender<FocaInput>,
 
@@ -86,9 +87,9 @@ pub struct AgentInner {
     clock: Arc<uhlc::HLC>,
     bookie: Bookie,
     tx_bcast: Sender<BroadcastInput>,
-    tx_apply: Sender<(ActorId, i64)>,
-    tx_empty: Sender<(ActorId, RangeInclusive<i64>)>,
-    tx_clear_buf: Sender<(ActorId, RangeInclusive<i64>)>,
+    tx_apply: Sender<(ActorId, Version)>,
+    tx_empty: Sender<(ActorId, RangeInclusive<Version>)>,
+    tx_clear_buf: Sender<(ActorId, RangeInclusive<Version>)>,
     tx_changes: Sender<(ChangeV1, ChangeSource)>,
     tx_foca: Sender<FocaInput>,
     write_sema: Arc<Semaphore>,
@@ -152,7 +153,7 @@ impl Agent {
         &self.0.tx_bcast
     }
 
-    pub fn tx_apply(&self) -> &Sender<(ActorId, i64)> {
+    pub fn tx_apply(&self) -> &Sender<(ActorId, Version)> {
         &self.0.tx_apply
     }
 
@@ -160,11 +161,11 @@ impl Agent {
         &self.0.tx_changes
     }
 
-    pub fn tx_empty(&self) -> &Sender<(ActorId, RangeInclusive<i64>)> {
+    pub fn tx_empty(&self) -> &Sender<(ActorId, RangeInclusive<Version>)> {
         &self.0.tx_empty
     }
 
-    pub fn tx_clear_buf(&self) -> &Sender<(ActorId, RangeInclusive<i64>)> {
+    pub fn tx_clear_buf(&self) -> &Sender<(ActorId, RangeInclusive<Version>)> {
         &self.0.tx_clear_buf
     }
 
@@ -578,22 +579,8 @@ impl DerefMut for WriteConn {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum KnownDbVersion {
-    Partial {
-        // range of sequences recorded
-        seqs: RangeInclusiveSet<i64>,
-        // actual last sequence originally produced
-        last_seq: i64,
-        // timestamp when the change was produced by the source
-        ts: Timestamp,
-    },
-    Current {
-        // cr-sqlite db version
-        db_version: i64,
-        // actual last sequence originally produced
-        last_seq: i64,
-        // timestamp when the change was produced by the source
-        ts: Timestamp,
-    },
+    Partial(PartialVersion),
+    Current(CurrentVersion),
     Cleared,
 }
 
@@ -909,9 +896,9 @@ impl Drop for LockTracker {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CurrentVersion {
     // cr-sqlite db version
-    pub db_version: i64,
+    pub db_version: CrsqlDbVersion,
     // actual last sequence originally produced
-    pub last_seq: i64,
+    pub last_seq: CrsqlSeq,
     // timestamp when the change was produced by the source
     pub ts: Timestamp,
 }
@@ -919,16 +906,16 @@ pub struct CurrentVersion {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PartialVersion {
     // range of sequences recorded
-    pub seqs: RangeInclusiveSet<i64>,
+    pub seqs: RangeInclusiveSet<CrsqlSeq>,
     // actual last sequence originally produced
-    pub last_seq: i64,
+    pub last_seq: CrsqlSeq,
     // timestamp when the change was produced by the source
     pub ts: Timestamp,
 }
 
 impl From<PartialVersion> for KnownDbVersion {
-    fn from(PartialVersion { seqs, last_seq, ts }: PartialVersion) -> Self {
-        KnownDbVersion::Partial { seqs, last_seq, ts }
+    fn from(partial: PartialVersion) -> Self {
+        KnownDbVersion::Partial(partial)
     }
 }
 
@@ -949,43 +936,29 @@ impl<'a> From<KnownVersion<'a>> for KnownDbVersion {
     fn from(value: KnownVersion<'a>) -> Self {
         match value {
             KnownVersion::Cleared => KnownDbVersion::Cleared,
-            KnownVersion::Current(CurrentVersion {
-                db_version,
-                last_seq,
-                ts,
-            }) => KnownDbVersion::Current {
-                db_version: *db_version,
-                last_seq: *last_seq,
-                ts: *ts,
-            },
-            KnownVersion::Partial(PartialVersion { seqs, last_seq, ts }) => {
-                KnownDbVersion::Partial {
-                    seqs: seqs.clone(),
-                    last_seq: *last_seq,
-                    ts: *ts,
-                }
-            }
+            KnownVersion::Current(current) => KnownDbVersion::Current(current.clone()),
+            KnownVersion::Partial(partial) => KnownDbVersion::Partial(partial.clone()),
         }
     }
 }
 
 #[derive(Default, Clone)]
 pub struct BookedVersions {
-    pub cleared: RangeInclusiveSet<i64>,
-    pub current: BTreeMap<i64, CurrentVersion>,
-    pub partials: BTreeMap<i64, PartialVersion>,
-    sync_need: RangeInclusiveSet<i64>,
-    last: Option<i64>,
+    pub cleared: RangeInclusiveSet<Version>,
+    pub current: BTreeMap<Version, CurrentVersion>,
+    pub partials: BTreeMap<Version, PartialVersion>,
+    sync_need: RangeInclusiveSet<Version>,
+    last: Option<Version>,
 }
 
 impl BookedVersions {
-    pub fn contains_version(&self, version: &i64) -> bool {
+    pub fn contains_version(&self, version: &Version) -> bool {
         self.cleared.contains(version)
             || self.current.contains_key(version)
             || self.partials.contains_key(version)
     }
 
-    pub fn get(&self, version: &i64) -> Option<KnownVersion> {
+    pub fn get(&self, version: &Version) -> Option<KnownVersion> {
         self.cleared
             .get(version)
             .map(|_| KnownVersion::Cleared)
@@ -993,7 +966,7 @@ impl BookedVersions {
             .or_else(|| self.partials.get(version).map(KnownVersion::Partial))
     }
 
-    pub fn contains(&self, version: i64, seqs: Option<&RangeInclusive<i64>>) -> bool {
+    pub fn contains(&self, version: Version, seqs: Option<&RangeInclusive<CrsqlSeq>>) -> bool {
         self.contains_version(&version)
             && seqs
                 .map(|check_seqs| match self.get(&version) {
@@ -1008,52 +981,44 @@ impl BookedVersions {
 
     pub fn contains_all(
         &self,
-        mut versions: RangeInclusive<i64>,
-        seqs: Option<&RangeInclusive<i64>>,
+        mut versions: RangeInclusive<Version>,
+        seqs: Option<&RangeInclusive<CrsqlSeq>>,
     ) -> bool {
         versions.all(|version| self.contains(version, seqs))
     }
 
-    pub fn contains_current(&self, version: &i64) -> bool {
+    pub fn contains_current(&self, version: &Version) -> bool {
         self.current.contains_key(version)
     }
 
-    pub fn current_versions(&self) -> BTreeMap<i64, i64> {
+    pub fn current_versions(&self) -> BTreeMap<CrsqlDbVersion, Version> {
         self.current
             .iter()
             .map(|(version, current)| (current.db_version, *version))
             .collect()
     }
 
-    pub fn last(&self) -> Option<i64> {
+    pub fn last(&self) -> Option<Version> {
         self.last
     }
 
-    pub fn insert(&mut self, version: i64, known_version: KnownDbVersion) {
+    pub fn insert(&mut self, version: Version, known_version: KnownDbVersion) {
         self.insert_many(version..=version, known_version);
     }
 
-    pub fn insert_many(&mut self, versions: RangeInclusive<i64>, known_version: KnownDbVersion) {
+    pub fn insert_many(
+        &mut self,
+        versions: RangeInclusive<Version>,
+        known_version: KnownDbVersion,
+    ) {
         match known_version {
-            KnownDbVersion::Partial { seqs, last_seq, ts } => {
-                self.partials
-                    .insert(*versions.start(), PartialVersion { seqs, last_seq, ts });
+            KnownDbVersion::Partial(partial) => {
+                self.partials.insert(*versions.start(), partial);
             }
-            KnownDbVersion::Current {
-                db_version,
-                last_seq,
-                ts,
-            } => {
+            KnownDbVersion::Current(current) => {
                 let version = *versions.start();
                 self.partials.remove(&version);
-                self.current.insert(
-                    version,
-                    CurrentVersion {
-                        db_version,
-                        last_seq,
-                        ts,
-                    },
-                );
+                self.current.insert(version, current);
             }
             KnownDbVersion::Cleared => {
                 for version in versions.clone() {
@@ -1081,7 +1046,7 @@ impl BookedVersions {
         self.sync_need.remove(versions);
     }
 
-    pub fn sync_need(&self) -> &RangeInclusiveSet<i64> {
+    pub fn sync_need(&self) -> &RangeInclusiveSet<Version> {
         &self.sync_need
     }
 }

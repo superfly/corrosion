@@ -24,9 +24,10 @@ use arc_swap::ArcSwap;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
-        migrate, Agent, AgentConfig, BookedVersions, Bookie, ChangeError, KnownDbVersion,
-        PartialVersion, SplitPool,
+        migrate, Agent, AgentConfig, BookedVersions, Bookie, ChangeError, CurrentVersion,
+        KnownDbVersion, PartialVersion, SplitPool,
     },
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{
         BiPayload, BiPayloadV1, BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset,
         ChangesetParts, FocaInput, Timestamp, UniPayload, UniPayloadV1,
@@ -91,9 +92,9 @@ pub struct AgentOptions {
     pub transport: Transport,
     pub api_listener: TcpListener,
     pub rx_bcast: Receiver<BroadcastInput>,
-    pub rx_apply: Receiver<(ActorId, i64)>,
-    pub rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
-    pub rx_clear_buf: Receiver<(ActorId, RangeInclusive<i64>)>,
+    pub rx_apply: Receiver<(ActorId, Version)>,
+    pub rx_empty: Receiver<(ActorId, RangeInclusive<Version>)>,
+    pub rx_clear_buf: Receiver<(ActorId, RangeInclusive<Version>)>,
     pub rx_changes: Receiver<(ChangeV1, ChangeSource)>,
     pub rx_foca: Receiver<FocaInput>,
     pub rtt_rx: Receiver<(SocketAddr, Duration)>,
@@ -168,15 +169,15 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                         let actor_id = row.get(0)?;
                         let ranges = bk.entry(actor_id).or_default();
                         let start_v = row.get(1)?;
-                        let end_v: Option<i64> = row.get(2)?;
+                        let end_v: Option<Version> = row.get(2)?;
                         ranges.insert_many(
                             start_v..=end_v.unwrap_or(start_v),
                             match row.get(3)? {
-                                Some(db_version) => KnownDbVersion::Current {
+                                Some(db_version) => KnownDbVersion::Current(CurrentVersion {
                                     db_version,
                                     last_seq: row.get(4)?,
                                     ts: row.get(5)?,
-                                },
+                                }),
                                 None => {
                                     *cleared_rows.entry(actor_id).or_default() += 1;
                                     KnownDbVersion::Cleared
@@ -187,8 +188,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 }
             }
 
-            let mut partials: HashMap<(ActorId, i64), (RangeInclusiveSet<i64>, i64, Timestamp)> =
-                HashMap::new();
+            let mut partials: HashMap<
+                (ActorId, Version),
+                (RangeInclusiveSet<CrsqlSeq>, CrsqlSeq, Timestamp),
+            > = HashMap::new();
 
             debug!("getting seq bookkept rows");
 
@@ -216,22 +219,25 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             debug!("filling up partial known versions");
 
             for ((actor_id, version), (seqs, last_seq, ts)) in partials {
-                debug!(%actor_id, version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
+                debug!(%actor_id, %version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
                 let ranges = bk.entry(actor_id).or_default();
 
                 if let Some(known) = ranges.get(&version) {
-                    warn!(%actor_id, version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
+                    warn!(%actor_id, %version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
 
                     _ = tx_clear_buf.try_send((actor_id, version..=version));
                     continue;
                 }
 
-                let gaps_count = seqs.gaps(&(0..=last_seq)).count();
+                let gaps_count = seqs.gaps(&(CrsqlSeq(0)..=last_seq)).count();
 
-                ranges.insert(version, KnownDbVersion::Partial { seqs, last_seq, ts });
+                ranges.insert(
+                    version,
+                    KnownDbVersion::Partial(PartialVersion { seqs, last_seq, ts }),
+                );
 
                 if gaps_count == 0 {
-                    info!(%actor_id, version, "found fully buffered, unapplied, changes! scheduling apply");
+                    info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
                     // spawn this because it can block if the channel gets full, nothing is draining it yet!
                     tokio::spawn({
                         let tx_apply = tx_apply.clone();
@@ -1011,6 +1017,9 @@ async fn clear_overwritten_versions(agent: Agent) {
         let mut db_elapsed = Duration::new(0, 0);
 
         for (actor_id, booked) in bookie_clone {
+            // pull the current db version -> version map at the present time
+            // these are only updated _after_ a transaction has been committed, via a write lock
+            // so it should be representative of the current state.
             let mut versions = {
                 match timeout(
                     Duration::from_secs(1),
@@ -1033,11 +1042,13 @@ async fn clear_overwritten_versions(agent: Agent) {
                 continue;
             }
 
+            // we're using a read connection here, starting a read-only transaction
+            // this should be representative of the state of current versions from the actor
             let cleared_versions = match pool.read().await {
                 Ok(mut conn) => {
                     let start = Instant::now();
                     let res = block_in_place(|| {
-                        let tx = conn.immediate_transaction()?;
+                        let tx = conn.transaction()?;
                         find_cleared_db_versions(&tx, &actor_id)
                     });
                     db_elapsed += start.elapsed();
@@ -1063,35 +1074,42 @@ async fn clear_overwritten_versions(agent: Agent) {
                 }
             };
 
-            let mut to_clear = Vec::new();
+            if !cleared_versions.is_empty() {
+                let mut to_clear = Vec::new();
 
-            for db_v in cleared_versions {
-                if let Some(v) = versions.remove(&db_v) {
-                    to_clear.push((db_v, v))
-                }
-            }
-
-            if !to_clear.is_empty() {
-                let mut bookedw = booked
-                    .write(format!("clearing:{}", actor_id.as_simple()))
-                    .await;
-
-                for (_db_v, v) in to_clear.iter() {
-                    if bookedw.contains_current(v) {
-                        bookedw.insert(*v, KnownDbVersion::Cleared);
-                        deleted += 1;
+                for db_v in cleared_versions {
+                    if let Some(v) = versions.remove(&db_v) {
+                        to_clear.push((db_v, v))
                     }
                 }
 
-                for range in to_clear
-                    .iter()
-                    .filter_map(|(_, v)| bookedw.cleared.get(v))
-                    .dedup()
-                {
-                    if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
-                        error!("could not schedule version to be cleared: {e}");
-                    } else {
-                        inserted += 1;
+                if !to_clear.is_empty() {
+                    // use a write lock here so we can mutate the bookkept state
+                    let mut bookedw = booked
+                        .write(format!("clearing:{}", actor_id.as_simple()))
+                        .await;
+
+                    for (_db_v, v) in to_clear.iter() {
+                        // only remove when confirming that version is still considered "current"
+                        if bookedw.contains_current(v) {
+                            // set it as cleared right away
+                            bookedw.insert(*v, KnownDbVersion::Cleared);
+                            deleted += 1;
+                        }
+                    }
+
+                    // find any affected cleared ranges
+                    for range in to_clear
+                        .iter()
+                        .filter_map(|(_, v)| bookedw.cleared.get(v))
+                        .dedup()
+                    {
+                        // schedule for clearing in the background task
+                        if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
+                            error!("could not schedule version to be cleared: {e}");
+                        } else {
+                            inserted += 1;
+                        }
                     }
                 }
             }
@@ -1116,8 +1134,6 @@ async fn metrics_loop(agent: Agent, transport: Transport) {
         block_in_place(|| collect_metrics(&agent, &transport));
     }
 }
-
-// const MAX_COUNT_TO_HASH: i64 = 500_000;
 
 fn collect_metrics(agent: &Agent, transport: &Transport) {
     agent.pool().emit_metrics();
@@ -1234,8 +1250,8 @@ pub async fn handle_change(agent: &Agent, bcast: BroadcastV1, bcast_msg_tx: &Sen
 fn find_cleared_db_versions(
     tx: &Transaction,
     actor_id: &ActorId,
-) -> rusqlite::Result<BTreeSet<i64>> {
-    let clock_site_id: Option<i64> = match tx
+) -> rusqlite::Result<BTreeSet<CrsqlDbVersion>> {
+    let clock_site_id: Option<u64> = match tx
         .prepare_cached("SELECT ordinal FROM crsql_site_id WHERE site_id = ?")?
         .query_row([actor_id], |row| row.get(0))
         .optional()?
@@ -1256,6 +1272,7 @@ fn find_cleared_db_versions(
         .collect::<Result<BTreeSet<String>, _>>()?;
 
     if tables.is_empty() {
+        // means there's no schema trakced by cr-sqlite or corrosion.
         return Ok(BTreeSet::new());
     }
 
@@ -1273,7 +1290,7 @@ fn find_cleared_db_versions(
             .join(" UNION ")
     );
 
-    let cleared_db_versions: BTreeSet<i64> = tx
+    let cleared_db_versions: BTreeSet<CrsqlDbVersion> = tx
         .prepare_cached(&to_clear_query)?
         .query_map(params_from_iter(params.into_iter()), |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -1569,50 +1586,79 @@ async fn resolve_bootstrap(
 }
 
 fn store_empty_changeset(
-    tx: &Transaction,
+    conn: &Connection,
     actor_id: ActorId,
-    versions: RangeInclusive<i64>,
-) -> Result<usize, rusqlite::Error> {
+    versions: RangeInclusive<Version>,
+) -> eyre::Result<usize> {
     // first, delete "current" versions, they're now gone!
-    let deleted = tx
+    let deleted: Vec<RangeInclusive<Version>> = conn
         .prepare_cached(
             "
         DELETE FROM __corro_bookkeeping 
             WHERE
-                actor_id = ?
-            AND start_version >= ?
-            AND start_version <= ?
-            AND (
-                end_version IS NULL
-             OR end_version <= ? -- collapse start..=end ranges
-            )",
-        )?
-        .execute(params![
-            actor_id,
-            versions.start(),
-            versions.end(),
-            versions.end()
-        ])?;
+                actor_id = :actor_id AND
+                (
+                    -- start_version is between start and end of range AND no end_version
+                    ( start_version BETWEEN :start AND :end AND end_version IS NULL ) OR
+                    
+                    -- start_version and end_version are within the range
+                    ( start_version >= :start AND end_version <= :end ) OR
 
-    if deleted > 0 {
-        debug!("deleted {deleted} still-live versions from database's bookkeeping");
+                    -- range being inserted is partially contained within another
+                    ( start_version <= :end AND end_version >= :end ) OR
+
+                    -- start_version = end + 1 (to collapse ranges)
+                    ( start_version = :end + 1 AND end_version IS NOT NULL ) OR
+
+                    -- end_version = start - 1 (to collapse ranges)
+                    ( end_version = :start - 1 )
+                )
+            RETURNING start_version, end_version",
+        )?
+        .query_map(
+            named_params![
+                ":actor_id": actor_id,
+                ":start": versions.start(),
+                ":end": versions.end(),
+            ],
+            |row| {
+                let start = row.get(0)?;
+                Ok(start..=row.get::<_, Option<Version>>(1)?.unwrap_or(start))
+            },
+        )
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+    if !deleted.is_empty() {
+        debug!(
+            "deleted {} still-live versions from database's bookkeeping",
+            deleted.len()
+        );
     }
 
-    // insert cleared versions
-    let inserted = tx
+    // re-compute the ranges
+    let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
+    new_ranges.insert(versions);
+
+    // we should never have deleted non-contiguous ranges, abort!
+    if new_ranges.len() > 1 {
+        warn!("deleted non-contiguous ranges! {new_ranges:?}");
+        // this serves as a failsafe
+        eyre::bail!("deleted non-contiguous ranges: {new_ranges:?}");
+    }
+
+    let mut inserted = 0;
+
+    for range in new_ranges {
+        // insert cleared versions
+        inserted += conn
         .prepare_cached(
             "
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, last_seq, ts)
-                    VALUES (?, ?, ?, NULL, NULL, NULL)
-                    ON CONFLICT (actor_id, start_version) DO UPDATE SET
-                        end_version = excluded.end_version,
-                        db_version = NULL,
-                        last_seq = NULL,
-                        ts = NULL
-                    WHERE end_version < excluded.end_version;
+                    VALUES (?, ?, ?, NULL, NULL, NULL);
             ",
         )?
-        .execute(params![actor_id, versions.start(), versions.end()])?;
+        .execute(params![actor_id, range.start(), range.end()])?;
+    }
 
     Ok(inserted)
 }
@@ -1621,10 +1667,10 @@ fn store_empty_changeset(
 async fn process_fully_buffered_changes(
     agent: &Agent,
     actor_id: ActorId,
-    version: i64,
+    version: Version,
 ) -> Result<bool, ChangeError> {
     let mut conn = agent.pool().write_normal().await?;
-    debug!(%actor_id, version, "acquired write (normal) connection to process fully buffered changes");
+    debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
 
     let booked = {
         agent
@@ -1643,14 +1689,14 @@ async fn process_fully_buffered_changes(
             actor_id.as_simple()
         ))
         .await;
-    debug!(%actor_id, version, "acquired Booked write lock to process fully buffered changes");
+    debug!(%actor_id, %version, "acquired Booked write lock to process fully buffered changes");
 
     let inserted = block_in_place(|| {
         let (last_seq, ts) = {
             match bookedw.partials.get(&version) {
                 Some(PartialVersion { seqs, last_seq, ts }) => {
-                    if seqs.gaps(&(0..=*last_seq)).count() != 0 {
-                        error!(%actor_id, version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(0..=*last_seq)).collect::<RangeInclusiveSet<i64>>());
+                    if seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).count() != 0 {
+                        error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
                         // TODO: return an error here
                         return Ok(false);
                     }
@@ -1665,9 +1711,9 @@ async fn process_fully_buffered_changes(
 
         let tx = conn.immediate_transaction()?;
 
-        info!(%actor_id, version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+        info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
-        let max_db_version: Option<Option<i64>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional()?;
+        let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional()?;
 
         let start = Instant::now();
 
@@ -1685,9 +1731,9 @@ async fn process_fully_buffered_changes(
                             "#,
             )?
             .execute(params![max_db_version, actor_id.as_bytes(), version])?;
-            info!(%actor_id, version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+            info!(%actor_id, %version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
         } else {
-            info!(%actor_id, version, "No buffered rows, skipped insertion into crsql_changes");
+            info!(%actor_id, %version, "No buffered rows, skipped insertion into crsql_changes");
         }
 
         if let Err(e) = agent.tx_clear_buf().try_send((actor_id, version..=version)) {
@@ -1698,10 +1744,10 @@ async fn process_fully_buffered_changes(
             .prepare_cached("SELECT crsql_rows_impacted()")?
             .query_row((), |row| row.get(0))?;
 
-        debug!(%actor_id, version, "rows impacted by buffered changes insertion: {rows_impacted}");
+        debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
         let known_version = if rows_impacted > 0 {
-            let db_version: i64 =
+            let db_version: CrsqlDbVersion =
                 tx.query_row("SELECT crsql_next_db_version()", [], |row| row.get(0))?;
             debug!("db version: {db_version}");
 
@@ -1725,19 +1771,19 @@ async fn process_fully_buffered_changes(
                 ":ts": ts
             })?;
 
-            debug!(%actor_id, version, "inserted bookkeeping row after buffered insert");
+            debug!(%actor_id, %version, "inserted bookkeeping row after buffered insert");
 
-            Some(KnownDbVersion::Current {
+            Some(KnownDbVersion::Current(CurrentVersion {
                 db_version,
                 last_seq,
                 ts,
-            })
+            }))
         } else {
             if let Err(e) = agent.tx_empty().try_send((actor_id, version..=version)) {
                 error!(%actor_id, "could not schedule empties for clear: {e}");
             }
 
-            debug!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
+            debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
             Some(KnownDbVersion::Cleared)
         };
 
@@ -1847,7 +1893,7 @@ pub async fn process_multiple_changes(
                     if versions.clone().all(|version| match seqs {
                         Some(check_seqs) => match seen.get(&version) {
                             Some(known) => match known {
-                                KnownDbVersion::Partial { seqs, .. } => {
+                                KnownDbVersion::Partial(PartialVersion { seqs, .. }) => {
                                     check_seqs.clone().all(|seq| seqs.contains(&seq))
                                 }
                                 KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
@@ -1883,7 +1929,10 @@ pub async fn process_multiple_changes(
                         ) {
                             Ok((known, changeset)) => {
                                 let versions = changeset.versions();
-                                if let KnownDbVersion::Current { db_version, .. } = &known {
+                                if let KnownDbVersion::Current(CurrentVersion {
+                                    db_version, ..
+                                }) = &known
+                                {
                                     last_db_version = Some(*db_version);
                                     changesets.push((actor_id, changeset, *db_version, src));
                                 }
@@ -1913,14 +1962,14 @@ pub async fn process_multiple_changes(
                     KnownDbVersion::Partial { .. } => {
                         continue;
                     }
-                    KnownDbVersion::Current {
+                    KnownDbVersion::Current(CurrentVersion {
                         db_version,
                         last_seq,
                         ts,
-                    } => {
+                    }) => {
                         count += 1;
                         let version = versions.start();
-                        debug!(%actor_id, self_actor_id = %agent.actor_id(), version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
+                        debug!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
                         tx.prepare_cached("
                             INSERT INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  last_seq,  ts)
                                                     VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);")?
@@ -1964,13 +2013,13 @@ pub async fn process_multiple_changes(
             ));
 
             for (versions, known) in knowns {
-                if let KnownDbVersion::Partial { seqs, last_seq, .. } = &known {
-                    let full_seqs_range = 0..=*last_seq;
+                if let KnownDbVersion::Partial(PartialVersion { seqs, last_seq, .. }) = &known {
+                    let full_seqs_range = CrsqlSeq(0)..=*last_seq;
                     let gaps_count = seqs.gaps(&full_seqs_range).count();
                     let version = *versions.start();
                     if gaps_count == 0 {
                         // if we have no gaps, then we can schedule applying all these changes.
-                        debug!(%actor_id, version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
+                        debug!(%actor_id, %version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
                         let tx_apply = agent.tx_apply().clone();
                         tokio::spawn(async move {
                             if let Err(e) = tx_apply.send((actor_id, version)).await {
@@ -1978,7 +2027,7 @@ pub async fn process_multiple_changes(
                             }
                         });
                     } else {
-                        debug!(%actor_id, version, "still have {gaps_count} gaps in partially buffered seqs");
+                        debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs");
                     }
                 }
                 booked_write.insert_many(versions, known);
@@ -2024,7 +2073,7 @@ fn process_incomplete_version(
         ts,
     } = parts;
 
-    debug!(%actor_id, version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
+    debug!(%actor_id, %version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
     let mut inserted = 0;
     for change in changes.iter() {
         trace!("buffering change! {change:?}");
@@ -2054,10 +2103,10 @@ fn process_incomplete_version(
         })?;
     }
 
-    debug!(%actor_id, version, "buffered {inserted} changes");
+    debug!(%actor_id, %version, "buffered {inserted} changes");
 
     // calculate all known sequences for the actor + version combo
-    let mut seqs_in_bookkeeping: RangeInclusiveSet<i64> = tx
+    let mut seqs_in_bookkeeping: RangeInclusiveSet<CrsqlSeq> = tx
         .prepare_cached(
             "
                     SELECT start_seq, end_seq
@@ -2094,19 +2143,19 @@ fn process_incomplete_version(
         ])?;
     }
 
-    Ok(KnownDbVersion::Partial {
+    Ok(KnownDbVersion::Partial(PartialVersion {
         seqs: seqs_in_bookkeeping.clone(),
         last_seq: *last_seq,
         ts: *ts,
-    })
+    }))
 }
 
 #[tracing::instrument(skip(tx, last_db_version, parts), err)]
 fn process_complete_version(
     tx: &Transaction,
     actor_id: ActorId,
-    last_db_version: Option<i64>,
-    versions: RangeInclusive<i64>,
+    last_db_version: Option<CrsqlDbVersion>,
+    versions: RangeInclusive<Version>,
     parts: ChangesetParts,
 ) -> rusqlite::Result<(KnownDbVersion, Changeset)> {
     let ChangesetParts {
@@ -2119,11 +2168,15 @@ fn process_complete_version(
 
     let len = changes.len();
 
-    let max_db_version = changes.iter().map(|c| c.db_version).max().unwrap_or(0);
+    let max_db_version = changes
+        .iter()
+        .map(|c| c.db_version)
+        .max()
+        .unwrap_or(CrsqlDbVersion(0));
 
-    debug!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
+    debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
 
-    debug_assert!(len <= (seqs.end() - seqs.start() + 1) as usize);
+    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize);
 
     let mut impactful_changeset = vec![];
 
@@ -2181,15 +2234,15 @@ fn process_complete_version(
         (KnownDbVersion::Cleared, Changeset::Empty { versions })
     } else {
         // TODO: find a way to avoid this...
-        let db_version: i64 = tx
+        let db_version: CrsqlDbVersion = tx
             .prepare_cached("SELECT crsql_next_db_version()")?
             .query_row([], |row| row.get(0))?;
         (
-            KnownDbVersion::Current {
+            KnownDbVersion::Current(CurrentVersion {
                 db_version,
                 last_seq,
                 ts,
-            },
+            }),
             Changeset::Full {
                 version,
                 changes: impactful_changeset,
@@ -2210,7 +2263,7 @@ fn process_complete_version(
 fn check_buffered_meta_to_clear(
     conn: &Connection,
     actor_id: ActorId,
-    versions: RangeInclusive<i64>,
+    versions: RangeInclusive<Version>,
 ) -> rusqlite::Result<bool> {
     let should_clear: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))?;
     if should_clear {
@@ -2224,7 +2277,7 @@ fn check_buffered_meta_to_clear(
 fn process_single_version(
     agent: &Agent,
     tx: &Transaction,
-    last_db_version: Option<i64>,
+    last_db_version: Option<CrsqlDbVersion>,
     change: ChangeV1,
 ) -> rusqlite::Result<(KnownDbVersion, Changeset)> {
     let ChangeV1 {
@@ -2324,7 +2377,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.to_string());
     }
     for (actor_id, version) in sync_state.heads.iter() {
-        gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
+        gauge!("corro.sync.client.head", version.0 as f64, "actor_id" => actor_id.to_string());
     }
 
     let chosen: Vec<(ActorId, SocketAddr)> = {
@@ -2468,10 +2521,10 @@ const CHECK_EMPTIES_TO_INSERT_AFTER: Duration = Duration::from_secs(120);
 
 async fn write_empties_loop(
     agent: Agent,
-    mut rx_empty: Receiver<(ActorId, RangeInclusive<i64>)>,
+    mut rx_empty: Receiver<(ActorId, RangeInclusive<Version>)>,
     mut tripwire: Tripwire,
 ) {
-    let mut empties: BTreeMap<ActorId, RangeInclusiveSet<i64>> = BTreeMap::new();
+    let mut empties: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
 
     let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
     tokio::pin!(next_empties_check);
@@ -2521,7 +2574,7 @@ const TO_CLEAR_COUNT: usize = 1000;
 
 async fn clear_buffered_meta_loop(
     agent: Agent,
-    mut rx_partials: Receiver<(ActorId, RangeInclusive<i64>)>,
+    mut rx_partials: Receiver<(ActorId, RangeInclusive<Version>)>,
 ) {
     while let Some((actor_id, versions)) = rx_partials.recv().await {
         let pool = agent.pool().clone();
@@ -2563,73 +2616,12 @@ async fn clear_buffered_meta_loop(
             Ok::<_, eyre::Report>(())
         });
     }
-
-    // let mut to_clear: VecDeque<(ActorId, RangeInclusive<i64>)> = VecDeque::new();
-
-    // loop {
-    //     let conn = tokio::select! {
-    //         conn_res = agent.pool().write_low(), if !to_clear.is_empty() => match conn_res {
-    //             Ok(conn) => conn,
-    //             Err(e) => {
-    //                 error!("could not get conn for to clear buffered meta: {e}");
-    //                 break;
-    //             }
-    //         },
-    //         maybe_partial = rx_partials.recv() => match maybe_partial {
-    //             Some((actor_id, versions)) => {
-    //                 to_clear.push_back((actor_id, versions));
-    //                 continue;
-    //             },
-    //             None => {
-    //                 debug!("partials clear queue is done");
-    //                 break;
-    //             }
-    //         },
-    //         _ = &mut tripwire => break
-    //     };
-
-    //     let (actor_id, versions) = match to_clear.pop_front() {
-    //         Some(popped) => popped,
-    //         None => {
-    //             warn!("did not pop a partial buffered version range to clear");
-    //             continue;
-    //         }
-    //     };
-
-    //     let res = block_in_place(|| {
-    //         let buf_count = conn
-    //         .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
-    //         .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
-
-    //         let seq_count = conn
-    //         .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
-    //         .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
-
-    //         Ok::<_, rusqlite::Error>((buf_count, seq_count))
-    //     });
-
-    //     match res {
-    //         Ok((buf_count, seq_count)) => {
-    //             if buf_count + seq_count > 0 {
-    //                 info!(%actor_id, "cleared {} buffered meta rows for versions {versions:?}", buf_count + seq_count);
-    //             }
-    //             if buf_count >= TO_CLEAR_COUNT || seq_count >= TO_CLEAR_COUNT {
-    //                 // we haven't fully cleared these versions, push back to the front!
-    //                 to_clear.push_front((actor_id, versions));
-    //             }
-    //         }
-    //         Err(e) => {
-    //             error!(%actor_id, "could not clear buffered meta for versions {versions:?}: {e}");
-    //             to_clear.push_front((actor_id, versions));
-    //         }
-    //     }
-    // }
 }
 
 async fn sync_loop(
     agent: Agent,
     transport: Transport,
-    mut rx_apply: Receiver<(ActorId, i64)>,
+    mut rx_apply: Receiver<(ActorId, Version)>,
     mut tripwire: Tripwire,
 ) {
     let mut sync_backoff = backoff::Backoff::new(0)
@@ -2641,7 +2633,7 @@ async fn sync_loop(
     loop {
         enum Branch {
             Tick,
-            BackgroundApply { actor_id: ActorId, version: i64 },
+            BackgroundApply { actor_id: ActorId, version: Version },
         }
 
         let branch = tokio::select! {
@@ -2687,16 +2679,16 @@ async fn sync_loop(
                     .reset(tokio::time::Instant::now() + sync_backoff.next().unwrap());
             }
             Branch::BackgroundApply { actor_id, version } => {
-                debug!(%actor_id, version, "picked up background apply of buffered changes");
+                debug!(%actor_id, %version, "picked up background apply of buffered changes");
                 match process_fully_buffered_changes(&agent, actor_id, version).await {
                     Ok(false) => {
-                        warn!(%actor_id, version, "did not apply buffered changes");
+                        warn!(%actor_id, %version, "did not apply buffered changes");
                     }
                     Ok(true) => {
-                        debug!(%actor_id, version, "succesfully applied buffered changes");
+                        debug!(%actor_id, %version, "succesfully applied buffered changes");
                     }
                     Err(e) => {
-                        error!(%actor_id, version, "could not apply fully buffered changes: {e}");
+                        error!(%actor_id, %version, "could not apply fully buffered changes: {e}");
                     }
                 }
             }
@@ -2707,7 +2699,7 @@ async fn sync_loop(
 #[tracing::instrument(skip_all, err)]
 async fn process_completed_empties(
     agent: Agent,
-    empties: BTreeMap<ActorId, RangeInclusiveSet<i64>>,
+    empties: BTreeMap<ActorId, RangeInclusiveSet<Version>>,
 ) -> eyre::Result<()> {
     debug!(
         "processing empty versions (count: {})",
@@ -2723,10 +2715,21 @@ async fn process_completed_empties(
         for ranges in v.chunks(50) {
             let mut conn = agent.pool().write_low().await?;
             block_in_place(|| {
-                let tx = conn.immediate_transaction()?;
+                let mut tx = conn.immediate_transaction()?;
 
                 for range in ranges {
-                    inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
+                    let mut sp = tx.savepoint()?;
+                    match store_empty_changeset(&sp, actor_id, range.clone()) {
+                        Ok(count) => {
+                            inserted += count;
+                            sp.commit()?;
+                        }
+                        Err(e) => {
+                            error!(%actor_id, "could not store empty changeset for versions {range:?}: {e}");
+                            sp.rollback()?;
+                            continue;
+                        }
+                    }
                     if let Err(e) = agent.tx_clear_buf().try_send((actor_id, range.clone())) {
                         error!(%actor_id, "could not schedule buffered meta clear: {e}");
                     }
@@ -2812,13 +2815,13 @@ pub mod tests {
         let body: ExecResponse =
             serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
 
-        let db_version: i64 =
+        let db_version: CrsqlDbVersion =
             ta1.agent
                 .pool()
                 .read()
                 .await?
                 .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-        assert_eq!(db_version, 1);
+        assert_eq!(db_version, CrsqlDbVersion(1));
 
         println!("body: {body:?}");
 
@@ -2879,7 +2882,7 @@ pub mod tests {
         println!("body: {body:?}");
 
         #[allow(clippy::type_complexity)]
-        let bk: Vec<(ActorId, i64, Option<i64>, i64, Option<i64>)> = ta1
+        let bk: Vec<(ActorId, Version, Option<Version>, CrsqlDbVersion, Option<CrsqlSeq>)> = ta1
             .agent
             .pool()
             .read()
@@ -2888,10 +2891,10 @@ pub mod tests {
             .query_map((), |row| {
                 Ok((
                     row.get::<_, ActorId>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Version>(1)?,
+                    row.get::<_, Option<Version>>(2)?,
+                    row.get::<_, CrsqlDbVersion>(3)?,
+                    row.get::<_, Option<CrsqlSeq>>(4)?,
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -2899,8 +2902,20 @@ pub mod tests {
         assert_eq!(
             bk,
             vec![
-                (ta1.agent.actor_id(), 1, None, 1, Some(0)),
-                (ta1.agent.actor_id(), 2, None, 2, Some(0))
+                (
+                    ta1.agent.actor_id(),
+                    Version(1),
+                    None,
+                    CrsqlDbVersion(1),
+                    Some(CrsqlSeq(0))
+                ),
+                (
+                    ta1.agent.actor_id(),
+                    Version(2),
+                    None,
+                    CrsqlDbVersion(2),
+                    Some(CrsqlSeq(0))
+                )
             ]
         );
 
@@ -2957,13 +2972,13 @@ pub mod tests {
         )
         .await??;
 
-        let db_version: i64 =
+        let db_version: CrsqlDbVersion =
             ta1.agent
                 .pool()
                 .read()
                 .await?
                 .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-        assert_eq!(db_version, 3);
+        assert_eq!(db_version, CrsqlDbVersion(3));
 
         let expected_count: i64 =
             ta1.agent
@@ -3236,9 +3251,10 @@ pub mod tests {
         // invalid, but whatever
         conn.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version) SELECT crsql_site_id(), 2, crsql_db_version()", [])?;
 
-        let db_version: i64 = conn.query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
+        let db_version: CrsqlDbVersion =
+            conn.query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
 
-        assert_eq!(db_version, 2);
+        assert_eq!(db_version, CrsqlDbVersion(2));
 
         {
             let mut prepped = conn.prepare("SELECT * FROM __corro_bookkeeping")?;
@@ -3278,8 +3294,8 @@ pub mod tests {
 
         println!("to_clear: {to_clear:?}");
 
-        assert!(to_clear.contains(&1));
-        assert!(!to_clear.contains(&2));
+        assert!(to_clear.contains(&CrsqlDbVersion(1)));
+        assert!(!to_clear.contains(&CrsqlDbVersion(2)));
 
         tx.execute("DELETE FROM __corro_bookkeeping WHERE db_version = 1", [])?;
         tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) SELECT crsql_site_id(), 1, 1", [])?;
@@ -3304,9 +3320,9 @@ pub mod tests {
         let tx = conn.immediate_transaction()?;
         let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
 
-        assert!(to_clear.contains(&2));
-        assert!(!to_clear.contains(&3));
-        assert!(!to_clear.contains(&4));
+        assert!(to_clear.contains(&CrsqlDbVersion(2)));
+        assert!(!to_clear.contains(&CrsqlDbVersion(3)));
+        assert!(!to_clear.contains(&CrsqlDbVersion(4)));
 
         tx.execute("DELETE FROM __corro_bookkeeping WHERE db_version = 2", [])?;
         tx.execute(
@@ -3350,13 +3366,13 @@ pub mod tests {
 
         println!("body: {body:?}");
 
-        let db_version: i64 =
+        let db_version: CrsqlDbVersion =
             ta1.agent
                 .pool()
                 .read()
                 .await?
                 .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-        assert_eq!(db_version, 1);
+        assert_eq!(db_version, CrsqlDbVersion(1));
 
         sleep(Duration::from_secs(2)).await;
 
@@ -3579,6 +3595,374 @@ pub mod tests {
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_store_empty_changeset() -> eyre::Result<()> {
+        let mut conn = Connection::open_in_memory()?;
+
+        corro_types::sqlite::setup_conn(&mut conn)?;
+        migrate(&mut conn)?;
+
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct CorroBook {
+            actor_id: ActorId,
+            start_version: Version,
+            end_version: Option<Version>,
+        }
+
+        conn.execute(
+            "INSERT INTO __corro_bookkeeping (actor_id, start_version) VALUES (?, 1)",
+            [actor_id],
+        )?;
+
+        {
+            let tx = conn.transaction()?;
+            assert_eq!(
+                store_empty_changeset(&tx, actor_id, Version(1)..=Version(2))?,
+                1
+            );
+            tx.commit()?;
+        }
+
+        let rows = conn
+            .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+            .query_map([], |row| {
+                Ok(CorroBook {
+                    actor_id: row.get(0)?,
+                    start_version: row.get(1)?,
+                    end_version: row.get(2)?,
+                })
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        assert_eq!(rows.len(), 1);
+
+        assert_eq!(
+            rows[0],
+            CorroBook {
+                actor_id,
+                start_version: Version(1),
+                end_version: Some(Version(2))
+            }
+        );
+
+        conn.execute(
+            "INSERT INTO __corro_bookkeeping (actor_id, start_version) VALUES (?, 3)",
+            [actor_id],
+        )?;
+
+        {
+            let tx = conn.transaction()?;
+            assert_eq!(
+                store_empty_changeset(&tx, actor_id, Version(5)..=Version(7))?,
+                1
+            );
+            tx.commit()?;
+        }
+
+        let rows = conn
+            .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+            .query_map([], |row| {
+                Ok(CorroBook {
+                    actor_id: row.get(0)?,
+                    start_version: row.get(1)?,
+                    end_version: row.get(2)?,
+                })
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        assert_eq!(rows.len(), 3);
+
+        assert_eq!(
+            rows[0],
+            CorroBook {
+                actor_id,
+                start_version: Version(1),
+                end_version: Some(Version(2))
+            }
+        );
+        assert_eq!(
+            rows[1],
+            CorroBook {
+                actor_id,
+                start_version: Version(3),
+                end_version: None
+            }
+        );
+        assert_eq!(
+            rows[2],
+            CorroBook {
+                actor_id,
+                start_version: Version(5),
+                end_version: Some(Version(7))
+            }
+        );
+
+        {
+            let tx = conn.transaction()?;
+            assert_eq!(
+                store_empty_changeset(&tx, actor_id, Version(3)..=Version(6))?,
+                1
+            );
+            tx.commit()?;
+        }
+
+        let rows = conn
+            .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+            .query_map([], |row| {
+                Ok(CorroBook {
+                    actor_id: row.get(0)?,
+                    start_version: row.get(1)?,
+                    end_version: row.get(2)?,
+                })
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        println!("rows: {rows:?}");
+
+        assert_eq!(rows.len(), 1);
+
+        assert_eq!(
+            rows[0],
+            CorroBook {
+                actor_id,
+                start_version: Version(1),
+                end_version: Some(Version(7))
+            }
+        );
+
+        conn.execute(
+            "INSERT INTO __corro_bookkeeping (actor_id, start_version) VALUES (?, 12)",
+            [actor_id],
+        )?;
+
+        {
+            let tx = conn.transaction()?;
+            assert_eq!(
+                store_empty_changeset(&tx, actor_id, Version(1)..=Version(10))?,
+                1
+            );
+            tx.commit()?;
+        }
+
+        let rows = conn
+            .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+            .query_map([], |row| {
+                Ok(CorroBook {
+                    actor_id: row.get(0)?,
+                    start_version: row.get(1)?,
+                    end_version: row.get(2)?,
+                })
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        println!("rows: {rows:?}");
+
+        assert_eq!(rows.len(), 2);
+
+        assert_eq!(
+            rows[0],
+            CorroBook {
+                actor_id,
+                start_version: Version(1),
+                end_version: Some(Version(10))
+            }
+        );
+
+        assert_eq!(
+            rows[1],
+            CorroBook {
+                actor_id,
+                start_version: Version(12),
+                end_version: None
+            }
+        );
+
+        {
+            let tx = conn.transaction()?;
+            assert_eq!(
+                store_empty_changeset(&tx, actor_id, Version(1)..=Version(11))?,
+                1
+            );
+            tx.commit()?;
+        }
+
+        let rows = conn
+            .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+            .query_map([], |row| {
+                Ok(CorroBook {
+                    actor_id: row.get(0)?,
+                    start_version: row.get(1)?,
+                    end_version: row.get(2)?,
+                })
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        println!("rows: {rows:?}");
+
+        assert_eq!(rows.len(), 2);
+
+        assert_eq!(
+            rows[0],
+            CorroBook {
+                actor_id,
+                start_version: Version(1),
+                end_version: Some(Version(11))
+            }
+        );
+
+        assert_eq!(
+            rows[1],
+            CorroBook {
+                actor_id,
+                start_version: Version(12),
+                end_version: None
+            }
+        );
+
+        conn.execute(
+            "INSERT INTO __corro_bookkeeping (actor_id, start_version) VALUES (?, 13)",
+            [actor_id],
+        )?;
+
+        {
+            let tx = conn.transaction()?;
+            assert_eq!(
+                store_empty_changeset(&tx, actor_id, Version(14)..=Version(14))?,
+                1
+            );
+            tx.commit()?;
+        }
+
+        let rows = conn
+            .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+            .query_map([], |row| {
+                Ok(CorroBook {
+                    actor_id: row.get(0)?,
+                    start_version: row.get(1)?,
+                    end_version: row.get(2)?,
+                })
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        println!("rows: {rows:?}");
+
+        assert_eq!(rows.len(), 4);
+
+        assert_eq!(
+            rows[0],
+            CorroBook {
+                actor_id,
+                start_version: Version(1),
+                end_version: Some(Version(11))
+            }
+        );
+
+        assert_eq!(
+            rows[1],
+            CorroBook {
+                actor_id,
+                start_version: Version(12),
+                end_version: None
+            }
+        );
+        assert_eq!(
+            rows[2],
+            CorroBook {
+                actor_id,
+                start_version: Version(13),
+                end_version: None
+            }
+        );
+
+        assert_eq!(
+            rows[3],
+            CorroBook {
+                actor_id,
+                start_version: Version(14),
+                end_version: Some(Version(14))
+            }
+        );
+
+        {
+            let tx = conn.transaction()?;
+            assert_eq!(
+                store_empty_changeset(&tx, actor_id, Version(12)..=Version(14))?,
+                1
+            );
+            tx.commit()?;
+        }
+
+        let rows = conn
+            .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+            .query_map([], |row| {
+                Ok(CorroBook {
+                    actor_id: row.get(0)?,
+                    start_version: row.get(1)?,
+                    end_version: row.get(2)?,
+                })
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        println!("rows: {rows:?}");
+
+        assert_eq!(rows.len(), 1);
+
+        assert_eq!(
+            rows[0],
+            CorroBook {
+                actor_id,
+                start_version: Version(1),
+                end_version: Some(Version(14))
+            }
+        );
+
+        conn.execute(
+            "INSERT INTO __corro_bookkeeping (actor_id, start_version) VALUES (?, 15)",
+            [actor_id],
+        )?;
+        conn.execute(
+            "INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, 16, 18)",
+            [actor_id],
+        )?;
+
+        {
+            let tx = conn.transaction()?;
+            assert_eq!(
+                store_empty_changeset(&tx, actor_id, Version(15)..=Version(15))?,
+                1
+            );
+            tx.commit()?;
+        }
+
+        let rows = conn
+            .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+            .query_map([], |row| {
+                Ok(CorroBook {
+                    actor_id: row.get(0)?,
+                    start_version: row.get(1)?,
+                    end_version: row.get(2)?,
+                })
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        println!("rows: {rows:?}");
+
+        assert_eq!(rows.len(), 1);
+
+        assert_eq!(
+            rows[0],
+            CorroBook {
+                actor_id,
+                start_version: Version(1),
+                end_version: Some(Version(18))
+            }
+        );
 
         Ok(())
     }
