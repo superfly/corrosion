@@ -793,9 +793,30 @@ dependencies = [
  "async-trait",
  "camino",
  "compact_str 0.7.0",
+ "corro-base-types",
  "corro-speedy",
  "deadpool",
  "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "strum",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "corro-base-types"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "camino",
+ "compact_str 0.7.0",
+ "corro-speedy",
+ "deadpool",
+ "hex",
+ "rangemap",
  "rusqlite",
  "serde",
  "serde_json",
@@ -922,6 +943,7 @@ dependencies = [
  "config",
  "consul-client",
  "corro-api-types",
+ "corro-base-types",
  "corro-speedy",
  "deadpool",
  "enquote",

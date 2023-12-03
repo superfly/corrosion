@@ -1,5 +1,5 @@
 [package]
-name = "corro-api-types"
+name = "corro-base-types"
 version = "0.1.0-alpha.1"
 edition = "2021"
 description = "common API types for corrosion"
@@ -19,4 +19,4 @@ speedy = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true } 
 tokio = { workspace = true }
-corro-base-types = { path = "../corro-base-types" }
+rangemap = { workspace = true }

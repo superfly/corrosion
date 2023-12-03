@@ -2364,7 +2364,8 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
                     ORDER BY seq ASC
             "#)?;
                 let rows = prepped.query_map([db_version], row_to_change)?;
-                let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_BYTE_SIZE);
+                let chunked =
+                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
                 for changes_seqs in chunked {
                     match changes_seqs {
                         Ok((changes, seqs)) => {

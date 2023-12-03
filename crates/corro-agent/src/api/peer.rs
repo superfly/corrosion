@@ -380,12 +380,12 @@ fn handle_known_version(
                     Some(known) => {
                         // a current version cannot go back to a partial version
                         if known.is_cleared() {
-                            debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
+                            debug!(%actor_id, %version, "in-memory bookkeeping has been cleared, aborting.");
                             break;
                         }
                     }
                     None => {
-                        warn!(%actor_id, version, "in-memory bookkeeping vanished, aborting.");
+                        warn!(%actor_id, %version, "in-memory bookkeeping vanished, aborting.");
                         break;
                     }
                 }
@@ -460,7 +460,7 @@ fn handle_known_version(
                             Some(known) => match known {
                                 KnownVersion::Partial(PartialVersion { seqs, .. }) => {
                                     if seqs != &partial_seqs {
-                                        warn!(%actor_id, version, "different partial sequences, updating! range_needed: {range_needed:?}");
+                                        warn!(%actor_id, %version, "different partial sequences, updating! range_needed: {range_needed:?}");
                                         partial_seqs = seqs.clone();
                                         if let Some(new_start_seq) = last_sent_seq.take() {
                                             range_needed =
@@ -472,18 +472,18 @@ fn handle_known_version(
                                 }
                                 known @ KnownVersion::Current(_) => Some(known.into()),
                                 KnownVersion::Cleared => {
-                                    debug!(%actor_id, version, "in-memory bookkeeping has been cleared, aborting.");
+                                    debug!(%actor_id, %version, "in-memory bookkeeping has been cleared, aborting.");
                                     break;
                                 }
                             },
                             None => {
-                                warn!(%actor_id, version, "in-memory bookkeeping vanished!");
+                                warn!(%actor_id, %version, "in-memory bookkeeping vanished!");
                                 break;
                             }
                         };
 
                         if let Some(known) = maybe_current_version {
-                            warn!(%actor_id, version, "switched from partial to current version");
+                            warn!(%actor_id, %version, "switched from partial to current version");
 
                             // drop write lock
                             drop(bw);
@@ -547,7 +547,7 @@ fn handle_known_version(
                             ts,
                         )?;
 
-                        debug!(%actor_id, version, "done sending chunks of partial changes");
+                        debug!(%actor_id, %version, "done sending chunks of partial changes");
 
                         last_sent_seq = Some(*end_seq);
                     }
@@ -581,7 +581,7 @@ async fn process_version(
             KnownDbVersion::Cleared => return Ok(()),
         };
         if seqs_needed.is_empty() {
-            seqs_needed = vec![(0..=last_seq)];
+            seqs_needed = vec![(CrsqlSeq(0)..=last_seq)];
         }
 
         (last_seq, ts)
@@ -653,7 +653,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
                 }
             }
             Some(Err(e)) => {
-                error!(%actor_id, version, "could not process changes to send via sync: {e}");
+                error!(%actor_id, %version, "could not process changes to send via sync: {e}");
                 break;
             }
             None => {
@@ -830,10 +830,10 @@ async fn process_sync(
     Ok(())
 }
 
-fn chunk_range(
-    range: RangeInclusive<u64>,
+fn chunk_range<T: std::iter::Step + std::ops::Add<u64, Output = T> + std::cmp::Ord + Copy>(
+    range: RangeInclusive<T>,
     chunk_size: usize,
-) -> impl Iterator<Item = RangeInclusive<u64>> {
+) -> impl Iterator<Item = RangeInclusive<T>> {
     range.clone().step_by(chunk_size).map(move |block_start| {
         let block_end = (block_start + chunk_size as u64).min(*range.end());
         block_start..=block_end
@@ -1062,7 +1062,7 @@ pub async fn parallel_sync(
                 trace!(%actor_id, "needs: {needs:?}");
 
                 debug!(%actor_id, %addr, "needs len: {}", needs.values().map(|needs| needs.iter().map(|need| match need {
-                    SyncNeedV1::Full {versions} => (versions.end() - versions.start()) as usize + 1,
+                    SyncNeedV1::Full {versions} => (versions.end().0 - versions.start().0) as usize + 1,
                     SyncNeedV1::Partial {..} => 0,
                 }).sum::<usize>()).sum::<usize>());
 
@@ -1508,6 +1508,7 @@ mod tests {
     use corro_tests::TEST_SCHEMA;
     use corro_types::{
         api::{ColumnName, TableName},
+        base::CrsqlDbVersion,
         config::{Config, TlsConfig},
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
@@ -1557,8 +1558,8 @@ mod tests {
             cid: ColumnName("text".into()),
             val: "one".into(),
             col_version: 1,
-            db_version: 1,
-            seq: 0,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1569,8 +1570,8 @@ mod tests {
             cid: ColumnName("text".into()),
             val: "two".into(),
             col_version: 1,
-            db_version: 2,
-            seq: 0,
+            db_version: CrsqlDbVersion(2),
+            seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1582,10 +1583,10 @@ mod tests {
                     ChangeV1 {
                         actor_id,
                         changeset: Changeset::Full {
-                            version: 1,
+                            version: Version(1),
                             changes: vec![change1.clone()],
-                            seqs: 0..=0,
-                            last_seq: 0,
+                            seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                            last_seq: CrsqlSeq(0),
                             ts,
                         },
                     },
@@ -1595,10 +1596,10 @@ mod tests {
                     ChangeV1 {
                         actor_id,
                         changeset: Changeset::Full {
-                            version: 2,
+                            version: Version(2),
                             changes: vec![change2.clone()],
-                            seqs: 0..=0,
-                            last_seq: 0,
+                            seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                            last_seq: CrsqlSeq(0),
                             ts,
                         },
                     },
@@ -1609,14 +1610,14 @@ mod tests {
         .await?;
 
         let known1 = KnownDbVersion::Current(CurrentVersion {
-            db_version: 1,
-            last_seq: 0,
+            db_version: CrsqlDbVersion(1),
+            last_seq: CrsqlSeq(0),
             ts,
         });
 
         let known2 = KnownDbVersion::Current(CurrentVersion {
-            db_version: 2,
-            last_seq: 0, // original last seq
+            db_version: CrsqlDbVersion(2),
+            last_seq: CrsqlSeq(0), // original last seq
             ts,
         });
 
@@ -1631,8 +1632,8 @@ mod tests {
         {
             let read = booked.read("test").await;
 
-            assert_eq!(KnownDbVersion::from(read.get(&1).unwrap()), known1);
-            assert_eq!(KnownDbVersion::from(read.get(&2).unwrap()), known2);
+            assert_eq!(KnownDbVersion::from(read.get(&Version(1)).unwrap()), known1);
+            assert_eq!(KnownDbVersion::from(read.get(&Version(2)).unwrap()), known2);
         }
 
         {
@@ -1658,11 +1659,11 @@ mod tests {
                     &mut conn,
                     actor_id,
                     false,
-                    1,
+                    Version(1),
                     known1,
                     &booked,
-                    vec![0..=0],
-                    0,
+                    vec![CrsqlSeq(0)..=CrsqlSeq(0)],
+                    CrsqlSeq(0),
                     ts,
                     &tx,
                 )
@@ -1674,10 +1675,10 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: 1,
+                        version: Version(1),
                         changes: vec![change1],
-                        seqs: 0..=0,
-                        last_seq: 0,
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
                         ts,
                     }
                 }))
@@ -1688,11 +1689,11 @@ mod tests {
                     &mut conn,
                     actor_id,
                     false,
-                    2,
+                    Version(2),
                     known2,
                     &booked,
-                    vec![0..=0],
-                    0,
+                    vec![CrsqlSeq(0)..=CrsqlSeq(0)],
+                    CrsqlSeq(0),
                     ts,
                     &tx,
                 )
@@ -1704,10 +1705,10 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: 2,
+                        version: Version(2),
                         changes: vec![change2],
-                        seqs: 0..=0,
-                        last_seq: 0,
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
                         ts,
                     }
                 }))

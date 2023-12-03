@@ -160,7 +160,9 @@ impl Changeset {
     pub fn is_complete(&self) -> bool {
         match self {
             Changeset::Empty { .. } => true,
-            Changeset::Full { seqs, last_seq, .. } => *seqs.start() == 0 && seqs.end() == last_seq,
+            Changeset::Full { seqs, last_seq, .. } => {
+                *seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq
+            }
         }
     }
 

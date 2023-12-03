@@ -236,7 +236,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 };
 
                 let site_id: [u8; 16] = {
-                    let conn = Connection::open(&db_path)?;
+                    let conn = Connection::open(db_path)?;
                     conn.query_row(
                         "SELECT site_id FROM crsql_site_id WHERE ordinal = 0;",
                         [],

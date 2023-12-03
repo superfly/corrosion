@@ -161,7 +161,7 @@ impl SubsManager {
 
     pub fn match_changes(&self, changes: &[Change], db_version: CrsqlDbVersion) {
         trace!(
-            db_version,
+            %db_version,
             "trying to match changes to subscribers, len: {}",
             changes.len()
         );
@@ -177,7 +177,7 @@ impl SubsManager {
         };
 
         for (id, handle) in handles.iter() {
-            trace!(sub_id = %id, db_version, "attempting to match changes to a subscription");
+            trace!(sub_id = %id, %db_version, "attempting to match changes to a subscription");
             let mut candidates = MatchCandidates::new();
             let mut match_count = 0;
             for change in changes.iter().map(MatchableChange::from) {
@@ -191,7 +191,7 @@ impl SubsManager {
                 counter!("corro.subs.changes.matched.count", pks.len() as u64, "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string());
             }
 
-            trace!(sub_id = %id, db_version, "found {match_count} candidates");
+            trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
             if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
                 error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
@@ -2558,7 +2558,7 @@ mod tests {
             }
 
             println!("processing change...");
-            filter_changes_from_db(&matcher, &conn, None, 2).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(2)).unwrap();
             println!("processed changes");
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
@@ -2579,7 +2579,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, 3).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(3)).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
@@ -2602,7 +2602,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, 4).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(4)).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
@@ -2661,7 +2661,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, 5).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(5)).unwrap();
 
             let start = Instant::now();
             for _ in range {

@@ -7,6 +7,7 @@ use std::{
 };
 
 use compact_str::CompactString;
+use corro_base_types::{CrsqlDbVersion, CrsqlSeq};
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
     Row, ToSql,
@@ -212,10 +213,8 @@ pub struct Change {
     pub cid: ColumnName,
     pub val: SqliteValue,
     pub col_version: i64,
-    // TODO: use CrsqlDbVersion
-    pub db_version: u64,
-    // TODO: use CrsqlSeq
-    pub seq: u64,
+    pub db_version: CrsqlDbVersion,
+    pub seq: CrsqlSeq,
     pub site_id: [u8; 16],
     pub cl: i64,
 }

@@ -219,17 +219,17 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             debug!("filling up partial known versions");
 
             for ((actor_id, version), (seqs, last_seq, ts)) in partials {
-                debug!(%actor_id, version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
+                debug!(%actor_id, %version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
                 let ranges = bk.entry(actor_id).or_default();
 
                 if let Some(known) = ranges.get(&version) {
-                    warn!(%actor_id, version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
+                    warn!(%actor_id, %version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
 
                     _ = tx_clear_buf.try_send((actor_id, version..=version));
                     continue;
                 }
 
-                let gaps_count = seqs.gaps(&(0..=last_seq)).count();
+                let gaps_count = seqs.gaps(&(CrsqlSeq(0)..=last_seq)).count();
 
                 ranges.insert(
                     version,
@@ -237,7 +237,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 );
 
                 if gaps_count == 0 {
-                    info!(%actor_id, version, "found fully buffered, unapplied, changes! scheduling apply");
+                    info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
                     // spawn this because it can block if the channel gets full, nothing is draining it yet!
                     tokio::spawn({
                         let tx_apply = tx_apply.clone();
@@ -1628,7 +1628,7 @@ async fn process_fully_buffered_changes(
     version: Version,
 ) -> Result<bool, ChangeError> {
     let mut conn = agent.pool().write_normal().await?;
-    debug!(%actor_id, version, "acquired write (normal) connection to process fully buffered changes");
+    debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
 
     let booked = {
         agent
@@ -1647,14 +1647,14 @@ async fn process_fully_buffered_changes(
             actor_id.as_simple()
         ))
         .await;
-    debug!(%actor_id, version, "acquired Booked write lock to process fully buffered changes");
+    debug!(%actor_id, %version, "acquired Booked write lock to process fully buffered changes");
 
     let inserted = block_in_place(|| {
         let (last_seq, ts) = {
             match bookedw.partials.get(&version) {
                 Some(PartialVersion { seqs, last_seq, ts }) => {
-                    if seqs.gaps(&(0..=*last_seq)).count() != 0 {
-                        error!(%actor_id, version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(0..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
+                    if seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).count() != 0 {
+                        error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
                         // TODO: return an error here
                         return Ok(false);
                     }
@@ -1669,7 +1669,7 @@ async fn process_fully_buffered_changes(
 
         let tx = conn.immediate_transaction()?;
 
-        info!(%actor_id, version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+        info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
         let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional()?;
 
@@ -1689,9 +1689,9 @@ async fn process_fully_buffered_changes(
                             "#,
             )?
             .execute(params![max_db_version, actor_id.as_bytes(), version])?;
-            info!(%actor_id, version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+            info!(%actor_id, %version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
         } else {
-            info!(%actor_id, version, "No buffered rows, skipped insertion into crsql_changes");
+            info!(%actor_id, %version, "No buffered rows, skipped insertion into crsql_changes");
         }
 
         if let Err(e) = agent.tx_clear_buf().try_send((actor_id, version..=version)) {
@@ -1702,7 +1702,7 @@ async fn process_fully_buffered_changes(
             .prepare_cached("SELECT crsql_rows_impacted()")?
             .query_row((), |row| row.get(0))?;
 
-        debug!(%actor_id, version, "rows impacted by buffered changes insertion: {rows_impacted}");
+        debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
         let known_version = if rows_impacted > 0 {
             let db_version: CrsqlDbVersion =
@@ -1729,7 +1729,7 @@ async fn process_fully_buffered_changes(
                 ":ts": ts
             })?;
 
-            debug!(%actor_id, version, "inserted bookkeeping row after buffered insert");
+            debug!(%actor_id, %version, "inserted bookkeeping row after buffered insert");
 
             Some(KnownDbVersion::Current(CurrentVersion {
                 db_version,
@@ -1741,7 +1741,7 @@ async fn process_fully_buffered_changes(
                 error!(%actor_id, "could not schedule empties for clear: {e}");
             }
 
-            debug!(%actor_id, version, "inserted CLEARED bookkeeping row after buffered insert");
+            debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
             Some(KnownDbVersion::Cleared)
         };
 
@@ -1927,7 +1927,7 @@ pub async fn process_multiple_changes(
                     }) => {
                         count += 1;
                         let version = versions.start();
-                        debug!(%actor_id, self_actor_id = %agent.actor_id(), version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
+                        debug!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
                         tx.prepare_cached("
                             INSERT INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  last_seq,  ts)
                                                     VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);")?
@@ -1972,12 +1972,12 @@ pub async fn process_multiple_changes(
 
             for (versions, known) in knowns {
                 if let KnownDbVersion::Partial(PartialVersion { seqs, last_seq, .. }) = &known {
-                    let full_seqs_range = 0..=*last_seq;
+                    let full_seqs_range = CrsqlSeq(0)..=*last_seq;
                     let gaps_count = seqs.gaps(&full_seqs_range).count();
                     let version = *versions.start();
                     if gaps_count == 0 {
                         // if we have no gaps, then we can schedule applying all these changes.
-                        debug!(%actor_id, version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
+                        debug!(%actor_id, %version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
                         let tx_apply = agent.tx_apply().clone();
                         tokio::spawn(async move {
                             if let Err(e) = tx_apply.send((actor_id, version)).await {
@@ -1985,7 +1985,7 @@ pub async fn process_multiple_changes(
                             }
                         });
                     } else {
-                        debug!(%actor_id, version, "still have {gaps_count} gaps in partially buffered seqs");
+                        debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs");
                     }
                 }
                 booked_write.insert_many(versions, known);
@@ -2031,7 +2031,7 @@ fn process_incomplete_version(
         ts,
     } = parts;
 
-    debug!(%actor_id, version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
+    debug!(%actor_id, %version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
     let mut inserted = 0;
     for change in changes.iter() {
         trace!("buffering change! {change:?}");
@@ -2061,7 +2061,7 @@ fn process_incomplete_version(
         })?;
     }
 
-    debug!(%actor_id, version, "buffered {inserted} changes");
+    debug!(%actor_id, %version, "buffered {inserted} changes");
 
     // calculate all known sequences for the actor + version combo
     let mut seqs_in_bookkeeping: RangeInclusiveSet<CrsqlSeq> = tx
@@ -2126,11 +2126,15 @@ fn process_complete_version(
 
     let len = changes.len();
 
-    let max_db_version = changes.iter().map(|c| c.db_version).max().unwrap_or(0);
+    let max_db_version = changes
+        .iter()
+        .map(|c| c.db_version)
+        .max()
+        .unwrap_or(CrsqlDbVersion(0));
 
-    debug!(%actor_id, version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
+    debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
 
-    debug_assert!(len <= (seqs.end() - seqs.start() + 1) as usize);
+    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize);
 
     let mut impactful_changeset = vec![];
 
@@ -2331,7 +2335,7 @@ async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncCli
         gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.to_string());
     }
     for (actor_id, version) in sync_state.heads.iter() {
-        gauge!("corro.sync.client.head", *version as f64, "actor_id" => actor_id.to_string());
+        gauge!("corro.sync.client.head", version.0 as f64, "actor_id" => actor_id.to_string());
     }
 
     let chosen: Vec<(ActorId, SocketAddr)> = {
@@ -2633,16 +2637,16 @@ async fn sync_loop(
                     .reset(tokio::time::Instant::now() + sync_backoff.next().unwrap());
             }
             Branch::BackgroundApply { actor_id, version } => {
-                debug!(%actor_id, version, "picked up background apply of buffered changes");
+                debug!(%actor_id, %version, "picked up background apply of buffered changes");
                 match process_fully_buffered_changes(&agent, actor_id, version).await {
                     Ok(false) => {
-                        warn!(%actor_id, version, "did not apply buffered changes");
+                        warn!(%actor_id, %version, "did not apply buffered changes");
                     }
                     Ok(true) => {
-                        debug!(%actor_id, version, "succesfully applied buffered changes");
+                        debug!(%actor_id, %version, "succesfully applied buffered changes");
                     }
                     Err(e) => {
-                        error!(%actor_id, version, "could not apply fully buffered changes: {e}");
+                        error!(%actor_id, %version, "could not apply fully buffered changes: {e}");
                     }
                 }
             }
@@ -2764,7 +2768,7 @@ pub mod tests {
                 .read()
                 .await?
                 .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-        assert_eq!(db_version, 1);
+        assert_eq!(db_version, CrsqlDbVersion(1));
 
         println!("body: {body:?}");
 
@@ -2845,8 +2849,20 @@ pub mod tests {
         assert_eq!(
             bk,
             vec![
-                (ta1.agent.actor_id(), 1, None, 1, Some(0)),
-                (ta1.agent.actor_id(), 2, None, 2, Some(0))
+                (
+                    ta1.agent.actor_id(),
+                    Version(1),
+                    None,
+                    CrsqlDbVersion(1),
+                    Some(CrsqlSeq(0))
+                ),
+                (
+                    ta1.agent.actor_id(),
+                    Version(2),
+                    None,
+                    CrsqlDbVersion(2),
+                    Some(CrsqlSeq(0))
+                )
             ]
         );
 
@@ -2909,7 +2925,7 @@ pub mod tests {
                 .read()
                 .await?
                 .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-        assert_eq!(db_version, 3);
+        assert_eq!(db_version, CrsqlDbVersion(3));
 
         let expected_count: i64 =
             ta1.agent
@@ -3185,7 +3201,7 @@ pub mod tests {
         let db_version: CrsqlDbVersion =
             conn.query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
 
-        assert_eq!(db_version, 2);
+        assert_eq!(db_version, CrsqlDbVersion(2));
 
         {
             let mut prepped = conn.prepare("SELECT * FROM __corro_bookkeeping")?;
@@ -3225,8 +3241,8 @@ pub mod tests {
 
         println!("to_clear: {to_clear:?}");
 
-        assert!(to_clear.contains(&1));
-        assert!(!to_clear.contains(&2));
+        assert!(to_clear.contains(&CrsqlDbVersion(1)));
+        assert!(!to_clear.contains(&CrsqlDbVersion(2)));
 
         tx.execute("DELETE FROM __corro_bookkeeping WHERE db_version = 1", [])?;
         tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) SELECT crsql_site_id(), 1, 1", [])?;
@@ -3251,9 +3267,9 @@ pub mod tests {
         let tx = conn.immediate_transaction()?;
         let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
 
-        assert!(to_clear.contains(&2));
-        assert!(!to_clear.contains(&3));
-        assert!(!to_clear.contains(&4));
+        assert!(to_clear.contains(&CrsqlDbVersion(2)));
+        assert!(!to_clear.contains(&CrsqlDbVersion(3)));
+        assert!(!to_clear.contains(&CrsqlDbVersion(4)));
 
         tx.execute("DELETE FROM __corro_bookkeeping WHERE db_version = 2", [])?;
         tx.execute(
@@ -3303,7 +3319,7 @@ pub mod tests {
                 .read()
                 .await?
                 .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-        assert_eq!(db_version, 1);
+        assert_eq!(db_version, CrsqlDbVersion(1));
 
         sleep(Duration::from_secs(2)).await;
 
