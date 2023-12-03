@@ -1586,12 +1586,12 @@ async fn resolve_bootstrap(
 }
 
 fn store_empty_changeset(
-    tx: &Transaction,
+    conn: &Connection,
     actor_id: ActorId,
     versions: RangeInclusive<Version>,
 ) -> eyre::Result<usize> {
     // first, delete "current" versions, they're now gone!
-    let deleted: Vec<(Version, Option<Version>)> = tx
+    let deleted: Vec<(Version, Option<Version>)> = conn
         .prepare_cached(
             "
         DELETE FROM __corro_bookkeeping 
@@ -1641,14 +1641,14 @@ fn store_empty_changeset(
     if new_ranges.len() > 1 {
         warn!("deleted non-contiguous ranges! {new_ranges:?}");
         // this serves as a failsafe
-        eyre::bail!("deleted non-contiguous ranges");
+        eyre::bail!("deleted non-contiguous ranges: {new_ranges:?}");
     }
 
     let mut inserted = 0;
 
     for range in new_ranges {
         // insert cleared versions
-        inserted += tx
+        inserted += conn
         .prepare_cached(
             "
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, last_seq, ts)
@@ -2713,10 +2713,21 @@ async fn process_completed_empties(
         for ranges in v.chunks(50) {
             let mut conn = agent.pool().write_low().await?;
             block_in_place(|| {
-                let tx = conn.immediate_transaction()?;
+                let mut tx = conn.immediate_transaction()?;
 
                 for range in ranges {
-                    inserted += store_empty_changeset(&tx, actor_id, range.clone())?;
+                    let mut sp = tx.savepoint()?;
+                    match store_empty_changeset(&sp, actor_id, range.clone()) {
+                        Ok(count) => {
+                            inserted += count;
+                            sp.commit()?;
+                        }
+                        Err(e) => {
+                            error!(%actor_id, "could not store empty changeset for versions {range:?}: {e}");
+                            sp.rollback()?;
+                            continue;
+                        }
+                    }
                     if let Err(e) = agent.tx_clear_buf().try_send((actor_id, range.clone())) {
                         error!(%actor_id, "could not schedule buffered meta clear: {e}");
                     }
