@@ -49,7 +49,7 @@ use axum::{
 };
 use bytes::Bytes;
 use foca::{Member, Notification};
-use futures::{FutureExt, StreamExt, TryFutureExt};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use itertools::Itertools;
 use metrics::{counter, gauge, histogram, increment_counter};
@@ -144,48 +144,68 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let (tx_apply, rx_apply) = channel(20480);
     let (tx_clear_buf, rx_clear_buf) = channel(10240);
 
-    let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
-
-    {
+    let bk = {
         debug!("getting read-only conn for pull bookkeeping rows");
-        let mut conn = pool.write_priority().await?;
+        let conn = pool.write_priority().await?;
 
         debug!("getting bookkept rows");
 
-        let mut cleared_rows: BTreeMap<ActorId, usize> = BTreeMap::new();
+        let bk = {
+            let actor_ids: Vec<ActorId> = conn
+                .prepare("SELECT DISTINCT actor_id FROM __corro_bookkeeping")?
+                .query_map([], |row| row.get(0))
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
 
-        {
-            let mut prepped = conn.prepare_cached(
-                "SELECT actor_id, start_version, end_version, db_version, last_seq, ts
-                FROM __corro_bookkeeping",
-            )?;
-            let mut rows = prepped.query([])?;
+            let mut buf = futures::stream::iter(actor_ids.into_iter().map(|actor_id| {
+                let pool = pool.clone();
+                async move {
+                    tokio::spawn(async move {
+                        let mut bv = BookedVersions::default();
+                        let conn = pool.read().await?;
 
-            loop {
-                let row = rows.next()?;
-                match row {
-                    None => break,
-                    Some(row) => {
-                        let actor_id = row.get(0)?;
-                        let ranges = bk.entry(actor_id).or_default();
-                        let start_v = row.get(1)?;
-                        let end_v: Option<Version> = row.get(2)?;
-                        ranges.insert_many(
-                            start_v..=end_v.unwrap_or(start_v),
-                            match row.get(3)? {
-                                Some(db_version) => KnownDbVersion::Current(CurrentVersion {
-                                    db_version,
-                                    last_seq: row.get(4)?,
-                                    ts: row.get(5)?,
-                                }),
-                                None => {
-                                    *cleared_rows.entry(actor_id).or_default() += 1;
-                                    KnownDbVersion::Cleared
+                        block_in_place(|| {
+                            let mut prepped = conn.prepare_cached(
+                                "SELECT start_version, end_version, db_version, last_seq, ts
+                            FROM __corro_bookkeeping WHERE actor_id = ?",
+                            )?;
+                            let mut rows = prepped.query([actor_id])?;
+
+                            loop {
+                                let row = rows.next()?;
+                                match row {
+                                    None => break,
+                                    Some(row) => {
+                                        let start_v = row.get(0)?;
+                                        let end_v: Option<Version> = row.get(1)?;
+                                        bv.insert_many(
+                                            start_v..=end_v.unwrap_or(start_v),
+                                            match row.get(2)? {
+                                                Some(db_version) => {
+                                                    KnownDbVersion::Current(CurrentVersion {
+                                                        db_version,
+                                                        last_seq: row.get(3)?,
+                                                        ts: row.get(4)?,
+                                                    })
+                                                }
+                                                None => KnownDbVersion::Cleared,
+                                            },
+                                        );
+                                    }
                                 }
-                            },
-                        );
-                    }
+                            }
+
+                            Ok::<_, eyre::Report>((actor_id, bv))
+                        })
+                    })
+                    .await?
                 }
+            }))
+            .buffer_unordered(8);
+
+            let mut bk = HashMap::<ActorId, BookedVersions>::new();
+
+            while let Some((actor_id, bv)) = TryStreamExt::try_next(&mut buf).await? {
+                bk.insert(actor_id, bv);
             }
 
             let mut partials: HashMap<
@@ -247,25 +267,29 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                     });
                 }
             }
-        }
 
-        for (actor_id, booked) in bk.iter() {
-            if let Some(clear_count) = cleared_rows.get(actor_id).copied() {
-                if clear_count > booked.cleared.len() {
-                    warn!(%actor_id, "cleared bookkept rows count ({clear_count}) in DB was bigger than in-memory entries count ({}), compacting...", booked.cleared.len());
-                    let tx = conn.immediate_transaction()?;
-                    let deleted = tx.execute("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND end_version IS NOT NULL", [actor_id])?;
-                    info!("deleted {deleted} rows that had an end_version");
-                    let mut inserted = 0;
-                    for range in booked.cleared.iter() {
-                        inserted += tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?)", params![actor_id, range.start(), range.end()])?;
-                    }
-                    info!("inserted {inserted} cleared version rows");
-                    tx.commit()?;
-                }
-            }
-        }
-    }
+            bk
+        };
+
+        // for (actor_id, booked) in bk.iter() {
+        //     if let Some(clear_count) = cleared_rows.get(actor_id).copied() {
+        //         if clear_count > booked.cleared.len() {
+        //             warn!(%actor_id, "cleared bookkept rows count ({clear_count}) in DB was bigger than in-memory entries count ({}), compacting...", booked.cleared.len());
+        //             let tx = conn.immediate_transaction()?;
+        //             let deleted = tx.execute("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND end_version IS NOT NULL", [actor_id])?;
+        //             info!("deleted {deleted} rows that had an end_version");
+        //             let mut inserted = 0;
+        //             for range in booked.cleared.iter() {
+        //                 inserted += tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?)", params![actor_id, range.start(), range.end()])?;
+        //             }
+        //             info!("inserted {inserted} cleared version rows");
+        //             tx.commit()?;
+        //         }
+        //     }
+        // }
+
+        bk
+    };
 
     debug!("done building bookkeeping");
 
