@@ -3650,7 +3650,7 @@ pub mod tests {
             let tx = conn.transaction()?;
             assert_eq!(
                 store_empty_changeset(&tx, actor_id, Version(1)..=Version(2))?,
-                1
+                2
             );
             tx.commit()?;
         }
@@ -3733,7 +3733,7 @@ pub mod tests {
             let tx = conn.transaction()?;
             assert_eq!(
                 store_empty_changeset(&tx, actor_id, Version(3)..=Version(6))?,
-                1
+                4
             );
             tx.commit()?;
         }
@@ -3771,7 +3771,7 @@ pub mod tests {
             let tx = conn.transaction()?;
             assert_eq!(
                 store_empty_changeset(&tx, actor_id, Version(1)..=Version(10))?,
-                1
+                2
             );
             tx.commit()?;
         }
@@ -3813,7 +3813,7 @@ pub mod tests {
             let tx = conn.transaction()?;
             assert_eq!(
                 store_empty_changeset(&tx, actor_id, Version(1)..=Version(11))?,
-                1
+                2
             );
             tx.commit()?;
         }
@@ -3919,7 +3919,7 @@ pub mod tests {
             let tx = conn.transaction()?;
             assert_eq!(
                 store_empty_changeset(&tx, actor_id, Version(12)..=Version(14))?,
-                1
+                5
             );
             tx.commit()?;
         }
@@ -3961,7 +3961,7 @@ pub mod tests {
             let tx = conn.transaction()?;
             assert_eq!(
                 store_empty_changeset(&tx, actor_id, Version(15)..=Version(15))?,
-                1
+                4
             );
             tx.commit()?;
         }
