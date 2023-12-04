@@ -1659,6 +1659,8 @@ fn store_empty_changeset(
         );
     }
 
+    let deleted_count = deleted.len();
+
     // re-compute the ranges
     let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
     new_ranges.insert(versions);
@@ -1675,16 +1677,16 @@ fn store_empty_changeset(
     for range in new_ranges {
         // insert cleared versions
         inserted += conn
-        .prepare_cached(
-            "
-                INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, last_seq, ts)
-                    VALUES (?, ?, ?, NULL, NULL, NULL);
+            .prepare_cached(
+                "
+                INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version)
+                    VALUES (?, ?, ?);
             ",
-        )?
-        .execute(params![actor_id, range.start(), range.end()])?;
+            )?
+            .execute(params![actor_id, range.start(), range.end()])?;
     }
 
-    Ok(inserted)
+    Ok(inserted + deleted_count)
 }
 
 #[tracing::instrument(skip(agent), err)]
@@ -2730,23 +2732,23 @@ async fn process_completed_empties(
         empties.values().map(RangeInclusiveSet::len).sum::<usize>()
     );
 
-    let mut inserted = 0;
-
-    let start = Instant::now();
     for (actor_id, empties) in empties {
         let v = empties.into_iter().collect::<Vec<_>>();
 
-        for ranges in v.chunks(50) {
+        for ranges in v.chunks(20) {
             let mut conn = agent.pool().write_low().await?;
             block_in_place(|| {
                 let mut tx = conn.immediate_transaction()?;
 
+                let mut affected = 0;
+
+                let start = Instant::now();
                 for range in ranges {
                     let mut sp = tx.savepoint()?;
                     match store_empty_changeset(&sp, actor_id, range.clone()) {
                         Ok(count) => {
-                            inserted += count;
                             sp.commit()?;
+                            affected += count;
                         }
                         Err(e) => {
                             error!(%actor_id, "could not store empty changeset for versions {range:?}: {e}");
@@ -2761,15 +2763,15 @@ async fn process_completed_empties(
 
                 tx.commit()?;
 
+                info!(%actor_id, "affected {affected} rows while storing cleared versions in {:?}", start.elapsed());
+
                 Ok::<_, eyre::Report>(())
             })?;
+
+            // let the pool breath a little
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
-
-    debug!(
-        "upserted {inserted} empty version ranges in {:?}",
-        start.elapsed()
-    );
 
     Ok(())
 }
