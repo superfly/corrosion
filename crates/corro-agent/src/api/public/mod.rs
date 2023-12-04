@@ -16,6 +16,7 @@ use hyper::StatusCode;
 use itertools::Itertools;
 use metrics::counter;
 use rusqlite::{named_params, params_from_iter, ToSql, Transaction};
+use serde::Deserialize;
 use spawn::spawn_counted;
 use tokio::{
     sync::{
@@ -464,8 +465,14 @@ async fn build_query_rows_response(
     }
 }
 
+#[derive(Deserialize)]
+pub struct V1QueriesParams {
+    ndjson: bool,
+}
+
 pub async fn api_v1_queries(
     Extension(agent): Extension<Agent>,
+    axum::extract::Query(pms): axum::extract::Query<V1QueriesParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
     let (mut tx, body) = hyper::Body::channel();
@@ -474,6 +481,13 @@ pub async fn api_v1_queries(
     let (data_tx, mut data_rx) = channel(512);
 
     tokio::spawn(async move {
+        if !pms.ndjson {
+            if let Err(e) = tx.send_data(bytes::Bytes::from_static(b"[")).await {
+                error!("could not send data through body's channel: {e}");
+                return;
+            }
+        }
+
         let mut buf = BytesMut::new();
 
         while let Some(row_res) = data_rx.recv().await {
@@ -493,13 +507,23 @@ pub async fn api_v1_queries(
                 }
             }
 
-            buf.extend_from_slice(b"\n");
+            if !matches!(row_res, QueryEvent::EndOfQuery { .. }) {
+                buf.extend_from_slice(if pms.ndjson { b"\n" } else { b"," });
+            }
 
             if let Err(e) = tx.send_data(buf.split().freeze()).await {
                 error!("could not send data through body's channel: {e}");
                 return;
             }
         }
+
+        if !pms.ndjson {
+            if let Err(e) = tx.send_data(bytes::Bytes::from_static(b"]")).await {
+                error!("could not send data through body's channel: {e}");
+                return;
+            }
+        }
+
         debug!("query body channel done");
     });
 
@@ -783,6 +807,7 @@ mod tests {
 
         let res = api_v1_queries(
             Extension(agent.clone()),
+            axum::extract::Query(V1QueriesParams { ndjson: true }),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await
