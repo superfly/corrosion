@@ -1128,7 +1128,7 @@ pub async fn parallel_sync(
                 if needs.is_empty() {
                     continue;
                 }
-                for (actor_id, need) in needs.drain(0..cmp::min(10, needs.len())) {
+                for (actor_id, need) in needs.drain(needs.len().saturating_sub(10)..) {
                     let actual_needs = match need {
                         SyncNeedV1::Full { versions } => {
                             let range = req_full.entry(actor_id).or_default();
