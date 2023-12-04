@@ -224,6 +224,7 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         Box::new(v0_2_0_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(v0_2_0_1_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(v0_2_0_2_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(v0_2_0_3_migration as fn(&Transaction) -> rusqlite::Result<()>),
     ];
 
     crate::sqlite::migrate(conn, migrations)
@@ -345,6 +346,16 @@ fn v0_2_0_2_migration(tx: &Transaction) -> rusqlite::Result<()> {
         ALTER TABLE __corro_members ADD COLUMN rtt_min INTEGER;
         -- add updated_at
         ALTER TABLE __corro_members ADD COLUMN updated_at DATETIME NOT NULL DEFAULT 0;
+    "#,
+    )
+}
+
+fn v0_2_0_3_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+        DROP TABLE __corro_subs;
+
+        CREATE INDEX __corro_bookkeeping_actor_id_start_end_version ON __corro_bookkeeping (actor_id, start_version, end_version);
     "#,
     )
 }
