@@ -102,8 +102,9 @@ where
         let recycle_count = self.recycle_count.fetch_add(1, Ordering::Relaxed);
         let n: usize = block_in_place(|| {
             conn.conn()
-                .query_row("SELECT $1", [recycle_count], |row| row.get(0))
-                .map_err(|e| RecycleError::Message(format!("{}", e)))
+                .prepare_cached("SELECT $1")?
+                .query_row([recycle_count], |row| row.get(0))
+                .map_err(RecycleError::from)
         })?;
         if n == recycle_count {
             Ok(())
