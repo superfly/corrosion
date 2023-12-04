@@ -2737,25 +2737,15 @@ async fn process_completed_empties(
 
         for ranges in v.chunks(20) {
             let mut conn = agent.pool().write_low().await?;
-            block_in_place(|| {
-                let mut tx = conn.immediate_transaction()?;
+            let res = block_in_place(|| {
+                let tx = conn.immediate_transaction()?;
 
                 let mut affected = 0;
 
                 let start = Instant::now();
                 for range in ranges {
-                    let mut sp = tx.savepoint()?;
-                    match store_empty_changeset(&sp, actor_id, range.clone()) {
-                        Ok(count) => {
-                            sp.commit()?;
-                            affected += count;
-                        }
-                        Err(e) => {
-                            error!(%actor_id, "could not store empty changeset for versions {range:?}: {e}");
-                            sp.rollback()?;
-                            continue;
-                        }
-                    }
+                    // let mut sp = tx.savepoint()?;
+                    affected += store_empty_changeset(&tx, actor_id, range.clone())?;
                     if let Err(e) = agent.tx_clear_buf().try_send((actor_id, range.clone())) {
                         error!(%actor_id, "could not schedule buffered meta clear: {e}");
                     }
@@ -2766,10 +2756,14 @@ async fn process_completed_empties(
                 info!(%actor_id, "affected {affected} rows while storing cleared versions in {:?}", start.elapsed());
 
                 Ok::<_, eyre::Report>(())
-            })?;
+            });
+
+            if let Err(e) = res {
+                error!("could not insert empty changesets: {e}");
+            }
 
             // let the pool breath a little
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
