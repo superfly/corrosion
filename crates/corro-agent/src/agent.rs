@@ -2735,7 +2735,7 @@ async fn process_completed_empties(
     for (actor_id, empties) in empties {
         let v = empties.into_iter().collect::<Vec<_>>();
 
-        for ranges in v.chunks(20) {
+        for ranges in v.chunks(40) {
             let mut conn = agent.pool().write_low().await?;
             let res = block_in_place(|| {
                 let tx = conn.immediate_transaction()?;
@@ -2753,7 +2753,7 @@ async fn process_completed_empties(
 
                 tx.commit()?;
 
-                info!(%actor_id, "affected {affected} rows while storing cleared versions in {:?}", start.elapsed());
+                debug!(%actor_id, "affected {affected} rows while storing cleared versions in {:?}", start.elapsed());
 
                 Ok::<_, eyre::Report>(())
             });
@@ -2761,9 +2761,6 @@ async fn process_completed_empties(
             if let Err(e) = res {
                 error!("could not insert empty changesets: {e}");
             }
-
-            // let the pool breath a little
-            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
