@@ -1231,7 +1231,7 @@ impl BookieInner {
     }
 
     fn check_notify_ready(&self) {
-        if self.ready_count == self.map.len() {
+        if dbg!(self.ready_count == self.map.len()) {
             self.is_ready.store(true, Ordering::Release);
             self.ready_notify.notify_waiters();
         }
@@ -1258,20 +1258,22 @@ impl Bookie {
         let registry = LockRegistry::default();
         let ready_notify = Arc::new(Notify::new());
         let is_ready = Arc::new(AtomicBool::new(false));
+        let inner = BookieInner {
+            ready_count: map.values().filter(|bv| bv.is_ready).count(),
+            map: map
+                .into_iter()
+                .map(|(k, v)| (k, Booked::new(v, registry.clone())))
+                .collect(),
+            registry: registry.clone(),
+            ready_notify: ready_notify.clone(),
+            is_ready: is_ready.clone(),
+        };
+
+        // unlocks any waiters if we're ready right off the bat!
+        inner.check_notify_ready();
+
         Self {
-            inner: Arc::new(CountedTokioRwLock::new(
-                registry.clone(),
-                BookieInner {
-                    ready_count: map.values().filter(|bv| bv.is_ready).count(),
-                    map: map
-                        .into_iter()
-                        .map(|(k, v)| (k, Booked::new(v, registry.clone())))
-                        .collect(),
-                    registry,
-                    ready_notify: ready_notify.clone(),
-                    is_ready: is_ready.clone(),
-                },
-            )),
+            inner: Arc::new(CountedTokioRwLock::new(registry, inner)),
             ready_notify,
             is_ready,
         }

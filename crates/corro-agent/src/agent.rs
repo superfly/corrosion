@@ -2589,8 +2589,14 @@ async fn sync_loop(
     mut rx_apply: Receiver<(ActorId, Version)>,
     mut tripwire: Tripwire,
 ) {
-    // first, wait for readiness
-    agent.bookie().wait_ready().await;
+    if !agent.bookie().is_ready() {
+        // first, wait for readiness
+        if let Outcome::Preempted(_) = agent.bookie().wait_ready().preemptible(&mut tripwire).await
+        {
+            warn!("sync loop's bookkeeping waiting for readiness pre-empted");
+            return;
+        }
+    }
 
     let mut sync_backoff = backoff::Backoff::new(0)
         .timeout_range(Duration::from_secs(1), MAX_SYNC_BACKOFF)
