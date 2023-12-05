@@ -1231,7 +1231,7 @@ impl BookieInner {
     }
 
     fn check_notify_ready(&self) {
-        if dbg!(self.ready_count == self.map.len()) {
+        if self.ready_count == self.map.len() {
             self.is_ready.store(true, Ordering::Release);
             self.ready_notify.notify_waiters();
         }

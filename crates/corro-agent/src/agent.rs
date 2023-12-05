@@ -2510,7 +2510,7 @@ async fn write_empties_loop(
                     break;
                 }
             },
-            _ = &mut next_empties_check => {
+            _ = &mut next_empties_check, if agent.bookie().is_ready() => {
                 next_empties_check.as_mut().reset(tokio::time::Instant::now() + CHECK_EMPTIES_TO_INSERT_AFTER);
                 if empties.is_empty() {
                     continue;
