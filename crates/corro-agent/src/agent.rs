@@ -945,6 +945,10 @@ async fn clear_overwritten_versions(agent: Agent) {
     let pool = agent.pool();
     let bookie = agent.bookie();
 
+    if !bookie.is_ready() {
+        bookie.wait_ready().await;
+    }
+
     loop {
         sleep(COMPACT_BOOKED_INTERVAL).await;
 
@@ -1168,14 +1172,14 @@ pub async fn handle_change(agent: &Agent, bcast: BroadcastV1, bcast_msg_tx: &Sen
                     .for_actor(change.actor_id)
             };
 
-            if booked
+            let bookedr = booked
                 .read(format!(
                     "handle_change(contains?):{}",
                     change.actor_id.as_simple()
                 ))
-                .await
-                .contains_all(change.versions(), change.seqs())
-            {
+                .await;
+
+            if !bookedr.is_ready || bookedr.contains_all(change.versions(), change.seqs()) {
                 trace!("already seen, stop disseminating");
                 return;
             }
