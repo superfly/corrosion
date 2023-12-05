@@ -205,10 +205,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                         }
                     }
 
-                    let mut bookiew = bookie.write("init actor bookkeeping").await;
-                    let booked = bookiew.for_actor(actor_id);
-                    let mut bookedw = booked.write("insert init").await;
-                    **bookedw = bv;
+                    bookie
+                        .write("replace_actor")
+                        .await
+                        .replace_actor(actor_id, bv);
                 }
 
                 Ok::<_, eyre::Report>(())

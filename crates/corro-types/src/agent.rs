@@ -994,7 +994,7 @@ impl BookedVersions {
         }
 
         let mut prepped = conn.prepare_cached(
-            "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_bookkeeping WHERE site_id = ?",
+            "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
         )?;
         let mut rows = prepped.query([actor_id])?;
 
@@ -1203,7 +1203,7 @@ impl BookieInner {
                         .insert(Booked(Arc::new(CountedTokioRwLock::new(
                             self.registry.clone(),
                             BookedVersions {
-                                is_ready: true,
+                                is_ready: true, // set this to true, it's a new actor and we don't have anything on them
                                 ..Default::default()
                             },
                         ))))
@@ -1235,10 +1235,6 @@ impl BookieInner {
             self.is_ready.store(true, Ordering::Release);
             self.ready_notify.notify_waiters();
         }
-    }
-
-    pub fn is_ready(&self) -> bool {
-        self.ready_count == self.map.len()
     }
 }
 
