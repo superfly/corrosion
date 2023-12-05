@@ -16,7 +16,6 @@ use hyper::StatusCode;
 use itertools::Itertools;
 use metrics::counter;
 use rusqlite::{named_params, params_from_iter, ToSql, Transaction};
-use serde::Deserialize;
 use spawn::spawn_counted;
 use tokio::{
     sync::{
@@ -465,23 +464,21 @@ async fn build_query_rows_response(
     }
 }
 
-#[derive(Deserialize)]
-pub struct V1QueriesParams {
-    ndjson: bool,
-}
-
 pub async fn api_v1_queries(
     Extension(agent): Extension<Agent>,
-    axum::extract::Query(pms): axum::extract::Query<V1QueriesParams>,
+    headers: axum::headers::HeaderMap,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
+    // https://github.com/ndjson/ndjson-spec#33-mediatype-and-file-extensions
+    let ndjson = headers.get("accept").map(|a| a == "application/x-ndjson").unwrap_or(false);
+
     let (mut tx, body) = hyper::Body::channel();
 
     // TODO: timeout on data send instead of infinitely waiting for channel space.
     let (data_tx, mut data_rx) = channel(512);
 
     tokio::spawn(async move {
-        if !pms.ndjson {
+        if !ndjson {
             if let Err(e) = tx.send_data(bytes::Bytes::from_static(b"[")).await {
                 error!("could not send data through body's channel: {e}");
                 return;
@@ -508,7 +505,7 @@ pub async fn api_v1_queries(
             }
 
             if !matches!(row_res, QueryEvent::EndOfQuery { .. }) {
-                buf.extend_from_slice(if pms.ndjson { b"\n" } else { b"," });
+                buf.extend_from_slice(if ndjson { b"\n" } else { b"," });
             }
 
             if let Err(e) = tx.send_data(buf.split().freeze()).await {
@@ -517,7 +514,7 @@ pub async fn api_v1_queries(
             }
         }
 
-        if !pms.ndjson {
+        if !ndjson {
             if let Err(e) = tx.send_data(bytes::Bytes::from_static(b"]")).await {
                 error!("could not send data through body's channel: {e}");
                 return;
@@ -637,6 +634,7 @@ pub async fn api_v1_db_schema(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
     use bytes::Bytes;
     use corro_types::{api::RowId, config::Config, schema::SqliteType, base::Version};
     use futures::Stream;
@@ -805,9 +803,12 @@ mod tests {
 
         println!("transaction body: {body:?}");
 
+        let mut headers = axum::headers::HeaderMap::new();
+        headers.insert("Accept", HeaderValue::from_static("application/x-ndjson"));
+
         let res = api_v1_queries(
             Extension(agent.clone()),
-            axum::extract::Query(V1QueriesParams { ndjson: true }),
+            headers,
             axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await
