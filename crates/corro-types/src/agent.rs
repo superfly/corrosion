@@ -5,7 +5,7 @@ use std::{
     ops::{Deref, DerefMut, RangeInclusive},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -21,8 +21,8 @@ use rangemap::RangeInclusiveSet;
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
-    AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
-    RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
+    AcquireError, Notify, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard,
+    OwnedSemaphorePermit, RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
     RwLockWriteGuard as TokioRwLockWriteGuard,
 };
 use tokio::{
@@ -960,16 +960,81 @@ pub struct BookedVersions {
     pub partials: BTreeMap<Version, PartialVersion>,
     sync_need: RangeInclusiveSet<Version>,
     last: Option<Version>,
+    pub is_ready: bool,
 }
 
 impl BookedVersions {
+    pub fn materialize(conn: &Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
+        let mut bv = Self::default();
+        let mut prepped = conn.prepare_cached(
+            "SELECT start_version, end_version, db_version, last_seq, ts FROM __corro_bookkeeping WHERE actor_id = ?",
+        )?;
+        let mut rows = prepped.query([actor_id])?;
+
+        loop {
+            let row = rows.next()?;
+            match row {
+                None => break,
+                Some(row) => {
+                    let start_v = row.get(0)?;
+                    let end_v: Option<Version> = row.get(1)?;
+                    bv._insert_many(
+                        start_v..=end_v.unwrap_or(start_v),
+                        match row.get(2)? {
+                            Some(db_version) => KnownDbVersion::Current(CurrentVersion {
+                                db_version,
+                                last_seq: row.get(3)?,
+                                ts: row.get(4)?,
+                            }),
+                            None => KnownDbVersion::Cleared,
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut prepped = conn.prepare_cached(
+            "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_bookkeeping WHERE site_id = ?",
+        )?;
+        let mut rows = prepped.query([actor_id])?;
+
+        loop {
+            let row = rows.next()?;
+            match row {
+                None => break,
+                Some(row) => match bv.partials.entry(row.get(0)?) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(PartialVersion {
+                            seqs: RangeInclusiveSet::from_iter(vec![row.get(1)?..=row.get(2)?]),
+                            last_seq: row.get(3)?,
+                            ts: row.get(4)?,
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().seqs.insert(row.get(1)?..=row.get(2)?);
+                    }
+                },
+            }
+        }
+
+        bv.is_ready = true;
+
+        Ok(bv)
+    }
+
     pub fn contains_version(&self, version: &Version) -> bool {
+        if !self.is_ready {
+            panic!("bookkeeping is not ready, can't lookup versions");
+        }
         self.cleared.contains(version)
             || self.current.contains_key(version)
             || self.partials.contains_key(version)
     }
 
     pub fn get(&self, version: &Version) -> Option<KnownVersion> {
+        if !self.is_ready {
+            panic!("bookkeeping is not ready for actor, can't get a cached version");
+        }
         self.cleared
             .get(version)
             .map(|_| KnownVersion::Cleared)
@@ -1022,6 +1087,13 @@ impl BookedVersions {
         versions: RangeInclusive<Version>,
         known_version: KnownDbVersion,
     ) {
+        if !self.is_ready {
+            panic!("bookkeeping is not ready for actor, can't insert versions");
+        }
+        self._insert_many(versions, known_version)
+    }
+
+    fn _insert_many(&mut self, versions: RangeInclusive<Version>, known_version: KnownDbVersion) {
         match known_version {
             KnownDbVersion::Partial(partial) => {
                 self.partials.insert(*versions.start(), partial);
@@ -1058,6 +1130,9 @@ impl BookedVersions {
     }
 
     pub fn sync_need(&self) -> &RangeInclusiveSet<Version> {
+        if !self.is_ready {
+            panic!("bookkeeping is not ready for actor, can't produce synchronization needs");
+        }
         &self.sync_need
     }
 }
@@ -1112,19 +1187,58 @@ impl Booked {
 pub struct BookieInner {
     map: HashMap<ActorId, Booked>,
     registry: LockRegistry,
+    ready_count: usize,
+    ready_notify: Arc<Notify>,
+    is_ready: Arc<AtomicBool>,
 }
 
 impl BookieInner {
     pub fn for_actor(&mut self, actor_id: ActorId) -> Booked {
-        self.map
-            .entry(actor_id)
-            .or_insert_with(|| {
-                Booked(Arc::new(CountedTokioRwLock::new(
-                    self.registry.clone(),
-                    Default::default(),
-                )))
-            })
-            .clone()
+        let (booked, is_new) = match self.map.entry(actor_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), false),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.ready_count += 1;
+                (
+                    entry
+                        .insert(Booked(Arc::new(CountedTokioRwLock::new(
+                            self.registry.clone(),
+                            BookedVersions {
+                                is_ready: true,
+                                ..Default::default()
+                            },
+                        ))))
+                        .clone(),
+                    true,
+                )
+            }
+        };
+        if is_new {
+            self.check_notify_ready();
+        }
+        booked
+    }
+
+    pub fn replace_actor(&mut self, actor_id: ActorId, bv: BookedVersions) {
+        if bv.is_ready {
+            self.ready_count += 1;
+            self.check_notify_ready();
+        }
+
+        self.map.insert(
+            actor_id,
+            Booked(Arc::new(CountedTokioRwLock::new(self.registry.clone(), bv))),
+        );
+    }
+
+    fn check_notify_ready(&self) {
+        if self.ready_count == self.map.len() {
+            self.is_ready.store(true, Ordering::Release);
+            self.ready_notify.notify_waiters();
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready_count == self.map.len()
     }
 }
 
@@ -1137,45 +1251,66 @@ impl Deref for BookieInner {
 }
 
 #[derive(Clone)]
-pub struct Bookie(Arc<CountedTokioRwLock<BookieInner>>);
+pub struct Bookie {
+    inner: Arc<CountedTokioRwLock<BookieInner>>,
+    is_ready: Arc<AtomicBool>,
+    ready_notify: Arc<Notify>,
+}
 
 impl Bookie {
     pub fn new(map: HashMap<ActorId, BookedVersions>) -> Self {
         let registry = LockRegistry::default();
-        Self(Arc::new(CountedTokioRwLock::new(
-            registry.clone(),
-            BookieInner {
-                map: map
-                    .into_iter()
-                    .map(|(k, v)| (k, Booked::new(v, registry.clone())))
-                    .collect(),
-                registry,
-            },
-        )))
+        let ready_notify = Arc::new(Notify::new());
+        let is_ready = Arc::new(AtomicBool::new(false));
+        Self {
+            inner: Arc::new(CountedTokioRwLock::new(
+                registry.clone(),
+                BookieInner {
+                    ready_count: map.values().filter(|bv| bv.is_ready).count(),
+                    map: map
+                        .into_iter()
+                        .map(|(k, v)| (k, Booked::new(v, registry.clone())))
+                        .collect(),
+                    registry,
+                    ready_notify: ready_notify.clone(),
+                    is_ready: is_ready.clone(),
+                },
+            )),
+            ready_notify,
+            is_ready,
+        }
+    }
+
+    pub async fn wait_ready(&self) {
+        self.ready_notify.notified().await
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.is_ready.load(Ordering::Acquire)
     }
 
     pub async fn read<L: Into<CompactString>>(
         &self,
         label: L,
     ) -> CountedTokioRwLockReadGuard<BookieInner> {
-        self.0.read(label).await
+        self.inner.read(label).await
     }
 
     pub async fn write<L: Into<CompactString>>(
         &self,
         label: L,
     ) -> CountedTokioRwLockWriteGuard<BookieInner> {
-        self.0.write(label).await
+        self.inner.write(label).await
     }
 
     pub fn blocking_write<L: Into<CompactString>>(
         &self,
         label: L,
     ) -> CountedTokioRwLockWriteGuard<BookieInner> {
-        self.0.blocking_write(label)
+        self.inner.blocking_write(label)
     }
 
     pub fn registry(&self) -> &LockRegistry {
-        self.0.registry()
+        self.inner.registry()
     }
 }

@@ -72,6 +72,8 @@ pub type SyncRequestV1 = Vec<(ActorId, Vec<SyncNeedV1>)>;
 pub enum SyncRejectionV1 {
     #[error("max concurrency reached")]
     MaxConcurrencyReached,
+    #[error("not ready")]
+    NotReady,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Readable, Writable, Serialize, Deserialize)]

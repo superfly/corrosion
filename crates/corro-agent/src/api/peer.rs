@@ -1298,9 +1298,24 @@ pub async fn serve_sync(
     tracing::Span::current().set_parent(context);
 
     debug!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "received sync request");
+
     let mut codec = LengthDelimitedCodec::new();
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
+
+    if !agent.bookie().is_ready() {
+        encode_write_sync_msg(
+            &mut codec,
+            &mut encode_buf,
+            &mut send_buf,
+            SyncMessage::V1(SyncMessageV1::Rejection(SyncRejectionV1::NotReady)),
+            &mut write,
+        )
+        .instrument(info_span!("write_sync_reject"))
+        .await?;
+
+        return Err(SyncRejectionV1::NotReady.into());
+    }
 
     // read the clock
     match read_sync_msg(&mut read)
