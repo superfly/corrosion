@@ -7,12 +7,11 @@ use std::{
 
 use deadpool::{
     async_trait,
-    managed::{self, Object, RecycleError},
+    managed::{self, Object},
 };
 
 pub use deadpool::managed::reexports::*;
 pub use rusqlite;
-use tokio::task::block_in_place;
 
 pub type Pool<T> = deadpool::managed::Pool<Manager<T>>;
 pub type RusqlitePool = Pool<rusqlite::Connection>;
@@ -96,19 +95,10 @@ where
 
     async fn recycle(
         &self,
-        conn: &mut Self::Type,
+        _conn: &mut Self::Type,
         _: &Metrics,
     ) -> managed::RecycleResult<Self::Error> {
-        let recycle_count = self.recycle_count.fetch_add(1, Ordering::Relaxed);
-        let n: usize = block_in_place(|| {
-            conn.conn()
-                .query_row("SELECT $1", [recycle_count], |row| row.get(0))
-                .map_err(|e| RecycleError::Message(format!("{}", e)))
-        })?;
-        if n == recycle_count {
-            Ok(())
-        } else {
-            Err(RecycleError::StaticMessage("Recycle count mismatch"))
-        }
+        let _ = self.recycle_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
