@@ -23,6 +23,14 @@
         rust-latest = fenix.packages."${system}".latest;
       in
         {
+          packages.mdbook-shell = pkgs.mkShell {
+            buildInputs = with pkgs; [ mdbook mdbook-linkcheck mdbook-admonish ];
+
+            shellHook = ''
+              mdbook serve
+            '';
+          };
+          
           ## Here we declare the only flake output to be a nix build
           ## of the corrosion crate tree
           packages.default =
