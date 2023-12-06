@@ -482,7 +482,7 @@ fn handle_known_version(
                             }
                         };
 
-                        if let Some(known) = maybe_current_version {
+                        if let Some(current) = maybe_current_version {
                             warn!(%actor_id, %version, "switched from partial to current version");
 
                             // drop write lock
@@ -501,7 +501,7 @@ fn handle_known_version(
                                 actor_id,
                                 is_local,
                                 version,
-                                known,
+                                current,
                                 booked,
                                 seqs_needed,
                                 last_seq,
@@ -513,6 +513,16 @@ fn handle_known_version(
                         // this is a read transaction!
                         let tx = conn.transaction()?;
 
+                        // first check if we do have the sequence...
+                        let still_exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ? AND start_seq <= ? AND end_seq >= ?)")?.query_row(params![actor_id, version, start_seq, end_seq], |row| row.get(0))?;
+
+                        if !still_exists {
+                            warn!(%actor_id, %version, "seqs bookkeeping indicated buffered changes were gone, aborting!");
+                            break 'outer;
+                        }
+
+                        // the data is still valid because we just checked __corro_seq_bookkeeping and
+                        // we're in a transaction (of "read" type since the first select)
                         let mut prepped = tx.prepare_cached(
                             r#"
                             SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
@@ -523,10 +533,8 @@ fn handle_known_version(
                                   ORDER BY seq ASC"#,
                         )?;
 
-                        let site_id: [u8; 16] = actor_id.to_bytes();
-
                         let rows = prepped.query_map(
-                            params![site_id, version, start_seq, end_seq],
+                            params![actor_id, version, start_seq, end_seq],
                             row_to_change,
                         )?;
 

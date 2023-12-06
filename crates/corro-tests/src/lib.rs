@@ -23,6 +23,11 @@ pub const TEST_SCHEMA: &str = r#"
             id BLOB NOT NULL PRIMARY KEY,
             text TEXT NOT NULL DEFAULT ""
         ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS testsbool (
+            id INTEGER NOT NULL PRIMARY KEY,
+            b boolean not null default false
+        );
     "#;
 
 #[derive(Clone)]
