@@ -50,12 +50,14 @@ async fn sub_by_id(
     bcast_cache: &SharedMatcherBroadcastCache,
     tripwire: Tripwire,
 ) -> hyper::Response<hyper::Body> {
-    let (matcher, rx) = match bcast_cache.read().await.get(&id).and_then(|tx| {
+    let matcher_rx = bcast_cache.read().await.get(&id).and_then(|tx| {
         subs.get(&id).map(|matcher| {
             debug!("found matcher by id {id}");
             (matcher, tx.subscribe())
         })
-    }) {
+    });
+
+    let (matcher, rx) = match matcher_rx {
         Some(matcher_rx) => matcher_rx,
         None => {
             // ensure this goes!
