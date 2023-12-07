@@ -108,6 +108,7 @@ pub enum AuthzConfig {
 pub struct GossipConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
+    pub external_addr: Option<SocketAddr>,
     #[serde(default)]
     pub bootstrap: Vec<String>,
     #[serde(default)]
@@ -196,6 +197,7 @@ pub struct ConfigBuilder {
     pub db_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
     api_addr: Option<SocketAddr>,
+    external_addr: Option<SocketAddr>,
     admin_path: Option<Utf8PathBuf>,
     prometheus_addr: Option<SocketAddr>,
     bootstrap: Option<Vec<String>>,
@@ -219,6 +221,11 @@ impl ConfigBuilder {
 
     pub fn api_addr(mut self, addr: SocketAddr) -> Self {
         self.api_addr = Some(addr);
+        self
+    }
+
+    pub fn external_addr(mut self, addr: SocketAddr) -> Self {
+        self.external_addr = Some(addr);
         self
     }
 
@@ -287,6 +294,7 @@ impl ConfigBuilder {
                 bind_addr: self
                     .gossip_addr
                     .ok_or(ConfigBuilderError::GossipAddrRequired)?,
+                external_addr: self.external_addr,
                 bootstrap: self.bootstrap.unwrap_or_default(),
                 plaintext: self.tls.is_none(),
                 tls: self.tls,

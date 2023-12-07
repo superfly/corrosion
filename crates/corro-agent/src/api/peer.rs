@@ -1760,6 +1760,7 @@ mod tests {
 
         let gossip_config = GossipConfig {
             bind_addr: "127.0.0.1:0".parse()?,
+            external_addr: None,
             bootstrap: vec![],
             tls: Some(TlsConfig {
                 cert_file,

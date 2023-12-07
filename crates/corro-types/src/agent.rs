@@ -56,6 +56,7 @@ pub struct AgentConfig {
     pub pool: SplitPool,
     pub config: ArcSwap<Config>,
     pub gossip_addr: SocketAddr,
+    pub external_addr: Option<SocketAddr>,
     pub api_addr: SocketAddr,
     pub members: RwLock<Members>,
     pub clock: Arc<uhlc::HLC>,
@@ -82,6 +83,7 @@ pub struct AgentInner {
     pool: SplitPool,
     config: ArcSwap<Config>,
     gossip_addr: SocketAddr,
+    external_addr: Option<SocketAddr>,
     api_addr: SocketAddr,
     members: RwLock<Members>,
     clock: Arc<uhlc::HLC>,
@@ -110,6 +112,7 @@ impl Agent {
             pool: config.pool,
             config: config.config,
             gossip_addr: config.gossip_addr,
+            external_addr: config.external_addr,
             api_addr: config.api_addr,
             members: config.members,
             clock: config.clock,
@@ -145,6 +148,11 @@ impl Agent {
     pub fn gossip_addr(&self) -> SocketAddr {
         self.0.gossip_addr
     }
+
+    pub fn external_addr(&self) -> Option<SocketAddr> {
+        self.0.external_addr
+    }
+
     pub fn api_addr(&self) -> SocketAddr {
         self.0.api_addr
     }
