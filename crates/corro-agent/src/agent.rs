@@ -274,6 +274,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let gossip_server_endpoint = gossip_server_endpoint(&conf.gossip).await?;
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
+    let external_addr = conf.gossip.external_addr;
+
     let (rtt_tx, rtt_rx) = channel(128);
 
     let transport = Transport::new(&conf.gossip, rtt_tx).await?;
@@ -315,6 +317,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         actor_id,
         pool,
         gossip_addr,
+        external_addr,
         api_addr,
         members: RwLock::new(members),
         config: ArcSwap::from_pointee(conf),
@@ -439,7 +442,7 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     runtime_loop(
         Actor::new(
             actor_id,
-            agent.gossip_addr(),
+            agent.external_addr().unwrap_or_else(|| agent.gossip_addr()),
             agent.clock().new_timestamp().into(),
         ),
         agent.clone(),

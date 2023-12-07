@@ -420,7 +420,7 @@ pub fn runtime_loop(
 
             match branch {
                 Branch::Tripped => {
-                    // nothing to here, yet!
+                    // nothing to do here, yet!
                 }
                 Branch::BroadcastTick => {
                     if !bcast_buf.is_empty() {
