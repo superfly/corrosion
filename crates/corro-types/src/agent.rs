@@ -381,8 +381,12 @@ pub enum PoolError {
 pub enum ChangeError {
     #[error("could not acquire pooled connection: {0}")]
     Pool(#[from] PoolError),
-    #[error("rusqlite: {0}")]
-    Rusqlite(#[from] rusqlite::Error),
+    #[error("rusqlite: {source} (actor_id: {actor_id:?}, version: {version:?})")]
+    Rusqlite {
+        source: rusqlite::Error,
+        actor_id: Option<ActorId>,
+        version: Option<Version>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

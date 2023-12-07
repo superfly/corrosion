@@ -1800,7 +1800,7 @@ async fn process_fully_buffered_changes(
         };
 
         Ok::<_, rusqlite::Error>(inserted)
-    })?;
+    }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
 
     Ok(inserted)
 }
@@ -1848,7 +1848,13 @@ pub async fn process_multiple_changes(
 
     let changesets = block_in_place(|| {
         let start = Instant::now();
-        let tx = conn.immediate_transaction()?;
+        let tx = conn
+            .immediate_transaction()
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
 
         let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
@@ -1969,17 +1975,17 @@ pub async fn process_multiple_changes(
                     }) => {
                         count += 1;
                         let version = versions.start();
-                        info!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
+                        debug!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
                         tx.prepare_cached("
                             INSERT INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  last_seq,  ts)
-                                                    VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);")?
+                                                    VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?
                             .execute(named_params!{
                                 ":actor_id": actor_id,
                                 ":start_version": *version,
                                 ":db_version": *db_version,
                                 ":last_seq": *last_seq,
                                 ":ts": *ts
-                            })?;
+                            }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?;
                     }
                     KnownDbVersion::Cleared => {
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
@@ -1994,7 +2000,11 @@ pub async fn process_multiple_changes(
 
         debug!("inserted {count} new changesets");
 
-        tx.commit()?;
+        tx.commit().map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?;
 
         debug!("committed {count} changes in {:?}", start.elapsed());
 
