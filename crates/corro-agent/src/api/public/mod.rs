@@ -57,7 +57,13 @@ where
 
     let start = Instant::now();
     block_in_place(move || {
-        let tx = conn.immediate_transaction()?;
+        let tx = conn
+            .immediate_transaction()
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
 
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
@@ -65,17 +71,31 @@ where
         let ts = Timestamp::from(agent.clock().new_timestamp());
 
         let db_version: CrsqlDbVersion = tx
-            .prepare_cached("SELECT crsql_next_db_version()")?
-            .query_row((), |row| row.get(0))?;
+            .prepare_cached("SELECT crsql_next_db_version()")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?
+            .query_row((), |row| row.get(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
 
         let has_changes: bool = tx
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE site_id IS NULL AND db_version = ?);",
-        )?
-        .query_row([db_version], |row| row.get(0))?;
+        ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: None})?
+        .query_row([db_version], |row| row.get(0)).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: None})?;
 
         if !has_changes {
-            tx.commit()?;
+            tx.commit().map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
             return Ok((ret, start.elapsed()));
         }
 
@@ -87,8 +107,18 @@ where
         let last_seq: CrsqlSeq = tx
             .prepare_cached(
                 "SELECT MAX(seq) FROM crsql_changes WHERE site_id IS NULL AND db_version = ?",
-            )?
-            .query_row([db_version], |row| row.get(0))?;
+            )
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?
+            .query_row([db_version], |row| row.get(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
 
         let elapsed = {
             tx.prepare_cached(
@@ -96,18 +126,32 @@ where
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
                     VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
             "#,
-            )?
+            )
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?
             .execute(named_params! {
                 ":actor_id": actor_id,
                 ":start_version": version,
                 ":db_version": db_version,
                 ":last_seq": last_seq,
                 ":ts": ts
+            })
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
             })?;
 
             debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
-            tx.commit()?;
+            tx.commit().map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
             start.elapsed()
         };
 
@@ -614,7 +658,7 @@ pub async fn api_v1_db_schema(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use corro_types::{api::RowId, config::Config, schema::SqliteType, base::Version};
+    use corro_types::{api::RowId, base::Version, config::Config, schema::SqliteType};
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
     use tokio::sync::mpsc::error::TryRecvError;

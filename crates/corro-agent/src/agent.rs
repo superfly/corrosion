@@ -945,13 +945,13 @@ pub async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
             .inspect(|_| info!("corrosion agent sync loop is done")),
     );
 
-    let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
-
     tokio::spawn(handle_gossip_to_send(transport.clone(), to_send_rx));
     tokio::spawn(handle_notifications(agent.clone(), notifications_rx));
     tokio::spawn(metrics_loop(agent.clone(), transport));
 
     tokio::spawn(handle_broadcasts(agent.clone(), bcast_rx));
+
+    let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
 
     loop {
         tokio::select! {
@@ -1800,7 +1800,7 @@ async fn process_fully_buffered_changes(
         };
 
         Ok::<_, rusqlite::Error>(inserted)
-    })?;
+    }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
 
     Ok(inserted)
 }
@@ -1848,7 +1848,13 @@ pub async fn process_multiple_changes(
 
     let changesets = block_in_place(|| {
         let start = Instant::now();
-        let tx = conn.immediate_transaction()?;
+        let tx = conn
+            .immediate_transaction()
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
 
         let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
@@ -1972,14 +1978,14 @@ pub async fn process_multiple_changes(
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
                         tx.prepare_cached("
                             INSERT INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  last_seq,  ts)
-                                                    VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);")?
+                                                    VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?
                             .execute(named_params!{
                                 ":actor_id": actor_id,
                                 ":start_version": *version,
                                 ":db_version": *db_version,
                                 ":last_seq": *last_seq,
                                 ":ts": *ts
-                            })?;
+                            }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?;
                     }
                     KnownDbVersion::Cleared => {
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
@@ -1994,7 +2000,11 @@ pub async fn process_multiple_changes(
 
         debug!("inserted {count} new changesets");
 
-        tx.commit()?;
+        tx.commit().map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?;
 
         debug!("committed {count} changes in {:?}", start.elapsed());
 
@@ -2013,10 +2023,13 @@ pub async fn process_multiple_changes(
             ));
 
             for (versions, known) in knowns {
-                if let KnownDbVersion::Partial(PartialVersion { seqs, last_seq, .. }) = &known {
-                    let full_seqs_range = CrsqlSeq(0)..=*last_seq;
+                let version = *versions.start();
+                // this merges partial version seqs
+                if let Some(PartialVersion { seqs, last_seq, .. }) =
+                    booked_write.insert_many(versions, known)
+                {
+                    let full_seqs_range = CrsqlSeq(0)..=last_seq;
                     let gaps_count = seqs.gaps(&full_seqs_range).count();
-                    let version = *versions.start();
                     if gaps_count == 0 {
                         // if we have no gaps, then we can schedule applying all these changes.
                         debug!(%actor_id, %version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
@@ -2030,7 +2043,6 @@ pub async fn process_multiple_changes(
                         debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs");
                     }
                 }
-                booked_write.insert_many(versions, known);
             }
         }
 
@@ -2073,13 +2085,15 @@ fn process_incomplete_version(
         ts,
     } = parts;
 
+    let mut changes_per_table = BTreeMap::new();
+
     debug!(%actor_id, %version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
     let mut inserted = 0;
     for change in changes.iter() {
         trace!("buffering change! {change:?}");
 
         // insert change, do nothing on conflict
-        inserted += tx.prepare_cached(
+        let new_insertion = tx.prepare_cached(
             r#"
                 INSERT INTO __corro_buffered_changes
                     ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, version)
@@ -2101,50 +2115,84 @@ fn process_incomplete_version(
             ":seq": change.seq,
             ":version": version,
         })?;
+
+        inserted += new_insertion;
+
+        if let Some(counter) = changes_per_table.get_mut(&change.table) {
+            *counter += 1;
+        } else {
+            changes_per_table.insert(change.table.clone(), 1);
+        }
     }
 
     debug!(%actor_id, %version, "buffered {inserted} changes");
 
-    // calculate all known sequences for the actor + version combo
-    let mut seqs_in_bookkeeping: RangeInclusiveSet<CrsqlSeq> = tx
+    let deleted: Vec<RangeInclusive<CrsqlSeq>> = tx
         .prepare_cached(
             "
-                    SELECT start_seq, end_seq
-                        FROM __corro_seq_bookkeeping
-                        WHERE site_id = ?
-                          AND version = ?
-                ",
-        )?
-        .query_map(params![actor_id, version], |row| {
-            Ok(row.get(0)?..=row.get(1)?)
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+            DELETE FROM __corro_seq_bookkeeping
+                WHERE site_id = :actor_id AND version = :version AND
+                (
+                    -- start_seq is between start and end of range AND no end_seq
+                    ( start_seq BETWEEN :start AND :end AND end_seq IS NULL ) OR
+                    
+                    -- start_seq and end_seq are within the range
+                    ( start_seq >= :start AND end_seq <= :end ) OR
 
-    // immediately add the new range to the recorded seqs ranges
-    seqs_in_bookkeeping.insert(seqs.clone());
+                    -- range being inserted is partially contained within another
+                    ( start_seq <= :end AND end_seq >= :end ) OR
 
-    tx.prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?
-        .execute(params![actor_id, version])?;
+                    -- start_seq = end + 1 (to collapse ranges)
+                    ( start_seq = :end + 1 AND end_seq IS NOT NULL ) OR
 
-    for range in seqs_in_bookkeeping.iter() {
-        tx.prepare_cached(
-            "
-            INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    -- end_seq = start - 1 (to collapse ranges)
+                    ( end_seq = :start - 1 )
+                )
         ",
         )?
-        .execute(params![
-            actor_id,
-            version,
-            range.start(),
-            range.end(),
-            last_seq,
-            ts
-        ])?;
+        .query_map(
+            named_params![
+                ":actor_id": actor_id,
+                ":version": version,
+                ":start": seqs.start(),
+                ":end": seqs.end(),
+            ],
+            |row| {
+                let start = row.get(0)?;
+                Ok(start..=row.get::<_, Option<CrsqlSeq>>(1)?.unwrap_or(start))
+            },
+        )
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+    // re-compute the ranges
+    let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
+    new_ranges.insert(seqs.clone());
+
+    // we should never have deleted non-contiguous seq ranges, abort!
+    if new_ranges.len() > 1 {
+        warn!("deleted non-contiguous ranges! {new_ranges:?}");
+        // this serves as a failsafe
+        return Err(rusqlite::Error::StatementChangedRows(new_ranges.len()));
+    }
+
+    // insert new seq ranges, there should only be one...
+    for range in new_ranges.clone() {
+        tx
+        .prepare_cached(
+            "
+                INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
+                    VALUES (?, ?, ?, ?, ?, ?);
+            ",
+        )?
+        .execute(params![actor_id, version, range.start(), range.end(), last_seq, ts])?;
+    }
+
+    for (table_name, count) in changes_per_table {
+        counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
     }
 
     Ok(KnownDbVersion::Partial(PartialVersion {
-        seqs: seqs_in_bookkeeping.clone(),
+        seqs: new_ranges,
         last_seq: *last_seq,
         ts: *ts,
     }))
@@ -2578,19 +2626,26 @@ async fn clear_buffered_meta_loop(
 ) {
     while let Some((actor_id, versions)) = rx_partials.recv().await {
         let pool = agent.pool().clone();
+        let self_actor_id = agent.actor_id();
         tokio::spawn(async move {
             loop {
                 let res = {
-                    let conn = pool.write_low().await?;
+                    let mut conn = pool.write_low().await?;
 
                     block_in_place(|| {
-                        let buf_count = conn
-                .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
-                .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+                        let tx = conn.immediate_transaction()?;
 
-                        let seq_count = conn
-                .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
-                .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+                        // TODO: delete buffered changes from deleted sequences only (maybe, it's kind of hard and may not be necessary)
+
+                        let seq_count = tx
+                            .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+                            .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+                        let buf_count = tx
+                            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+                            .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+
+                        tx.commit()?;
 
                         Ok::<_, rusqlite::Error>((buf_count, seq_count))
                     })
@@ -2599,7 +2654,7 @@ async fn clear_buffered_meta_loop(
                 match res {
                     Ok((buf_count, seq_count)) => {
                         if buf_count + seq_count > 0 {
-                            info!(%actor_id, "cleared {} buffered meta rows for versions {versions:?}", buf_count + seq_count);
+                            info!(%actor_id, %self_actor_id, "cleared {} buffered meta rows for versions {versions:?}", buf_count + seq_count);
                         }
                         if buf_count < TO_CLEAR_COUNT && seq_count < TO_CLEAR_COUNT {
                             break;
@@ -3347,24 +3402,37 @@ pub mod tests {
             .pool_idle_timeout(Duration::from_secs(300))
             .build_http::<hyper::Body>();
 
-        let req_body: Vec<Statement> = serde_json::from_value(json!(["INSERT INTO tests  WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 10000  ) SELECT id, \"hello\" as text FROM cte;"]))?;
+        let counts = [
+            10000, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 1000, 900, 800, 700, 600,
+            500, 400, 300, 200, 100, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 1000, 900,
+            800, 700, 600, 500, 400, 300, 200, 100, 1000, 900, 800, 700, 600, 500, 400, 300, 200,
+            100, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 1000, 900, 800, 700, 600, 500,
+            400, 300, 200, 100, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 1000, 900, 800,
+            700, 600, 500, 400, 300, 200, 100, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100,
+        ];
 
-        let res = timeout(
-            Duration::from_secs(5),
-            client.request(
-                hyper::Request::builder()
-                    .method(hyper::Method::POST)
-                    .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
-                    .header(hyper::header::CONTENT_TYPE, "application/json")
-                    .body(serde_json::to_vec(&req_body)?.into())?,
-            ),
-        )
-        .await??;
+        for n in counts.iter() {
+            let req_body: Vec<Statement> = serde_json::from_value(json!([format!("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT {n}  ) SELECT id FROM cte;")]))?;
 
-        let body: ExecResponse =
-            serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+            let res = timeout(
+                Duration::from_secs(5),
+                client.request(
+                    hyper::Request::builder()
+                        .method(hyper::Method::POST)
+                        .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                        .body(serde_json::to_vec(&req_body)?.into())?,
+                ),
+            )
+            .await??;
 
-        println!("body: {body:?}");
+            let body: ExecResponse =
+                serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+
+            println!("body: {body:?}");
+        }
+
+        let expected_count = counts.into_iter().sum::<usize>();
 
         let db_version: CrsqlDbVersion =
             ta1.agent
@@ -3372,7 +3440,7 @@ pub mod tests {
                 .read()
                 .await?
                 .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-        assert_eq!(db_version, CrsqlDbVersion(1));
+        assert_eq!(db_version, CrsqlDbVersion(counts.len() as u64));
 
         sleep(Duration::from_secs(2)).await;
 
@@ -3384,6 +3452,9 @@ pub mod tests {
             tripwire.clone(),
         )
         .await?;
+
+        sleep(Duration::from_secs(1)).await;
+
         let ta3 = launch_test_agent(
             |conf| {
                 conf.bootstrap(vec![ta2.agent.gossip_addr().to_string()])
@@ -3392,6 +3463,9 @@ pub mod tests {
             tripwire.clone(),
         )
         .await?;
+
+        sleep(Duration::from_secs(1)).await;
+
         let ta4 = launch_test_agent(
             |conf| {
                 conf.bootstrap(vec![ta3.agent.gossip_addr().to_string()])
@@ -3401,64 +3475,42 @@ pub mod tests {
         )
         .await?;
 
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(20)).await;
 
-        {
-            let conn = ta2.agent.pool().read().await?;
+        for agent in [ta2.agent, ta3.agent, ta4.agent] {
+            let conn = agent.pool().read().await?;
 
-            let count: i64 = conn
-                .prepare_cached("SELECT COUNT(*) FROM tests;")?
+            let count: u64 = conn
+                .prepare_cached("SELECT COUNT(*) FROM testsbool;")?
                 .query_row((), |row| row.get(0))?;
 
             println!(
                 "{:#?}",
-                generate_sync(ta2.agent.bookie(), ta2.agent.actor_id()).await
+                generate_sync(agent.bookie(), agent.actor_id()).await
             );
+
+            if count as usize != expected_count {
+                let buf_count: u64 =
+                    conn.query_row("select count(*) from __corro_buffered_changes", [], |row| {
+                        row.get(0)
+                    })?;
+                println!(
+                    "BUFFERED COUNT: {buf_count} (actor_id: {})",
+                    agent.actor_id()
+                );
+
+                let ranges = conn
+                    .prepare("select start_seq, end_seq from __corro_seq_bookkeeping")?
+                    .query_map([], |row| Ok(row.get::<_, u64>(0)?..=row.get::<_, u64>(1)?))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                println!("ranges: {ranges:?}");
+            }
 
             assert_eq!(
-                count,
-                10000,
-                "actor {} did not reach 100K rows",
-                ta2.agent.actor_id()
-            );
-        }
-
-        {
-            let conn = ta3.agent.pool().read().await?;
-
-            let count: i64 = conn
-                .prepare_cached("SELECT COUNT(*) FROM tests;")?
-                .query_row((), |row| row.get(0))?;
-
-            println!(
-                "{:#?}",
-                generate_sync(ta3.agent.bookie(), ta3.agent.actor_id()).await
-            );
-
-            assert_eq!(
-                count,
-                10000,
-                "actor {} did not reach 100K rows",
-                ta3.agent.actor_id()
-            );
-        }
-        {
-            let conn = ta4.agent.pool().read().await?;
-
-            let count: i64 = conn
-                .prepare_cached("SELECT COUNT(*) FROM tests;")?
-                .query_row((), |row| row.get(0))?;
-
-            println!(
-                "{:#?}",
-                generate_sync(ta4.agent.bookie(), ta4.agent.actor_id()).await
-            );
-
-            assert_eq!(
-                count,
-                10000,
-                "actor {} did not reach 100K rows",
-                ta4.agent.actor_id()
+                count as usize,
+                expected_count,
+                "actor {} did not reach 10K rows",
+                agent.actor_id()
             );
         }
 

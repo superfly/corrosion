@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{btree_map, BTreeMap, HashMap},
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
@@ -381,8 +381,12 @@ pub enum PoolError {
 pub enum ChangeError {
     #[error("could not acquire pooled connection: {0}")]
     Pool(#[from] PoolError),
-    #[error("rusqlite: {0}")]
-    Rusqlite(#[from] rusqlite::Error),
+    #[error("rusqlite: {source} (actor_id: {actor_id:?}, version: {version:?})")]
+    Rusqlite {
+        source: rusqlite::Error,
+        actor_id: Option<ActorId>,
+        version: Option<Version>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1010,15 +1014,23 @@ impl BookedVersions {
         &mut self,
         versions: RangeInclusive<Version>,
         known_version: KnownDbVersion,
-    ) {
-        match known_version {
+    ) -> Option<PartialVersion> {
+        let ret = match known_version {
             KnownDbVersion::Partial(partial) => {
-                self.partials.insert(*versions.start(), partial);
+                Some(match self.partials.entry(*versions.start()) {
+                    btree_map::Entry::Vacant(entry) => entry.insert(partial).clone(),
+                    btree_map::Entry::Occupied(mut entry) => {
+                        let got = entry.get_mut();
+                        got.seqs.extend(partial.seqs);
+                        got.clone()
+                    }
+                })
             }
             KnownDbVersion::Current(current) => {
                 let version = *versions.start();
                 self.partials.remove(&version);
                 self.current.insert(version, current);
+                None
             }
             KnownDbVersion::Cleared => {
                 for version in versions.clone() {
@@ -1026,8 +1038,9 @@ impl BookedVersions {
                     self.current.remove(&version);
                 }
                 self.cleared.insert(versions.clone());
+                None
             }
-        }
+        };
 
         // update last known version
         let old_last = self
@@ -1044,6 +1057,8 @@ impl BookedVersions {
         }
 
         self.sync_need.remove(versions);
+
+        ret
     }
 
     pub fn sync_need(&self) -> &RangeInclusiveSet<Version> {
