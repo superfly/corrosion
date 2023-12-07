@@ -3467,7 +3467,7 @@ pub mod tests {
         )
         .await?;
 
-        sleep(Duration::from_secs(30)).await;
+        sleep(Duration::from_secs(10)).await;
 
         for agent in [ta2.agent, ta3.agent, ta4.agent] {
             let conn = agent.pool().read().await?;
