@@ -1969,7 +1969,7 @@ pub async fn process_multiple_changes(
                     }) => {
                         count += 1;
                         let version = versions.start();
-                        debug!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
+                        info!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
                         tx.prepare_cached("
                             INSERT INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  last_seq,  ts)
                                                     VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);")?
