@@ -1711,7 +1711,7 @@ async fn process_fully_buffered_changes(
 
         let tx = conn.immediate_transaction()?;
 
-        info!(%actor_id, %version, self_actor_id = %agent.actor_id(), "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+        info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
         let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional()?;
 
@@ -1766,6 +1766,7 @@ async fn process_fully_buffered_changes(
                 ":actor_id": actor_id,
                 ":version": version,
                 ":db_version": db_version,
+             // ":start_version": 0,
                 ":last_seq": last_seq,
                 ":ts": ts
             })?;
@@ -1790,9 +1791,6 @@ async fn process_fully_buffered_changes(
 
         let inserted = if let Some(known_version) = known_version {
             bookedw.insert(version, known_version);
-
-            // TODO: remove before merging in main
-            warn!(%actor_id, %version, self_actor_id = %agent.actor_id(), "switched partial to current!");
 
             drop(bookedw);
 

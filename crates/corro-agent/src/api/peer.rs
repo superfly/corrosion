@@ -426,8 +426,6 @@ fn handle_known_version(
                 )?;
             }
             KnownDbVersion::Partial(PartialVersion { seqs, .. }) => {
-                // we'll know if that's the issue...
-                break;
                 let mut partial_seqs = seqs.clone();
                 let mut range_needed = range_needed.clone();
 
@@ -454,13 +452,10 @@ fn handle_known_version(
 
                         debug!("partial, effective range: {start_seq}..={end_seq}");
 
-                        // acquire a *write* lock to check if this is still a partial version and if the seqs are covered
                         let bw = booked.blocking_write(format_compact!(
                             "sync_handle_known(partial)[{version}]:{}",
                             actor_id.as_simple()
                         ));
-
-                        // re-fetch the version
                         let maybe_current_version = match bw.get(&version) {
                             Some(known) => match known {
                                 KnownVersion::Partial(PartialVersion { seqs, .. }) => {
@@ -478,12 +473,12 @@ fn handle_known_version(
                                 known @ KnownVersion::Current(_) => Some(known.into()),
                                 KnownVersion::Cleared => {
                                     debug!(%actor_id, %version, "in-memory bookkeeping has been cleared, aborting.");
-                                    break 'outer;
+                                    break;
                                 }
                             },
                             None => {
                                 warn!(%actor_id, %version, "in-memory bookkeeping vanished!");
-                                break 'outer;
+                                break;
                             }
                         };
 
