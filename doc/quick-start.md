@@ -26,7 +26,8 @@ path = "/var/lib/corrosion/state.db"
 schema_paths = ["/etc/corrosion/schema"]
 
 [gossip]
-addr = "[::]:8787"
+addr = "[::]:8787" # the address we bind to
+external_addr = "[::1]:8787" # the address we advertise as
 plaintext = true
 
 [api]
@@ -92,7 +93,8 @@ path = "/var/lib/corrosion-b/state.db"
 schema_paths = ["/etc/corrosion-b/schema"]
 
 [gossip]
-addr = "[::]:8788"
+addr = "[::]:8788" # the address we bind to
+external_addr = "[::1]:8788" # the address we advertise as
 bootstrap = ["[::1]:8787"] # bootstrap the node's cluster discovery w/ node A
 plaintext = true
 
