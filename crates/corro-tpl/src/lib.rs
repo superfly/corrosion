@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use compact_str::ToCompactString;
 use corro_client::sub::SubscriptionStream;
-use corro_client::{CorrosionApiClient, QueryEvent};
+use corro_client::{CorrosionApiClient, TypedQueryEvent};
 use corro_types::api::ColumnName;
 use corro_types::api::RowId;
 use corro_types::api::SqliteParam;
@@ -263,7 +263,7 @@ impl QueryResponseIter {
             };
             match res {
                 Some(Ok(evt)) => match evt {
-                    QueryEvent::Columns(cols) => {
+                    TypedQueryEvent::Columns(cols) => {
                         self.columns = Some(Arc::new(
                             cols.into_iter()
                                 .enumerate()
@@ -271,7 +271,7 @@ impl QueryResponseIter {
                                 .collect(),
                         ))
                     }
-                    QueryEvent::EndOfQuery { .. } => {
+                    TypedQueryEvent::EndOfQuery { .. } => {
                         match self.body.take() {
                             None => {
                                 self.done = true;
@@ -292,24 +292,23 @@ impl QueryResponseIter {
                         self.done = true;
                         return None;
                     }
-                    QueryEvent::Row(rowid, cells) | QueryEvent::Change(_, rowid, cells, _) => {
-                        match self.columns.as_ref() {
-                            Some(columns) => {
-                                return Some(Ok(Row {
-                                    id: rowid,
-                                    columns: columns.clone(),
-                                    cells: Arc::new(cells),
-                                }));
-                            }
-                            None => {
-                                self.done = true;
-                                return Some(Err(Box::new(EvalAltResult::from(
-                                    "did not receive columns data",
-                                ))));
-                            }
+                    TypedQueryEvent::Row(rowid, cells)
+                    | TypedQueryEvent::Change(_, rowid, cells, _) => match self.columns.as_ref() {
+                        Some(columns) => {
+                            return Some(Ok(Row {
+                                id: rowid,
+                                columns: columns.clone(),
+                                cells: Arc::new(cells),
+                            }));
                         }
-                    }
-                    QueryEvent::Error(e) => {
+                        None => {
+                            self.done = true;
+                            return Some(Err(Box::new(EvalAltResult::from(
+                                "did not receive columns data",
+                            ))));
+                        }
+                    },
+                    TypedQueryEvent::Error(e) => {
                         self.done = true;
                         return Some(Err(Box::new(EvalAltResult::from(e))));
                     }
@@ -424,7 +423,7 @@ async fn wait_for_rows(
     };
 
     match row_recv {
-        Some(Ok(QueryEvent::Change(_, _, cells, _))) => {
+        Some(Ok(TypedQueryEvent::Change(_, _, cells, _))) => {
             trace!("got an updated row! {cells:?}");
 
             if let Err(_e) = tx.send(TemplateCommand::Render).await {
