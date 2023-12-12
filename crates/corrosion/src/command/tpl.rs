@@ -227,12 +227,9 @@ pub async fn run(
 
     while let Some(res) = futs.next().await {
         match res {
-            Ok(_) => {
-                info!("")
-            }
-            Err(_) => todo!(),
+            Ok(path) => info!("done with template at {path}"),
+            Err(e) => error!("could not process template: {e}"),
         }
-        println!("got a res: {res:?}");
     }
 
     Ok(())
