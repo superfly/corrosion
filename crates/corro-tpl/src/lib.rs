@@ -191,13 +191,13 @@ impl Cell {
 struct SqliteValueWrap(SqliteValue);
 
 impl SqliteValueWrap {
-    fn to_json(&mut self) -> String {
+    fn to_json(&mut self) -> Dynamic {
         match &self.0 {
-            SqliteValue::Null => "null".into(),
-            SqliteValue::Integer(i) => i.to_string(),
-            SqliteValue::Real(f) => f.to_string(),
-            SqliteValue::Text(t) => enquote::enquote('"', t),
-            SqliteValue::Blob(b) => hex::encode(b.as_slice()),
+            SqliteValue::Null => Dynamic::UNIT,
+            SqliteValue::Integer(i) => Dynamic::from(*i),
+            SqliteValue::Real(f) => Dynamic::from(*f),
+            SqliteValue::Text(t) => Dynamic::from(t.to_string()),
+            SqliteValue::Blob(b) => Dynamic::from(b.to_vec()),
         }
     }
 
