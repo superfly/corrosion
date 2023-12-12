@@ -49,7 +49,7 @@ quoted-string = "0.6.1"
 rand = { version = "0.8.5", features = ["small_rng"] }
 rangemap = { version = "1.4.0" }
 rcgen = { version = "0.11.1", features = ["x509-parser"] }
-rhai = { version = "1.15.1", features = ["sync"] }
+rhai = { version = "1.15.1", features = ["sync", "metadata"] }
 rusqlite = { version = "0.29.0", features = ["serde_json", "time", "bundled", "uuid", "array", "load_extension", "column_decltype", "vtab", "functions", "chrono"] }
 rustls = { version = "0.21.0", features = ["dangerous_configuration", "quic"] }
 rustls-pemfile = "1.0.2"
