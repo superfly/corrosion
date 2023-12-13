@@ -3,19 +3,19 @@ pub mod sub;
 use std::{net::SocketAddr, ops::Deref, path::Path};
 
 use corro_api_types::{
-    sqlite::ChangeType, ChangeId, ColumnName, ExecResponse, ExecResult, RowId, SqliteValue,
-    Statement,
+    sqlite::ChangeType, ChangeId, ColumnName, ExecResponse, ExecResult, QueryEvent, RowId,
+    SqliteValue, Statement,
 };
 use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sub::SubscriptionStream;
-use tracing::{debug, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum QueryEvent<T> {
+pub enum TypedQueryEvent<T> {
     Columns(Vec<ColumnName>),
     Row(RowId, T),
     #[serde(rename = "eoq")]
@@ -54,26 +54,14 @@ impl CorrosionApiClient {
 
         if !res.status().is_success() {
             let status = res.status();
-            match hyper::body::to_bytes(res.into_body()).await {
-                Ok(b) => match serde_json::from_slice(&b) {
-                    Ok(res) => match res {
-                        ExecResult::Error { error } => return Err(Error::ResponseError(error)),
-                        res => return Err(Error::UnexpectedResult(res)),
-                    },
-                    Err(e) => {
-                        debug!(
-                            error = %e,
-                            "could not deserialize response body, sending generic error..."
-                        );
-                        return Err(Error::UnexpectedStatusCode(status));
-                    }
-                },
-                Err(e) => {
-                    debug!(
-                        error = %e,
-                        "could not aggregate response body bytes, sending generic error..."
-                    );
-                    return Err(Error::UnexpectedStatusCode(status));
+            let b = hyper::body::to_bytes(res.into_body()).await?;
+            match serde_json::from_slice::<QueryEvent>(&b) {
+                Ok(QueryEvent::Error(error)) => {
+                    return Err(Error::ResponseError(error.into_string()))
+                }
+                Ok(res) => return Err(Error::UnexpectedQueryResult(res)),
+                Err(_) => {
+                    return Err(make_unexpected_status_error(status, b));
                 }
             }
         }
@@ -109,11 +97,7 @@ impl CorrosionApiClient {
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statement)?))?;
 
-        let res = self.api_client.request(req).await?;
-
-        if !res.status().is_success() {
-            return Err(Error::UnexpectedStatusCode(res.status()));
-        }
+        let res = check_res(self.api_client.request(req).await?).await?;
 
         // TODO: make that header name a const in corro-types
         let id = res
@@ -166,11 +150,7 @@ impl CorrosionApiClient {
             .header(hyper::header::ACCEPT, "application/json")
             .body(hyper::Body::empty())?;
 
-        let res = self.api_client.request(req).await?;
-
-        if !res.status().is_success() {
-            return Err(Error::UnexpectedStatusCode(res.status()));
-        }
+        let res = check_res(self.api_client.request(req).await?).await?;
 
         Ok(SubscriptionStream::new(
             id,
@@ -197,11 +177,7 @@ impl CorrosionApiClient {
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statements)?))?;
 
-        let res = self.api_client.request(req).await?;
-
-        if !res.status().is_success() {
-            return Err(Error::UnexpectedStatusCode(res.status()));
-        }
+        let res = check_res(self.api_client.request(req).await?).await?;
 
         let bytes = hyper::body::to_bytes(res.into_body()).await?;
 
@@ -216,11 +192,7 @@ impl CorrosionApiClient {
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statements)?))?;
 
-        let res = self.api_client.request(req).await?;
-
-        if !res.status().is_success() {
-            return Err(Error::UnexpectedStatusCode(res.status()));
-        }
+        let res = check_res(self.api_client.request(req).await?).await?;
 
         let bytes = hyper::body::to_bytes(res.into_body()).await?;
 
@@ -314,6 +286,25 @@ impl CorrosionApiClient {
     }
 }
 
+async fn check_res(res: hyper::Response<Body>) -> Result<hyper::Response<Body>, Error> {
+    let status = res.status();
+    if !status.is_success() {
+        let b = hyper::body::to_bytes(res.into_body())
+            .await
+            .unwrap_or_default();
+
+        return Err(make_unexpected_status_error(status, b));
+    }
+    Ok(res)
+}
+
+fn make_unexpected_status_error(status: StatusCode, body: bytes::Bytes) -> Error {
+    Error::UnexpectedStatusCode {
+        status,
+        body: String::from_utf8(body.to_vec()).unwrap_or_default(),
+    }
+}
+
 #[derive(Clone)]
 pub struct CorrosionClient {
     api_client: CorrosionApiClient,
@@ -355,14 +346,17 @@ pub enum Error {
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
 
-    #[error("received unexpected response code: {0}")]
-    UnexpectedStatusCode(StatusCode),
+    #[error("received unexpected response code: {status}, body: {body}")]
+    UnexpectedStatusCode { status: StatusCode, body: String },
 
     #[error("{0}")]
     ResponseError(String),
 
-    #[error("unexpected result: {0:?}")]
-    UnexpectedResult(ExecResult),
+    #[error("unexpected exec result: {0:?}")]
+    UnexpectedExecResult(ExecResult),
+
+    #[error("unexpected query event: {0:?}")]
+    UnexpectedQueryResult(QueryEvent),
 
     #[error("could not retrieve subscription id from headers")]
     ExpectedQueryId,

@@ -21,7 +21,7 @@ use tokio_util::{
 use tracing::error;
 use uuid::Uuid;
 
-use super::QueryEvent;
+use super::TypedQueryEvent;
 
 pin_project! {
     pub struct IoBodyStream {
@@ -121,7 +121,7 @@ where
     fn poll_stream(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<QueryEvent<T>, SubscriptionError>>> {
+    ) -> Poll<Option<Result<TypedQueryEvent<T>, SubscriptionError>>> {
         let stream = loop {
             match self.stream.as_mut() {
                 None => match ready!(self.as_mut().poll_request(cx)) {
@@ -140,11 +140,11 @@ where
         match res {
             Some(Ok(b)) => match serde_json::from_slice(&b) {
                 Ok(evt) => {
-                    if let QueryEvent::EndOfQuery { change_id, .. } = &evt {
+                    if let TypedQueryEvent::EndOfQuery { change_id, .. } = &evt {
                         self.observed_eoq = true;
                         self.last_change_id = *change_id;
                     }
-                    if let QueryEvent::Change(_, _, _, change_id) = &evt {
+                    if let TypedQueryEvent::Change(_, _, _, change_id) = &evt {
                         if matches!(self.last_change_id, Some(id) if id.0 + 1 != change_id.0) {
                             return Poll::Ready(Some(Err(SubscriptionError::MissedChange)));
                         }
@@ -220,7 +220,7 @@ impl<T> Stream for SubscriptionStream<T>
 where
     T: DeserializeOwned + Unpin,
 {
-    type Item = Result<QueryEvent<T>, SubscriptionError>;
+    type Item = Result<TypedQueryEvent<T>, SubscriptionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // first, check if we need to wait for a backoff...
