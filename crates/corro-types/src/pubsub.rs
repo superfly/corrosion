@@ -24,7 +24,7 @@ use rusqlite::{
 use spawn::spawn_counted;
 use sqlite3_parser::{
     ast::{
-        As, Cmd, Expr, JoinConstraint, Name, OneSelect, Operator, QualifiedName, ResultColumn,
+        As, Cmd, Expr, Id, JoinConstraint, Name, OneSelect, Operator, QualifiedName, ResultColumn,
         Select, SelectTable, Stmt,
     },
     lexer::sql::Parser,
@@ -1644,6 +1644,7 @@ pub struct ParsedSelect {
     table_columns: IndexMap<String, HashSet<String>>,
     aliases: HashMap<String, String>,
     pub columns: Vec<ResultColumn>,
+    col_aliases: HashSet<String>,
     children: Vec<ParsedSelect>,
 }
 
@@ -1728,15 +1729,18 @@ fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSele
                         }
                     }
                 }
-                if let Some(expr) = where_clause {
-                    extract_expr_columns(expr, schema, &mut parsed)?;
-                }
                 from_table
             }
             _ => None,
         };
 
+        // first extract the select columns
         extract_columns(columns.as_slice(), from_table, schema, &mut parsed)?;
+
+        // then extract the columns from the WHERE expression
+        if let Some(expr) = where_clause {
+            extract_expr_columns(expr, schema, &mut parsed)?;
+        }
     }
 
     Ok(parsed)
@@ -1769,8 +1773,13 @@ fn extract_expr_columns(
                 .insert(colname.0.clone());
         }
 
-        Expr::Name(colname) => {
-            let check_col_name = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
+        Expr::Name(Name(colname)) | Expr::Id(Id(colname)) => {
+            let check_col_name = unquote(colname).ok().unwrap_or(colname.clone());
+
+            if parsed.col_aliases.contains(&check_col_name) {
+                // it cool, we know about this column even if it won't show up anywhere in our schema
+                return Ok(());
+            }
 
             let mut found = None;
             for tbl in parsed.table_columns.keys() {
@@ -1782,6 +1791,7 @@ fn extract_expr_columns(
                             });
                         }
                         found = Some(tbl.name.as_str());
+                        break;
                     }
                 }
             }
@@ -1793,45 +1803,48 @@ fn extract_expr_columns(
                     .or_default()
                     .insert(check_col_name);
             } else {
+                if colname.starts_with('"') {
+                    return Ok(());
+                }
                 return Err(MatcherError::TableForColumnNotFound {
                     col_name: check_col_name,
                 });
             }
         }
 
-        Expr::Id(colname) => {
-            let check_col_name = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
+        // Expr::Id(colname) => {
+        //     let check_col_name = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
 
-            let mut found = None;
-            for tbl in parsed.table_columns.keys() {
-                if let Some(tbl) = schema.tables.get(tbl) {
-                    if tbl.columns.contains_key(&check_col_name) {
-                        if found.is_some() {
-                            return Err(MatcherError::QualificationRequired {
-                                col_name: check_col_name,
-                            });
-                        }
-                        found = Some(tbl.name.as_str());
-                    }
-                }
-            }
+        //     let mut found = None;
+        //     for tbl in parsed.table_columns.keys() {
+        //         if let Some(tbl) = schema.tables.get(tbl) {
+        //             if tbl.columns.contains_key(&check_col_name) {
+        //                 if found.is_some() {
+        //                     return Err(MatcherError::QualificationRequired {
+        //                         col_name: check_col_name,
+        //                     });
+        //                 }
+        //                 found = Some(tbl.name.as_str());
+        //                 break;
+        //             }
+        //         }
+        //     }
 
-            if let Some(found) = found {
-                parsed
-                    .table_columns
-                    .entry(found.to_owned())
-                    .or_default()
-                    .insert(colname.0.clone());
-            } else {
-                if colname.0.starts_with('"') {
-                    return Ok(());
-                }
-                return Err(MatcherError::TableForColumnNotFound {
-                    col_name: colname.0.clone(),
-                });
-            }
-        }
-
+        //     if let Some(found) = found {
+        //         parsed
+        //             .table_columns
+        //             .entry(found.to_owned())
+        //             .or_default()
+        //             .insert(colname.0.clone());
+        //     } else {
+        //         if colname.0.starts_with('"') {
+        //             return Ok(());
+        //         }
+        //         return Err(MatcherError::TableForColumnNotFound {
+        //             col_name: colname.0.clone(),
+        //         });
+        //     }
+        // }
         Expr::Between { lhs, .. } => extract_expr_columns(lhs, schema, parsed)?,
         Expr::Binary(lhs, _, rhs) => {
             extract_expr_columns(lhs, schema, parsed)?;
@@ -1928,9 +1941,11 @@ fn extract_columns(
     let mut i = 0;
     for col in columns.iter() {
         match col {
-            ResultColumn::Expr(expr, _) => {
-                // println!("extracting col: {expr:?} (as: {maybe_as:?})");
+            ResultColumn::Expr(expr, maybe_as) => {
                 extract_expr_columns(expr, schema, parsed)?;
+                if let Some(As::As(Name(aliased)) | As::Elided(Name(aliased))) = maybe_as {
+                    parsed.col_aliases.insert(aliased.clone());
+                }
                 parsed.columns.push(ResultColumn::Expr(
                     expr.clone(),
                     Some(As::As(Name(format!("col_{i}")))),
