@@ -4,14 +4,10 @@
 //! 2. bar
 //! 3. spawn `super::other_module`
 
-use quinn::Connecting;
-use std::sync::Arc;
-use tokio::sync::{mpsc::channel, RwLock as TokioRwLock};
-use tracing::{debug, error, info};
-use tripwire::Tripwire;
+use std::{sync::Arc, time::Duration};
 
 use crate::{
-    agent::{bcast, setup, sync, AgentOptions},
+    agent::{handlers, metrics, setup, uni, util, AgentOptions},
     api::public::pubsub::{
         process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache,
     },
@@ -24,6 +20,12 @@ use corro_types::{
     config::Config,
     pubsub::{Matcher, SubsManager},
 };
+
+use futures::FutureExt;
+use spawn::spawn_counted;
+use tokio::sync::{mpsc::channel, RwLock as TokioRwLock};
+use tracing::{debug, error, info};
+use tripwire::{PreemptibleFutureExt, Tripwire};
 
 /// Start a new agent with an existing configuration
 ///

@@ -1,4 +1,10 @@
-//// std & core
+//! Setup main agent state
+
+//// External crates
+use arc_swap::ArcSwap;
+use parking_lot::RwLock;
+use rangemap::RangeInclusiveSet;
+use rusqlite::{params, Connection};
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
@@ -6,12 +12,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-
-//// External crates
-use arc_swap::ArcSwap;
-use parking_lot::RwLock;
-use rangemap::RangeInclusiveSet;
-use rusqlite::{params, Connection};
 use tokio::{
     net::TcpListener,
     sync::{

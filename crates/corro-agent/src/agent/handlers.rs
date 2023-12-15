@@ -1,17 +1,37 @@
+//! Various handler functions
 //!
+//! This module is _big_ and maybe should be split up further.
 
-use crate::agent::{bcast::spawn_unipayload_handler, sync::spawn_bipayload_handler};
-use corro_types::{
-    agent::Agent,
-    broadcast::{FocaInput, UniPayload},
+use std::{
+    cmp,
+    net::SocketAddr,
+    time::{Duration, Instant},
 };
-use metrics::increment_counter;
+
+use crate::{
+    agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL, MIN_CHANGES_CHUNK},
+    api::peer::parallel_sync,
+    transport::Transport,
+};
+use corro_types::{
+    actor::{Actor, ActorId},
+    agent::{Agent, SplitPool},
+    broadcast::{BroadcastV1, ChangeSource, ChangeV1, FocaInput, UniPayload},
+    sync::generate_sync,
+};
+
+use bytes::Bytes;
+use foca::Notification;
+use metrics::{counter, gauge, histogram, increment_counter};
+use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use spawn::spawn_counted;
-use std::{net::SocketAddr, time::Duration};
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    task::block_in_place,
+};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tracing::{debug, error};
-use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
+use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 
 /// Spawn a tree of tasks that handles incoming gossip server
 /// connections, streams, and their respective payloads.
