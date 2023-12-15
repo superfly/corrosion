@@ -24,7 +24,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
-    let agent = corro_agent::agent::start(config.clone(), tripwire.clone())
+    let agent = corro_agent::agent::start_with_config(config.clone(), tripwire.clone())
         .await
         .expect("could not start agent");
 

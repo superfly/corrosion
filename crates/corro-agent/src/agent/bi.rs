@@ -19,8 +19,10 @@ use tripwire::Tripwire;
 /// stream.  Valid incoming BiPayload messages are passed to
 /// `crate::api::peer::serve_sync()`
 pub fn spawn_bipayload_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Connection) {
+    let conn = conn.clone();
+    let agent = agent.clone();
+    let mut tripwire = tripwire.clone();
     tokio::spawn(async move {
-        let mut tripwire = tripwire.clone();
         loop {
             let (tx, rx) = tokio::select! {
                 tx_rx_res = conn.accept_bi() => match tx_rx_res {

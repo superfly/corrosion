@@ -1,4 +1,3 @@
-
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -6,6 +5,7 @@ use std::{
 };
 
 use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
+use hyper::StatusCode;
 use rand::{
     distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::IteratorRandom, SeedableRng,
 };
@@ -13,14 +13,19 @@ use serde::Deserialize;
 use serde_json::json;
 use spawn::wait_for_all_pending_handles;
 use tokio::time::{sleep, timeout, MissedTickBehavior};
-use tracing::info_span;
+use tracing::{debug, info_span};
 use tripwire::Tripwire;
 
-use super::*;
-
-use corro_types::api::{ExecResponse, ExecResult, Statement};
-
+use crate::agent::util::*;
 use corro_tests::*;
+use corro_types::{
+    actor::ActorId,
+    agent::migrate,
+    api::{ExecResponse, ExecResult, Statement},
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    sqlite::CrConn,
+    sync::generate_sync,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn insert_rows_and_gossip() -> eyre::Result<()> {
@@ -839,7 +844,7 @@ async fn many_small_changes() -> eyre::Result<()> {
 
 #[test]
 fn test_store_empty_changeset() -> eyre::Result<()> {
-    let mut conn = Connection::open_in_memory()?;
+    let mut conn = rusqlite::Connection::open_in_memory()?;
 
     corro_types::sqlite::setup_conn(&mut conn)?;
     migrate(&mut conn)?;

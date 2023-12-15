@@ -57,7 +57,12 @@ pub fn spawn_gossipserver_handler(
                 };
 
                 // Spawn incoming connection handlers
-                spawn_incoming_connection_handlers(&agent, &tripwire, process_uni_tx, connecting);
+                spawn_incoming_connection_handlers(
+                    &agent,
+                    &tripwire,
+                    process_uni_tx.clone(),
+                    connecting,
+                );
             }
 
             // graceful shutdown
@@ -101,8 +106,8 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        spawn_unipayload_handler(&agent, &tripwire, &conn, process_uni_tx);
-        spawn_bipayload_handler(&agent, &tripwire, &conn);
+        uni::spawn_unipayload_handler(&tripwire, &conn, process_uni_tx);
+        bi::spawn_bipayload_handler(&agent, &tripwire, &conn);
     });
 }
 
@@ -161,6 +166,7 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
     });
 }
 
+// DOCME: provide function context
 pub fn spawn_backoff_handler(agent: &Agent, gossip_addr: SocketAddr) {
     tokio::spawn({
         let agent = agent.clone();
@@ -174,7 +180,7 @@ pub fn spawn_backoff_handler(agent: &Agent, gossip_addr: SocketAddr) {
             loop {
                 timer.as_mut().await;
 
-                match generate_bootstrap(
+                match bootstrap::generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),
                     gossip_addr,
                     agent.pool(),
@@ -205,4 +211,295 @@ pub fn spawn_backoff_handler(agent: &Agent, gossip_addr: SocketAddr) {
             }
         }
     });
+}
+
+// DOCME: provide function context
+pub async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Bytes)>) {
+    // TODO: use tripwire and drain messages to send when that happens...
+    while let Some((actor, data)) = to_send_rx.recv().await {
+        trace!("got gossip to send to {actor:?}");
+
+        let addr = actor.addr();
+        let actor_id = actor.id();
+
+        let transport = transport.clone();
+
+        let len = data.len();
+        spawn_counted(async move {
+            if let Err(e) = transport.send_datagram(addr, data).await {
+                error!("could not write datagram {addr}: {e}");
+                return;
+            }
+            increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor_id.to_string());
+            counter!("corro.peer.datagram.bytes.sent.total", len as u64);
+        }.instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)));
+    }
+}
+
+// DOCME: provide function context
+pub async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>) {
+    while let Some(bcast) = bcast_rx.recv().await {
+        increment_counter!("corro.broadcast.recv.count");
+        match bcast {
+            BroadcastV1::Change(change) => {
+                if let Err(_e) = agent
+                    .tx_changes()
+                    .send((change, ChangeSource::Broadcast))
+                    .await
+                {
+                    error!("changes channel is closed");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// DOCME: provide function context
+pub async fn handle_notifications(
+    agent: Agent,
+    mut notification_rx: Receiver<Notification<Actor>>,
+) {
+    while let Some(notification) = notification_rx.recv().await {
+        trace!("handle notification");
+        match notification {
+            Notification::MemberUp(actor) => {
+                let (added, same) = { agent.members().write().add_member(&actor) };
+                trace!("Member Up {actor:?} (added: {added})");
+                if added {
+                    debug!("Member Up {actor:?}");
+                    increment_counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
+                    // actually added a member
+                    // notify of new cluster size
+                    let members_len = { agent.members().read().states.len() as u32 };
+                    if let Ok(size) = members_len.try_into() {
+                        if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await {
+                            error!("could not send new foca cluster size: {e}");
+                        }
+                    }
+                } else if !same {
+                    // had a older timestamp!
+                    if let Err(e) = agent
+                        .tx_foca()
+                        .send(FocaInput::ApplyMany(vec![foca::Member::new(
+                            actor.clone(),
+                            foca::Incarnation::default(),
+                            foca::State::Down,
+                        )]))
+                        .await
+                    {
+                        warn!(?actor, "could not manually declare actor as down! {e}");
+                    }
+                }
+                increment_counter!("corro.swim.notification", "type" => "memberup");
+            }
+            Notification::MemberDown(actor) => {
+                let removed = { agent.members().write().remove_member(&actor) };
+                trace!("Member Down {actor:?} (removed: {removed})");
+                if removed {
+                    debug!("Member Down {actor:?}");
+                    increment_counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
+                    // actually removed a member
+                    // notify of new cluster size
+                    let member_len = { agent.members().read().states.len() as u32 };
+                    if let Ok(size) = member_len.try_into() {
+                        if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await {
+                            error!("could not send new foca cluster size: {e}");
+                        }
+                    }
+                }
+                increment_counter!("corro.swim.notification", "type" => "memberdown");
+            }
+            Notification::Active => {
+                info!("Current node is considered ACTIVE");
+                increment_counter!("corro.swim.notification", "type" => "active");
+            }
+            Notification::Idle => {
+                warn!("Current node is considered IDLE");
+                increment_counter!("corro.swim.notification", "type" => "idle");
+            }
+            // this happens when we leave the cluster
+            Notification::Defunct => {
+                debug!("Current node is considered DEFUNCT");
+                increment_counter!("corro.swim.notification", "type" => "defunct");
+            }
+            Notification::Rejoin(id) => {
+                info!("Rejoined the cluster with id: {id:?}");
+                increment_counter!("corro.swim.notification", "type" => "rejoin");
+            }
+        }
+    }
+}
+
+// DOCME: provide function context
+pub async fn handle_db_cleanup(pool: SplitPool) -> eyre::Result<()> {
+    debug!("handling db_cleanup (WAL truncation)");
+    let conn = pool.write_low().await?;
+    block_in_place(move || {
+        let start = Instant::now();
+
+        let busy: bool =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
+        if busy {
+            warn!("could not truncate sqlite WAL, database busy");
+            increment_counter!("corro.db.wal.truncate.busy");
+        } else {
+            debug!("successfully truncated sqlite WAL!");
+            histogram!(
+                "corro.db.wal.truncate.seconds",
+                start.elapsed().as_secs_f64()
+            );
+        }
+        Ok::<_, eyre::Report>(())
+    })?;
+    debug!("done handling db_cleanup");
+    Ok(())
+}
+
+// DOCME: provide function context
+pub async fn handle_changes(
+    agent: Agent,
+    mut rx_changes: Receiver<(ChangeV1, ChangeSource)>,
+    mut tripwire: Tripwire,
+) {
+    let mut buf = vec![];
+    let mut count = 0;
+
+    let mut max_wait = tokio::time::interval(Duration::from_millis(500));
+
+    loop {
+        tokio::select! {
+            Some((change, src)) = rx_changes.recv() => {
+                counter!("corro.agent.changes.recv", std::cmp::max(change.len(), 1) as u64); // count empties...
+                count += change.len(); // don't count empties
+                buf.push((change, src));
+                if count < MIN_CHANGES_CHUNK {
+                    continue;
+                }
+            },
+            _ = max_wait.tick() => {
+                // got a wait interval tick...
+                if buf.is_empty() {
+                    continue;
+                }
+            },
+            _ = &mut tripwire => {
+                break;
+            }
+            else => {
+                break;
+            }
+        }
+
+        // drain and process current changes!
+        #[allow(clippy::drain_collect)]
+        if let Err(e) = util::process_multiple_changes(&agent, buf.drain(..).collect()).await {
+            error!("could not process multiple changes: {e}");
+        }
+
+        // reset count
+        count = 0;
+    }
+
+    info!("Draining changes receiver...");
+
+    // drain!
+    while let Ok((change, src)) = rx_changes.try_recv() {
+        let changes_count = std::cmp::max(change.len(), 1);
+        counter!("corro.agent.changes.recv", changes_count as u64);
+        count += changes_count;
+        buf.push((change, src));
+        if count >= MIN_CHANGES_CHUNK {
+            // drain and process current changes!
+            #[allow(clippy::drain_collect)]
+            if let Err(e) = util::process_multiple_changes(&agent, buf.drain(..).collect()).await {
+                error!("could not process last multiple changes: {e}");
+            }
+
+            // reset count
+            count = 0;
+        }
+    }
+
+    // process the last changes we got!
+    if let Err(e) = util::process_multiple_changes(&agent, buf).await {
+        error!("could not process multiple changes: {e}");
+    }
+}
+
+// DOCME: add context
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
+    let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
+
+    for (actor_id, needed) in sync_state.need.iter() {
+        gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.to_string());
+    }
+    for (actor_id, version) in sync_state.heads.iter() {
+        gauge!("corro.sync.client.head", version.0 as f64, "actor_id" => actor_id.to_string());
+    }
+
+    let chosen: Vec<(ActorId, SocketAddr)> = {
+        let candidates = {
+            let members = agent.members().read();
+
+            members
+                .states
+                .iter()
+                .filter(|(id, _state)| **id != agent.actor_id())
+                .map(|(id, state)| (*id, state.ring.unwrap_or(255), state.addr))
+                .collect::<Vec<(ActorId, u8, SocketAddr)>>()
+        };
+
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        debug!("found {} candidates to synchronize with", candidates.len());
+
+        let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
+
+        let mut rng = StdRng::from_entropy();
+
+        let mut choices = candidates
+            .into_iter()
+            .choose_multiple(&mut rng, desired_count * 2);
+
+        choices.sort_by(|a, b| {
+            // most missing actors first
+            sync_state
+                .need_len_for_actor(&b.0)
+                .cmp(&sync_state.need_len_for_actor(&a.0))
+                // if equal, look at proximity (via `ring`)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        choices.truncate(desired_count);
+        choices
+            .into_iter()
+            .map(|(actor_id, _, addr)| (actor_id, addr))
+            .collect()
+    };
+
+    if chosen.is_empty() {
+        return Ok(());
+    }
+
+    let start = Instant::now();
+    let n = parallel_sync(agent, transport, chosen.clone(), sync_state).await?;
+
+    let elapsed = start.elapsed();
+    if n > 0 {
+        info!(
+            "synced {n} changes w/ {} in {}s @ {} changes/s",
+            chosen
+                .into_iter()
+                .map(|(actor_id, _)| actor_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            elapsed.as_secs_f64(),
+            n as f64 / elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
 }

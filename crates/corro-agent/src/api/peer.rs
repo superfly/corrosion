@@ -40,7 +40,7 @@ use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::agent::error::SyncRecvError;
+use crate::agent::SyncRecvError;
 use crate::transport::{Transport, TransportError};
 
 use corro_types::{

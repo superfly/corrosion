@@ -64,10 +64,14 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         rtt_rx,
     } = opts;
 
-    let subs_bcast_cache = setup_spawn_subscriptions(&agent, &subs_manager, &tripwire).await;
+    // Get our gossip address and make sure it's valid
+    let gossip_addr = gossip_server_endpoint.local_addr()?;
+
+    // Setup subscription handlers
+    let subs_bcast_cache = setup_spawn_subscriptions(&agent, &subs_manager, &tripwire).await?;
 
     //// Start PG server to accept query requests from PG clients
-    // TODO: pull this out into a separate function
+    // TODO: pull this out into a separate function?
     if let Some(pg_conf) = agent.config().api.pg.clone() {
         info!("Starting PostgreSQL wire-compatible server");
         let pg_server = corro_pg::start(agent.clone(), pg_conf, tripwire.clone()).await?;
@@ -81,10 +85,7 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
     let (to_send_tx, to_send_rx) = channel(10240);
     let (notifications_tx, notifications_rx) = channel(10240);
     let (bcast_msg_tx, bcast_rx) = channel::<BroadcastV1>(10240);
-    let (process_uni_tx, mut process_uni_rx) = channel(10240);
-
-    //// DOCME: why here and why now?
-    let gossip_addr = gossip_server_endpoint.local_addr()?;
+    let (process_uni_tx, process_uni_rx) = channel(10240);
 
     //// Start the main SWIM runtime loop
     runtime_loop(
@@ -102,12 +103,79 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<()> {
         tripwire.clone(),
     );
 
-    //// Start async uni-broadcast message decoder
-    bcast::spawn_message_decoder(&agent, process_uni_rx, bcast_msg_tx);
+    //// Update member connection RTTs
+    handlers::spawn_rtt_handler(&agent, rtt_rx);
 
-    // TODO: start big_boi::spawn_lots_of_things
+    //// Start async uni-broadcast message decoder
+    uni::spawn_unipayload_message_decoder(&agent, process_uni_rx, bcast_msg_tx);
+
+    //// Start an incoming (corrosion) connection handler.  This
+    //// future tree spawns additional message type sub-handlers
+    handlers::spawn_gossipserver_handler(&agent, &tripwire, gossip_server_endpoint, process_uni_tx);
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
+
+    handlers::spawn_backoff_handler(&agent, gossip_addr);
+
+    tokio::spawn(util::clear_overwritten_versions(agent.clone()));
+
+    // Load existing cluster members into the SWIM runtime
+    util::initialise_foca(&agent).await;
+
+    // Setup client http API
+    util::setup_http_api_handler(
+        &agent,
+        &tripwire,
+        subs_bcast_cache,
+        &subs_manager,
+        api_listener,
+    )
+    .await?;
+
+    spawn_counted(handlers::handle_changes(
+        agent.clone(),
+        rx_changes,
+        tripwire.clone(),
+    ));
+
+    spawn_counted(util::write_empties_loop(
+        agent.clone(),
+        rx_empty,
+        tripwire.clone(),
+    ));
+
+    tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
+
+    spawn_counted(
+        util::sync_loop(agent.clone(), transport.clone(), rx_apply, tripwire.clone())
+            .inspect(|_| info!("corrosion agent sync loop is done")),
+    );
+
+    tokio::spawn(metrics::metrics_loop(agent.clone(), transport.clone()));
+    tokio::spawn(handlers::handle_gossip_to_send(
+        transport.clone(),
+        to_send_rx,
+    ));
+    tokio::spawn(handlers::handle_notifications(
+        agent.clone(),
+        notifications_rx,
+    ));
+    tokio::spawn(handlers::handle_broadcasts(agent.clone(), bcast_rx));
+
+    let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = db_cleanup_interval.tick() => {
+                tokio::spawn(handlers::handle_db_cleanup(agent.pool().clone()).preemptible(tripwire.clone()));
+            },
+            _ = &mut tripwire => {
+                debug!("tripped corrosion");
+                break;
+            }
+        }
+    }
 
     Ok(())
 }

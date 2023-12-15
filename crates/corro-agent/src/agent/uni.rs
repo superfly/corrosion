@@ -13,7 +13,6 @@ use tripwire::Tripwire;
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
 pub fn spawn_unipayload_handler(
-    agent: &Agent,
     tripwire: &Tripwire,
     conn: &quinn::Connection,
     process_uni_tx: Sender<UniPayload>,
@@ -91,7 +90,7 @@ pub fn spawn_unipayload_handler(
 // function out of the stream hot path?
 pub fn spawn_unipayload_message_decoder(
     agent: &Agent,
-    process_uni_rx: Receiver<UniPayload>,
+    mut process_uni_rx: Receiver<UniPayload>,
     bcast_msg_tx: Sender<BroadcastV1>,
 ) {
     tokio::spawn({
