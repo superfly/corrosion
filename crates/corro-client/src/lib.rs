@@ -2,31 +2,13 @@ pub mod sub;
 
 use std::{net::SocketAddr, ops::Deref, path::Path};
 
-use corro_api_types::{
-    sqlite::ChangeType, ChangeId, ColumnName, ExecResponse, ExecResult, RowId, SqliteValue,
-    Statement,
-};
+use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
 use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::de::DeserializeOwned;
 use sub::SubscriptionStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum QueryEvent<T> {
-    Columns(Vec<ColumnName>),
-    Row(RowId, T),
-    #[serde(rename = "eoq")]
-    EndOfQuery {
-        time: f64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        change_id: Option<ChangeId>,
-    },
-    Change(ChangeType, RowId, T, ChangeId),
-    Error(String),
-}
 
 #[derive(Clone)]
 pub struct CorrosionApiClient {
