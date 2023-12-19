@@ -45,6 +45,15 @@
                 allowBuiltinFetchGit = true;
               };
 
+              # Include a shell hook to run when we use `nix develop`
+              #
+              # NOTE: this depends on /etc/security/limits.conf
+              # setting an appropriate soft or hard-limit.  Without it
+              # users can't override their personal limits.
+              shellHook = ''
+                ulimit -n 65536
+              '';
+
               ## Build environment dependencies
               nativeBuildInputs = [
                 pkgs.pkg-config
