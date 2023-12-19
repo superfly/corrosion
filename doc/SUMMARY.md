@@ -2,6 +2,7 @@
 
 [Introduction](intro.md)
 [Quick start](quick-start.md)
+[Setup dev environment](devel.md)
 
 # User guide
 - [Authorization]() (to come)
