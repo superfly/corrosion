@@ -50,31 +50,44 @@ async fn sub_by_id(
     bcast_cache: &SharedMatcherBroadcastCache,
     tripwire: Tripwire,
 ) -> hyper::Response<hyper::Body> {
-    let (matcher, rx) = match bcast_cache.read().await.get(&id).and_then(|tx| {
+    let matcher_rx = bcast_cache.read().await.get(&id).and_then(|tx| {
         subs.get(&id).map(|matcher| {
             debug!("found matcher by id {id}");
             (matcher, tx.subscribe())
         })
-    }) {
+    });
+
+    let (matcher, rx) = match matcher_rx {
         Some(matcher_rx) => matcher_rx,
         None => {
             // ensure this goes!
-            bcast_cache.write().await.remove(&id);
-            if let Some(handle) = subs.remove(&id) {
-                info!(sub_id = %id, "Removed subscription from sub_by_id");
-                tokio::spawn(handle.cleanup());
-            }
+            let mut bcast_cache_write = bcast_cache.write().await;
 
-            return hyper::Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(
-                    serde_json::to_vec(&QueryEvent::Error(format_compact!(
-                        "could not find subscription with id {id}"
-                    )))
-                    .expect("could not serialize queries stream error")
-                    .into(),
-                )
-                .expect("could not build error response");
+            if let Some(matcher_rx) = bcast_cache_write.get(&id).and_then(|tx| {
+                subs.get(&id).map(|matcher| {
+                    debug!("found matcher by id {id}");
+                    (matcher, tx.subscribe())
+                })
+            }) {
+                matcher_rx
+            } else {
+                bcast_cache_write.remove(&id);
+                if let Some(handle) = subs.remove(&id) {
+                    info!(sub_id = %id, "Removed subscription from sub_by_id");
+                    tokio::spawn(handle.cleanup());
+                }
+
+                return hyper::Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(
+                        serde_json::to_vec(&QueryEvent::Error(format_compact!(
+                            "could not find subscription with id {id}"
+                        )))
+                        .expect("could not serialize queries stream error")
+                        .into(),
+                    )
+                    .expect("could not build error response");
+            }
         }
     };
 
@@ -589,7 +602,7 @@ pub async fn catch_up_sub(
         }
     };
 
-    forward_sub_to_sender(matcher.id(), sub_rx, evt_tx).await
+    forward_sub_to_sender(matcher, sub_rx, evt_tx, params.skip_rows).await
 }
 
 pub async fn upsert_sub(
@@ -607,7 +620,12 @@ pub async fn upsert_sub(
 
         let (sub_tx, sub_rx) = broadcast::channel(10240);
 
-        tokio::spawn(forward_sub_to_sender(handle.id(), sub_rx, tx));
+        tokio::spawn(forward_sub_to_sender(
+            handle.clone(),
+            sub_rx,
+            tx,
+            params.skip_rows,
+        ));
 
         bcast_write.insert(handle.id(), sub_tx.clone());
 
@@ -698,18 +716,41 @@ pub async fn api_v1_subs(
 const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 
 async fn forward_sub_to_sender(
-    sub_id: Uuid,
+    handle: MatcherHandle,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
+    skip_rows: bool,
 ) {
-    info!(%sub_id, "forwarding subscription events to a sender");
-    while let Ok((event_buf, meta)) = sub_rx.recv().await {
+    info!(sub_id = %handle.id(), "forwarding subscription events to a sender");
+
+    loop {
+        let (event_buf, meta) = tokio::select! {
+            Ok((event_buf, meta)) = sub_rx.recv() => {
+                (event_buf, meta)
+            },
+            _ = handle.cancelled() => {
+                info!(sub_id = %handle.id(), "subscription cancelled, aborting forwarding bytes to subscriber");
+                return;
+            },
+            else => {
+                info!(sub_id = %handle.id(), "events subcription ran out");
+                return;
+            }
+        };
+
+        if skip_rows
+            && matches!(
+                meta,
+                QueryEventMeta::Columns | QueryEventMeta::Row(_) | QueryEventMeta::EndOfQuery(_)
+            )
+        {
+            continue;
+        }
         if let Err(e) = tx.send((event_buf, meta)).await {
-            warn!(%sub_id, "could not send subscription event to channel: {e}");
+            warn!(sub_id = %handle.id(), "could not send subscription event to channel: {e}");
             return;
         }
     }
-    info!(%sub_id, "events subcription ran out");
 }
 
 async fn forward_bytes_to_body_sender(

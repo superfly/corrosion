@@ -14,6 +14,7 @@ use corro_api_types::{
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
+use metrics::counter;
 use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::{
     params_from_iter,
@@ -33,7 +34,7 @@ use tokio::{
     sync::{mpsc, watch, AcquireError},
     task::block_in_place,
 };
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFuture};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 use uuid::Uuid;
@@ -41,198 +42,12 @@ use uuid::Uuid;
 use crate::{
     agent::SplitPool,
     api::QueryEvent,
+    base::CrsqlDbVersion,
     schema::{Schema, Table},
     sqlite::CrConn,
 };
 
 pub use corro_api_types::sqlite::ChangeType;
-
-#[derive(Debug, thiserror::Error)]
-pub enum NormalizeStatementError {
-    #[error(transparent)]
-    Parse(#[from] sqlite3_parser::lexer::sql::Error),
-    #[error("unexpected statement: {0}")]
-    UnexpectedStatement(Cmd),
-    #[error("only 1 statement is supported")]
-    Multiple,
-    #[error("at least 1 statement is required")]
-    NoStatement,
-}
-
-pub fn normalize_sql(sql: &str) -> Result<String, NormalizeStatementError> {
-    let mut parser = Parser::new(sql.as_bytes());
-
-    let stmt = match parser.next()? {
-        Some(Cmd::Stmt(stmt)) => stmt,
-        Some(cmd) => {
-            return Err(NormalizeStatementError::UnexpectedStatement(cmd));
-        }
-        None => {
-            return Err(NormalizeStatementError::NoStatement);
-        }
-    };
-
-    if parser.next()?.is_some() {
-        return Err(NormalizeStatementError::Multiple);
-    }
-
-    Ok(Cmd::Stmt(stmt).to_string())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PackError {
-    #[error("abort")]
-    Abort,
-}
-
-pub fn pack_columns(args: &[SqliteValue]) -> Result<Vec<u8>, PackError> {
-    let mut buf = vec![];
-    /*
-     * Format:
-     * [num_columns:u8,...[(type(0-3),num_bytes?(3-7)):u8, length?:i32, ...bytes:u8[]]]
-     *
-     * The byte used for column type also encodes the number of bytes used for the integer.
-     * e.g.: (type(0-3),num_bytes?(3-7)):u8
-     * first 3 bits are type
-     * last 5 encode how long the following integer, if there is a following integer, is. 1, 2, 3, ... 8 bytes.
-     *
-     * Not packing an integer into the minimal number of bytes required is rather wasteful.
-     * E.g., the number `0` would take 8 bytes rather than 1 byte.
-     */
-    let len_result: Result<u8, _> = args.len().try_into();
-    if let Ok(len) = len_result {
-        buf.put_u8(len);
-        for value in args {
-            match value {
-                SqliteValue::Null => {
-                    buf.put_u8(ColumnType::Null as u8);
-                }
-                SqliteValue::Integer(val) => {
-                    let num_bytes_for_int = num_bytes_needed_i64(*val);
-                    let type_byte = num_bytes_for_int << 3 | (ColumnType::Integer as u8);
-                    buf.put_u8(type_byte);
-                    buf.put_int(*val, num_bytes_for_int as usize);
-                }
-                SqliteValue::Real(v) => {
-                    buf.put_u8(ColumnType::Float as u8);
-                    buf.put_f64(v.0);
-                }
-                SqliteValue::Text(value) => {
-                    let len = value.len() as i32;
-                    let num_bytes_for_len = num_bytes_needed_i32(len);
-                    let type_byte = num_bytes_for_len << 3 | (ColumnType::Text as u8);
-                    buf.put_u8(type_byte);
-                    buf.put_int(len as i64, num_bytes_for_len as usize);
-                    buf.put_slice(value.as_bytes());
-                }
-                SqliteValue::Blob(value) => {
-                    let len = value.len() as i32;
-                    let num_bytes_for_len = num_bytes_needed_i32(len);
-                    let type_byte = num_bytes_for_len << 3 | (ColumnType::Blob as u8);
-                    buf.put_u8(type_byte);
-                    buf.put_int(len as i64, num_bytes_for_len as usize);
-                    buf.put_slice(value);
-                }
-            }
-        }
-        Ok(buf)
-    } else {
-        Err(PackError::Abort)
-    }
-}
-
-fn num_bytes_needed_i64(val: i64) -> u8 {
-    if val & 0xFF00000000000000u64 as i64 != 0 {
-        8
-    } else if val & 0x00FF000000000000 != 0 {
-        7
-    } else if val & 0x0000FF0000000000 != 0 {
-        6
-    } else if val & 0x000000FF00000000 != 0 {
-        5
-    } else {
-        num_bytes_needed_i32(val as i32)
-    }
-}
-
-fn num_bytes_needed_i32(val: i32) -> u8 {
-    if val & 0xFF000000u32 as i32 != 0 {
-        4
-    } else if val & 0x00FF0000 != 0 {
-        3
-    } else if val & 0x0000FF00 != 0 {
-        2
-    } else if val * 0x000000FF != 0 {
-        1
-    } else {
-        0
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum UnpackError {
-    #[error("abort")]
-    Abort,
-    #[error("misuse")]
-    Misuse,
-}
-
-pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError> {
-    let mut ret = vec![];
-    let num_columns = buf.get_u8();
-
-    for _i in 0..num_columns {
-        if !buf.has_remaining() {
-            return Err(UnpackError::Abort);
-        }
-        let column_type_and_maybe_intlen = buf.get_u8();
-        let column_type = ColumnType::from_u8(column_type_and_maybe_intlen & 0x07);
-        let intlen = (column_type_and_maybe_intlen >> 3) as usize;
-
-        match column_type {
-            Some(ColumnType::Blob) => {
-                if buf.remaining() < intlen {
-                    return Err(UnpackError::Abort);
-                }
-                let len = buf.get_int(intlen) as usize;
-                if buf.remaining() < len {
-                    return Err(UnpackError::Abort);
-                }
-                ret.push(SqliteValueRef(ValueRef::Blob(&buf[0..len])));
-                buf.advance(len);
-            }
-            Some(ColumnType::Float) => {
-                if buf.remaining() < 8 {
-                    return Err(UnpackError::Abort);
-                }
-                ret.push(SqliteValueRef(ValueRef::Real(buf.get_f64())));
-            }
-            Some(ColumnType::Integer) => {
-                if buf.remaining() < intlen {
-                    return Err(UnpackError::Abort);
-                }
-                ret.push(SqliteValueRef(ValueRef::Integer(buf.get_int(intlen))));
-            }
-            Some(ColumnType::Null) => {
-                ret.push(SqliteValueRef(ValueRef::Null));
-            }
-            Some(ColumnType::Text) => {
-                if buf.remaining() < intlen {
-                    return Err(UnpackError::Abort);
-                }
-                let len = buf.get_int(intlen) as usize;
-                if buf.remaining() < len {
-                    return Err(UnpackError::Abort);
-                }
-                ret.push(SqliteValueRef(ValueRef::Text(&buf[0..len])));
-                buf.advance(len);
-            }
-            None => return Err(UnpackError::Misuse),
-        }
-    }
-
-    Ok(ret)
-}
 
 #[derive(Debug, Default, Clone)]
 pub struct SubsManager(Arc<RwLock<InnerSubsManager>>);
@@ -344,9 +159,9 @@ impl SubsManager {
         inner.remove(id)
     }
 
-    pub fn match_changes(&self, changes: &[Change], db_version: i64) {
+    pub fn match_changes(&self, changes: &[Change], db_version: CrsqlDbVersion) {
         trace!(
-            db_version,
+            %db_version,
             "trying to match changes to subscribers, len: {}",
             changes.len()
         );
@@ -362,13 +177,21 @@ impl SubsManager {
         };
 
         for (id, handle) in handles.iter() {
-            trace!(sub_id = %id, db_version, "attempting to match changes to a subscription");
+            trace!(sub_id = %id, %db_version, "attempting to match changes to a subscription");
             let mut candidates = MatchCandidates::new();
+            let mut match_count = 0;
             for change in changes.iter().map(MatchableChange::from) {
-                handle.filter_matchable_change(&mut candidates, change);
+                if handle.filter_matchable_change(&mut candidates, change) {
+                    match_count += 1;
+                }
             }
 
-            trace!(sub_id = %id, db_version, "found {} candidates", candidates.values().map(|pks| pks.len()).sum::<usize>());
+            // metrics...
+            for (table, pks) in candidates.iter() {
+                counter!("corro.subs.changes.matched.count", pks.len() as u64, "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string());
+            }
+
+            trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
             if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
                 error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
@@ -447,11 +270,12 @@ pub struct MatcherHandle {
 struct InnerMatcherHandle {
     id: Uuid,
     sql: String,
+    hash: String,
     pool: sqlite_pool::RusqlitePool,
     parsed: ParsedSelect,
     col_names: Vec<ColumnName>,
     cancel: CancellationToken,
-    changes_tx: mpsc::Sender<(MatchCandidates, i64)>,
+    changes_tx: mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>,
     last_change_rx: watch::Receiver<ChangeId>,
 }
 
@@ -485,6 +309,10 @@ impl MatcherHandle {
         while !state.is_running() {
             cvar.wait(&mut state);
         }
+    }
+
+    pub fn cancelled(&self) -> WaitForCancellationFuture {
+        self.inner.cancel.cancelled()
     }
 
     pub fn max_change_id(&self, conn: &Connection) -> rusqlite::Result<ChangeId> {
@@ -610,14 +438,18 @@ impl MatcherHandle {
         Ok(max_change_id)
     }
 
-    fn filter_matchable_change(&self, candidates: &mut MatchCandidates, change: MatchableChange) {
+    fn filter_matchable_change(
+        &self,
+        candidates: &mut MatchCandidates,
+        change: MatchableChange,
+    ) -> bool {
         // don't double process the same pk
         if candidates
             .get(change.table)
             .map(|pks| pks.contains(change.pk))
             .unwrap_or_default()
         {
-            return;
+            return false;
         }
 
         // don't consider changes that don't have both the table + col in the matcher query
@@ -629,13 +461,14 @@ impl MatcherHandle {
             .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
             .unwrap_or_default()
         {
-            return;
+            return false;
         }
 
         if let Some(v) = candidates.get_mut(change.table) {
-            v.insert(change.pk.to_vec());
+            v.insert(change.pk.to_vec())
         } else {
             candidates.insert(change.table.clone(), [change.pk.to_vec()].into());
+            true
         }
     }
 }
@@ -644,19 +477,20 @@ type StateLock = Arc<(Mutex<MatcherState>, Condvar)>;
 
 pub struct Matcher {
     pub id: Uuid,
+    pub hash: String,
     pub query: Stmt,
     pub cached_statements: HashMap<String, MatcherStmt>,
     pub pks: IndexMap<String, Vec<String>>,
     pub parsed: ParsedSelect,
     pub evt_tx: mpsc::Sender<QueryEvent>,
     pub col_names: Vec<ColumnName>,
-    pub last_rowid: i64,
+    pub last_rowid: u64,
     conn: Connection,
     base_path: Utf8PathBuf,
     cancel: CancellationToken,
     state: StateLock,
     last_change_tx: watch::Sender<ChangeId>,
-    changes_rx: mpsc::Receiver<(MatchCandidates, i64)>,
+    changes_rx: mpsc::Receiver<(MatchCandidates, CrsqlDbVersion)>,
 }
 
 #[derive(Debug, Clone)]
@@ -800,20 +634,19 @@ impl Matcher {
             let mut new_query = Cmd::Stmt(stmt).to_string();
             new_query.pop();
 
-            let mut tmp_cols = pks.values().flatten().cloned().collect::<Vec<String>>();
+            let mut all_cols = pks.values().flatten().cloned().collect::<Vec<String>>();
             for i in 0..(parsed.columns.len()) {
-                tmp_cols.push(format!("col_{i}"));
+                all_cols.push(format!("col_{i}"));
             }
 
             let temp_query = format!(
-                "SELECT {} FROM query WHERE ({}) IN temp_{}",
-                tmp_cols.join(","),
+                "SELECT {} FROM query WHERE ({}) IN temp_{tbl_name}",
+                all_cols.join(","),
                 pks.get(tbl_name)
                     .cloned()
                     .ok_or(MatcherError::MissingPrimaryKeys)?
                     .to_vec()
                     .join(","),
-                tbl_name,
             );
 
             info!(sub_id = %id, "modified query for table '{tbl_name}': {new_query}");
@@ -836,10 +669,13 @@ impl Matcher {
         // big channel to not miss anything
         let (changes_tx, changes_rx) = mpsc::channel(20480);
 
+        let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
+
         let handle = MatcherHandle {
             inner: Arc::new(InnerMatcherHandle {
                 id,
                 sql: sql.to_owned(),
+                hash: sql_hash.clone(),
                 pool: sqlite_pool::Config::new(sub_db_path.into_std_path_buf())
                     .max_size(5)
                     .read_only()
@@ -856,6 +692,7 @@ impl Matcher {
 
         let matcher = Self {
             id,
+            hash: sql_hash,
             query: stmt,
             cached_statements: statements,
             pks,
@@ -952,14 +789,14 @@ impl Matcher {
             .cloned()
             .collect::<Vec<String>>();
 
-        let mut tmp_cols = pk_cols.clone();
+        let mut all_cols = pk_cols.clone();
 
-        let mut actual_cols = vec![];
+        let mut query_cols = vec![];
 
         for i in 0..(matcher.parsed.columns.len()) {
             let col_name = format!("col_{i}");
-            tmp_cols.push(col_name.clone());
-            actual_cols.push(col_name);
+            all_cols.push(col_name.clone());
+            query_cols.push(col_name);
         }
 
         block_in_place(|| {
@@ -991,18 +828,31 @@ impl Matcher {
                     PRIMARY KEY ("table", cid)
                 );
             "#,
-                columns = tmp_cols.join(","),
+                columns = all_cols.join(","),
                 id = id.as_simple(),
                 pks_coalesced = pk_cols
                     .iter()
                     .map(|pk| format!("coalesce({pk}, \"\")"))
                     .collect::<Vec<_>>()
                     .join(","),
-                actual_columns = actual_cols.join(","),
+                actual_columns = query_cols.join(","),
             );
 
             tx.execute_batch(&create_temp_table)?;
             trace!("created sub tables");
+
+            for (table, pks) in matcher.pks.iter() {
+                tx.execute(
+                    &format!(
+                        "CREATE INDEX index_{id}_{table}_pk ON query ({pks})",
+                        id = id.as_simple(),
+                        table = table,
+                        pks = pks.to_vec().join(","),
+                    ),
+                    [],
+                )?;
+            }
+            trace!("created query indexes");
 
             for (table, columns) in matcher.parsed.table_columns.iter() {
                 tx.execute(
@@ -1070,10 +920,10 @@ impl Matcher {
         }
 
         let catch_up_res = block_in_place(|| {
-            let db_version: i64 =
+            let db_version: CrsqlDbVersion =
                 state_conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
 
-            let last_db_version: i64 = self.conn.query_row(
+            let last_db_version: CrsqlDbVersion = self.conn.query_row(
                 "SELECT value FROM meta WHERE key = 'db_version'",
                 (),
                 |row| row.get(0),
@@ -1132,11 +982,11 @@ impl Matcher {
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
 
         // max duration of aggregating candidates
-        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(400));
+        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(600));
 
         loop {
             enum Branch {
-                NewCandidates((MatchCandidates, i64)),
+                NewCandidates((MatchCandidates, CrsqlDbVersion)),
                 PurgeOldChanges,
             }
 
@@ -1159,7 +1009,7 @@ impl Matcher {
                     }
                     last_db_version = Some(db_version);
 
-                    if buf_count >= 200 {
+                    if buf_count >= 500 {
                         if let Some(db_version) = last_db_version.take() {
                             Branch::NewCandidates((std::mem::take(&mut buf), db_version))
                         } else {
@@ -1177,7 +1027,7 @@ impl Matcher {
                     }
                 },
                 _ = &mut tripwire => {
-                    trace!("tripped cmd_loop, returning");
+                    trace!(sub_id = %self.id, "tripped cmd_loop, returning");
                     // just return!
                     return;
                 }
@@ -1193,7 +1043,7 @@ impl Matcher {
                         self.handle_candidates(&mut state_conn, candidates, db_version)
                     }) {
                         if !matches!(e, MatcherError::EventReceiverClosed) {
-                            error!("could not handle change: {e}");
+                            error!(sub_id = %self.id, "could not handle change: {e}");
                         }
                         break;
                     }
@@ -1213,12 +1063,11 @@ impl Matcher {
                     });
 
                     match res {
-                        Ok(deleted) => info!(
-                            "Deleted {deleted} old changes row for subscription {}",
-                            self.id.as_simple()
-                        ),
+                        Ok(deleted) => {
+                            info!(sub_id = %self.id, "Deleted {deleted} old changes row")
+                        }
                         Err(e) => {
-                            error!("could not delete old changes: {e}");
+                            error!(sub_id = %self.id, "could not delete old changes: {e}");
                         }
                     }
                 }
@@ -1239,7 +1088,7 @@ impl Matcher {
             .send(QueryEvent::Columns(self.col_names.clone()))
             .await
         {
-            error!("could not send back columns, probably means no receivers! {e}");
+            error!(sub_id = %self.id, "could not send back columns, probably means no receivers! {e}");
             return;
         }
 
@@ -1259,7 +1108,7 @@ impl Matcher {
             let mut stmt_str = Cmd::Stmt(self.query.clone()).to_string();
             stmt_str.pop(); // remove trailing `;`
 
-            let mut tmp_cols = self
+            let mut all_cols = self
                 .pks
                 .values()
                 .flatten()
@@ -1268,7 +1117,7 @@ impl Matcher {
 
             for i in 0..(self.parsed.columns.len()) {
                 let col_name = format!("col_{i}");
-                tmp_cols.push(col_name.clone());
+                all_cols.push(col_name.clone());
             }
 
             let mut last_rowid = 0;
@@ -1277,7 +1126,7 @@ impl Matcher {
             tx.execute_batch(&format!(
                 "DROP TABLE IF EXISTS state_rows;
                     CREATE TEMP TABLE state_rows ({})",
-                tmp_cols.join(",")
+                all_cols.join(",")
             ))?;
 
             info!(sub_id = %self.id, "Starting state conn read transaction for initial query");
@@ -1294,11 +1143,12 @@ impl Matcher {
                     select.query(())?
                 };
                 let elapsed = start.elapsed();
+                info!(sub_id = %self.id, "Initial query done in {elapsed:?}");
 
                 let insert_into = format!(
                     "INSERT INTO query ({}) VALUES ({}) RETURNING __corro_rowid,{}",
-                    tmp_cols.join(","),
-                    tmp_cols
+                    all_cols.join(","),
+                    all_cols
                         .iter()
                         .map(|_| "?".to_string())
                         .collect::<Vec<_>>()
@@ -1313,7 +1163,7 @@ impl Matcher {
                     loop {
                         match select_rows.next() {
                             Ok(Some(row)) => {
-                                for i in 0..tmp_cols.len() {
+                                for i in 0..all_cols.len() {
                                     insert.raw_bind_parameter(
                                         i + 1,
                                         SqliteValueRef::from(row.get_ref(i)?),
@@ -1332,17 +1182,17 @@ impl Matcher {
                                     .map(|i| row.get::<_, SqliteValue>(i))
                                     .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                                if let Err(e) = self
-                                    .evt_tx
-                                    .blocking_send(QueryEvent::Row(RowId(rowid), cells))
+                                if let Err(e) =
+                                    self.evt_tx.try_send(QueryEvent::Row(RowId(rowid), cells))
                                 {
-                                    error!("could not send back row: {e}");
+                                    error!(sub_id = %self.id, "could not send back row: {e}");
                                     return Err(MatcherError::EventReceiverClosed);
                                 }
 
                                 last_rowid = cmp::max(rowid, last_rowid);
                             }
                             Ok(None) => {
+                                info!(sub_id = %self.id, "Done iterating through rows for initial query");
                                 // done!
                                 break;
                             }
@@ -1366,7 +1216,7 @@ impl Matcher {
 
                 tx.execute_batch("DROP TABLE IF EXISTS state_rows;")?;
 
-                let db_version: i64 =
+                let db_version: CrsqlDbVersion =
                     state_tx.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
                 update_last_db_version(&tx, db_version)?;
 
@@ -1399,17 +1249,18 @@ impl Matcher {
                     })
                     .await
                 {
-                    error!("could not return end of query event: {e}");
+                    error!(sub_id = %self.id, "could not return end of query event: {e}");
                     return;
                 }
                 db_version
             }
             Err(e) => {
-                debug!("could not complete initial query: {e}");
+                warn!(sub_id = %self.id, "could not complete initial query: {e}");
                 _ = self
                     .evt_tx
                     .send(QueryEvent::Error(e.to_compact_string()))
                     .await;
+
                 return;
             }
         };
@@ -1421,10 +1272,11 @@ impl Matcher {
 
         if let Some(first_db_version) = first_buffered_db_version {
             if db_version < first_db_version {
+                info!(sub_id = %self.id, "processing missed changes between {db_version} and {first_db_version}");
                 if let Err(e) = block_in_place(|| {
                     self.handle_change(&mut state_conn, db_version + 1, first_db_version - 1)
                 }) {
-                    error!("could not catch up from last db version {db_version} to first buffered db version {first_db_version}: {e}");
+                    error!(sub_id = %self.id, "could not catch up from last db version {db_version} to first buffered db version {first_db_version}: {e}");
                     _ = self
                         .evt_tx
                         .try_send(QueryEvent::Error(e.to_compact_string()));
@@ -1432,10 +1284,11 @@ impl Matcher {
                 }
             }
             if let Some(last_db_version) = last_db_version {
+                info!(sub_id = %self.id, "handling buffered candidates while performing initial query");
                 if let Err(e) = block_in_place(|| {
                     self.handle_candidates(&mut state_conn, candidates, last_db_version)
                 }) {
-                    error!("could not catch up from buffered candidates: {e}");
+                    error!(sub_id = %self.id, "could not catch up from buffered candidates: {e}");
                     _ = self
                         .evt_tx
                         .try_send(QueryEvent::Error(e.to_compact_string()));
@@ -1451,7 +1304,7 @@ impl Matcher {
         &mut self,
         state_conn: &mut Connection,
         candidates: MatchCandidates,
-        last_db_version: i64,
+        last_db_version: CrsqlDbVersion,
     ) -> Result<(), MatcherError> {
         let mut tables = IndexSet::new();
 
@@ -1503,7 +1356,7 @@ impl Matcher {
         tx.commit()?;
         trace!("committed temp pk tables");
 
-        let mut actual_cols = vec![];
+        let mut query_cols = vec![];
 
         let pk_cols = self
             .pks
@@ -1512,11 +1365,11 @@ impl Matcher {
             .cloned()
             .collect::<Vec<String>>();
 
-        let mut tmp_cols = pk_cols.clone();
+        let mut all_cols = pk_cols.clone();
         for i in 0..(self.parsed.columns.len()) {
             let col_name = format!("col_{i}");
-            tmp_cols.push(col_name.clone());
-            actual_cols.push(col_name);
+            all_cols.push(col_name.clone());
+            query_cols.push(col_name);
         }
 
         // start a new tx
@@ -1525,7 +1378,7 @@ impl Matcher {
         // ensure drop and recreate
         tx.execute_batch(&format!(
             "CREATE TEMP TABLE IF NOT EXISTS state_results ({})",
-            tmp_cols.join(",")
+            all_cols.join(",")
         ))?;
 
         let mut new_last_rowid = self.last_rowid;
@@ -1535,7 +1388,7 @@ impl Matcher {
             let state_tx = state_conn.transaction()?;
             let mut tmp_insert_prepped = tx.prepare_cached(&format!(
                 "INSERT INTO state_results VALUES ({})",
-                (0..tmp_cols.len())
+                (0..all_cols.len())
                     .map(|_| "?")
                     .collect::<Vec<_>>()
                     .join(",")
@@ -1580,7 +1433,7 @@ impl Matcher {
                             WHERE {excluded_not_same}
                         RETURNING __corro_rowid,{return_cols}",
                     // insert into
-                    insert_cols = tmp_cols.join(","),
+                    insert_cols = all_cols.join(","),
                     query_query = stmt.temp_query,
                     conflict_clause = pk_cols
                         .iter()
@@ -1595,7 +1448,7 @@ impl Matcher {
                         .map(|i| format!("col_{i} IS NOT excluded.col_{i}"))
                         .collect::<Vec<_>>()
                         .join(" OR "),
-                    return_cols = actual_cols.join(",")
+                    return_cols = query_cols.join(",")
                 );
 
                 trace!("INSERT SQL: {sql}");
@@ -1614,7 +1467,7 @@ impl Matcher {
                     pks = pk_cols.join(","),
                     select_pks = pk_cols.join(","),
                     query_query = stmt.temp_query,
-                    return_cols = actual_cols.join(",")
+                    return_cols = query_cols.join(",")
                 );
 
                 trace!("DELETE SQL: {sql}");
@@ -1623,14 +1476,14 @@ impl Matcher {
 
                 let mut change_insert_stmt = tx.prepare_cached(&format!(
                     "INSERT INTO changes (__corro_rowid, {CHANGE_TYPE_COL}, {}) VALUES (?, ?, {}) RETURNING {CHANGE_ID_COL}",
-                    actual_cols.join(","),
-                    (0..actual_cols.len())
+                    query_cols.join(","),
+                    (0..query_cols.len())
                         .map(|_i| "?")
                         .collect::<Vec<_>>()
                         .join(",")
                 ))?;
 
-                for (mut change_type, mut prepped) in [
+                for (change_type, mut prepped) in [
                     (None, insert_prepped),
                     (Some(ChangeType::Delete), delete_prepped),
                 ] {
@@ -1641,7 +1494,7 @@ impl Matcher {
                     while let Ok(Some(row)) = rows.next() {
                         let rowid: RowId = row.get(0)?;
 
-                        let change_type = change_type.take().unwrap_or({
+                        let change_type = change_type.clone().take().unwrap_or({
                             if rowid.0 > self.last_rowid {
                                 ChangeType::Insert
                             } else {
@@ -1690,10 +1543,9 @@ impl Matcher {
                         }
                     }
                 }
+                // clean that up
+                tx.execute_batch("DELETE FROM state_results")?;
             }
-
-            // clean that up
-            tx.execute_batch("DELETE FROM state_results")?;
 
             // clean up temporary tables immediately
             for table in tables {
@@ -1720,8 +1572,8 @@ impl Matcher {
     fn handle_change(
         &mut self,
         state_conn: &mut Connection,
-        start_db_version: i64,
-        end_db_version: i64,
+        start_db_version: CrsqlDbVersion,
+        end_db_version: CrsqlDbVersion,
     ) -> Result<(), MatcherError> {
         debug!(sub_id = %self.id, "handling change from version {start_db_version} to {end_db_version}");
 
@@ -1751,7 +1603,10 @@ impl Matcher {
     }
 }
 
-fn update_last_db_version(conn: &Connection, last_db_version: i64) -> rusqlite::Result<()> {
+fn update_last_db_version(
+    conn: &Connection,
+    last_db_version: CrsqlDbVersion,
+) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO meta (key,value) VALUES ('db_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value WHERE excluded.value > value",
         [last_db_version],
@@ -2219,6 +2074,193 @@ impl MatcherError {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum NormalizeStatementError {
+    #[error(transparent)]
+    Parse(#[from] sqlite3_parser::lexer::sql::Error),
+    #[error("unexpected statement: {0}")]
+    UnexpectedStatement(Cmd),
+    #[error("only 1 statement is supported")]
+    Multiple,
+    #[error("at least 1 statement is required")]
+    NoStatement,
+}
+
+pub fn normalize_sql(sql: &str) -> Result<String, NormalizeStatementError> {
+    let mut parser = Parser::new(sql.as_bytes());
+
+    let stmt = match parser.next()? {
+        Some(Cmd::Stmt(stmt)) => stmt,
+        Some(cmd) => {
+            return Err(NormalizeStatementError::UnexpectedStatement(cmd));
+        }
+        None => {
+            return Err(NormalizeStatementError::NoStatement);
+        }
+    };
+
+    if parser.next()?.is_some() {
+        return Err(NormalizeStatementError::Multiple);
+    }
+
+    Ok(Cmd::Stmt(stmt).to_string())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PackError {
+    #[error("abort")]
+    Abort,
+}
+
+pub fn pack_columns(args: &[SqliteValue]) -> Result<Vec<u8>, PackError> {
+    let mut buf = vec![];
+    /*
+     * Format:
+     * [num_columns:u8,...[(type(0-3),num_bytes?(3-7)):u8, length?:i32, ...bytes:u8[]]]
+     *
+     * The byte used for column type also encodes the number of bytes used for the integer.
+     * e.g.: (type(0-3),num_bytes?(3-7)):u8
+     * first 3 bits are type
+     * last 5 encode how long the following integer, if there is a following integer, is. 1, 2, 3, ... 8 bytes.
+     *
+     * Not packing an integer into the minimal number of bytes required is rather wasteful.
+     * E.g., the number `0` would take 8 bytes rather than 1 byte.
+     */
+    let len_result: Result<u8, _> = args.len().try_into();
+    if let Ok(len) = len_result {
+        buf.put_u8(len);
+        for value in args {
+            match value {
+                SqliteValue::Null => {
+                    buf.put_u8(ColumnType::Null as u8);
+                }
+                SqliteValue::Integer(val) => {
+                    let num_bytes_for_int = num_bytes_needed_i64(*val);
+                    let type_byte = num_bytes_for_int << 3 | (ColumnType::Integer as u8);
+                    buf.put_u8(type_byte);
+                    buf.put_int(*val, num_bytes_for_int as usize);
+                }
+                SqliteValue::Real(v) => {
+                    buf.put_u8(ColumnType::Float as u8);
+                    buf.put_f64(v.0);
+                }
+                SqliteValue::Text(value) => {
+                    let len = value.len() as i32;
+                    let num_bytes_for_len = num_bytes_needed_i32(len);
+                    let type_byte = num_bytes_for_len << 3 | (ColumnType::Text as u8);
+                    buf.put_u8(type_byte);
+                    buf.put_int(len as i64, num_bytes_for_len as usize);
+                    buf.put_slice(value.as_bytes());
+                }
+                SqliteValue::Blob(value) => {
+                    let len = value.len() as i32;
+                    let num_bytes_for_len = num_bytes_needed_i32(len);
+                    let type_byte = num_bytes_for_len << 3 | (ColumnType::Blob as u8);
+                    buf.put_u8(type_byte);
+                    buf.put_int(len as i64, num_bytes_for_len as usize);
+                    buf.put_slice(value);
+                }
+            }
+        }
+        Ok(buf)
+    } else {
+        Err(PackError::Abort)
+    }
+}
+
+fn num_bytes_needed_i64(val: i64) -> u8 {
+    if val & 0xFF00000000000000u64 as i64 != 0 {
+        8
+    } else if val & 0x00FF000000000000 != 0 {
+        7
+    } else if val & 0x0000FF0000000000 != 0 {
+        6
+    } else if val & 0x000000FF00000000 != 0 {
+        5
+    } else {
+        num_bytes_needed_i32(val as i32)
+    }
+}
+
+fn num_bytes_needed_i32(val: i32) -> u8 {
+    if val & 0xFF000000u32 as i32 != 0 {
+        4
+    } else if val & 0x00FF0000 != 0 {
+        3
+    } else if val & 0x0000FF00 != 0 {
+        2
+    } else if val * 0x000000FF != 0 {
+        1
+    } else {
+        0
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UnpackError {
+    #[error("abort")]
+    Abort,
+    #[error("misuse")]
+    Misuse,
+}
+
+pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError> {
+    let mut ret = vec![];
+    let num_columns = buf.get_u8();
+
+    for _i in 0..num_columns {
+        if !buf.has_remaining() {
+            return Err(UnpackError::Abort);
+        }
+        let column_type_and_maybe_intlen = buf.get_u8();
+        let column_type = ColumnType::from_u8(column_type_and_maybe_intlen & 0x07);
+        let intlen = (column_type_and_maybe_intlen >> 3) as usize;
+
+        match column_type {
+            Some(ColumnType::Blob) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                let len = buf.get_int(intlen) as usize;
+                if buf.remaining() < len {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef(ValueRef::Blob(&buf[0..len])));
+                buf.advance(len);
+            }
+            Some(ColumnType::Float) => {
+                if buf.remaining() < 8 {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef(ValueRef::Real(buf.get_f64())));
+            }
+            Some(ColumnType::Integer) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef(ValueRef::Integer(buf.get_int(intlen))));
+            }
+            Some(ColumnType::Null) => {
+                ret.push(SqliteValueRef(ValueRef::Null));
+            }
+            Some(ColumnType::Text) => {
+                if buf.remaining() < intlen {
+                    return Err(UnpackError::Abort);
+                }
+                let len = buf.get_int(intlen) as usize;
+                if buf.remaining() < len {
+                    return Err(UnpackError::Abort);
+                }
+                ret.push(SqliteValueRef(ValueRef::Text(&buf[0..len])));
+                buf.advance(len);
+            }
+            None => return Err(UnpackError::Misuse),
+        }
+    }
+
+    Ok(ret)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
@@ -2516,7 +2558,7 @@ mod tests {
             }
 
             println!("processing change...");
-            filter_changes_from_db(&matcher, &conn, None, 2).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(2)).unwrap();
             println!("processed changes");
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
@@ -2537,7 +2579,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, 3).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(3)).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
@@ -2560,7 +2602,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, 4).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(4)).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
@@ -2619,7 +2661,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, 5).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(5)).unwrap();
 
             let start = Instant::now();
             for _ in range {
@@ -2751,7 +2793,7 @@ mod tests {
         matcher: &MatcherHandle,
         state_conn: &Connection,
         actor_id: Option<ActorId>,
-        db_version: i64,
+        db_version: CrsqlDbVersion,
     ) -> rusqlite::Result<()> {
         let mut candidates = MatchCandidates::new();
 

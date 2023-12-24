@@ -50,7 +50,7 @@ impl CrConn {
         Ok(Self(conn))
     }
 
-    pub fn transaction(&mut self) -> rusqlite::Result<Transaction> {
+    pub fn immediate_transaction(&mut self) -> rusqlite::Result<Transaction> {
         self.0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
     }
@@ -104,7 +104,7 @@ fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-pub(crate) fn setup_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+pub fn setup_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     // WAL journal mode and synchronous NORMAL for best performance / crash resilience compromise
     conn.execute_batch(
         r#"

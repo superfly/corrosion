@@ -15,11 +15,13 @@ compact_str = { workspace = true }
 config = { workspace = true }
 consul-client = { version = "0.1.0-alpha.0", path = "../consul-client" }
 corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
+corro-base-types = { version = "0.1.0-alpha.1", path = "../corro-base-types" }
 deadpool = { workspace = true }
 enquote = { workspace = true }
 fallible-iterator = { workspace = true }
 foca = { workspace = true } 
 futures = { workspace = true }
+hex = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }

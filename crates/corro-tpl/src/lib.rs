@@ -9,10 +9,8 @@ use std::sync::Arc;
 
 use compact_str::ToCompactString;
 use corro_client::sub::SubscriptionStream;
-use corro_client::{CorrosionApiClient, QueryEvent};
-use corro_types::api::ColumnName;
-use corro_types::api::SqliteParam;
-use corro_types::api::Statement;
+use corro_client::CorrosionApiClient;
+use corro_types::api::{ColumnName, QueryEvent, RowId, SqliteParam, Statement};
 use corro_types::change::SqliteValue;
 use futures::StreamExt;
 use indexmap::IndexMap;
@@ -107,7 +105,7 @@ impl IntoIterator for QueryResponse {
 #[derive(Clone)]
 struct Row {
     #[allow(dead_code)]
-    id: i64,
+    id: RowId,
     columns: Arc<IndexMap<ColumnName, u16>>,
     cells: Arc<Vec<SqliteValue>>,
 }
@@ -295,7 +293,7 @@ impl QueryResponseIter {
                         match self.columns.as_ref() {
                             Some(columns) => {
                                 return Some(Ok(Row {
-                                    id: rowid.0,
+                                    id: rowid,
                                     columns: columns.clone(),
                                     cells: Arc::new(cells),
                                 }));

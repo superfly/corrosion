@@ -11,3 +11,4 @@ pub mod schema;
 pub mod sqlite;
 pub mod sync;
 pub mod tls;
+pub use corro_base_types as base;

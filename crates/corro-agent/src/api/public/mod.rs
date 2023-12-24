@@ -4,8 +4,9 @@ use axum::{response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
-    agent::{Agent, ChangeError, KnownDbVersion},
+    agent::{Agent, ChangeError, CurrentVersion, KnownDbVersion},
     api::{row_to_change, ColumnName, ExecResponse, ExecResult, QueryEvent, Statement},
+    base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{ChunkedChanges, SqliteValue, MAX_CHANGES_BYTE_SIZE},
     schema::{apply_schema, parse_sql},
@@ -56,23 +57,53 @@ where
 
     let start = Instant::now();
     block_in_place(move || {
-        let tx = conn.transaction()?;
+        let tx = conn
+            .immediate_transaction()
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
 
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
         let ts = Timestamp::from(agent.clock().new_timestamp());
 
-        let db_version: i64 = tx
-            .prepare_cached("SELECT crsql_next_db_version()")?
-            .query_row((), |row| row.get(0))?;
+        let db_version: CrsqlDbVersion = tx
+            .prepare_cached("SELECT crsql_next_db_version()")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?
+            .query_row((), |row| row.get(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
 
         let has_changes: bool = tx
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE db_version = ?);")?
-            .query_row([db_version], |row| row.get(0))?;
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE db_version = ?);")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?
+            .query_row([db_version], |row| row.get(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
 
         if !has_changes {
-            tx.commit()?;
+            tx.commit().map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
             return Ok((ret, start.elapsed()));
         }
 
@@ -81,9 +112,19 @@ where
         let version = last_version + 1;
         trace!("version: {version}");
 
-        let last_seq: i64 = tx
-            .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
-            .query_row([db_version], |row| row.get(0))?;
+        let last_seq: CrsqlSeq = tx
+            .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?
+            .query_row([db_version], |row| row.get(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
 
         let elapsed = {
             tx.prepare_cached(
@@ -91,18 +132,32 @@ where
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
                     VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
             "#,
-            )?
+            )
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?
             .execute(named_params! {
                 ":actor_id": actor_id,
                 ":start_version": version,
                 ":db_version": db_version,
                 ":last_seq": last_seq,
                 ":ts": ts
+            })
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
             })?;
 
             debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
-            tx.commit()?;
+            tx.commit().map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
             start.elapsed()
         };
 
@@ -110,11 +165,11 @@ where
 
         book_writer.insert(
             version,
-            KnownDbVersion::Current {
+            KnownDbVersion::Current(CurrentVersion {
                 db_version,
                 last_seq,
                 ts,
-            },
+            }),
         );
         drop(book_writer);
 
@@ -134,7 +189,8 @@ where
                 "#,
                 )?;
                 let rows = prepped.query_map([db_version], row_to_change)?;
-                let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_BYTE_SIZE);
+                let chunked =
+                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
                 for changes_seqs in chunked {
                     match changes_seqs {
                         Ok((changes, seqs)) => {
@@ -545,7 +601,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     new_schema.constrain()?;
 
     block_in_place(|| {
-        let tx = conn.transaction()?;
+        let tx = conn.immediate_transaction()?;
 
         apply_schema(&tx, &schema_write, &mut new_schema)?;
 
@@ -609,7 +665,7 @@ pub async fn api_v1_db_schema(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use corro_types::{api::RowId, config::Config, schema::SqliteType};
+    use corro_types::{api::RowId, base::Version, config::Config, schema::SqliteType};
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
     use tokio::sync::mpsc::error::TryRecvError;
@@ -684,7 +740,10 @@ mod tests {
         assert!(matches!(
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
-                changeset: Changeset::Full { version: 1, .. },
+                changeset: Changeset::Full {
+                    version: Version(1),
+                    ..
+                },
                 ..
             }))
         ));
@@ -698,7 +757,7 @@ mod tests {
                 .read("test")
                 .await
                 .last(),
-            Some(1)
+            Some(Version(1))
         );
 
         println!("second req...");

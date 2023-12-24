@@ -14,7 +14,8 @@ use bytes::Buf;
 use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
-    agent::{Agent, KnownDbVersion},
+    agent::{Agent, CurrentVersion, KnownDbVersion},
+    base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset, Timestamp},
     change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     config::PgConfig,
@@ -2282,7 +2283,7 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
 
     let ts = Timestamp::from(agent.clock().new_timestamp());
 
-    let db_version: i64 = conn
+    let db_version: CrsqlDbVersion = conn
         .prepare_cached("SELECT crsql_next_db_version()")?
         .query_row((), |row| row.get(0))?;
 
@@ -2302,7 +2303,7 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
             .for_actor(actor_id)
     };
 
-    let last_seq: i64 = conn
+    let last_seq: CrsqlSeq = conn
         .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
         .query_row([db_version], |row| row.get(0))?;
 
@@ -2335,11 +2336,11 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
 
     book_writer.insert(
         version,
-        KnownDbVersion::Current {
+        KnownDbVersion::Current(CurrentVersion {
             db_version,
             last_seq,
             ts,
-        },
+        }),
     );
 
     drop(book_writer);
@@ -2360,7 +2361,8 @@ fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
             "#,
                 )?;
                 let rows = prepped.query_map([db_version], row_to_change)?;
-                let chunked = ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_BYTE_SIZE);
+                let chunked =
+                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
                 for changes_seqs in chunked {
                     match changes_seqs {
                         Ok((changes, seqs)) => {

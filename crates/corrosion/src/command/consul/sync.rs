@@ -520,7 +520,6 @@ async fn execute(
 
     if !statements.is_empty() {
         corrosion.execute(&statements).await?;
-        info!("updated consul services");
     }
 
     let mut svc_stats = ApplyStats::default();
