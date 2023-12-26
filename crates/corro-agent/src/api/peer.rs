@@ -358,7 +358,6 @@ const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
 fn handle_known_version(
     conn: &mut Connection,
     actor_id: ActorId,
-    is_local: bool,
     version: Version,
     init_known: KnownDbVersion,
     booked: &Booked,
@@ -498,7 +497,6 @@ fn handle_known_version(
                             return handle_known_version(
                                 conn,
                                 actor_id,
-                                is_local,
                                 version,
                                 current,
                                 booked,
@@ -572,7 +570,6 @@ fn handle_known_version(
 async fn process_version(
     pool: &SplitPool,
     actor_id: ActorId,
-    is_local: bool,
     version: Version,
     known_version: KnownDbVersion,
     booked: &Booked,
@@ -598,7 +595,6 @@ async fn process_version(
         handle_known_version(
             &mut conn,
             actor_id,
-            is_local,
             version,
             known_version,
             booked,
@@ -673,7 +669,6 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
 }
 
 async fn process_sync(
-    local_actor_id: ActorId,
     pool: SplitPool,
     bookie: Bookie,
     sender: Sender<SyncMessage>,
@@ -723,8 +718,6 @@ async fn process_sync(
                 Some(booked) => booked,
                 None => continue,
             };
-
-            let is_local = actor_id == local_actor_id;
 
             let mut cleared: RangeInclusiveSet<Version> = RangeInclusiveSet::new();
 
@@ -786,7 +779,6 @@ async fn process_sync(
                         process_version(
                             &pool,
                             actor_id,
-                            is_local,
                             version,
                             known_version,
                             &booked,
@@ -810,7 +802,6 @@ async fn process_sync(
                         process_version(
                             &pool,
                             actor_id,
-                            is_local,
                             version,
                             known_version,
                             &booked,
@@ -1372,15 +1363,9 @@ pub async fn serve_sync(
     let (tx, mut rx) = mpsc::channel::<SyncMessage>(256);
 
     tokio::spawn(
-        process_sync(
-            agent.actor_id(),
-            agent.pool().clone(),
-            agent.bookie().clone(),
-            tx,
-            rx_need,
-        )
-        .instrument(info_span!("process_sync"))
-        .inspect_err(|e| error!("could not process sync request: {e}")),
+        process_sync(agent.pool().clone(), agent.bookie().clone(), tx, rx_need)
+            .instrument(info_span!("process_sync"))
+            .inspect_err(|e| error!("could not process sync request: {e}")),
     );
 
     let (send_res, recv_res) = tokio::join!(
@@ -1665,7 +1650,6 @@ mod tests {
                 handle_known_version(
                     &mut conn,
                     actor_id,
-                    false,
                     Version(1),
                     known1,
                     &booked,
@@ -1695,7 +1679,6 @@ mod tests {
                 handle_known_version(
                     &mut conn,
                     actor_id,
-                    false,
                     Version(2),
                     known2,
                     &booked,
