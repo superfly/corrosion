@@ -128,6 +128,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let schema = {
         let mut conn = pool.write_priority().await?;
         migrate(&mut conn)?;
+
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
 
@@ -3650,7 +3651,7 @@ pub mod tests {
 
     #[test]
     fn test_store_empty_changeset() -> eyre::Result<()> {
-        let mut conn = Connection::open_in_memory()?;
+        let mut conn = CrConn::init(Connection::open_in_memory()?)?;
 
         corro_types::sqlite::setup_conn(&mut conn)?;
         migrate(&mut conn)?;

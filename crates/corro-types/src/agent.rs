@@ -359,7 +359,7 @@ fn v0_2_0_2_migration(tx: &Transaction) -> rusqlite::Result<()> {
 }
 
 // since crsqlite 0.16, site_id is NOT NULL in clock tables
-// also sets the new 'merge-equal-values' config to true
+// also sets the new 'merge-equal-values' config to true.
 fn crsqlite_v0_16_migration(tx: &Transaction) -> rusqlite::Result<()> {
     let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -396,7 +396,11 @@ fn crsqlite_v0_16_migration(tx: &Transaction) -> rusqlite::Result<()> {
     }
 
     // we want this to be true or else we'll assuredly make our DB inconsistent.
-    tx.execute_batch("SELECT crsql_config_set('merge-equal-values', 1);")?;
+    let value: i64 = tx.query_row(
+        "SELECT crsql_config_set('merge-equal-values', 1);",
+        [],
+        |row| row.get(0),
+    )?;
 
     Ok(())
 }
