@@ -229,9 +229,9 @@ impl Agent {
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let migrations: Vec<Box<dyn Migration>> = vec![
         Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
-        Box::new(v0_2_0_migration as fn(&Transaction) -> rusqlite::Result<()>),
-        Box::new(v0_2_0_1_migration as fn(&Transaction) -> rusqlite::Result<()>),
-        Box::new(v0_2_0_2_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(bookkeeping_db_version_index as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(create_corro_subs as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(refactor_corro_members as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(crsqlite_v0_16_migration as fn(&Transaction) -> rusqlite::Result<()>),
     ];
 
@@ -322,7 +322,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
+fn bookkeeping_db_version_index(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         "
         CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version);
@@ -330,7 +330,7 @@ fn v0_2_0_migration(tx: &Transaction) -> rusqlite::Result<()> {
     )
 }
 
-fn v0_2_0_1_migration(tx: &Transaction) -> rusqlite::Result<()> {
+fn create_corro_subs(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         r#"
         -- where subscriptions are stored
@@ -343,7 +343,7 @@ fn v0_2_0_1_migration(tx: &Transaction) -> rusqlite::Result<()> {
     )
 }
 
-fn v0_2_0_2_migration(tx: &Transaction) -> rusqlite::Result<()> {
+fn refactor_corro_members(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         r#"
         -- remove state
