@@ -389,6 +389,8 @@ fn crsqlite_v0_16_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 ALTER TABLE {table}_new RENAME TO {table};
 
                 DROP TABLE {table}_old;
+
+                CREATE INDEX IF NOT EXISTS corro_{table}__crsql_clock_site_id_dbv ON {table}__crsql_clock (site_id, db_version);
             "#),
         )?;
 

@@ -1,10 +1,13 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    ops::{Deref, DerefMut},
+    time::Instant,
+};
 
 use once_cell::sync::Lazy;
 use rusqlite::{params, Connection, Transaction};
 use sqlite_pool::SqliteConn;
 use tempfile::TempDir;
-use tracing::{error, trace};
+use tracing::{error, info, trace};
 
 pub type SqlitePool = sqlite_pool::Pool<CrConn>;
 pub type SqlitePoolError = sqlite_pool::PoolError;
@@ -158,8 +161,12 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
     // determine how many migrations to skip (skip as many as we are at)
     let skip_n = migration_version(&tx).unwrap_or_default();
 
-    for migration in migrations.into_iter().skip(skip_n) {
+    for (i, migration) in migrations.into_iter().skip(skip_n).enumerate() {
+        let new_version = skip_n + i;
+        info!("Applying migration to v{new_version}");
+        let start = Instant::now();
         migration.migrate(&tx)?;
+        info!("Applied v{new_version} in {:?}", start.elapsed());
     }
     set_migration_version(&tx, target_version)?;
 

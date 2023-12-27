@@ -132,13 +132,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
 
-        info!("Ensuring clock table indexes for fast compaction");
-        let start = Instant::now();
-        for table in schema.tables.keys() {
-            conn.execute_batch(&format!("CREATE INDEX IF NOT EXISTS corro_{table}__crsql_clock_site_id_dbv ON {table}__crsql_clock (site_id, db_version);"))?;
-        }
-        info!("Ensured indexes in {:?}", start.elapsed());
-
         schema
     };
 
