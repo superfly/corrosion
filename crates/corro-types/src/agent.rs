@@ -385,7 +385,10 @@ fn crsqlite_v0_16_migration(tx: &Transaction) -> rusqlite::Result<()> {
 
                 INSERT INTO {table}_new SELECT key, col_name, col_version, db_version, COALESCE(site_id, 0), seq FROM {table};
 
-                DROP TABLE {table};
+                ALTER TABLE {table} RENAME TO {table}_old;
+                ALTER TABLE {table}_new RENAME TO {table};
+
+                DROP TABLE {table}_old;
             "#),
         )?;
 
@@ -396,7 +399,7 @@ fn crsqlite_v0_16_migration(tx: &Transaction) -> rusqlite::Result<()> {
     }
 
     // we want this to be true or else we'll assuredly make our DB inconsistent.
-    let value: i64 = tx.query_row(
+    let _value: i64 = tx.query_row(
         "SELECT crsql_config_set('merge-equal-values', 1);",
         [],
         |row| row.get(0),
