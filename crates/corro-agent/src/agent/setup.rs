@@ -1,6 +1,6 @@
 //! Setup main agent state
 
-//// External crates
+// External crates
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
     ops::RangeInclusive,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     net::TcpListener,
@@ -22,7 +22,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 use tripwire::Tripwire;
 
-//// Internals
+// Internals
 use crate::{api::peer::gossip_server_endpoint, transport::Transport};
 use corro_types::{
     actor::ActorId,
