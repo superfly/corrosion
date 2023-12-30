@@ -358,7 +358,6 @@ const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
 fn handle_known_version(
     conn: &mut Connection,
     actor_id: ActorId,
-    is_local: bool,
     version: Version,
     init_known: KnownDbVersion,
     booked: &Booked,
@@ -393,23 +392,22 @@ fn handle_known_version(
                 // this is a read transaction!
                 let tx = conn.transaction()?;
 
-                let mut prepped = tx.prepare_cached(r#"
-                    SELECT "table", pk, cid, val, col_version, db_version, seq, COALESCE(site_id, crsql_site_id()), cl
+                let mut prepped = tx.prepare_cached(
+                    r#"
+                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                         FROM crsql_changes
-                        WHERE site_id IS ?
+                        WHERE site_id = ?
                         AND db_version = ?
                         AND seq >= ? AND seq <= ?
                         ORDER BY seq ASC
-                "#)?;
-                let site_id: Option<[u8; 16]> = (!is_local)
-                    .then_some(actor_id)
-                    .map(|actor_id| actor_id.to_bytes());
+                "#,
+                )?;
 
                 let start_seq = range_needed.start();
                 let end_seq = range_needed.end();
 
                 let rows = prepped.query_map(
-                    params![site_id, db_version, start_seq, end_seq],
+                    params![actor_id, db_version, start_seq, end_seq],
                     row_to_change,
                 )?;
 
@@ -499,7 +497,6 @@ fn handle_known_version(
                             return handle_known_version(
                                 conn,
                                 actor_id,
-                                is_local,
                                 version,
                                 current,
                                 booked,
@@ -573,7 +570,6 @@ fn handle_known_version(
 async fn process_version(
     pool: &SplitPool,
     actor_id: ActorId,
-    is_local: bool,
     version: Version,
     known_version: KnownDbVersion,
     booked: &Booked,
@@ -599,7 +595,6 @@ async fn process_version(
         handle_known_version(
             &mut conn,
             actor_id,
-            is_local,
             version,
             known_version,
             booked,
@@ -674,7 +669,6 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
 }
 
 async fn process_sync(
-    local_actor_id: ActorId,
     pool: SplitPool,
     bookie: Bookie,
     sender: Sender<SyncMessage>,
@@ -724,8 +718,6 @@ async fn process_sync(
                 Some(booked) => booked,
                 None => continue,
             };
-
-            let is_local = actor_id == local_actor_id;
 
             let mut cleared: RangeInclusiveSet<Version> = RangeInclusiveSet::new();
 
@@ -787,7 +779,6 @@ async fn process_sync(
                         process_version(
                             &pool,
                             actor_id,
-                            is_local,
                             version,
                             known_version,
                             &booked,
@@ -811,7 +802,6 @@ async fn process_sync(
                         process_version(
                             &pool,
                             actor_id,
-                            is_local,
                             version,
                             known_version,
                             &booked,
@@ -1373,15 +1363,9 @@ pub async fn serve_sync(
     let (tx, mut rx) = mpsc::channel::<SyncMessage>(256);
 
     tokio::spawn(
-        process_sync(
-            agent.actor_id(),
-            agent.pool().clone(),
-            agent.bookie().clone(),
-            tx,
-            rx_need,
-        )
-        .instrument(info_span!("process_sync"))
-        .inspect_err(|e| error!("could not process sync request: {e}")),
+        process_sync(agent.pool().clone(), agent.bookie().clone(), tx, rx_need)
+            .instrument(info_span!("process_sync"))
+            .inspect_err(|e| error!("could not process sync request: {e}")),
     );
 
     let (send_res, recv_res) = tokio::join!(
@@ -1666,7 +1650,6 @@ mod tests {
                 handle_known_version(
                     &mut conn,
                     actor_id,
-                    false,
                     Version(1),
                     known1,
                     &booked,
@@ -1696,7 +1679,6 @@ mod tests {
                 handle_known_version(
                     &mut conn,
                     actor_id,
-                    false,
                     Version(2),
                     known2,
                     &booked,

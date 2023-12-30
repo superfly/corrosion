@@ -45,12 +45,14 @@ use axum::{
     BoxError, Extension, Router, TypedHeader,
 };
 use foca::Member;
-use metrics::counter;
 use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use itertools::Itertools;
+use metrics::counter;
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{params, named_params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction};
+use rusqlite::{
+    named_params, params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction,
+};
 use spawn::spawn_counted;
 use tokio::{
     net::TcpListener,
@@ -413,7 +415,6 @@ pub fn find_cleared_db_versions(
         .query_row([actor_id], |row| row.get(0))
         .optional()?
     {
-        Some(0) => None, // this is the current crsql_site_id which is going to be NULL in clock tables
         Some(ordinal) => Some(ordinal),
         None => {
             warn!(actor_id = %actor_id, "could not find crsql ordinal for actor");
@@ -441,7 +442,7 @@ pub fn find_cleared_db_versions(
             .iter()
             .map(|table| {
                 params.push(&clock_site_id);
-                format!("SELECT DISTINCT db_version FROM {table} WHERE site_id IS ?")
+                format!("SELECT DISTINCT db_version FROM {table} WHERE site_id = ?")
             })
             .collect::<Vec<_>>()
             .join(" UNION ")

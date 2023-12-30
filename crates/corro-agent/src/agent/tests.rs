@@ -397,16 +397,9 @@ async fn stress_test() -> eyre::Result<()> {
 
             let conn = ta.agent.pool().read().await?;
             let counts: HashMap<ActorId, i64> = conn
-                    .prepare_cached(
-                        "SELECT COALESCE(site_id, crsql_site_id()), count(*) FROM crsql_changes GROUP BY site_id;",
-                    )?
-                    .query_map([], |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<_>>()?;
+                .prepare_cached("SELECT site_id, count(*) FROM crsql_changes GROUP BY site_id;")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
 
             debug!("versions count: {counts:?}");
 
@@ -526,8 +519,8 @@ fn test_in_memory_versions_compaction() -> eyre::Result<()> {
     }
 
     {
-        let mut prepped = conn.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT db_version FROM foo2__crsql_clock WHERE site_id IS ? UNION SELECT DISTINCT db_version FROM foo__crsql_clock WHERE site_id IS ?;")?;
-        let mut rows = prepped.query([rusqlite::types::Null, rusqlite::types::Null])?;
+        let mut prepped = conn.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT db_version FROM foo2__crsql_clock WHERE site_id = ? UNION SELECT DISTINCT db_version FROM foo__crsql_clock WHERE site_id = ?;")?;
+        let mut rows = prepped.query([0, 0])?;
 
         println!("matching clock rows:");
         while let Ok(Some(row)) = rows.next() {
@@ -844,7 +837,7 @@ async fn many_small_changes() -> eyre::Result<()> {
 
 #[test]
 fn test_store_empty_changeset() -> eyre::Result<()> {
-    let mut conn = rusqlite::Connection::open_in_memory()?;
+    let mut conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
 
     corro_types::sqlite::setup_conn(&mut conn)?;
     migrate(&mut conn)?;

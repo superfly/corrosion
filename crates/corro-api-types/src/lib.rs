@@ -20,29 +20,31 @@ use sqlite::ChangeType;
 
 pub mod sqlite;
 
+pub type QueryEvent = TypedQueryEvent<Vec<SqliteValue>>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum QueryEvent {
+pub enum TypedQueryEvent<T> {
     Columns(Vec<ColumnName>),
-    Row(RowId, Vec<SqliteValue>),
+    Row(RowId, T),
     #[serde(rename = "eoq")]
     EndOfQuery {
         time: f64,
         #[serde(skip_serializing_if = "Option::is_none")]
         change_id: Option<ChangeId>,
     },
-    Change(ChangeType, RowId, Vec<SqliteValue>, ChangeId),
+    Change(ChangeType, RowId, T, ChangeId),
     Error(CompactString),
 }
 
-impl QueryEvent {
+impl<T> TypedQueryEvent<T> {
     pub fn meta(&self) -> QueryEventMeta {
         match self {
-            QueryEvent::Columns(_) => QueryEventMeta::Columns,
-            QueryEvent::Row(rowid, _) => QueryEventMeta::Row(*rowid),
-            QueryEvent::EndOfQuery { change_id, .. } => QueryEventMeta::EndOfQuery(*change_id),
-            QueryEvent::Change(_, _, _, id) => QueryEventMeta::Change(*id),
-            QueryEvent::Error(_) => QueryEventMeta::Error,
+            TypedQueryEvent::Columns(_) => QueryEventMeta::Columns,
+            TypedQueryEvent::Row(rowid, _) => QueryEventMeta::Row(*rowid),
+            TypedQueryEvent::EndOfQuery { change_id, .. } => QueryEventMeta::EndOfQuery(*change_id),
+            TypedQueryEvent::Change(_, _, _, id) => QueryEventMeta::Change(*id),
+            TypedQueryEvent::Error(_) => QueryEventMeta::Error,
         }
     }
 }
