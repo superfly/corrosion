@@ -128,15 +128,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let schema = {
         let mut conn = pool.write_priority().await?;
         migrate(&mut conn)?;
+
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
-
-        info!("Ensuring clock table indexes for fast compaction");
-        let start = Instant::now();
-        for table in schema.tables.keys() {
-            conn.execute_batch(&format!("CREATE INDEX IF NOT EXISTS corro_{table}__crsql_clock_site_id_dbv ON {table}__crsql_clock (site_id, db_version);"))?;
-        }
-        info!("Ensured indexes in {:?}", start.elapsed());
 
         schema
     };
@@ -1259,7 +1253,6 @@ fn find_cleared_db_versions(
         .query_row([actor_id], |row| row.get(0))
         .optional()?
     {
-        Some(0) => None, // this is the current crsql_site_id which is going to be NULL in clock tables
         Some(ordinal) => Some(ordinal),
         None => {
             warn!(actor_id = %actor_id, "could not find crsql ordinal for actor");
@@ -1287,7 +1280,7 @@ fn find_cleared_db_versions(
             .iter()
             .map(|table| {
                 params.push(&clock_site_id);
-                format!("SELECT DISTINCT db_version FROM {table} WHERE site_id IS ?")
+                format!("SELECT DISTINCT db_version FROM {table} WHERE site_id = ?")
             })
             .collect::<Vec<_>>()
             .join(" UNION ")
@@ -3208,14 +3201,9 @@ pub mod tests {
                 let conn = ta.agent.pool().read().await?;
                 let counts: HashMap<ActorId, i64> = conn
                     .prepare_cached(
-                        "SELECT COALESCE(site_id, crsql_site_id()), count(*) FROM crsql_changes GROUP BY site_id;",
+                        "SELECT site_id, count(*) FROM crsql_changes GROUP BY site_id;",
                     )?
-                    .query_map([], |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                        ))
-                    })?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
 
                 debug!("versions count: {counts:?}");
@@ -3336,8 +3324,8 @@ pub mod tests {
         }
 
         {
-            let mut prepped = conn.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT db_version FROM foo2__crsql_clock WHERE site_id IS ? UNION SELECT DISTINCT db_version FROM foo__crsql_clock WHERE site_id IS ?;")?;
-            let mut rows = prepped.query([rusqlite::types::Null, rusqlite::types::Null])?;
+            let mut prepped = conn.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT db_version FROM foo2__crsql_clock WHERE site_id = ? UNION SELECT DISTINCT db_version FROM foo__crsql_clock WHERE site_id = ?;")?;
+            let mut rows = prepped.query([0, 0])?;
 
             println!("matching clock rows:");
             while let Ok(Some(row)) = rows.next() {
@@ -3656,7 +3644,7 @@ pub mod tests {
 
     #[test]
     fn test_store_empty_changeset() -> eyre::Result<()> {
-        let mut conn = Connection::open_in_memory()?;
+        let mut conn = CrConn::init(Connection::open_in_memory()?)?;
 
         corro_types::sqlite::setup_conn(&mut conn)?;
         migrate(&mut conn)?;
