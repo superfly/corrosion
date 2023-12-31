@@ -270,7 +270,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
 
                     for table in tables {
                         let n = conn.execute(
-                            &format!("UPDATE \"{table}\" SET site_id = NULL WHERE site_id = ?"),
+                            &format!("UPDATE \"{table}\" SET site_id = 0 WHERE site_id = ?"),
                             [ordinal],
                         )?;
                         info!("Updated {n} rows in {table}");
