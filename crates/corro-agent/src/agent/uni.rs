@@ -1,5 +1,5 @@
 use corro_types::{
-    agent::Agent,
+    agent::{Agent, Bookie},
     broadcast::{BroadcastV1, UniPayload, UniPayloadV1},
 };
 use metrics::{counter, histogram, increment_counter};
@@ -90,16 +90,18 @@ pub fn spawn_unipayload_handler(
 // function out of the stream hot path?
 pub fn spawn_unipayload_message_decoder(
     agent: &Agent,
+    bookie: &Bookie,
     mut process_uni_rx: Receiver<UniPayload>,
     bcast_msg_tx: Sender<BroadcastV1>,
 ) {
     tokio::spawn({
         let agent = agent.clone();
+        let bookie = bookie.clone();
         async move {
             while let Some(payload) = process_uni_rx.recv().await {
                 match payload {
                     UniPayload::V1(UniPayloadV1::Broadcast(bcast)) => {
-                        handle_change(&agent, bcast, &bcast_msg_tx).await
+                        handle_change(&agent, &bookie, bcast, &bcast_msg_tx).await
                     }
                 }
             }
@@ -111,7 +113,12 @@ pub fn spawn_unipayload_message_decoder(
 
 /// Apply a single broadcast to the local actor state, then
 /// re-broadcast to other cluster members via the bcast_msg_tx channel
-async fn handle_change(agent: &Agent, bcast: BroadcastV1, bcast_msg_tx: &Sender<BroadcastV1>) {
+async fn handle_change(
+    agent: &Agent,
+    bookie: &Bookie,
+    bcast: BroadcastV1,
+    bcast_msg_tx: &Sender<BroadcastV1>,
+) {
     match bcast {
         BroadcastV1::Change(change) => {
             let diff = if let Some(ts) = change.ts() {
@@ -134,8 +141,7 @@ async fn handle_change(agent: &Agent, bcast: BroadcastV1, bcast_msg_tx: &Sender<
             trace!("handling {} changes", change.len());
 
             let booked = {
-                agent
-                    .bookie()
+                bookie
                     .write(format!(
                         "handle_change(for_actor):{}",
                         change.actor_id.as_simple()
