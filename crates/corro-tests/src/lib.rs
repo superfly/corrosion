@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use corro_agent::agent::start;
+use corro_agent::agent::start_with_config;
 use corro_types::{
     agent::Agent,
     config::{Config, ConfigBuilder, ConfigBuilderError},
@@ -56,7 +56,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 
     let schema_paths = conf.db.schema_paths.clone();
 
-    let agent = start(conf, tripwire).await?;
+    let agent = start_with_config(conf, tripwire).await?;
 
     {
         let client = corro_client::CorrosionApiClient::new(agent.api_addr());
