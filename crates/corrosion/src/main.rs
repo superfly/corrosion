@@ -237,9 +237,9 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             };
 
             if *self_actor_id || actor_id.is_some() {
-                let site_id: [u8; 16] = {
+                let site_id: Uuid = {
                     if let Some(actor_id) = actor_id {
-                        actor_id.to_bytes_le()
+                        *actor_id
                     } else {
                         let conn = Connection::open(&db_path)?;
                         conn.query_row(
