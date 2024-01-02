@@ -227,21 +227,21 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 eyre::bail!("corrosion is currently running, shut it down before restoring!");
             }
 
+            let db_path = match cli.db_path() {
+                Ok(db_path) => db_path,
+                Err(_e) => {
+                    eyre::bail!(
+                        "path to current database is required either via --db-path or specified in the config file passed as --config"
+                    );
+                }
+            };
+
             if *self_actor_id || actor_id.is_some() {
                 let site_id: [u8; 16] = {
                     if let Some(actor_id) = actor_id {
                         actor_id.to_bytes_le()
                     } else {
-                        let db_path = match cli.db_path() {
-                            Ok(db_path) => db_path,
-                            Err(_e) => {
-                                eyre::bail!(
-                                    "path to current database is required when passing --self-actor-id"
-                                );
-                            }
-                        };
-
-                        let conn = Connection::open(db_path)?;
+                        let conn = Connection::open(&db_path)?;
                         conn.query_row(
                             "SELECT site_id FROM crsql_site_id WHERE ordinal = 0;",
                             [],
@@ -285,13 +285,17 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 }
             }
 
-            let restored =
-                sqlite3_restore::restore(path, cli.config()?.db.path, Duration::from_secs(30))?;
+            if path.as_path() == db_path.as_std_path() {
+                info!("reused the db path, not copying database into place");
+            } else {
+                let restored =
+                    sqlite3_restore::restore(path, cli.config()?.db.path, Duration::from_secs(30))?;
 
-            info!(
-                "successfully restored! old size: {}, new size: {}",
-                restored.old_len, restored.new_len
-            );
+                info!(
+                    "successfully restored! old size: {}, new size: {}",
+                    restored.old_len, restored.new_len
+                );
+            }
         }
         Command::Cluster(ClusterCommand::MembershipStates) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
