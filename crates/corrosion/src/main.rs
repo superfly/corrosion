@@ -258,7 +258,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 }
 
                 let inserted = conn.execute(
-                    "INSERT INTO crsql_site_id (ordinal, site_id) VALUES (0, ?)",
+                    "INSERT OR REPLACE INTO crsql_site_id (ordinal, site_id) VALUES (0, ?)",
                     [site_id],
                 )?;
                 if inserted != 1 {
