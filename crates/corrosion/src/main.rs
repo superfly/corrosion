@@ -37,6 +37,7 @@ use tracing_subscriber::{
     fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
     EnvFilter,
 };
+use uuid::Uuid;
 
 pub mod admin;
 pub mod command;
@@ -220,28 +221,33 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
         Command::Restore {
             path,
             self_actor_id,
+            actor_id,
         } => {
             if AdminConn::connect(cli.admin_path()).await.is_ok() {
                 eyre::bail!("corrosion is currently running, shut it down before restoring!");
             }
 
-            if *self_actor_id {
-                let db_path = match cli.db_path() {
-                    Ok(db_path) => db_path,
-                    Err(_e) => {
-                        eyre::bail!(
-                            "path to current database is required when passing --self-actor-id"
-                        );
-                    }
-                };
-
+            if *self_actor_id || actor_id.is_some() {
                 let site_id: [u8; 16] = {
-                    let conn = Connection::open(db_path)?;
-                    conn.query_row(
-                        "SELECT site_id FROM crsql_site_id WHERE ordinal = 0;",
-                        [],
-                        |row| row.get(0),
-                    )?
+                    if let Some(actor_id) = actor_id {
+                        actor_id.to_bytes_le()
+                    } else {
+                        let db_path = match cli.db_path() {
+                            Ok(db_path) => db_path,
+                            Err(_e) => {
+                                eyre::bail!(
+                                    "path to current database is required when passing --self-actor-id"
+                                );
+                            }
+                        };
+
+                        let conn = Connection::open(db_path)?;
+                        conn.query_row(
+                            "SELECT site_id FROM crsql_site_id WHERE ordinal = 0;",
+                            [],
+                            |row| row.get(0),
+                        )?
+                    }
                 };
 
                 let conn = Connection::open(path)?;
@@ -257,6 +263,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                     warn!("snapshot database did not know about the current actor id");
                 }
 
+                // FIXME: find the old site_id for ordinal 0 and fix crsql_clock tables
                 let inserted = conn.execute(
                     "INSERT OR REPLACE INTO crsql_site_id (ordinal, site_id) VALUES (0, ?)",
                     [site_id],
@@ -527,6 +534,8 @@ enum Command {
         path: PathBuf,
         #[arg(long, default_value = "false")]
         self_actor_id: bool,
+        #[arg(long)]
+        actor_id: Option<Uuid>,
     },
 
     /// Cluster interactions
