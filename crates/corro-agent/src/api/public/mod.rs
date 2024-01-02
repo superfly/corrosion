@@ -4,7 +4,7 @@ use axum::{response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
-    agent::{Agent, Booked, ChangeError, CurrentVersion, KnownDbVersion},
+    agent::{Agent, ChangeError, CurrentVersion, KnownDbVersion},
     api::{row_to_change, ColumnName, ExecResponse, ExecResult, QueryEvent, Statement},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{ChangeV1, Changeset, Timestamp},

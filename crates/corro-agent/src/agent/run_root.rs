@@ -4,7 +4,7 @@
 //! 2. bar
 //! 3. spawn `super::other_module`
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use crate::{
     agent::{
@@ -52,7 +52,7 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
         gossip_server_endpoint,
         transport,
         api_listener,
-        mut tripwire,
+        tripwire,
         lock_registry,
         rx_bcast,
         rx_apply,
@@ -142,7 +142,7 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
 
     spawn_handle_db_cleanup(agent.pool().clone());
 
-    let mut bookie = Bookie::new_with_registry(Default::default(), lock_registry);
+    let bookie = Bookie::new_with_registry(Default::default(), lock_registry);
     {
         let mut w = bookie.write("init").await;
         w.insert(agent.actor_id(), agent.booked().clone());

@@ -14,7 +14,7 @@ use bytes::Buf;
 use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
-    agent::{Agent, Booked, CurrentVersion, KnownDbVersion},
+    agent::{Agent, CurrentVersion, KnownDbVersion},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset, Timestamp},
     change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
@@ -3129,7 +3129,6 @@ mod tests {
 
     use chrono::{DateTime, Utc};
     use corro_tests::launch_test_agent;
-    use corro_types::agent::Bookie;
     use spawn::wait_for_all_pending_handles;
     use tokio_postgres::NoTls;
     use tripwire::Tripwire;

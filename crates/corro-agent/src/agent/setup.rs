@@ -2,17 +2,9 @@
 
 // External crates
 use arc_swap::ArcSwap;
-use futures::lock;
 use parking_lot::RwLock;
-use rangemap::RangeInclusiveSet;
-use rusqlite::{params, Connection};
-use std::{
-    collections::{BTreeMap, HashMap},
-    net::SocketAddr,
-    ops::RangeInclusive,
-    sync::Arc,
-    time::Duration,
-};
+use rusqlite::Connection;
+use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{
@@ -20,19 +12,16 @@ use tokio::{
         Semaphore,
     },
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use tripwire::Tripwire;
 
 // Internals
 use crate::{api::peer::gossip_server_endpoint, transport::Transport};
 use corro_types::{
     actor::ActorId,
-    agent::{
-        migrate, Agent, AgentConfig, Booked, BookedVersions, Bookie, CurrentVersion,
-        KnownDbVersion, LockRegistry, PartialVersion, SplitPool,
-    },
-    base::{CrsqlSeq, Version},
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
+    agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
+    base::Version,
+    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     config::Config,
     members::Members,
     pubsub::SubsManager,

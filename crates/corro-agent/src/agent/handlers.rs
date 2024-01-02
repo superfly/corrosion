@@ -362,7 +362,7 @@ async fn db_cleanup(pool: &SplitPool) -> eyre::Result<()> {
 
 // Every now and then, we need to truncate the WAL.
 // It can get enormous when under write pressure.
-pub async fn spawn_handle_db_cleanup(pool: SplitPool) {
+pub fn spawn_handle_db_cleanup(pool: SplitPool) {
     tokio::spawn(async move {
         let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
         loop {
