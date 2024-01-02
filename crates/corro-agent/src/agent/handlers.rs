@@ -15,7 +15,7 @@ use crate::{
 };
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, SplitPool},
+    agent::{Agent, Bookie, SplitPool},
     broadcast::{BroadcastV1, ChangeSource, ChangeV1, FocaInput, UniPayload},
     sync::generate_sync,
 };
@@ -37,12 +37,14 @@ use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 /// connections, streams, and their respective payloads.
 pub fn spawn_gossipserver_handler(
     agent: &Agent,
+    bookie: &Bookie,
     tripwire: &Tripwire,
     gossip_server_endpoint: quinn::Endpoint,
     process_uni_tx: Sender<UniPayload>,
 ) {
     spawn_counted({
         let agent = agent.clone();
+        let bookie = bookie.clone();
         let mut tripwire = tripwire.clone();
         async move {
             loop {
@@ -59,6 +61,7 @@ pub fn spawn_gossipserver_handler(
                 // Spawn incoming connection handlers
                 spawn_incoming_connection_handlers(
                     &agent,
+                    &bookie,
                     &tripwire,
                     process_uni_tx.clone(),
                     connecting,
@@ -80,12 +83,14 @@ pub fn spawn_gossipserver_handler(
 /// incoming connection.  This function spawns many futures!
 pub fn spawn_incoming_connection_handlers(
     agent: &Agent,
+    bookie: &Bookie,
     tripwire: &Tripwire,
     process_uni_tx: Sender<UniPayload>,
     connecting: quinn::Connecting,
 ) {
     let process_uni_tx = process_uni_tx.clone();
     let agent = agent.clone();
+    let bookie = bookie.clone();
     let tripwire = tripwire.clone();
     tokio::spawn(async move {
         let remote_addr = connecting.remote_address();
@@ -107,7 +112,7 @@ pub fn spawn_incoming_connection_handlers(
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
         uni::spawn_unipayload_handler(&tripwire, &conn, process_uni_tx);
-        bi::spawn_bipayload_handler(&agent, &tripwire, &conn);
+        bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }
 
@@ -167,7 +172,7 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
 }
 
 // DOCME: provide function context
-pub fn spawn_backoff_handler(agent: &Agent, gossip_addr: SocketAddr) {
+pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
     tokio::spawn({
         let agent = agent.clone();
         async move {
@@ -331,8 +336,7 @@ pub async fn handle_notifications(
     }
 }
 
-// DOCME: provide function context
-pub async fn handle_db_cleanup(pool: SplitPool) -> eyre::Result<()> {
+async fn db_cleanup(pool: &SplitPool) -> eyre::Result<()> {
     debug!("handling db_cleanup (WAL truncation)");
     let conn = pool.write_low().await?;
     block_in_place(move || {
@@ -356,9 +360,25 @@ pub async fn handle_db_cleanup(pool: SplitPool) -> eyre::Result<()> {
     Ok(())
 }
 
+// Every now and then, we need to truncate the WAL.
+// It can get enormous when under write pressure.
+pub fn spawn_handle_db_cleanup(pool: SplitPool) {
+    tokio::spawn(async move {
+        let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
+        loop {
+            db_cleanup_interval.tick().await;
+
+            if let Err(e) = db_cleanup(&pool).await {
+                error!("could not truncate db: {e}");
+            }
+        }
+    });
+}
+
 // DOCME: provide function context
 pub async fn handle_changes(
     agent: Agent,
+    bookie: Bookie,
     mut rx_changes: Receiver<(ChangeV1, ChangeSource)>,
     mut tripwire: Tripwire,
 ) {
@@ -393,7 +413,9 @@ pub async fn handle_changes(
 
         // drain and process current changes!
         #[allow(clippy::drain_collect)]
-        if let Err(e) = util::process_multiple_changes(&agent, buf.drain(..).collect()).await {
+        if let Err(e) =
+            util::process_multiple_changes(&agent, &bookie, buf.drain(..).collect()).await
+        {
             error!("could not process multiple changes: {e}");
         }
 
@@ -412,7 +434,9 @@ pub async fn handle_changes(
         if count >= MIN_CHANGES_CHUNK {
             // drain and process current changes!
             #[allow(clippy::drain_collect)]
-            if let Err(e) = util::process_multiple_changes(&agent, buf.drain(..).collect()).await {
+            if let Err(e) =
+                util::process_multiple_changes(&agent, &bookie, buf.drain(..).collect()).await
+            {
                 error!("could not process last multiple changes: {e}");
             }
 
@@ -422,15 +446,19 @@ pub async fn handle_changes(
     }
 
     // process the last changes we got!
-    if let Err(e) = util::process_multiple_changes(&agent, buf).await {
+    if let Err(e) = util::process_multiple_changes(&agent, &bookie, buf).await {
         error!("could not process multiple changes: {e}");
     }
 }
 
 // DOCME: add context
 #[tracing::instrument(skip_all, err, level = "debug")]
-pub async fn handle_sync(agent: &Agent, transport: &Transport) -> Result<(), SyncClientError> {
-    let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
+pub async fn handle_sync(
+    agent: &Agent,
+    bookie: &Bookie,
+    transport: &Transport,
+) -> Result<(), SyncClientError> {
+    let sync_state = generate_sync(bookie, agent.actor_id()).await;
 
     for (actor_id, needed) in sync_state.need.iter() {
         gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.to_string());

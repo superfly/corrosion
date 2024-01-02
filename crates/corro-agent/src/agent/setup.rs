@@ -3,15 +3,8 @@
 // External crates
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
-use rangemap::RangeInclusiveSet;
-use rusqlite::{params, Connection};
-use std::{
-    collections::{BTreeMap, HashMap},
-    net::SocketAddr,
-    ops::RangeInclusive,
-    sync::Arc,
-    time::Duration,
-};
+use rusqlite::Connection;
+use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{
@@ -19,19 +12,16 @@ use tokio::{
         Semaphore,
     },
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use tripwire::Tripwire;
 
 // Internals
 use crate::{api::peer::gossip_server_endpoint, transport::Transport};
 use corro_types::{
     actor::ActorId,
-    agent::{
-        migrate, Agent, AgentConfig, BookedVersions, Bookie, CurrentVersion, KnownDbVersion,
-        PartialVersion, SplitPool,
-    },
-    base::{CrsqlSeq, Version},
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
+    agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
+    base::Version,
+    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     config::Config,
     members::Members,
     pubsub::SubsManager,
@@ -42,6 +32,7 @@ use corro_types::{
 /// Runtime state for the Corrosion agent
 pub struct AgentOptions {
     pub actor_id: ActorId,
+    pub lock_registry: LockRegistry,
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
     pub api_listener: TcpListener,
@@ -92,132 +83,141 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let (tx_apply, rx_apply) = channel(20480);
     let (tx_clear_buf, rx_clear_buf) = channel(10240);
 
-    let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
+    let lock_registry = LockRegistry::default();
+    let booked = {
+        let conn = pool.read().await?;
+        Booked::new(
+            BookedVersions::from_conn(&conn, actor_id)?,
+            lock_registry.clone(),
+        )
+    };
 
-    {
-        debug!("getting read-only conn for pull bookkeeping rows");
-        let mut conn = pool.write_priority().await?;
+    // let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
 
-        debug!("getting bookkept rows");
+    // {
+    //     debug!("getting read-only conn for pull bookkeeping rows");
+    //     let mut conn = pool.write_priority().await?;
 
-        let mut cleared_rows: BTreeMap<ActorId, usize> = BTreeMap::new();
+    //     debug!("getting bookkept rows");
 
-        {
-            let mut prepped = conn.prepare_cached(
-                "SELECT actor_id, start_version, end_version, db_version, last_seq, ts
-                FROM __corro_bookkeeping",
-            )?;
-            let mut rows = prepped.query([])?;
+    //     let mut cleared_rows: BTreeMap<ActorId, usize> = BTreeMap::new();
 
-            loop {
-                let row = rows.next()?;
-                match row {
-                    None => break,
-                    Some(row) => {
-                        let actor_id = row.get(0)?;
-                        let ranges = bk.entry(actor_id).or_default();
-                        let start_v = row.get(1)?;
-                        let end_v: Option<Version> = row.get(2)?;
-                        ranges.insert_many(
-                            start_v..=end_v.unwrap_or(start_v),
-                            match row.get(3)? {
-                                Some(db_version) => KnownDbVersion::Current(CurrentVersion {
-                                    db_version,
-                                    last_seq: row.get(4)?,
-                                    ts: row.get(5)?,
-                                }),
-                                None => {
-                                    *cleared_rows.entry(actor_id).or_default() += 1;
-                                    KnownDbVersion::Cleared
-                                }
-                            },
-                        );
-                    }
-                }
-            }
+    //     {
+    //         let mut prepped = conn.prepare_cached(
+    //             "SELECT actor_id, start_version, end_version, db_version, last_seq, ts
+    //             FROM __corro_bookkeeping",
+    //         )?;
+    //         let mut rows = prepped.query([])?;
 
-            let mut partials: HashMap<
-                (ActorId, Version),
-                (RangeInclusiveSet<CrsqlSeq>, CrsqlSeq, Timestamp),
-            > = HashMap::new();
+    //         loop {
+    //             let row = rows.next()?;
+    //             match row {
+    //                 None => break,
+    //                 Some(row) => {
+    //                     let actor_id = row.get(0)?;
+    //                     let ranges = bk.entry(actor_id).or_default();
+    //                     let start_v = row.get(1)?;
+    //                     let end_v: Option<Version> = row.get(2)?;
+    //                     ranges.insert_many(
+    //                         start_v..=end_v.unwrap_or(start_v),
+    //                         match row.get(3)? {
+    //                             Some(db_version) => KnownDbVersion::Current(CurrentVersion {
+    //                                 db_version,
+    //                                 last_seq: row.get(4)?,
+    //                                 ts: row.get(5)?,
+    //                             }),
+    //                             None => {
+    //                                 *cleared_rows.entry(actor_id).or_default() += 1;
+    //                                 KnownDbVersion::Cleared
+    //                             }
+    //                         },
+    //                     );
+    //                 }
+    //             }
+    //         }
 
-            debug!("getting seq bookkept rows");
+    //         let mut partials: HashMap<
+    //             (ActorId, Version),
+    //             (RangeInclusiveSet<CrsqlSeq>, CrsqlSeq, Timestamp),
+    //         > = HashMap::new();
 
-            let mut prepped = conn.prepare_cached(
-                "SELECT site_id, version, start_seq, end_seq, last_seq, ts
-                FROM __corro_seq_bookkeeping",
-            )?;
-            let mut rows = prepped.query([])?;
+    //         debug!("getting seq bookkept rows");
 
-            loop {
-                let row = rows.next()?;
-                match row {
-                    None => break,
-                    Some(row) => {
-                        let (range, last_seq, ts) =
-                            partials.entry((row.get(0)?, row.get(1)?)).or_default();
+    //         let mut prepped = conn.prepare_cached(
+    //             "SELECT site_id, version, start_seq, end_seq, last_seq, ts
+    //             FROM __corro_seq_bookkeeping",
+    //         )?;
+    //         let mut rows = prepped.query([])?;
 
-                        range.insert(row.get(2)?..=row.get(3)?);
-                        *last_seq = row.get(4)?;
-                        *ts = row.get(5)?;
-                    }
-                }
-            }
+    //         loop {
+    //             let row = rows.next()?;
+    //             match row {
+    //                 None => break,
+    //                 Some(row) => {
+    //                     let (range, last_seq, ts) =
+    //                         partials.entry((row.get(0)?, row.get(1)?)).or_default();
 
-            debug!("filling up partial known versions");
+    //                     range.insert(row.get(2)?..=row.get(3)?);
+    //                     *last_seq = row.get(4)?;
+    //                     *ts = row.get(5)?;
+    //                 }
+    //             }
+    //         }
 
-            for ((actor_id, version), (seqs, last_seq, ts)) in partials {
-                debug!(%actor_id, %version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
-                let ranges = bk.entry(actor_id).or_default();
+    //         debug!("filling up partial known versions");
 
-                if let Some(known) = ranges.get(&version) {
-                    warn!(%actor_id, %version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
+    //         for ((actor_id, version), (seqs, last_seq, ts)) in partials {
+    //             debug!(%actor_id, %version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
+    //             let ranges = bk.entry(actor_id).or_default();
 
-                    _ = tx_clear_buf.try_send((actor_id, version..=version));
-                    continue;
-                }
+    //             if let Some(known) = ranges.get(&version) {
+    //                 warn!(%actor_id, %version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
 
-                let gaps_count = seqs.gaps(&(CrsqlSeq(0)..=last_seq)).count();
+    //                 _ = tx_clear_buf.try_send((actor_id, version..=version));
+    //                 continue;
+    //             }
 
-                ranges.insert(
-                    version,
-                    KnownDbVersion::Partial(PartialVersion { seqs, last_seq, ts }),
-                );
+    //             let gaps_count = seqs.gaps(&(CrsqlSeq(0)..=last_seq)).count();
 
-                if gaps_count == 0 {
-                    info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
-                    // spawn this because it can block if the channel gets full, nothing is draining it yet!
-                    tokio::spawn({
-                        let tx_apply = tx_apply.clone();
-                        async move {
-                            let _ = tx_apply.send((actor_id, version)).await;
-                        }
-                    });
-                }
-            }
-        }
+    //             ranges.insert(
+    //                 version,
+    //                 KnownDbVersion::Partial(PartialVersion { seqs, last_seq, ts }),
+    //             );
 
-        for (actor_id, booked) in bk.iter() {
-            if let Some(clear_count) = cleared_rows.get(actor_id).copied() {
-                if clear_count > booked.cleared.len() {
-                    warn!(%actor_id, "cleared bookkept rows count ({clear_count}) in DB was bigger than in-memory entries count ({}), compacting...", booked.cleared.len());
-                    let tx = conn.immediate_transaction()?;
-                    let deleted = tx.execute("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND end_version IS NOT NULL", [actor_id])?;
-                    info!("deleted {deleted} rows that had an end_version");
-                    let mut inserted = 0;
-                    for range in booked.cleared.iter() {
-                        inserted += tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?)", params![actor_id, range.start(), range.end()])?;
-                    }
-                    info!("inserted {inserted} cleared version rows");
-                    tx.commit()?;
-                }
-            }
-        }
-    }
+    //             if gaps_count == 0 {
+    //                 info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
+    //                 // spawn this because it can block if the channel gets full, nothing is draining it yet!
+    //                 tokio::spawn({
+    //                     let tx_apply = tx_apply.clone();
+    //                     async move {
+    //                         let _ = tx_apply.send((actor_id, version)).await;
+    //                     }
+    //                 });
+    //             }
+    //         }
+    //     }
 
-    debug!("done building bookkeeping");
+    //     for (actor_id, booked) in bk.iter() {
+    //         if let Some(clear_count) = cleared_rows.get(actor_id).copied() {
+    //             if clear_count > booked.cleared.len() {
+    //                 warn!(%actor_id, "cleared bookkept rows count ({clear_count}) in DB was bigger than in-memory entries count ({}), compacting...", booked.cleared.len());
+    //                 let tx = conn.immediate_transaction()?;
+    //                 let deleted = tx.execute("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND end_version IS NOT NULL", [actor_id])?;
+    //                 info!("deleted {deleted} rows that had an end_version");
+    //                 let mut inserted = 0;
+    //                 for range in booked.cleared.iter() {
+    //                     inserted += tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?)", params![actor_id, range.start(), range.end()])?;
+    //                 }
+    //                 info!("inserted {inserted} cleared version rows");
+    //                 tx.commit()?;
+    //             }
+    //         }
+    //     }
+    // }
 
-    let bookie = Bookie::new(bk);
+    // debug!("done building bookkeeping");
+
+    // let bookie = Bookie::new(bk);
 
     let gossip_server_endpoint = gossip_server_endpoint(&conf.gossip).await?;
     let gossip_addr = gossip_server_endpoint.local_addr()?;
@@ -250,6 +250,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         gossip_server_endpoint,
         transport,
         api_listener,
+        lock_registry,
         rx_bcast,
         rx_apply,
         rx_empty,
@@ -270,7 +271,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         members: RwLock::new(members),
         config: ArcSwap::from_pointee(conf),
         clock,
-        bookie,
+        booked,
         tx_bcast,
         tx_apply,
         tx_empty,

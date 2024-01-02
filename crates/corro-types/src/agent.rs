@@ -60,7 +60,8 @@ pub struct AgentConfig {
     pub api_addr: SocketAddr,
     pub members: RwLock<Members>,
     pub clock: Arc<uhlc::HLC>,
-    pub bookie: Bookie,
+
+    pub booked: Booked,
 
     pub tx_bcast: Sender<BroadcastInput>,
     pub tx_apply: Sender<(ActorId, Version)>,
@@ -87,7 +88,7 @@ pub struct AgentInner {
     api_addr: SocketAddr,
     members: RwLock<Members>,
     clock: Arc<uhlc::HLC>,
-    bookie: Bookie,
+    booked: Booked,
     tx_bcast: Sender<BroadcastInput>,
     tx_apply: Sender<(ActorId, Version)>,
     tx_empty: Sender<(ActorId, RangeInclusive<Version>)>,
@@ -116,7 +117,7 @@ impl Agent {
             api_addr: config.api_addr,
             members: config.members,
             clock: config.clock,
-            bookie: config.bookie,
+            booked: config.booked,
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             tx_empty: config.tx_empty,
@@ -193,8 +194,8 @@ impl Agent {
         Handle::current().block_on(self.0.write_sema.clone().acquire_owned())
     }
 
-    pub fn bookie(&self) -> &Bookie {
-        &self.0.bookie
+    pub fn booked(&self) -> &Booked {
+        &self.0.booked
     }
 
     pub fn members(&self) -> &RwLock<Members> {
@@ -1017,6 +1018,62 @@ pub struct BookedVersions {
 }
 
 impl BookedVersions {
+    pub fn from_conn(conn: &Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
+        let mut bv = Self::default();
+        let mut prepped = conn.prepare_cached(
+            "SELECT start_version, end_version, db_version, last_seq, ts FROM __corro_bookkeeping WHERE actor_id = ?",
+        )?;
+        let mut rows = prepped.query([actor_id])?;
+
+        loop {
+            let row = rows.next()?;
+            match row {
+                None => break,
+                Some(row) => {
+                    let start_v = row.get(0)?;
+                    let end_v: Option<Version> = row.get(1)?;
+                    bv.insert_many(
+                        start_v..=end_v.unwrap_or(start_v),
+                        match row.get(2)? {
+                            Some(db_version) => KnownDbVersion::Current(CurrentVersion {
+                                db_version,
+                                last_seq: row.get(3)?,
+                                ts: row.get(4)?,
+                            }),
+                            None => KnownDbVersion::Cleared,
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut prepped = conn.prepare_cached(
+            "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
+        )?;
+        let mut rows = prepped.query([actor_id])?;
+
+        loop {
+            let row = rows.next()?;
+            match row {
+                None => break,
+                Some(row) => match bv.partials.entry(row.get(0)?) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(PartialVersion {
+                            seqs: RangeInclusiveSet::from_iter(vec![row.get(1)?..=row.get(2)?]),
+                            last_seq: row.get(3)?,
+                            ts: row.get(4)?,
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().seqs.insert(row.get(1)?..=row.get(2)?);
+                    }
+                },
+            }
+        }
+
+        Ok(bv)
+    }
+
     pub fn contains_version(&self, version: &Version) -> bool {
         self.cleared.contains(version)
             || self.current.contains_key(version)
@@ -1133,7 +1190,7 @@ pub type BookedInner = Arc<CountedTokioRwLock<BookedVersions>>;
 pub struct Booked(BookedInner);
 
 impl Booked {
-    fn new(versions: BookedVersions, registry: LockRegistry) -> Self {
+    pub fn new(versions: BookedVersions, registry: LockRegistry) -> Self {
         Self(Arc::new(CountedTokioRwLock::new(registry, versions)))
     }
 
@@ -1191,6 +1248,13 @@ impl BookieInner {
             })
             .clone()
     }
+
+    pub fn replace_actor(&mut self, actor_id: ActorId, bv: BookedVersions) {
+        self.map.insert(
+            actor_id,
+            Booked(Arc::new(CountedTokioRwLock::new(self.registry.clone(), bv))),
+        );
+    }
 }
 
 impl Deref for BookieInner {
@@ -1201,12 +1265,25 @@ impl Deref for BookieInner {
     }
 }
 
+impl DerefMut for BookieInner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
 #[derive(Clone)]
 pub struct Bookie(Arc<CountedTokioRwLock<BookieInner>>);
 
 impl Bookie {
     pub fn new(map: HashMap<ActorId, BookedVersions>) -> Self {
         let registry = LockRegistry::default();
+        Self::new_with_registry(map, registry)
+    }
+
+    pub fn new_with_registry(
+        map: HashMap<ActorId, BookedVersions>,
+        registry: LockRegistry,
+    ) -> Self {
         Self(Arc::new(CountedTokioRwLock::new(
             registry.clone(),
             BookieInner {

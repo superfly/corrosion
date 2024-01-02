@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use corro_agent::agent::start_with_config;
 use corro_types::{
-    agent::Agent,
+    agent::{Agent, Bookie},
     config::{Config, ConfigBuilder, ConfigBuilderError},
 };
 use tempfile::TempDir;
@@ -33,6 +33,7 @@ pub const TEST_SCHEMA: &str = r#"
 #[derive(Clone)]
 pub struct TestAgent {
     pub agent: Agent,
+    pub bookie: Bookie,
     pub tmpdir: Arc<TempDir>,
 }
 
@@ -56,7 +57,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 
     let schema_paths = conf.db.schema_paths.clone();
 
-    let agent = start_with_config(conf, tripwire).await?;
+    let (agent, bookie) = start_with_config(conf, tripwire).await?;
 
     {
         let client = corro_client::CorrosionApiClient::new(agent.api_addr());
@@ -65,6 +66,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 
     Ok(TestAgent {
         agent,
+        bookie,
         tmpdir: Arc::new(tmpdir),
     })
 }

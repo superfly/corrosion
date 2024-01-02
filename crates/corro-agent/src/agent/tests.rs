@@ -407,11 +407,9 @@ async fn stress_test() -> eyre::Result<()> {
                 conn.query_row("SELECT count(*) FROM crsql_changes;", (), |row| row.get(0))?;
             debug!("actual count: {actual_count}");
 
-            let bookie = ta.agent.bookie();
-
             debug!(
                 "last version: {:?}",
-                bookie
+                ta.bookie
                     .write("test")
                     .await
                     .for_actor(ta.agent.actor_id())
@@ -420,7 +418,7 @@ async fn stress_test() -> eyre::Result<()> {
                     .last()
             );
 
-            let sync = generate_sync(bookie, ta.agent.actor_id()).await;
+            let sync = generate_sync(&ta.bookie, ta.agent.actor_id()).await;
             let needed = sync.need_len();
 
             debug!("generated sync: {sync:?}");
@@ -663,17 +661,15 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
     sleep(Duration::from_secs(20)).await;
 
-    for agent in [ta2.agent, ta3.agent, ta4.agent] {
+    for ta in [ta2, ta3, ta4] {
+        let agent = ta.agent;
         let conn = agent.pool().read().await?;
 
         let count: u64 = conn
             .prepare_cached("SELECT COUNT(*) FROM testsbool;")?
             .query_row((), |row| row.get(0))?;
 
-        println!(
-            "{:#?}",
-            generate_sync(agent.bookie(), agent.actor_id()).await
-        );
+        println!("{:#?}", generate_sync(&ta.bookie, agent.actor_id()).await);
 
         if count as usize != expected_count {
             let buf_count: u64 =

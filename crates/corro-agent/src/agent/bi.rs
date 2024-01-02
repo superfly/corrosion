@@ -1,6 +1,6 @@
 use crate::api::peer::serve_sync;
 use corro_types::{
-    agent::Agent,
+    agent::{Agent, Bookie},
     broadcast::{BiPayload, BiPayloadV1},
 };
 use metrics::increment_counter;
@@ -18,9 +18,15 @@ use tripwire::Tripwire;
 /// For every incoming stream, spawn another task to handle the
 /// stream.  Valid incoming BiPayload messages are passed to
 /// `crate::api::peer::serve_sync()`
-pub fn spawn_bipayload_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Connection) {
+pub fn spawn_bipayload_handler(
+    agent: &Agent,
+    bookie: &Bookie,
+    tripwire: &Tripwire,
+    conn: &quinn::Connection,
+) {
     let conn = conn.clone();
     let agent = agent.clone();
+    let bookie = bookie.clone();
     let mut tripwire = tripwire.clone();
     tokio::spawn(async move {
         loop {
@@ -48,6 +54,7 @@ pub fn spawn_bipayload_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn:
             // TODO: implement concurrency limit for sync requests
             tokio::spawn({
                 let agent = agent.clone();
+                let bookie = bookie.clone();
                 async move {
                     let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
 
@@ -75,7 +82,8 @@ pub fn spawn_bipayload_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn:
                                                     );
                                                     // println!("got sync state: {state:?}");
                                                     if let Err(e) = serve_sync(
-                                                        &agent, actor_id, trace_ctx, framed, tx,
+                                                        &agent, &bookie, actor_id, trace_ctx,
+                                                        framed, tx,
                                                     )
                                                     .await
                                                     {

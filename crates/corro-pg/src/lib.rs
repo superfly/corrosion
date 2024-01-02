@@ -338,7 +338,7 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
 }
 
 #[derive(Debug, Default)]
-enum OpenTx {
+enum TxState {
     Started {
         kind: OpenTxKind,
         write_permit: Option<OwnedSemaphorePermit>,
@@ -347,7 +347,7 @@ enum OpenTx {
     Ended,
 }
 
-impl OpenTx {
+impl TxState {
     fn implicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Implicit,
@@ -364,7 +364,7 @@ impl OpenTx {
     fn is_writing(&self) -> bool {
         matches!(
             self,
-            OpenTx::Started {
+            TxState::Started {
                 write_permit: Some(_),
                 ..
             }
@@ -373,8 +373,8 @@ impl OpenTx {
 
     fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
         match self {
-            OpenTx::Started { write_permit, .. } => *write_permit = Some(permit),
-            OpenTx::Ended => {
+            TxState::Started { write_permit, .. } => *write_permit = Some(permit),
+            TxState::Ended => {
                 // do nothing, maybe bomb?
             }
         }
@@ -383,7 +383,7 @@ impl OpenTx {
     fn is_implicit(&self) -> bool {
         matches!(
             self,
-            OpenTx::Started {
+            TxState::Started {
                 kind: OpenTxKind::Implicit,
                 ..
             }
@@ -392,14 +392,14 @@ impl OpenTx {
     fn is_explicit(&self) -> bool {
         matches!(
             self,
-            OpenTx::Started {
+            TxState::Started {
                 kind: OpenTxKind::Explicit,
                 ..
             }
         )
     }
     fn is_ended(&self) -> bool {
-        matches!(self, OpenTx::Ended)
+        matches!(self, TxState::Ended)
     }
 
     fn start_implicit(&mut self) {
@@ -412,10 +412,10 @@ impl OpenTx {
 
     fn end(&mut self) -> Option<OwnedSemaphorePermit> {
         let permit = match self {
-            OpenTx::Started { write_permit, .. } => write_permit.take(),
-            OpenTx::Ended => None,
+            TxState::Started { write_permit, .. } => write_permit.take(),
+            TxState::Ended => None,
         };
-        *self = OpenTx::Ended;
+        *self = TxState::Ended;
         permit
     }
 }
@@ -703,7 +703,10 @@ pub async fn start(
 
                     let mut discard_until_sync = false;
 
-                    let mut open_tx = OpenTx::default();
+                    let mut session = Session {
+                        agent,
+                        tx_state: TxState::default(),
+                    };
 
                     'outer: while let Some(msg) = front_rx.blocking_recv() {
                         debug!("msg: {msg:?}");
@@ -1401,13 +1404,7 @@ pub async fn start(
                                 )?;
                             }
                             PgWireFrontendMessage::Sync(_) => {
-                                send_ready(
-                                    &agent,
-                                    &conn,
-                                    &mut open_tx,
-                                    discard_until_sync,
-                                    &back_tx,
-                                )?;
+                                send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
 
                                 // reset this
                                 discard_until_sync = false;
@@ -1463,13 +1460,11 @@ pub async fn start(
                                     max_rows as usize
                                 };
 
-                                if let Err(e) = handle_execute(
-                                    &agent,
+                                if let Err(e) = session.handle_execute(
                                     &conn,
                                     prepped,
                                     result_formats,
                                     cmd,
-                                    &mut open_tx,
                                     max_rows,
                                     &back_tx,
                                 ) {
@@ -1480,13 +1475,7 @@ pub async fn start(
 
                                     discard_until_sync = true;
 
-                                    send_ready(
-                                        &agent,
-                                        &conn,
-                                        &mut open_tx,
-                                        discard_until_sync,
-                                        &back_tx,
-                                    )?;
+                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
                                     continue;
                                 }
                             }
@@ -1509,9 +1498,8 @@ pub async fn start(
                                                 .into(),
                                         )?;
                                         send_ready(
-                                            &agent,
+                                            &mut session,
                                             &conn,
-                                            &mut open_tx,
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1530,33 +1518,21 @@ pub async fn start(
                                             .into(),
                                     )?;
 
-                                    send_ready(
-                                        &agent,
-                                        &conn,
-                                        &mut open_tx,
-                                        discard_until_sync,
-                                        &back_tx,
-                                    )?;
+                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
                                     continue;
                                 }
 
                                 for cmd in parsed_query.into_iter() {
-                                    if let Err(e) = handle_query(
-                                        &agent,
-                                        &conn,
-                                        &cmd,
-                                        &mut open_tx,
-                                        &back_tx,
-                                        true,
-                                    ) {
+                                    if let Err(e) =
+                                        session.handle_query(&conn, &cmd, &back_tx, true)
+                                    {
                                         back_tx.blocking_send(BackendResponse::Message {
                                             message: e.try_into()?,
                                             flush: true,
                                         })?;
                                         send_ready(
-                                            &agent,
+                                            &mut session,
                                             &conn,
-                                            &mut open_tx,
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1565,11 +1541,11 @@ pub async fn start(
                                 }
 
                                 // automatically commit an implicit tx
-                                if open_tx.is_implicit() {
+                                if session.tx_state.is_implicit() {
                                     trace!("committing IMPLICIT tx");
-                                    let _permit = open_tx.end();
+                                    let _permit = session.tx_state.end();
 
-                                    if let Err(e) = handle_commit(&agent, &conn) {
+                                    if let Err(e) = session.handle_commit(&conn) {
                                         back_tx.blocking_send(
                                             (
                                                 PgWireBackendMessage::ErrorResponse(
@@ -1585,9 +1561,8 @@ pub async fn start(
                                                 .into(),
                                         )?;
                                         send_ready(
-                                            &agent,
+                                            &mut session,
                                             &conn,
-                                            &mut open_tx,
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1596,13 +1571,7 @@ pub async fn start(
                                     trace!("committed IMPLICIT tx");
                                 }
 
-                                send_ready(
-                                    &agent,
-                                    &conn,
-                                    &mut open_tx,
-                                    discard_until_sync,
-                                    &back_tx,
-                                )?;
+                                send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
                             }
                             PgWireFrontendMessage::Terminate(_) => {
                                 break;
@@ -1769,15 +1738,520 @@ pub async fn start(
     Ok(PgServer { local_addr })
 }
 
+struct Session {
+    agent: Agent,
+    tx_state: TxState,
+}
+
+impl Session {
+    fn handle_query(
+        &mut self,
+        conn: &Connection,
+        cmd: &ParsedCmd,
+        back_tx: &Sender<BackendResponse>,
+        send_row_desc: bool,
+    ) -> Result<(), QueryError> {
+        if cmd.is_show() {
+            back_tx
+                .blocking_send(
+                    (
+                        PgWireBackendMessage::CommandComplete(CommandComplete::new("SHOW".into())),
+                        true,
+                    )
+                        .into(),
+                )
+                .map_err(|_| QueryError::BackendResponseSendFailed)?;
+            return Ok(());
+        }
+
+        if cmd.is_set() {
+            back_tx
+                .blocking_send(
+                    (
+                        PgWireBackendMessage::CommandComplete(CommandComplete::new("SET".into())),
+                        true,
+                    )
+                        .into(),
+                )
+                .map_err(|_| QueryError::BackendResponseSendFailed)?;
+            return Ok(());
+        }
+
+        // need to start an implicit transaction
+        if self.tx_state.is_ended() && !cmd.is_begin() {
+            conn.execute_batch("BEGIN")?;
+            trace!("started IMPLICIT tx");
+            self.tx_state.start_implicit();
+        } else if self.tx_state.is_implicit() && cmd.is_begin() {
+            trace!("committing IMPLICIT tx");
+            let _permit = self.tx_state.end();
+
+            self.handle_commit(conn)?;
+            trace!("committed IMPLICIT tx");
+        }
+
+        let count = if cmd.is_begin() {
+            conn.execute_batch("BEGIN")?;
+            self.tx_state.start_explicit();
+            0
+        } else if cmd.is_commit() {
+            let _permit = self.tx_state.end();
+            self.handle_commit(conn)?;
+            0
+        } else if cmd.is_rollback() {
+            let _permit = self.tx_state.end();
+            conn.execute_batch("ROLLBACK")?;
+            0
+        } else {
+            let mut prepped = if cmd.is_pg() {
+                return Err(QueryError::NotSqlite);
+            } else {
+                conn.prepare(&cmd.to_string())?
+            };
+
+            let mut fields = vec![];
+            for col in prepped.columns() {
+                let col_type = name_to_type(col.decl_type().unwrap_or("text"))?;
+                fields.push(FieldInfo::new(
+                    col.name().to_string(),
+                    None,
+                    None,
+                    col_type,
+                    FieldFormat::Text,
+                ));
+            }
+
+            if send_row_desc {
+                back_tx
+                    .blocking_send(
+                        (
+                            PgWireBackendMessage::RowDescription(RowDescription::new(
+                                fields.iter().map(Into::into).collect(),
+                            )),
+                            true,
+                        )
+                            .into(),
+                    )
+                    .map_err(|_| QueryError::BackendResponseSendFailed)?;
+            }
+
+            let schema = Arc::new(fields);
+
+            if !self.tx_state.is_writing() && !prepped.readonly() {
+                trace!("query statement writes, acquiring permit...");
+                self.tx_state
+                    .set_write_permit(self.agent.write_permit_blocking()?);
+            }
+
+            let mut rows = prepped.raw_query();
+            let ncols = schema.len();
+
+            let mut count = 0;
+            while let Some(row) = rows.next()? {
+                count += 1;
+                let mut encoder = DataRowEncoder::new(schema.clone());
+                for idx in 0..ncols {
+                    let data = row.get_ref_unwrap::<usize>(idx);
+                    match data {
+                        ValueRef::Null => encoder.encode_field(&None::<i8>).unwrap(),
+                        ValueRef::Integer(i) => {
+                            encoder.encode_field(&i).unwrap();
+                        }
+                        ValueRef::Real(f) => {
+                            encoder.encode_field(&f).unwrap();
+                        }
+                        ValueRef::Text(t) => {
+                            encoder
+                                .encode_field(&String::from_utf8_lossy(t).as_ref())
+                                .unwrap();
+                        }
+                        ValueRef::Blob(b) => {
+                            encoder.encode_field(&b).unwrap();
+                        }
+                    }
+                }
+                let data_row = encoder.finish()?;
+                back_tx
+                    .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
+                    .map_err(|_| QueryError::BackendResponseSendFailed)?;
+            }
+            count
+        };
+
+        back_tx
+            .blocking_send(
+                (
+                    PgWireBackendMessage::CommandComplete(
+                        cmd.tag().into_command_complete(count, conn),
+                    ),
+                    true,
+                )
+                    .into(),
+            )
+            .map_err(|_| QueryError::BackendResponseSendFailed)?;
+
+        if cmd.is_begin() {
+            trace!("setting EXPLICIT tx");
+            // explicit tx
+            self.tx_state.start_explicit();
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_execute<'conn>(
+        &mut self,
+        conn: &'conn Connection,
+        prepped: &mut Statement<'conn>,
+        result_formats: &[FieldFormat],
+        cmd: &ParsedCmd,
+        max_rows: usize,
+        back_tx: &Sender<BackendResponse>,
+    ) -> Result<(), QueryError> {
+        // TODO: maybe we don't need to recompute this...
+        let mut fields = vec![];
+        for (i, col) in prepped.columns().into_iter().enumerate() {
+            trace!("col decl_type: {:?}", col.decl_type());
+            let col_type = name_to_type(col.decl_type().unwrap_or("any"))?;
+
+            fields.push(FieldInfo::new(
+                col.name().to_string(),
+                None,
+                None,
+                col_type,
+                result_formats.get(i).copied().unwrap_or(FieldFormat::Text),
+            ));
+        }
+
+        trace!("fields: {fields:?}");
+
+        let schema = Arc::new(fields);
+
+        // we need to know because we'll commit it right away
+        let mut opened_implicit_tx = false;
+
+        if self.tx_state.is_ended() {
+            if !cmd.is_begin() && !prepped.readonly() {
+                // NOT in a tx and statement mutates DB...
+                conn.execute_batch("BEGIN")?;
+
+                self.tx_state.start_implicit();
+                opened_implicit_tx = true;
+            } else if cmd.is_begin() {
+                conn.execute_batch("BEGIN")?;
+                self.tx_state.start_explicit();
+            }
+        }
+
+        let mut count = 0;
+
+        if cmd.is_commit() {
+            let _permit = self.tx_state.end();
+            self.handle_commit(conn)?;
+        } else {
+            if !self.tx_state.is_writing() && !prepped.readonly() {
+                trace!("statement writes, acquiring permit...");
+                self.tx_state
+                    .set_write_permit(self.agent.write_permit_blocking()?);
+            }
+            let mut rows = prepped.raw_query();
+            loop {
+                if count >= max_rows {
+                    trace!("attained max rows");
+                    // forget the Rows iterator here so as to not reset the statement!
+                    std::mem::forget(rows);
+                    back_tx
+                        .blocking_send(
+                            (
+                                PgWireBackendMessage::PortalSuspended(PortalSuspended::new()),
+                                true,
+                            )
+                                .into(),
+                        )
+                        .map_err(|_| QueryError::BackendResponseSendFailed)?;
+                    return Ok(());
+                }
+
+                let row = match rows.next()? {
+                    Some(row) => {
+                        trace!("got a row: {row:?}");
+                        row
+                    }
+                    None => {
+                        trace!("done w/ rows");
+                        break;
+                    }
+                };
+
+                count += 1;
+
+                let mut encoder = DataRowEncoder::new(schema.clone());
+                for (idx, field) in schema.iter().enumerate() {
+                    trace!("processing field: {field:?}");
+                    let format = *field.format();
+                    match field.datatype() {
+                        &Type::ANY => {
+                            let data = row.get_ref_unwrap(idx);
+                            match data {
+                                ValueRef::Null => encoder
+                                    .encode_field_with_type_and_format(
+                                        &None::<i8>,
+                                        &Type::ANY,
+                                        format,
+                                    )
+                                    .unwrap(),
+                                ValueRef::Integer(i) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(&i, &Type::INT8, format)
+                                        .unwrap();
+                                }
+                                ValueRef::Real(f) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &f,
+                                            &Type::FLOAT8,
+                                            format,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Text(t) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &String::from_utf8_lossy(t).as_ref(),
+                                            &Type::TEXT,
+                                            format,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Blob(b) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(&b, &Type::BYTEA, format)
+                                        .unwrap();
+                                }
+                            }
+                        }
+                        t @ &Type::INT8 => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &row.get::<_, Option<i64>>(idx)?,
+                                    t,
+                                    format,
+                                )
+                                .unwrap();
+                        }
+                        t @ &Type::TIMESTAMP => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &row.get::<_, Option<NaiveDateTime>>(idx)?,
+                                    t,
+                                    format,
+                                )
+                                .unwrap();
+                        }
+                        t @ &Type::VARCHAR | t @ &Type::TEXT | t @ &Type::JSON => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &row.get::<_, Option<String>>(idx)?,
+                                    t,
+                                    format,
+                                )
+                                .unwrap();
+                        }
+                        t @ &Type::BYTEA | t @ &Type::JSONB => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &row.get::<_, Option<Vec<u8>>>(idx)?,
+                                    t,
+                                    format,
+                                )
+                                .unwrap();
+                        }
+                        t @ &Type::FLOAT8 => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &row.get::<_, Option<f64>>(idx)?,
+                                    t,
+                                    format,
+                                )
+                                .unwrap();
+                        }
+                        _ => {
+                            return Err(UnsupportedSqliteToPostgresType(field.name().clone()).into())
+                        }
+                    }
+                }
+
+                let data_row = encoder.finish()?;
+                back_tx
+                    .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
+                    .map_err(|_| QueryError::BackendResponseSendFailed)?;
+            }
+
+            if opened_implicit_tx {
+                let _permit = self.tx_state.end();
+                self.handle_commit(conn)?;
+            }
+        }
+
+        let tag = cmd.tag();
+        trace!("done w/ rows, computing tag: {tag:?}");
+
+        // done!
+        back_tx
+            .blocking_send(
+                (
+                    PgWireBackendMessage::CommandComplete(tag.into_command_complete(count, conn)),
+                    true,
+                )
+                    .into(),
+            )
+            .map_err(|_| QueryError::BackendResponseSendFailed)?;
+
+        Ok(())
+    }
+
+    fn handle_commit(&self, conn: &Connection) -> rusqlite::Result<()> {
+        trace!("HANDLE COMMIT");
+        let actor_id = self.agent.actor_id();
+
+        let ts = Timestamp::from(self.agent.clock().new_timestamp());
+
+        let db_version: CrsqlDbVersion = conn
+            .prepare_cached("SELECT crsql_next_db_version()")?
+            .query_row((), |row| row.get(0))?;
+
+        let has_changes: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE db_version = ?);")?
+            .query_row([db_version], |row| row.get(0))?;
+
+        if !has_changes {
+            conn.execute_batch("COMMIT")?;
+            return Ok(());
+        }
+
+        let last_seq: CrsqlSeq = conn
+            .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
+            .query_row([db_version], |row| row.get(0))?;
+
+        let mut book_writer = self
+            .agent
+            .booked()
+            .blocking_write("handle_write_tx(book_writer)");
+
+        let last_version = book_writer.last().unwrap_or_default();
+        trace!("last_version: {last_version}");
+        let version = last_version + 1;
+        trace!("version: {version}");
+
+        conn.prepare_cached(
+            r#"
+                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
+                    VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
+            "#,
+        )?
+        .execute(named_params! {
+            ":actor_id": actor_id,
+            ":start_version": version,
+            ":db_version": db_version,
+            ":last_seq": last_seq,
+            ":ts": ts
+        })?;
+
+        debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
+
+        conn.execute_batch("COMMIT")?;
+
+        trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
+
+        book_writer.insert(
+            version,
+            KnownDbVersion::Current(CurrentVersion {
+                db_version,
+                last_seq,
+                ts,
+            }),
+        );
+
+        drop(book_writer);
+
+        spawn_counted({
+            let agent = self.agent.clone();
+            async move {
+                let conn = agent.pool().read().await?;
+
+                block_in_place(|| {
+                    // TODO: make this more generic so both sync and local changes can use it.
+                    let mut prepped = conn.prepare_cached(
+                        r#"
+                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                        FROM crsql_changes
+                        WHERE db_version = ?
+                        ORDER BY seq ASC
+                "#,
+                    )?;
+                    let rows = prepped.query_map([db_version], row_to_change)?;
+                    let chunked =
+                        ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+                    for changes_seqs in chunked {
+                        match changes_seqs {
+                            Ok((changes, seqs)) => {
+                                for (table_name, count) in
+                                    changes.iter().counts_by(|change| &change.table)
+                                {
+                                    counter!("corro.changes.committed", count as u64, "table" => table_name.to_string(), "source" => "local");
+                                }
+
+                                trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
+
+                                agent.subs_manager().match_changes(&changes, db_version);
+
+                                let tx_bcast = agent.tx_bcast().clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = tx_bcast
+                                        .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
+                                            ChangeV1 {
+                                                actor_id,
+                                                changeset: Changeset::Full {
+                                                    version,
+                                                    changes,
+                                                    seqs,
+                                                    last_seq,
+                                                    ts,
+                                                },
+                                            },
+                                        )))
+                                        .await
+                                    {
+                                        error!("could not send change message for broadcast: {e}");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    Ok::<_, rusqlite::Error>(())
+                })?;
+
+                Ok::<_, BoxError>(())
+            }
+        });
+
+        Ok(())
+    }
+}
+
 fn send_ready(
-    agent: &Agent,
+    session: &mut Session,
     conn: &Connection,
-    open_tx: &mut OpenTx,
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
-    let ready_status = if open_tx.is_implicit() {
-        let _permit = open_tx.end(); // do this first, in case of failure
+    let ready_status = if session.tx_state.is_implicit() {
+        let _permit = session.tx_state.end(); // do this first, in case of failure
         if discard_until_sync {
             // an error occured, rollback implicit tx!
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");
@@ -1785,11 +2259,11 @@ fn send_ready(
         } else {
             // no error, commit implicit tx
             warn!("receive Sync message, committing implicit tx");
-            handle_commit(agent, conn)?;
+            session.handle_commit(conn)?;
         }
 
         READY_STATUS_IDLE
-    } else if open_tx.is_explicit() {
+    } else if session.tx_state.is_explicit() {
         if discard_until_sync {
             READY_STATUS_FAILED_TRANSACTION_BLOCK
         } else {
@@ -1851,361 +2325,6 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
             QueryError::BackendResponseSendFailed => return Err(ChannelClosed),
         }))
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_execute<'conn>(
-    agent: &Agent,
-    conn: &'conn Connection,
-    prepped: &mut Statement<'conn>,
-    result_formats: &[FieldFormat],
-    cmd: &ParsedCmd,
-    open_tx: &mut OpenTx,
-    max_rows: usize,
-    back_tx: &Sender<BackendResponse>,
-) -> Result<(), QueryError> {
-    // TODO: maybe we don't need to recompute this...
-    let mut fields = vec![];
-    for (i, col) in prepped.columns().into_iter().enumerate() {
-        trace!("col decl_type: {:?}", col.decl_type());
-        let col_type = name_to_type(col.decl_type().unwrap_or("any"))?;
-
-        fields.push(FieldInfo::new(
-            col.name().to_string(),
-            None,
-            None,
-            col_type,
-            result_formats.get(i).copied().unwrap_or(FieldFormat::Text),
-        ));
-    }
-
-    trace!("fields: {fields:?}");
-
-    let schema = Arc::new(fields);
-
-    // we need to know because we'll commit it right away
-    let mut opened_implicit_tx = false;
-
-    if open_tx.is_ended() {
-        if !cmd.is_begin() && !prepped.readonly() {
-            // NOT in a tx and statement mutates DB...
-            conn.execute_batch("BEGIN")?;
-
-            open_tx.start_implicit();
-            opened_implicit_tx = true;
-        } else if cmd.is_begin() {
-            conn.execute_batch("BEGIN")?;
-            open_tx.start_explicit();
-        }
-    }
-
-    let mut count = 0;
-
-    if cmd.is_commit() {
-        let _permit = open_tx.end();
-        handle_commit(agent, conn)?;
-    } else {
-        if !open_tx.is_writing() && !prepped.readonly() {
-            trace!("statement writes, acquiring permit...");
-            open_tx.set_write_permit(agent.write_permit_blocking()?);
-        }
-        let mut rows = prepped.raw_query();
-        loop {
-            if count >= max_rows {
-                trace!("attained max rows");
-                // forget the Rows iterator here so as to not reset the statement!
-                std::mem::forget(rows);
-                back_tx
-                    .blocking_send(
-                        (
-                            PgWireBackendMessage::PortalSuspended(PortalSuspended::new()),
-                            true,
-                        )
-                            .into(),
-                    )
-                    .map_err(|_| QueryError::BackendResponseSendFailed)?;
-                return Ok(());
-            }
-
-            let row = match rows.next()? {
-                Some(row) => {
-                    trace!("got a row: {row:?}");
-                    row
-                }
-                None => {
-                    trace!("done w/ rows");
-                    break;
-                }
-            };
-
-            count += 1;
-
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            for (idx, field) in schema.iter().enumerate() {
-                trace!("processing field: {field:?}");
-                let format = *field.format();
-                match field.datatype() {
-                    &Type::ANY => {
-                        let data = row.get_ref_unwrap(idx);
-                        match data {
-                            ValueRef::Null => encoder
-                                .encode_field_with_type_and_format(&None::<i8>, &Type::ANY, format)
-                                .unwrap(),
-                            ValueRef::Integer(i) => {
-                                encoder
-                                    .encode_field_with_type_and_format(&i, &Type::INT8, format)
-                                    .unwrap();
-                            }
-                            ValueRef::Real(f) => {
-                                encoder
-                                    .encode_field_with_type_and_format(&f, &Type::FLOAT8, format)
-                                    .unwrap();
-                            }
-                            ValueRef::Text(t) => {
-                                encoder
-                                    .encode_field_with_type_and_format(
-                                        &String::from_utf8_lossy(t).as_ref(),
-                                        &Type::TEXT,
-                                        format,
-                                    )
-                                    .unwrap();
-                            }
-                            ValueRef::Blob(b) => {
-                                encoder
-                                    .encode_field_with_type_and_format(&b, &Type::BYTEA, format)
-                                    .unwrap();
-                            }
-                        }
-                    }
-                    t @ &Type::INT8 => {
-                        encoder
-                            .encode_field_with_type_and_format(
-                                &row.get::<_, Option<i64>>(idx)?,
-                                t,
-                                format,
-                            )
-                            .unwrap();
-                    }
-                    t @ &Type::TIMESTAMP => {
-                        encoder
-                            .encode_field_with_type_and_format(
-                                &row.get::<_, Option<NaiveDateTime>>(idx)?,
-                                t,
-                                format,
-                            )
-                            .unwrap();
-                    }
-                    t @ &Type::VARCHAR | t @ &Type::TEXT | t @ &Type::JSON => {
-                        encoder
-                            .encode_field_with_type_and_format(
-                                &row.get::<_, Option<String>>(idx)?,
-                                t,
-                                format,
-                            )
-                            .unwrap();
-                    }
-                    t @ &Type::BYTEA | t @ &Type::JSONB => {
-                        encoder
-                            .encode_field_with_type_and_format(
-                                &row.get::<_, Option<Vec<u8>>>(idx)?,
-                                t,
-                                format,
-                            )
-                            .unwrap();
-                    }
-                    t @ &Type::FLOAT8 => {
-                        encoder
-                            .encode_field_with_type_and_format(
-                                &row.get::<_, Option<f64>>(idx)?,
-                                t,
-                                format,
-                            )
-                            .unwrap();
-                    }
-                    _ => return Err(UnsupportedSqliteToPostgresType(field.name().clone()).into()),
-                }
-            }
-
-            let data_row = encoder.finish()?;
-            back_tx
-                .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
-                .map_err(|_| QueryError::BackendResponseSendFailed)?;
-        }
-
-        if opened_implicit_tx {
-            let _permit = open_tx.end();
-            handle_commit(agent, conn)?;
-        }
-    }
-
-    let tag = cmd.tag();
-    trace!("done w/ rows, computing tag: {tag:?}");
-
-    // done!
-    back_tx
-        .blocking_send(
-            (
-                PgWireBackendMessage::CommandComplete(tag.into_command_complete(count, conn)),
-                true,
-            )
-                .into(),
-        )
-        .map_err(|_| QueryError::BackendResponseSendFailed)?;
-
-    Ok(())
-}
-
-fn handle_query(
-    agent: &Agent,
-    conn: &Connection,
-    cmd: &ParsedCmd,
-    open_tx: &mut OpenTx,
-    back_tx: &Sender<BackendResponse>,
-    send_row_desc: bool,
-) -> Result<(), QueryError> {
-    if cmd.is_show() {
-        back_tx
-            .blocking_send(
-                (
-                    PgWireBackendMessage::CommandComplete(CommandComplete::new("SHOW".into())),
-                    true,
-                )
-                    .into(),
-            )
-            .map_err(|_| QueryError::BackendResponseSendFailed)?;
-        return Ok(());
-    }
-
-    if cmd.is_set() {
-        back_tx
-            .blocking_send(
-                (
-                    PgWireBackendMessage::CommandComplete(CommandComplete::new("SET".into())),
-                    true,
-                )
-                    .into(),
-            )
-            .map_err(|_| QueryError::BackendResponseSendFailed)?;
-        return Ok(());
-    }
-
-    // need to start an implicit transaction
-    if open_tx.is_ended() && !cmd.is_begin() {
-        conn.execute_batch("BEGIN")?;
-        trace!("started IMPLICIT tx");
-        open_tx.start_implicit();
-    } else if open_tx.is_implicit() && cmd.is_begin() {
-        trace!("committing IMPLICIT tx");
-        let _permit = open_tx.end();
-
-        handle_commit(agent, conn)?;
-        trace!("committed IMPLICIT tx");
-    }
-
-    let count = if cmd.is_begin() {
-        conn.execute_batch("BEGIN")?;
-        open_tx.start_explicit();
-        0
-    } else if cmd.is_commit() {
-        let _permit = open_tx.end();
-        handle_commit(agent, conn)?;
-        0
-    } else if cmd.is_rollback() {
-        let _permit = open_tx.end();
-        conn.execute_batch("ROLLBACK")?;
-        0
-    } else {
-        let mut prepped = if cmd.is_pg() {
-            return Err(QueryError::NotSqlite);
-        } else {
-            conn.prepare(&cmd.to_string())?
-        };
-
-        let mut fields = vec![];
-        for col in prepped.columns() {
-            let col_type = name_to_type(col.decl_type().unwrap_or("text"))?;
-            fields.push(FieldInfo::new(
-                col.name().to_string(),
-                None,
-                None,
-                col_type,
-                FieldFormat::Text,
-            ));
-        }
-
-        if send_row_desc {
-            back_tx
-                .blocking_send(
-                    (
-                        PgWireBackendMessage::RowDescription(RowDescription::new(
-                            fields.iter().map(Into::into).collect(),
-                        )),
-                        true,
-                    )
-                        .into(),
-                )
-                .map_err(|_| QueryError::BackendResponseSendFailed)?;
-        }
-
-        let schema = Arc::new(fields);
-
-        if !open_tx.is_writing() && !prepped.readonly() {
-            trace!("query statement writes, acquiring permit...");
-            open_tx.set_write_permit(agent.write_permit_blocking()?);
-        }
-
-        let mut rows = prepped.raw_query();
-        let ncols = schema.len();
-
-        let mut count = 0;
-        while let Some(row) = rows.next()? {
-            count += 1;
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            for idx in 0..ncols {
-                let data = row.get_ref_unwrap::<usize>(idx);
-                match data {
-                    ValueRef::Null => encoder.encode_field(&None::<i8>).unwrap(),
-                    ValueRef::Integer(i) => {
-                        encoder.encode_field(&i).unwrap();
-                    }
-                    ValueRef::Real(f) => {
-                        encoder.encode_field(&f).unwrap();
-                    }
-                    ValueRef::Text(t) => {
-                        encoder
-                            .encode_field(&String::from_utf8_lossy(t).as_ref())
-                            .unwrap();
-                    }
-                    ValueRef::Blob(b) => {
-                        encoder.encode_field(&b).unwrap();
-                    }
-                }
-            }
-            let data_row = encoder.finish()?;
-            back_tx
-                .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
-                .map_err(|_| QueryError::BackendResponseSendFailed)?;
-        }
-        count
-    };
-
-    back_tx
-        .blocking_send(
-            (
-                PgWireBackendMessage::CommandComplete(cmd.tag().into_command_complete(count, conn)),
-                true,
-            )
-                .into(),
-        )
-        .map_err(|_| QueryError::BackendResponseSendFailed)?;
-
-    if cmd.is_begin() {
-        trace!("setting EXPLICIT tx");
-        // explicit tx
-        open_tx.start_explicit();
-    }
-
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2275,142 +2394,6 @@ fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
         "FLOAT" => Type::FLOAT8,
         _ => return Err(UnsupportedSqliteToPostgresType(name.to_string())),
     })
-}
-
-fn handle_commit(agent: &Agent, conn: &Connection) -> rusqlite::Result<()> {
-    trace!("HANDLE COMMIT");
-    let actor_id = agent.actor_id();
-
-    let ts = Timestamp::from(agent.clock().new_timestamp());
-
-    let db_version: CrsqlDbVersion = conn
-        .prepare_cached("SELECT crsql_next_db_version()")?
-        .query_row((), |row| row.get(0))?;
-
-    let has_changes: bool = conn
-        .prepare_cached("SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE db_version = ?);")?
-        .query_row([db_version], |row| row.get(0))?;
-
-    if !has_changes {
-        conn.execute_batch("COMMIT")?;
-        return Ok(());
-    }
-
-    let booked = {
-        agent
-            .bookie()
-            .blocking_write("handle_write_tx(for_actor)")
-            .for_actor(actor_id)
-    };
-
-    let last_seq: CrsqlSeq = conn
-        .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
-        .query_row([db_version], |row| row.get(0))?;
-
-    let mut book_writer = booked.blocking_write("handle_write_tx(book_writer)");
-
-    let last_version = book_writer.last().unwrap_or_default();
-    trace!("last_version: {last_version}");
-    let version = last_version + 1;
-    trace!("version: {version}");
-
-    conn.prepare_cached(
-        r#"
-            INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
-                VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
-        "#,
-    )?
-    .execute(named_params! {
-        ":actor_id": actor_id,
-        ":start_version": version,
-        ":db_version": db_version,
-        ":last_seq": last_seq,
-        ":ts": ts
-    })?;
-
-    debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
-
-    conn.execute_batch("COMMIT")?;
-
-    trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
-
-    book_writer.insert(
-        version,
-        KnownDbVersion::Current(CurrentVersion {
-            db_version,
-            last_seq,
-            ts,
-        }),
-    );
-
-    drop(book_writer);
-
-    spawn_counted({
-        let agent = agent.clone();
-        async move {
-            let conn = agent.pool().read().await?;
-
-            block_in_place(|| {
-                // TODO: make this more generic so both sync and local changes can use it.
-                let mut prepped = conn.prepare_cached(
-                    r#"
-                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                    FROM crsql_changes
-                    WHERE db_version = ?
-                    ORDER BY seq ASC
-            "#,
-                )?;
-                let rows = prepped.query_map([db_version], row_to_change)?;
-                let chunked =
-                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
-                for changes_seqs in chunked {
-                    match changes_seqs {
-                        Ok((changes, seqs)) => {
-                            for (table_name, count) in
-                                changes.iter().counts_by(|change| &change.table)
-                            {
-                                counter!("corro.changes.committed", count as u64, "table" => table_name.to_string(), "source" => "local");
-                            }
-
-                            trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
-
-                            agent.subs_manager().match_changes(&changes, db_version);
-
-                            let tx_bcast = agent.tx_bcast().clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = tx_bcast
-                                    .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
-                                        ChangeV1 {
-                                            actor_id,
-                                            changeset: Changeset::Full {
-                                                version,
-                                                changes,
-                                                seqs,
-                                                last_seq,
-                                                ts,
-                                            },
-                                        },
-                                    )))
-                                    .await
-                                {
-                                    error!("could not send change message for broadcast: {e}");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                            break;
-                        }
-                    }
-                }
-                Ok::<_, rusqlite::Error>(())
-            })?;
-
-            Ok::<_, BoxError>(())
-        }
-    });
-
-    Ok(())
 }
 
 fn compute_schema(conn: &Connection) -> Result<Schema, SchemaError> {

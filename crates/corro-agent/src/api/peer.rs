@@ -1283,9 +1283,10 @@ pub async fn parallel_sync(
     Ok(counts.into_iter().flatten().sum::<usize>())
 }
 
-#[tracing::instrument(skip(agent, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]
+#[tracing::instrument(skip(agent, bookie, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]
 pub async fn serve_sync(
     agent: &Agent,
+    bookie: &Bookie,
     their_actor_id: ActorId,
     trace_ctx: SyncTraceContextV1,
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
@@ -1324,7 +1325,7 @@ pub async fn serve_sync(
 
     trace!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "read clock");
 
-    let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
+    let sync_state = generate_sync(bookie, agent.actor_id()).await;
 
     // first, send the current sync state
     encode_write_sync_msg(
@@ -1363,7 +1364,7 @@ pub async fn serve_sync(
     let (tx, mut rx) = mpsc::channel::<SyncMessage>(256);
 
     tokio::spawn(
-        process_sync(agent.pool().clone(), agent.bookie().clone(), tx, rx_need)
+        process_sync(agent.pool().clone(), bookie.clone(), tx, rx_need)
             .instrument(info_span!("process_sync"))
             .inspect_err(|e| error!("could not process sync request: {e}")),
     );
@@ -1568,8 +1569,11 @@ mod tests {
             cl: 1,
         };
 
+        let bookie = Bookie::new(Default::default());
+
         process_multiple_changes(
             &agent,
+            &bookie,
             vec![
                 (
                     ChangeV1 {
@@ -1613,13 +1617,7 @@ mod tests {
             ts,
         });
 
-        let booked = agent
-            .bookie()
-            .read("test")
-            .await
-            .get(&actor_id)
-            .cloned()
-            .unwrap();
+        let booked = bookie.read("test").await.get(&actor_id).cloned().unwrap();
 
         {
             let read = booked.read("test").await;

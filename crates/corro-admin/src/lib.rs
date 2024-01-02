@@ -2,7 +2,7 @@ use std::{fmt::Display, time::Duration};
 
 use camino::Utf8PathBuf;
 use corro_types::{
-    agent::{Agent, LockKind, LockMeta, LockState},
+    agent::{Agent, Bookie, LockKind, LockMeta, LockState},
     broadcast::{FocaCmd, FocaInput},
     sqlite::SqlitePoolError,
     sync::generate_sync,
@@ -34,6 +34,7 @@ pub struct AdminConfig {
 
 pub fn start_server(
     agent: Agent,
+    bookie: Bookie,
     config: AdminConfig,
     mut tripwire: Tripwire,
 ) -> Result<(), AdminError> {
@@ -65,9 +66,10 @@ pub fn start_server(
 
             spawn_counted({
                 let agent = agent.clone();
+                let bookie = bookie.clone();
                 let config = config.clone();
                 async move {
-                    if let Err(e) = handle_conn(agent, config, stream).await {
+                    if let Err(e) = handle_conn(agent, &bookie, config, stream).await {
                         error!("could not handle admin connection: {e}");
                     }
                 }
@@ -161,6 +163,7 @@ impl From<LockMeta> for LockMetaElapsed {
 
 async fn handle_conn(
     agent: Agent,
+    bookie: &Bookie,
     _config: AdminConfig,
     stream: UnixStream,
 ) -> Result<(), AdminError> {
@@ -176,7 +179,7 @@ async fn handle_conn(
                 Command::Ping => send_success(&mut stream).await,
                 Command::Sync(SyncCommand::Generate) => {
                     info_log(&mut stream, "generating sync...").await;
-                    let sync_state = generate_sync(agent.bookie(), agent.actor_id()).await;
+                    let sync_state = generate_sync(bookie, agent.actor_id()).await;
                     match serde_json::to_value(&sync_state) {
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,
@@ -185,7 +188,6 @@ async fn handle_conn(
                 }
                 Command::Locks { top } => {
                     info_log(&mut stream, "gathering top locks").await;
-                    let bookie = agent.bookie();
                     let registry = bookie.registry();
 
                     let topn: Vec<LockMetaElapsed> = {

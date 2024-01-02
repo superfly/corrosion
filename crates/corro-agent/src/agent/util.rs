@@ -28,7 +28,7 @@ use crate::{
 };
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
+    agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{
         BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaInput,
@@ -93,9 +93,8 @@ pub async fn initialise_foca(agent: &Agent) {
 }
 
 /// Prune the database
-pub async fn clear_overwritten_versions(agent: Agent) {
+pub async fn clear_overwritten_versions(agent: Agent, bookie: Bookie) {
     let pool = agent.pool();
-    let bookie = agent.bookie();
 
     loop {
         sleep(COMPACT_BOOKED_INTERVAL).await;
@@ -460,6 +459,7 @@ pub fn find_cleared_db_versions(
 // TODO: move to a more appropriate module?
 pub async fn sync_loop(
     agent: Agent,
+    bookie: Bookie,
     transport: Transport,
     mut rx_apply: Receiver<(ActorId, Version)>,
     mut tripwire: Tripwire,
@@ -498,7 +498,7 @@ pub async fn sync_loop(
         match branch {
             Branch::Tick => {
                 // ignoring here, there is trying and logging going on inside
-                match handlers::handle_sync(&agent, &transport)
+                match handlers::handle_sync(&agent, &bookie, &transport)
                     .preemptible(&mut tripwire)
                     .await
                 {
@@ -520,7 +520,7 @@ pub async fn sync_loop(
             }
             Branch::BackgroundApply { actor_id, version } => {
                 debug!(%actor_id, %version, "picked up background apply of buffered changes");
-                match process_fully_buffered_changes(&agent, actor_id, version).await {
+                match process_fully_buffered_changes(&agent, &bookie, actor_id, version).await {
                     Ok(false) => {
                         warn!(%actor_id, %version, "did not apply buffered changes");
                     }
@@ -821,9 +821,10 @@ pub fn store_empty_changeset(
     Ok(inserted)
 }
 
-#[tracing::instrument(skip(agent), err)]
+#[tracing::instrument(skip(agent, bookie), err)]
 pub async fn process_fully_buffered_changes(
     agent: &Agent,
+    bookie: &Bookie,
     actor_id: ActorId,
     version: Version,
 ) -> Result<bool, ChangeError> {
@@ -831,8 +832,7 @@ pub async fn process_fully_buffered_changes(
     debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
 
     let booked = {
-        agent
-            .bookie()
+        bookie
             .write(format!(
                 "process_fully_buffered(for_actor):{}",
                 actor_id.as_simple()
@@ -963,14 +963,13 @@ pub async fn process_fully_buffered_changes(
     Ok(inserted)
 }
 
-#[tracing::instrument(skip(agent, changes), err)]
+#[tracing::instrument(skip(agent, bookie, changes), err)]
 pub async fn process_multiple_changes(
     agent: &Agent,
+    bookie: &Bookie,
     changes: Vec<(ChangeV1, ChangeSource)>,
 ) -> Result<(), ChangeError> {
     debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _)| cmp::max(change.len(), 1)).sum::<usize>());
-
-    let bookie = agent.bookie();
 
     let mut seen = HashSet::new();
     let mut unknown_changes = Vec::with_capacity(changes.len());

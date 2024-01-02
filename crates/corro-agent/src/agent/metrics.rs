@@ -46,6 +46,7 @@ pub fn collect_metrics(agent: &Agent, transport: &Transport) {
         }
     }
 
+    // TODO: collect from bookie?
     match conn
         .prepare_cached("SELECT actor_id, (select count(site_id) FROM __corro_buffered_changes WHERE site_id = actor_id) FROM __corro_members")
         .and_then(|mut prepped| {
