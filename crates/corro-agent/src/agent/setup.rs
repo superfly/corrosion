@@ -18,7 +18,7 @@ use tripwire::Tripwire;
 // Internals
 use crate::{api::peer::gossip_server_endpoint, transport::Transport};
 use corro_types::{
-    actor::{ActorId, ClusterId},
+    actor::ActorId,
     agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
     base::Version,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
@@ -57,23 +57,15 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     // do this early to error earlier
     let members = Members::default();
 
-    let (actor_id, cluster_id): (_, ClusterId) = {
+    let actor_id = {
         let conn = CrConn::init(Connection::open(&conf.db.path)?)?;
-        (
-            conn.query_row("SELECT crsql_site_id();", [], |row| {
-                row.get::<_, ActorId>(0)
-            })?,
-            conn.query_row(
-                "SELECT value FROM __corro_state WHERE key = 'cluster_id'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or_default(),
-        )
-    };
 
-    info!("Actor ID: {actor_id} (cluster ID: {cluster_id})");
+        conn.query_row("SELECT crsql_site_id();", [], |row| {
+            row.get::<_, ActorId>(0)
+        })
+    }?;
+
+    info!("Actor ID: {actor_id}");
 
     let write_sema = Arc::new(Semaphore::new(1));
 
@@ -87,6 +79,19 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
         schema
     };
+
+    let cluster_id = {
+        let conn = pool.read().await?;
+        conn.query_row(
+            "SELECT value FROM __corro_state WHERE key = 'cluster_id'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_default()
+    };
+
+    info!("Cluster ID: {cluster_id}");
 
     let (tx_apply, rx_apply) = channel(20480);
     let (tx_clear_buf, rx_clear_buf) = channel(10240);
