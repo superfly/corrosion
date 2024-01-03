@@ -80,9 +80,6 @@ pub fn spawn_bipayload_handler(
                                                         },
                                                     cluster_id,
                                                 } => {
-                                                    if cluster_id != agent.cluster_id() {
-                                                        break;
-                                                    }
                                                     trace!(
                                                         "framed read buffer len: {}",
                                                         framed.read_buffer().len()
@@ -90,7 +87,7 @@ pub fn spawn_bipayload_handler(
                                                     // println!("got sync state: {state:?}");
                                                     if let Err(e) = serve_sync(
                                                         &agent, &bookie, actor_id, trace_ctx,
-                                                        framed, tx,
+                                                        cluster_id, framed, tx,
                                                     )
                                                     .await
                                                     {
