@@ -16,19 +16,26 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use time::OffsetDateTime;
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::{
+    mpsc::{self, Sender},
+    oneshot,
+};
 use tracing::{error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
-    actor::{Actor, ActorId},
+    actor::{Actor, ActorId, ClusterId},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     sync::SyncTraceContextV1,
 };
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayload {
-    V1(UniPayloadV1),
+    V1 {
+        data: UniPayloadV1,
+        #[speedy(default_on_eof)]
+        cluster_id: ClusterId,
+    },
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -38,7 +45,11 @@ pub enum UniPayloadV1 {
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum BiPayload {
-    V1(BiPayloadV1),
+    V1 {
+        data: BiPayloadV1,
+        #[speedy(default_on_eof)]
+        cluster_id: ClusterId,
+    },
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -62,6 +73,7 @@ pub enum FocaInput {
 #[derive(Debug)]
 pub enum FocaCmd {
     MembershipStates(mpsc::Sender<foca::Member<Actor>>),
+    ChangeIdentity(Actor, oneshot::Sender<Result<(), foca::Error>>),
 }
 
 #[derive(Debug, Clone, Readable, Writable)]

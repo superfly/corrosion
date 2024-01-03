@@ -72,10 +72,17 @@ pub fn spawn_bipayload_handler(
                                     match BiPayload::read_from_buffer(&b) {
                                         Ok(payload) => {
                                             match payload {
-                                                BiPayload::V1(BiPayloadV1::SyncStart {
-                                                    actor_id,
-                                                    trace_ctx,
-                                                }) => {
+                                                BiPayload::V1 {
+                                                    data:
+                                                        BiPayloadV1::SyncStart {
+                                                            actor_id,
+                                                            trace_ctx,
+                                                        },
+                                                    cluster_id,
+                                                } => {
+                                                    if cluster_id != agent.cluster_id() {
+                                                        break;
+                                                    }
                                                     trace!(
                                                         "framed read buffer len: {}",
                                                         framed.read_buffer().len()

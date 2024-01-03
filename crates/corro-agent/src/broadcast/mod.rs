@@ -257,6 +257,14 @@ pub fn runtime_loop(
                                     }
                                 }
                             }
+                            FocaCmd::ChangeIdentity(id, callback) => {
+                                if callback
+                                    .send(foca.change_identity(id, &mut runtime))
+                                    .is_err()
+                                {
+                                    warn!("could not send back result after changing identity");
+                                }
+                            }
                         },
                     },
                     Branch::HandleTimer(timer, seq) => {
@@ -440,8 +448,11 @@ pub fn runtime_loop(
                     };
                     trace!("adding broadcast: {bcast:?}, local? {is_local}");
 
-                    if let Err(e) = UniPayload::V1(UniPayloadV1::Broadcast(bcast.clone()))
-                        .write_to_stream((&mut ser_buf).writer())
+                    if let Err(e) = (UniPayload::V1 {
+                        data: UniPayloadV1::Broadcast(bcast.clone()),
+                        cluster_id: agent.cluster_id(),
+                    })
+                    .write_to_stream((&mut ser_buf).writer())
                     {
                         error!("could not encode UniPayload::V1 Broadcast: {e}");
                         ser_buf.clear();
@@ -526,8 +537,11 @@ pub fn runtime_loop(
                         .states
                         .iter()
                         .filter_map(|(member_id, state)| {
-                            // don't broadcast to ourselves... or ring0 if local broadcast
-                            if *member_id == actor_id || (pending.is_local && state.is_ring0()) {
+                            // don't broadcast to ourselves, different cluster... or ring0 if local broadcast
+                            if state.cluster_id != agent.cluster_id()
+                                || *member_id == actor_id
+                                || (pending.is_local && state.is_ring0())
+                            {
                                 None
                             } else {
                                 Some(state.addr)

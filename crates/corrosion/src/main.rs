@@ -15,6 +15,7 @@ use command::{
 use corro_api_types::SqliteParam;
 use corro_client::CorrosionApiClient;
 use corro_types::{
+    actor::ClusterId,
     api::{ExecResult, QueryEvent, Statement},
     config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
 };
@@ -301,6 +302,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Cluster(
                 corro_admin::ClusterCommand::MembershipStates,
+            ))
+            .await?;
+        }
+        Command::Cluster(ClusterCommand::SetClusterId { cluster_id }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Cluster(
+                corro_admin::ClusterCommand::SetClusterId(ClusterId(*cluster_id)),
             ))
             .await?;
         }
@@ -597,6 +605,8 @@ enum Command {
 enum ClusterCommand {
     /// Dumps the current member states
     MembershipStates,
+    /// Set a new cluster ID for the node
+    SetClusterId { cluster_id: u16 },
 }
 
 #[derive(Subcommand)]

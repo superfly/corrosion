@@ -2,6 +2,7 @@ use std::{fmt::Display, time::Duration};
 
 use camino::Utf8PathBuf;
 use corro_types::{
+    actor::ClusterId,
     agent::{Agent, Bookie, LockKind, LockMeta, LockState},
     broadcast::{FocaCmd, FocaInput},
     sqlite::SqlitePoolError,
@@ -13,7 +14,8 @@ use spawn::spawn_counted;
 use time::OffsetDateTime;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
+    task::block_in_place,
 };
 use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
@@ -97,6 +99,7 @@ pub enum SyncCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClusterCommand {
     MembershipStates,
+    SetClusterId(ClusterId),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -228,6 +231,51 @@ async fn handle_conn(
                     }
                     send_success(&mut stream).await;
                 }
+                Command::Cluster(ClusterCommand::SetClusterId(cluster_id)) => {
+                    info_log(&mut stream, "gathering membership state").await;
+
+                    let mut conn = match agent.pool().write_priority().await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    };
+
+                    let res = block_in_place(|| {
+                        let tx = conn.transaction()?;
+
+                        tx.execute("INSERT OR REPLACE INTO __corro_state (key, value) VALUES ('cluster_id', ?)", [cluster_id])?;
+
+                        let (cb_tx, cb_rx) = oneshot::channel();
+
+                        agent
+                            .tx_foca()
+                            .blocking_send(FocaInput::Cmd(FocaCmd::ChangeIdentity(
+                                agent.actor(cluster_id),
+                                cb_tx,
+                            )))
+                            .map_err(|_| ProcessingError::Send)?;
+
+                        cb_rx
+                            .blocking_recv()
+                            .map_err(|_| ProcessingError::CallbackRecv)?
+                            .map_err(|e| ProcessingError::String(e.to_string()))?;
+
+                        tx.commit()?;
+
+                        agent.set_cluster_id(cluster_id);
+
+                        Ok::<_, ProcessingError>(())
+                    });
+
+                    if let Err(e) = res {
+                        send_error(&mut stream, e).await;
+                        continue;
+                    }
+
+                    send_success(&mut stream).await;
+                }
             },
             Ok(None) => {
                 debug!("done with admin conn");
@@ -242,6 +290,18 @@ async fn handle_conn(
     }
 
     Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessingError {
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("could not send via channel")]
+    Send,
+    #[error("could not receive response from a callback")]
+    CallbackRecv,
+    #[error("{0}")]
+    String(String),
 }
 
 #[derive(Debug, thiserror::Error)]

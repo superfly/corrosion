@@ -100,7 +100,13 @@ pub fn spawn_unipayload_message_decoder(
         async move {
             while let Some(payload) = process_uni_rx.recv().await {
                 match payload {
-                    UniPayload::V1(UniPayloadV1::Broadcast(bcast)) => {
+                    UniPayload::V1 {
+                        data: UniPayloadV1::Broadcast(bcast),
+                        cluster_id,
+                    } => {
+                        if cluster_id != agent.cluster_id() {
+                            continue;
+                        }
                         handle_change(&agent, &bookie, bcast, &bcast_msg_tx).await
                     }
                 }

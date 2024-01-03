@@ -960,7 +960,7 @@ pub async fn parallel_sync(
                         &mut codec,
                         &mut encode_buf,
                         &mut send_buf,
-                        BiPayload::V1(BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}),
+                        BiPayload::V1 {data: BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}, cluster_id: agent.cluster_id()},
                         &mut tx,
                     ).instrument(info_span!("write_sync_start"))
                     .await?;

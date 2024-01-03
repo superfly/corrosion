@@ -3,7 +3,7 @@
 // External crates
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
@@ -18,7 +18,7 @@ use tripwire::Tripwire;
 // Internals
 use crate::{api::peer::gossip_server_endpoint, transport::Transport};
 use corro_types::{
-    actor::ActorId,
+    actor::{ActorId, ClusterId},
     agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
     base::Version,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
@@ -31,7 +31,6 @@ use corro_types::{
 
 /// Runtime state for the Corrosion agent
 pub struct AgentOptions {
-    pub actor_id: ActorId,
     pub lock_registry: LockRegistry,
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
@@ -58,14 +57,23 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     // do this early to error earlier
     let members = Members::default();
 
-    let actor_id = {
+    let (actor_id, cluster_id): (_, ClusterId) = {
         let conn = CrConn::init(Connection::open(&conf.db.path)?)?;
-        conn.query_row("SELECT crsql_site_id();", [], |row| {
-            row.get::<_, ActorId>(0)
-        })?
+        (
+            conn.query_row("SELECT crsql_site_id();", [], |row| {
+                row.get::<_, ActorId>(0)
+            })?,
+            conn.query_row(
+                "SELECT value FROM __corro_state WHERE key = 'cluster_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default(),
+        )
     };
 
-    info!("Actor ID: {}", actor_id);
+    info!("Actor ID: {actor_id} (cluster ID: {cluster_id})");
 
     let write_sema = Arc::new(Semaphore::new(1));
 
@@ -91,133 +99,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             lock_registry.clone(),
         )
     };
-
-    // let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
-
-    // {
-    //     debug!("getting read-only conn for pull bookkeeping rows");
-    //     let mut conn = pool.write_priority().await?;
-
-    //     debug!("getting bookkept rows");
-
-    //     let mut cleared_rows: BTreeMap<ActorId, usize> = BTreeMap::new();
-
-    //     {
-    //         let mut prepped = conn.prepare_cached(
-    //             "SELECT actor_id, start_version, end_version, db_version, last_seq, ts
-    //             FROM __corro_bookkeeping",
-    //         )?;
-    //         let mut rows = prepped.query([])?;
-
-    //         loop {
-    //             let row = rows.next()?;
-    //             match row {
-    //                 None => break,
-    //                 Some(row) => {
-    //                     let actor_id = row.get(0)?;
-    //                     let ranges = bk.entry(actor_id).or_default();
-    //                     let start_v = row.get(1)?;
-    //                     let end_v: Option<Version> = row.get(2)?;
-    //                     ranges.insert_many(
-    //                         start_v..=end_v.unwrap_or(start_v),
-    //                         match row.get(3)? {
-    //                             Some(db_version) => KnownDbVersion::Current(CurrentVersion {
-    //                                 db_version,
-    //                                 last_seq: row.get(4)?,
-    //                                 ts: row.get(5)?,
-    //                             }),
-    //                             None => {
-    //                                 *cleared_rows.entry(actor_id).or_default() += 1;
-    //                                 KnownDbVersion::Cleared
-    //                             }
-    //                         },
-    //                     );
-    //                 }
-    //             }
-    //         }
-
-    //         let mut partials: HashMap<
-    //             (ActorId, Version),
-    //             (RangeInclusiveSet<CrsqlSeq>, CrsqlSeq, Timestamp),
-    //         > = HashMap::new();
-
-    //         debug!("getting seq bookkept rows");
-
-    //         let mut prepped = conn.prepare_cached(
-    //             "SELECT site_id, version, start_seq, end_seq, last_seq, ts
-    //             FROM __corro_seq_bookkeeping",
-    //         )?;
-    //         let mut rows = prepped.query([])?;
-
-    //         loop {
-    //             let row = rows.next()?;
-    //             match row {
-    //                 None => break,
-    //                 Some(row) => {
-    //                     let (range, last_seq, ts) =
-    //                         partials.entry((row.get(0)?, row.get(1)?)).or_default();
-
-    //                     range.insert(row.get(2)?..=row.get(3)?);
-    //                     *last_seq = row.get(4)?;
-    //                     *ts = row.get(5)?;
-    //                 }
-    //             }
-    //         }
-
-    //         debug!("filling up partial known versions");
-
-    //         for ((actor_id, version), (seqs, last_seq, ts)) in partials {
-    //             debug!(%actor_id, %version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
-    //             let ranges = bk.entry(actor_id).or_default();
-
-    //             if let Some(known) = ranges.get(&version) {
-    //                 warn!(%actor_id, %version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
-
-    //                 _ = tx_clear_buf.try_send((actor_id, version..=version));
-    //                 continue;
-    //             }
-
-    //             let gaps_count = seqs.gaps(&(CrsqlSeq(0)..=last_seq)).count();
-
-    //             ranges.insert(
-    //                 version,
-    //                 KnownDbVersion::Partial(PartialVersion { seqs, last_seq, ts }),
-    //             );
-
-    //             if gaps_count == 0 {
-    //                 info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
-    //                 // spawn this because it can block if the channel gets full, nothing is draining it yet!
-    //                 tokio::spawn({
-    //                     let tx_apply = tx_apply.clone();
-    //                     async move {
-    //                         let _ = tx_apply.send((actor_id, version)).await;
-    //                     }
-    //                 });
-    //             }
-    //         }
-    //     }
-
-    //     for (actor_id, booked) in bk.iter() {
-    //         if let Some(clear_count) = cleared_rows.get(actor_id).copied() {
-    //             if clear_count > booked.cleared.len() {
-    //                 warn!(%actor_id, "cleared bookkept rows count ({clear_count}) in DB was bigger than in-memory entries count ({}), compacting...", booked.cleared.len());
-    //                 let tx = conn.immediate_transaction()?;
-    //                 let deleted = tx.execute("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND end_version IS NOT NULL", [actor_id])?;
-    //                 info!("deleted {deleted} rows that had an end_version");
-    //                 let mut inserted = 0;
-    //                 for range in booked.cleared.iter() {
-    //                     inserted += tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?)", params![actor_id, range.start(), range.end()])?;
-    //                 }
-    //                 info!("inserted {inserted} cleared version rows");
-    //                 tx.commit()?;
-    //             }
-    //         }
-    //     }
-    // }
-
-    // debug!("done building bookkeeping");
-
-    // let bookie = Bookie::new(bk);
 
     let gossip_server_endpoint = gossip_server_endpoint(&conf.gossip).await?;
     let gossip_addr = gossip_server_endpoint.local_addr()?;
@@ -246,7 +127,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let subs_manager = SubsManager::default();
 
     let opts = AgentOptions {
-        actor_id,
         gossip_server_endpoint,
         transport,
         api_listener,
@@ -280,6 +160,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_foca,
         write_sema,
         schema: RwLock::new(schema),
+        cluster_id,
         subs_manager,
         tripwire,
     });

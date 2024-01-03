@@ -269,6 +269,9 @@ pub async fn handle_notifications(
         trace!("handle notification");
         match notification {
             Notification::MemberUp(actor) => {
+                if actor.cluster_id() != agent.cluster_id() {
+                    continue;
+                }
                 let (added, same) = { agent.members().write().add_member(&actor) };
                 trace!("Member Up {actor:?} (added: {added})");
                 if added {
@@ -299,6 +302,9 @@ pub async fn handle_notifications(
                 increment_counter!("corro.swim.notification", "type" => "memberup");
             }
             Notification::MemberDown(actor) => {
+                if actor.cluster_id() != agent.cluster_id() {
+                    continue;
+                }
                 let removed = { agent.members().write().remove_member(&actor) };
                 trace!("Member Down {actor:?} (removed: {removed})");
                 if removed {
