@@ -88,6 +88,7 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
 
     //// Start the main SWIM runtime loop
     runtime_loop(
+        // here the agent already has the current cluster_id, we don't need to pass one
         agent.actor(None),
         agent.clone(),
         transport.clone(),
