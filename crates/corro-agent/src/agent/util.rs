@@ -455,8 +455,12 @@ pub fn find_cleared_db_versions(
     Ok(cleared_db_versions)
 }
 
-// DOCME: provide some context for this function
-// TODO: move to a more appropriate module?
+/// Periodically initiate a sync with many other nodes.  Before we do
+/// though, apply buffered/ partial changesets to avoid having to sync
+/// things we should already know about.
+///
+/// Actual sync logic is handled by
+/// [`handle_sync`](crate::agent::handlers::handle_sync).
 pub async fn sync_loop(
     agent: Agent,
     bookie: Bookie,
@@ -536,8 +540,7 @@ pub async fn sync_loop(
     }
 }
 
-// DOCME: provide some context for this function
-// TODO: move to a more appropriate module?
+/// Compact the database by finding cleared versions
 pub async fn clear_buffered_meta_loop(
     agent: Agent,
     mut rx_partials: Receiver<(ActorId, RangeInclusive<Version>)>,
@@ -591,8 +594,13 @@ pub async fn clear_buffered_meta_loop(
     }
 }
 
-// DOCME: provide some context for this function
-// TODO: move to a more appropriate module?
+/// Clear empty versions from the database in chunks to avoid locking
+/// the database for too long.
+///
+/// We are given versions to clear either by receiving empty
+/// changesets, or when calling
+/// [`find_cleared_db_versions`](self::find_cleared_db_versions)
+/// periodically.
 pub async fn write_empties_loop(
     agent: Agent,
     mut rx_empty: Receiver<(ActorId, RangeInclusive<Version>)>,

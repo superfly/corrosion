@@ -86,8 +86,9 @@ pub fn spawn_unipayload_handler(
 /// Start an async buffer task that pull messages from one channel
 /// (process_uni_rx) and moves them into the next if the variant
 /// matches (bcast_msg_tx)
-// DOCME: why is this task needed?  Do we just want to get this
-// function out of the stream hot path?
+///
+/// This task may not be needed anymore, but decouples broadcast
+/// receivers and handlers, so we may still want to keep it.
 pub fn spawn_unipayload_message_decoder(
     agent: &Agent,
     bookie: &Bookie,
@@ -162,6 +163,7 @@ async fn handle_change(
                 return;
             }
 
+            // If the change originated from us we're done
             if change.actor_id == agent.actor_id() {
                 return;
             }
@@ -170,6 +172,7 @@ async fn handle_change(
                 histogram!("corro.broadcast.recv.lag.seconds", diff.as_secs_f64());
             }
 
+            // Otherwise pass it to handle_broadcasts
             if let Err(e) = bcast_msg_tx.send(BroadcastV1::Change(change)).await {
                 error!("could not send change message through broadcast channel: {e}");
             }
