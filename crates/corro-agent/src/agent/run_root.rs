@@ -1,8 +1,4 @@
 //! Start the root agent tasks
-//!
-//! 1. foo
-//! 2. bar
-//! 3. spawn `super::other_module`
 
 use std::sync::Arc;
 
@@ -84,7 +80,7 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
     //// TODO: turn channels into a named and counted resource
     let (to_send_tx, to_send_rx) = channel(10240);
     let (notifications_tx, notifications_rx) = channel(10240);
-    let (bcast_msg_tx, bcast_rx) = channel::<BroadcastV1>(10240);
+    let (bcast_msg_tx, bcast_msg_rx) = channel::<BroadcastV1>(10240);
     let (process_uni_tx, process_uni_rx) = channel(10240);
 
     //// Start the main SWIM runtime loop
@@ -138,7 +134,7 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
         agent.clone(),
         notifications_rx,
     ));
-    tokio::spawn(handlers::handle_broadcasts(agent.clone(), bcast_rx));
+    tokio::spawn(handlers::handle_broadcasts(agent.clone(), bcast_msg_rx));
 
     spawn_handle_db_cleanup(agent.pool().clone());
 

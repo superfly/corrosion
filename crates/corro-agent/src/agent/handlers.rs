@@ -171,7 +171,13 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
     });
 }
 
-// DOCME: provide function context
+/// Announce this node to other random nodes (according to SWIM)
+///
+/// We use an exponential backoff to announce aggressively in the
+/// beginning, get a full picture of the cluster, then stop spamming
+/// everyone.
+///
+/// 
 pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
     tokio::spawn({
         let agent = agent.clone();
@@ -218,10 +224,11 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
     });
 }
 
-// DOCME: provide function context
-pub async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Bytes)>) {
+/// A central dispatcher for SWIM cluster management messages
+// TODO: we may be able to inline this code where it is needed
+pub async fn handle_gossip_to_send(transport: Transport, mut swim_to_send_rx: Receiver<(Actor, Bytes)>) {
     // TODO: use tripwire and drain messages to send when that happens...
-    while let Some((actor, data)) = to_send_rx.recv().await {
+    while let Some((actor, data)) = swim_to_send_rx.recv().await {
         trace!("got gossip to send to {actor:?}");
 
         let addr = actor.addr();
@@ -241,7 +248,8 @@ pub async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receive
     }
 }
 
-// DOCME: provide function context
+/// Take changesets from other nodes and passes them to tx_changes
+// TODO: may not be needed anymore
 pub async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>) {
     while let Some(bcast) = bcast_rx.recv().await {
         increment_counter!("corro.broadcast.recv.count");
@@ -260,7 +268,8 @@ pub async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>
     }
 }
 
-// DOCME: provide function context
+/// Poll for updates from the cluster membership system (`foca`/ SWIM)
+/// and apply any incoming changes to the local actor/ agent state.
 pub async fn handle_notifications(
     agent: Agent,
     mut notification_rx: Receiver<Notification<Actor>>,
@@ -336,6 +345,10 @@ pub async fn handle_notifications(
     }
 }
 
+/// We keep a write-ahead-log, which under write-pressure can grow to
+/// multiple gigabytes and needs periodic truncation.  We don't want
+/// to schedule this task too often since it locks the whole DB.
+// TODO: can we get around the lock somehow?
 async fn db_cleanup(pool: &SplitPool) -> eyre::Result<()> {
     debug!("handling db_cleanup (WAL truncation)");
     let conn = pool.write_low().await?;
@@ -360,8 +373,7 @@ async fn db_cleanup(pool: &SplitPool) -> eyre::Result<()> {
     Ok(())
 }
 
-// Every now and then, we need to truncate the WAL.
-// It can get enormous when under write pressure.
+/// See `db_cleanup`
 pub fn spawn_handle_db_cleanup(pool: SplitPool) {
     tokio::spawn(async move {
         let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
@@ -375,7 +387,12 @@ pub fn spawn_handle_db_cleanup(pool: SplitPool) {
     });
 }
 
-// DOCME: provide function context
+/// Bundle incoming changes to optimise transaction sizes with SQLite
+///
+/// *Performance tradeoff*: introduce latency (with a max timeout) to
+/// apply changes more efficiently.
+///
+/// This function used by broadcast receivers and sync receivers
 pub async fn handle_changes(
     agent: Agent,
     bookie: Bookie,
@@ -451,7 +468,10 @@ pub async fn handle_changes(
     }
 }
 
-// DOCME: add context
+/// Start a new sync with multiple other nodes
+///
+/// Choose members to sync with based on the current RTT and how many
+/// (known) versions we need from that peer.  Add randomness to taste.
 #[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn handle_sync(
     agent: &Agent,
@@ -474,7 +494,9 @@ pub async fn handle_sync(
             members
                 .states
                 .iter()
+                // Filter out self
                 .filter(|(id, _state)| **id != agent.actor_id())
+                // Grab a ring-buffer index to the member RTT range
                 .map(|(id, state)| (*id, state.ring.unwrap_or(255), state.addr))
                 .collect::<Vec<(ActorId, u8, SocketAddr)>>()
         };
