@@ -256,6 +256,59 @@ where
     }
 }
 
+pub struct QueryStream<T> {
+    stream: FramedBody,
+    _deser: std::marker::PhantomData<T>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum QueryError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Deserialize(#[from] serde_json::Error),
+    #[error("max line length exceeded")]
+    MaxLineLengthExceeded,
+}
+
+impl<T> QueryStream<T>
+where
+    T: DeserializeOwned + Unpin,
+{
+    pub fn new(body: hyper::Body) -> Self {
+        Self {
+            stream: FramedRead::new(
+                StreamReader::new(IoBodyStream { body }),
+                LinesBytesCodec::default(),
+            ),
+            _deser: Default::default(),
+        }
+    }
+}
+
+impl<T> Stream for QueryStream<T>
+where
+    T: DeserializeOwned + Unpin,
+{
+    type Item = Result<TypedQueryEvent<T>, QueryError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match ready!(Pin::new(&mut self.stream).poll_next(cx)) {
+            Some(Ok(b)) => match serde_json::from_slice(&b) {
+                Ok(evt) => Poll::Ready(Some(Ok(evt))),
+                Err(e) => Poll::Ready(Some(Err(e.into()))),
+            },
+            Some(Err(e)) => match e {
+                LinesCodecError::MaxLineLengthExceeded => {
+                    Poll::Ready(Some(Err(QueryError::MaxLineLengthExceeded)))
+                }
+                LinesCodecError::Io(io_err) => Poll::Ready(Some(Err(io_err.into()))),
+            },
+            None => Poll::Ready(None),
+        }
+    }
+}
+
 pub struct LinesBytesCodec {
     // Stored index of the next index to examine for a `\n` character.
     // This is used to optimize searching.

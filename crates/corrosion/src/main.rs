@@ -5,7 +5,6 @@ use std::{
 };
 
 use admin::AdminConn;
-use bytes::BytesMut;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use command::{
@@ -31,7 +30,6 @@ use opentelemetry::{
 };
 use opentelemetry_otlp::WithExportConfig;
 use rusqlite::{Connection, OptionalExtension};
-use tokio_util::codec::{Decoder, LinesCodec};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{
     fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
@@ -329,27 +327,15 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 )
             };
 
-            let mut body = cli.api_client()?.query(&stmt).await?;
-
-            let mut lines = LinesCodec::new();
-
-            let mut buf = BytesMut::new();
-
-            loop {
-                buf.extend_from_slice(&body.next().await.unwrap()?);
-                let s = match lines.decode(&mut buf)? {
-                    Some(s) => s,
-                    None => break,
-                };
-                let res: QueryEvent = serde_json::from_str(&s)?;
-
+            let mut query = cli.api_client()?.query(&stmt).await?;
+            while let Some(res) = query.next().await {
                 match res {
-                    QueryEvent::Columns(cols) => {
+                    Ok(QueryEvent::Columns(cols)) => {
                         if *show_columns {
                             println!("{}", cols.join("|"));
                         }
                     }
-                    QueryEvent::Row(_, cells) => {
+                    Ok(QueryEvent::Row(_, cells)) => {
                         println!(
                             "{}",
                             cells
@@ -359,15 +345,18 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                                 .join("|")
                         );
                     }
-                    QueryEvent::EndOfQuery { time, .. } => {
+                    Ok(QueryEvent::EndOfQuery { time, .. }) => {
                         if *timer {
                             println!("time: {time}s");
                         }
                     }
-                    QueryEvent::Change(_, _, _, _) => {
+                    Ok(QueryEvent::Change(_, _, _, _)) => {
                         break;
                     }
-                    QueryEvent::Error(e) => {
+                    Ok(QueryEvent::Error(e)) => {
+                        eyre::bail!("{e}");
+                    }
+                    Err(e) => {
                         eyre::bail!("{e}");
                     }
                 }

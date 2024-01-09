@@ -6,7 +6,7 @@ use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement
 use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use serde::de::DeserializeOwned;
-use sub::SubscriptionStream;
+use sub::{QueryStream, SubscriptionStream};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -24,7 +24,10 @@ impl CorrosionApiClient {
         }
     }
 
-    pub async fn query(&self, statement: &Statement) -> Result<hyper::Body, Error> {
+    pub async fn query_typed<T: DeserializeOwned + Unpin>(
+        &self,
+        statement: &Statement,
+    ) -> Result<QueryStream<T>, Error> {
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(format!("http://{}/v1/queries", self.api_addr))
@@ -60,7 +63,14 @@ impl CorrosionApiClient {
             }
         }
 
-        Ok(res.into_body())
+        Ok(QueryStream::new(res.into_body()))
+    }
+
+    pub async fn query(
+        &self,
+        statement: &Statement,
+    ) -> Result<QueryStream<Vec<SqliteValue>>, Error> {
+        self.query_typed(statement).await
     }
 
     pub async fn subscribe_typed<T: DeserializeOwned + Unpin>(
