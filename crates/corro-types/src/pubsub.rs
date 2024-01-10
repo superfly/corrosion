@@ -1182,8 +1182,9 @@ impl Matcher {
                                     .map(|i| row.get::<_, SqliteValue>(i))
                                     .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                                if let Err(e) =
-                                    self.evt_tx.try_send(QueryEvent::Row(RowId(rowid), cells))
+                                if let Err(e) = self
+                                    .evt_tx
+                                    .blocking_send(QueryEvent::Row(RowId(rowid), cells))
                                 {
                                     error!(sub_id = %self.id, "could not send back row: {e}");
                                     return Err(MatcherError::EventReceiverClosed);
