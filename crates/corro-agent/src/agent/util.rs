@@ -361,8 +361,10 @@ pub async fn setup_http_api_handler(
 
     let api_addr = api_listener.local_addr()?;
     info!("Starting public API server on tcp/{api_addr}");
+    let mut incoming = AddrIncoming::from_listener(api_listener)?;
+    incoming.set_nodelay(true);
     spawn_counted(
-        axum::Server::builder(AddrIncoming::from_listener(api_listener)?)
+        axum::Server::builder(incoming)
             .executor(CountedExecutor)
             .serve(
                 api.clone()
