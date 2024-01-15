@@ -636,18 +636,16 @@ impl Matcher {
                         Some(FromClause {
                             joins: Some(joins), ..
                         }) if idx > 0 => {
-                            match joins.get_mut(idx - 1) {
-                                Some(JoinedSelectTable {
-                                    operator:
-                                        JoinOperator::TypedJoin {
-                                            join_type: join_type @ Some(JoinType::LeftOuter),
-                                            ..
-                                        },
-                                    ..
-                                }) => {
-                                    *join_type = Some(JoinType::Inner);
-                                }
-                                _ => (),
+                            if let Some(JoinedSelectTable {
+                                operator:
+                                    JoinOperator::TypedJoin {
+                                        join_type: join_type @ Some(JoinType::LeftOuter),
+                                        ..
+                                    },
+                                ..
+                            }) = joins.get_mut(idx - 1)
+                            {
+                                *join_type = Some(JoinType::Inner);
                             };
                         }
                         _ => (),
