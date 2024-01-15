@@ -24,8 +24,8 @@ use rusqlite::{
 use spawn::spawn_counted;
 use sqlite3_parser::{
     ast::{
-        As, Cmd, Expr, JoinConstraint, Name, OneSelect, Operator, QualifiedName, ResultColumn,
-        Select, SelectTable, Stmt,
+        As, Cmd, Expr, FromClause, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, Name,
+        OneSelect, Operator, QualifiedName, ResultColumn, Select, SelectTable, Stmt,
     },
     lexer::sql::Parser,
 };
@@ -609,7 +609,7 @@ impl Matcher {
             _ => unreachable!(),
         }
 
-        for (tbl_name, _cols) in parsed.table_columns.iter() {
+        for (idx, (tbl_name, _cols)) in parsed.table_columns.iter().enumerate() {
             let expr = table_to_expr(
                 &parsed.aliases,
                 schema
@@ -622,11 +622,35 @@ impl Matcher {
             let mut stmt = stmt.clone();
 
             if let Stmt::Select(select) = &mut stmt {
-                if let OneSelect::Select { where_clause, .. } = &mut select.body.select {
+                if let OneSelect::Select {
+                    where_clause, from, ..
+                } = &mut select.body.select
+                {
                     *where_clause = if let Some(prev) = where_clause.take() {
                         Some(Expr::Binary(Box::new(expr), Operator::And, Box::new(prev)))
                     } else {
                         Some(expr)
+                    };
+
+                    match from {
+                        Some(FromClause {
+                            joins: Some(joins), ..
+                        }) if idx > 0 => {
+                            match joins.get_mut(idx - 1) {
+                                Some(JoinedSelectTable {
+                                    operator:
+                                        JoinOperator::TypedJoin {
+                                            join_type: join_type @ Some(JoinType::LeftOuter),
+                                            ..
+                                        },
+                                    ..
+                                }) => {
+                                    *join_type = Some(JoinType::Inner);
+                                }
+                                _ => (),
+                            };
+                        }
+                        _ => (),
                     };
                 }
             }
