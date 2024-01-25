@@ -207,6 +207,17 @@ pub enum ExecResult {
     Execute { rows_affected: usize, time: f64 },
     Error { error: String },
 }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TableStatRequest {
+    pub tables: Vec<String>,
+}
+
+/// Contain node and sync status information
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TableStatResponse {
+    pub total_row_count: i64,
+    pub invalid_tables: Vec<String>,
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
 pub struct Change {

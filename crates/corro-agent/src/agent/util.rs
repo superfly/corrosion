@@ -21,7 +21,7 @@ use crate::{
         MAX_SYNC_BACKOFF, TO_CLEAR_COUNT,
     },
     api::public::{
-        api_v1_db_schema, api_v1_queries, api_v1_transactions,
+        api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
         pubsub::{api_v1_sub_by_id, api_v1_subs},
     },
     transport::Transport,
@@ -336,6 +336,20 @@ pub async fn setup_http_api_handler(
         .route(
             "/v1/migrations",
             post(api_v1_db_schema).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(4)),
+            ),
+        )
+        .route(
+            "/v1/table_stats",
+            post(api_v1_table_stats).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
