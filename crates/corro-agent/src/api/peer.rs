@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -1096,7 +1096,7 @@ pub async fn parallel_sync(
                                 .map(|need| (actor_id, need))
                                 .collect::<Vec<_>>()
                         })
-                        .collect::<Vec<_>>(),
+                        .collect::<VecDeque<_>>(),
                     tx,
                 ));
 
@@ -1132,7 +1132,19 @@ pub async fn parallel_sync(
                 if needs.is_empty() {
                     continue;
                 }
-                for (actor_id, need) in needs.drain(0..cmp::min(10, needs.len())) {
+
+                let mut drained = 0;
+
+                while drained < 10 {
+                    let (actor_id, need) = match needs.pop_front() {
+                        Some(popped) => popped,
+                        None => {
+                            break;
+                        }
+                    };
+
+                    drained += 1;
+
                     let actual_needs = match need {
                         SyncNeedV1::Full { versions } => {
                             let range = req_full.entry(actor_id).or_default();
