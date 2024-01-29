@@ -2,7 +2,7 @@ use corro_types::{
     agent::{Agent, Bookie},
     broadcast::{BroadcastV1, UniPayload, UniPayloadV1},
 };
-use metrics::{counter, histogram, increment_counter};
+use metrics::{counter, histogram};
 use speedy::Readable;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_stream::StreamExt;
@@ -36,7 +36,7 @@ pub fn spawn_unipayload_handler(
                     }
                 };
 
-                increment_counter!("corro.peer.stream.accept.total", "type" => "uni");
+                counter!("corro.peer.stream.accept.total", "type" => "uni").increment(1);
 
                 debug!(
                     "accepted a unidirectional stream from {}",
@@ -51,7 +51,8 @@ pub fn spawn_unipayload_handler(
                         loop {
                             match StreamExt::next(&mut framed).await {
                                 Some(Ok(b)) => {
-                                    counter!("corro.peer.stream.bytes.recv.total", b.len() as u64, "type" => "uni");
+                                    counter!("corro.peer.stream.bytes.recv.total", "type" => "uni")
+                                        .increment(b.len() as u64);
                                     match UniPayload::read_from_buffer(&b) {
                                         Ok(payload) => {
                                             trace!("parsed a payload: {payload:?}");
@@ -137,7 +138,7 @@ async fn handle_change(
                 None
             };
 
-            increment_counter!("corro.broadcast.recv.count", "kind" => "change");
+            counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
 
             trace!("handling {} changes", change.len());
 
@@ -169,7 +170,7 @@ async fn handle_change(
             }
 
             if let Some(diff) = diff {
-                histogram!("corro.broadcast.recv.lag.seconds", diff.as_secs_f64());
+                histogram!("corro.broadcast.recv.lag.seconds").record(diff.as_secs_f64());
             }
 
             // Otherwise pass it to handle_broadcasts

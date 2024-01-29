@@ -1369,7 +1369,7 @@ pub fn process_incomplete_version(
     }
 
     for (table_name, count) in changes_per_table {
-        counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
+        counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "remote").increment(count);
     }
 
     Ok(KnownDbVersion::Partial(PartialVersion {
@@ -1483,7 +1483,7 @@ pub fn process_complete_version(
     };
 
     for (table_name, count) in changes_per_table {
-        counter!("corro.changes.committed", count, "table" => table_name.to_string(), "source" => "remote");
+        counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "remote").increment(count);
     }
 
     Ok::<_, rusqlite::Error>((known_version, new_changeset))

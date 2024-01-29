@@ -2199,7 +2199,7 @@ impl Session {
                                 for (table_name, count) in
                                     changes.iter().counts_by(|change| &change.table)
                                 {
-                                    counter!("corro.changes.committed", count as u64, "table" => table_name.to_string(), "source" => "local");
+                                    counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "local").increment(count as u64);
                                 }
 
                                 trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");

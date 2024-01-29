@@ -265,28 +265,20 @@ pub fn runtime_loop(
                     Branch::Metrics => {
                         trace!("handling Branch::Metrics");
                         {
-                            gauge!("corro.gossip.members", foca.num_members() as f64);
-                            gauge!(
-                                "corro.gossip.member.states",
-                                foca.iter_membership_state().count() as f64
-                            );
-                            gauge!(
-                                "corro.gossip.updates_backlog",
-                                foca.updates_backlog() as f64
-                            );
+                            gauge!("corro.gossip.members").set(foca.num_members() as f64);
+                            gauge!("corro.gossip.member.states")
+                                .set(foca.iter_membership_state().count() as f64);
+                            gauge!("corro.gossip.updates_backlog")
+                                .set(foca.updates_backlog() as f64);
                         }
                         {
                             let config = config.read();
-                            gauge!(
-                                "corro.gossip.config.max_transmissions",
-                                config.max_transmissions.get() as f64
-                            );
-                            gauge!(
-                                "corro.gossip.config.num_indirect_probes",
-                                config.num_indirect_probes.get() as f64
-                            );
+                            gauge!("corro.gossip.config.max_transmissions")
+                                .set(config.max_transmissions.get() as f64);
+                            gauge!("corro.gossip.config.num_indirect_probes")
+                                .set(config.num_indirect_probes.get() as f64);
                         }
-                        gauge!("corro.gossip.cluster_size", last_cluster_size.get() as f64);
+                        gauge!("corro.gossip.cluster_size").set(last_cluster_size.get() as f64);
                     }
                     Branch::DiffMembers => {
                         diff_member_states(&agent, &foca, &mut last_states);
@@ -496,15 +488,10 @@ pub fn runtime_loop(
                 }
                 Branch::Metrics => {
                     trace!("handling Branch::Metrics");
-                    gauge!("corro.broadcast.pending.count", idle_pendings.len() as f64);
-                    gauge!(
-                        "corro.broadcast.buffer.capacity",
-                        bcast_buf.capacity() as f64
-                    );
-                    gauge!(
-                        "corro.broadcast.serialization.buffer.capacity",
-                        ser_buf.capacity() as f64
-                    );
+                    gauge!("corro.broadcast.pending.count").set(idle_pendings.len() as f64);
+                    gauge!("corro.broadcast.buffer.capacity").set(bcast_buf.capacity() as f64);
+                    gauge!("corro.broadcast.serialization.buffer.capacity")
+                        .set(ser_buf.capacity() as f64);
                 }
             }
 
@@ -750,7 +737,7 @@ async fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAd
             error!("could not write to uni stream to {addr}: {e}");
         }
         Ok(Ok(_)) => {
-            counter!("corro.peer.stream.bytes.sent.total", len as u64, "type" => "uni");
+            counter!("corro.peer.stream.bytes.sent.total", "type" => "uni").increment(len as u64);
         }
     }
 }
