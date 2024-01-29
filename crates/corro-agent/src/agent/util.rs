@@ -33,6 +33,7 @@ use corro_types::{
     broadcast::{
         BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaInput,
     },
+    channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
 };
@@ -56,7 +57,6 @@ use rusqlite::{
 use spawn::spawn_counted;
 use tokio::{
     net::TcpListener,
-    sync::mpsc::Receiver,
     task::block_in_place,
     time::{sleep, timeout},
 };
@@ -481,7 +481,7 @@ pub async fn sync_loop(
     agent: Agent,
     bookie: Bookie,
     transport: Transport,
-    mut rx_apply: Receiver<(ActorId, Version)>,
+    mut rx_apply: CorroReceiver<(ActorId, Version)>,
     mut tripwire: Tripwire,
 ) {
     let mut sync_backoff = backoff::Backoff::new(0)
@@ -559,7 +559,7 @@ pub async fn sync_loop(
 /// Compact the database by finding cleared versions
 pub async fn clear_buffered_meta_loop(
     agent: Agent,
-    mut rx_partials: Receiver<(ActorId, RangeInclusive<Version>)>,
+    mut rx_partials: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
 ) {
     while let Some((actor_id, versions)) = rx_partials.recv().await {
         let pool = agent.pool().clone();
@@ -619,7 +619,7 @@ pub async fn clear_buffered_meta_loop(
 /// periodically.
 pub async fn write_empties_loop(
     agent: Agent,
-    mut rx_empty: Receiver<(ActorId, RangeInclusive<Version>)>,
+    mut rx_empty: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
     mut tripwire: Tripwire,
 ) {
     let mut empties: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();

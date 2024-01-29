@@ -1,10 +1,10 @@
 use corro_types::{
     agent::{Agent, Bookie},
     broadcast::{BroadcastV1, UniPayload, UniPayloadV1},
+    channel::{CorroReceiver, CorroSender},
 };
 use metrics::{counter, histogram};
 use speedy::Readable;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace};
@@ -15,7 +15,7 @@ use tripwire::Tripwire;
 pub fn spawn_unipayload_handler(
     tripwire: &Tripwire,
     conn: &quinn::Connection,
-    process_uni_tx: Sender<UniPayload>,
+    process_uni_tx: CorroSender<UniPayload>,
 ) {
     tokio::spawn({
         let conn = conn.clone();
@@ -93,8 +93,8 @@ pub fn spawn_unipayload_handler(
 pub fn spawn_unipayload_message_decoder(
     agent: &Agent,
     bookie: &Bookie,
-    mut process_uni_rx: Receiver<UniPayload>,
-    bcast_msg_tx: Sender<BroadcastV1>,
+    mut process_uni_rx: CorroReceiver<UniPayload>,
+    bcast_msg_tx: CorroSender<BroadcastV1>,
 ) {
     tokio::spawn({
         let agent = agent.clone();
@@ -119,7 +119,7 @@ async fn handle_change(
     agent: &Agent,
     bookie: &Bookie,
     bcast: BroadcastV1,
-    bcast_msg_tx: &Sender<BroadcastV1>,
+    bcast_msg_tx: &CorroSender<BroadcastV1>,
 ) {
     match bcast {
         BroadcastV1::Change(change) => {

@@ -17,16 +17,14 @@ use corro_types::{
     agent::{Agent, BookedVersions, Bookie},
     base::CrsqlSeq,
     broadcast::BroadcastV1,
+    channel::bounded,
     config::Config,
     pubsub::{Matcher, SubsManager},
 };
 
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use spawn::spawn_counted;
-use tokio::{
-    sync::{mpsc::channel, RwLock as TokioRwLock},
-    task::block_in_place,
-};
+use tokio::{sync::RwLock as TokioRwLock, task::block_in_place};
 use tracing::{error, info};
 use tripwire::Tripwire;
 
@@ -77,11 +75,10 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
         );
     }
 
-    //// TODO: turn channels into a named and counted resource
-    let (to_send_tx, to_send_rx) = channel(10240);
-    let (notifications_tx, notifications_rx) = channel(10240);
-    let (bcast_msg_tx, bcast_msg_rx) = channel::<BroadcastV1>(10240);
-    let (process_uni_tx, process_uni_rx) = channel(10240);
+    let (to_send_tx, to_send_rx) = bounded(10240, "to_send");
+    let (notifications_tx, notifications_rx) = bounded(10240, "notifications");
+    let (bcast_msg_tx, bcast_msg_rx) = bounded::<BroadcastV1>(10240, "bcast_msg");
+    let (process_uni_tx, process_uni_rx) = bounded(10240, "process_uni");
 
     //// Start the main SWIM runtime loop
     runtime_loop(

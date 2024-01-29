@@ -17,6 +17,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
     broadcast::{BroadcastV1, ChangeSource, ChangeV1, FocaInput, UniPayload},
+    channel::{CorroReceiver, CorroSender},
     sync::generate_sync,
 };
 
@@ -25,10 +26,7 @@ use foca::Notification;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use spawn::spawn_counted;
-use tokio::{
-    sync::mpsc::{Receiver, Sender},
-    task::block_in_place,
-};
+use tokio::{sync::mpsc::Receiver as TokioReceiver, task::block_in_place};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
@@ -40,7 +38,7 @@ pub fn spawn_gossipserver_handler(
     bookie: &Bookie,
     tripwire: &Tripwire,
     gossip_server_endpoint: quinn::Endpoint,
-    process_uni_tx: Sender<UniPayload>,
+    process_uni_tx: CorroSender<UniPayload>,
 ) {
     spawn_counted({
         let agent = agent.clone();
@@ -85,7 +83,7 @@ pub fn spawn_incoming_connection_handlers(
     agent: &Agent,
     bookie: &Bookie,
     tripwire: &Tripwire,
-    process_uni_tx: Sender<UniPayload>,
+    process_uni_tx: CorroSender<UniPayload>,
     connecting: quinn::Connecting,
 ) {
     let process_uni_tx = process_uni_tx.clone();
@@ -118,7 +116,7 @@ pub fn spawn_incoming_connection_handlers(
 
 /// Spawn a single task that accepts chunks from a receiver and
 /// updates cluster member round-trip-times in the agent state.
-pub fn spawn_rtt_handler(agent: &Agent, rtt_rx: Receiver<(SocketAddr, Duration)>) {
+pub fn spawn_rtt_handler(agent: &Agent, rtt_rx: TokioReceiver<(SocketAddr, Duration)>) {
     tokio::spawn({
         let agent = agent.clone();
         async move {
@@ -228,7 +226,7 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
 // TODO: we may be able to inline this code where it is needed
 pub async fn handle_gossip_to_send(
     transport: Transport,
-    mut swim_to_send_rx: Receiver<(Actor, Bytes)>,
+    mut swim_to_send_rx: CorroReceiver<(Actor, Bytes)>,
 ) {
     // TODO: use tripwire and drain messages to send when that happens...
     while let Some((actor, data)) = swim_to_send_rx.recv().await {
@@ -257,7 +255,7 @@ pub async fn handle_gossip_to_send(
 
 /// Take changesets from other nodes and passes them to tx_changes
 // TODO: may not be needed anymore
-pub async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>) {
+pub async fn handle_broadcasts(agent: Agent, mut bcast_rx: CorroReceiver<BroadcastV1>) {
     while let Some(bcast) = bcast_rx.recv().await {
         counter!("corro.broadcast.recv.count").increment(1);
         match bcast {
@@ -279,7 +277,7 @@ pub async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>
 /// and apply any incoming changes to the local actor/ agent state.
 pub async fn handle_notifications(
     agent: Agent,
-    mut notification_rx: Receiver<Notification<Actor>>,
+    mut notification_rx: CorroReceiver<Notification<Actor>>,
 ) {
     while let Some(notification) = notification_rx.recv().await {
         trace!("handle notification");
@@ -400,7 +398,7 @@ pub fn spawn_handle_db_cleanup(pool: SplitPool) {
 pub async fn handle_changes(
     agent: Agent,
     bookie: Bookie,
-    mut rx_changes: Receiver<(ChangeV1, ChangeSource)>,
+    mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     mut tripwire: Tripwire,
 ) {
     let mut buf = vec![];

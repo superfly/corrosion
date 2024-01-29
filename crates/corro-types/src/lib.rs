@@ -4,6 +4,7 @@ pub mod agent;
 pub mod api;
 pub mod broadcast;
 pub mod change;
+pub mod channel;
 pub mod config;
 pub mod members;
 pub mod pubsub;
