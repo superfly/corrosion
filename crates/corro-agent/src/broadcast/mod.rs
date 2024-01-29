@@ -3,7 +3,10 @@ use std::{
     net::SocketAddr,
     num::NonZeroU32,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -152,11 +155,14 @@ pub fn runtime_loop(
         }
     });
 
+    let cluster_size = Arc::new(AtomicU32::new(1));
+
     // foca SWIM operations loop.
     // NOTE: every turn of that loop should be fast or else we risk being a down suspect
     spawn_counted({
         let config = config.clone();
         let agent = agent.clone();
+        let cluster_size = cluster_size.clone();
         let mut tripwire = tripwire.clone();
         async move {
             let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
@@ -242,6 +248,8 @@ pub fn runtime_loop(
                                     *config = new_config;
                                 }
                             }
+
+                            cluster_size.store(size.get(), Ordering::Release);
                         }
                         FocaInput::ApplyMany(updates) => {
                             trace!("handling FocaInput::ApplyMany");
@@ -455,14 +463,16 @@ pub fn runtime_loop(
 
                         local_bcast_buf.extend_from_slice(&payload);
 
-                        let members = agent.members().read();
-                        for addr in members.ring0() {
-                            // this spawns, so we won't be holding onto the read lock for long
-                            tokio::spawn(transmit_broadcast(
-                                payload.clone(),
-                                transport.clone(),
-                                addr,
-                            ));
+                        {
+                            let members = agent.members().read();
+                            for addr in members.ring0() {
+                                // this spawns, so we won't be holding onto the read lock for long
+                                tokio::spawn(transmit_broadcast(
+                                    payload.clone(),
+                                    transport.clone(),
+                                    addr,
+                                ));
+                            }
                         }
 
                         if local_bcast_buf.len() >= BROADCAST_CUTOFF {
@@ -502,7 +512,10 @@ pub fn runtime_loop(
                 let (member_count, max_transmissions) = {
                     let config = config.read();
                     (
-                        config.num_indirect_probes.get(),
+                        std::cmp::max(
+                            config.num_indirect_probes.get(),
+                            cluster_size.load(Ordering::Acquire) as usize / 10,
+                        ),
                         config.max_transmissions.get(),
                     )
                 };
