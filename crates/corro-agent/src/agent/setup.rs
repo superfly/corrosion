@@ -8,7 +8,7 @@ use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{
-        mpsc::{channel, Receiver},
+        mpsc::{channel as tokio_channel, Receiver as TokioReceiver},
         Semaphore,
     },
 };
@@ -22,6 +22,7 @@ use corro_types::{
     agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
     base::Version,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
+    channel::{bounded, CorroReceiver},
     config::Config,
     members::Members,
     pubsub::SubsManager,
@@ -36,13 +37,13 @@ pub struct AgentOptions {
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
     pub api_listener: TcpListener,
-    pub rx_bcast: Receiver<BroadcastInput>,
-    pub rx_apply: Receiver<(ActorId, Version)>,
-    pub rx_empty: Receiver<(ActorId, RangeInclusive<Version>)>,
-    pub rx_clear_buf: Receiver<(ActorId, RangeInclusive<Version>)>,
-    pub rx_changes: Receiver<(ChangeV1, ChangeSource)>,
-    pub rx_foca: Receiver<FocaInput>,
-    pub rtt_rx: Receiver<(SocketAddr, Duration)>,
+    pub rx_bcast: CorroReceiver<BroadcastInput>,
+    pub rx_apply: CorroReceiver<(ActorId, Version)>,
+    pub rx_empty: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
+    pub rx_clear_buf: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
+    pub rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
+    pub rx_foca: CorroReceiver<FocaInput>,
+    pub rtt_rx: TokioReceiver<(SocketAddr, Duration)>,
     pub subs_manager: SubsManager,
     pub tripwire: Tripwire,
 }
@@ -80,8 +81,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         schema
     };
 
-    let (tx_apply, rx_apply) = channel(20480);
-    let (tx_clear_buf, rx_clear_buf) = channel(10240);
+    let (tx_apply, rx_apply) = bounded(20480, "apply");
+    let (tx_clear_buf, rx_clear_buf) = bounded(10240, "clear_buf");
 
     let lock_registry = LockRegistry::default();
     let booked = {
@@ -92,139 +93,14 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         )
     };
 
-    // let mut bk: HashMap<ActorId, BookedVersions> = HashMap::new();
-
-    // {
-    //     debug!("getting read-only conn for pull bookkeeping rows");
-    //     let mut conn = pool.write_priority().await?;
-
-    //     debug!("getting bookkept rows");
-
-    //     let mut cleared_rows: BTreeMap<ActorId, usize> = BTreeMap::new();
-
-    //     {
-    //         let mut prepped = conn.prepare_cached(
-    //             "SELECT actor_id, start_version, end_version, db_version, last_seq, ts
-    //             FROM __corro_bookkeeping",
-    //         )?;
-    //         let mut rows = prepped.query([])?;
-
-    //         loop {
-    //             let row = rows.next()?;
-    //             match row {
-    //                 None => break,
-    //                 Some(row) => {
-    //                     let actor_id = row.get(0)?;
-    //                     let ranges = bk.entry(actor_id).or_default();
-    //                     let start_v = row.get(1)?;
-    //                     let end_v: Option<Version> = row.get(2)?;
-    //                     ranges.insert_many(
-    //                         start_v..=end_v.unwrap_or(start_v),
-    //                         match row.get(3)? {
-    //                             Some(db_version) => KnownDbVersion::Current(CurrentVersion {
-    //                                 db_version,
-    //                                 last_seq: row.get(4)?,
-    //                                 ts: row.get(5)?,
-    //                             }),
-    //                             None => {
-    //                                 *cleared_rows.entry(actor_id).or_default() += 1;
-    //                                 KnownDbVersion::Cleared
-    //                             }
-    //                         },
-    //                     );
-    //                 }
-    //             }
-    //         }
-
-    //         let mut partials: HashMap<
-    //             (ActorId, Version),
-    //             (RangeInclusiveSet<CrsqlSeq>, CrsqlSeq, Timestamp),
-    //         > = HashMap::new();
-
-    //         debug!("getting seq bookkept rows");
-
-    //         let mut prepped = conn.prepare_cached(
-    //             "SELECT site_id, version, start_seq, end_seq, last_seq, ts
-    //             FROM __corro_seq_bookkeeping",
-    //         )?;
-    //         let mut rows = prepped.query([])?;
-
-    //         loop {
-    //             let row = rows.next()?;
-    //             match row {
-    //                 None => break,
-    //                 Some(row) => {
-    //                     let (range, last_seq, ts) =
-    //                         partials.entry((row.get(0)?, row.get(1)?)).or_default();
-
-    //                     range.insert(row.get(2)?..=row.get(3)?);
-    //                     *last_seq = row.get(4)?;
-    //                     *ts = row.get(5)?;
-    //                 }
-    //             }
-    //         }
-
-    //         debug!("filling up partial known versions");
-
-    //         for ((actor_id, version), (seqs, last_seq, ts)) in partials {
-    //             debug!(%actor_id, %version, "looking at partials (seq: {seqs:?}, last_seq: {last_seq})");
-    //             let ranges = bk.entry(actor_id).or_default();
-
-    //             if let Some(known) = ranges.get(&version) {
-    //                 warn!(%actor_id, %version, "found partial data that has been applied, clearing buffered meta, known: {known:?}");
-
-    //                 _ = tx_clear_buf.try_send((actor_id, version..=version));
-    //                 continue;
-    //             }
-
-    //             let gaps_count = seqs.gaps(&(CrsqlSeq(0)..=last_seq)).count();
-
-    //             ranges.insert(
-    //                 version,
-    //                 KnownDbVersion::Partial(PartialVersion { seqs, last_seq, ts }),
-    //             );
-
-    //             if gaps_count == 0 {
-    //                 info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
-    //                 // spawn this because it can block if the channel gets full, nothing is draining it yet!
-    //                 tokio::spawn({
-    //                     let tx_apply = tx_apply.clone();
-    //                     async move {
-    //                         let _ = tx_apply.send((actor_id, version)).await;
-    //                     }
-    //                 });
-    //             }
-    //         }
-    //     }
-
-    //     for (actor_id, booked) in bk.iter() {
-    //         if let Some(clear_count) = cleared_rows.get(actor_id).copied() {
-    //             if clear_count > booked.cleared.len() {
-    //                 warn!(%actor_id, "cleared bookkept rows count ({clear_count}) in DB was bigger than in-memory entries count ({}), compacting...", booked.cleared.len());
-    //                 let tx = conn.immediate_transaction()?;
-    //                 let deleted = tx.execute("DELETE FROM __corro_bookkeeping WHERE actor_id = ? AND end_version IS NOT NULL", [actor_id])?;
-    //                 info!("deleted {deleted} rows that had an end_version");
-    //                 let mut inserted = 0;
-    //                 for range in booked.cleared.iter() {
-    //                     inserted += tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) VALUES (?, ?, ?)", params![actor_id, range.start(), range.end()])?;
-    //                 }
-    //                 info!("inserted {inserted} cleared version rows");
-    //                 tx.commit()?;
-    //             }
-    //         }
-    //     }
-    // }
-
-    // debug!("done building bookkeeping");
-
-    // let bookie = Bookie::new(bk);
-
     let gossip_server_endpoint = gossip_server_endpoint(&conf.gossip).await?;
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
     let external_addr = conf.gossip.external_addr;
 
-    let (rtt_tx, rtt_rx) = channel(128);
+    // RTT handling interacts with the tokio ReceiverStream and as
+    // such needs a raw tokio channel
+    let (rtt_tx, rtt_rx) = tokio_channel(128);
 
     let transport = Transport::new(&conf.gossip, rtt_tx).await?;
 
@@ -238,10 +114,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             .build(),
     );
 
-    let (tx_bcast, rx_bcast) = channel(10240);
-    let (tx_empty, rx_empty) = channel(10240);
-    let (tx_changes, rx_changes) = channel(5192);
-    let (tx_foca, rx_foca) = channel(10240);
+    let (tx_bcast, rx_bcast) = bounded(10240, "bcast");
+    let (tx_empty, rx_empty) = bounded(10240, "empty");
+    let (tx_changes, rx_changes) = bounded(5192, "changes");
+    let (tx_foca, rx_foca) = bounded(10240, "foca");
 
     let subs_manager = SubsManager::default();
 

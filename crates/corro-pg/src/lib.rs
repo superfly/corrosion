@@ -2181,6 +2181,7 @@ impl Session {
                 let conn = agent.pool().read().await?;
 
                 block_in_place(|| {
+                    let agent = agent.clone();
                     // TODO: make this more generic so both sync and local changes can use it.
                     let mut prepped = conn.prepare_cached(
                         r#"

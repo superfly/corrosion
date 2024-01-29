@@ -16,13 +16,14 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use time::OffsetDateTime;
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::mpsc;
 use tracing::{error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
     actor::{Actor, ActorId},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
+    channel::CorroSender,
     sync::SyncTraceContextV1,
 };
 
@@ -345,9 +346,9 @@ pub enum BroadcastInput {
 }
 
 pub struct DispatchRuntime<T> {
-    pub to_send: Sender<(T, Bytes)>,
-    pub to_schedule: Sender<(Duration, Timer<T>)>,
-    pub notifications: Sender<Notification<T>>,
+    pub to_send: CorroSender<(T, Bytes)>,
+    pub to_schedule: CorroSender<(Duration, Timer<T>)>,
+    pub notifications: CorroSender<Notification<T>>,
     pub active: bool,
     pub buf: BytesMut,
 }
@@ -392,9 +393,9 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
 
 impl<T> DispatchRuntime<T> {
     pub fn new(
-        to_send: Sender<(T, Bytes)>,
-        to_schedule: Sender<(Duration, Timer<T>)>,
-        notifications: Sender<Notification<T>>,
+        to_send: CorroSender<(T, Bytes)>,
+        to_schedule: CorroSender<(Duration, Timer<T>)>,
+        notifications: CorroSender<Notification<T>>,
     ) -> Self {
         Self {
             to_send,

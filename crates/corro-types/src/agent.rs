@@ -27,10 +27,7 @@ use tokio::sync::{
 };
 use tokio::{
     runtime::Handle,
-    sync::{
-        mpsc::{channel, Sender},
-        oneshot, Semaphore,
-    },
+    sync::{oneshot, Semaphore},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error};
@@ -40,6 +37,7 @@ use crate::{
     actor::ActorId,
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
+    channel::{bounded, CorroSender},
     config::Config,
     pubsub::SubsManager,
     schema::Schema,
@@ -63,12 +61,12 @@ pub struct AgentConfig {
 
     pub booked: Booked,
 
-    pub tx_bcast: Sender<BroadcastInput>,
-    pub tx_apply: Sender<(ActorId, Version)>,
-    pub tx_empty: Sender<(ActorId, RangeInclusive<Version>)>,
-    pub tx_clear_buf: Sender<(ActorId, RangeInclusive<Version>)>,
-    pub tx_changes: Sender<(ChangeV1, ChangeSource)>,
-    pub tx_foca: Sender<FocaInput>,
+    pub tx_bcast: CorroSender<BroadcastInput>,
+    pub tx_apply: CorroSender<(ActorId, Version)>,
+    pub tx_empty: CorroSender<(ActorId, RangeInclusive<Version>)>,
+    pub tx_clear_buf: CorroSender<(ActorId, RangeInclusive<Version>)>,
+    pub tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    pub tx_foca: CorroSender<FocaInput>,
 
     pub write_sema: Arc<Semaphore>,
 
@@ -89,12 +87,12 @@ pub struct AgentInner {
     members: RwLock<Members>,
     clock: Arc<uhlc::HLC>,
     booked: Booked,
-    tx_bcast: Sender<BroadcastInput>,
-    tx_apply: Sender<(ActorId, Version)>,
-    tx_empty: Sender<(ActorId, RangeInclusive<Version>)>,
-    tx_clear_buf: Sender<(ActorId, RangeInclusive<Version>)>,
-    tx_changes: Sender<(ChangeV1, ChangeSource)>,
-    tx_foca: Sender<FocaInput>,
+    tx_bcast: CorroSender<BroadcastInput>,
+    tx_apply: CorroSender<(ActorId, Version)>,
+    tx_empty: CorroSender<(ActorId, RangeInclusive<Version>)>,
+    tx_clear_buf: CorroSender<(ActorId, RangeInclusive<Version>)>,
+    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    tx_foca: CorroSender<FocaInput>,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     limits: Limits,
@@ -158,27 +156,27 @@ impl Agent {
         self.0.api_addr
     }
 
-    pub fn tx_bcast(&self) -> &Sender<BroadcastInput> {
+    pub fn tx_bcast(&self) -> &CorroSender<BroadcastInput> {
         &self.0.tx_bcast
     }
 
-    pub fn tx_apply(&self) -> &Sender<(ActorId, Version)> {
+    pub fn tx_apply(&self) -> &CorroSender<(ActorId, Version)> {
         &self.0.tx_apply
     }
 
-    pub fn tx_changes(&self) -> &Sender<(ChangeV1, ChangeSource)> {
+    pub fn tx_changes(&self) -> &CorroSender<(ChangeV1, ChangeSource)> {
         &self.0.tx_changes
     }
 
-    pub fn tx_empty(&self) -> &Sender<(ActorId, RangeInclusive<Version>)> {
+    pub fn tx_empty(&self) -> &CorroSender<(ActorId, RangeInclusive<Version>)> {
         &self.0.tx_empty
     }
 
-    pub fn tx_clear_buf(&self) -> &Sender<(ActorId, RangeInclusive<Version>)> {
+    pub fn tx_clear_buf(&self) -> &CorroSender<(ActorId, RangeInclusive<Version>)> {
         &self.0.tx_clear_buf
     }
 
-    pub fn tx_foca(&self) -> &Sender<FocaInput> {
+    pub fn tx_foca(&self) -> &CorroSender<FocaInput> {
         &self.0.tx_foca
     }
 
@@ -422,9 +420,9 @@ struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
 
-    priority_tx: Sender<oneshot::Sender<CancellationToken>>,
-    normal_tx: Sender<oneshot::Sender<CancellationToken>>,
-    low_tx: Sender<oneshot::Sender<CancellationToken>>,
+    priority_tx: CorroSender<oneshot::Sender<CancellationToken>>,
+    normal_tx: CorroSender<oneshot::Sender<CancellationToken>>,
+    low_tx: CorroSender<oneshot::Sender<CancellationToken>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -487,9 +485,9 @@ impl SplitPool {
     }
 
     fn new(path: PathBuf, write_sema: Arc<Semaphore>, read: SqlitePool, write: SqlitePool) -> Self {
-        let (priority_tx, mut priority_rx) = channel(256);
-        let (normal_tx, mut normal_rx) = channel(512);
-        let (low_tx, mut low_rx) = channel(1024);
+        let (priority_tx, mut priority_rx) = bounded(256, "priority");
+        let (normal_tx, mut normal_rx) = bounded(512, "normal");
+        let (low_tx, mut low_rx) = bounded(1024, "low");
 
         tokio::spawn(async move {
             loop {
@@ -572,7 +570,7 @@ impl SplitPool {
 
     async fn write_inner(
         &self,
-        chan: &Sender<oneshot::Sender<CancellationToken>>,
+        chan: &CorroSender<oneshot::Sender<CancellationToken>>,
         queue: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();

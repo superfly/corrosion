@@ -22,7 +22,7 @@ use spawn::spawn_counted;
 use speedy::Writable;
 use strum::EnumDiscriminants;
 use tokio::{
-    sync::mpsc::{self, channel, Receiver, Sender},
+    sync::mpsc,
     task::{block_in_place, LocalSet},
     time::interval,
 };
@@ -35,6 +35,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
+    channel::{bounded, CorroReceiver, CorroSender},
 };
 
 use crate::transport::Transport;
@@ -90,7 +91,7 @@ impl TimerSpawner {
 fn handle_timer(
     foca: &mut Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, NoCustomBroadcast>,
     runtime: &mut DispatchRuntime<Actor>,
-    timer_rx: &mut Receiver<(Timer<Actor>, Instant)>,
+    timer_rx: &mut mpsc::Receiver<(Timer<Actor>, Instant)>,
     timer: Timer<Actor>,
     seq: Instant,
 ) {
@@ -117,10 +118,10 @@ pub fn runtime_loop(
     actor: Actor,
     agent: Agent,
     transport: Transport,
-    mut rx_foca: Receiver<FocaInput>,
-    mut rx_bcast: Receiver<BroadcastInput>,
-    to_send_tx: Sender<(Actor, Bytes)>,
-    notifications_tx: Sender<Notification<Actor>>,
+    mut rx_foca: CorroReceiver<FocaInput>,
+    mut rx_bcast: CorroReceiver<BroadcastInput>,
+    to_send_tx: CorroSender<(Actor, Bytes)>,
+    notifications_tx: CorroSender<Notification<Actor>>,
     mut tripwire: Tripwire,
 ) {
     debug!("starting runtime loop for actor: {actor:?}");
@@ -137,12 +138,12 @@ pub fn runtime_loop(
         NoCustomBroadcast,
     );
 
-    let (to_schedule_tx, mut to_schedule_rx) = channel(10240);
+    let (to_schedule_tx, mut to_schedule_rx) = bounded(10240, "to_schedule");
 
     let mut runtime: DispatchRuntime<Actor> =
         DispatchRuntime::new(to_send_tx, to_schedule_tx, notifications_tx);
 
-    let (timer_tx, mut timer_rx) = channel(10);
+    let (timer_tx, mut timer_rx) = mpsc::channel(10);
     let timer_spawner = TimerSpawner::new(timer_tx);
 
     tokio::spawn(async move {
