@@ -123,6 +123,11 @@ async fn handle_change(
 ) {
     match bcast {
         BroadcastV1::Change(change) => {
+            // If the change originated from us we're done
+            if change.actor_id == agent.actor_id() {
+                return;
+            }
+
             let diff = if let Some(ts) = change.ts() {
                 if let Ok(id) = change.actor_id.try_into() {
                     Some(
@@ -144,29 +149,27 @@ async fn handle_change(
 
             let booked = {
                 bookie
-                    .write(format!(
-                        "handle_change(for_actor):{}",
+                    .read(format!(
+                        "handle_change(get):{}",
                         change.actor_id.as_simple()
                     ))
                     .await
-                    .for_actor(change.actor_id)
+                    .get(&change.actor_id)
+                    .cloned()
             };
 
-            if booked
-                .read(format!(
-                    "handle_change(contains?):{}",
-                    change.actor_id.as_simple()
-                ))
-                .await
-                .contains_all(change.versions(), change.seqs())
-            {
-                trace!("already seen, stop disseminating");
-                return;
-            }
-
-            // If the change originated from us we're done
-            if change.actor_id == agent.actor_id() {
-                return;
+            if let Some(booked) = booked {
+                if booked
+                    .read(format!(
+                        "handle_change(contains?):{}",
+                        change.actor_id.as_simple()
+                    ))
+                    .await
+                    .contains_all(change.versions(), change.seqs())
+                {
+                    trace!("already seen, stop disseminating");
+                    return;
+                }
             }
 
             if let Some(diff) = diff {

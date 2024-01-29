@@ -1219,7 +1219,7 @@ pub struct BookieInner {
 }
 
 impl BookieInner {
-    pub fn for_actor(&mut self, actor_id: ActorId) -> Booked {
+    pub fn ensure(&mut self, actor_id: ActorId) -> Booked {
         self.map
             .entry(actor_id)
             .or_insert_with(|| {

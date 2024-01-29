@@ -858,11 +858,11 @@ pub async fn process_fully_buffered_changes(
     let booked = {
         bookie
             .write(format!(
-                "process_fully_buffered(for_actor):{}",
+                "process_fully_buffered(ensure):{}",
                 actor_id.as_simple()
             ))
             .await
-            .for_actor(actor_id)
+            .ensure(actor_id)
     };
 
     let mut bookedw = booked
@@ -1007,11 +1007,11 @@ pub async fn process_multiple_changes(
         }
         if bookie
             .write(format!(
-                "process_multiple_changes(for_actor):{}",
+                "process_multiple_changes(ensure):{}",
                 change.actor_id.as_simple()
             ))
             .await
-            .for_actor(change.actor_id)
+            .ensure(change.actor_id)
             .read(format!(
                 "process_multiple_changes(contains?):{}",
                 change.actor_id.as_simple()
@@ -1057,7 +1057,7 @@ pub async fn process_multiple_changes(
                             "process_multiple_changes(for_actor_blocking):{}",
                             actor_id.as_simple()
                         ))
-                        .for_actor(actor_id)
+                        .ensure(actor_id)
                 };
                 let booked_write = booked.blocking_write(format!(
                     "process_multiple_changes(booked writer):{}",
@@ -1198,7 +1198,7 @@ pub async fn process_multiple_changes(
                         "process_multiple_changes(for_actor_blocking):{}",
                         actor_id.as_simple()
                     ))
-                    .for_actor(actor_id)
+                    .ensure(actor_id)
             };
             let mut booked_write = booked.blocking_write(format!(
                 "process_multiple_changes(booked writer, post commit):{}",

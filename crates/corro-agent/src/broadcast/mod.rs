@@ -511,12 +511,14 @@ pub fn runtime_loop(
 
                 let (member_count, max_transmissions) = {
                     let config = config.read();
+                    let members = agent.members().read();
+                    let ring0_count = members.ring0().count();
                     let max_transmissions = config.max_transmissions.get();
                     (
                         std::cmp::max(
                             config.num_indirect_probes.get(),
-                            cluster_size.load(Ordering::Acquire) as usize
-                                / (max_transmissions * 4) as usize,
+                            (cluster_size.load(Ordering::Acquire) as usize - ring0_count)
+                                / (max_transmissions as usize * 5),
                         ),
                         max_transmissions,
                     )
