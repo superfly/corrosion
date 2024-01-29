@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, HashSet},
     net::SocketAddr,
     num::NonZeroU32,
     pin::Pin,
@@ -516,7 +516,7 @@ pub fn runtime_loop(
                         std::cmp::max(
                             config.num_indirect_probes.get(),
                             cluster_size.load(Ordering::Acquire) as usize
-                                / (max_transmissions * 3) as usize,
+                                / (max_transmissions * 4) as usize,
                         ),
                         max_transmissions,
                     )
@@ -530,7 +530,11 @@ pub fn runtime_loop(
                         .iter()
                         .filter_map(|(member_id, state)| {
                             // don't broadcast to ourselves... or ring0 if local broadcast
-                            if *member_id == actor_id || (pending.is_local && state.is_ring0()) {
+                            if *member_id == actor_id
+                                || (pending.is_local && state.is_ring0())
+                                || pending.sent_to.contains(&state.addr)
+                            // don't resend
+                            {
                                 None
                             } else {
                                 Some(state.addr)
@@ -540,29 +544,29 @@ pub fn runtime_loop(
                 };
 
                 for addr in broadcast_to {
-                    debug!(actor = %actor_id, "broadcasting {} bytes to: {addr} (send count: {})", pending.payload.len(), pending.send_count);
+                    debug!(actor = %actor_id, "broadcasting {} bytes to: {addr}", pending.payload.len());
 
                     tokio::spawn(transmit_broadcast(
                         pending.payload.clone(),
                         transport.clone(),
                         addr,
                     ));
+
+                    pending.sent_to.insert(addr);
                 }
 
-                pending.send_count = pending.send_count.wrapping_add(1);
+                if let Some(send_count) = pending.send_count.checked_add(1) {
+                    trace!("send_count: {send_count}, max_transmissions: {max_transmissions}");
+                    pending.send_count = send_count;
 
-                trace!(
-                    "send_count: {}, max_transmissions: {max_transmissions}",
-                    pending.send_count
-                );
-
-                if pending.send_count < max_transmissions {
-                    debug!("queueing for re-send");
-                    idle_pendings.push(Box::pin(async move {
-                        // FIXME: calculate sleep duration based on send count
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        pending
-                    }));
+                    if send_count < max_transmissions {
+                        debug!("queueing for re-send");
+                        idle_pendings.push(Box::pin(async move {
+                            // FIXME: calculate sleep duration based on send count
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            pending
+                        }));
+                    }
                 }
             }
         }
@@ -719,6 +723,7 @@ fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
 struct PendingBroadcast {
     payload: Bytes,
     is_local: bool,
+    sent_to: HashSet<SocketAddr>,
     send_count: u8,
 }
 
@@ -727,6 +732,7 @@ impl PendingBroadcast {
         Self {
             payload,
             is_local: false,
+            sent_to: Default::default(),
             send_count: 0,
         }
     }
@@ -735,6 +741,7 @@ impl PendingBroadcast {
         Self {
             payload,
             is_local: true,
+            sent_to: Default::default(),
             send_count: 0,
         }
     }
