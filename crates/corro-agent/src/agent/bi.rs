@@ -80,6 +80,7 @@ pub fn spawn_bipayload_handler(
                                                         "framed read buffer len: {}",
                                                         framed.read_buffer().len()
                                                     );
+
                                                     // println!("got sync state: {state:?}");
                                                     if let Err(e) = serve_sync(
                                                         &agent, &bookie, actor_id, trace_ctx,

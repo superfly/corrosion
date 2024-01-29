@@ -1222,6 +1222,9 @@ pub async fn parallel_sync(
                         error!(%server_actor_id, %addr, "could not write sync requests: {e} (elapsed: {:?})", start.elapsed());
                         continue;
                     }
+                } else {
+                    // give some reprieve
+                    tokio::task::yield_now().await;
                 }
 
                 if needs.is_empty() {
@@ -1344,6 +1347,25 @@ pub async fn serve_sync(
     }
 
     trace!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "read clock");
+
+    let _permit = match agent.limits().sync.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            // no permits!
+            encode_write_sync_msg(
+                &mut codec,
+                &mut encode_buf,
+                &mut send_buf,
+                SyncMessage::V1(SyncMessageV1::Rejection(
+                    SyncRejectionV1::MaxConcurrencyReached,
+                )),
+                &mut write,
+            )
+            .instrument(info_span!("write_sync_rejection"))
+            .await?;
+            return Ok(0);
+        }
+    };
 
     let sync_state = generate_sync(bookie, agent.actor_id()).await;
 
