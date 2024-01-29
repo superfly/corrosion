@@ -22,7 +22,7 @@ use corro_types::{
 
 use bytes::Bytes;
 use foca::Notification;
-use metrics::{counter, gauge, histogram, increment_counter};
+use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use spawn::spawn_counted;
 use tokio::{
@@ -105,7 +105,7 @@ pub fn spawn_incoming_connection_handlers(
             }
         };
 
-        increment_counter!("corro.peer.connection.accept.total");
+        counter!("corro.peer.connection.accept.total").increment(1);
 
         debug!("accepted a QUIC conn from {remote_addr}");
 
@@ -148,8 +148,8 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
                 let b = tokio::select! {
                     b_res = conn.read_datagram() => match b_res {
                         Ok(b) => {
-                            increment_counter!("corro.peer.datagram.recv.total");
-                            counter!("corro.peer.datagram.bytes.recv.total", b.len() as u64);
+                            counter!("corro.peer.datagram.recv.total").increment(1);
+                            counter!("corro.peer.datagram.bytes.recv.total").increment(b.len() as u64);
                             b
                         },
                         Err(e) => {
@@ -177,7 +177,7 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
 /// beginning, get a full picture of the cluster, then stop spamming
 /// everyone.
 ///
-/// 
+///
 pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
     tokio::spawn({
         let agent = agent.clone();
@@ -226,7 +226,10 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
 
 /// A central dispatcher for SWIM cluster management messages
 // TODO: we may be able to inline this code where it is needed
-pub async fn handle_gossip_to_send(transport: Transport, mut swim_to_send_rx: Receiver<(Actor, Bytes)>) {
+pub async fn handle_gossip_to_send(
+    transport: Transport,
+    mut swim_to_send_rx: Receiver<(Actor, Bytes)>,
+) {
     // TODO: use tripwire and drain messages to send when that happens...
     while let Some((actor, data)) = swim_to_send_rx.recv().await {
         trace!("got gossip to send to {actor:?}");
@@ -237,14 +240,18 @@ pub async fn handle_gossip_to_send(transport: Transport, mut swim_to_send_rx: Re
         let transport = transport.clone();
 
         let len = data.len();
-        spawn_counted(async move {
-            if let Err(e) = transport.send_datagram(addr, data).await {
-                error!("could not write datagram {addr}: {e}");
-                return;
+        spawn_counted(
+            async move {
+                if let Err(e) = transport.send_datagram(addr, data).await {
+                    error!("could not write datagram {addr}: {e}");
+                    return;
+                }
+                counter!("corro.peer.datagram.sent.total", "actor_id" => actor_id.to_string())
+                    .increment(1);
+                counter!("corro.peer.datagram.bytes.sent.total").increment(len as u64);
             }
-            increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor_id.to_string());
-            counter!("corro.peer.datagram.bytes.sent.total", len as u64);
-        }.instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)));
+            .instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)),
+        );
     }
 }
 
@@ -252,7 +259,7 @@ pub async fn handle_gossip_to_send(transport: Transport, mut swim_to_send_rx: Re
 // TODO: may not be needed anymore
 pub async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>) {
     while let Some(bcast) = bcast_rx.recv().await {
-        increment_counter!("corro.broadcast.recv.count");
+        counter!("corro.broadcast.recv.count").increment(1);
         match bcast {
             BroadcastV1::Change(change) => {
                 if let Err(_e) = agent
@@ -282,7 +289,7 @@ pub async fn handle_notifications(
                 trace!("Member Up {actor:?} (added: {added})");
                 if added {
                     debug!("Member Up {actor:?}");
-                    increment_counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
+                    counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
                     // actually added a member
                     // notify of new cluster size
                     let members_len = { agent.members().read().states.len() as u32 };
@@ -305,14 +312,14 @@ pub async fn handle_notifications(
                         warn!(?actor, "could not manually declare actor as down! {e}");
                     }
                 }
-                increment_counter!("corro.swim.notification", "type" => "memberup");
+                counter!("corro.swim.notification", "type" => "memberup").increment(1);
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
                 trace!("Member Down {actor:?} (removed: {removed})");
                 if removed {
                     debug!("Member Down {actor:?}");
-                    increment_counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
+                    counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
                     // actually removed a member
                     // notify of new cluster size
                     let member_len = { agent.members().read().states.len() as u32 };
@@ -322,24 +329,24 @@ pub async fn handle_notifications(
                         }
                     }
                 }
-                increment_counter!("corro.swim.notification", "type" => "memberdown");
+                counter!("corro.swim.notification", "type" => "memberdown").increment(1);
             }
             Notification::Active => {
                 info!("Current node is considered ACTIVE");
-                increment_counter!("corro.swim.notification", "type" => "active");
+                counter!("corro.swim.notification", "type" => "active").increment(1);
             }
             Notification::Idle => {
                 warn!("Current node is considered IDLE");
-                increment_counter!("corro.swim.notification", "type" => "idle");
+                counter!("corro.swim.notification", "type" => "idle").increment(1);
             }
             // this happens when we leave the cluster
             Notification::Defunct => {
                 debug!("Current node is considered DEFUNCT");
-                increment_counter!("corro.swim.notification", "type" => "defunct");
+                counter!("corro.swim.notification", "type" => "defunct").increment(1);
             }
             Notification::Rejoin(id) => {
                 info!("Rejoined the cluster with id: {id:?}");
-                increment_counter!("corro.swim.notification", "type" => "rejoin");
+                counter!("corro.swim.notification", "type" => "rejoin").increment(1);
             }
         }
     }
@@ -359,13 +366,10 @@ async fn db_cleanup(pool: &SplitPool) -> eyre::Result<()> {
             conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
         if busy {
             warn!("could not truncate sqlite WAL, database busy");
-            increment_counter!("corro.db.wal.truncate.busy");
+            counter!("corro.db.wal.truncate.busy").increment(1);
         } else {
             debug!("successfully truncated sqlite WAL!");
-            histogram!(
-                "corro.db.wal.truncate.seconds",
-                start.elapsed().as_secs_f64()
-            );
+            histogram!("corro.db.wal.truncate.seconds").record(start.elapsed().as_secs_f64());
         }
         Ok::<_, eyre::Report>(())
     })?;
@@ -407,7 +411,7 @@ pub async fn handle_changes(
     loop {
         tokio::select! {
             Some((change, src)) = rx_changes.recv() => {
-                counter!("corro.agent.changes.recv", std::cmp::max(change.len(), 1) as u64); // count empties...
+                counter!("corro.agent.changes.recv").increment(std::cmp::max(change.len(), 1) as u64); // count empties...
                 count += change.len(); // don't count empties
                 buf.push((change, src));
                 if count < MIN_CHANGES_CHUNK {
@@ -445,7 +449,7 @@ pub async fn handle_changes(
     // drain!
     while let Ok((change, src)) = rx_changes.try_recv() {
         let changes_count = std::cmp::max(change.len(), 1);
-        counter!("corro.agent.changes.recv", changes_count as u64);
+        counter!("corro.agent.changes.recv").increment(changes_count as u64);
         count += changes_count;
         buf.push((change, src));
         if count >= MIN_CHANGES_CHUNK {
@@ -481,10 +485,11 @@ pub async fn handle_sync(
     let sync_state = generate_sync(bookie, agent.actor_id()).await;
 
     for (actor_id, needed) in sync_state.need.iter() {
-        gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.to_string());
+        gauge!("corro.sync.client.needed", "actor_id" => actor_id.to_string())
+            .set(needed.len() as f64);
     }
     for (actor_id, version) in sync_state.heads.iter() {
-        gauge!("corro.sync.client.head", version.0 as f64, "actor_id" => actor_id.to_string());
+        gauge!("corro.sync.client.head", "actor_id" => actor_id.to_string()).set(version.0 as f64);
     }
 
     let chosen: Vec<(ActorId, SocketAddr)> = {

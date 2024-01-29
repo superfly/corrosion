@@ -188,7 +188,7 @@ impl SubsManager {
 
             // metrics...
             for (table, pks) in candidates.iter() {
-                counter!("corro.subs.changes.matched.count", pks.len() as u64, "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string());
+                counter!("corro.subs.changes.matched.count", "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string()).increment(pks.len() as u64);
             }
 
             trace!(sub_id = %id, %db_version, "found {match_count} candidates");

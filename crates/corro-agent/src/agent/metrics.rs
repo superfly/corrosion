@@ -37,7 +37,7 @@ pub fn collect_metrics(agent: &Agent, transport: &Transport) {
             .and_then(|mut prepped| prepped.query_row([], |row| row.get::<_, i64>(0)))
         {
             Ok(count) => {
-                gauge!("corro.db.table.rows.total", count as f64, "table" => table.clone());
+                gauge!("corro.db.table.rows.total", "table" => table.clone()).set(count as f64);
             }
             Err(e) => {
                 error!("could not query count for table {table}: {e}");
@@ -58,7 +58,7 @@ pub fn collect_metrics(agent: &Agent, transport: &Transport) {
         }) {
         Ok(mapped) => {
             for (actor_id, count) in mapped {
-                gauge!("corro.db.buffered.changes.rows.total", count as f64, "actor_id" => actor_id.to_string())
+                gauge!("corro.db.buffered.changes.rows.total", "actor_id" => actor_id.to_string()).set(count as f64)
             }
         }
         Err(e) => {

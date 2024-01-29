@@ -8,7 +8,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use corro_api_types::Change;
 use foca::{Identity, Member, Notification, Runtime, Timer};
-use metrics::increment_counter;
+use metrics::counter;
 use rusqlite::{
     types::{FromSql, FromSqlError},
     ToSql,
@@ -364,7 +364,8 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
             _ => {}
         };
         if let Err(e) = self.notifications.try_send(notification) {
-            increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications");
+            counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications")
+                .increment(1);
             error!("error dispatching notification: {e}");
         }
     }
@@ -374,14 +375,16 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
         self.buf.extend_from_slice(data);
 
         if let Err(e) = self.to_send.try_send((to, self.buf.split().freeze())) {
-            increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_send");
+            counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_send")
+                .increment(1);
             error!("error dispatching broadcast packet: {e}");
         }
     }
 
     fn submit_after(&mut self, event: Timer<T>, after: Duration) {
         if let Err(e) = self.to_schedule.try_send((after, event)) {
-            increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_schedule");
+            counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_schedule")
+                .increment(1);
             error!("error dispatching scheduled event: {e}");
         }
     }

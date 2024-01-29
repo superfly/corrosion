@@ -518,29 +518,14 @@ impl SplitPool {
 
     pub fn emit_metrics(&self) {
         let read_state = self.0.read.status();
-        gauge!("corro.sqlite.pool.read.connections", read_state.size as f64);
-        gauge!(
-            "corro.sqlite.pool.read.connections.available",
-            read_state.available as f64
-        );
-        gauge!(
-            "corro.sqlite.pool.read.connections.waiting",
-            read_state.waiting as f64
-        );
+        gauge!("corro.sqlite.pool.read.connections").set(read_state.size as f64);
+        gauge!("corro.sqlite.pool.read.connections.available").set(read_state.available as f64);
+        gauge!("corro.sqlite.pool.read.connections.waiting").set(read_state.waiting as f64);
 
         let write_state = self.0.write.status();
-        gauge!(
-            "corro.sqlite.pool.write.connections",
-            write_state.size as f64
-        );
-        gauge!(
-            "corro.sqlite.pool.write.connections.available",
-            write_state.available as f64
-        );
-        gauge!(
-            "corro.sqlite.pool.write.connections.waiting",
-            write_state.waiting as f64
-        );
+        gauge!("corro.sqlite.pool.write.connections").set(write_state.size as f64);
+        gauge!("corro.sqlite.pool.write.connections.available").set(write_state.available as f64);
+        gauge!("corro.sqlite.pool.write.connections.waiting").set(write_state.waiting as f64);
     }
 
     // get a read-only connection
@@ -594,15 +579,14 @@ impl SplitPool {
         chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
         let start = Instant::now();
         let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
-        histogram!("corro.sqlite.pool.queue.seconds", start.elapsed().as_secs_f64(), "queue" => queue);
+        histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
+            .record(start.elapsed().as_secs_f64());
         let conn = self.0.write.get().await?;
 
         let start = Instant::now();
         let _permit = self.0.write_sema.clone().acquire_owned().await?;
-        histogram!(
-            "corro.sqlite.write_permit.acquisition.seconds",
-            start.elapsed().as_secs_f64()
-        );
+        histogram!("corro.sqlite.write_permit.acquisition.seconds")
+            .record(start.elapsed().as_secs_f64());
 
         Ok(WriteConn {
             conn,
