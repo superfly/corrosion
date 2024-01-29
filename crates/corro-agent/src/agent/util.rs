@@ -49,7 +49,7 @@ use foca::Member;
 use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use itertools::Itertools;
-use metrics::counter;
+use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{
     named_params, params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction,
@@ -993,6 +993,8 @@ pub async fn process_multiple_changes(
     bookie: &Bookie,
     changes: Vec<(ChangeV1, ChangeSource)>,
 ) -> Result<(), ChangeError> {
+    let start = Instant::now();
+    counter!("corro.agent.changes.processing.started").increment(changes.len() as u64);
     debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
     let mut seen = HashSet::new();
@@ -1248,6 +1250,8 @@ pub async fn process_multiple_changes(
             }
         }
     }
+
+    histogram!("corro.agent.changes.processing.time.seconds").record(start.elapsed());
 
     Ok(())
 }
