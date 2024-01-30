@@ -427,13 +427,12 @@ pub async fn handle_changes(
             Some((change, src)) = rx_changes.recv() => {
                 let change_len = change.len();
                 counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
-                count += change_len; // don't count empties
 
                 if change.actor_id == agent.actor_id() {
                     continue;
                 }
 
-                let diff = matches!(src, ChangeSource::Broadcast).then(|| change
+                let recv_lag = matches!(src, ChangeSource::Broadcast).then(|| change
                     .ts()
                     .map(|ts| (agent.clock().new_timestamp().get_time() - ts.0).to_duration())).flatten();
 
@@ -466,17 +465,18 @@ pub async fn handle_changes(
                     }
                 }
 
-                if let Some(diff) = diff {
-                    histogram!("corro.broadcast.recv.lag.seconds").record(diff.as_secs_f64());
+                if let Some(recv_lag) = recv_lag {
+                    histogram!("corro.broadcast.recv.lag.seconds").record(recv_lag.as_secs_f64());
                 }
 
                 queue.push_back((change, src));
+                count += change_len; // don't count empties
             },
 
             _ = max_wait.tick() => {
                 // got a wait interval tick...
 
-                gauge!("corro.agent.changes.queued").set(count as f64);
+                gauge!("corro.agent.changes.in_queue").set(count as f64);
 
                 if count < MIN_CHANGES_CHUNK && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     debug!(%count, "spawning processing multiple changes from max wait interval");

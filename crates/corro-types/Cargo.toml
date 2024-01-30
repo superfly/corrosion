@@ -49,7 +49,6 @@ tracing = { workspace = true }
 tripwire = { version = "0.1.0-alpha.0", path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }
-cuckoofilter = { version = "0.5.0" }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

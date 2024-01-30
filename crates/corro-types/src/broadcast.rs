@@ -70,54 +70,9 @@ pub enum AuthzV1 {
     Token(String),
 }
 
-// pub struct Recipients {
-//     filter: cuckoofilter::CuckooFilter<seahash::SeaHasher>,
-// }
-
-// impl<'a, C> Readable<'a, C> for Recipients
-// where
-//     C: Context,
-// {
-//     #[inline]
-//     fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
-//         Ok(Recipients {
-//             filter: ExportedCuckooFilter {
-//                 values: Readable::read_from(reader)?,
-//                 length: usize::read_from(reader)?,
-//             }
-//             .into(),
-//         })
-//     }
-
-//     #[inline]
-//     fn minimum_bytes_needed() -> usize {
-//         Vec::<u8>::minimum_bytes_needed() + usize::minimum_bytes_needed()
-//     }
-// }
-
-// impl<C> Writable<C> for Recipients
-// where
-//     C: Context,
-// {
-//     #[inline]
-//     fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
-//         let export = self.filter.export();
-//         export.values.write_to(writer)?;
-//         export.length.write_to(writer)?;
-//         Ok(())
-//     }
-
-//     #[inline]
-//     fn bytes_needed(&self) -> Result<usize, C::Error> {}
-// }
-
 #[derive(Clone, Debug, Readable, Writable)]
 pub enum BroadcastV1 {
-    Change(ChangeV1), // Change {
-                      //     change: ChangeV1,
-                      //     #[speedy(default_on_eof)]
-                      //     recipients: Recipients,
-                      // },
+    Change(ChangeV1),
 }
 
 #[derive(Debug, Clone, Copy)]
