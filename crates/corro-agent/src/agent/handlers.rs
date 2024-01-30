@@ -513,6 +513,7 @@ pub async fn handle_changes(
                 // got a wait interval tick...
 
                 gauge!("corro.agent.changes.in_queue").set(count as f64);
+                gauge!("corro.agent.changesets.in_queue").set(queue.len() as f64);
                 gauge!("corro.agent.changes.processing.jobs").set(join_set.len() as f64);
 
                 if count < MIN_CHANGES_CHUNK && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
