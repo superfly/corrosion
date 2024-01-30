@@ -376,7 +376,7 @@ pub async fn handle_changes(
     mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     mut tripwire: Tripwire,
 ) {
-    const MIN_CHANGES_CHUNK: usize = 500;
+    const MIN_CHANGES_CHUNK: usize = 2000;
     let mut queue: VecDeque<(ChangeV1, ChangeSource)> = VecDeque::new();
     let mut buf = vec![];
     let mut count = 0;
@@ -421,6 +421,7 @@ pub async fn handle_changes(
                 if let Some(Err(e)) = res {
                     error!("could not process multiple changes: {e}");
                 }
+                continue;
             },
 
             Some((change, src)) = rx_changes.recv() => {
