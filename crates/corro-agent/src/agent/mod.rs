@@ -38,8 +38,6 @@ pub const RANDOM_NODES_CHOICES: usize = 10;
 pub const CHECK_EMPTIES_TO_INSERT_AFTER: Duration = Duration::from_secs(120);
 pub const TO_CLEAR_COUNT: usize = 1000;
 
-pub const MIN_CHANGES_CHUNK: usize = 1000;
-
 pub type BcastCache = Arc<RwLock<HashMap<Uuid, Sender<(Bytes, QueryEventMeta)>>>>;
 
 #[derive(Clone)]

@@ -70,12 +70,13 @@ pub enum AuthzV1 {
     Token(String),
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Clone, Debug, Readable, Writable)]
 pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ChangeSource {
     Broadcast,
     Sync,

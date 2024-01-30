@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -1096,7 +1096,7 @@ pub async fn parallel_sync(
                                 .map(|need| (actor_id, need))
                                 .collect::<Vec<_>>()
                         })
-                        .collect::<Vec<_>>(),
+                        .collect::<VecDeque<_>>(),
                     tx,
                 ));
 
@@ -1132,7 +1132,19 @@ pub async fn parallel_sync(
                 if needs.is_empty() {
                     continue;
                 }
-                for (actor_id, need) in needs.drain(0..cmp::min(10, needs.len())) {
+
+                let mut drained = 0;
+
+                while drained < 10 {
+                    let (actor_id, need) = match needs.pop_front() {
+                        Some(popped) => popped,
+                        None => {
+                            break;
+                        }
+                    };
+
+                    drained += 1;
+
                     let actual_needs = match need {
                         SyncNeedV1::Full { versions } => {
                             let range = req_full.entry(actor_id).or_default();
@@ -1210,6 +1222,9 @@ pub async fn parallel_sync(
                         error!(%server_actor_id, %addr, "could not write sync requests: {e} (elapsed: {:?})", start.elapsed());
                         continue;
                     }
+                } else {
+                    // give some reprieve
+                    tokio::task::yield_now().await;
                 }
 
                 if needs.is_empty() {
@@ -1332,6 +1347,25 @@ pub async fn serve_sync(
     }
 
     trace!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "read clock");
+
+    let _permit = match agent.limits().sync.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            // no permits!
+            encode_write_sync_msg(
+                &mut codec,
+                &mut encode_buf,
+                &mut send_buf,
+                SyncMessage::V1(SyncMessageV1::Rejection(
+                    SyncRejectionV1::MaxConcurrencyReached,
+                )),
+                &mut write,
+            )
+            .instrument(info_span!("write_sync_rejection"))
+            .await?;
+            return Ok(0);
+        }
+    };
 
     let sync_state = generate_sync(bookie, agent.actor_id()).await;
 
@@ -1580,8 +1614,8 @@ mod tests {
         let bookie = Bookie::new(Default::default());
 
         process_multiple_changes(
-            &agent,
-            &bookie,
+            agent.clone(),
+            bookie.clone(),
             vec![
                 (
                     ChangeV1 {
@@ -1595,6 +1629,7 @@ mod tests {
                         },
                     },
                     ChangeSource::Sync,
+                    Instant::now(),
                 ),
                 (
                     ChangeV1 {
@@ -1608,6 +1643,7 @@ mod tests {
                         },
                     },
                     ChangeSource::Sync,
+                    Instant::now(),
                 ),
             ],
         )

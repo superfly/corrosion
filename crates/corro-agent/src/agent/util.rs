@@ -30,9 +30,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{
-        BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaInput,
-    },
+    broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaInput},
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
@@ -49,7 +47,7 @@ use foca::Member;
 use futures::{FutureExt, TryFutureExt};
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use itertools::Itertools;
-use metrics::counter;
+use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{
     named_params, params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction,
@@ -649,6 +647,8 @@ pub async fn write_empties_loop(
         }
 
         let empties_to_process = std::mem::take(&mut empties);
+
+        // TODO: replace with a JoinSet and max concurrency
         spawn_counted(
             process_completed_empties(agent.clone(), empties_to_process)
                 .inspect_err(|e| error!("could not process empties: {e}")),
@@ -684,7 +684,7 @@ pub async fn process_completed_empties(
     for (actor_id, empties) in empties {
         let v = empties.into_iter().collect::<Vec<_>>();
 
-        for ranges in v.chunks(50) {
+        for ranges in v.chunks(25) {
             let mut conn = agent.pool().write_low().await?;
             block_in_place(|| {
                 let mut tx = conn.immediate_transaction()?;
@@ -858,11 +858,11 @@ pub async fn process_fully_buffered_changes(
     let booked = {
         bookie
             .write(format!(
-                "process_fully_buffered(for_actor):{}",
+                "process_fully_buffered(ensure):{}",
                 actor_id.as_simple()
             ))
             .await
-            .for_actor(actor_id)
+            .ensure(actor_id)
     };
 
     let mut bookedw = booked
@@ -989,15 +989,18 @@ pub async fn process_fully_buffered_changes(
 
 #[tracing::instrument(skip(agent, bookie, changes), err)]
 pub async fn process_multiple_changes(
-    agent: &Agent,
-    bookie: &Bookie,
-    changes: Vec<(ChangeV1, ChangeSource)>,
+    agent: Agent,
+    bookie: Bookie,
+    changes: Vec<(ChangeV1, ChangeSource, Instant)>,
 ) -> Result<(), ChangeError> {
-    debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _)| cmp::max(change.len(), 1)).sum::<usize>());
+    let start = Instant::now();
+    counter!("corro.agent.changes.processing.started").increment(changes.len() as u64);
+    debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
     let mut seen = HashSet::new();
     let mut unknown_changes = Vec::with_capacity(changes.len());
-    for (change, src) in changes {
+    for (change, src, queued_at) in changes {
+        histogram!("corro.agent.changes.queued.seconds").record(queued_at.elapsed());
         let versions = change.versions();
         let seqs = change.seqs();
         if !seen.insert((change.actor_id, versions, seqs.cloned())) {
@@ -1005,11 +1008,11 @@ pub async fn process_multiple_changes(
         }
         if bookie
             .write(format!(
-                "process_multiple_changes(for_actor):{}",
+                "process_multiple_changes(ensure):{}",
                 change.actor_id.as_simple()
             ))
             .await
-            .for_actor(change.actor_id)
+            .ensure(change.actor_id)
             .read(format!(
                 "process_multiple_changes(contains?):{}",
                 change.actor_id.as_simple()
@@ -1055,7 +1058,7 @@ pub async fn process_multiple_changes(
                             "process_multiple_changes(for_actor_blocking):{}",
                             actor_id.as_simple()
                         ))
-                        .for_actor(actor_id)
+                        .ensure(actor_id)
                 };
                 let booked_write = booked.blocking_write(format!(
                     "process_multiple_changes(booked writer):{}",
@@ -1109,7 +1112,7 @@ pub async fn process_multiple_changes(
                         }
 
                         let (known, versions) = match process_single_version(
-                            agent,
+                            &agent,
                             &tx,
                             last_db_version,
                             change,
@@ -1187,6 +1190,13 @@ pub async fn process_multiple_changes(
             version: None,
         })?;
 
+        for (_, changeset, _, _) in changesets.iter() {
+            if let Some(ts) = changeset.ts() {
+                let dur = (agent.clock().new_timestamp().get_time() - ts.0).to_duration();
+                histogram!("corro.agent.changes.commit.lag.seconds").record(dur);
+            }
+        }
+
         debug!("committed {count} changes in {:?}", start.elapsed());
 
         for (actor_id, knowns) in knowns {
@@ -1196,7 +1206,7 @@ pub async fn process_multiple_changes(
                         "process_multiple_changes(for_actor_blocking):{}",
                         actor_id.as_simple()
                     ))
-                    .for_actor(actor_id)
+                    .ensure(actor_id)
             };
             let mut booked_write = booked.blocking_write(format!(
                 "process_multiple_changes(booked writer, post commit):{}",
@@ -1230,24 +1240,13 @@ pub async fn process_multiple_changes(
         Ok::<_, ChangeError>(changesets)
     })?;
 
-    for (actor_id, changeset, db_version, src) in changesets {
+    for (_actor_id, changeset, db_version, _src) in changesets {
         agent
             .subs_manager()
             .match_changes(changeset.changes(), db_version);
-
-        if matches!(src, ChangeSource::Broadcast) && !changeset.is_empty() {
-            if let Err(_e) =
-                agent
-                    .tx_bcast()
-                    .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
-                        actor_id,
-                        changeset,
-                    })))
-            {
-                debug!("broadcasts are full or done!");
-            }
-        }
     }
+
+    histogram!("corro.agent.changes.processing.time.seconds").record(start.elapsed());
 
     Ok(())
 }

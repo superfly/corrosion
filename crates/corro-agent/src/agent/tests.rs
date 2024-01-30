@@ -412,7 +412,7 @@ async fn stress_test() -> eyre::Result<()> {
                 ta.bookie
                     .write("test")
                     .await
-                    .for_actor(ta.agent.actor_id())
+                    .ensure(ta.agent.actor_id())
                     .read("test")
                     .await
                     .last()

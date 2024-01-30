@@ -30,7 +30,7 @@ impl MemberState {
     }
 }
 
-const RING_BUCKETS: [Range<u64>; 6] = [0..5, 5..15, 15..50, 50..100, 100..200, 200..300];
+const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 200..300];
 
 #[derive(Debug, Default, Clone)]
 pub struct Rtt {
@@ -126,7 +126,6 @@ impl Members {
                 })
             }) {
                 if let Some(state) = self.states.get_mut(actor_id) {
-
                     // We check which range-bucket the RTT is
                     // contained in, then update the stored index
                     for (ring, n) in RING_BUCKETS.iter().enumerate() {

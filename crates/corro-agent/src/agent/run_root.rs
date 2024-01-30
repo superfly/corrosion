@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_cleanup},
-        metrics, setup, uni, util, AgentOptions,
+        metrics, setup, util, AgentOptions,
     },
     api::public::pubsub::{
         process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache,
@@ -16,7 +16,6 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, BookedVersions, Bookie},
     base::CrsqlSeq,
-    broadcast::BroadcastV1,
     channel::bounded,
     config::Config,
     pubsub::{Matcher, SubsManager},
@@ -77,8 +76,6 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
 
     let (to_send_tx, to_send_rx) = bounded(10240, "to_send");
     let (notifications_tx, notifications_rx) = bounded(10240, "notifications");
-    let (bcast_msg_tx, bcast_msg_rx) = bounded::<BroadcastV1>(10240, "bcast_msg");
-    let (process_uni_tx, process_uni_rx) = bounded(10240, "process_uni");
 
     //// Start the main SWIM runtime loop
     runtime_loop(
@@ -131,7 +128,6 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
         agent.clone(),
         notifications_rx,
     ));
-    tokio::spawn(handlers::handle_broadcasts(agent.clone(), bcast_msg_rx));
 
     spawn_handle_db_cleanup(agent.pool().clone());
 
@@ -202,16 +198,7 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
 
     //// Start an incoming (corrosion) connection handler.  This
     //// future tree spawns additional message type sub-handlers
-    handlers::spawn_gossipserver_handler(
-        &agent,
-        &bookie,
-        &tripwire,
-        gossip_server_endpoint,
-        process_uni_tx,
-    );
-
-    //// Start async uni-broadcast message decoder
-    uni::spawn_unipayload_message_decoder(&agent, &bookie, process_uni_rx, bcast_msg_tx);
+    handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
 
     spawn_counted(handlers::handle_changes(
         agent.clone(),
