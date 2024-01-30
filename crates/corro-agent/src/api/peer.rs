@@ -1629,6 +1629,7 @@ mod tests {
                         },
                     },
                     ChangeSource::Sync,
+                    Instant::now(),
                 ),
                 (
                     ChangeV1 {
@@ -1642,6 +1643,7 @@ mod tests {
                         },
                     },
                     ChangeSource::Sync,
+                    Instant::now(),
                 ),
             ],
         )

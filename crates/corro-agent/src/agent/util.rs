@@ -30,9 +30,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{
-        BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaInput,
-    },
+    broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaInput},
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
@@ -991,15 +989,16 @@ pub async fn process_fully_buffered_changes(
 pub async fn process_multiple_changes(
     agent: Agent,
     bookie: Bookie,
-    changes: Vec<(ChangeV1, ChangeSource)>,
+    changes: Vec<(ChangeV1, ChangeSource, Instant)>,
 ) -> Result<(), ChangeError> {
     let start = Instant::now();
     counter!("corro.agent.changes.processing.started").increment(changes.len() as u64);
-    debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _)| cmp::max(change.len(), 1)).sum::<usize>());
+    debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
     let mut seen = HashSet::new();
     let mut unknown_changes = Vec::with_capacity(changes.len());
-    for (change, src) in changes {
+    for (change, src, queued_at) in changes {
+        histogram!("corro.agent.changes.queued.seconds").record(queued_at.elapsed());
         let versions = change.versions();
         let seqs = change.seqs();
         if !seen.insert((change.actor_id, versions, seqs.cloned())) {
@@ -1189,6 +1188,13 @@ pub async fn process_multiple_changes(
             version: None,
         })?;
 
+        for (_, changeset, _, _) in changesets.iter() {
+            if let Some(ts) = changeset.ts() {
+                let dur = (agent.clock().new_timestamp().get_time() - ts.0).to_duration();
+                histogram!("corro.agent.changes.commit.lag.seconds").record(dur);
+            }
+        }
+
         debug!("committed {count} changes in {:?}", start.elapsed());
 
         for (actor_id, knowns) in knowns {
@@ -1232,23 +1238,10 @@ pub async fn process_multiple_changes(
         Ok::<_, ChangeError>(changesets)
     })?;
 
-    for (actor_id, changeset, db_version, src) in changesets {
+    for (_actor_id, changeset, db_version, _src) in changesets {
         agent
             .subs_manager()
             .match_changes(changeset.changes(), db_version);
-
-        if matches!(src, ChangeSource::Broadcast) && !changeset.is_empty() {
-            if let Err(_e) =
-                agent
-                    .tx_bcast()
-                    .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
-                        actor_id,
-                        changeset,
-                    })))
-            {
-                debug!("broadcasts are full or done!");
-            }
-        }
     }
 
     histogram!("corro.agent.changes.processing.time.seconds").record(start.elapsed());

@@ -18,7 +18,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{ChangeSource, ChangeV1, FocaInput},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
     channel::CorroReceiver,
     sync::generate_sync,
 };
@@ -380,7 +380,7 @@ pub async fn handle_changes(
     mut tripwire: Tripwire,
 ) {
     const MIN_CHANGES_CHUNK: usize = 2000;
-    let mut queue: VecDeque<(ChangeV1, ChangeSource)> = VecDeque::new();
+    let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
     let mut count = 0;
 
@@ -401,9 +401,9 @@ pub async fn handle_changes(
             // so we want to accumulate at least that much and process them
             // concurrently bvased on MAX_CONCURRENCY
             let mut tmp_count = 0;
-            while let Some((change, src)) = queue.pop_front() {
+            while let Some((change, src, queued_at)) = queue.pop_front() {
                 tmp_count += change.len();
-                buf.push((change, src));
+                buf.push((change, src, queued_at));
                 if tmp_count >= MIN_CHANGES_CHUNK {
                     break;
                 }
@@ -504,7 +504,17 @@ pub async fn handle_changes(
                     }
                 }
 
-                queue.push_back((change, src));
+                if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
+                    if let Err(_e) =
+                        agent
+                            .tx_bcast()
+                            .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(change.clone())))
+                    {
+                        debug!("broadcasts are full or done!");
+                    }
+                }
+
+                queue.push_back((change, src, Instant::now()));
 
                 count += change_len; // track number of individual changes, not changesets
             },
@@ -550,7 +560,7 @@ pub async fn handle_changes(
         let changes_count = std::cmp::max(change.len(), 1);
         counter!("corro.agent.changes.recv").increment(changes_count as u64);
         count += changes_count;
-        queue.push_back((change, src));
+        queue.push_back((change, src, Instant::now()));
         if count >= MIN_CHANGES_CHUNK {
             // drain and process current changes!
             if let Err(e) = util::process_multiple_changes(
