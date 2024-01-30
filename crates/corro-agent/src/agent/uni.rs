@@ -1,13 +1,12 @@
 use corro_types::{
-    agent::{Agent, Bookie},
-    broadcast::{BroadcastV1, UniPayload, UniPayloadV1},
-    channel::{CorroReceiver, CorroSender},
+    broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
+    channel::CorroSender,
 };
-use metrics::{counter, histogram};
+use metrics::counter;
 use speedy::Readable;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, trace};
 use tripwire::Tripwire;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
@@ -15,7 +14,7 @@ use tripwire::Tripwire;
 pub fn spawn_unipayload_handler(
     tripwire: &Tripwire,
     conn: &quinn::Connection,
-    process_uni_tx: CorroSender<UniPayload>,
+    changes_tx: CorroSender<(ChangeV1, ChangeSource)>,
 ) {
     tokio::spawn({
         let conn = conn.clone();
@@ -44,7 +43,7 @@ pub fn spawn_unipayload_handler(
                 );
 
                 tokio::spawn({
-                    let process_uni_tx = process_uni_tx.clone();
+                    let changes_tx = changes_tx.clone();
                     async move {
                         let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
 
@@ -57,12 +56,20 @@ pub fn spawn_unipayload_handler(
                                         Ok(payload) => {
                                             trace!("parsed a payload: {payload:?}");
 
-                                            if let Err(e) = process_uni_tx.send(payload).await {
-                                                error!(
-                                                    "could not send UniPayload for processing: {e}"
-                                                );
-                                                // this means we won't be able to process more...
-                                                return;
+                                            match payload {
+                                                UniPayload::V1(UniPayloadV1::Broadcast(
+                                                    BroadcastV1::Change(change),
+                                                )) => {
+                                                    if let Err(e) = changes_tx
+                                                        .send((change, ChangeSource::Broadcast))
+                                                        .await
+                                                    {
+                                                        error!(
+                                                            "could not send change for processing: {e}"
+                                                        );
+                                                        return;
+                                                    }
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -82,104 +89,4 @@ pub fn spawn_unipayload_handler(
             }
         }
     });
-}
-
-/// Start an async buffer task that pull messages from one channel
-/// (process_uni_rx) and moves them into the next if the variant
-/// matches (bcast_msg_tx)
-///
-/// This task may not be needed anymore, but decouples broadcast
-/// receivers and handlers, so we may still want to keep it.
-pub fn spawn_unipayload_message_decoder(
-    agent: &Agent,
-    bookie: &Bookie,
-    mut process_uni_rx: CorroReceiver<UniPayload>,
-    bcast_msg_tx: CorroSender<BroadcastV1>,
-) {
-    tokio::spawn({
-        let agent = agent.clone();
-        let bookie = bookie.clone();
-        async move {
-            while let Some(payload) = process_uni_rx.recv().await {
-                match payload {
-                    UniPayload::V1(UniPayloadV1::Broadcast(bcast)) => {
-                        handle_change(&agent, &bookie, bcast, &bcast_msg_tx).await
-                    }
-                }
-            }
-
-            info!("uni payload process loop is done!");
-        }
-    });
-}
-
-/// Apply a single broadcast to the local actor state, then
-/// re-broadcast to other cluster members via the bcast_msg_tx channel
-async fn handle_change(
-    agent: &Agent,
-    bookie: &Bookie,
-    bcast: BroadcastV1,
-    bcast_msg_tx: &CorroSender<BroadcastV1>,
-) {
-    match bcast {
-        BroadcastV1::Change(change) => {
-            // If the change originated from us we're done
-            if change.actor_id == agent.actor_id() {
-                return;
-            }
-
-            let diff = if let Some(ts) = change.ts() {
-                if let Ok(id) = change.actor_id.try_into() {
-                    Some(
-                        agent
-                            .clock()
-                            .new_timestamp()
-                            .get_diff_duration(&uhlc::Timestamp::new(ts.0, id)),
-                    )
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
-
-            trace!("handling {} changes", change.len());
-
-            let booked = {
-                bookie
-                    .read(format!(
-                        "handle_change(get):{}",
-                        change.actor_id.as_simple()
-                    ))
-                    .await
-                    .get(&change.actor_id)
-                    .cloned()
-            };
-
-            if let Some(booked) = booked {
-                if booked
-                    .read(format!(
-                        "handle_change(contains?):{}",
-                        change.actor_id.as_simple()
-                    ))
-                    .await
-                    .contains_all(change.versions(), change.seqs())
-                {
-                    trace!("already seen, stop disseminating");
-                    return;
-                }
-            }
-
-            if let Some(diff) = diff {
-                histogram!("corro.broadcast.recv.lag.seconds").record(diff.as_secs_f64());
-            }
-
-            // Otherwise pass it to handle_broadcasts
-            if let Err(e) = bcast_msg_tx.send(BroadcastV1::Change(change)).await {
-                error!("could not send change message through broadcast channel: {e}");
-            }
-        }
-    }
 }

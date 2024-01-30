@@ -16,8 +16,8 @@ use crate::{
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
-    broadcast::{BroadcastV1, ChangeSource, ChangeV1, FocaInput, UniPayload},
-    channel::{CorroReceiver, CorroSender},
+    broadcast::{ChangeSource, ChangeV1, FocaInput},
+    channel::CorroReceiver,
     sync::generate_sync,
 };
 
@@ -38,7 +38,6 @@ pub fn spawn_gossipserver_handler(
     bookie: &Bookie,
     tripwire: &Tripwire,
     gossip_server_endpoint: quinn::Endpoint,
-    process_uni_tx: CorroSender<UniPayload>,
 ) {
     spawn_counted({
         let agent = agent.clone();
@@ -57,13 +56,7 @@ pub fn spawn_gossipserver_handler(
                 };
 
                 // Spawn incoming connection handlers
-                spawn_incoming_connection_handlers(
-                    &agent,
-                    &bookie,
-                    &tripwire,
-                    process_uni_tx.clone(),
-                    connecting,
-                );
+                spawn_incoming_connection_handlers(&agent, &bookie, &tripwire, connecting);
             }
 
             // graceful shutdown
@@ -83,10 +76,8 @@ pub fn spawn_incoming_connection_handlers(
     agent: &Agent,
     bookie: &Bookie,
     tripwire: &Tripwire,
-    process_uni_tx: CorroSender<UniPayload>,
     connecting: quinn::Connecting,
 ) {
-    let process_uni_tx = process_uni_tx.clone();
     let agent = agent.clone();
     let bookie = bookie.clone();
     let tripwire = tripwire.clone();
@@ -109,7 +100,7 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(&tripwire, &conn, process_uni_tx);
+        uni::spawn_unipayload_handler(&tripwire, &conn, agent.tx_changes().clone());
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }
@@ -253,26 +244,6 @@ pub async fn handle_gossip_to_send(
     }
 }
 
-/// Take changesets from other nodes and passes them to tx_changes
-// TODO: may not be needed anymore
-pub async fn handle_broadcasts(agent: Agent, mut bcast_rx: CorroReceiver<BroadcastV1>) {
-    while let Some(bcast) = bcast_rx.recv().await {
-        counter!("corro.broadcast.recv.count").increment(1);
-        match bcast {
-            BroadcastV1::Change(change) => {
-                if let Err(_e) = agent
-                    .tx_changes()
-                    .send((change, ChangeSource::Broadcast))
-                    .await
-                {
-                    error!("changes channel is closed");
-                    break;
-                }
-            }
-        }
-    }
-}
-
 /// Poll for updates from the cluster membership system (`foca`/ SWIM)
 /// and apply any incoming changes to the local actor/ agent state.
 pub async fn handle_notifications(
@@ -411,6 +382,48 @@ pub async fn handle_changes(
             Some((change, src)) = rx_changes.recv() => {
                 counter!("corro.agent.changes.recv").increment(std::cmp::max(change.len(), 1) as u64); // count empties...
                 count += change.len(); // don't count empties
+
+                if change.actor_id == agent.actor_id() {
+                    continue;
+                }
+
+                let diff = matches!(src, ChangeSource::Broadcast).then(|| change
+                    .ts()
+                    .map(|ts| (agent.clock().new_timestamp().get_time() - ts.0).to_duration())).flatten();
+
+                if matches!(src, ChangeSource::Broadcast) {
+                    counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
+                }
+
+                let booked = {
+                    bookie
+                        .read(format!(
+                            "handle_change(get):{}",
+                            change.actor_id.as_simple()
+                        ))
+                        .await
+                        .get(&change.actor_id)
+                        .cloned()
+                };
+
+                if let Some(booked) = booked {
+                    if booked
+                        .read(format!(
+                            "handle_change(contains?):{}",
+                            change.actor_id.as_simple()
+                        ))
+                        .await
+                        .contains_all(change.versions(), change.seqs())
+                    {
+                        trace!("already seen, stop disseminating");
+                        continue;
+                    }
+                }
+
+                if let Some(diff) = diff {
+                    histogram!("corro.broadcast.recv.lag.seconds").record(diff.as_secs_f64());
+                }
+
                 buf.push((change, src));
                 if count < MIN_CHANGES_CHUNK {
                     continue;
@@ -431,9 +444,8 @@ pub async fn handle_changes(
         }
 
         // drain and process current changes!
-        #[allow(clippy::drain_collect)]
         if let Err(e) =
-            util::process_multiple_changes(&agent, &bookie, buf.drain(..).collect()).await
+            util::process_multiple_changes(&agent, &bookie, std::mem::take(&mut buf)).await
         {
             error!("could not process multiple changes: {e}");
         }
@@ -452,9 +464,8 @@ pub async fn handle_changes(
         buf.push((change, src));
         if count >= MIN_CHANGES_CHUNK {
             // drain and process current changes!
-            #[allow(clippy::drain_collect)]
             if let Err(e) =
-                util::process_multiple_changes(&agent, &bookie, buf.drain(..).collect()).await
+                util::process_multiple_changes(&agent, &bookie, std::mem::take(&mut buf)).await
             {
                 error!("could not process last multiple changes: {e}");
             }
