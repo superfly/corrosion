@@ -475,7 +475,7 @@ pub async fn handle_changes(
             _ = max_wait.tick() => {
                 // got a wait interval tick...
 
-                gauge!("corrosion.agent.changes.queued").set(count as f64);
+                gauge!("corro.agent.changes.queued").set(count as f64);
 
                 if count < MIN_CHANGES_CHUNK && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     debug!(%count, "spawning processing multiple changes from max wait interval");
