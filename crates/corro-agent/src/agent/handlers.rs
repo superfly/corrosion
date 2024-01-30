@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL, MIN_CHANGES_CHUNK},
+    agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL},
     api::peer::parallel_sync,
     transport::Transport,
 };
@@ -376,6 +376,7 @@ pub async fn handle_changes(
     mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     mut tripwire: Tripwire,
 ) {
+    const MIN_CHANGES_CHUNK: usize = 500;
     let mut queue: VecDeque<(ChangeV1, ChangeSource)> = VecDeque::new();
     let mut buf = vec![];
     let mut count = 0;
@@ -396,6 +397,11 @@ pub async fn handle_changes(
                 }
             }
 
+            if buf.is_empty() {
+                break;
+            }
+
+            debug!(count = %tmp_count, "spawning processing multiple changes from beginning of func");
             join_set.spawn(util::process_multiple_changes(
                 agent.clone(),
                 bookie.clone(),
@@ -408,7 +414,10 @@ pub async fn handle_changes(
         tokio::select! {
             biased;
 
+            // process these first, we don't care about the result,
+            // but we need to drain it to free up concurrency
             res = join_set.join_next(), if !join_set.is_empty() => {
+                debug!("processed multiple changes concurrently");
                 if let Some(Err(e)) = res {
                     error!("could not process multiple changes: {e}");
                 }
@@ -469,6 +478,7 @@ pub async fn handle_changes(
                 gauge!("corrosion.agent.changes.queued").set(count as f64);
 
                 if count < MIN_CHANGES_CHUNK && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
+                    debug!(%count, "spawning processing multiple changes from max wait interval");
                     join_set.spawn(util::process_multiple_changes(
                         agent.clone(),
                         bookie.clone(),
