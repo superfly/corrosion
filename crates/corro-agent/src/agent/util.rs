@@ -989,8 +989,8 @@ pub async fn process_fully_buffered_changes(
 
 #[tracing::instrument(skip(agent, bookie, changes), err)]
 pub async fn process_multiple_changes(
-    agent: &Agent,
-    bookie: &Bookie,
+    agent: Agent,
+    bookie: Bookie,
     changes: Vec<(ChangeV1, ChangeSource)>,
 ) -> Result<(), ChangeError> {
     let start = Instant::now();
@@ -1111,7 +1111,7 @@ pub async fn process_multiple_changes(
                         }
 
                         let (known, versions) = match process_single_version(
-                            agent,
+                            &agent,
                             &tx,
                             last_db_version,
                             change,

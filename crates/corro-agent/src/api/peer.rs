@@ -1614,8 +1614,8 @@ mod tests {
         let bookie = Bookie::new(Default::default());
 
         process_multiple_changes(
-            &agent,
-            &bookie,
+            agent.clone(),
+            bookie.clone(),
             vec![
                 (
                     ChangeV1 {

@@ -4,6 +4,7 @@
 
 use std::{
     cmp,
+    collections::VecDeque,
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -26,7 +27,10 @@ use foca::Notification;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use spawn::spawn_counted;
-use tokio::{sync::mpsc::Receiver as TokioReceiver, task::block_in_place};
+use tokio::{
+    sync::mpsc::Receiver as TokioReceiver,
+    task::{block_in_place, JoinSet},
+};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
@@ -372,16 +376,48 @@ pub async fn handle_changes(
     mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     mut tripwire: Tripwire,
 ) {
+    let mut queue: VecDeque<(ChangeV1, ChangeSource)> = VecDeque::new();
     let mut buf = vec![];
     let mut count = 0;
+
+    const MAX_CONCURRENT: usize = 3;
+    let mut join_set = JoinSet::new();
 
     let mut max_wait = tokio::time::interval(Duration::from_millis(500));
 
     loop {
+        while count >= MIN_CHANGES_CHUNK && join_set.len() < MAX_CONCURRENT {
+            let mut tmp_count = 0;
+            while let Some((change, src)) = queue.pop_front() {
+                tmp_count += change.len();
+                buf.push((change, src));
+                if tmp_count >= MIN_CHANGES_CHUNK {
+                    break;
+                }
+            }
+
+            join_set.spawn(util::process_multiple_changes(
+                agent.clone(),
+                bookie.clone(),
+                std::mem::take(&mut buf),
+            ));
+
+            count -= tmp_count;
+        }
+
         tokio::select! {
+            biased;
+
+            res = join_set.join_next(), if !join_set.is_empty() => {
+                if let Some(Err(e)) = res {
+                    error!("could not process multiple changes: {e}");
+                }
+            },
+
             Some((change, src)) = rx_changes.recv() => {
-                counter!("corro.agent.changes.recv").increment(std::cmp::max(change.len(), 1) as u64); // count empties...
-                count += change.len(); // don't count empties
+                let change_len = change.len();
+                counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
+                count += change_len; // don't count empties
 
                 if change.actor_id == agent.actor_id() {
                     continue;
@@ -424,34 +460,32 @@ pub async fn handle_changes(
                     histogram!("corro.broadcast.recv.lag.seconds").record(diff.as_secs_f64());
                 }
 
-                buf.push((change, src));
-                if count < MIN_CHANGES_CHUNK {
-                    continue;
-                }
+                queue.push_back((change, src));
             },
+
             _ = max_wait.tick() => {
                 // got a wait interval tick...
-                if buf.is_empty() {
-                    continue;
+
+                gauge!("corrosion.agent.changes.queued").set(count as f64);
+
+                if count < MIN_CHANGES_CHUNK && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
+                    join_set.spawn(util::process_multiple_changes(
+                        agent.clone(),
+                        bookie.clone(),
+                        queue.drain(..).collect(),
+                    ));
+                    count = 0;
                 }
             },
+
             _ = &mut tripwire => {
                 break;
             }
+
             else => {
                 break;
             }
         }
-
-        // drain and process current changes!
-        if let Err(e) =
-            util::process_multiple_changes(&agent, &bookie, std::mem::take(&mut buf)).await
-        {
-            error!("could not process multiple changes: {e}");
-        }
-
-        // reset count
-        count = 0;
     }
 
     info!("Draining changes receiver...");
@@ -461,11 +495,15 @@ pub async fn handle_changes(
         let changes_count = std::cmp::max(change.len(), 1);
         counter!("corro.agent.changes.recv").increment(changes_count as u64);
         count += changes_count;
-        buf.push((change, src));
+        queue.push_back((change, src));
         if count >= MIN_CHANGES_CHUNK {
             // drain and process current changes!
-            if let Err(e) =
-                util::process_multiple_changes(&agent, &bookie, std::mem::take(&mut buf)).await
+            if let Err(e) = util::process_multiple_changes(
+                agent.clone(),
+                bookie.clone(),
+                queue.drain(..).collect(),
+            )
+            .await
             {
                 error!("could not process last multiple changes: {e}");
             }
@@ -476,7 +514,8 @@ pub async fn handle_changes(
     }
 
     // process the last changes we got!
-    if let Err(e) = util::process_multiple_changes(&agent, &bookie, buf).await {
+    if let Err(e) = util::process_multiple_changes(agent, bookie, queue.into_iter().collect()).await
+    {
         error!("could not process multiple changes: {e}");
     }
 }
