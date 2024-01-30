@@ -17,6 +17,7 @@ use crate::{
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
+    base::CrsqlSeq,
     broadcast::{ChangeSource, ChangeV1, FocaInput},
     channel::CorroReceiver,
     sync::generate_sync,
@@ -24,8 +25,10 @@ use corro_types::{
 
 use bytes::Bytes;
 use foca::Notification;
+use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
+use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
@@ -386,8 +389,17 @@ pub async fn handle_changes(
 
     let mut max_wait = tokio::time::interval(Duration::from_millis(500));
 
+    const MAX_SEEN_CACHE_LEN: usize = 10000;
+    const KEEP_SEEN_CACHE_SIZE: usize = 1000;
+    let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
+
+    // complicated loop to process changes efficiently w/ a max concurrency
+    // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
         while count >= MIN_CHANGES_CHUNK && join_set.len() < MAX_CONCURRENT {
+            // we're already bigger than the minimum size of changes batch
+            // so we want to accumulate at least that much and process them
+            // concurrently bvased on MAX_CONCURRENCY
             let mut tmp_count = 0;
             while let Some((change, src)) = queue.pop_front() {
                 tmp_count += change.len();
@@ -401,7 +413,7 @@ pub async fn handle_changes(
                 break;
             }
 
-            debug!(count = %tmp_count, "spawning processing multiple changes from beginning of func");
+            debug!(count = %tmp_count, "spawning processing multiple changes from beginning of loop");
             join_set.spawn(util::process_multiple_changes(
                 agent.clone(),
                 bookie.clone(),
@@ -418,7 +430,7 @@ pub async fn handle_changes(
             // but we need to drain it to free up concurrency
             res = join_set.join_next(), if !join_set.is_empty() => {
                 debug!("processed multiple changes concurrently");
-                if let Some(Err(e)) = res {
+                if let Some(Ok(Err(e))) = res {
                     error!("could not process multiple changes: {e}");
                 }
                 continue;
@@ -432,9 +444,23 @@ pub async fn handle_changes(
                     continue;
                 }
 
-                let recv_lag = matches!(src, ChangeSource::Broadcast).then(|| change
+                if let Some(mut seqs) = change.seqs().cloned() {
+                    let v = *change.versions().start();
+                    if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
+                        if seqs.all(|seq| seen_seqs.contains(&seq)) {
+                            continue;
+                        }
+                    }
+                } else {
+                    // empty versions
+                    if change.versions().all(|v| seen.contains_key(&(change.actor_id, v))) {
+                        continue;
+                    }
+                }
+
+                let recv_lag = change
                     .ts()
-                    .map(|ts| (agent.clock().new_timestamp().get_time() - ts.0).to_duration())).flatten();
+                    .map(|ts| (agent.clock().new_timestamp().get_time() - ts.0).to_duration());
 
                 if matches!(src, ChangeSource::Broadcast) {
                     counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
@@ -466,19 +492,31 @@ pub async fn handle_changes(
                 }
 
                 if let Some(recv_lag) = recv_lag {
-                    histogram!("corro.broadcast.recv.lag.seconds").record(recv_lag.as_secs_f64());
+                    let src_str: &'static str = src.into();
+                    histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str).record(recv_lag.as_secs_f64());
+                }
+
+                // this will only run once for a non-empty changeset
+                for v in change.versions() {
+                    let entry = seen.entry((change.actor_id, v)).or_default();
+                    if let Some(seqs) = change.seqs().cloned() {
+                        entry.extend([seqs]);
+                    }
                 }
 
                 queue.push_back((change, src));
-                count += change_len; // don't count empties
+
+                count += change_len; // track number of individual changes, not changesets
             },
 
             _ = max_wait.tick() => {
                 // got a wait interval tick...
 
                 gauge!("corro.agent.changes.in_queue").set(count as f64);
+                gauge!("corro.agent.changes.processing.jobs").set(join_set.len() as f64);
 
                 if count < MIN_CHANGES_CHUNK && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
+                    // we can process this right away
                     debug!(%count, "spawning processing multiple changes from max wait interval");
                     join_set.spawn(util::process_multiple_changes(
                         agent.clone(),
@@ -486,6 +524,11 @@ pub async fn handle_changes(
                         queue.drain(..).collect(),
                     ));
                     count = 0;
+                }
+
+                if seen.len() > MAX_SEEN_CACHE_LEN {
+                    // we don't want to keep too many entries in here.
+                    seen = seen.split_off(seen.len() - KEEP_SEEN_CACHE_SIZE);
                 }
             },
 

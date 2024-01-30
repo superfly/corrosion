@@ -518,7 +518,7 @@ pub fn runtime_loop(
                         std::cmp::max(
                             config.num_indirect_probes.get(),
                             (cluster_size.load(Ordering::Acquire) as usize - ring0_count)
-                                / (max_transmissions as usize * 5),
+                                / (max_transmissions as usize * 10),
                         ),
                         max_transmissions,
                     )

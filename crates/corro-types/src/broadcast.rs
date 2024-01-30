@@ -75,7 +75,8 @@ pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ChangeSource {
     Broadcast,
     Sync,
