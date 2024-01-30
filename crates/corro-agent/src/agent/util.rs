@@ -647,6 +647,8 @@ pub async fn write_empties_loop(
         }
 
         let empties_to_process = std::mem::take(&mut empties);
+
+        // TODO: replace with a JoinSet and max concurrency
         spawn_counted(
             process_completed_empties(agent.clone(), empties_to_process)
                 .inspect_err(|e| error!("could not process empties: {e}")),
@@ -682,7 +684,7 @@ pub async fn process_completed_empties(
     for (actor_id, empties) in empties {
         let v = empties.into_iter().collect::<Vec<_>>();
 
-        for ranges in v.chunks(50) {
+        for ranges in v.chunks(25) {
             let mut conn = agent.pool().write_low().await?;
             block_in_place(|| {
                 let mut tx = conn.immediate_transaction()?;
