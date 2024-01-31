@@ -54,7 +54,7 @@ pub fn bounded<T: Send + 'static>(
     capacity: usize,
     label: &'static str,
 ) -> (CorroSender<T>, CorroReceiver<T>) {
-    gauge!("corro.runtime.channel.capacity", "channel_name" => label).set(capacity as f64);
+    gauge!("corro.runtime.channel.max_capacity", "channel_name" => label).set(capacity as f64);
 
     // Count the number of sends and receives going through the channel
     let send_count = counter!("corro.runtime.channel.send_count", "channel_name" => label);
