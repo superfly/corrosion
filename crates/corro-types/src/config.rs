@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr};
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,11 @@ pub struct PrometheusConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum OtelConfig {
     FromEnv,
-    Exporter { endpoint: String },
+    Exporter {
+        endpoint: String,
+        #[serde(default)]
+        metadata: HashMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

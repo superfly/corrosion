@@ -71,7 +71,13 @@ fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
             let otlp_exporter = opentelemetry_otlp::new_exporter().tonic().with_env();
             let otlp_exporter = match otel {
                 OtelConfig::FromEnv => otlp_exporter,
-                OtelConfig::Exporter { endpoint } => otlp_exporter.with_endpoint(endpoint),
+                OtelConfig::Exporter { endpoint, metadata } => {
+                    let headers = hyper::HeaderMap::try_from(metadata)
+                        .expect("could not parse otel metadata as a header map");
+                    otlp_exporter
+                        .with_endpoint(endpoint)
+                        .with_metadata(tonic::metadata::MetadataMap::from_headers(headers))
+                }
             };
 
             let batch_config = BatchConfig::default().with_max_queue_size(10240);

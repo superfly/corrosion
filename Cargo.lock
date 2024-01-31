@@ -1027,6 +1027,7 @@ dependencies = [
  "tokio-metrics",
  "tokio-serde",
  "tokio-util",
+ "tonic",
  "tracing",
  "tracing-filter",
  "tracing-opentelemetry",
