@@ -4,6 +4,7 @@ version = "0.1.0-alpha.1"
 edition = "2021"
 description = "common types for corrosion"
 license = "MIT"
+repository = "https://github.com/superfly/corrosion"
 
 [dependencies]
 arc-swap = { workspace = true }

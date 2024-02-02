@@ -2,6 +2,7 @@
 name = "corro-agent"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/superfly/corrosion"
 
 [dependencies]
 arc-swap = { workspace = true }
