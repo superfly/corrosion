@@ -756,7 +756,7 @@ async fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAd
     let len = payload.len();
     match tokio::time::timeout(Duration::from_secs(5), transport.send_uni(addr, payload)).await {
         Err(_e) => {
-            warn!("timed out writing broadcast to uni stream");
+            warn!("timed out writing broadcast to uni stream {:?}", addr);
         }
         Ok(Err(e)) => {
             error!("could not write to uni stream to {addr}: {e}");
