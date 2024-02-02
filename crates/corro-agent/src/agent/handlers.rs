@@ -62,6 +62,19 @@ pub fn spawn_gossipserver_handler(
                     Outcome::Preempted(_) => break,
                 };
 
+                match connecting.remote_address() {
+                    SocketAddr::V4(_) => {}
+                    addr @ SocketAddr::V6(v6) => {
+                        if let [0xfd, 0xaa] = v6.ip().octets()[0..2] {
+                            warn!(
+                                "other node tried to reach us via a fdaa address: {addr}, local ip: {:?}",
+                                connecting.local_ip()
+                            );
+                            return;
+                        }
+                    }
+                }
+
                 // Spawn incoming connection handlers
                 spawn_incoming_connection_handlers(&agent, &bookie, &tripwire, connecting);
             }

@@ -159,7 +159,7 @@ impl Transport {
             SocketAddr::V4(_) => {}
             SocketAddr::V6(v6) => {
                 if let [0xfd, 0xaa] = v6.ip().octets()[0..2] {
-                    warn!("attempted to reach fdaa address: {v6}");
+                    warn!("attempted to reach fdaa address: {addr}");
                     return Err(TransportError::UnacceptableDestination(addr));
                 }
             }
