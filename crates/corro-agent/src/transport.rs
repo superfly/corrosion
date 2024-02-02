@@ -44,6 +44,8 @@ pub enum TransportError {
     SendStreamWrite(#[from] WriteError),
     #[error(transparent)]
     TimedOut(#[from] Elapsed),
+    #[error("tried to reach an unacceptable destination: {0}")]
+    UnacceptableDestination(SocketAddr),
 }
 
 impl Transport {
@@ -153,6 +155,16 @@ impl Transport {
         addr: SocketAddr,
         server_name: String,
     ) -> Result<Connection, TransportError> {
+        match addr {
+            SocketAddr::V4(_) => {}
+            SocketAddr::V6(v6) => {
+                if let [0xfd, 0xaa] = v6.ip().octets()[0..2] {
+                    warn!("attempted to reach fdaa address: {v6}");
+                    return Err(TransportError::UnacceptableDestination(addr));
+                }
+            }
+        }
+
         let start = Instant::now();
 
         let mut hasher = seahash::SeaHasher::new();
