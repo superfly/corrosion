@@ -70,7 +70,7 @@ pub fn spawn_gossipserver_handler(
                                 "other node tried to reach us via a fdaa address: {addr}, local ip: {:?}",
                                 connecting.local_ip()
                             );
-                            return;
+                            continue;
                         }
                     }
                 }
