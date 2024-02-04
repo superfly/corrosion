@@ -18,7 +18,7 @@ use tokio::{
     sync::{mpsc, Mutex, RwLock},
     time::error::Elapsed,
 };
-use tracing::{debug, debug_span, warn, Instrument};
+use tracing::{debug, debug_span, info, warn, Instrument};
 
 use crate::api::peer::gossip_client_endpoint;
 
@@ -52,8 +52,21 @@ impl Transport {
         rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
     ) -> eyre::Result<Self> {
         let mut endpoints = vec![];
-        for _ in 0..8 {
-            endpoints.push(gossip_client_endpoint(config).await?);
+        let endpoints_count = if config.client_addr.port() == 0 {
+            // zero port means we'll use whatever is available,
+            // corrosion can use multiple sockets and reduce the risk of filling kernel buffers
+            8
+        } else {
+            // non-zero client addr port means we can only use 1
+            1
+        };
+        for i in 0..endpoints_count {
+            let ep = gossip_client_endpoint(config).await?;
+            info!(
+                "Transport ({i}) for outgoing connections bound to socket {}",
+                ep.local_addr().unwrap()
+            );
+            endpoints.push(ep);
         }
         Ok(Self(Arc::new(TransportInner {
             endpoints,

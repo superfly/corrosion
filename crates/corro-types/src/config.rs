@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,8 @@ pub struct GossipConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
     pub external_addr: Option<SocketAddr>,
+    #[serde(default = "default_gossip_client_addr")]
+    pub client_addr: SocketAddr,
     #[serde(default)]
     pub bootstrap: Vec<String>,
     #[serde(default)]
@@ -125,6 +127,13 @@ pub struct GossipConfig {
 
 fn default_gossip_idle_timeout() -> u32 {
     DEFAULT_GOSSIP_IDLE_TIMEOUT
+}
+
+pub const DEFAULT_GOSSIP_CLIENT_ADDR: SocketAddr =
+    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0u16, 0, 0));
+
+fn default_gossip_client_addr() -> SocketAddr {
+    DEFAULT_GOSSIP_CLIENT_ADDR
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,6 +304,7 @@ impl ConfigBuilder {
                     .gossip_addr
                     .ok_or(ConfigBuilderError::GossipAddrRequired)?,
                 external_addr: self.external_addr,
+                client_addr: default_gossip_client_addr(),
                 bootstrap: self.bootstrap.unwrap_or_default(),
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
