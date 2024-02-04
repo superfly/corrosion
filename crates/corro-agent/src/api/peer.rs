@@ -315,7 +315,7 @@ async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn:
 pub async fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
     let client_config = build_quinn_client_config(config).await?;
 
-    let mut client = quinn::Endpoint::client(SocketAddr::from((config.bind_addr.ip(), 0)))?;
+    let mut client = quinn::Endpoint::client(config.client_addr)?;
 
     client.set_default_client_config(client_config);
     Ok(client)
@@ -1540,7 +1540,7 @@ mod tests {
     use corro_types::{
         api::{ColumnName, TableName},
         base::CrsqlDbVersion,
-        config::{Config, TlsConfig},
+        config::{Config, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
@@ -1788,6 +1788,7 @@ mod tests {
 
         let gossip_config = GossipConfig {
             bind_addr: "127.0.0.1:0".parse()?,
+            client_addr: DEFAULT_GOSSIP_CLIENT_ADDR,
             external_addr: None,
             bootstrap: vec![],
             tls: Some(TlsConfig {
