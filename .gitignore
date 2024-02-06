@@ -3,3 +3,4 @@
 /config.toml
 /data
 /book
+.direnv/**
