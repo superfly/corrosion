@@ -1,0 +1,13 @@
+[package]
+name = "corro-devcluster"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true, features = [ "derive" ] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+random_graphs = { workspace = true }
+nom = { workspace = true }
+clap = { workspace = true }
