@@ -36,6 +36,7 @@ indexmap = { version = "2.1.0", features = ["serde"] }
 itertools = { version = "0.10.5" }
 metrics = "0.22.0"
 metrics-exporter-prometheus = { version = "0.13.0", default-features = false, features = ["http-listener"] }
+nom = "7.0"
 once_cell = "1.17.1"
 opentelemetry = { version = "0.20.0", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.13.0" }
@@ -47,6 +48,7 @@ quinn-proto = "0.10.5"
 quinn-plaintext = { version = "0.2.0" }
 quoted-string = "0.6.1"
 rand = { version = "0.8.5", features = ["small_rng"] }
+random_graphs = "0.1"
 rangemap = { version = "1.4.0" }
 rcgen = { version = "0.11.1", features = ["x509-parser"] }
 rhai = { version = "1.15.1", features = ["sync"] }
