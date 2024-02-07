@@ -54,10 +54,15 @@
                 ulimit -n 65536
               '';
 
+              # Useful when doing development builds
+              doCheck = false;
+              buildType = "debug";
+              
               ## Build environment dependencies
               nativeBuildInputs = [
                 pkgs.pkg-config
                 pkgs.mold
+                pkgs.clang
                 rust-latest.toolchain
               ];
 
