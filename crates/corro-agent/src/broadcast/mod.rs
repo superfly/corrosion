@@ -1,3 +1,5 @@
+mod send;
+
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     net::SocketAddr,
@@ -11,7 +13,7 @@ use std::{
 };
 
 use bincode::DefaultOptions;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use foca::{BincodeCodec, Foca, NoCustomBroadcast, Notification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
@@ -22,7 +24,6 @@ use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
 use spawn::spawn_counted;
-use speedy::Writable;
 use strum::EnumDiscriminants;
 use tokio::{
     sync::mpsc,
@@ -30,18 +31,18 @@ use tokio::{
     time::interval,
 };
 use tokio_stream::StreamExt;
-use tokio_util::codec::{Encoder, LengthDelimitedCodec};
+use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, log::info, trace, warn};
 use tripwire::Tripwire;
 
 use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
-    broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
+    broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput},
     channel::{bounded, CorroReceiver, CorroSender},
 };
 
-use crate::transport::Transport;
+use crate::{broadcast::send::dispatch_broadcast, transport::Transport};
 
 #[derive(Clone)]
 struct TimerSpawner {
@@ -363,8 +364,6 @@ pub fn runtime_loop(
     });
 
     tokio::spawn(async move {
-        const BROADCAST_CUTOFF: usize = 64 * 1024;
-
         let mut bcast_codec = LengthDelimitedCodec::new();
 
         let mut bcast_buf = BytesMut::new();
@@ -443,65 +442,20 @@ pub fn runtime_loop(
                 }
                 Branch::Broadcast(input) => {
                     trace!("handling Branch::Broadcast");
-                    let (bcast, is_local) = match input {
-                        BroadcastInput::Rebroadcast(bcast) => (bcast, false),
-                        BroadcastInput::AddBroadcast(bcast) => (bcast, true),
-                    };
-                    trace!("adding broadcast: {bcast:?}, local? {is_local}");
-
-                    if let Err(e) = (UniPayload::V1 {
-                        data: UniPayloadV1::Broadcast(bcast.clone()),
-                        cluster_id: agent.cluster_id(),
-                    })
-                    .write_to_stream((&mut ser_buf).writer())
+                    if dispatch_broadcast(
+                        &agent,
+                        &transport,
+                        input,
+                        &mut bcast_codec,
+                        &mut ser_buf,
+                        &mut single_bcast_buf,
+                        &mut local_bcast_buf,
+                        &mut bcast_buf,
+                        &mut to_broadcast,
+                    )
+                    .is_none()
                     {
-                        error!("could not encode UniPayload::V1 Broadcast: {e}");
-                        ser_buf.clear();
                         continue;
-                    }
-                    trace!("ser buf len: {}", ser_buf.len());
-
-                    if is_local {
-                        if let Err(e) =
-                            bcast_codec.encode(ser_buf.split().freeze(), &mut single_bcast_buf)
-                        {
-                            error!("could not encode local broadcast: {e}");
-                            single_bcast_buf.clear();
-                            continue;
-                        }
-
-                        let payload = single_bcast_buf.split().freeze();
-
-                        local_bcast_buf.extend_from_slice(&payload);
-
-                        {
-                            let members = agent.members().read();
-                            for addr in members.ring0(agent.cluster_id()) {
-                                // this spawns, so we won't be holding onto the read lock for long
-                                tokio::spawn(transmit_broadcast(
-                                    payload.clone(),
-                                    transport.clone(),
-                                    addr,
-                                ));
-                            }
-                        }
-
-                        if local_bcast_buf.len() >= BROADCAST_CUTOFF {
-                            to_broadcast.push(PendingBroadcast::new_local(
-                                local_bcast_buf.split().freeze(),
-                            ));
-                        }
-                    } else {
-                        if let Err(e) = bcast_codec.encode(ser_buf.split().freeze(), &mut bcast_buf)
-                        {
-                            error!("could not encode broadcast: {e}");
-                            bcast_buf.clear();
-                            continue;
-                        }
-
-                        if bcast_buf.len() >= BROADCAST_CUTOFF {
-                            to_broadcast.push(PendingBroadcast::new(bcast_buf.split().freeze()));
-                        }
                     }
                 }
                 Branch::WokePendingBroadcast(pending) => {

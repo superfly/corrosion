@@ -33,9 +33,12 @@ pub enum UniPayload {
         data: UniPayloadV1,
         #[speedy(default_on_eof)]
         cluster_id: ClusterId,
+        #[speedy(default_on_eof)]
+        priority: bool,
     },
 }
 
+/// Broadcast change payload
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
     Broadcast(BroadcastV1),
