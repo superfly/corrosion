@@ -232,7 +232,7 @@ async fn handle_conn(
                     send_success(&mut stream).await;
                 }
                 Command::Cluster(ClusterCommand::SetId(cluster_id)) => {
-                    info_log(&mut stream, "setting new cluster id: {cluster_id}").await;
+                    info_log(&mut stream, format!("setting new cluster id: {cluster_id}")).await;
 
                     let mut conn = match agent.pool().write_priority().await {
                         Ok(conn) => conn,
