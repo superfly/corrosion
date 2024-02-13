@@ -393,6 +393,9 @@ pub async fn handle_changes(
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
+    let mut max_sync_lag = Duration::new(0, 0);
+    let mut max_broadcast_lag = Duration::new(0, 0);
+
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
@@ -494,6 +497,17 @@ pub async fn handle_changes(
                 if let Some(recv_lag) = recv_lag {
                     let src_str: &'static str = src.into();
                     histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str).record(recv_lag.as_secs_f64());
+                    let max = match src {
+                        ChangeSource::Broadcast => {
+                            max_broadcast_lag = std::cmp::max(max_broadcast_lag, recv_lag);
+                            max_broadcast_lag
+                        }
+                        ChangeSource::Sync => {
+                            max_sync_lag = std::cmp::max(max_sync_lag, recv_lag);
+                            max_sync_lag
+                        },
+                    };
+                    gauge!("corro.agent.changes.recv.lag.max", "source" => src_str).set(max.as_secs_f64());
                 }
 
                 // this will only run once for a non-empty changeset
