@@ -8,7 +8,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use corro_api_types::Change;
 use foca::{Identity, Member, Notification, Runtime, Timer};
-use metrics::increment_counter;
+use metrics::counter;
 use rusqlite::{
     types::{FromSql, FromSqlError},
     ToSql,
@@ -16,16 +16,14 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use time::OffsetDateTime;
-use tokio::sync::{
-    mpsc::{self, Sender},
-    oneshot,
-};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
+    channel::CorroSender,
     sync::SyncTraceContextV1,
 };
 
@@ -81,12 +79,13 @@ pub enum AuthzV1 {
     Token(String),
 }
 
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Clone, Debug, Readable, Writable)]
 pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ChangeSource {
     Broadcast,
     Sync,
@@ -357,9 +356,9 @@ pub enum BroadcastInput {
 }
 
 pub struct DispatchRuntime<T> {
-    pub to_send: Sender<(T, Bytes)>,
-    pub to_schedule: Sender<(Duration, Timer<T>)>,
-    pub notifications: Sender<Notification<T>>,
+    pub to_send: CorroSender<(T, Bytes)>,
+    pub to_schedule: CorroSender<(Duration, Timer<T>)>,
+    pub notifications: CorroSender<Notification<T>>,
     pub active: bool,
     pub buf: BytesMut,
 }
@@ -376,7 +375,8 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
             _ => {}
         };
         if let Err(e) = self.notifications.try_send(notification) {
-            increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications");
+            counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications")
+                .increment(1);
             error!("error dispatching notification: {e}");
         }
     }
@@ -386,14 +386,16 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
         self.buf.extend_from_slice(data);
 
         if let Err(e) = self.to_send.try_send((to, self.buf.split().freeze())) {
-            increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_send");
+            counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_send")
+                .increment(1);
             error!("error dispatching broadcast packet: {e}");
         }
     }
 
     fn submit_after(&mut self, event: Timer<T>, after: Duration) {
         if let Err(e) = self.to_schedule.try_send((after, event)) {
-            increment_counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_schedule");
+            counter!("corro.channel.error", "type" => "full", "name" => "dispatch.to_schedule")
+                .increment(1);
             error!("error dispatching scheduled event: {e}");
         }
     }
@@ -401,9 +403,9 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
 
 impl<T> DispatchRuntime<T> {
     pub fn new(
-        to_send: Sender<(T, Bytes)>,
-        to_schedule: Sender<(Duration, Timer<T>)>,
-        notifications: Sender<Notification<T>>,
+        to_send: CorroSender<(T, Bytes)>,
+        to_schedule: CorroSender<(Duration, Timer<T>)>,
+        notifications: CorroSender<Notification<T>>,
     ) -> Self {
         Self {
             to_send,

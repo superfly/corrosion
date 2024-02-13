@@ -1,15 +1,11 @@
 //! Start the root agent tasks
-//!
-//! 1. foo
-//! 2. bar
-//! 3. spawn `super::other_module`
 
 use std::sync::Arc;
 
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_cleanup},
-        metrics, setup, uni, util, AgentOptions,
+        metrics, setup, util, AgentOptions,
     },
     api::public::pubsub::{
         process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache,
@@ -20,17 +16,14 @@ use corro_types::{
     actor::ActorId,
     agent::{Agent, BookedVersions, Bookie},
     base::CrsqlSeq,
-    broadcast::BroadcastV1,
+    channel::bounded,
     config::Config,
     pubsub::{Matcher, SubsManager},
 };
 
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use spawn::spawn_counted;
-use tokio::{
-    sync::{mpsc::channel, RwLock as TokioRwLock},
-    task::block_in_place,
-};
+use tokio::{sync::RwLock as TokioRwLock, task::block_in_place};
 use tracing::{error, info};
 use tripwire::Tripwire;
 
@@ -80,11 +73,8 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
         );
     }
 
-    //// TODO: turn channels into a named and counted resource
-    let (to_send_tx, to_send_rx) = channel(10240);
-    let (notifications_tx, notifications_rx) = channel(10240);
-    let (bcast_msg_tx, bcast_rx) = channel::<BroadcastV1>(10240);
-    let (process_uni_tx, process_uni_rx) = channel(10240);
+    let (to_send_tx, to_send_rx) = bounded(10240, "to_send");
+    let (notifications_tx, notifications_rx) = bounded(10240, "notifications");
 
     //// Start the main SWIM runtime loop
     runtime_loop(
@@ -134,7 +124,6 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
         agent.clone(),
         notifications_rx,
     ));
-    tokio::spawn(handlers::handle_broadcasts(agent.clone(), bcast_rx));
 
     spawn_handle_db_cleanup(agent.pool().clone());
 
@@ -205,16 +194,7 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
 
     //// Start an incoming (corrosion) connection handler.  This
     //// future tree spawns additional message type sub-handlers
-    handlers::spawn_gossipserver_handler(
-        &agent,
-        &bookie,
-        &tripwire,
-        gossip_server_endpoint,
-        process_uni_tx,
-    );
-
-    //// Start async uni-broadcast message decoder
-    uni::spawn_unipayload_message_decoder(&agent, &bookie, process_uni_rx, bcast_msg_tx);
+    handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
 
     spawn_counted(handlers::handle_changes(
         agent.clone(),

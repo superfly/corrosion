@@ -1,9 +1,12 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, HashSet},
     net::SocketAddr,
     num::NonZeroU32,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -22,7 +25,7 @@ use spawn::spawn_counted;
 use speedy::Writable;
 use strum::EnumDiscriminants;
 use tokio::{
-    sync::mpsc::{self, channel, Receiver, Sender},
+    sync::mpsc,
     task::{block_in_place, LocalSet},
     time::interval,
 };
@@ -35,6 +38,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
+    channel::{bounded, CorroReceiver, CorroSender},
 };
 
 use crate::transport::Transport;
@@ -90,7 +94,7 @@ impl TimerSpawner {
 fn handle_timer(
     foca: &mut Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, NoCustomBroadcast>,
     runtime: &mut DispatchRuntime<Actor>,
-    timer_rx: &mut Receiver<(Timer<Actor>, Instant)>,
+    timer_rx: &mut mpsc::Receiver<(Timer<Actor>, Instant)>,
     timer: Timer<Actor>,
     seq: Instant,
 ) {
@@ -117,10 +121,10 @@ pub fn runtime_loop(
     actor: Actor,
     agent: Agent,
     transport: Transport,
-    mut rx_foca: Receiver<FocaInput>,
-    mut rx_bcast: Receiver<BroadcastInput>,
-    to_send_tx: Sender<(Actor, Bytes)>,
-    notifications_tx: Sender<Notification<Actor>>,
+    mut rx_foca: CorroReceiver<FocaInput>,
+    mut rx_bcast: CorroReceiver<BroadcastInput>,
+    to_send_tx: CorroSender<(Actor, Bytes)>,
+    notifications_tx: CorroSender<Notification<Actor>>,
     mut tripwire: Tripwire,
 ) {
     debug!("starting runtime loop for actor: {actor:?}");
@@ -137,12 +141,12 @@ pub fn runtime_loop(
         NoCustomBroadcast,
     );
 
-    let (to_schedule_tx, mut to_schedule_rx) = channel(10240);
+    let (to_schedule_tx, mut to_schedule_rx) = bounded(10240, "to_schedule");
 
     let mut runtime: DispatchRuntime<Actor> =
         DispatchRuntime::new(to_send_tx, to_schedule_tx, notifications_tx);
 
-    let (timer_tx, mut timer_rx) = channel(10);
+    let (timer_tx, mut timer_rx) = mpsc::channel(10);
     let timer_spawner = TimerSpawner::new(timer_tx);
 
     tokio::spawn(async move {
@@ -151,11 +155,14 @@ pub fn runtime_loop(
         }
     });
 
+    let cluster_size = Arc::new(AtomicU32::new(1));
+
     // foca SWIM operations loop.
     // NOTE: every turn of that loop should be fast or else we risk being a down suspect
     spawn_counted({
         let config = config.clone();
         let agent = agent.clone();
+        let cluster_size = cluster_size.clone();
         let mut tripwire = tripwire.clone();
         async move {
             let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
@@ -241,6 +248,8 @@ pub fn runtime_loop(
                                     *config = new_config;
                                 }
                             }
+
+                            cluster_size.store(size.get(), Ordering::Release);
                         }
                         FocaInput::ApplyMany(updates) => {
                             trace!("handling FocaInput::ApplyMany");
@@ -273,28 +282,20 @@ pub fn runtime_loop(
                     Branch::Metrics => {
                         trace!("handling Branch::Metrics");
                         {
-                            gauge!("corro.gossip.members", foca.num_members() as f64);
-                            gauge!(
-                                "corro.gossip.member.states",
-                                foca.iter_membership_state().count() as f64
-                            );
-                            gauge!(
-                                "corro.gossip.updates_backlog",
-                                foca.updates_backlog() as f64
-                            );
+                            gauge!("corro.gossip.members").set(foca.num_members() as f64);
+                            gauge!("corro.gossip.member.states")
+                                .set(foca.iter_membership_state().count() as f64);
+                            gauge!("corro.gossip.updates_backlog")
+                                .set(foca.updates_backlog() as f64);
                         }
                         {
                             let config = config.read();
-                            gauge!(
-                                "corro.gossip.config.max_transmissions",
-                                config.max_transmissions.get() as f64
-                            );
-                            gauge!(
-                                "corro.gossip.config.num_indirect_probes",
-                                config.num_indirect_probes.get() as f64
-                            );
+                            gauge!("corro.gossip.config.max_transmissions")
+                                .set(config.max_transmissions.get() as f64);
+                            gauge!("corro.gossip.config.num_indirect_probes")
+                                .set(config.num_indirect_probes.get() as f64);
                         }
-                        gauge!("corro.gossip.cluster_size", last_cluster_size.get() as f64);
+                        gauge!("corro.gossip.cluster_size").set(last_cluster_size.get() as f64);
                     }
                     Branch::DiffMembers => {
                         diff_member_states(&agent, &foca, &mut last_states);
@@ -473,14 +474,16 @@ pub fn runtime_loop(
 
                         local_bcast_buf.extend_from_slice(&payload);
 
-                        let members = agent.members().read();
-                        for addr in members.ring0() {
-                            // this spawns, so we won't be holding onto the read lock for long
-                            tokio::spawn(transmit_broadcast(
-                                payload.clone(),
-                                transport.clone(),
-                                addr,
-                            ));
+                        {
+                            let members = agent.members().read();
+                            for addr in members.ring0() {
+                                // this spawns, so we won't be holding onto the read lock for long
+                                tokio::spawn(transmit_broadcast(
+                                    payload.clone(),
+                                    transport.clone(),
+                                    addr,
+                                ));
+                            }
                         }
 
                         if local_bcast_buf.len() >= BROADCAST_CUTOFF {
@@ -507,15 +510,10 @@ pub fn runtime_loop(
                 }
                 Branch::Metrics => {
                     trace!("handling Branch::Metrics");
-                    gauge!("corro.broadcast.pending.count", idle_pendings.len() as f64);
-                    gauge!(
-                        "corro.broadcast.buffer.capacity",
-                        bcast_buf.capacity() as f64
-                    );
-                    gauge!(
-                        "corro.broadcast.serialization.buffer.capacity",
-                        ser_buf.capacity() as f64
-                    );
+                    gauge!("corro.broadcast.pending.count").set(idle_pendings.len() as f64);
+                    gauge!("corro.broadcast.buffer.capacity").set(bcast_buf.capacity() as f64);
+                    gauge!("corro.broadcast.serialization.buffer.capacity")
+                        .set(ser_buf.capacity() as f64);
                 }
             }
 
@@ -524,9 +522,16 @@ pub fn runtime_loop(
 
                 let (member_count, max_transmissions) = {
                     let config = config.read();
+                    let members = agent.members().read();
+                    let ring0_count = members.ring0().count();
+                    let max_transmissions = config.max_transmissions.get();
                     (
-                        config.num_indirect_probes.get(),
-                        config.max_transmissions.get(),
+                        std::cmp::max(
+                            config.num_indirect_probes.get(),
+                            (cluster_size.load(Ordering::Acquire) as usize - ring0_count)
+                                / (max_transmissions as usize * 10),
+                        ),
+                        max_transmissions,
                     )
                 };
 
@@ -537,10 +542,12 @@ pub fn runtime_loop(
                         .states
                         .iter()
                         .filter_map(|(member_id, state)| {
-                            // don't broadcast to ourselves, different cluster... or ring0 if local broadcast
-                            if state.cluster_id != agent.cluster_id()
-                                || *member_id == actor_id
+                            // don't broadcast to ourselves... or ring0 if local broadcast
+                            if *member_id == actor_id
+                                || state.cluster_id != agent.cluster_id()
                                 || (pending.is_local && state.is_ring0())
+                                || pending.sent_to.contains(&state.addr)
+                            // don't resend
                             {
                                 None
                             } else {
@@ -551,29 +558,29 @@ pub fn runtime_loop(
                 };
 
                 for addr in broadcast_to {
-                    debug!(actor = %actor_id, "broadcasting {} bytes to: {addr} (send count: {})", pending.payload.len(), pending.send_count);
+                    debug!(actor = %actor_id, "broadcasting {} bytes to: {addr}", pending.payload.len());
 
                     tokio::spawn(transmit_broadcast(
                         pending.payload.clone(),
                         transport.clone(),
                         addr,
                     ));
+
+                    pending.sent_to.insert(addr);
                 }
 
-                pending.send_count = pending.send_count.wrapping_add(1);
+                if let Some(send_count) = pending.send_count.checked_add(1) {
+                    trace!("send_count: {send_count}, max_transmissions: {max_transmissions}");
+                    pending.send_count = send_count;
 
-                trace!(
-                    "send_count: {}, max_transmissions: {max_transmissions}",
-                    pending.send_count
-                );
-
-                if pending.send_count < max_transmissions {
-                    debug!("queueing for re-send");
-                    idle_pendings.push(Box::pin(async move {
-                        // FIXME: calculate sleep duration based on send count
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        pending
-                    }));
+                    if send_count < max_transmissions {
+                        debug!("queueing for re-send");
+                        idle_pendings.push(Box::pin(async move {
+                            // FIXME: calculate sleep duration based on send count
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            pending
+                        }));
+                    }
                 }
             }
         }
@@ -730,6 +737,7 @@ fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
 struct PendingBroadcast {
     payload: Bytes,
     is_local: bool,
+    sent_to: HashSet<SocketAddr>,
     send_count: u8,
 }
 
@@ -738,6 +746,7 @@ impl PendingBroadcast {
         Self {
             payload,
             is_local: false,
+            sent_to: Default::default(),
             send_count: 0,
         }
     }
@@ -746,6 +755,7 @@ impl PendingBroadcast {
         Self {
             payload,
             is_local: true,
+            sent_to: Default::default(),
             send_count: 0,
         }
     }
@@ -758,13 +768,13 @@ async fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAd
     let len = payload.len();
     match tokio::time::timeout(Duration::from_secs(5), transport.send_uni(addr, payload)).await {
         Err(_e) => {
-            warn!("timed out writing broadcast to uni stream");
+            warn!("timed out writing broadcast to uni stream {:?}", addr);
         }
         Ok(Err(e)) => {
             error!("could not write to uni stream to {addr}: {e}");
         }
         Ok(Ok(_)) => {
-            counter!("corro.peer.stream.bytes.sent.total", len as u64, "type" => "uni");
+            counter!("corro.peer.stream.bytes.sent.total", "type" => "uni").increment(len as u64);
         }
     }
 }

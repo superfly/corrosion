@@ -1,11 +1,17 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 
 use axum::{response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError, CurrentVersion, KnownDbVersion},
-    api::{row_to_change, ColumnName, ExecResponse, ExecResult, QueryEvent, Statement},
+    api::{
+        row_to_change, ColumnName, ExecResponse, ExecResult, QueryEvent, Statement,
+        TableStatRequest, TableStatResponse,
+    },
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{ChunkedChanges, SqliteValue, MAX_CHANGES_BYTE_SIZE},
@@ -191,7 +197,7 @@ where
                             for (table_name, count) in
                                 changes.iter().counts_by(|change| &change.table)
                             {
-                                counter!("corro.changes.committed", count as u64, "table" => table_name.to_string(), "source" => "local");
+                                counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "local").increment(count as u64);
                             }
 
                             trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
@@ -654,6 +660,68 @@ pub async fn api_v1_db_schema(
             time: start.elapsed().as_secs_f64(),
         }),
     )
+}
+
+/// Query the table status of the current node
+///
+/// Currently this endpoint only supports querying the row count for a
+/// selection of provided tables.  Table names are checked for
+/// existence before querying
+pub async fn api_v1_table_stats(
+    Extension(agent): Extension<Agent>,
+    axum::extract::Json(ts_req): axum::extract::Json<TableStatRequest>,
+) -> (StatusCode, axum::Json<TableStatResponse>) {
+    async fn count_table_lengths(
+        agent: &Agent,
+        ts_req: TableStatRequest,
+    ) -> eyre::Result<(i64, Vec<String>)> {
+        debug!("Querying row count for {} tables", ts_req.tables.len());
+        let conn = agent.pool().read().await?;
+
+        block_in_place(move || -> eyre::Result<(i64, Vec<String>)> {
+            let valid_tables: BTreeSet<String> = conn
+                .prepare_cached("select name from sqlite_schema where type = 'table'")?
+                .query_map([], |row| row.get(0))?
+                .filter_map(|name| name.ok())
+                .collect();
+
+            let mut invalid_tables = vec![];
+            let mut total_count = 0;
+            for table in ts_req.tables.into_iter() {
+                if !valid_tables.contains(&table) {
+                    error!("Table name {} doesn't exist!", &table);
+                    invalid_tables.push(table);
+                    continue;
+                }
+
+                let count: i64 = conn
+                    .prepare_cached(&format!("SELECT COUNT(*) FROM {}", &table))?
+                    .query_row((), |row| row.get(0))?;
+
+                total_count += count;
+            }
+            Ok((total_count, invalid_tables))
+        })
+    }
+
+    match count_table_lengths(&agent, ts_req).await {
+        Ok((count, invalid_tables)) => (
+            StatusCode::OK,
+            axum::Json(TableStatResponse {
+                total_row_count: count,
+                invalid_tables,
+            }),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(TableStatResponse {
+                total_row_count: 0,
+                // Since we don't know what error occured or if any
+                // tables were valid, we just return an empty list
+                invalid_tables: vec![],
+            }),
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use corro_types::sync::{
 use futures::stream::FuturesUnordered;
 use futures::{Future, Stream, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
-use metrics::{counter, increment_counter};
+use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rand::seq::SliceRandom;
 use rangemap::RangeInclusiveSet;
@@ -316,11 +316,7 @@ async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn:
 pub async fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
     let client_config = build_quinn_client_config(config).await?;
 
-    let client_bind_addr = match config.bind_addr {
-        SocketAddr::V4(_) => "0.0.0.0:0".parse()?,
-        SocketAddr::V6(_) => "[::]:0".parse()?,
-    };
-    let mut client = quinn::Endpoint::client(client_bind_addr)?;
+    let mut client = quinn::Endpoint::client(config.client_addr)?;
 
     client.set_default_client_config(client_config);
     Ok(client)
@@ -895,7 +891,7 @@ async fn encode_write_sync_msg(
 async fn write_buf(send_buf: &mut BytesMut, write: &mut SendStream) -> Result<(), SyncSendError> {
     let len = send_buf.len();
     write.write_chunk(send_buf.split().freeze()).await?;
-    counter!("corro.sync.chunk.sent.bytes", len as u64);
+    counter!("corro.sync.chunk.sent.bytes").increment(len as u64);
 
     Ok(())
 }
@@ -907,7 +903,7 @@ pub async fn read_sync_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
     match read.next().await {
         Some(buf_res) => match buf_res {
             Ok(mut buf) => {
-                counter!("corro.sync.chunk.recv.bytes", buf.len() as u64);
+                counter!("corro.sync.chunk.recv.bytes").increment(buf.len() as u64);
                 tracing::Span::current().record("buf_size", buf.len());
                 match SyncMessage::from_buf(&mut buf) {
                     Ok(msg) => Ok(Some(msg)),
@@ -1011,7 +1007,7 @@ pub async fn parallel_sync(
                     }
                     trace!(%actor_id, self_actor_id = %agent.actor_id(), "read clock payload");
 
-                    increment_counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string());
+                    counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string()).increment(1);
 
                     let needs = our_sync_state.compute_available_needs(&their_sync_state);
 
@@ -1028,22 +1024,28 @@ pub async fn parallel_sync(
     debug!("collected member needs and such!");
 
     #[allow(clippy::manual_try_fold)]
-    let syncers = results.into_iter().fold(Ok(vec![]), |agg, (actor_id, addr, res)| {
-        match res {
+    let syncers = results
+        .into_iter()
+        .fold(Ok(vec![]), |agg, (actor_id, addr, res)| match res {
             Ok((needs, tx, read)) => {
                 let mut v = agg.unwrap_or_default();
                 v.push((actor_id, addr, needs, tx, read));
                 Ok(v)
-            },
+            }
             Err(e) => {
-                increment_counter!("corro.sync.client.handshake.errors", "actor_id" => actor_id.to_string(), "addr" => addr.to_string(), "error" => e.to_string());
+                counter!(
+                    "corro.sync.client.handshake.errors",
+                    "actor_id" => actor_id.to_string(),
+                    "addr" => addr.to_string(),
+                    "error" => e.to_string()
+                )
+                .increment(1);
                 match agg {
                     Ok(v) if !v.is_empty() => Ok(v),
-                    _ => Err(e)
+                    _ => Err(e),
                 }
             }
-        }
-    })?;
+        })?;
 
     let len = syncers.len();
 
@@ -1091,7 +1093,7 @@ pub async fn parallel_sync(
                                 .map(|need| (actor_id, need))
                                 .collect::<Vec<_>>()
                         })
-                        .collect::<Vec<_>>(),
+                        .collect::<VecDeque<_>>(),
                     tx,
                 ));
 
@@ -1127,7 +1129,19 @@ pub async fn parallel_sync(
                 if needs.is_empty() {
                     continue;
                 }
-                for (actor_id, need) in needs.drain(0..cmp::min(10, needs.len())) {
+
+                let mut drained = 0;
+
+                while drained < 10 {
+                    let (actor_id, need) = match needs.pop_front() {
+                        Some(popped) => popped,
+                        None => {
+                            break;
+                        }
+                    };
+
+                    drained += 1;
+
                     let actual_needs = match need {
                         SyncNeedV1::Full { versions } => {
                             let range = req_full.entry(actor_id).or_default();
@@ -1197,7 +1211,7 @@ pub async fn parallel_sync(
                         continue 'servers;
                     }
 
-                    counter!("corro.sync.client.req.sent", req_len as u64, "actor_id" => server_actor_id.to_string());
+                    counter!("corro.sync.client.req.sent", "actor_id" => server_actor_id.to_string()).increment(req_len as u64);
                 }
 
                 if !send_buf.is_empty() {
@@ -1205,6 +1219,9 @@ pub async fn parallel_sync(
                         error!(%server_actor_id, %addr, "could not write sync requests: {e} (elapsed: {:?})", start.elapsed());
                         continue;
                     }
+                } else {
+                    // give some reprieve
+                    tokio::task::yield_now().await;
                 }
 
                 if needs.is_empty() {
@@ -1242,7 +1259,8 @@ pub async fn parallel_sync(
                             let changes_len = cmp::max(change.len(), 1);
                             // tracing::Span::current().record("changes_len", changes_len);
                             count += changes_len;
-                            counter!("corro.sync.changes.recv", changes_len as u64, "actor_id" => actor_id.to_string());
+                            counter!("corro.sync.changes.recv", "actor_id" => actor_id.to_string())
+                                .increment(changes_len as u64);
                             tx_changes
                                 .send((change, ChangeSource::Sync))
                                 .await
@@ -1270,7 +1288,8 @@ pub async fn parallel_sync(
             debug!(%actor_id, %count, "done reading sync messages");
 
             Ok(count)
-        }.instrument(info_span!("read_sync_requests_responses", %actor_id))
+        }
+        .instrument(info_span!("read_sync_requests_responses", %actor_id))
     }))
     .collect::<Vec<Result<usize, SyncError>>>()
     .await;
@@ -1339,6 +1358,25 @@ pub async fn serve_sync(
     }
 
     trace!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "read clock");
+
+    let _permit = match agent.limits().sync.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            // no permits!
+            encode_write_sync_msg(
+                &mut codec,
+                &mut encode_buf,
+                &mut send_buf,
+                SyncMessage::V1(SyncMessageV1::Rejection(
+                    SyncRejectionV1::MaxConcurrencyReached,
+                )),
+                &mut write,
+            )
+            .instrument(info_span!("write_sync_rejection"))
+            .await?;
+            return Ok(0);
+        }
+    };
 
     let sync_state = generate_sync(bookie, agent.actor_id()).await;
 
@@ -1445,7 +1483,7 @@ pub async fn serve_sync(
 
             debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
 
-            counter!("corro.sync.changes.sent", count as u64, "actor_id" => their_actor_id.to_string());
+            counter!("corro.sync.changes.sent", "actor_id" => their_actor_id.to_string()).increment(count as u64);
 
             Ok::<_, SyncError>(count)
         }.instrument(info_span!("process_versions_to_send")),
@@ -1496,7 +1534,7 @@ pub async fn serve_sync(
 
             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
 
-            counter!("corro.sync.requests.recv", count as u64, "actor_id" => their_actor_id.to_string());
+            counter!("corro.sync.requests.recv", "actor_id" => their_actor_id.to_string()).increment(count as u64);
 
             Ok(count)
         }.instrument(info_span!("process_version_requests"))
@@ -1517,7 +1555,7 @@ mod tests {
     use corro_types::{
         api::{ColumnName, TableName},
         base::CrsqlDbVersion,
-        config::{Config, TlsConfig},
+        config::{Config, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
@@ -1587,8 +1625,8 @@ mod tests {
         let bookie = Bookie::new(Default::default());
 
         process_multiple_changes(
-            &agent,
-            &bookie,
+            agent.clone(),
+            bookie.clone(),
             vec![
                 (
                     ChangeV1 {
@@ -1602,6 +1640,7 @@ mod tests {
                         },
                     },
                     ChangeSource::Sync,
+                    Instant::now(),
                 ),
                 (
                     ChangeV1 {
@@ -1615,6 +1654,7 @@ mod tests {
                         },
                     },
                     ChangeSource::Sync,
+                    Instant::now(),
                 ),
             ],
         )
@@ -1763,6 +1803,7 @@ mod tests {
 
         let gossip_config = GossipConfig {
             bind_addr: "127.0.0.1:0".parse()?,
+            client_addr: DEFAULT_GOSSIP_CLIENT_ADDR,
             external_addr: None,
             bootstrap: vec![],
             tls: Some(TlsConfig {

@@ -4,30 +4,35 @@
 
 use std::{
     cmp,
+    collections::VecDeque,
     net::SocketAddr,
     time::{Duration, Instant},
 };
 
 use crate::{
-    agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL, MIN_CHANGES_CHUNK},
+    agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL},
     api::peer::parallel_sync,
     transport::Transport,
 };
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
-    broadcast::{BroadcastV1, ChangeSource, ChangeV1, FocaInput, UniPayload},
+    base::CrsqlSeq,
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
+    channel::CorroReceiver,
     sync::generate_sync,
 };
 
 use bytes::Bytes;
 use foca::Notification;
-use metrics::{counter, gauge, histogram, increment_counter};
+use indexmap::IndexMap;
+use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
+use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
 use tokio::{
-    sync::mpsc::{Receiver, Sender},
-    task::block_in_place,
+    sync::mpsc::Receiver as TokioReceiver,
+    task::{block_in_place, JoinSet},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
@@ -40,7 +45,6 @@ pub fn spawn_gossipserver_handler(
     bookie: &Bookie,
     tripwire: &Tripwire,
     gossip_server_endpoint: quinn::Endpoint,
-    process_uni_tx: Sender<UniPayload>,
 ) {
     spawn_counted({
         let agent = agent.clone();
@@ -59,13 +63,7 @@ pub fn spawn_gossipserver_handler(
                 };
 
                 // Spawn incoming connection handlers
-                spawn_incoming_connection_handlers(
-                    &agent,
-                    &bookie,
-                    &tripwire,
-                    process_uni_tx.clone(),
-                    connecting,
-                );
+                spawn_incoming_connection_handlers(&agent, &bookie, &tripwire, connecting);
             }
 
             // graceful shutdown
@@ -85,10 +83,8 @@ pub fn spawn_incoming_connection_handlers(
     agent: &Agent,
     bookie: &Bookie,
     tripwire: &Tripwire,
-    process_uni_tx: Sender<UniPayload>,
     connecting: quinn::Connecting,
 ) {
-    let process_uni_tx = process_uni_tx.clone();
     let agent = agent.clone();
     let bookie = bookie.clone();
     let tripwire = tripwire.clone();
@@ -105,20 +101,20 @@ pub fn spawn_incoming_connection_handlers(
             }
         };
 
-        increment_counter!("corro.peer.connection.accept.total");
+        counter!("corro.peer.connection.accept.total").increment(1);
 
         debug!("accepted a QUIC conn from {remote_addr}");
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(&tripwire, &conn, process_uni_tx);
+        uni::spawn_unipayload_handler(&tripwire, &conn, agent.clone());
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }
 
 /// Spawn a single task that accepts chunks from a receiver and
 /// updates cluster member round-trip-times in the agent state.
-pub fn spawn_rtt_handler(agent: &Agent, rtt_rx: Receiver<(SocketAddr, Duration)>) {
+pub fn spawn_rtt_handler(agent: &Agent, rtt_rx: TokioReceiver<(SocketAddr, Duration)>) {
     tokio::spawn({
         let agent = agent.clone();
         async move {
@@ -148,8 +144,8 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
                 let b = tokio::select! {
                     b_res = conn.read_datagram() => match b_res {
                         Ok(b) => {
-                            increment_counter!("corro.peer.datagram.recv.total");
-                            counter!("corro.peer.datagram.bytes.recv.total", b.len() as u64);
+                            counter!("corro.peer.datagram.recv.total").increment(1);
+                            counter!("corro.peer.datagram.bytes.recv.total").increment(b.len() as u64);
                             b
                         },
                         Err(e) => {
@@ -171,7 +167,13 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
     });
 }
 
-// DOCME: provide function context
+/// Announce this node to other random nodes (according to SWIM)
+///
+/// We use an exponential backoff to announce aggressively in the
+/// beginning, get a full picture of the cluster, then stop spamming
+/// everyone.
+///
+///
 pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
     tokio::spawn({
         let agent = agent.clone();
@@ -218,10 +220,14 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
     });
 }
 
-// DOCME: provide function context
-pub async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receiver<(Actor, Bytes)>) {
+/// A central dispatcher for SWIM cluster management messages
+// TODO: we may be able to inline this code where it is needed
+pub async fn handle_gossip_to_send(
+    transport: Transport,
+    mut swim_to_send_rx: CorroReceiver<(Actor, Bytes)>,
+) {
     // TODO: use tripwire and drain messages to send when that happens...
-    while let Some((actor, data)) = to_send_rx.recv().await {
+    while let Some((actor, data)) = swim_to_send_rx.recv().await {
         trace!("got gossip to send to {actor:?}");
 
         let addr = actor.addr();
@@ -230,40 +236,26 @@ pub async fn handle_gossip_to_send(transport: Transport, mut to_send_rx: Receive
         let transport = transport.clone();
 
         let len = data.len();
-        spawn_counted(async move {
-            if let Err(e) = transport.send_datagram(addr, data).await {
-                error!("could not write datagram {addr}: {e}");
-                return;
-            }
-            increment_counter!("corro.peer.datagram.sent.total", "actor_id" => actor_id.to_string());
-            counter!("corro.peer.datagram.bytes.sent.total", len as u64);
-        }.instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)));
-    }
-}
-
-// DOCME: provide function context
-pub async fn handle_broadcasts(agent: Agent, mut bcast_rx: Receiver<BroadcastV1>) {
-    while let Some(bcast) = bcast_rx.recv().await {
-        increment_counter!("corro.broadcast.recv.count");
-        match bcast {
-            BroadcastV1::Change(change) => {
-                if let Err(_e) = agent
-                    .tx_changes()
-                    .send((change, ChangeSource::Broadcast))
-                    .await
-                {
-                    error!("changes channel is closed");
-                    break;
+        spawn_counted(
+            async move {
+                if let Err(e) = transport.send_datagram(addr, data).await {
+                    error!("could not write datagram {addr}: {e}");
+                    return;
                 }
+                counter!("corro.peer.datagram.sent.total", "actor_id" => actor_id.to_string())
+                    .increment(1);
+                counter!("corro.peer.datagram.bytes.sent.total").increment(len as u64);
             }
-        }
+            .instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)),
+        );
     }
 }
 
-// DOCME: provide function context
+/// Poll for updates from the cluster membership system (`foca`/ SWIM)
+/// and apply any incoming changes to the local actor/ agent state.
 pub async fn handle_notifications(
     agent: Agent,
-    mut notification_rx: Receiver<Notification<Actor>>,
+    mut notification_rx: CorroReceiver<Notification<Actor>>,
 ) {
     while let Some(notification) = notification_rx.recv().await {
         trace!("handle notification");
@@ -273,7 +265,7 @@ pub async fn handle_notifications(
                 trace!("Member Up {actor:?} (added: {added})");
                 if added {
                     debug!("Member Up {actor:?}");
-                    increment_counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
+                    counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
                     // actually added a member
                     // notify of new cluster size
                     let members_len = { agent.members().read().states.len() as u32 };
@@ -296,14 +288,14 @@ pub async fn handle_notifications(
                         warn!(?actor, "could not manually declare actor as down! {e}");
                     }
                 }
-                increment_counter!("corro.swim.notification", "type" => "memberup");
+                counter!("corro.swim.notification", "type" => "memberup").increment(1);
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
                 trace!("Member Down {actor:?} (removed: {removed})");
                 if removed {
                     debug!("Member Down {actor:?}");
-                    increment_counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string());
+                    counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
                     // actually removed a member
                     // notify of new cluster size
                     let member_len = { agent.members().read().states.len() as u32 };
@@ -313,29 +305,33 @@ pub async fn handle_notifications(
                         }
                     }
                 }
-                increment_counter!("corro.swim.notification", "type" => "memberdown");
+                counter!("corro.swim.notification", "type" => "memberdown").increment(1);
             }
             Notification::Active => {
                 info!("Current node is considered ACTIVE");
-                increment_counter!("corro.swim.notification", "type" => "active");
+                counter!("corro.swim.notification", "type" => "active").increment(1);
             }
             Notification::Idle => {
                 warn!("Current node is considered IDLE");
-                increment_counter!("corro.swim.notification", "type" => "idle");
+                counter!("corro.swim.notification", "type" => "idle").increment(1);
             }
             // this happens when we leave the cluster
             Notification::Defunct => {
                 debug!("Current node is considered DEFUNCT");
-                increment_counter!("corro.swim.notification", "type" => "defunct");
+                counter!("corro.swim.notification", "type" => "defunct").increment(1);
             }
             Notification::Rejoin(id) => {
                 info!("Rejoined the cluster with id: {id:?}");
-                increment_counter!("corro.swim.notification", "type" => "rejoin");
+                counter!("corro.swim.notification", "type" => "rejoin").increment(1);
             }
         }
     }
 }
 
+/// We keep a write-ahead-log, which under write-pressure can grow to
+/// multiple gigabytes and needs periodic truncation.  We don't want
+/// to schedule this task too often since it locks the whole DB.
+// TODO: can we get around the lock somehow?
 async fn db_cleanup(pool: &SplitPool) -> eyre::Result<()> {
     debug!("handling db_cleanup (WAL truncation)");
     let conn = pool.write_low().await?;
@@ -346,13 +342,10 @@ async fn db_cleanup(pool: &SplitPool) -> eyre::Result<()> {
             conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
         if busy {
             warn!("could not truncate sqlite WAL, database busy");
-            increment_counter!("corro.db.wal.truncate.busy");
+            counter!("corro.db.wal.truncate.busy").increment(1);
         } else {
             debug!("successfully truncated sqlite WAL!");
-            histogram!(
-                "corro.db.wal.truncate.seconds",
-                start.elapsed().as_secs_f64()
-            );
+            histogram!("corro.db.wal.truncate.seconds").record(start.elapsed().as_secs_f64());
         }
         Ok::<_, eyre::Report>(())
     })?;
@@ -360,8 +353,7 @@ async fn db_cleanup(pool: &SplitPool) -> eyre::Result<()> {
     Ok(())
 }
 
-// Every now and then, we need to truncate the WAL.
-// It can get enormous when under write pressure.
+/// See `db_cleanup`
 pub fn spawn_handle_db_cleanup(pool: SplitPool) {
     tokio::spawn(async move {
         let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
@@ -375,52 +367,190 @@ pub fn spawn_handle_db_cleanup(pool: SplitPool) {
     });
 }
 
-// DOCME: provide function context
+/// Bundle incoming changes to optimise transaction sizes with SQLite
+///
+/// *Performance tradeoff*: introduce latency (with a max timeout) to
+/// apply changes more efficiently.
+///
+/// This function used by broadcast receivers and sync receivers
 pub async fn handle_changes(
     agent: Agent,
     bookie: Bookie,
-    mut rx_changes: Receiver<(ChangeV1, ChangeSource)>,
+    mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     mut tripwire: Tripwire,
 ) {
+    const MIN_CHANGES_CHUNK: usize = 2000;
+    let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
     let mut count = 0;
 
+    const MAX_CONCURRENT: usize = 3;
+    let mut join_set = JoinSet::new();
+
     let mut max_wait = tokio::time::interval(Duration::from_millis(500));
 
+    const MAX_SEEN_CACHE_LEN: usize = 10000;
+    const KEEP_SEEN_CACHE_SIZE: usize = 1000;
+    let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
+
+    // complicated loop to process changes efficiently w/ a max concurrency
+    // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
+        while count >= MIN_CHANGES_CHUNK && join_set.len() < MAX_CONCURRENT {
+            // we're already bigger than the minimum size of changes batch
+            // so we want to accumulate at least that much and process them
+            // concurrently bvased on MAX_CONCURRENCY
+            let mut tmp_count = 0;
+            while let Some((change, src, queued_at)) = queue.pop_front() {
+                tmp_count += change.len();
+                buf.push((change, src, queued_at));
+                if tmp_count >= MIN_CHANGES_CHUNK {
+                    break;
+                }
+            }
+
+            if buf.is_empty() {
+                break;
+            }
+
+            debug!(count = %tmp_count, "spawning processing multiple changes from beginning of loop");
+            join_set.spawn(util::process_multiple_changes(
+                agent.clone(),
+                bookie.clone(),
+                std::mem::take(&mut buf),
+            ));
+
+            count -= tmp_count;
+        }
+
         tokio::select! {
+            biased;
+
+            // process these first, we don't care about the result,
+            // but we need to drain it to free up concurrency
+            res = join_set.join_next(), if !join_set.is_empty() => {
+                debug!("processed multiple changes concurrently");
+                if let Some(Ok(Err(e))) = res {
+                    error!("could not process multiple changes: {e}");
+                }
+                continue;
+            },
+
             Some((change, src)) = rx_changes.recv() => {
-                counter!("corro.agent.changes.recv", std::cmp::max(change.len(), 1) as u64); // count empties...
-                count += change.len(); // don't count empties
-                buf.push((change, src));
-                if count < MIN_CHANGES_CHUNK {
+                let change_len = change.len();
+                counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
+
+                if change.actor_id == agent.actor_id() {
                     continue;
                 }
+
+                if let Some(mut seqs) = change.seqs().cloned() {
+                    let v = *change.versions().start();
+                    if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
+                        if seqs.all(|seq| seen_seqs.contains(&seq)) {
+                            continue;
+                        }
+                    }
+                } else {
+                    // empty versions
+                    if change.versions().all(|v| seen.contains_key(&(change.actor_id, v))) {
+                        continue;
+                    }
+                }
+
+                let recv_lag = change
+                    .ts()
+                    .map(|ts| (agent.clock().new_timestamp().get_time() - ts.0).to_duration());
+
+                if matches!(src, ChangeSource::Broadcast) {
+                    counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
+                }
+
+                let booked = {
+                    bookie
+                        .read(format!(
+                            "handle_change(get):{}",
+                            change.actor_id.as_simple()
+                        ))
+                        .await
+                        .get(&change.actor_id)
+                        .cloned()
+                };
+
+                if let Some(booked) = booked {
+                    if booked
+                        .read(format!(
+                            "handle_change(contains?):{}",
+                            change.actor_id.as_simple()
+                        ))
+                        .await
+                        .contains_all(change.versions(), change.seqs())
+                    {
+                        trace!("already seen, stop disseminating");
+                        continue;
+                    }
+                }
+
+                if let Some(recv_lag) = recv_lag {
+                    let src_str: &'static str = src.into();
+                    histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str).record(recv_lag.as_secs_f64());
+                }
+
+                // this will only run once for a non-empty changeset
+                for v in change.versions() {
+                    let entry = seen.entry((change.actor_id, v)).or_default();
+                    if let Some(seqs) = change.seqs().cloned() {
+                        entry.extend([seqs]);
+                    }
+                }
+
+                if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
+                    if let Err(_e) =
+                        agent
+                            .tx_bcast()
+                            .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(change.clone())))
+                    {
+                        debug!("broadcasts are full or done!");
+                    }
+                }
+
+                queue.push_back((change, src, Instant::now()));
+
+                count += change_len; // track number of individual changes, not changesets
             },
+
             _ = max_wait.tick() => {
                 // got a wait interval tick...
-                if buf.is_empty() {
-                    continue;
+
+                gauge!("corro.agent.changes.in_queue").set(count as f64);
+                gauge!("corro.agent.changesets.in_queue").set(queue.len() as f64);
+                gauge!("corro.agent.changes.processing.jobs").set(join_set.len() as f64);
+
+                if count < MIN_CHANGES_CHUNK && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
+                    // we can process this right away
+                    debug!(%count, "spawning processing multiple changes from max wait interval");
+                    join_set.spawn(util::process_multiple_changes(
+                        agent.clone(),
+                        bookie.clone(),
+                        queue.drain(..).collect(),
+                    ));
+                    count = 0;
+                }
+
+                if seen.len() > MAX_SEEN_CACHE_LEN {
+                    // we don't want to keep too many entries in here.
+                    seen = seen.split_off(seen.len() - KEEP_SEEN_CACHE_SIZE);
                 }
             },
+
             _ = &mut tripwire => {
                 break;
             }
+
             else => {
                 break;
             }
         }
-
-        // drain and process current changes!
-        #[allow(clippy::drain_collect)]
-        if let Err(e) =
-            util::process_multiple_changes(&agent, &bookie, buf.drain(..).collect()).await
-        {
-            error!("could not process multiple changes: {e}");
-        }
-
-        // reset count
-        count = 0;
     }
 
     info!("Draining changes receiver...");
@@ -428,14 +558,17 @@ pub async fn handle_changes(
     // drain!
     while let Ok((change, src)) = rx_changes.try_recv() {
         let changes_count = std::cmp::max(change.len(), 1);
-        counter!("corro.agent.changes.recv", changes_count as u64);
+        counter!("corro.agent.changes.recv").increment(changes_count as u64);
         count += changes_count;
-        buf.push((change, src));
+        queue.push_back((change, src, Instant::now()));
         if count >= MIN_CHANGES_CHUNK {
             // drain and process current changes!
-            #[allow(clippy::drain_collect)]
-            if let Err(e) =
-                util::process_multiple_changes(&agent, &bookie, buf.drain(..).collect()).await
+            if let Err(e) = util::process_multiple_changes(
+                agent.clone(),
+                bookie.clone(),
+                queue.drain(..).collect(),
+            )
+            .await
             {
                 error!("could not process last multiple changes: {e}");
             }
@@ -446,12 +579,16 @@ pub async fn handle_changes(
     }
 
     // process the last changes we got!
-    if let Err(e) = util::process_multiple_changes(&agent, &bookie, buf).await {
+    if let Err(e) = util::process_multiple_changes(agent, bookie, queue.into_iter().collect()).await
+    {
         error!("could not process multiple changes: {e}");
     }
 }
 
-// DOCME: add context
+/// Start a new sync with multiple other nodes
+///
+/// Choose members to sync with based on the current RTT and how many
+/// (known) versions we need from that peer.  Add randomness to taste.
 #[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn handle_sync(
     agent: &Agent,
@@ -461,10 +598,11 @@ pub async fn handle_sync(
     let sync_state = generate_sync(bookie, agent.actor_id()).await;
 
     for (actor_id, needed) in sync_state.need.iter() {
-        gauge!("corro.sync.client.needed", needed.len() as f64, "actor_id" => actor_id.to_string());
+        gauge!("corro.sync.client.needed", "actor_id" => actor_id.to_string())
+            .set(needed.len() as f64);
     }
     for (actor_id, version) in sync_state.heads.iter() {
-        gauge!("corro.sync.client.head", version.0 as f64, "actor_id" => actor_id.to_string());
+        gauge!("corro.sync.client.head", "actor_id" => actor_id.to_string()).set(version.0 as f64);
     }
 
     let chosen: Vec<(ActorId, SocketAddr)> = {
@@ -474,7 +612,9 @@ pub async fn handle_sync(
             members
                 .states
                 .iter()
+                // Filter out self
                 .filter(|(id, _state)| **id != agent.actor_id())
+                // Grab a ring-buffer index to the member RTT range
                 .map(|(id, state)| (*id, state.ring.unwrap_or(255), state.addr))
                 .collect::<Vec<(ActorId, u8, SocketAddr)>>()
         };

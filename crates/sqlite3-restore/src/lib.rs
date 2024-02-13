@@ -110,7 +110,7 @@ pub fn restore<P1: AsRef<Path>, P2: AsRef<Path>>(
     copy_check(&mut src_db_file, &mut dst_db_file, src_meta.len())?;
 
     if let Locked::Wal(ref mut dst_shm_file) = dst_locked {
-        dst_shm_file.write_at(&[136], 0)?;
+        dst_shm_file.write_at(&[0; 136], 0)?;
     }
 
     info!("done");

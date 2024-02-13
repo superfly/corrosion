@@ -8,7 +8,7 @@ use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{
-        mpsc::{channel, Receiver},
+        mpsc::{channel as tokio_channel, Receiver as TokioReceiver},
         Semaphore,
     },
 };
@@ -22,6 +22,7 @@ use corro_types::{
     agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
     base::Version,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
+    channel::{bounded, CorroReceiver},
     config::Config,
     members::Members,
     pubsub::SubsManager,
@@ -35,13 +36,13 @@ pub struct AgentOptions {
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
     pub api_listener: TcpListener,
-    pub rx_bcast: Receiver<BroadcastInput>,
-    pub rx_apply: Receiver<(ActorId, Version)>,
-    pub rx_empty: Receiver<(ActorId, RangeInclusive<Version>)>,
-    pub rx_clear_buf: Receiver<(ActorId, RangeInclusive<Version>)>,
-    pub rx_changes: Receiver<(ChangeV1, ChangeSource)>,
-    pub rx_foca: Receiver<FocaInput>,
-    pub rtt_rx: Receiver<(SocketAddr, Duration)>,
+    pub rx_bcast: CorroReceiver<BroadcastInput>,
+    pub rx_apply: CorroReceiver<(ActorId, Version)>,
+    pub rx_empty: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
+    pub rx_clear_buf: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
+    pub rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
+    pub rx_foca: CorroReceiver<FocaInput>,
+    pub rtt_rx: TokioReceiver<(SocketAddr, Duration)>,
     pub subs_manager: SubsManager,
     pub tripwire: Tripwire,
 }
@@ -93,8 +94,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     info!("Cluster ID: {cluster_id}");
 
-    let (tx_apply, rx_apply) = channel(20480);
-    let (tx_clear_buf, rx_clear_buf) = channel(10240);
+    let (tx_apply, rx_apply) = bounded(20480, "apply");
+    let (tx_clear_buf, rx_clear_buf) = bounded(10240, "clear_buf");
 
     let lock_registry = LockRegistry::default();
     let booked = {
@@ -110,7 +111,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let external_addr = conf.gossip.external_addr;
 
-    let (rtt_tx, rtt_rx) = channel(128);
+    // RTT handling interacts with the tokio ReceiverStream and as
+    // such needs a raw tokio channel
+    let (rtt_tx, rtt_rx) = tokio_channel(128);
 
     let transport = Transport::new(&conf.gossip, rtt_tx).await?;
 
@@ -124,10 +127,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             .build(),
     );
 
-    let (tx_bcast, rx_bcast) = channel(10240);
-    let (tx_empty, rx_empty) = channel(10240);
-    let (tx_changes, rx_changes) = channel(5192);
-    let (tx_foca, rx_foca) = channel(10240);
+    let (tx_bcast, rx_bcast) = bounded(10240, "bcast");
+    let (tx_empty, rx_empty) = bounded(10240, "empty");
+    let (tx_changes, rx_changes) = bounded(5192, "changes");
+    let (tx_foca, rx_foca) = bounded(10240, "foca");
 
     let subs_manager = SubsManager::default();
 

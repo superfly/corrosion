@@ -1,22 +1,17 @@
 use corro_types::{
-    agent::{Agent, Bookie},
-    broadcast::{BroadcastV1, UniPayload, UniPayloadV1},
+    agent::Agent,
+    broadcast::{BroadcastV1, ChangeSource, UniPayload, UniPayloadV1},
 };
-use metrics::{counter, histogram, increment_counter};
+use metrics::counter;
 use speedy::Readable;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, trace};
 use tripwire::Tripwire;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
-pub fn spawn_unipayload_handler(
-    tripwire: &Tripwire,
-    conn: &quinn::Connection,
-    process_uni_tx: Sender<UniPayload>,
-) {
+pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, agent: Agent) {
     tokio::spawn({
         let conn = conn.clone();
         let mut tripwire = tripwire.clone();
@@ -36,7 +31,7 @@ pub fn spawn_unipayload_handler(
                     }
                 };
 
-                increment_counter!("corro.peer.stream.accept.total", "type" => "uni");
+                counter!("corro.peer.stream.accept.total", "type" => "uni").increment(1);
 
                 debug!(
                     "accepted a unidirectional stream from {}",
@@ -44,24 +39,41 @@ pub fn spawn_unipayload_handler(
                 );
 
                 tokio::spawn({
-                    let process_uni_tx = process_uni_tx.clone();
+                    let agent = agent.clone();
                     async move {
                         let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
 
                         loop {
                             match StreamExt::next(&mut framed).await {
                                 Some(Ok(b)) => {
-                                    counter!("corro.peer.stream.bytes.recv.total", b.len() as u64, "type" => "uni");
+                                    counter!("corro.peer.stream.bytes.recv.total", "type" => "uni")
+                                        .increment(b.len() as u64);
                                     match UniPayload::read_from_buffer(&b) {
                                         Ok(payload) => {
                                             trace!("parsed a payload: {payload:?}");
 
-                                            if let Err(e) = process_uni_tx.send(payload).await {
-                                                error!(
-                                                    "could not send UniPayload for processing: {e}"
-                                                );
-                                                // this means we won't be able to process more...
-                                                return;
+                                            match payload {
+                                                UniPayload::V1 {
+                                                    data:
+                                                        UniPayloadV1::Broadcast(BroadcastV1::Change(
+                                                            change,
+                                                        )),
+                                                    cluster_id,
+                                                } => {
+                                                    if cluster_id != agent.cluster_id() {
+                                                        continue;
+                                                    }
+                                                    if let Err(e) = agent
+                                                        .tx_changes()
+                                                        .send((change, ChangeSource::Broadcast))
+                                                        .await
+                                                    {
+                                                        error!(
+                                                            "could not send change for processing: {e}"
+                                                        );
+                                                        return;
+                                                    }
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -81,104 +93,4 @@ pub fn spawn_unipayload_handler(
             }
         }
     });
-}
-
-/// Start an async buffer task that pull messages from one channel
-/// (process_uni_rx) and moves them into the next if the variant
-/// matches (bcast_msg_tx)
-// DOCME: why is this task needed?  Do we just want to get this
-// function out of the stream hot path?
-pub fn spawn_unipayload_message_decoder(
-    agent: &Agent,
-    bookie: &Bookie,
-    mut process_uni_rx: Receiver<UniPayload>,
-    bcast_msg_tx: Sender<BroadcastV1>,
-) {
-    tokio::spawn({
-        let agent = agent.clone();
-        let bookie = bookie.clone();
-        async move {
-            while let Some(payload) = process_uni_rx.recv().await {
-                match payload {
-                    UniPayload::V1 {
-                        data: UniPayloadV1::Broadcast(bcast),
-                        cluster_id,
-                    } => {
-                        if cluster_id != agent.cluster_id() {
-                            continue;
-                        }
-                        handle_change(&agent, &bookie, bcast, &bcast_msg_tx).await
-                    }
-                }
-            }
-
-            info!("uni payload process loop is done!");
-        }
-    });
-}
-
-/// Apply a single broadcast to the local actor state, then
-/// re-broadcast to other cluster members via the bcast_msg_tx channel
-async fn handle_change(
-    agent: &Agent,
-    bookie: &Bookie,
-    bcast: BroadcastV1,
-    bcast_msg_tx: &Sender<BroadcastV1>,
-) {
-    match bcast {
-        BroadcastV1::Change(change) => {
-            let diff = if let Some(ts) = change.ts() {
-                if let Ok(id) = change.actor_id.try_into() {
-                    Some(
-                        agent
-                            .clock()
-                            .new_timestamp()
-                            .get_diff_duration(&uhlc::Timestamp::new(ts.0, id)),
-                    )
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            increment_counter!("corro.broadcast.recv.count", "kind" => "change");
-
-            trace!("handling {} changes", change.len());
-
-            let booked = {
-                bookie
-                    .write(format!(
-                        "handle_change(for_actor):{}",
-                        change.actor_id.as_simple()
-                    ))
-                    .await
-                    .for_actor(change.actor_id)
-            };
-
-            if booked
-                .read(format!(
-                    "handle_change(contains?):{}",
-                    change.actor_id.as_simple()
-                ))
-                .await
-                .contains_all(change.versions(), change.seqs())
-            {
-                trace!("already seen, stop disseminating");
-                return;
-            }
-
-            if change.actor_id == agent.actor_id() {
-                return;
-            }
-
-            if let Some(diff) = diff {
-                histogram!("corro.broadcast.recv.lag.seconds", diff.as_secs_f64());
-            }
-
-            if let Err(e) = bcast_msg_tx.send(BroadcastV1::Change(change)).await {
-                error!("could not send change message through broadcast channel: {e}");
-            }
-        }
-    }
 }

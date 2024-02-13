@@ -32,7 +32,7 @@ impl MemberState {
     }
 }
 
-const RING_BUCKETS: [Range<u64>; 6] = [0..5, 5..15, 15..50, 50..100, 100..200, 200..300];
+const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 200..300];
 
 #[derive(Debug, Default, Clone)]
 pub struct Rtt {
@@ -111,16 +111,26 @@ impl Members {
         self.recalculate_rings(addr)
     }
 
+    /// For a given member, calculate the average RTT and update
+    /// `self.ring` with the index of the corresponding bucket in
+    /// `RING_BUCKETS`.
     fn recalculate_rings(&mut self, addr: SocketAddr) {
         if let Some(actor_id) = self.by_addr.get(&addr) {
             if let Some(avg) = self.rtts.get(&addr).and_then(|rtt| {
+                // If the ring buffer isn't empty
                 (!rtt.buf.is_empty()).then(|| {
+                    // We can only access the ring buffer via two
+                    // slices, so we sum both of them together
                     (rtt.buf.as_slices().0.iter().sum::<u64>()
-                        + rtt.buf.as_slices().1.iter().sum::<u64>())
+                     + rtt.buf.as_slices().1.iter().sum::<u64>())
+                        // Then average over the full size of the ring
+                        // buffer for the average of recent RTTs
                         / rtt.buf.len() as u64
                 })
             }) {
                 if let Some(state) = self.states.get_mut(actor_id) {
+                    // We check which range-bucket the RTT is
+                    // contained in, then update the stored index
                     for (ring, n) in RING_BUCKETS.iter().enumerate() {
                         if n.contains(&avg) {
                             state.ring = Some(ring as u8);
@@ -132,6 +142,8 @@ impl Members {
         }
     }
 
+    /// Get member addresses where the ring index is `0` (meaning a
+    /// very small RTT)
     pub fn ring0(&self) -> impl Iterator<Item = SocketAddr> + '_ {
         self.states
             .values()

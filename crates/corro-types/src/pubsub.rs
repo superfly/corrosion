@@ -24,8 +24,8 @@ use rusqlite::{
 use spawn::spawn_counted;
 use sqlite3_parser::{
     ast::{
-        As, Cmd, Expr, JoinConstraint, Name, OneSelect, Operator, QualifiedName, ResultColumn,
-        Select, SelectTable, Stmt,
+        As, Cmd, Expr, FromClause, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, Name,
+        OneSelect, Operator, QualifiedName, ResultColumn, Select, SelectTable, Stmt,
     },
     lexer::sql::Parser,
 };
@@ -188,7 +188,7 @@ impl SubsManager {
 
             // metrics...
             for (table, pks) in candidates.iter() {
-                counter!("corro.subs.changes.matched.count", pks.len() as u64, "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string());
+                counter!("corro.subs.changes.matched.count", "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string()).increment(pks.len() as u64);
             }
 
             trace!(sub_id = %id, %db_version, "found {match_count} candidates");
@@ -609,7 +609,7 @@ impl Matcher {
             _ => unreachable!(),
         }
 
-        for (tbl_name, _cols) in parsed.table_columns.iter() {
+        for (idx, (tbl_name, _cols)) in parsed.table_columns.iter().enumerate() {
             let expr = table_to_expr(
                 &parsed.aliases,
                 schema
@@ -622,11 +622,33 @@ impl Matcher {
             let mut stmt = stmt.clone();
 
             if let Stmt::Select(select) = &mut stmt {
-                if let OneSelect::Select { where_clause, .. } = &mut select.body.select {
+                if let OneSelect::Select {
+                    where_clause, from, ..
+                } = &mut select.body.select
+                {
                     *where_clause = if let Some(prev) = where_clause.take() {
                         Some(Expr::Binary(Box::new(expr), Operator::And, Box::new(prev)))
                     } else {
                         Some(expr)
+                    };
+
+                    match from {
+                        Some(FromClause {
+                            joins: Some(joins), ..
+                        }) if idx > 0 => {
+                            if let Some(JoinedSelectTable {
+                                operator:
+                                    JoinOperator::TypedJoin {
+                                        join_type: join_type @ Some(JoinType::LeftOuter),
+                                        ..
+                                    },
+                                ..
+                            }) = joins.get_mut(idx - 1)
+                            {
+                                *join_type = Some(JoinType::Inner);
+                            };
+                        }
+                        _ => (),
                     };
                 }
             }
@@ -1182,8 +1204,9 @@ impl Matcher {
                                     .map(|i| row.get::<_, SqliteValue>(i))
                                     .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                                if let Err(e) =
-                                    self.evt_tx.try_send(QueryEvent::Row(RowId(rowid), cells))
+                                if let Err(e) = self
+                                    .evt_tx
+                                    .blocking_send(QueryEvent::Row(RowId(rowid), cells))
                                 {
                                     error!(sub_id = %self.id, "could not send back row: {e}");
                                     return Err(MatcherError::EventReceiverClosed);

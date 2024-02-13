@@ -3,7 +3,7 @@ use corro_types::{
     agent::{Agent, Bookie},
     broadcast::{BiPayload, BiPayloadV1},
 };
-use metrics::increment_counter;
+use metrics::counter;
 use speedy::Readable;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -44,7 +44,7 @@ pub fn spawn_bipayload_handler(
                 }
             };
 
-            increment_counter!("corro.peer.stream.accept.total", "type" => "bi");
+            counter!("corro.peer.stream.accept.total", "type" => "bi").increment(1);
 
             debug!(
                 "accepted a bidirectional stream from {}",
@@ -84,6 +84,7 @@ pub fn spawn_bipayload_handler(
                                                         "framed read buffer len: {}",
                                                         framed.read_buffer().len()
                                                     );
+
                                                     // println!("got sync state: {state:?}");
                                                     if let Err(e) = serve_sync(
                                                         &agent, &bookie, actor_id, trace_ctx,

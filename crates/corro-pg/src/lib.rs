@@ -2181,6 +2181,7 @@ impl Session {
                 let conn = agent.pool().read().await?;
 
                 block_in_place(|| {
+                    let agent = agent.clone();
                     // TODO: make this more generic so both sync and local changes can use it.
                     let mut prepped = conn.prepare_cached(
                         r#"
@@ -2199,7 +2200,7 @@ impl Session {
                                 for (table_name, count) in
                                     changes.iter().counts_by(|change| &change.table)
                                 {
-                                    counter!("corro.changes.committed", count as u64, "table" => table_name.to_string(), "source" => "local");
+                                    counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "local").increment(count as u64);
                                 }
 
                                 trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");

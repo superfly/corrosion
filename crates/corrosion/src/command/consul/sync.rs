@@ -2,7 +2,7 @@ use consul_client::{AgentCheck, AgentService, Client};
 use corro_api_types::ColumnType;
 use corro_client::CorrosionClient;
 use corro_types::{api::Statement, config::ConsulConfig};
-use metrics::{histogram, increment_counter};
+use metrics::{histogram, counter};
 use serde::{Deserialize, Serialize};
 use spawn::{spawn_counted, wait_for_all_pending_handles};
 use std::{
@@ -38,7 +38,7 @@ pub async fn run<P: AsRef<Path>>(
     setup(
         &corrosion
     )
-    .await?;
+        .await?;
 
     let mut consul_services: HashMap<String, u64> = HashMap::new();
     let mut consul_checks: HashMap<String, u64> = HashMap::new();
@@ -257,11 +257,11 @@ fn append_upsert_service_statements(
     VALUES (?, ?)
     ON CONFLICT (id) DO UPDATE SET
         hash = excluded.hash;"
-    .into(),vec![
-        
-        svc.id.clone().into(),
-        hash.to_be_bytes().to_vec().into(),
-    ]));
+                                          .into(),vec![
+                                              
+                                              svc.id.clone().into(),
+                                              hash.to_be_bytes().to_vec().into(),
+                                          ]));
 
     // upsert!
     statements.push(Statement::WithParams("INSERT INTO consul_services ( node, id, name, tags, meta, port, address, updated_at )
@@ -273,17 +273,17 @@ fn append_upsert_service_statements(
         port = excluded.port,
         address = excluded.address,
         updated_at = excluded.updated_at;"
-        .into(),vec![
-        
-        node.into(),
-        svc.id.into(),
-        svc.name.into(),
-        serde_json::to_string(&svc.tags).unwrap_or_else(|_| "[]".to_string()).into(),
-        serde_json::to_string(&svc.meta).unwrap_or_else(|_| "{}".to_string()).into(),
-        svc.port.into(),
-        svc.address.into(),
-        updated_at.into(),
-    ]));
+                                          .into(),vec![
+                                              
+                                              node.into(),
+                                              svc.id.into(),
+                                              svc.name.into(),
+                                              serde_json::to_string(&svc.tags).unwrap_or_else(|_| "[]".to_string()).into(),
+                                              serde_json::to_string(&svc.meta).unwrap_or_else(|_| "{}".to_string()).into(),
+                                              svc.port.into(),
+                                              svc.address.into(),
+                                              updated_at.into(),
+                                          ]));
 }
 
 fn append_upsert_check_statements(
@@ -298,11 +298,11 @@ fn append_upsert_check_statements(
     VALUES (?, ?)
     ON CONFLICT (id) DO UPDATE SET
         hash = excluded.hash;"
-    .into(),vec![
-        
-        check.id.clone().into(),
-        hash.to_be_bytes().to_vec().into(),
-    ]));
+                                          .into(),vec![
+                                              
+                                              check.id.clone().into(),
+                                              hash.to_be_bytes().to_vec().into(),
+                                          ]));
 
     // upsert!
     statements.push(Statement::WithParams("INSERT INTO consul_checks ( node, id, service_id, service_name, name, status, output, updated_at )
@@ -314,18 +314,17 @@ fn append_upsert_check_statements(
         status = excluded.status,
         output = excluded.output,
         updated_at = excluded.updated_at;"
-        .into(),vec![
-        
-        node.into(),
-        check.id.into(),
-        check.service_id.into(),
-        check.service_name.into(),
-        check.name.into(),
-        check.status.as_str().into(),
-        check.output.into(),
-        updated_at.into(),
-    ]));
-
+                                          .into(),vec![
+                                              
+                                              node.into(),
+                                              check.id.into(),
+                                              check.service_id.into(),
+                                              check.service_name.into(),
+                                              check.name.into(),
+                                              check.status.as_str().into(),
+                                              check.output.into(),
+                                              updated_at.into(),
+                                          ]));
 }
 
 enum ConsulServiceOp {
@@ -338,6 +337,7 @@ enum ConsulCheckOp {
     Delete { id: String }
 }
 
+///
 fn update_services(
     mut services: HashMap<String, AgentService>,
     hashes: &HashMap<String, u64>,
@@ -415,45 +415,39 @@ pub async fn update_consul(
 ) -> eyre::Result<(ApplyStats, ApplyStats)> {
     let fut_services = async {
         let start = Instant::now();
-            match timeout(Duration::from_secs(5), consul.agent_services()).await {
-                Ok(Ok(services)) => {
-                    histogram!(
-                        "corro_consul.consul.response.time.seconds",
-                        start.elapsed().as_secs_f64()
-                    );
-                    Ok::<_, eyre::Report>(update_services(services, service_hashes, skip_hash_check))
-                }
-                Ok(Err(e)) => {
-                    increment_counter!("corro_consul.consul.response.errors", "error" => e.to_string(), "type" => "services");
-                    Err(e.into())
-                }
-                Err(e) => {
-                    increment_counter!("corro_consul.consul.response.errors", "error" => "timed out", "type" => "services");
-                    Err(e.into())
-                }
+        match timeout(Duration::from_secs(5), consul.agent_services()).await {
+            Ok(Ok(services)) => {
+                histogram!("corro_consul.consul.response.time.seconds").record(start.elapsed().as_secs_f64());
+                Ok::<_, eyre::Report>(update_services(services, service_hashes, skip_hash_check))
             }
+            Ok(Err(e)) => {
+                counter!("corro_consul.consul.response.errors", "error" => e.to_string(), "type" => "services").increment(1);
+                Err(e.into())
+            }
+            Err(e) => {
+                counter!("corro_consul.consul.response.errors", "error" => "timed out", "type" => "services").increment(1);
+                Err(e.into())
+            }
+        }
         
     };
 
     let fut_checks = async {
         let start = Instant::now();
-            match timeout(Duration::from_secs(5), consul.agent_checks()).await {
-                Ok(Ok(checks)) => {
-                    histogram!(
-                        "corro_consul.consul.response.time.seconds",
-                        start.elapsed().as_secs_f64()
-                    );
-                    Ok::<_, eyre::Report>(update_checks(checks, check_hashes, skip_hash_check))
-                }
-                Ok(Err(e)) => {
-                    increment_counter!("corro_consul.consul.response.errors", "error" => e.to_string(), "type" => "checks");
-                    Err(e.into())
-                }
-                Err(e) => {
-                    increment_counter!("corro_consul.consul.response.errors", "error" => "timed out", "type" => "checks");
-                    Err(e.into())
-                }
+        match timeout(Duration::from_secs(5), consul.agent_checks()).await {
+            Ok(Ok(checks)) => {
+                histogram!("corro_consul.consul.response.time.seconds").record(start.elapsed().as_secs_f64());
+                Ok::<_, eyre::Report>(update_checks(checks, check_hashes, skip_hash_check))
             }
+            Ok(Err(e)) => {
+                counter!("corro_consul.consul.response.errors", "error" => e.to_string(), "type" => "checks").increment(1);
+                Err(e.into())
+            }
+            Err(e) => {
+                counter!("corro_consul.consul.response.errors", "error" => "timed out", "type" => "checks").increment(1);
+                Err(e.into())
+            }
+        }
     };
 
     let (svcs, checks) = tokio::try_join!(fut_services, fut_checks)?;
@@ -468,8 +462,8 @@ async fn execute(
     service_hashes: &mut HashMap<String, u64>,
     checks: Vec<ConsulCheckOp>,
     check_hashes: &mut HashMap<String, u64>,
-    ) -> eyre::Result<(ApplyStats, ApplyStats)> {
-        let updated_at = SystemTime::now()
+) -> eyre::Result<(ApplyStats, ApplyStats)> {
+    let updated_at = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("could not get system time")
         .as_millis() as i64;
@@ -598,14 +592,14 @@ mod tests {
             },
             tripwire.clone(),
         )
-        .await?;
+            .await?;
 
         let ta1_client = CorrosionClient::new(ta1.agent.api_addr(), ta1.agent.db_path());
 
         setup(
             &ta1_client,
         )
-        .await?;
+            .await?;
 
         let mut services = HashMap::new();
 
@@ -662,7 +656,7 @@ mod tests {
         setup(
             &ta2_client,
         )
-        .await?;
+            .await?;
 
         sleep(Duration::from_secs(2)).await;
 

@@ -54,6 +54,7 @@ trust-dns-resolver = { workspace = true }
 uhlc = { workspace = true }
 uuid = { workspace = true }
 corro-pg = { path = "../corro-pg" }
+indexmap = { workspace = true }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
