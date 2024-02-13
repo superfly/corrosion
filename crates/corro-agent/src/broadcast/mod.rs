@@ -547,7 +547,7 @@ pub fn runtime_loop(
                                 || state.cluster_id != agent.cluster_id()
                                 || (pending.is_local && state.is_ring0())
                                 || pending.sent_to.contains(&state.addr)
-                            // don't resend
+                            // don't broadcast to this peer
                             {
                                 None
                             } else {
