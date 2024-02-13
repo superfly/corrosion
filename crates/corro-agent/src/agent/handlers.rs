@@ -613,7 +613,9 @@ pub async fn handle_sync(
                 .states
                 .iter()
                 // Filter out self
-                .filter(|(id, _state)| **id != agent.actor_id())
+                .filter(|(id, state)| {
+                    **id != agent.actor_id() && state.cluster_id == agent.cluster_id()
+                })
                 // Grab a ring-buffer index to the member RTT range
                 .map(|(id, state)| (*id, state.ring.unwrap_or(255), state.addr))
                 .collect::<Vec<(ActorId, u8, SocketAddr)>>()
