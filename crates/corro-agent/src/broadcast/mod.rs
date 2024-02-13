@@ -476,7 +476,7 @@ pub fn runtime_loop(
 
                         {
                             let members = agent.members().read();
-                            for addr in members.ring0() {
+                            for addr in members.ring0(agent.cluster_id()) {
                                 // this spawns, so we won't be holding onto the read lock for long
                                 tokio::spawn(transmit_broadcast(
                                     payload.clone(),
@@ -523,7 +523,7 @@ pub fn runtime_loop(
                 let (member_count, max_transmissions) = {
                     let config = config.read();
                     let members = agent.members().read();
-                    let ring0_count = members.ring0().count();
+                    let ring0_count = members.ring0(agent.cluster_id()).count();
                     let max_transmissions = config.max_transmissions.get();
                     (
                         std::cmp::max(

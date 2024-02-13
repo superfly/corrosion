@@ -144,9 +144,10 @@ impl Members {
 
     /// Get member addresses where the ring index is `0` (meaning a
     /// very small RTT)
-    pub fn ring0(&self) -> impl Iterator<Item = SocketAddr> + '_ {
-        self.states
-            .values()
-            .filter_map(|v| v.ring.and_then(|ring| (ring == 0).then_some(v.addr)))
+    pub fn ring0(&self, cluster_id: ClusterId) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.states.values().filter_map(move |v| {
+            v.ring
+                .and_then(|ring| (v.cluster_id == cluster_id && ring == 0).then_some(v.addr))
+        })
     }
 }
