@@ -99,7 +99,7 @@ pub enum SyncCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClusterCommand {
     MembershipStates,
-    SetClusterId(ClusterId),
+    SetId(ClusterId),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -231,7 +231,7 @@ async fn handle_conn(
                     }
                     send_success(&mut stream).await;
                 }
-                Command::Cluster(ClusterCommand::SetClusterId(cluster_id)) => {
+                Command::Cluster(ClusterCommand::SetId(cluster_id)) => {
                     info_log(&mut stream, "gathering membership state").await;
 
                     let mut conn = match agent.pool().write_priority().await {

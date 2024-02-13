@@ -303,10 +303,10 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
-        Command::Cluster(ClusterCommand::SetClusterId { cluster_id }) => {
+        Command::Cluster(ClusterCommand::SetId { cluster_id }) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Cluster(
-                corro_admin::ClusterCommand::SetClusterId(ClusterId(*cluster_id)),
+                corro_admin::ClusterCommand::SetId(ClusterId(*cluster_id)),
             ))
             .await?;
         }
@@ -595,7 +595,7 @@ enum ClusterCommand {
     /// Dumps the current member states
     MembershipStates,
     /// Set a new cluster ID for the node
-    SetClusterId { cluster_id: u16 },
+    SetId { cluster_id: u16 },
 }
 
 #[derive(Subcommand)]
