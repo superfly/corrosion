@@ -454,14 +454,20 @@ pub fn apply_schema(
             } else {
                 info!("Altering crsql for table {}", table.name);
                 let start = Instant::now();
-                tx.execute_batch(&format!("SELECT crsql_begin_alter('{name}');"))?;
-
-                let new_cols_iter = new_table
+                let new_cols = new_table
                     .columns
                     .iter()
-                    .filter(|(col_name, _)| new_col_names.contains(col_name));
+                    .filter(|(col_name, _)| new_col_names.contains(col_name))
+                    .collect::<Vec<_>>();
 
-                for (col_name, col) in new_cols_iter {
+                // if all columns are generated, we don't need a migration
+                let require_migration = !new_cols.iter().all(|(_, col)| col.generated.is_some());
+
+                if require_migration {
+                    tx.execute_batch(&format!("SELECT crsql_begin_alter('{name}');"))?;
+                }
+
+                for (col_name, col) in new_cols {
                     info!("adding column '{col_name}'");
                     if col.primary_key {
                         return Err(ApplySchemaError::AddPrimaryKey(
@@ -478,7 +484,10 @@ pub fn apply_schema(
                     }
                     tx.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {}", col))?;
                 }
-                tx.execute_batch(&format!("SELECT crsql_commit_alter('{name}');"))?;
+
+                if require_migration {
+                    tx.execute_batch(&format!("SELECT crsql_commit_alter('{name}');"))?;
+                }
                 info!(
                     "Altering crsql for table {} took {:?}",
                     table.name,
