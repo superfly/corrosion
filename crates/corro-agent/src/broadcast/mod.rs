@@ -266,6 +266,14 @@ pub fn runtime_loop(
                                     }
                                 }
                             }
+                            FocaCmd::ChangeIdentity(id, callback) => {
+                                if callback
+                                    .send(foca.change_identity(id, &mut runtime))
+                                    .is_err()
+                                {
+                                    warn!("could not send back result after changing identity");
+                                }
+                            }
                         },
                     },
                     Branch::HandleTimer(timer, seq) => {
@@ -441,8 +449,11 @@ pub fn runtime_loop(
                     };
                     trace!("adding broadcast: {bcast:?}, local? {is_local}");
 
-                    if let Err(e) = UniPayload::V1(UniPayloadV1::Broadcast(bcast.clone()))
-                        .write_to_stream((&mut ser_buf).writer())
+                    if let Err(e) = (UniPayload::V1 {
+                        data: UniPayloadV1::Broadcast(bcast.clone()),
+                        cluster_id: agent.cluster_id(),
+                    })
+                    .write_to_stream((&mut ser_buf).writer())
                     {
                         error!("could not encode UniPayload::V1 Broadcast: {e}");
                         ser_buf.clear();
@@ -465,7 +476,7 @@ pub fn runtime_loop(
 
                         {
                             let members = agent.members().read();
-                            for addr in members.ring0() {
+                            for addr in members.ring0(agent.cluster_id()) {
                                 // this spawns, so we won't be holding onto the read lock for long
                                 tokio::spawn(transmit_broadcast(
                                     payload.clone(),
@@ -512,7 +523,7 @@ pub fn runtime_loop(
                 let (member_count, max_transmissions) = {
                     let config = config.read();
                     let members = agent.members().read();
-                    let ring0_count = members.ring0().count();
+                    let ring0_count = members.ring0(agent.cluster_id()).count();
                     let max_transmissions = config.max_transmissions.get();
                     (
                         std::cmp::max(
@@ -533,9 +544,10 @@ pub fn runtime_loop(
                         .filter_map(|(member_id, state)| {
                             // don't broadcast to ourselves... or ring0 if local broadcast
                             if *member_id == actor_id
+                                || state.cluster_id != agent.cluster_id()
                                 || (pending.is_local && state.is_ring0())
                                 || pending.sent_to.contains(&state.addr)
-                            // don't resend
+                            // don't broadcast to this peer
                             {
                                 None
                             } else {

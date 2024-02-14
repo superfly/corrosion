@@ -4,7 +4,7 @@ use circular_buffer::CircularBuffer;
 use tracing::{debug, trace};
 
 use crate::{
-    actor::{Actor, ActorId},
+    actor::{Actor, ActorId, ClusterId},
     broadcast::Timestamp,
 };
 
@@ -12,15 +12,17 @@ use crate::{
 pub struct MemberState {
     pub addr: SocketAddr,
     pub ts: Timestamp,
+    pub cluster_id: ClusterId,
 
     pub ring: Option<u8>,
 }
 
 impl MemberState {
-    pub fn new(addr: SocketAddr, ts: Timestamp) -> Self {
+    pub fn new(addr: SocketAddr, ts: Timestamp, cluster_id: ClusterId) -> Self {
         Self {
             addr,
             ts,
+            cluster_id,
             ring: None,
         }
     }
@@ -56,7 +58,7 @@ impl Members {
         let member = self
             .states
             .entry(actor_id)
-            .or_insert_with(|| MemberState::new(actor.addr(), actor.ts()));
+            .or_insert_with(|| MemberState::new(actor.addr(), actor.ts(), actor.cluster_id()));
 
         trace!("member: {member:?}");
 
@@ -72,6 +74,7 @@ impl Members {
         if newer {
             member.addr = actor.addr();
             member.ts = actor.ts();
+            member.cluster_id = actor.cluster_id();
 
             self.by_addr.insert(actor.addr(), actor.id());
             self.recalculate_rings(actor.addr());
@@ -141,9 +144,10 @@ impl Members {
 
     /// Get member addresses where the ring index is `0` (meaning a
     /// very small RTT)
-    pub fn ring0(&self) -> impl Iterator<Item = SocketAddr> + '_ {
-        self.states
-            .values()
-            .filter_map(|v| v.ring.and_then(|ring| (ring == 0).then_some(v.addr)))
+    pub fn ring0(&self, cluster_id: ClusterId) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.states.values().filter_map(move |v| {
+            v.ring
+                .and_then(|ring| (v.cluster_id == cluster_id && ring == 0).then_some(v.addr))
+        })
     }
 }

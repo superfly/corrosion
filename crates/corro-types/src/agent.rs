@@ -34,7 +34,7 @@ use tracing::{debug, error};
 use tripwire::Tripwire;
 
 use crate::{
-    actor::ActorId,
+    actor::{Actor, ActorId, ClusterId},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     channel::{bounded, CorroSender},
@@ -71,6 +71,7 @@ pub struct AgentConfig {
     pub write_sema: Arc<Semaphore>,
 
     pub schema: RwLock<Schema>,
+    pub cluster_id: ClusterId,
 
     pub subs_manager: SubsManager,
 
@@ -95,6 +96,7 @@ pub struct AgentInner {
     tx_foca: CorroSender<FocaInput>,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
+    cluster_id: ArcSwap<ClusterId>,
     limits: Limits,
     subs_manager: SubsManager,
 }
@@ -124,11 +126,21 @@ impl Agent {
             tx_foca: config.tx_foca,
             write_sema: config.write_sema,
             schema: config.schema,
+            cluster_id: ArcSwap::from_pointee(config.cluster_id),
             limits: Limits {
                 sync: Arc::new(Semaphore::new(3)),
             },
             subs_manager: config.subs_manager,
         }))
+    }
+
+    pub fn actor<C: Into<Option<ClusterId>>>(&self, cluster_id: C) -> Actor {
+        Actor::new(
+            self.0.actor_id,
+            self.external_addr().unwrap_or_else(|| self.gossip_addr()),
+            self.clock().new_timestamp().into(),
+            cluster_id.into().unwrap_or_else(|| self.cluster_id()),
+        )
     }
 
     /// Return a borrowed [SqlitePool]
@@ -223,6 +235,14 @@ impl Agent {
     pub fn subs_manager(&self) -> &SubsManager {
         &self.0.subs_manager
     }
+
+    pub fn set_cluster_id(&self, cluster_id: ClusterId) {
+        self.0.cluster_id.store(Arc::new(cluster_id));
+    }
+
+    pub fn cluster_id(&self) -> ClusterId {
+        *self.0.cluster_id.load().as_ref()
+    }
 }
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -235,6 +255,94 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     ];
 
     crate::sqlite::migrate(conn, migrations)
+}
+
+// since crsqlite 0.16, site_id is NOT NULL in clock tables
+// also sets the new 'merge-equal-values' config to true.
+fn crsqlite_v0_16_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    for table in tables {
+        let indexes: Vec<String> = tx
+            .prepare(&format!(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name LIKE '{table}%'"
+            ))?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        tx.execute_batch(
+            &format!(r#"
+                CREATE TABLE {table}_new (
+                    key INTEGER NOT NULL,
+                    col_name TEXT NOT NULL,
+                    col_version INTEGER NOT NULL,
+                    db_version INTEGER NOT NULL,
+                    site_id INTEGER NOT NULL DEFAULT 0,
+                    seq INTEGER NOT NULL,
+                    PRIMARY KEY (key, col_name)
+                ) WITHOUT ROWID, STRICT;
+
+                INSERT INTO {table}_new SELECT key, col_name, col_version, db_version, COALESCE(site_id, 0), seq FROM {table};
+
+                ALTER TABLE {table} RENAME TO {table}_old;
+                ALTER TABLE {table}_new RENAME TO {table};
+
+                DROP TABLE {table}_old;
+
+                CREATE INDEX IF NOT EXISTS corro_{table}_site_id_dbv ON {table} (site_id, db_version);
+            "#),
+        )?;
+
+        // recreate the indexes
+        for sql in indexes {
+            tx.execute_batch(&sql)?;
+        }
+    }
+
+    // we want this to be true or else we'll assuredly make our DB inconsistent.
+    let _value: i64 = tx.query_row(
+        "SELECT crsql_config_set('merge-equal-values', 1);",
+        [],
+        |row| row.get(0),
+    )?;
+
+    Ok(())
+}
+
+fn refactor_corro_members(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+        -- remove state
+        ALTER TABLE __corro_members DROP COLUMN state;
+        -- remove rtts
+        ALTER TABLE __corro_members DROP COLUMN rtts;
+        -- add computed rtt_min
+        ALTER TABLE __corro_members ADD COLUMN rtt_min INTEGER;
+        -- add updated_at
+        ALTER TABLE __corro_members ADD COLUMN updated_at DATETIME NOT NULL DEFAULT 0;
+    "#,
+    )
+}
+
+fn create_corro_subs(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+        -- where subscriptions are stored
+        CREATE TABLE __corro_subs (
+            id BLOB PRIMARY KEY NOT NULL,
+            sql TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'created'
+        ) WITHOUT ROWID;
+    "#,
+    )
+}
+
+fn bookkeeping_db_version_index(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "
+        CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version);
+        ",
+    )
 }
 
 fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
@@ -316,94 +424,6 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 PRIMARY KEY (tbl_name, type, name)
             ) WITHOUT ROWID;
         "#,
-    )?;
-
-    Ok(())
-}
-
-fn bookkeeping_db_version_index(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        "
-        CREATE INDEX __corro_bookkeeping_db_version ON __corro_bookkeeping (db_version);
-        ",
-    )
-}
-
-fn create_corro_subs(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        r#"
-        -- where subscriptions are stored
-        CREATE TABLE __corro_subs (
-            id BLOB PRIMARY KEY NOT NULL,
-            sql TEXT NOT NULL,
-            state TEXT NOT NULL DEFAULT 'created'
-        ) WITHOUT ROWID;
-    "#,
-    )
-}
-
-fn refactor_corro_members(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        r#"
-        -- remove state
-        ALTER TABLE __corro_members DROP COLUMN state;
-        -- remove rtts
-        ALTER TABLE __corro_members DROP COLUMN rtts;
-        -- add computed rtt_min
-        ALTER TABLE __corro_members ADD COLUMN rtt_min INTEGER;
-        -- add updated_at
-        ALTER TABLE __corro_members ADD COLUMN updated_at DATETIME NOT NULL DEFAULT 0;
-    "#,
-    )
-}
-
-// since crsqlite 0.16, site_id is NOT NULL in clock tables
-// also sets the new 'merge-equal-values' config to true.
-fn crsqlite_v0_16_migration(tx: &Transaction) -> rusqlite::Result<()> {
-    let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-
-    for table in tables {
-        let indexes: Vec<String> = tx
-            .prepare(&format!(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name LIKE '{table}%'"
-            ))?
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        tx.execute_batch(
-            &format!(r#"
-                CREATE TABLE {table}_new (
-                    key INTEGER NOT NULL,
-                    col_name TEXT NOT NULL,
-                    col_version INTEGER NOT NULL,
-                    db_version INTEGER NOT NULL,
-                    site_id INTEGER NOT NULL DEFAULT 0,
-                    seq INTEGER NOT NULL,
-                    PRIMARY KEY (key, col_name)
-                ) WITHOUT ROWID, STRICT;
-
-                INSERT INTO {table}_new SELECT key, col_name, col_version, db_version, COALESCE(site_id, 0), seq FROM {table};
-
-                ALTER TABLE {table} RENAME TO {table}_old;
-                ALTER TABLE {table}_new RENAME TO {table};
-
-                DROP TABLE {table}_old;
-
-                CREATE INDEX IF NOT EXISTS corro_{table}_site_id_dbv ON {table} (site_id, db_version);
-            "#),
-        )?;
-
-        // recreate the indexes
-        for sql in indexes {
-            tx.execute_batch(&sql)?;
-        }
-    }
-
-    // we want this to be true or else we'll assuredly make our DB inconsistent.
-    let _value: i64 = tx.query_row(
-        "SELECT crsql_config_set('merge-equal-values', 1);",
-        [],
-        |row| row.get(0),
     )?;
 
     Ok(())

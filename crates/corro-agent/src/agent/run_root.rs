@@ -13,7 +13,7 @@ use crate::{
     broadcast::runtime_loop,
 };
 use corro_types::{
-    actor::{Actor, ActorId},
+    actor::ActorId,
     agent::{Agent, BookedVersions, Bookie},
     base::CrsqlSeq,
     channel::bounded,
@@ -41,7 +41,6 @@ pub async fn start_with_config(conf: Config, tripwire: Tripwire) -> eyre::Result
 
 async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
     let AgentOptions {
-        actor_id,
         gossip_server_endpoint,
         transport,
         api_listener,
@@ -79,11 +78,8 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
 
     //// Start the main SWIM runtime loop
     runtime_loop(
-        Actor::new(
-            actor_id,
-            agent.external_addr().unwrap_or_else(|| agent.gossip_addr()),
-            agent.clock().new_timestamp().into(),
-        ),
+        // here the agent already has the current cluster_id, we don't need to pass one
+        agent.actor(None),
         agent.clone(),
         transport.clone(),
         rx_foca,

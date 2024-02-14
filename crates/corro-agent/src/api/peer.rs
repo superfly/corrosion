@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
 use compact_str::format_compact;
+use corro_types::actor::ClusterId;
 use corro_types::agent::{
     Agent, CurrentVersion, KnownDbVersion, KnownVersion, PartialVersion, SplitPool,
 };
@@ -956,7 +957,7 @@ pub async fn parallel_sync(
                         &mut codec,
                         &mut encode_buf,
                         &mut send_buf,
-                        BiPayload::V1(BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}),
+                        BiPayload::V1 {data: BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}, cluster_id: agent.cluster_id()},
                         &mut tx,
                     ).instrument(info_span!("write_sync_start"))
                     .await?;
@@ -1308,6 +1309,7 @@ pub async fn serve_sync(
     bookie: &Bookie,
     their_actor_id: ActorId,
     trace_ctx: SyncTraceContextV1,
+    cluster_id: ClusterId,
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
@@ -1319,6 +1321,19 @@ pub async fn serve_sync(
     let mut codec = LengthDelimitedCodec::new();
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
+
+    if cluster_id != agent.cluster_id() {
+        encode_write_sync_msg(
+            &mut codec,
+            &mut encode_buf,
+            &mut send_buf,
+            SyncMessage::V1(SyncMessageV1::Rejection(SyncRejectionV1::DifferentCluster)),
+            &mut write,
+        )
+        .instrument(info_span!("write_rejection_cluster_id"))
+        .await?;
+        return Ok(0);
+    }
 
     // read the clock
     match read_sync_msg(&mut read)

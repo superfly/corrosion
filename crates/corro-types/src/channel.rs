@@ -124,6 +124,21 @@ impl<T> CorroSender<T> {
             })
     }
 
+    pub fn blocking_send(&self, value: T) -> Result<(), SendError<T>> {
+        let before = Instant::now();
+        self.inner
+            .blocking_send(value)
+            .map(|r| {
+                self.send_time.record(before.elapsed().as_secs_f64());
+                self.send_count.increment(1);
+                r
+            })
+            .map_err(|e| {
+                self.failed_sends.increment(1);
+                e
+            })
+    }
+
     pub async fn send_timeout(
         &self,
         value: T,

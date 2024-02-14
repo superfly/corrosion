@@ -3,7 +3,7 @@
 // External crates
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
@@ -32,7 +32,6 @@ use corro_types::{
 
 /// Runtime state for the Corrosion agent
 pub struct AgentOptions {
-    pub actor_id: ActorId,
     pub lock_registry: LockRegistry,
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
@@ -61,12 +60,13 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let actor_id = {
         let conn = CrConn::init(Connection::open(&conf.db.path)?)?;
+
         conn.query_row("SELECT crsql_site_id();", [], |row| {
             row.get::<_, ActorId>(0)
-        })?
-    };
+        })
+    }?;
 
-    info!("Actor ID: {}", actor_id);
+    info!("Actor ID: {actor_id}");
 
     let write_sema = Arc::new(Semaphore::new(1));
 
@@ -80,6 +80,19 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
         schema
     };
+
+    let cluster_id = {
+        let conn = pool.read().await?;
+        conn.query_row(
+            "SELECT value FROM __corro_state WHERE key = 'cluster_id'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_default()
+    };
+
+    info!("Cluster ID: {cluster_id}");
 
     let (tx_apply, rx_apply) = bounded(20480, "apply");
     let (tx_clear_buf, rx_clear_buf) = bounded(10240, "clear_buf");
@@ -122,7 +135,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let subs_manager = SubsManager::default();
 
     let opts = AgentOptions {
-        actor_id,
         gossip_server_endpoint,
         transport,
         api_listener,
@@ -156,6 +168,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_foca,
         write_sema,
         schema: RwLock::new(schema),
+        cluster_id,
         subs_manager,
         tripwire,
     });
