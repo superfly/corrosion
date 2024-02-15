@@ -60,34 +60,21 @@ async fn sub_by_id(
     let (matcher, rx) = match matcher_rx {
         Some(matcher_rx) => matcher_rx,
         None => {
-            // ensure this goes!
-            let mut bcast_cache_write = bcast_cache.write().await;
-
-            if let Some(matcher_rx) = bcast_cache_write.get(&id).and_then(|tx| {
-                subs.get(&id).map(|matcher| {
-                    debug!("found matcher by id {id}");
-                    (matcher, tx.subscribe())
-                })
-            }) {
-                matcher_rx
-            } else {
-                bcast_cache_write.remove(&id);
-                if let Some(handle) = subs.remove(&id) {
-                    info!(sub_id = %id, "Removed subscription from sub_by_id");
-                    tokio::spawn(handle.cleanup());
-                }
-
-                return hyper::Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(
-                        serde_json::to_vec(&QueryEvent::Error(format_compact!(
-                            "could not find subscription with id {id}"
-                        )))
-                        .expect("could not serialize queries stream error")
-                        .into(),
-                    )
-                    .expect("could not build error response");
+            if let Some(handle) = subs.remove(&id) {
+                info!(sub_id = %id, "Removed subscription from sub_by_id");
+                tokio::spawn(handle.cleanup());
             }
+
+            return hyper::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(
+                    serde_json::to_vec(&QueryEvent::Error(format_compact!(
+                        "could not find subscription with id {id}"
+                    )))
+                    .expect("could not serialize queries stream error")
+                    .into(),
+                )
+                .expect("could not build error response");
         }
     };
 
