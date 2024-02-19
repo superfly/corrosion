@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, net::SocketAddr, ops::Range, time::Duration};
 
 use circular_buffer::CircularBuffer;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
 use crate::{
@@ -8,7 +9,7 @@ use crate::{
     broadcast::Timestamp,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemberState {
     pub addr: SocketAddr,
     pub ts: Timestamp,
