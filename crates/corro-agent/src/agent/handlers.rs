@@ -263,7 +263,7 @@ pub async fn handle_notifications(
         match notification {
             Notification::MemberUp(actor) => {
                 let (added, same) = { agent.members().write().add_member(&actor) };
-                trace!("Member Up {actor:?} (added: {added})");
+                trace!("Member Up {actor:?} (added: {added}, same: {same})");
                 if added {
                     debug!("Member Up {actor:?}");
                     counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);

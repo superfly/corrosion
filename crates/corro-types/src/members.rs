@@ -90,6 +90,10 @@ impl Members {
             member.ts == actor.ts()
         } else {
             // Shouldn't happen
+            tracing::warn!(
+                "Tried removing a member that didn't exist: {:?}",
+                actor.id()
+            );
             false
         };
 
