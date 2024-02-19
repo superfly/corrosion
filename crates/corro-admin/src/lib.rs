@@ -10,6 +10,7 @@ use corro_types::{
 };
 use futures::{SinkExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use spawn::spawn_counted;
 use time::OffsetDateTime;
 use tokio::{
@@ -98,6 +99,7 @@ pub enum SyncCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClusterCommand {
+    Members,
     MembershipStates,
     SetId(ClusterId),
 }
@@ -209,6 +211,30 @@ async fn handle_conn(
                         Err(e) => send_error(&mut stream, e).await,
                     }
                     send_success(&mut stream).await;
+                }
+                Command::Cluster(ClusterCommand::Members) => {
+                    debug_log(&mut stream, "gathering members").await;
+
+                    let values = {
+                        let members = agent.members().read();
+                        members
+                            .states
+                            .iter()
+                            .map(|(actor_id, state)| {
+                                let rtts =
+                                    members.rtts.get(&state.addr).map(|rtt| rtt.buf.to_vec());
+                                json!({
+                                    "id": actor_id,
+                                    "state": state,
+                                    "rtts": rtts,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
+                    for value in values {
+                        send(&mut stream, Response::Json(value)).await;
+                    }
                 }
                 Command::Cluster(ClusterCommand::MembershipStates) => {
                     info_log(&mut stream, "gathering membership state").await;
@@ -332,6 +358,9 @@ async fn send_log<M: Into<String>>(stream: &mut FramedStream, level: LogLevel, m
 
 async fn info_log<M: Into<String>>(stream: &mut FramedStream, msg: M) {
     send_log(stream, LogLevel::Info, msg).await
+}
+async fn debug_log<M: Into<String>>(stream: &mut FramedStream, msg: M) {
+    send_log(stream, LogLevel::Debug, msg).await
 }
 
 async fn send_success(stream: &mut FramedStream) {
