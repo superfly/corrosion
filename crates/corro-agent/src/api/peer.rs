@@ -119,6 +119,7 @@ fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig
     if let Some(max_mtu) = config.max_mtu {
         info!("Setting maximum MTU for QUIC at {max_mtu}");
         transport_config.initial_mtu(max_mtu);
+        transport_config.min_mtu(max_mtu);
         // disable discovery
         transport_config.mtu_discovery_config(None);
     }
