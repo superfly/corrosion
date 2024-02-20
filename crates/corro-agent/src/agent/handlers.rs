@@ -285,17 +285,17 @@ pub async fn handle_notifications(
                         // anything else to do here?
                     }
                     MemberAddedResult::Ignored => {
-                        if let Err(e) = agent
-                            .tx_foca()
-                            .send(FocaInput::ApplyMany(vec![foca::Member::new(
-                                actor.clone(),
-                                foca::Incarnation::default(),
-                                foca::State::Down,
-                            )]))
-                            .await
-                        {
-                            warn!(?actor, "could not manually declare actor as down! {e}");
-                        }
+                        // if let Err(e) = agent
+                        //     .tx_foca()
+                        //     .send(FocaInput::ApplyMany(vec![foca::Member::new(
+                        //         actor.clone(),
+                        //         foca::Incarnation::default(),
+                        //         foca::State::Down,
+                        //     )]))
+                        //     .await
+                        // {
+                        //     warn!(?actor, "could not manually declare actor as down! {e}");
+                        // }
                     }
                 }
                 counter!("corro.swim.notification", "type" => "memberup").increment(1);
