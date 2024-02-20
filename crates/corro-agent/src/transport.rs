@@ -228,18 +228,6 @@ impl Transport {
         *lock = None;
 
         let conn = self.measured_connect(addr, addr.ip().to_string()).await?;
-
-        // spawn a task to detect connection close
-        tokio::spawn({
-            let (conn, conn_lock) = (conn.clone(), conn_lock.clone());
-            async move {
-                let addr = conn.remote_address();
-                let reason = conn.closed().await;
-                debug!(%addr, "connection was closed: {reason}");
-                conn_lock.lock().await.take();
-            }
-        });
-
         *lock = Some(conn.clone());
         Ok(conn)
     }
@@ -449,7 +437,7 @@ fn test_conn(conn: &Connection) -> bool {
             false
         }
         Some(e) => {
-            warn!(addr = %conn.remote_address(), "cached connection was closed abnormally: {e}");
+            warn!("cached connection was closed abnormally, reconnecting: {e}");
             false
         }
     }
