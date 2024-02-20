@@ -101,6 +101,7 @@ pub enum SyncCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClusterCommand {
+    Rejoin,
     Members,
     MembershipStates,
     SetId(ClusterId),
@@ -217,6 +218,27 @@ async fn handle_conn(
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,
                     }
+                    send_success(&mut stream).await;
+                }
+                Command::Cluster(ClusterCommand::Rejoin) => {
+                    let (cb_tx, cb_rx) = oneshot::channel();
+
+                    if let Err(e) = agent
+                        .tx_foca()
+                        .send(FocaInput::Cmd(FocaCmd::Rejoin(cb_tx)))
+                        .await
+                    {
+                        send_error(&mut stream, e).await;
+                        continue;
+                    }
+
+                    if let Err(e) = cb_rx.await {
+                        send_error(&mut stream, e).await;
+                        continue;
+                    }
+
+                    info_log(&mut stream, "Rejoined cluster with a renewed identity").await;
+
                     send_success(&mut stream).await;
                 }
                 Command::Cluster(ClusterCommand::Members) => {

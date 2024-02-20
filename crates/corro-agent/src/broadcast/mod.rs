@@ -12,7 +12,7 @@ use std::{
 
 use bincode::DefaultOptions;
 use bytes::{BufMut, Bytes, BytesMut};
-use foca::{BincodeCodec, Foca, NoCustomBroadcast, Notification, Timer};
+use foca::{BincodeCodec, Foca, Identity, NoCustomBroadcast, Notification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future,
@@ -258,6 +258,17 @@ pub fn runtime_loop(
                             }
                         }
                         FocaInput::Cmd(cmd) => match cmd {
+                            FocaCmd::Rejoin(callback) => {
+                                if callback
+                                    .send(foca.change_identity(
+                                        foca.identity().renew().unwrap(),
+                                        &mut runtime,
+                                    ))
+                                    .is_err()
+                                {
+                                    warn!("could not send back result after rejoining cluster");
+                                }
+                            }
                             FocaCmd::MembershipStates(sender) => {
                                 for member in foca.iter_membership_state() {
                                     if let Err(e) = sender.send(member.clone()).await {
