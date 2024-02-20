@@ -18,56 +18,53 @@ use tripwire::Tripwire;
 /// For every incoming stream, spawn another task to handle the
 /// stream.  Valid incoming BiPayload messages are passed to
 /// `crate::api::peer::serve_sync()`
-pub fn spawn_bipayload_handler(
+pub async fn bipayload_handler(
     agent: &Agent,
     bookie: &Bookie,
-    tripwire: &Tripwire,
+    mut tripwire: Tripwire,
     conn: &quinn::Connection,
 ) {
-    let conn = conn.clone();
-    let agent = agent.clone();
-    let bookie = bookie.clone();
-    let mut tripwire = tripwire.clone();
-    tokio::spawn(async move {
-        loop {
-            let (tx, rx) = tokio::select! {
-                tx_rx_res = conn.accept_bi() => match tx_rx_res {
-                    Ok(tx_rx) => tx_rx,
-                    Err(e) => {
-                        debug!("could not accept bidirectional stream from connection: {e}");
-                        return;
-                    }
-                },
-                _ = &mut tripwire => {
-                    debug!("connection cancelled");
+    loop {
+        let (tx, rx) = tokio::select! {
+            biased;
+            _ = &mut tripwire => {
+                debug!("connection cancelled");
+                return;
+            },
+            tx_rx_res = conn.accept_bi() => match tx_rx_res {
+                Ok(tx_rx) => tx_rx,
+                Err(e) => {
+                    debug!("could not accept bidirectional stream from connection: {e}");
                     return;
                 }
-            };
+            }
+        };
 
-            counter!("corro.peer.stream.accept.total", "type" => "bi").increment(1);
+        counter!("corro.peer.stream.accept.total", "type" => "bi").increment(1);
 
-            debug!(
-                "accepted a bidirectional stream from {}",
-                conn.remote_address()
-            );
+        debug!(
+            "accepted a bidirectional stream from {}",
+            conn.remote_address()
+        );
 
-            // TODO: implement concurrency limit for sync requests
-            tokio::spawn({
-                let agent = agent.clone();
-                let bookie = bookie.clone();
-                async move {
-                    let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
+        // TODO: implement concurrency limit for sync requests
+        tokio::spawn({
+            let agent = agent.clone();
+            let bookie = bookie.clone();
+            async move {
+                let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
 
-                    loop {
-                        match timeout(Duration::from_secs(5), StreamExt::next(&mut framed)).await {
-                            Err(_e) => {
-                                warn!("timed out receiving bidirectional frame");
-                                return;
-                            }
-                            Ok(None) => {
-                                return;
-                            }
-                            Ok(Some(res)) => match res {
+                loop {
+                    match timeout(Duration::from_secs(5), StreamExt::next(&mut framed)).await {
+                        Err(_e) => {
+                            warn!("timed out receiving bidirectional frame");
+                            return;
+                        }
+                        Ok(None) => {
+                            return;
+                        }
+                        Ok(Some(res)) => {
+                            match res {
                                 Ok(b) => {
                                     match BiPayload::read_from_buffer(&b) {
                                         Ok(payload) => {
@@ -108,11 +105,11 @@ pub fn spawn_bipayload_handler(
                                 Err(e) => {
                                     error!("could not read framed payload from bidirectional stream: {e}");
                                 }
-                            },
+                            }
                         }
                     }
                 }
-            });
-        }
-    });
+            }
+        });
+    }
 }

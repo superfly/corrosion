@@ -90,7 +90,7 @@ pub fn spawn_incoming_connection_handlers(
     let agent = agent.clone();
     let bookie = bookie.clone();
     let tripwire = tripwire.clone();
-    tokio::spawn(async move {
+    spawn_counted(async move {
         let remote_addr = connecting.remote_address();
         // let local_ip = connecting.local_ip().unwrap();
         debug!("got a connection from {remote_addr}");
@@ -108,9 +108,15 @@ pub fn spawn_incoming_connection_handlers(
         debug!("accepted a QUIC conn from {remote_addr}");
 
         // Spawn handler tasks for this connection
-        spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(&agent, &bookie, &tripwire, &conn);
-        bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
+        let datagram_fut = datagram_handler(&agent, tripwire.clone(), &conn);
+        let uni_fut = uni::unipayload_handler(&agent, &bookie, tripwire.clone(), &conn);
+        let bi_fut = bi::bipayload_handler(&agent, &bookie, tripwire, &conn);
+
+        _ = tokio::join!(datagram_fut, uni_fut, bi_fut);
+
+        conn.close(0u32.into(), &[]);
+        // wait until it is
+        conn.closed().await;
     });
 }
 
@@ -136,37 +142,32 @@ pub fn spawn_rtt_handler(agent: &Agent, rtt_rx: TokioReceiver<(SocketAddr, Durat
 
 /// Spawn a single task to listen for `Datagram`s from the transport
 /// and apply FOCA messages to the local SWIM statemachine.
-pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Connection) {
-    tokio::spawn({
-        let conn = conn.clone();
-        let mut tripwire = tripwire.clone();
-        let foca_tx = agent.tx_foca().clone();
-        async move {
-            loop {
-                let b = tokio::select! {
-                    b_res = conn.read_datagram() => match b_res {
-                        Ok(b) => {
-                            counter!("corro.peer.datagram.recv.total").increment(1);
-                            counter!("corro.peer.datagram.bytes.recv.total").increment(b.len() as u64);
-                            b
-                        },
-                        Err(e) => {
-                            debug!("could not read datagram from connection: {e}");
-                            return;
-                        }
-                    },
-                    _ = &mut tripwire => {
-                        debug!("connection cancelled");
-                        return;
-                    }
-                };
-
-                if let Err(e) = foca_tx.send(FocaInput::Data(b)).await {
-                    error!("could not send data foca input: {e}");
+pub async fn datagram_handler(agent: &Agent, mut tripwire: Tripwire, conn: &quinn::Connection) {
+    let foca_tx = agent.tx_foca();
+    loop {
+        let b = tokio::select! {
+            biased;
+            _ = &mut tripwire => {
+                debug!("connection cancelled");
+                return;
+            },
+            b_res = conn.read_datagram() => match b_res {
+                Ok(b) => {
+                    counter!("corro.peer.datagram.recv.total").increment(1);
+                    counter!("corro.peer.datagram.bytes.recv.total").increment(b.len() as u64);
+                    b
+                },
+                Err(e) => {
+                    debug!("could not read datagram from connection: {e}");
+                    return;
                 }
             }
+        };
+
+        if let Err(e) = foca_tx.send(FocaInput::Data(b)).await {
+            error!("could not send data foca input: {e}");
         }
-    });
+    }
 }
 
 /// Announce this node to other random nodes (according to SWIM)
@@ -624,9 +625,11 @@ pub async fn handle_sync(
             members
                 .states
                 .iter()
-                // Filter out self
                 .filter(|(id, state)| {
-                    **id != agent.actor_id() && state.cluster_id == agent.cluster_id()
+                    // Filter out self
+                    **id != agent.actor_id() &&
+                    // ... or different cluster id
+                    state.cluster_id == agent.cluster_id()
                 })
                 // Grab a ring-buffer index to the member RTT range
                 .map(|(id, state)| (*id, state.ring.unwrap_or(255), state.addr))
