@@ -296,6 +296,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 );
             }
         }
+        Command::Cluster(ClusterCommand::Rejoin) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Cluster(
+                corro_admin::ClusterCommand::Rejoin,
+            ))
+            .await?;
+        }
         Command::Cluster(ClusterCommand::Members) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Cluster(
@@ -599,6 +606,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ClusterCommand {
+    // /// Dumps info about the current actor
+    // Actor,
+    /// Force a rejoin of the cluster
+    Rejoin,
     /// Dumps the current members
     Members,
     /// Dumps the current member SWIM states
