@@ -491,19 +491,15 @@ pub fn runtime_loop(
                     let members = agent.members().read();
                     let ring0_count = members.ring0(agent.cluster_id()).count();
                     let max_transmissions = config.max_transmissions.get();
-
-                    let cluster_size = cluster_size.load(Ordering::Acquire) as usize;
-                    warn!("Currently known cluster_size: {cluster_size}");
                     (
                         std::cmp::max(
                             config.num_indirect_probes.get(),
-                            (cluster_size - ring0_count) / (max_transmissions as usize * 10),
+                            (cluster_size.load(Ordering::Acquire) as usize - ring0_count)
+                                / (max_transmissions as usize * 10),
                         ),
                         max_transmissions,
                     )
                 };
-
-                warn!("member_count: {member_count}, max_transmissions: {max_transmissions}");
 
                 let broadcast_to = {
                     agent
