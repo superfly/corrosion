@@ -78,7 +78,10 @@ pub async fn initialise_foca(agent: &Agent) {
                 if matches!(foca_state.state(), foca::State::Suspect) {
                     continue;
                 }
-                foca_states.push(foca_state);
+
+                if !foca_states.contains(&foca_state) {
+                    foca_states.push(foca_state);
+                }
             }
         }
 
