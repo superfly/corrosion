@@ -220,7 +220,7 @@ pub fn runtime_loop(
                     Branch::Foca(input) => match input {
                         FocaInput::Announce(actor) => {
                             trace!("handling FocaInput::Announce");
-                            trace!("announcing actor: {actor:?}");
+                            info!("announcing actor: {actor:?}");
                             if let Err(e) = foca.announce(actor, &mut runtime) {
                                 error!("foca announce error: {e}");
                             }
@@ -253,7 +253,7 @@ pub fn runtime_loop(
                             cluster_size.store(size.get(), Ordering::Release);
                         }
                         FocaInput::ApplyMany(updates) => {
-                            trace!("handling FocaInput::ApplyMany");
+                            debug!("handling FocaInput::ApplyMany");
                             if let Err(e) = foca.apply_many(updates.into_iter(), &mut runtime) {
                                 error!("foca apply_many error: {e}");
                             }
@@ -261,18 +261,18 @@ pub fn runtime_loop(
                         FocaInput::Cmd(cmd) => match cmd {
                             FocaCmd::Rejoin(callback) => {
                                 let renewed = foca.identity().renew().unwrap();
-                                trace!("handling FocaInput::Rejoin {renewed:?}");
+                                info!("handling FocaInput::Rejoin {renewed:?}");
 
-                                if callback
-                                    .send(foca.change_identity(renewed, &mut runtime))
-                                    .is_err()
-                                {
+                                let new_id = foca.change_identity(renewed, &mut runtime);
+                                info!("New identity: {new_id:?}");
+
+                                if callback.send(new_id).is_err() {
                                     warn!("could not send back result after rejoining cluster");
                                 }
                             }
                             FocaCmd::MembershipStates(sender) => {
                                 for member in foca.iter_membership_state() {
-                                    warn!("MEMBER STATE: {member:?}");
+                                    info!("MEMBER STATE: {member:?}");
                                     if let Err(e) = sender.send(member.clone()).await {
                                         error!("could not send back foca membership: {e}");
                                         break;

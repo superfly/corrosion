@@ -93,13 +93,15 @@ pub async fn initialise_foca(agent: &Agent) {
             }
         }
 
-        agent
+        if let Err(e) = agent
             .tx_foca()
             .send(FocaInput::ApplyMany(
                 foca_states.into_iter().map(|(_, v)| v).collect(),
             ))
             .await
-            .ok();
+        {
+            error!("Failed to queue initial foca state: {e:?}, cluster membership states will be broken!");
+        }
     }
 }
 
