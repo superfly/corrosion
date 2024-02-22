@@ -111,7 +111,7 @@ pub async fn initialise_foca(agent: &Agent) {
 
         let agent = agent.clone();
         tokio::task::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
 
             async fn apply_rejoin(agent: &Agent) -> eyre::Result<()> {
                 let (cb_tx, cb_rx) = tokio::sync::oneshot::channel();
