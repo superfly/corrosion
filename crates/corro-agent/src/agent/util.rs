@@ -29,7 +29,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{Changeset, ChangesetParts, FocaInput},
+    broadcast::{Changeset, ChangesetParts, FocaCmd, FocaInput},
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
@@ -98,23 +98,35 @@ pub async fn initialise_foca(agent: &Agent) {
             "Node state we care about: {:?}",
             foca_states.get(&"[fc01:a7b:ac6::]:8787".parse().unwrap())
         );
-        let apply_many = FocaInput::ApplyMany(foca_states.into_iter().map(|(_, v)| v).collect());
 
-        if let Err(e) = agent.tx_foca().send(apply_many).await {
+        if let Err(e) = agent
+            .tx_foca()
+            .send(FocaInput::ApplyMany(
+                foca_states.into_iter().map(|(_, v)| v).collect(),
+            ))
+            .await
+        {
             error!("Failed to queue initial foca state: {e:?}, cluster membership states will be broken!");
         }
 
-        let (cb_tx, cb_rx) = tokio::sync::oneshot::channel();
-        agent
-            .tx_foca()
-            .send(FocaInput::Cmd(corro_types::broadcast::FocaCmd::Rejoin(
-                cb_tx,
-            )))
-            .await
-            .unwrap();
+        let agent = agent.clone();
+        tokio::task::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
 
-        let result = cb_rx.await;
-        info!("Auto-rejoin command {result:?}");
+            async fn apply_rejoin(agent: &Agent) -> eyre::Result<()> {
+                let (cb_tx, cb_rx) = tokio::sync::oneshot::channel();
+                agent
+                    .tx_foca()
+                    .send(FocaInput::Cmd(FocaCmd::Rejoin(cb_tx)))
+                    .await?;
+                cb_rx.await??;
+                Ok(())
+            }
+
+            if let Err(e) = apply_rejoin(&agent).await {
+                error!("failed to execute cluster rejoin: {e:?}");
+            }
+        });
     } else {
         warn!("No existing cluster member state to load!  This seems sus");
     }
