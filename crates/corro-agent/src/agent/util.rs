@@ -30,7 +30,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaInput},
+    broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
@@ -94,13 +94,36 @@ pub async fn initialise_foca(agent: &Agent) {
             }
         }
 
-        agent
+        if let Err(e) = agent
             .tx_foca()
             .send(FocaInput::ApplyMany(
                 foca_states.into_iter().map(|(_, v)| v).collect(),
             ))
             .await
-            .ok();
+        {
+            error!("Failed to queue initial foca state: {e:?}, cluster membership states will be broken!");
+        }
+
+        let agent = agent.clone();
+        tokio::task::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+
+            async fn apply_rejoin(agent: &Agent) -> eyre::Result<()> {
+                let (cb_tx, cb_rx) = tokio::sync::oneshot::channel();
+                agent
+                    .tx_foca()
+                    .send(FocaInput::Cmd(FocaCmd::Rejoin(cb_tx)))
+                    .await?;
+                cb_rx.await??;
+                Ok(())
+            }
+
+            if let Err(e) = apply_rejoin(&agent).await {
+                error!("failed to execute cluster rejoin: {e:?}");
+            }
+        });
+    } else {
+        warn!("No existing cluster member state to load!  This seems sus");
     }
 }
 
