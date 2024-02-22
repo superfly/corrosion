@@ -239,7 +239,7 @@ pub fn runtime_loop(
                             // debug!("received cluster size update: {size}, last size: {last_cluster_size}, diff: {diff}");
 
                             if size != last_cluster_size {
-                                debug!("Adjusting cluster size to {size}");
+                                warn!("Adjusting cluster size to {size}");
                                 let new_config = make_foca_config(size);
                                 if let Err(e) = foca.set_config(new_config.clone()) {
                                     error!("foca set_config error: {e}");
@@ -253,7 +253,7 @@ pub fn runtime_loop(
                             cluster_size.store(size.get(), Ordering::Release);
                         }
                         FocaInput::ApplyMany(updates) => {
-                            debug!("handling FocaInput::ApplyMany");
+                            warn!("handling FocaInput::ApplyMany: {updates:?}");
                             if let Err(e) = foca.apply_many(updates.into_iter(), &mut runtime) {
                                 error!("foca apply_many error: {e}");
                             }
@@ -261,10 +261,10 @@ pub fn runtime_loop(
                         FocaInput::Cmd(cmd) => match cmd {
                             FocaCmd::Rejoin(callback) => {
                                 let renewed = foca.identity().renew().unwrap();
-                                info!("handling FocaInput::Rejoin {renewed:?}");
+                                warn!("handling FocaInput::Rejoin {renewed:?}");
 
                                 let new_id = foca.change_identity(renewed, &mut runtime);
-                                info!("New identity: {new_id:?}");
+                                warn!("New identity: {new_id:?}");
 
                                 if callback.send(new_id).is_err() {
                                     warn!("could not send back result after rejoining cluster");

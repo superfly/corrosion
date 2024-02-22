@@ -264,7 +264,7 @@ pub async fn handle_notifications(
         match notification {
             Notification::MemberUp(actor) => {
                 let member_added_res = agent.members().write().add_member(&actor);
-                trace!("Member Up {actor:?} (result: {member_added_res:?})");
+                warn!("Member Up {actor:?} (result: {member_added_res:?})");
 
                 match member_added_res {
                     MemberAddedResult::NewMember => {
@@ -282,7 +282,7 @@ pub async fn handle_notifications(
                         }
                     }
                     MemberAddedResult::Updated => {
-                        debug!("Member Updated {actor:?}");
+                        warn!("Member Updated {actor:?}");
                         // anything else to do here?
                     }
                     MemberAddedResult::Ignored => {
@@ -303,9 +303,9 @@ pub async fn handle_notifications(
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
-                trace!("Member Down {actor:?} (removed: {removed})");
+                warn!("Member Down {actor:?} (removed: {removed})");
                 if removed {
-                    debug!("Member Down {actor:?}");
+                    warn!("Member Down {actor:?}");
                     counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
                     // actually removed a member
                     // notify of new cluster size
