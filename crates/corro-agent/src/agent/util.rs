@@ -100,6 +100,18 @@ pub async fn initialise_foca(agent: &Agent) {
         if let Err(e) = agent.tx_foca().send(apply_many).await {
             error!("Failed to queue initial foca state: {e:?}, cluster membership states will be broken!");
         }
+
+        let (cb_tx, cb_rx) = tokio::sync::oneshot::channel();
+        agent
+            .tx_foca()
+            .send(FocaInput::Cmd(corro_types::broadcast::FocaCmd::Rejoin(
+                cb_tx,
+            )))
+            .await
+            .unwrap();
+
+        let result = cb_rx.await;
+        info!("Auto-rejoin command {result:?}");
     } else {
         warn!("No existing cluster member state to load!  This seems sus");
     }
