@@ -67,6 +67,7 @@ use super::BcastCache;
 pub async fn initialise_foca(agent: &Agent) {
     let states = load_member_states(agent).await;
     if !states.is_empty() {
+        info!("Loading {} existing member states", states.len());
         let mut foca_states = BTreeMap::<SocketAddr, Member<Actor>>::new();
 
         {
@@ -102,6 +103,8 @@ pub async fn initialise_foca(agent: &Agent) {
         {
             error!("Failed to queue initial foca state: {e:?}, cluster membership states will be broken!");
         }
+    } else {
+        warn!("No existing cluster member state to load!  This seems sus");
     }
 }
 
