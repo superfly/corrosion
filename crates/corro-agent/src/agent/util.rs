@@ -68,7 +68,7 @@ use super::BcastCache;
 pub async fn initialise_foca(agent: &Agent) {
     let states = load_member_states(agent).await;
     if !states.is_empty() {
-        let mut foca_states = Vec::with_capacity(states.len());
+        let mut foca_states = BTreeMap::<SocketAddr, Member<Actor>>::new();
 
         {
             // block to drop the members write lock
@@ -79,15 +79,26 @@ pub async fn initialise_foca(agent: &Agent) {
                     continue;
                 }
 
-                if !foca_states.contains(&foca_state) {
-                    foca_states.push(foca_state);
+                // Add to the foca_states if the member doesn't yet
+                // exist in the map, or if we are replacing an older
+                // timestamp
+                match foca_states.get(&address) {
+                    Some(state) if state.id().ts() < foca_state.id().ts() => {
+                        foca_states.insert(address, foca_state);
+                    }
+                    None => {
+                        foca_states.insert(address, foca_state);
+                    }
+                    _ => {}
                 }
             }
         }
 
         agent
             .tx_foca()
-            .send(FocaInput::ApplyMany(foca_states))
+            .send(FocaInput::ApplyMany(
+                foca_states.into_iter().map(|(_, v)| v).collect(),
+            ))
             .await
             .ok();
     }
