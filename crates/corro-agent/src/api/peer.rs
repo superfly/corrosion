@@ -963,7 +963,7 @@ pub async fn parallel_sync(
                     ).instrument(info_span!("write_sync_start"))
                     .await?;
 
-                    warn!(%actor_id, self_actor_id = %agent.actor_id(), "sent start payload");
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "sent start payload");
 
                     encode_write_sync_msg(
                         &mut codec,
@@ -974,10 +974,10 @@ pub async fn parallel_sync(
                     ).instrument(info_span!("write_sync_clock"))
                     .await?;
 
-                    warn!(%actor_id, self_actor_id = %agent.actor_id(), "sent clock payload");
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "sent clock payload");
                     tx.flush().instrument(info_span!("quic_flush")).await.map_err(SyncSendError::from)?;
 
-                    warn!(%actor_id, self_actor_id = %agent.actor_id(), "flushed sync payloads");
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "flushed sync payloads");
 
                     let their_sync_state = match timeout(Duration::from_secs(2), read_sync_msg(&mut read)).instrument(info_span!("read_sync_state")).await.map_err(SyncRecvError::from)?? {
                         Some(SyncMessage::V1(SyncMessageV1::State(state))) => state,
@@ -987,7 +987,7 @@ pub async fn parallel_sync(
                         Some(_) => return Err(SyncRecvError::ExpectedSyncState.into()),
                         None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
                     };
-                    warn!(%actor_id, self_actor_id = %agent.actor_id(), "read state payload: {their_sync_state:?}");
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "read state payload: {their_sync_state:?}");
 
                     match timeout(Duration::from_secs(2), read_sync_msg(&mut read)).instrument(info_span!("read_sync_clock")).await.map_err(SyncRecvError::from)??  {
                         Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match actor_id.try_into() {
@@ -1006,7 +1006,7 @@ pub async fn parallel_sync(
                         Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
                         None => return Err(SyncRecvError::UnexpectedEndOfStream.into()),
                     }
-                    warn!(%actor_id, self_actor_id = %agent.actor_id(), "read clock payload");
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "read clock payload");
 
                     counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string()).increment(1);
 

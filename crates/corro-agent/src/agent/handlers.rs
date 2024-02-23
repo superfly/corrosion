@@ -264,7 +264,7 @@ pub async fn handle_notifications(
         match notification {
             Notification::MemberUp(actor) => {
                 let member_added_res = agent.members().write().add_member(&actor);
-                warn!("Member Up {actor:?} (result: {member_added_res:?})");
+                debug!("Member Up {actor:?} (result: {member_added_res:?})");
 
                 match member_added_res {
                     MemberAddedResult::NewMember => {
@@ -282,10 +282,14 @@ pub async fn handle_notifications(
                         }
                     }
                     MemberAddedResult::Updated => {
-                        // warn!("Member Updated {actor:?}");
+                        debug!("Member Updated {actor:?}");
                         // anything else to do here?
                     }
                     MemberAddedResult::Ignored => {
+                        // TODO: it's unclear if this is needed or
+                        // not.  We removed it to debug a foca member
+                        // state issue.  It may be needed again.
+
                         // if let Err(e) = agent
                         //     .tx_foca()
                         //     .send(FocaInput::ApplyMany(vec![foca::Member::new(
@@ -303,9 +307,9 @@ pub async fn handle_notifications(
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
-                warn!("Member Down {actor:?} (removed: {removed})");
+                info!("Member Down {actor:?} (removed: {removed})");
                 if removed {
-                    warn!("Member Down {actor:?}");
+                    debug!("Member Down {actor:?}");
                     counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
                     // actually removed a member
                     // notify of new cluster size
@@ -640,7 +644,7 @@ pub async fn handle_sync(
         debug!("found {} candidates to synchronize with", candidates.len());
 
         let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
-        warn!("Selected {desired_count} nodes to sync with");
+        info!("Selected {desired_count} nodes to sync with");
 
         let mut rng = StdRng::from_entropy();
 
@@ -664,7 +668,7 @@ pub async fn handle_sync(
             .collect()
     };
 
-    warn!("Sync set: {chosen:?}");
+    trace!("Sync set: {chosen:?}");
 
     if chosen.is_empty() {
         return Ok(());

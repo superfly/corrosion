@@ -6,7 +6,7 @@ use metrics::counter;
 use speedy::Readable;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
