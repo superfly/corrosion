@@ -109,24 +109,24 @@ pub async fn initialise_foca(agent: &Agent) {
             error!("Failed to queue initial foca state: {e:?}, cluster membership states will be broken!");
         }
 
-        let agent = agent.clone();
-        tokio::task::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+        // let agent = agent.clone();
+        // tokio::task::spawn(async move {
+        //     tokio::time::sleep(Duration::from_secs(30)).await;
 
-            async fn apply_rejoin(agent: &Agent) -> eyre::Result<()> {
-                let (cb_tx, cb_rx) = tokio::sync::oneshot::channel();
-                agent
-                    .tx_foca()
-                    .send(FocaInput::Cmd(FocaCmd::Rejoin(cb_tx)))
-                    .await?;
-                cb_rx.await??;
-                Ok(())
-            }
+        //     async fn apply_rejoin(agent: &Agent) -> eyre::Result<()> {
+        //         let (cb_tx, cb_rx) = tokio::sync::oneshot::channel();
+        //         agent
+        //             .tx_foca()
+        //             .send(FocaInput::Cmd(FocaCmd::Rejoin(cb_tx)))
+        //             .await?;
+        //         cb_rx.await??;
+        //         Ok(())
+        //     }
 
-            if let Err(e) = apply_rejoin(&agent).await {
-                error!("failed to execute cluster rejoin: {e:?}");
-            }
-        });
+        //     if let Err(e) = apply_rejoin(&agent).await {
+        //         error!("failed to execute cluster rejoin: {e:?}");
+        //     }
+        // });
     } else {
         warn!("No existing cluster member state to load!  This seems sus");
     }
@@ -531,6 +531,8 @@ pub async fn sync_loop(
     tokio::pin!(next_sync_at);
 
     loop {
+        warn!("Next sync: {next_sync_at:?}");
+
         enum Branch {
             Tick,
             BackgroundApply { actor_id: ActorId, version: Version },

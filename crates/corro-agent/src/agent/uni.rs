@@ -64,62 +64,16 @@ pub fn spawn_unipayload_handler(
                                     match UniPayload::read_from_buffer(&b) {
                                         Ok(payload) => {
                                             trace!("parsed a payload: {payload:?}");
-
-                                            match payload {
-                                                UniPayload::V1 {
-                                                    data:
-                                                        UniPayloadV1::Broadcast(BroadcastV1::Change(
-                                                            change,
-                                                        )),
-                                                    cluster_id,
-                                                    priority,
-                                                } if priority => {
-                                                    if cluster_id != agent.cluster_id() {
-                                                        continue;
-                                                    }
-
-                                                    tokio::spawn(async move {
-                                                        if let Err(e) =
-                                                            crate::change::process_multiple_changes(
-                                                                agent,
-                                                                bookie,
-                                                                vec![(
-                                                                    change,
-                                                                    ChangeSource::Broadcast,
-                                                                    std::time::Instant::now(),
-                                                                )],
-                                                            )
-                                                            .await
-                                                        {
-                                                            error!(
-                                                            "process_priority_change failed: {:?}",
-                                                            e
-                                                        );
-                                                        }
-                                                    });
-                                                }
-                                                UniPayload::V1 {
-                                                    data:
-                                                        UniPayloadV1::Broadcast(BroadcastV1::Change(
-                                                            change,
-                                                        )),
-                                                    cluster_id,
-                                                    ..
-                                                } => {
-                                                    if cluster_id != agent.cluster_id() {
-                                                        continue;
-                                                    }
-                                                    if let Err(e) = agent
-                                                        .tx_changes()
-                                                        .send((change, ChangeSource::Broadcast))
-                                                        .await
-                                                    {
-                                                        error!(
-                                                            "could not send change for processing: {e}"
-                                                        );
-                                                        return;
-                                                    }
-                                                }
+                                            match handle_uni_payload(
+                                                agent.clone(),
+                                                bookie.clone(),
+                                                payload,
+                                            )
+                                            .await
+                                            {
+                                                LoopControl::Continue => continue,
+                                                LoopControl::Return => return,
+                                                LoopControl::Ok => {}
                                             }
                                         }
                                         Err(e) => {
@@ -139,4 +93,57 @@ pub fn spawn_unipayload_handler(
             }
         }
     });
+}
+
+enum LoopControl {
+    Continue,
+    Return,
+    Ok,
+}
+
+async fn handle_uni_payload(agent: Agent, bookie: Bookie, payload: UniPayload) -> LoopControl {
+    match payload {
+        UniPayload::V1 {
+            data: UniPayloadV1::Broadcast(BroadcastV1::Change(change)),
+            cluster_id,
+            priority,
+        } if priority => {
+            if cluster_id != agent.cluster_id() {
+                warn!("broadcast payload from different cluster; continue");
+                return LoopControl::Continue;
+            }
+
+            tokio::spawn(async move {
+                if let Err(e) = crate::change::process_multiple_changes(
+                    agent,
+                    bookie,
+                    vec![(change, ChangeSource::Broadcast, std::time::Instant::now())],
+                )
+                .await
+                {
+                    error!("process_priority_change failed: {:?}", e);
+                }
+            });
+        }
+        UniPayload::V1 {
+            data: UniPayloadV1::Broadcast(BroadcastV1::Change(change)),
+            cluster_id,
+            ..
+        } => {
+            if cluster_id != agent.cluster_id() {
+                warn!("broadcast payload from different cluster; continue");
+                return LoopControl::Continue;
+            }
+            if let Err(e) = agent
+                .tx_changes()
+                .send((change, ChangeSource::Broadcast))
+                .await
+            {
+                error!("could not send change for processing: {e}");
+                return LoopControl::Return;
+            }
+        }
+    }
+
+    LoopControl::Ok
 }

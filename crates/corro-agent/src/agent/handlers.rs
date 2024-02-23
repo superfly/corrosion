@@ -282,7 +282,7 @@ pub async fn handle_notifications(
                         }
                     }
                     MemberAddedResult::Updated => {
-                        warn!("Member Updated {actor:?}");
+                        // warn!("Member Updated {actor:?}");
                         // anything else to do here?
                     }
                     MemberAddedResult::Ignored => {
@@ -663,6 +663,8 @@ pub async fn handle_sync(
             .map(|(actor_id, _, addr)| (actor_id, addr))
             .collect()
     };
+
+    warn!("Sync set: {chosen:?}");
 
     if chosen.is_empty() {
         return Ok(());
