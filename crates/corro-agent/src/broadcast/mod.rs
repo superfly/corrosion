@@ -259,13 +259,13 @@ pub fn runtime_loop(
                         }
                         FocaInput::Cmd(cmd) => match cmd {
                             FocaCmd::Rejoin(callback) => {
-                                if callback
-                                    .send(foca.change_identity(
-                                        foca.identity().renew().unwrap(),
-                                        &mut runtime,
-                                    ))
-                                    .is_err()
-                                {
+                                let renewed = foca.identity().renew().unwrap();
+                                debug!("handling FocaInput::Rejoin {renewed:?}");
+
+                                let new_id = foca.change_identity(renewed, &mut runtime);
+                                info!("New identity: {new_id:?}");
+
+                                if callback.send(new_id).is_err() {
                                     warn!("could not send back result after rejoining cluster");
                                 }
                             }
@@ -735,7 +735,11 @@ fn diff_member_states(
 
 fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
     let mut config = foca::Config::new_wan(cluster_size);
-    config.remove_down_after = Duration::from_secs(2 * 24 * 60 * 60);
+    // NOTE: previously this value was set to 2 * 24 * 3600 (48h) due
+    // to a previous cluster membership issue.  We may want to change
+    // it back if we are sure that the new issues are unrelated or if
+    // this change causes other problems.
+    config.remove_down_after = Duration::from_secs(60);
 
     // max payload size for udp datagrams, use a safe value here...
     // TODO: calculate from smallest max datagram size for all QUIC conns

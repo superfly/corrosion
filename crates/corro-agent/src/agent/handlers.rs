@@ -263,7 +263,7 @@ pub async fn handle_notifications(
         match notification {
             Notification::MemberUp(actor) => {
                 let member_added_res = agent.members().write().add_member(&actor);
-                trace!("Member Up {actor:?} (result: {member_added_res:?})");
+                info!("Member Up {actor:?} (result: {member_added_res:?})");
 
                 match member_added_res {
                     MemberAddedResult::NewMember => {
@@ -285,6 +285,10 @@ pub async fn handle_notifications(
                         // anything else to do here?
                     }
                     MemberAddedResult::Ignored => {
+                        // TODO: it's unclear if this is needed or
+                        // not.  We removed it to debug a foca member
+                        // state issue.  It may be needed again.
+
                         // if let Err(e) = agent
                         //     .tx_foca()
                         //     .send(FocaInput::ApplyMany(vec![foca::Member::new(
@@ -302,7 +306,7 @@ pub async fn handle_notifications(
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
-                trace!("Member Down {actor:?} (removed: {removed})");
+                info!("Member Down {actor:?} (removed: {removed})");
                 if removed {
                     debug!("Member Down {actor:?}");
                     counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
@@ -645,6 +649,7 @@ pub async fn handle_sync(
         debug!("found {} candidates to synchronize with", candidates.len());
 
         let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
+        debug!("Selected {desired_count} nodes to sync with");
 
         let mut rng = StdRng::from_entropy();
 
@@ -668,6 +673,7 @@ pub async fn handle_sync(
             .collect()
     };
 
+    trace!("Sync set: {chosen:?}");
     if chosen.is_empty() {
         return Ok(());
     }
