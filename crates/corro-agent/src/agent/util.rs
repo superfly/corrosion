@@ -527,12 +527,12 @@ pub async fn sync_loop(
     let mut sync_backoff = backoff::Backoff::new(0)
         .timeout_range(Duration::from_secs(1), MAX_SYNC_BACKOFF)
         .iter();
-    let next_sync_at = tokio::time::sleep(sync_backoff.next().unwrap());
+    let backoff = sync_backoff.next().unwrap();
+    let next_sync_at = tokio::time::sleep(backoff);
     tokio::pin!(next_sync_at);
 
     loop {
-        warn!("Next sync: {next_sync_at:?}");
-
+        warn!("Next sync: {:?}", backoff);
         enum Branch {
             Tick,
             BackgroundApply { actor_id: ActorId, version: Version },
