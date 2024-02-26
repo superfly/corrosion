@@ -6,7 +6,7 @@ use corro_types::{
 };
 use speedy::Writable;
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
-use tracing::{debug, error, trace};
+use tracing::{error, info, trace};
 
 use super::PendingBroadcast;
 
@@ -33,7 +33,7 @@ pub fn dispatch_broadcast(
     // Locally originating broadcasts are given higher priority
     if is_local {
         // todo: change this to encode a V1 payload before merging
-        debug!("Generating a high priority broadcast!");
+        info!("Generating a high priority broadcast!");
         if let Err(e) = (UniPayload::V1 {
             data: UniPayloadV1::Broadcast(bcast),
             cluster_id: agent.cluster_id(),
@@ -73,7 +73,7 @@ pub fn dispatch_broadcast(
     }
     // Re-broadcasts are given default priority
     else {
-        debug!("Generating a regular broadcast!");
+        info!("Generating a regular broadcast!");
         if let Err(e) = (UniPayload::V1 {
             data: UniPayloadV1::Broadcast(bcast),
             cluster_id: agent.cluster_id(),
