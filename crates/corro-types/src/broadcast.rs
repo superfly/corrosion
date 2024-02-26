@@ -33,6 +33,8 @@ pub enum UniPayload {
         data: UniPayloadV1,
         #[speedy(default_on_eof)]
         cluster_id: ClusterId,
+        #[speedy(default_on_eof)]
+        priority: bool,
     },
 }
 
