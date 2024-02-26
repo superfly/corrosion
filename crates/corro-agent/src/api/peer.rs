@@ -1565,7 +1565,10 @@ mod tests {
     use tokio::sync::mpsc;
     use tripwire::Tripwire;
 
-    use crate::{agent::setup, api::public::api_v1_db_schema, change::process_multiple_changes};
+    use crate::{
+        agent::{process_multiple_changes, setup},
+        api::public::api_v1_db_schema,
+    };
 
     use super::*;
 

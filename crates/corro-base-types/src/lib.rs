@@ -181,9 +181,6 @@ impl fmt::Display for CrsqlDbVersion {
     }
 }
 
-/// A single change in a sequence of changes in a single transaction
-///
-/// This type is usually wrapped by a RangeMap/Set
 #[derive(
     Copy, Clone, Debug, Default, Ord, PartialOrd, Eq, PartialEq, Hash, Serialize, Deserialize,
 )]

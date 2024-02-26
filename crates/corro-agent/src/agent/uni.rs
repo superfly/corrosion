@@ -1,5 +1,5 @@
 use corro_types::{
-    agent::{Agent, Bookie},
+    agent::Agent,
     broadcast::{BroadcastV1, ChangeSource, UniPayload, UniPayloadV1},
 };
 use metrics::counter;
@@ -11,22 +11,12 @@ use tripwire::Tripwire;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
-pub fn spawn_unipayload_handler(
-    agent: &Agent,
-    bookie: &Bookie,
-    tripwire: &Tripwire,
-    conn: &quinn::Connection,
-) {
-    let agent = agent.clone();
-    let bookie = bookie.clone();
+pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, agent: Agent) {
     tokio::spawn({
         let conn = conn.clone();
         let mut tripwire = tripwire.clone();
-
         async move {
             loop {
-                let agent = agent.clone();
-                let bookie = bookie.clone();
                 let rx = tokio::select! {
                     rx_res = conn.accept_uni() => match rx_res {
                         Ok(rx) => rx,
@@ -54,9 +44,6 @@ pub fn spawn_unipayload_handler(
                         let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
 
                         loop {
-                            let agent = agent.clone();
-                            let bookie = bookie.clone();
-
                             match StreamExt::next(&mut framed).await {
                                 Some(Ok(b)) => {
                                     counter!("corro.peer.stream.bytes.recv.total", "type" => "uni")
@@ -72,39 +59,6 @@ pub fn spawn_unipayload_handler(
                                                             change,
                                                         )),
                                                     cluster_id,
-                                                    priority,
-                                                } if priority => {
-                                                    if cluster_id != agent.cluster_id() {
-                                                        continue;
-                                                    }
-
-                                                    tokio::spawn(async move {
-                                                        if let Err(e) =
-                                                            crate::change::process_multiple_changes(
-                                                                agent,
-                                                                bookie,
-                                                                vec![(
-                                                                    change,
-                                                                    ChangeSource::Broadcast,
-                                                                    std::time::Instant::now(),
-                                                                )],
-                                                            )
-                                                            .await
-                                                        {
-                                                            error!(
-                                                            "process_priority_change failed: {:?}",
-                                                            e
-                                                        );
-                                                        }
-                                                    });
-                                                }
-                                                UniPayload::V1 {
-                                                    data:
-                                                        UniPayloadV1::Broadcast(BroadcastV1::Change(
-                                                            change,
-                                                        )),
-                                                    cluster_id,
-                                                    ..
                                                 } => {
                                                     if cluster_id != agent.cluster_id() {
                                                         continue;

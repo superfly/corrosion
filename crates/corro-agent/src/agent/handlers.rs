@@ -10,9 +10,8 @@ use std::{
 };
 
 use crate::{
-    agent::{bi, bootstrap, uni, SyncClientError, ANNOUNCE_INTERVAL},
+    agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL},
     api::peer::parallel_sync,
-    change,
     transport::Transport,
 };
 use corro_types::{
@@ -108,7 +107,7 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(&agent, &bookie, &tripwire, &conn);
+        uni::spawn_unipayload_handler(&tripwire, &conn, agent.clone());
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }
@@ -415,7 +414,7 @@ pub async fn handle_changes(
             }
 
             debug!(count = %tmp_count, "spawning processing multiple changes from beginning of loop");
-            join_set.spawn(change::process_multiple_changes(
+            join_set.spawn(util::process_multiple_changes(
                 agent.clone(),
                 bookie.clone(),
                 std::mem::take(&mut buf),
@@ -530,7 +529,7 @@ pub async fn handle_changes(
                 if count < MIN_CHANGES_CHUNK && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     // we can process this right away
                     debug!(%count, "spawning processing multiple changes from max wait interval");
-                    join_set.spawn(change::process_multiple_changes(
+                    join_set.spawn(util::process_multiple_changes(
                         agent.clone(),
                         bookie.clone(),
                         queue.drain(..).collect(),
@@ -564,7 +563,7 @@ pub async fn handle_changes(
         queue.push_back((change, src, Instant::now()));
         if count >= MIN_CHANGES_CHUNK {
             // drain and process current changes!
-            if let Err(e) = change::process_multiple_changes(
+            if let Err(e) = util::process_multiple_changes(
                 agent.clone(),
                 bookie.clone(),
                 queue.drain(..).collect(),
@@ -580,8 +579,7 @@ pub async fn handle_changes(
     }
 
     // process the last changes we got!
-    if let Err(e) =
-        change::process_multiple_changes(agent, bookie, queue.into_iter().collect()).await
+    if let Err(e) = util::process_multiple_changes(agent, bookie, queue.into_iter().collect()).await
     {
         error!("could not process multiple changes: {e}");
     }
