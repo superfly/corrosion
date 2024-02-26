@@ -12,7 +12,7 @@ mod metrics;
 mod run_root;
 mod setup;
 mod uni;
-pub(crate) mod util;
+mod util;
 
 #[cfg(test)]
 mod tests;
@@ -27,6 +27,7 @@ use uuid::Uuid;
 pub use error::{SyncClientError, SyncRecvError};
 pub use run_root::start_with_config;
 pub use setup::{setup, AgentOptions};
+pub use util::process_multiple_changes;
 
 pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
 pub const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(300);
