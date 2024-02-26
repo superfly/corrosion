@@ -57,7 +57,7 @@
               # Useful when doing development builds
               doCheck = false;
               buildType = "debug";
-
+              
               ## Build environment dependencies
               nativeBuildInputs = [
                 pkgs.pkg-config
