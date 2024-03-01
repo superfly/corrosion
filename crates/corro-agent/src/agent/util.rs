@@ -1312,10 +1312,7 @@ pub fn process_incomplete_version(
             "
             DELETE FROM __corro_seq_bookkeeping
                 WHERE site_id = :actor_id AND version = :version AND
-                (
-                    -- start_seq is between start and end of range AND no end_seq
-                    ( start_seq BETWEEN :start AND :end AND end_seq IS NULL ) OR
-                    
+                (   
                     -- start_seq and end_seq are within the range
                     ( start_seq >= :start AND end_seq <= :end ) OR
 
@@ -1323,7 +1320,7 @@ pub fn process_incomplete_version(
                     ( start_seq <= :end AND end_seq >= :end ) OR
 
                     -- start_seq = end + 1 (to collapse ranges)
-                    ( start_seq = :end + 1 AND end_seq IS NOT NULL ) OR
+                    ( start_seq = :end + 1) OR
 
                     -- end_seq = start - 1 (to collapse ranges)
                     ( end_seq = :start - 1 )
@@ -1340,7 +1337,7 @@ pub fn process_incomplete_version(
             ],
             |row| {
                 let start = row.get(0)?;
-                Ok(start..=row.get::<_, Option<CrsqlSeq>>(1)?.unwrap_or(start))
+                Ok(start..=row.get(1)?)
             },
         )
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
