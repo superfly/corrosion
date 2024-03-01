@@ -300,8 +300,10 @@ async fn handle_conn(
                                 KnownVersion::Cleared => {
                                     Ok(serde_json::Value::String("cleared".into()))
                                 }
-                                KnownVersion::Current(known) => serde_json::to_value(known),
-                                KnownVersion::Partial(known) => serde_json::to_value(known),
+                                KnownVersion::Current(known) => serde_json::to_value(known)
+                                    .map(|v| serde_json::json!({"current": v})),
+                                KnownVersion::Partial(known) => serde_json::to_value(known)
+                                    .map(|v| serde_json::json!({"partial": v})),
                             },
                             None => Ok(serde_json::Value::Null),
                         }
