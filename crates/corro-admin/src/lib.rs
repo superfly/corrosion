@@ -2,8 +2,9 @@ use std::{fmt::Display, time::Duration};
 
 use camino::Utf8PathBuf;
 use corro_types::{
-    actor::ClusterId,
-    agent::{Agent, Bookie, LockKind, LockMeta, LockState},
+    actor::{ActorId, ClusterId},
+    agent::{Agent, Bookie, KnownVersion, LockKind, LockMeta, LockState},
+    base::Version,
     broadcast::{FocaCmd, FocaInput},
     sqlite::SqlitePoolError,
     sync::generate_sync,
@@ -89,6 +90,7 @@ pub enum Command {
     Sync(SyncCommand),
     Locks { top: usize },
     Cluster(ClusterCommand),
+    Actor(ActorCommand),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +102,11 @@ pub enum SyncCommand {
 pub enum ClusterCommand {
     MembershipStates,
     SetId(ClusterId),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ActorCommand {
+    Version { actor_id: ActorId, version: Version },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -272,6 +279,40 @@ async fn handle_conn(
                     if let Err(e) = res {
                         send_error(&mut stream, e).await;
                         continue;
+                    }
+
+                    send_success(&mut stream).await;
+                }
+                Command::Actor(ActorCommand::Version { actor_id, version }) => {
+                    let json = {
+                        let bookie = bookie.read("admin actor version").await;
+                        let booked = match bookie.get(&actor_id) {
+                            Some(booked) => booked,
+                            None => {
+                                send_error(&mut stream, format!("unknown actor id: {actor_id}"))
+                                    .await;
+                                continue;
+                            }
+                        };
+                        let booked_read = booked.read("admin actor version booked").await;
+                        match booked_read.get(&version) {
+                            Some(known) => match known {
+                                KnownVersion::Cleared => {
+                                    Ok(serde_json::Value::String("cleared".into()))
+                                }
+                                KnownVersion::Current(known) => serde_json::to_value(known),
+                                KnownVersion::Partial(known) => serde_json::to_value(known),
+                            },
+                            None => Ok(serde_json::Value::Null),
+                        }
+                    };
+
+                    match json {
+                        Ok(j) => _ = send(&mut stream, Response::Json(j)).await,
+                        Err(e) => {
+                            _ = send_error(&mut stream, e).await;
+                            continue;
+                        }
                     }
 
                     send_success(&mut stream).await;

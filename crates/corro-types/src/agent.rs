@@ -961,7 +961,7 @@ impl Drop for LockTracker {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CurrentVersion {
     // cr-sqlite db version
     pub db_version: CrsqlDbVersion,
@@ -971,7 +971,7 @@ pub struct CurrentVersion {
     pub ts: Timestamp,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PartialVersion {
     // range of sequences recorded
     pub seqs: RangeInclusiveSet<CrsqlSeq>,

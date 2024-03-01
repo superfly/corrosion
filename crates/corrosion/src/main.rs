@@ -14,8 +14,9 @@ use command::{
 use corro_api_types::SqliteParam;
 use corro_client::CorrosionApiClient;
 use corro_types::{
-    actor::ClusterId,
+    actor::{ActorId, ClusterId},
     api::{ExecResult, QueryEvent, Statement},
+    base::Version,
     config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
 };
 use futures::StreamExt;
@@ -432,6 +433,16 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 generate_client_cert(ca_cert, ca_key).await?
             }
         },
+        Command::Actor(ActorCommand::Version { actor_id, version }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Actor(
+                corro_admin::ActorCommand::Version {
+                    actor_id: ActorId(*actor_id),
+                    version: Version(*version),
+                },
+            ))
+            .await?;
+        }
     }
 
     Ok(())
@@ -579,6 +590,10 @@ enum Command {
         top: usize,
     },
 
+    /// Actor-related commands
+    #[command(subcommand)]
+    Actor(ActorCommand),
+
     Template {
         template: Vec<String>,
         #[command(flatten)]
@@ -608,6 +623,12 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
+}
+
+#[derive(Subcommand)]
+enum ActorCommand {
+    /// Get information about a known version
+    Version { actor_id: Uuid, version: u64 },
 }
 
 #[derive(Subcommand)]
