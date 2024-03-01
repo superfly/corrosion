@@ -1328,6 +1328,7 @@ pub fn process_incomplete_version(
                     -- end_seq = start - 1 (to collapse ranges)
                     ( end_seq = :start - 1 )
                 )
+                RETURNING start_seq, end_seq
         ",
         )?
         .query_map(
