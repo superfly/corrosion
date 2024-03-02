@@ -690,8 +690,14 @@ mod tests {
         let tmpdir = tempfile::tempdir()?;
 
         let conn = rusqlite::Connection::open(tmpdir.path().join("db.sqlite"))?;
+        let pragma_value = 12345u64;
+        conn.pragma_update(None, "busy_timeout", pragma_value)?;
 
         db_cleanup(&conn)?;
+        assert_eq!(
+            conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))?,
+            pragma_value
+        );
 
         Ok(())
     }
