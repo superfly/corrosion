@@ -379,7 +379,7 @@ pub async fn handle_changes(
     mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     mut tripwire: Tripwire,
 ) {
-    const MIN_CHANGES_CHUNK: usize = 2000;
+    const MIN_CHANGES_CHUNK: usize = 500;
     let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
     let mut count = 0;
