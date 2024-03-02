@@ -610,7 +610,7 @@ pub async fn clear_buffered_meta_loop(
     }
 }
 
-const MAX_EMPTIES_BATCH_SIZE: u64 = 10;
+const MAX_EMPTIES_BATCH_SIZE: u64 = 40;
 
 /// Clear empty versions from the database in chunks to avoid locking
 /// the database for too long.
