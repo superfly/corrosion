@@ -338,6 +338,9 @@ async fn db_cleanup(pool: &SplitPool) -> eyre::Result<()> {
     block_in_place(move || {
         let start = Instant::now();
 
+        let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+        conn.pragma_update(None, "busy_timeout", 60000)?;
+
         let busy: bool =
             conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
         if busy {
@@ -347,6 +350,9 @@ async fn db_cleanup(pool: &SplitPool) -> eyre::Result<()> {
             debug!("successfully truncated sqlite WAL!");
             histogram!("corro.db.wal.truncate.seconds").record(start.elapsed().as_secs_f64());
         }
+
+        _ = conn.pragma_update(None, "busy_timeout", orig);
+
         Ok::<_, eyre::Report>(())
     })?;
     debug!("done handling db_cleanup");
