@@ -379,12 +379,12 @@ pub async fn handle_changes(
     mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     mut tripwire: Tripwire,
 ) {
-    const MIN_CHANGES_CHUNK: usize = 500;
+    const MAX_CHANGES_CHUNK: usize = 800;
     let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
     let mut count = 0;
 
-    const MAX_CONCURRENT: usize = 3;
+    const MAX_CONCURRENT: usize = 5;
     let mut join_set = JoinSet::new();
 
     let mut max_wait = tokio::time::interval(Duration::from_millis(500));
@@ -396,7 +396,7 @@ pub async fn handle_changes(
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
-        while count >= MIN_CHANGES_CHUNK && join_set.len() < MAX_CONCURRENT {
+        while count >= MAX_CHANGES_CHUNK && join_set.len() < MAX_CONCURRENT {
             // we're already bigger than the minimum size of changes batch
             // so we want to accumulate at least that much and process them
             // concurrently bvased on MAX_CONCURRENCY
@@ -404,7 +404,7 @@ pub async fn handle_changes(
             while let Some((change, src, queued_at)) = queue.pop_front() {
                 tmp_count += change.len();
                 buf.push((change, src, queued_at));
-                if tmp_count >= MIN_CHANGES_CHUNK {
+                if tmp_count >= MAX_CHANGES_CHUNK {
                     break;
                 }
             }
@@ -526,7 +526,7 @@ pub async fn handle_changes(
                 gauge!("corro.agent.changesets.in_queue").set(queue.len() as f64);
                 gauge!("corro.agent.changes.processing.jobs").set(join_set.len() as f64);
 
-                if count < MIN_CHANGES_CHUNK && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
+                if count < MAX_CHANGES_CHUNK && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     // we can process this right away
                     debug!(%count, "spawning processing multiple changes from max wait interval");
                     join_set.spawn(util::process_multiple_changes(
@@ -561,7 +561,7 @@ pub async fn handle_changes(
         counter!("corro.agent.changes.recv").increment(changes_count as u64);
         count += changes_count;
         queue.push_back((change, src, Instant::now()));
-        if count >= MIN_CHANGES_CHUNK {
+        if count >= MAX_CHANGES_CHUNK {
             // drain and process current changes!
             if let Err(e) = util::process_multiple_changes(
                 agent.clone(),
