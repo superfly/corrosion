@@ -264,7 +264,7 @@ fn index_bookkeeping_ranges(tx: &Transaction) -> rusqlite::Result<()> {
         -- we often query these columns
         -- creating them will make SQLite use covering indexes
         CREATE UNIQUE INDEX __corro_bookkeeping_actor_id_start_version_end_version ON __corro_bookkeeping (actor_id, start_version, end_version);
-        CREATE UNIQUE INDEX __corro_seq_bookkeeping_site_id_version_start_seq_end_seq ON __corro_bookkeeping (site_id, version, start_seq, end_seq);
+        CREATE UNIQUE INDEX __corro_seq_bookkeeping_site_id_version_start_seq_end_seq ON __corro_seq_bookkeeping (site_id, version, start_seq, end_seq);
     "#,
     )
 }
