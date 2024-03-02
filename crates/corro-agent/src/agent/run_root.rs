@@ -203,10 +203,10 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
         tripwire.clone(),
     ));
 
-    tokio::spawn(util::clear_overwritten_versions(
-        agent.clone(),
-        bookie.clone(),
-    ));
+    // tokio::spawn(util::clear_overwritten_versions(
+    //     agent.clone(),
+    //     bookie.clone(),
+    // ));
 
     Ok(bookie)
 }
