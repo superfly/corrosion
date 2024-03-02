@@ -252,21 +252,9 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         Box::new(create_corro_subs as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(refactor_corro_members as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(crsqlite_v0_16_migration as fn(&Transaction) -> rusqlite::Result<()>),
-        Box::new(index_bookkeeping_ranges as fn(&Transaction) -> rusqlite::Result<()>),
     ];
 
     crate::sqlite::migrate(conn, migrations)
-}
-
-fn index_bookkeeping_ranges(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        r#"
-        -- we often query these columns
-        -- creating them will make SQLite use covering indexes
-        CREATE UNIQUE INDEX __corro_bookkeeping_actor_id_start_version_end_version ON __corro_bookkeeping (actor_id, start_version, end_version);
-        CREATE UNIQUE INDEX __corro_seq_bookkeeping_site_id_version_start_seq_end_seq ON __corro_seq_bookkeeping (site_id, version, start_seq, end_seq);
-    "#,
-    )
 }
 
 // since crsqlite 0.16, site_id is NOT NULL in clock tables
