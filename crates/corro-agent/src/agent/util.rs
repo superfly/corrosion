@@ -714,10 +714,12 @@ pub async fn process_completed_empties(
         }
     }
 
-    debug!(
-        "upserted {inserted} empty version ranges in {:?}",
-        start.elapsed()
-    );
+    let elapsed = start.elapsed();
+
+    debug!("upserted {inserted} empty version ranges in {elapsed:?}");
+
+    counter!("corro.agent.empties.committed").increment(inserted as u64);
+    histogram!("corro.agent.empties.commit.second").record(elapsed);
 
     Ok(())
 }
@@ -1335,10 +1337,7 @@ pub fn process_incomplete_version(
                 ":start": seqs.start(),
                 ":end": seqs.end(),
             ],
-            |row| {
-                let start = row.get(0)?;
-                Ok(start..=row.get(1)?)
-            },
+            |row| Ok(row.get(0)?..=row.get(1)?),
         )
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
 
