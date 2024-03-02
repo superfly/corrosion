@@ -572,10 +572,12 @@ pub async fn clear_buffered_meta_loop(
 
                         // TODO: delete buffered changes from deleted sequences only (maybe, it's kind of hard and may not be necessary)
 
+                        // sub query required due to DELETE and LIMIT interaction
                         let seq_count = tx
                             .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
                             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
+                        // sub query required due to DELETE and LIMIT interaction
                         let buf_count = tx
                             .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
                             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
@@ -608,6 +610,8 @@ pub async fn clear_buffered_meta_loop(
     }
 }
 
+const MAX_EMPTIES_BATCH_SIZE: u64 = 100;
+
 /// Clear empty versions from the database in chunks to avoid locking
 /// the database for too long.
 ///
@@ -625,12 +629,17 @@ pub async fn write_empties_loop(
     let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
     tokio::pin!(next_empties_check);
 
+    let mut count = 0;
+
     loop {
         tokio::select! {
             maybe_empty = rx_empty.recv() => match maybe_empty {
                 Some((actor_id, versions)) => {
                     empties.entry(actor_id).or_default().insert(versions);
-                    continue;
+                    count += 1;
+                    if count < MAX_EMPTIES_BATCH_SIZE {
+                        continue;
+                    }
                 },
                 None => {
                     debug!("empties queue is done");
@@ -653,6 +662,8 @@ pub async fn write_empties_loop(
             process_completed_empties(agent.clone(), empties_to_process)
                 .inspect_err(|e| error!("could not process empties: {e}")),
         );
+
+        count = 0;
     }
     info!("Draining empty versions to process...");
     // drain empties channel
