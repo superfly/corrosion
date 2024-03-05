@@ -65,4 +65,16 @@ pub fn collect_metrics(agent: &Agent, transport: &Transport) {
             error!("could not query count for buffered changes: {e}");
         }
     }
+
+    let mut db_path = agent.config().db.path.clone();
+
+    if let Ok(meta) = db_path.metadata() {
+        gauge!("corro.db.size").set(meta.len() as f64);
+    }
+
+    if db_path.set_extension(format!("{}-wal", db_path.extension().unwrap_or_default())) {
+        if let Ok(meta) = db_path.metadata() {
+            gauge!("corro.db.wal.size").set(meta.len() as f64);
+        }
+    }
 }

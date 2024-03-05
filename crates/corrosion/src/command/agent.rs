@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
+use build_info::VersionControl;
 use camino::Utf8PathBuf;
 use corro_admin::AdminConfig;
 use corro_types::config::{Config, PrometheusConfig};
@@ -16,12 +17,25 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
 
     if let Some(PrometheusConfig { bind_addr }) = config.telemetry.prometheus {
         setup_prometheus(bind_addr).expect("could not setup prometheus");
-        let info = crate::version();
+        let info = crate::version().clone();
+
+        // I know this is cloned a lot, but I don't care since it's called once
+        // and then we won't be hearing about it ever again
+        let unknown: String = "unknown".into();
+        let (git_commit, git_branch) = if let Some(VersionControl::Git(git)) = info.version_control
+        {
+            (git.commit_short_id, git.branch.unwrap_or(unknown.clone()))
+        } else {
+            (unknown.clone(), unknown.clone())
+        };
+
         gauge!(
             "corro.build.info",
             "version" => info.crate_info.version.to_string(),
             "ts" => info.timestamp.to_string(),
-            "rustc_version" => info.compiler.version.to_string()
+            "rustc_version" => info.compiler.version.to_string(),
+            "git_commit" => git_commit,
+            "git_branch" => git_branch,
         )
         .set(1.0);
 
