@@ -19,11 +19,14 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
         setup_prometheus(bind_addr).expect("could not setup prometheus");
         let info = crate::version().clone();
 
+        // I know this is cloned a lot, but I don't care since it's called once
+        // and then we won't be hearing about it ever again
+        let unknown: String = "unknown".into();
         let (git_commit, git_branch) = if let Some(VersionControl::Git(git)) = info.version_control
         {
-            (git.commit_short_id, git.branch.unwrap_or_default())
+            (git.commit_short_id, git.branch.unwrap_or(unknown.clone()))
         } else {
-            (String::new(), String::new())
+            (unknown.clone(), unknown.clone())
         };
 
         gauge!(
