@@ -639,7 +639,8 @@ impl Matcher {
                             if let Some(JoinedSelectTable {
                                 operator:
                                     JoinOperator::TypedJoin {
-                                        join_type: join_type @ Some(JoinType::LeftOuter),
+                                        join_type:
+                                            join_type @ Some(JoinType::LeftOuter | JoinType::Left),
                                         ..
                                     },
                                 ..
