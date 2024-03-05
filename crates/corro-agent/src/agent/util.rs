@@ -131,6 +131,10 @@ pub async fn initialise_foca(agent: &Agent) {
 }
 
 /// Prune the database
+// FIXME: we remove this function from running while debugging a
+// performance incident.  We still need to clean up deleted versions
+// from the database, so this is only a temporary fix.
+#[allow(unused)]
 pub async fn clear_overwritten_versions(agent: Agent, bookie: Bookie) {
     let pool = agent.pool();
 
