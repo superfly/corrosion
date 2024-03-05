@@ -20,6 +20,7 @@ use corro_types::{
     base::CrsqlSeq,
     broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
     channel::CorroReceiver,
+    members::MemberAddedResult,
     sync::generate_sync,
 };
 
@@ -261,38 +262,51 @@ pub async fn handle_notifications(
         trace!("handle notification");
         match notification {
             Notification::MemberUp(actor) => {
-                let (added, same) = { agent.members().write().add_member(&actor) };
-                trace!("Member Up {actor:?} (added: {added})");
-                if added {
-                    debug!("Member Up {actor:?}");
-                    counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
-                    // actually added a member
-                    // notify of new cluster size
-                    let members_len = { agent.members().read().states.len() as u32 };
-                    if let Ok(size) = members_len.try_into() {
-                        if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await {
-                            error!("could not send new foca cluster size: {e}");
+                let member_added_res = agent.members().write().add_member(&actor);
+                info!("Member Up {actor:?} (result: {member_added_res:?})");
+
+                match member_added_res {
+                    MemberAddedResult::NewMember => {
+                        debug!("Member Added {actor:?}");
+                        counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+
+                        // actually added a member
+                        // notify of new cluster size
+                        let members_len = agent.members().read().states.len() as u32;
+                        if let Ok(size) = members_len.try_into() {
+                            if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await
+                            {
+                                error!("could not send new foca cluster size: {e}");
+                            }
                         }
                     }
-                } else if !same {
-                    // had a older timestamp!
-                    if let Err(e) = agent
-                        .tx_foca()
-                        .send(FocaInput::ApplyMany(vec![foca::Member::new(
-                            actor.clone(),
-                            foca::Incarnation::default(),
-                            foca::State::Down,
-                        )]))
-                        .await
-                    {
-                        warn!(?actor, "could not manually declare actor as down! {e}");
+                    MemberAddedResult::Updated => {
+                        debug!("Member Updated {actor:?}");
+                        // anything else to do here?
+                    }
+                    MemberAddedResult::Ignored => {
+                        // TODO: it's unclear if this is needed or
+                        // not.  We removed it to debug a foca member
+                        // state issue.  It may be needed again.
+
+                        // if let Err(e) = agent
+                        //     .tx_foca()
+                        //     .send(FocaInput::ApplyMany(vec![foca::Member::new(
+                        //         actor.clone(),
+                        //         foca::Incarnation::default(),
+                        //         foca::State::Down,
+                        //     )]))
+                        //     .await
+                        // {
+                        //     warn!(?actor, "could not manually declare actor as down! {e}");
+                        // }
                     }
                 }
                 counter!("corro.swim.notification", "type" => "memberup").increment(1);
             }
             Notification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
-                trace!("Member Down {actor:?} (removed: {removed})");
+                info!("Member Down {actor:?} (removed: {removed})");
                 if removed {
                     debug!("Member Down {actor:?}");
                     counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
@@ -635,6 +649,7 @@ pub async fn handle_sync(
         debug!("found {} candidates to synchronize with", candidates.len());
 
         let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
+        debug!("Selected {desired_count} nodes to sync with");
 
         let mut rng = StdRng::from_entropy();
 
@@ -658,6 +673,7 @@ pub async fn handle_sync(
             .collect()
     };
 
+    trace!("Sync set: {chosen:?}");
     if chosen.is_empty() {
         return Ok(());
     }

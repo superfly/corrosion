@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, net::SocketAddr, ops::Range, time::Duration};
 
 use circular_buffer::CircularBuffer;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
 use crate::{
@@ -8,7 +9,7 @@ use crate::{
     broadcast::Timestamp,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemberState {
     pub addr: SocketAddr,
     pub ts: Timestamp,
@@ -46,6 +47,13 @@ pub struct Members {
     pub rtts: BTreeMap<SocketAddr, Rtt>,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum MemberAddedResult {
+    NewMember,
+    Updated,
+    Ignored,
+}
+
 impl Members {
     pub fn get(&self, id: &ActorId) -> Option<&MemberState> {
         self.states.get(id)
@@ -53,34 +61,44 @@ impl Members {
 
     // A result of `true` means that the effective list of
     // cluster member addresses has changed
-    pub fn add_member(&mut self, actor: &Actor) -> (bool, bool) {
+    pub fn add_member(&mut self, actor: &Actor) -> MemberAddedResult {
         let actor_id = actor.id();
-        let member = self
-            .states
-            .entry(actor_id)
-            .or_insert_with(|| MemberState::new(actor.addr(), actor.ts(), actor.cluster_id()));
+        let mut ret = MemberAddedResult::Ignored;
+
+        let member = self.states.entry(actor_id).or_insert_with(|| {
+            ret = MemberAddedResult::NewMember;
+            MemberState::new(actor.addr(), actor.ts(), actor.cluster_id())
+        });
 
         trace!("member: {member:?}");
 
+        // The received timestamp is older than the previously known
+        // one.  If we just added the member this shouldn't ever
+        // trigger (because the timestamps would be the same).
         if actor.ts().to_duration() < member.ts.to_duration() {
             debug!("older timestamp, ignoring");
-            return (false, false);
+            return MemberAddedResult::Ignored;
         }
 
-        // sometimes, this can be equal
-        let newer = actor.ts().to_duration() > member.ts.to_duration();
-        let same = actor.ts().to_duration() == member.ts.to_duration();
-
-        if newer {
+        // If the new timestamp is newer than what we had on file we
+        // update the member, then set the return to "Update".
+        // Because a newly inserted member would always have the same
+        // timestamp this code doesn't run if we just inserted.
+        if actor.ts().to_duration() > member.ts.to_duration() {
             member.addr = actor.addr();
             member.ts = actor.ts();
             member.cluster_id = actor.cluster_id();
+            ret = MemberAddedResult::Updated;
+        }
 
+        // If we just inserted, add the actor to the by_addr set and
+        // recalculate the RTT rings.
+        if ret == MemberAddedResult::NewMember {
             self.by_addr.insert(actor.addr(), actor.id());
             self.recalculate_rings(actor.addr());
         }
 
-        (newer, same)
+        ret
     }
 
     // A result of `true` means that the effective list of

@@ -30,7 +30,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaInput},
+    broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
@@ -68,7 +68,7 @@ use super::BcastCache;
 pub async fn initialise_foca(agent: &Agent) {
     let states = load_member_states(agent).await;
     if !states.is_empty() {
-        let mut foca_states = Vec::with_capacity(states.len());
+        let mut foca_states = BTreeMap::<SocketAddr, Member<Actor>>::new();
 
         {
             // block to drop the members write lock
@@ -78,15 +78,55 @@ pub async fn initialise_foca(agent: &Agent) {
                 if matches!(foca_state.state(), foca::State::Suspect) {
                     continue;
                 }
-                foca_states.push(foca_state);
+
+                // Add to the foca_states if the member doesn't yet
+                // exist in the map, or if we are replacing an older
+                // timestamp
+                match foca_states.get(&address) {
+                    Some(state) if state.id().ts() < foca_state.id().ts() => {
+                        foca_states.insert(address, foca_state);
+                    }
+                    None => {
+                        foca_states.insert(address, foca_state);
+                    }
+                    _ => {}
+                }
             }
         }
 
-        agent
+        if let Err(e) = agent
             .tx_foca()
-            .send(FocaInput::ApplyMany(foca_states))
+            .send(FocaInput::ApplyMany(
+                foca_states.into_iter().map(|(_, v)| v).collect(),
+            ))
             .await
-            .ok();
+        {
+            error!("Failed to queue initial foca state: {e:?}, cluster membership states will be broken!");
+        }
+
+        let agent = agent.clone();
+        tokio::task::spawn(async move {
+            // Add some random scatter to the task sleep so that
+            // restarted nodes don't all rejoin at once
+            let scatter = rand::random::<u64>() % 15;
+            tokio::time::sleep(Duration::from_secs(25 + scatter)).await;
+
+            async fn apply_rejoin(agent: &Agent) -> eyre::Result<()> {
+                let (cb_tx, cb_rx) = tokio::sync::oneshot::channel();
+                agent
+                    .tx_foca()
+                    .send(FocaInput::Cmd(FocaCmd::Rejoin(cb_tx)))
+                    .await?;
+                cb_rx.await??;
+                Ok(())
+            }
+
+            if let Err(e) = apply_rejoin(&agent).await {
+                error!("failed to execute cluster rejoin: {e:?}");
+            }
+        });
+    } else {
+        warn!("No existing cluster member state to load!  This seems sus");
     }
 }
 
