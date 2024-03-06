@@ -692,6 +692,7 @@ pub async fn api_v1_subs(
         tripwire,
     ));
 
+    let cleanup_handle = handle.clone();
     let matcher_id = match upsert_sub(
         handle,
         maybe_created,
@@ -703,7 +704,10 @@ pub async fn api_v1_subs(
     .await
     {
         Ok(id) => id,
-        Err(e) => return hyper::Response::<hyper::Body>::from(e),
+        Err(e) => {
+            cleanup_handle.cleanup_on_disk().await;
+            return hyper::Response::<hyper::Body>::from(e);
+        }
     };
 
     hyper::Response::builder()

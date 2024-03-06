@@ -56,6 +56,7 @@ pub struct SubsManager(Arc<RwLock<InnerSubsManager>>);
 struct InnerSubsManager {
     handles: BTreeMap<Uuid, MatcherHandle>,
     queries: HashMap<String, Uuid>,
+    base_path: Utf8PathBuf,
 }
 
 // tools to bootstrap a new subscriber
@@ -66,6 +67,17 @@ pub struct MatcherCreated {
 const SUB_EVENT_CHANNEL_CAP: usize = 512;
 
 impl SubsManager {
+    pub fn with_path(path: Utf8PathBuf) -> Self {
+        Self(Arc::new(RwLock::new(InnerSubsManager {
+            base_path: path,
+            ..Default::default()
+        })))
+    }
+
+    pub fn subs_id_path(&self, id: Uuid) -> Utf8PathBuf {
+        self.0.read().base_path.join(id.as_simple().to_string())
+    }
+
     pub fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
         self.0.read().get(id)
     }
@@ -108,7 +120,7 @@ impl SubsManager {
             Ok(handle) => handle,
             Err(e) => {
                 error!(sub_id = %id, "could not create subscription: {e}");
-                if let Err(e) = Matcher::cleanup(id, Matcher::sub_path(subs_path, id)) {
+                if let Err(e) = Matcher::cleanup_on_disk(id, Matcher::sub_path(subs_path, id)) {
                     error!("could not cleanup subscription: {e}");
                 }
 
@@ -264,6 +276,7 @@ impl MatcherState {
 pub struct MatcherHandle {
     inner: Arc<InnerMatcherHandle>,
     state: StateLock,
+    path: Utf8PathBuf,
 }
 
 #[derive(Debug)]
@@ -297,6 +310,17 @@ impl MatcherHandle {
     pub async fn cleanup(self) {
         self.inner.cancel.cancel();
         info!(sub_id = %self.inner.id, "Canceled subscription");
+    }
+
+    pub async fn cleanup_on_disk(self) {
+        info!(sub_id = %self.inner.id, "Attempting to cleanup...");
+        block_in_place(|| {
+            if let Err(e) = std::fs::remove_dir_all(&self.path) {
+                error!(sub_id = %self.inner.id, "could not delete subscription base path {} due to: {e}", self.path);
+            }
+        });
+
+        self.cleanup().await;
     }
 
     pub fn pool(&self) -> &RusqlitePool {
@@ -711,6 +735,7 @@ impl Matcher {
                 changes_tx,
             }),
             state: state.clone(),
+            path: sub_path.clone(),
         };
 
         let matcher = Self {
@@ -734,16 +759,12 @@ impl Matcher {
         Ok((matcher, handle))
     }
 
-    pub fn cleanup(id: Uuid, sub_path: Utf8PathBuf) -> rusqlite::Result<()> {
+    pub async fn cleanup_on_disk(id: Uuid, sub_path: Utf8PathBuf) -> rusqlite::Result<()> {
         info!(sub_id = %id, "Attempting to cleanup...");
 
-        block_in_place(|| {
-            if let Err(e) = std::fs::remove_dir_all(&sub_path) {
-                error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
-            }
-
-            Ok(())
-        })
+        if let Err(e) = tokio::fs::remove_dir_all(&sub_path).await {
+            error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
+        }
     }
 
     pub fn sub_path(subs_path: &Utf8Path, id: Uuid) -> Utf8PathBuf {
@@ -1099,7 +1120,7 @@ impl Matcher {
 
         debug!(id = %self.id, "matcher loop is done");
 
-        if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+        if let Err(e) = Self::cleanup_on_disk(self.id, self.base_path.clone()) {
             error!("could not handle cleanup: {e}");
         }
     }
