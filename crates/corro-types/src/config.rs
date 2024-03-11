@@ -6,11 +6,37 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
 
+const fn default_apply_queue() -> usize {
+    600
+}
+
+const fn default_apply_channel() -> usize {
+    2048
+}
+
+const fn default_mid_channel() -> usize {
+    512
+}
+
+const fn default_changes_channel() -> usize {
+    1024
+}
+
+const fn default_small_channel() -> usize {
+    256
+}
+
+const fn default_apply_timeout() -> usize {
+    50
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub db: DbConfig,
     pub api: ApiConfig,
     pub gossip: GossipConfig,
+
+    pub perf: PerfConfig,
 
     #[serde(default)]
     pub admin: AdminConfig,
@@ -125,6 +151,35 @@ pub struct GossipConfig {
     pub disable_gso: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfConfig {
+    #[serde(default = "default_apply_channel")]
+    pub apply_channel_len: usize,
+    #[serde(default = "default_mid_channel")]
+    pub mid_channel_len: usize,
+    #[serde(default = "default_changes_channel")]
+    pub changes_channel_len: usize,
+    #[serde(default = "default_small_channel")]
+    pub small_channel_len: usize,
+    #[serde(default = "default_apply_timeout")]
+    pub apply_queue_timeout: usize,
+    #[serde(default = "default_apply_queue")]
+    pub apply_queue_len: usize,
+}
+
+impl Default for PerfConfig {
+    fn default() -> Self {
+        Self {
+            apply_channel_len: default_apply_channel(),
+            mid_channel_len: default_mid_channel(),
+            changes_channel_len: default_changes_channel(),
+            small_channel_len: default_small_channel(),
+            apply_queue_timeout: default_apply_timeout(),
+            apply_queue_len: default_apply_queue(),
+        }
+    }
+}
+
 fn default_gossip_idle_timeout() -> u32 {
     DEFAULT_GOSSIP_IDLE_TIMEOUT
 }
@@ -215,6 +270,7 @@ pub struct ConfigBuilder {
     max_change_size: Option<i64>,
     consul: Option<ConsulConfig>,
     tls: Option<TlsConfig>,
+    perf: Option<PerfConfig>,
 }
 
 impl ConfigBuilder {
@@ -312,6 +368,7 @@ impl ConfigBuilder {
                 max_mtu: None, // TODO: add a builder function for it
                 disable_gso: false,
             },
+            perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {
                 uds_path: self.admin_path.unwrap_or_else(default_admin_path),
             },

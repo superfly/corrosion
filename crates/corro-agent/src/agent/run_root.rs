@@ -17,7 +17,7 @@ use corro_types::{
     agent::{Agent, BookedVersions, Bookie},
     base::CrsqlSeq,
     channel::bounded,
-    config::Config,
+    config::{Config, PerfConfig},
     pubsub::{Matcher, SubsManager},
 };
 
@@ -32,14 +32,14 @@ use tripwire::Tripwire;
 /// First initialise `AgentOptions` state via `setup()`, then spawn a
 /// new task that runs the main agent state machine
 pub async fn start_with_config(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Bookie)> {
-    let (agent, opts) = setup(conf, tripwire.clone()).await?;
+    let (agent, opts) = setup(conf.clone(), tripwire.clone()).await?;
 
-    let bookie = run(agent.clone(), opts).await?;
+    let bookie = run(agent.clone(), opts, conf.perf).await?;
 
     Ok((agent, bookie))
 }
 
-async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
+async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Result<Bookie> {
     let AgentOptions {
         gossip_server_endpoint,
         transport,
@@ -73,8 +73,8 @@ async fn run(agent: Agent, opts: AgentOptions) -> eyre::Result<Bookie> {
         );
     }
 
-    let (to_send_tx, to_send_rx) = bounded(10240, "to_send");
-    let (notifications_tx, notifications_rx) = bounded(10240, "notifications");
+    let (to_send_tx, to_send_rx) = bounded(pconf.mid_channel_len, "to_send");
+    let (notifications_tx, notifications_rx) = bounded(pconf.mid_channel_len, "notifications");
 
     //// Start the main SWIM runtime loop
     runtime_loop(
