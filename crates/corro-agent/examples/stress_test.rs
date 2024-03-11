@@ -148,7 +148,7 @@ async fn main() -> eyre::Result<()> {
 
     let start = Instant::now();
 
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
