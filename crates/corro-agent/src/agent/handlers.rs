@@ -408,7 +408,7 @@ pub async fn handle_changes(
     const MAX_CONCURRENT: usize = 5;
     let mut join_set = JoinSet::new();
 
-    let mut max_wait = tokio::time::interval(Duration::from_millis(500));
+    let mut max_wait = tokio::time::interval(Duration::from_millis(50));
 
     const MAX_SEEN_CACHE_LEN: usize = 10000;
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
