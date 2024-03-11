@@ -94,8 +94,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     info!("Cluster ID: {cluster_id}");
 
-    let (tx_apply, rx_apply) = bounded(20480, "apply");
-    let (tx_clear_buf, rx_clear_buf) = bounded(10240, "clear_buf");
+    let (tx_apply, rx_apply) = bounded(2048, "apply");
+    let (tx_clear_buf, rx_clear_buf) = bounded(512, "clear_buf");
 
     let lock_registry = LockRegistry::default();
     let booked = {
@@ -127,10 +127,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
             .build(),
     );
 
-    let (tx_bcast, rx_bcast) = bounded(10240, "bcast");
-    let (tx_empty, rx_empty) = bounded(10240, "empty");
-    let (tx_changes, rx_changes) = bounded(5192, "changes");
-    let (tx_foca, rx_foca) = bounded(10240, "foca");
+    let (tx_bcast, rx_bcast) = bounded(512, "bcast");
+    let (tx_empty, rx_empty) = bounded(512, "empty");
+    let (tx_changes, rx_changes) = bounded(1024, "changes");
+    let (tx_foca, rx_foca) = bounded(256, "foca");
 
     let subs_manager = SubsManager::default();
 
