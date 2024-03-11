@@ -1444,6 +1444,11 @@ impl Matcher {
                     tmp_insert_prepped.raw_execute()?;
                 }
 
+                let coalesced_pks = pk_cols
+                    .iter()
+                    .map(|pk| format!("coalesce({pk},\"\")"))
+                    .collect::<Vec<_>>()
+                    .join(",");
                 let sql = format!(
                     "INSERT INTO query ({insert_cols})
                         SELECT * FROM (
@@ -1459,11 +1464,7 @@ impl Matcher {
                     // insert into
                     insert_cols = all_cols.join(","),
                     query_query = stmt.temp_query,
-                    conflict_clause = pk_cols
-                        .iter()
-                        .map(|pk| format!("coalesce({pk},\"\")"))
-                        .collect::<Vec<_>>()
-                        .join(","),
+                    conflict_clause = coalesced_pks,
                     excluded = (0..(self.parsed.columns.len()))
                         .map(|i| format!("col_{i} = excluded.col_{i}"))
                         .collect::<Vec<_>>()
@@ -1488,8 +1489,8 @@ impl Matcher {
                     )) RETURNING __corro_rowid,{return_cols}
                 ",
                     // delete from
-                    pks = pk_cols.join(","),
-                    select_pks = pk_cols.join(","),
+                    pks = coalesced_pks,
+                    select_pks = coalesced_pks,
                     query_query = stmt.temp_query,
                     return_cols = query_cols.join(",")
                 );
