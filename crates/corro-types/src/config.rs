@@ -36,6 +36,7 @@ pub struct Config {
     pub api: ApiConfig,
     pub gossip: GossipConfig,
 
+    #[serde(default)]
     pub perf: PerfConfig,
 
     #[serde(default)]
