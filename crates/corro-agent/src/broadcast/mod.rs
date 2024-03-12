@@ -141,7 +141,7 @@ pub fn runtime_loop(
         NoCustomBroadcast,
     );
 
-    let (to_schedule_tx, mut to_schedule_rx) = bounded(agent.config().perf.mid_channel_len, "to_schedule");
+    let (to_schedule_tx, mut to_schedule_rx) = bounded(agent.config().perf.schedule_channel_len, "to_schedule");
 
     let mut runtime: DispatchRuntime<Actor> =
         DispatchRuntime::new(to_send_tx, to_schedule_tx, notifications_tx);

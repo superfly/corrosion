@@ -157,13 +157,23 @@ pub struct GossipConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerfConfig {
     #[serde(default = "default_huge_channel")]
-    pub huge_channel_len: usize,
-    #[serde(default = "default_mid_channel")]
-    pub big_channel_len: usize,
-    #[serde(default = "default_small_channel")]
-    pub mid_channel_len: usize,
+    pub apply_channel_len: usize,
     #[serde(default = "default_big_channel")]
-    pub small_channel_len: usize,
+    pub changes_channel_len: usize,
+    #[serde(default = "default_big_channel")]
+    pub empties_channel_len: usize,
+    #[serde(default = "default_mid_channel")]
+    pub to_send_channel_len: usize,
+    #[serde(default = "default_mid_channel")]
+    pub notifications_channel_len: usize,
+    #[serde(default = "default_mid_channel")]
+    pub schedule_channel_len: usize,
+    #[serde(default = "default_mid_channel")]
+    pub clearbuf_channel_len: usize,
+    #[serde(default = "default_mid_channel")]
+    pub bcast_channel_len: usize,
+    #[serde(default = "default_small_channel")]
+    pub foca_channel_len: usize,
     #[serde(default = "default_apply_timeout")]
     pub apply_queue_timeout: usize,
     #[serde(default = "default_apply_queue")]
@@ -173,10 +183,15 @@ pub struct PerfConfig {
 impl Default for PerfConfig {
     fn default() -> Self {
         Self {
-            huge_channel_len: default_huge_channel(),
-            big_channel_len: default_big_channel(),
-            mid_channel_len: default_mid_channel(),
-            small_channel_len: default_small_channel(),
+            apply_channel_len: default_huge_channel(),
+            changes_channel_len: default_big_channel(),
+            empties_channel_len: default_big_channel(),
+            to_send_channel_len: default_mid_channel(),
+            notifications_channel_len: default_mid_channel(),
+            schedule_channel_len: default_mid_channel(),
+            clearbuf_channel_len: default_mid_channel(),
+            bcast_channel_len: default_mid_channel(),
+            foca_channel_len: default_small_channel(),
             apply_queue_timeout: default_apply_timeout(),
             apply_queue_len: default_apply_queue(),
         }
