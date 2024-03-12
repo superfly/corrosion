@@ -131,6 +131,9 @@ pub async fn initialise_foca(agent: &Agent) {
 }
 
 /// Prune the database
+// TODO: remove me again after we figure out how to not make this
+// super slow.  Make Github CI shut up about it for now though
+#[allow(unused)]
 pub async fn clear_overwritten_versions(agent: Agent, bookie: Bookie) {
     let pool = agent.pool();
 

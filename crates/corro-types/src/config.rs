@@ -10,16 +10,18 @@ const fn default_apply_queue() -> usize {
     600
 }
 
-const fn default_apply_channel() -> usize {
+/// Used for the apply channel
+const fn default_huge_channel() -> usize {
     2048
+}
+
+//
+const fn default_big_channel() -> usize {
+    1024
 }
 
 const fn default_mid_channel() -> usize {
     512
-}
-
-const fn default_changes_channel() -> usize {
-    1024
 }
 
 const fn default_small_channel() -> usize {
@@ -154,13 +156,13 @@ pub struct GossipConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerfConfig {
-    #[serde(default = "default_apply_channel")]
-    pub apply_channel_len: usize,
+    #[serde(default = "default_huge_channel")]
+    pub huge_channel_len: usize,
     #[serde(default = "default_mid_channel")]
-    pub mid_channel_len: usize,
-    #[serde(default = "default_changes_channel")]
-    pub changes_channel_len: usize,
+    pub big_channel_len: usize,
     #[serde(default = "default_small_channel")]
+    pub mid_channel_len: usize,
+    #[serde(default = "default_big_channel")]
     pub small_channel_len: usize,
     #[serde(default = "default_apply_timeout")]
     pub apply_queue_timeout: usize,
@@ -171,9 +173,9 @@ pub struct PerfConfig {
 impl Default for PerfConfig {
     fn default() -> Self {
         Self {
-            apply_channel_len: default_apply_channel(),
+            huge_channel_len: default_huge_channel(),
+            big_channel_len: default_big_channel(),
             mid_channel_len: default_mid_channel(),
-            changes_channel_len: default_changes_channel(),
             small_channel_len: default_small_channel(),
             apply_queue_timeout: default_apply_timeout(),
             apply_queue_len: default_apply_queue(),
