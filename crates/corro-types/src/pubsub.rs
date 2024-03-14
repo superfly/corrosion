@@ -1,6 +1,7 @@
 use std::{
     cmp,
     collections::{BTreeMap, HashMap, HashSet},
+    io,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,6 +32,7 @@ use sqlite3_parser::{
 };
 use sqlite_pool::RusqlitePool;
 use tokio::{
+    runtime::Handle,
     sync::{mpsc, watch, AcquireError},
     task::block_in_place,
 };
@@ -120,7 +122,12 @@ impl SubsManager {
             Ok(handle) => handle,
             Err(e) => {
                 error!(sub_id = %id, "could not create subscription: {e}");
-                if let Err(e) = Matcher::cleanup_on_disk(id, Matcher::sub_path(subs_path, id)) {
+
+                if let Err(e) = tokio::task::block_in_place(move || {
+                    Handle::current().block_on(async move {
+                        Matcher::cleanup_on_disk(id, Matcher::sub_path(subs_path, id)).await
+                    })
+                }) {
                     error!("could not cleanup subscription: {e}");
                 }
 
@@ -314,11 +321,9 @@ impl MatcherHandle {
 
     pub async fn cleanup_on_disk(self) {
         info!(sub_id = %self.inner.id, "Attempting to cleanup...");
-        block_in_place(|| {
-            if let Err(e) = std::fs::remove_dir_all(&self.path) {
-                error!(sub_id = %self.inner.id, "could not delete subscription base path {} due to: {e}", self.path);
-            }
-        });
+        if let Err(e) = tokio::fs::remove_dir_all(&self.path).await {
+            error!(sub_id = %self.inner.id, "could not delete subscription base path {} due to: {e}", self.path);
+        }
 
         self.cleanup().await;
     }
@@ -759,11 +764,15 @@ impl Matcher {
         Ok((matcher, handle))
     }
 
-    pub async fn cleanup_on_disk(id: Uuid, sub_path: Utf8PathBuf) -> rusqlite::Result<()> {
+    pub async fn cleanup_on_disk(id: Uuid, sub_path: Utf8PathBuf) -> io::Result<()> {
         info!(sub_id = %id, "Attempting to cleanup...");
 
-        if let Err(e) = tokio::fs::remove_dir_all(&sub_path).await {
-            error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
+        match tokio::fs::remove_dir_all(&sub_path).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
+                Err(e)
+            }
         }
     }
 
@@ -1120,7 +1129,7 @@ impl Matcher {
 
         debug!(id = %self.id, "matcher loop is done");
 
-        if let Err(e) = Self::cleanup_on_disk(self.id, self.base_path.clone()) {
+        if let Err(e) = Self::cleanup_on_disk(self.id, self.base_path.clone()).await {
             error!("could not handle cleanup: {e}");
         }
     }

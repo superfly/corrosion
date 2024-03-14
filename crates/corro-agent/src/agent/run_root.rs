@@ -269,7 +269,7 @@ async fn setup_spawn_subscriptions(
 
     for id in to_cleanup {
         info!(sub_id = %id, "Cleaning up unclean subscription");
-        Matcher::cleanup_on_disk(id, subs_manager.subs_id_path(id))?;
+        Matcher::cleanup_on_disk(id, subs_manager.subs_id_path(id)).await?;
     }
 
     Ok(Arc::new(TokioRwLock::new(subs_bcast_cache)))
