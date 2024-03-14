@@ -108,7 +108,7 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(&tripwire, &conn, agent.clone());
+        uni::spawn_unipayload_handler(agent.clone(), bookie.clone(), &tripwire, &conn);
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }

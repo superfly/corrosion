@@ -463,6 +463,7 @@ pub fn runtime_loop(
                     if let Err(e) = (UniPayload::V1 {
                         data: UniPayloadV1::Broadcast(bcast.clone()),
                         cluster_id: agent.cluster_id(),
+                        priority: is_local,
                     })
                     .write_to_stream((&mut ser_buf).writer())
                     {

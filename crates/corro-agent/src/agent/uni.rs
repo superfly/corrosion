@@ -1,5 +1,6 @@
+use crate::agent::util::process_multiple_changes;
 use corro_types::{
-    agent::Agent,
+    agent::{Agent, Bookie},
     broadcast::{BroadcastV1, ChangeSource, UniPayload, UniPayloadV1},
 };
 use metrics::counter;
@@ -11,7 +12,12 @@ use tripwire::Tripwire;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
-pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, agent: Agent) {
+pub fn spawn_unipayload_handler(
+    agent: Agent,
+    bookie: Bookie,
+    tripwire: &Tripwire,
+    conn: &quinn::Connection,
+) {
     tokio::spawn({
         let conn = conn.clone();
         let mut tripwire = tripwire.clone();
@@ -40,6 +46,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
 
                 tokio::spawn({
                     let agent = agent.clone();
+                    let bookie = bookie.clone();
                     async move {
                         let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
 
@@ -59,19 +66,43 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                                             change,
                                                         )),
                                                     cluster_id,
+                                                    priority,
                                                 } => {
                                                     if cluster_id != agent.cluster_id() {
                                                         continue;
                                                     }
-                                                    if let Err(e) = agent
-                                                        .tx_changes()
-                                                        .send((change, ChangeSource::Broadcast))
-                                                        .await
-                                                    {
-                                                        error!(
-                                                            "could not send change for processing: {e}"
-                                                        );
-                                                        return;
+
+                                                    if priority {
+                                                        let agent = agent.clone();
+                                                        let bookie = bookie.clone();
+
+                                                        tokio::spawn(async move {
+                                                            if let Err(e) =
+                                                                process_multiple_changes(
+                                                                    agent,
+                                                                    bookie,
+                                                                    vec![(
+                                                                        change,
+                                                                        ChangeSource::Broadcast,
+                                                                        std::time::Instant::now(),
+                                                                    )],
+                                                                )
+                                                                .await
+                                                            {
+                                                                error!("Process priority change failed: {:?}", e);
+                                                            }
+                                                        });
+                                                    } else {
+                                                        if let Err(e) = agent
+                                                            .tx_changes()
+                                                            .send((change, ChangeSource::Broadcast))
+                                                            .await
+                                                        {
+                                                            error!(
+                                                                "could not send change for processing: {e}"
+                                                            );
+                                                            return;
+                                                        }
                                                     }
                                                 }
                                             }
