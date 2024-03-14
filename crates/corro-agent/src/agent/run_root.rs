@@ -252,7 +252,7 @@ async fn setup_spawn_subscriptions(
 
                     info!(%sub_id, "Restored subscription");
 
-                    let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
+                    let (sub_tx, _) = tokio::sync::broadcast::channel(512);
 
                     tokio::spawn(process_sub_channel(
                         subs_manager.clone(),
