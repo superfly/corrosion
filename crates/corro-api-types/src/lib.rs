@@ -60,7 +60,18 @@ pub enum QueryEventMeta {
 
 /// RowId newtype to differentiate from ChangeId
 #[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, Readable, Writable, PartialEq, Eq, Ord, PartialOrd,
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    Readable,
+    Writable,
+    PartialEq,
+    Eq,
+    Ord,
+    PartialOrd,
+    Hash,
 )]
 #[serde(transparent)]
 pub struct RowId(pub u64);
