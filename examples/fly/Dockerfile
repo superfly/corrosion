@@ -1,5 +1,5 @@
 # build image
-FROM rust:latest as builder
+FROM rust:bookworm as builder
 
 RUN apt update && apt install -y build-essential gcc-x86-64-linux-gnu clang llvm
 
@@ -20,7 +20,7 @@ RUN set -eux; \
 WORKDIR /usr/src/app
 COPY . .
 # Will build and cache the binary and dependent crates in release mode
-RUN --mount=type=cache,target=/usr/local/cargo,from=rust:latest,source=/usr/local/cargo \
+RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/local/cargo \
     --mount=type=cache,target=target \
     cargo build --release && mv target/release/corrosion ./
 

@@ -26,17 +26,14 @@ Clone the Corrosion repository, and enter its root directory.
 $ git clone https://github.com/superfly/corrosion.git && cd corrosion
 ```
 
-Check out the latest release as a new branch.
-
-```bash
-$ git checkout tags/v0.1.0 -b v010
-```
-
 [Fly Launch](https://fly.io/docs/apps/launch/) uses a TOML file for [app configuration](https://fly.io/docs/reference/configuration/). Copy the example `fly.toml` to the working directory.
 
 ```bash
 $ cp examples/fly/fly.toml .
 ```
+
+Edit `fly.toml` changing the `app` value from `corrosion2` to a  unique app name.
+
 
 ## Launch a new app
 
@@ -174,7 +171,7 @@ SQLite3 and [not-perf](https://github.com/koute/not-perf) are installed for conv
 
 ```Docker
 # build image
-FROM rust:latest as builder
+FROM rust:bookworm as builder
 
 RUN apt update && apt install -y build-essential gcc-x86-64-linux-gnu clang llvm
 
@@ -195,7 +192,7 @@ RUN set -eux; \
 WORKDIR /usr/src/app
 COPY . .
 # Will build and cache the binary and dependent crates in release mode
-RUN --mount=type=cache,target=/usr/local/cargo,from=rust:latest,source=/usr/local/cargo \
+RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/local/cargo \
     --mount=type=cache,target=target \
     cargo build --release && mv target/release/corrosion ./
 
