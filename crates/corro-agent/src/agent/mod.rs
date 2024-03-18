@@ -30,7 +30,6 @@ pub use setup::{setup, AgentOptions};
 pub use util::process_multiple_changes;
 
 pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
-pub const COMPACT_BOOKED_INTERVAL: Duration = Duration::from_secs(300);
 pub const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(15); // 1 minute oughta be enough, we're constantly
                                                                 // getting broadcasts randomly + targetted
 pub const RANDOM_NODES_CHOICES: usize = 10;
