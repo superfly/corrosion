@@ -258,56 +258,71 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stress_test() -> eyre::Result<()> {
+    configurable_stress_test(30, 10, 200).await
+}
+
+/// Default parameters:
+///
+/// - num_nodes: 30
+/// - connectivity: 10
+/// - input_count: 200
+///
+/// 
+#[allow(unused)]
+pub async fn configurable_stress_test(
+    num_nodes: usize,
+    connectivity: usize,
+    input_count: usize,
+) -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
-    let agents =
-        futures::stream::iter((0..10).map(|n| "127.0.0.1:0".parse().map(move |addr| (n, addr))))
-            .try_chunks(50)
-            .try_fold(vec![], {
-                let tripwire = tripwire.clone();
-                move |mut agents: Vec<TestAgent>, to_launch| {
-                    let tripwire = tripwire.clone();
-                    async move {
-                        for (n, gossip_addr) in to_launch {
-                            println!("LAUNCHING AGENT #{n}");
-                            let mut rng = StdRng::from_entropy();
-                            let bootstrap = agents
-                                .iter()
-                                .map(|ta| ta.agent.gossip_addr())
-                                .choose_multiple(&mut rng, 10);
-                            agents.push(
-                                launch_test_agent(
-                                    |conf| {
-                                        conf.gossip_addr(gossip_addr)
-                                            .bootstrap(
-                                                bootstrap
-                                                    .iter()
-                                                    .map(SocketAddr::to_string)
-                                                    .collect::<Vec<String>>(),
-                                            )
-                                            .build()
-                                    },
-                                    tripwire.clone(),
-                                )
-                                .await
-                                .unwrap(),
-                            );
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        Ok(agents)
-                    }
+    let agents = futures::stream::iter(
+        (0..num_nodes).map(|n| "127.0.0.1:0".parse().map(move |addr| (n, addr))),
+    )
+    .try_chunks(50)
+    .try_fold(vec![], {
+        let tripwire = tripwire.clone();
+        move |mut agents: Vec<TestAgent>, to_launch| {
+            let tripwire = tripwire.clone();
+            async move {
+                for (n, gossip_addr) in to_launch {
+                    println!("LAUNCHING AGENT #{n}");
+                    let mut rng = StdRng::from_entropy();
+                    let bootstrap = agents
+                        .iter()
+                        .map(|ta| ta.agent.gossip_addr())
+                        .choose_multiple(&mut rng, connectivity);
+                    agents.push(
+                        launch_test_agent(
+                            |conf| {
+                                conf.gossip_addr(gossip_addr)
+                                    .bootstrap(
+                                        bootstrap
+                                            .iter()
+                                            .map(SocketAddr::to_string)
+                                            .collect::<Vec<String>>(),
+                                    )
+                                    .build()
+                            },
+                            tripwire.clone(),
+                        )
+                        .await
+                        .unwrap(),
+                    );
                 }
-            })
-            .await?;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(agents)
+            }
+        }
+    })
+    .await?;
 
     let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
 
     let addrs: Vec<SocketAddr> = agents.iter().map(|ta| ta.agent.api_addr()).collect();
 
-    let count = 200;
-
-    let iter = (0..count).flat_map(|n| {
+    let iter = (0..input_count).flat_map(|n| {
         serde_json::from_value::<Vec<Statement>>(json!([
             [
                 "INSERT INTO tests (id,text) VALUES (?,?)",
@@ -379,7 +394,7 @@ async fn stress_test() -> eyre::Result<()> {
         Ok::<_, eyre::Report>(())
     });
 
-    let changes_count = 4 * count;
+    let changes_count = 4 * input_count;
 
     println!("expecting {changes_count} ops");
 
@@ -430,7 +445,7 @@ async fn stress_test() -> eyre::Result<()> {
         }
         if v.len() == agents.len()
             && v.iter()
-                .all(|(n, needed)| *n == changes_count && *needed == 0)
+                .all(|(n, needed)| *n == changes_count as i64 && *needed == 0)
         {
             break;
         }

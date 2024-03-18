@@ -74,7 +74,8 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     }
 
     let (to_send_tx, to_send_rx) = bounded(pconf.to_send_channel_len, "to_send");
-    let (notifications_tx, notifications_rx) = bounded(pconf.notifications_channel_len, "notifications");
+    let (notifications_tx, notifications_rx) =
+        bounded(pconf.notifications_channel_len, "notifications");
 
     //// Start the main SWIM runtime loop
     runtime_loop(
@@ -203,10 +204,12 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         tripwire.clone(),
     ));
 
-    // tokio::spawn(util::clear_overwritten_versions(
-    //     agent.clone(),
-    //     bookie.clone(),
-    // ));
+    if agent.config().db.clear_overwritten {
+        tokio::spawn(util::clear_overwritten_versions(
+            agent.clone(),
+            bookie.clone(),
+        ));
+    }
 
     Ok(bookie)
 }
