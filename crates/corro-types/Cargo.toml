@@ -38,6 +38,7 @@ serde_json = { workspace = true }
 serde_with = { workspace = true }
 spawn = { path = "../spawn" }
 speedy = { workspace = true }
+sqlite-functions = { path = "../sqlite-functions" }
 sqlite-pool = { path = "../sqlite-pool" }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }

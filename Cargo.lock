@@ -982,6 +982,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "spawn",
+ "sqlite-functions",
  "sqlite-pool",
  "sqlite3-parser",
  "strum",
