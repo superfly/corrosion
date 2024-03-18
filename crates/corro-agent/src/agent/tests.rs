@@ -257,8 +257,19 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn chill_test() -> eyre::Result<()> {
+    configurable_stress_test(2, 1, 1).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stress_test() -> eyre::Result<()> {
     configurable_stress_test(30, 10, 200).await
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn stresser_test() -> eyre::Result<()> {
+    configurable_stress_test(45, 15, 1500).await
 }
 
 /// Default parameters:
@@ -267,7 +278,7 @@ async fn stress_test() -> eyre::Result<()> {
 /// - connectivity: 10
 /// - input_count: 200
 ///
-/// 
+///
 #[allow(unused)]
 pub async fn configurable_stress_test(
     num_nodes: usize,

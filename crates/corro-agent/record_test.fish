@@ -2,7 +2,7 @@
 
 sudo echo "Got root, thanks!"
 
-cargo run --example $argv[1] --release 2>/dev/null &
+cargo run --test $argv[1] --release 2>/dev/null -- --nocapture --ignored &
 
 echo "PID: $last_pid"
 set -g keep_tryin true
