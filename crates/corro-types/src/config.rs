@@ -1,7 +1,4 @@
-use std::{
-    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
-    time::Duration,
-};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};

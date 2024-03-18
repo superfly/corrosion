@@ -627,7 +627,11 @@ impl Matcher {
                 } = &mut select.body.select
                 {
                     *where_clause = if let Some(prev) = where_clause.take() {
-                        Some(Expr::Binary(Box::new(expr), Operator::And, Box::new(prev)))
+                        Some(Expr::Binary(
+                            Box::new(expr),
+                            Operator::And,
+                            Box::new(Expr::parenthesized(prev)),
+                        ))
                     } else {
                         Some(expr)
                     };
@@ -636,6 +640,7 @@ impl Matcher {
                         Some(FromClause {
                             joins: Some(joins), ..
                         }) if idx > 0 => {
+                            // Replace LEFT JOIN with INNER join if the target is the joined table
                             if let Some(JoinedSelectTable {
                                 operator:
                                     JoinOperator::TypedJoin {
@@ -647,6 +652,16 @@ impl Matcher {
                             }) = joins.get_mut(idx - 1)
                             {
                                 *join_type = Some(JoinType::Inner);
+                            };
+
+                            // Remove all custom INDEXED BY clauses for the table as the most efficient
+                            // way is to query it by the primary keys
+                            if let Some(JoinedSelectTable {
+                                table: SelectTable::Table(_, _, indexed @ Some(_)),
+                                ..
+                            }) = joins.get_mut(idx - 1)
+                            {
+                                *indexed = None
                             };
                         }
                         _ => (),
