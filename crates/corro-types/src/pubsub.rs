@@ -627,7 +627,11 @@ impl Matcher {
                 } = &mut select.body.select
                 {
                     *where_clause = if let Some(prev) = where_clause.take() {
-                        Some(Expr::Binary(Box::new(expr), Operator::And, Box::new(prev)))
+                        Some(Expr::Binary(
+                            Box::new(expr),
+                            Operator::And,
+                            Box::new(Expr::parenthesized(prev)),
+                        ))
                     } else {
                         Some(expr)
                     };
