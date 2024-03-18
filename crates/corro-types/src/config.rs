@@ -1,4 +1,7 @@
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::{
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    time::Duration,
+};
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
@@ -95,7 +98,7 @@ pub struct DbConfig {
     #[serde(default)]
     pub subscriptions_path: Option<Utf8PathBuf>,
     #[serde(default)]
-    pub clear_overwritten: bool,
+    pub clear_overwritten_secs: Option<u64>,
 }
 
 impl DbConfig {
@@ -369,7 +372,7 @@ impl ConfigBuilder {
                 path: db_path,
                 schema_paths: self.schema_paths,
                 subscriptions_path: None,
-                clear_overwritten: false,
+                clear_overwritten_secs: None,
             },
             api: ApiConfig {
                 bind_addr: self.api_addr.ok_or(ConfigBuilderError::ApiAddrRequired)?,

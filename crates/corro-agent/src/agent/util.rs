@@ -17,7 +17,7 @@ use std::{
 
 use crate::{
     agent::{
-        handlers, CountedExecutor, CHECK_EMPTIES_TO_INSERT_AFTER, COMPACT_BOOKED_INTERVAL,
+        handlers, CountedExecutor, CHECK_EMPTIES_TO_INSERT_AFTER,
         MAX_SYNC_BACKOFF, TO_CLEAR_COUNT,
     },
     api::public::{
@@ -131,11 +131,12 @@ pub async fn initialise_foca(agent: &Agent) {
 }
 
 /// Prune the database
-pub async fn clear_overwritten_versions(agent: Agent, bookie: Bookie) {
+pub async fn clear_overwritten_versions(agent: Agent, bookie: Bookie, sleep_in_secs: u64) {
     let pool = agent.pool();
-
+    let sleep_duration = Duration::from_secs(sleep_in_secs);
+    
     loop {
-        sleep(COMPACT_BOOKED_INTERVAL).await;
+        sleep(sleep_duration).await;
 
         info!("Starting compaction...");
         let start = Instant::now();
