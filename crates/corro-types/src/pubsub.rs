@@ -952,7 +952,7 @@ impl Matcher {
             return;
         }
 
-        if let Err(e) = block_in_place(|| self.setup(&state_conn)) {
+        if let Err(e) = block_in_place(|| self.setup(&mut state_conn)) {
             error!(sub_id = %self.id, "could not setup connection: {e}");
             return;
         }
@@ -985,7 +985,7 @@ impl Matcher {
         self.cmd_loop(state_conn, tripwire).await
     }
 
-    fn setup(&self, state_conn: &Connection) -> rusqlite::Result<()> {
+    fn setup(&self, state_conn: &mut Connection) -> Result<(), MatcherError> {
         info!(sub_id = %self.id, "Attaching __corro_sub to state db");
         if let Err(e) = state_conn.execute_batch(&format!(
             "ATTACH DATABASE {} AS __corro_sub",
@@ -995,10 +995,26 @@ impl Matcher {
             _ = self.evt_tx.try_send(QueryEvent::Error(format_compact!(
                 "could not ATTACH subscription db: {e}"
             )));
-            return Err(e);
+            return Err(e.into());
         }
 
         info!(sub_id = %self.id, "Attached __corro_sub to state db");
+
+        for (tbl_name, pks) in &self.pks {
+            if let Ok(plan) = dump_query_plan(
+                state_conn,
+                &self
+                    .cached_statements
+                    .get(tbl_name)
+                    .ok_or(MatcherError::StatementRequired)?
+                    .new_query,
+                tbl_name,
+                pks,
+            ) {
+                info!(sub_id = %self.id, "query plan for table '{tbl_name}':\n{plan}");
+            }
+        }
+
         Ok(())
     }
 
@@ -1304,7 +1320,7 @@ impl Matcher {
             }
         };
 
-        if let Err(e) = block_in_place(|| self.setup(&state_conn)) {
+        if let Err(e) = block_in_place(|| self.setup(&mut state_conn)) {
             error!(sub_id = %self.id, "could not setup connection: {e}");
             return;
         }
@@ -1641,6 +1657,32 @@ impl Matcher {
 
         self.handle_candidates(state_conn, candidates, end_db_version)
     }
+}
+
+fn dump_query_plan(
+    conn: &mut Connection,
+    query: &str,
+    table_name: &str,
+    pks: &[String],
+) -> Result<String, MatcherError> {
+    let tx = conn.transaction()?;
+
+    tx.prepare_cached(&format!(
+        "CREATE TABLE IF NOT EXISTS __corro_sub.temp_{table_name} ({})",
+        pks.join(",")
+    ))?
+    .execute(())?;
+
+    let mut prepped = tx.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?;
+    let mut rows = prepped.query(())?;
+
+    let mut output = String::new();
+    while let Some(row) = rows.next()? {
+        output.push_str(&row.get::<_, String>("detail")?);
+        output.push('\n');
+    }
+
+    Ok(output)
 }
 
 fn update_last_db_version(
