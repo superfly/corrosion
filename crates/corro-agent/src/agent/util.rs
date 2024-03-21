@@ -17,8 +17,7 @@ use std::{
 
 use crate::{
     agent::{
-        handlers, CountedExecutor, CHECK_EMPTIES_TO_INSERT_AFTER,
-        MAX_SYNC_BACKOFF, TO_CLEAR_COUNT,
+        handlers, CountedExecutor, CHECK_EMPTIES_TO_INSERT_AFTER, MAX_SYNC_BACKOFF, TO_CLEAR_COUNT,
     },
     api::public::{
         api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
@@ -134,7 +133,7 @@ pub async fn initialise_foca(agent: &Agent) {
 pub async fn clear_overwritten_versions(agent: Agent, bookie: Bookie, sleep_in_secs: u64) {
     let pool = agent.pool();
     let sleep_duration = Duration::from_secs(sleep_in_secs);
-    
+
     loop {
         sleep(sleep_duration).await;
 

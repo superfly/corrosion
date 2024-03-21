@@ -252,7 +252,7 @@ async fn setup_spawn_subscriptions(
 
                     info!(%sub_id, "Restored subscription");
 
-                    let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
+                    let (sub_tx, _) = tokio::sync::broadcast::channel(512);
 
                     tokio::spawn(process_sub_channel(
                         subs_manager.clone(),
@@ -269,7 +269,7 @@ async fn setup_spawn_subscriptions(
 
     for id in to_cleanup {
         info!(sub_id = %id, "Cleaning up unclean subscription");
-        Matcher::cleanup(id, Matcher::sub_path(subs_path.as_path(), id))?;
+        Matcher::cleanup_on_disk(id, subs_manager.subs_id_path(id)).await?;
     }
 
     Ok(Arc::new(TokioRwLock::new(subs_bcast_cache)))
