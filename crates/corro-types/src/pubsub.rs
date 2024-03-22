@@ -195,10 +195,10 @@ impl SubsManager {
             trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
             if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
-                error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
+                error!(sub_id = %id, sql_hash = %handle.inner.hash, "could not send change candidates to subscription handler: {e}");
                 match e {
                     mpsc::error::TrySendError::Full(item) => {
-                        warn!("channel is full, falling back to async send");
+                        warn!(sub_id = %id, sql_hash = %handle.inner.hash, "channel is full, falling back to async send");
                         let changes_tx = handle.inner.changes_tx.clone();
                         tokio::spawn(async move {
                             _ = changes_tx.send(item).await;
@@ -374,7 +374,7 @@ impl MatcherHandle {
                     .collect::<rusqlite::Result<Vec<_>>>()?,
                 change_id,
             )) {
-                error!("could not send change to channel: {e}");
+                error!(sub_id = %self.inner.id, sql_hash = %self.inner.hash, "could not send change to channel: {e}");
                 break;
             }
         }
@@ -522,8 +522,9 @@ impl Matcher {
         sql: &str,
     ) -> Result<(Matcher, MatcherHandle), MatcherError> {
         let sub_path = Self::sub_path(subs_path.as_path(), id);
+        let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
 
-        info!("Initializing subscription at {sub_path}");
+        info!(%sql_hash, "Initializing subscription at {sub_path}");
 
         std::fs::create_dir_all(&sub_path)?;
 
@@ -693,7 +694,7 @@ impl Matcher {
                     .join(","),
             );
 
-            info!(sub_id = %id, "modified query for table '{tbl_name}': {new_query}");
+            info!(sub_id = %id, %sql_hash, "modified query for table '{tbl_name}': {new_query}");
 
             statements.insert(
                 tbl_name.clone(),
@@ -710,7 +711,6 @@ impl Matcher {
 
         let (last_change_tx, last_change_rx) = watch::channel(ChangeId(0));
 
-        let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
         // big channel to not miss anything
         let (changes_tx, changes_rx) =
             crate::channel::bounded(20480, "sub_changes", sql_hash.clone());
@@ -934,7 +934,7 @@ impl Matcher {
     }
 
     async fn run_restore(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
-        info!(sub_id = %self.id, "Restoring subscription");
+        info!(sub_id = %self.id, sql_hash = %self.hash, "Restoring subscription");
         let init_res = block_in_place(|| {
             self.last_rowid = self
                 .conn
@@ -957,12 +957,12 @@ impl Matcher {
         });
 
         if let Err(e) = init_res {
-            error!(sub_id = %self.id, "could not re-initialize subscription: {e}");
+            error!(sub_id = %self.id, sql_hash = %self.hash, "could not re-initialize subscription: {e}");
             return;
         }
 
         if let Err(e) = block_in_place(|| self.setup(&state_conn)) {
-            error!(sub_id = %self.id, "could not setup connection: {e}");
+            error!(sub_id = %self.id, sql_hash = %self.hash, "could not setup connection: {e}");
             return;
         }
 
@@ -984,7 +984,7 @@ impl Matcher {
         });
 
         if let Err(e) = catch_up_res {
-            error!(sub_id = %self.id, "could not catch up: {e}");
+            error!(sub_id = %self.id, sql_hash = %self.hash, "could not catch up: {e}");
             _ = self
                 .evt_tx
                 .try_send(QueryEvent::Error(e.to_compact_string()));
@@ -1000,7 +1000,7 @@ impl Matcher {
             "ATTACH DATABASE {} AS __corro_sub",
             enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
         )) {
-            error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
+            error!(sub_id = %self.id, sql_hash = %self.hash, "could not ATTACH sub db as __corro_sub on state db: {e}");
             _ = self.evt_tx.try_send(QueryEvent::Error(format_compact!(
                 "could not ATTACH subscription db: {e}"
             )));
@@ -1012,13 +1012,13 @@ impl Matcher {
     }
 
     async fn cmd_loop(mut self, mut state_conn: CrConn, mut tripwire: Tripwire) {
-        info!(sub_id = %self.id, "Starting loop to run the subscription");
+        info!(sub_id = %self.id, sql_hash = %self.hash, "Starting loop to run the subscription");
         {
             let (lock, cvar) = &*self.state;
             let mut state = lock.lock();
             *state = MatcherState::Running;
             cvar.notify_all();
-            info!(sub_id = %self.id, "Notified condvar that the subscription is 'running'");
+            info!(sub_id = %self.id, sql_hash = %self.hash, "Notified condvar that the subscription is 'running'");
         }
         trace!("set state!");
 
@@ -1044,7 +1044,7 @@ impl Matcher {
             let branch = tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => {
-                    info!(sub_id = %self.id, "Acknowledged subscription cancellation, breaking loop.");
+                    info!(sub_id = %self.id, sql_hash = %self.hash, "Acknowledged subscription cancellation, breaking loop.");
                     break;
                 }
                 Some((candidates, db_version)) = self.changes_rx.recv() => {
@@ -1092,7 +1092,7 @@ impl Matcher {
                         self.handle_candidates(&mut state_conn, candidates, db_version)
                     }) {
                         if !matches!(e, MatcherError::EventReceiverClosed) {
-                            error!(sub_id = %self.id, "could not handle change: {e}");
+                            error!(sub_id = %self.id, sql_hash = %self.hash, "could not handle change: {e}");
                         }
                         break;
                     }
@@ -1113,10 +1113,10 @@ impl Matcher {
 
                     match res {
                         Ok(deleted) => {
-                            info!(sub_id = %self.id, "Deleted {deleted} old changes row")
+                            info!(sub_id = %self.id, sql_hash = %self.hash, "Deleted {deleted} old changes row")
                         }
                         Err(e) => {
-                            error!(sub_id = %self.id, "could not delete old changes: {e}");
+                            error!(sub_id = %self.id, sql_hash = %self.hash, "could not delete old changes: {e}");
                         }
                     }
                 }
@@ -1126,7 +1126,7 @@ impl Matcher {
         debug!(id = %self.id, "matcher loop is done");
 
         if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
-            error!("could not handle cleanup: {e}");
+            error!(sql_hash = %self.hash, "could not handle cleanup: {e}");
         }
     }
 
@@ -1137,7 +1137,7 @@ impl Matcher {
             .send(QueryEvent::Columns(self.col_names.clone()))
             .await
         {
-            error!(sub_id = %self.id, "could not send back columns, probably means no receivers! {e}");
+            error!(sub_id = %self.id, sql_hash = %self.hash, "could not send back columns, probably means no receivers! {e}");
             return;
         }
 
@@ -1235,7 +1235,7 @@ impl Matcher {
                                     .evt_tx
                                     .blocking_send(QueryEvent::Row(RowId(rowid), cells))
                                 {
-                                    error!(sub_id = %self.id, "could not send back row: {e}");
+                                    error!(sub_id = %self.id, sql_hash = %self.hash, "could not send back row: {e}");
                                     return Err(MatcherError::EventReceiverClosed);
                                 }
 
@@ -1299,13 +1299,13 @@ impl Matcher {
                     })
                     .await
                 {
-                    error!(sub_id = %self.id, "could not return end of query event: {e}");
+                    error!(sub_id = %self.id, sql_hash = %self.hash, "could not return end of query event: {e}");
                     return;
                 }
                 db_version
             }
             Err(e) => {
-                warn!(sub_id = %self.id, "could not complete initial query: {e}");
+                warn!(sub_id = %self.id, sql_hash = %self.hash, "could not complete initial query: {e}");
                 _ = self
                     .evt_tx
                     .send(QueryEvent::Error(e.to_compact_string()))
@@ -1316,7 +1316,7 @@ impl Matcher {
         };
 
         if let Err(e) = block_in_place(|| self.setup(&state_conn)) {
-            error!(sub_id = %self.id, "could not setup connection: {e}");
+            error!(sub_id = %self.id, sql_hash = %self.hash, "could not setup connection: {e}");
             return;
         }
 
@@ -1326,7 +1326,7 @@ impl Matcher {
                 if let Err(e) = block_in_place(|| {
                     self.handle_change(&mut state_conn, db_version + 1, first_db_version - 1)
                 }) {
-                    error!(sub_id = %self.id, "could not catch up from last db version {db_version} to first buffered db version {first_db_version}: {e}");
+                    error!(sub_id = %self.id, sql_hash = %self.hash, "could not catch up from last db version {db_version} to first buffered db version {first_db_version}: {e}");
                     _ = self
                         .evt_tx
                         .try_send(QueryEvent::Error(e.to_compact_string()));
@@ -1334,11 +1334,11 @@ impl Matcher {
                 }
             }
             if let Some(last_db_version) = last_db_version {
-                info!(sub_id = %self.id, "handling buffered candidates while performing initial query");
+                info!(sub_id = %self.id, sql_hash = %self.hash, "handling buffered candidates while performing initial query");
                 if let Err(e) = block_in_place(|| {
                     self.handle_candidates(&mut state_conn, candidates, last_db_version)
                 }) {
-                    error!(sub_id = %self.id, "could not catch up from buffered candidates: {e}");
+                    error!(sub_id = %self.id, sql_hash = %self.hash, "could not catch up from buffered candidates: {e}");
                     _ = self
                         .evt_tx
                         .try_send(QueryEvent::Error(e.to_compact_string()));
@@ -1583,13 +1583,13 @@ impl Matcher {
                                     cells,
                                     change_id,
                                 )) {
-                                    debug!("could not send back row to matcher sub sender: {e}");
+                                    debug!(sql_hash = %self.hash, "could not send back row to matcher sub sender: {e}");
                                     return Err(MatcherError::EventReceiverClosed);
                                 }
                                 _ = self.last_change_tx.send(change_id);
                             }
                             Err(e) => {
-                                error!("could not deserialize row's cells: {e}");
+                                error!(sql_hash = %self.hash, "could not deserialize row's cells: {e}");
                                 return Ok(());
                             }
                         }
