@@ -1017,10 +1017,12 @@ impl Matcher {
         let mut buf = MatchCandidates::new();
         let mut buf_count = 0;
 
+        const MAX_BATCHED_CHANGES: usize = 100;
+
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
 
         // max duration of aggregating candidates
-        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(600));
+        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(200));
 
         loop {
             enum Branch {
@@ -1047,7 +1049,7 @@ impl Matcher {
                     }
                     last_db_version = Some(db_version);
 
-                    if buf_count >= 500 {
+                    if buf_count >= MAX_BATCHED_CHANGES {
                         if let Some(db_version) = last_db_version.take() {
                             Branch::NewCandidates((std::mem::take(&mut buf), db_version))
                         } else {
