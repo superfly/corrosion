@@ -212,7 +212,7 @@ struct BinHandle {
     path: String,
 }
 
-fn nix_output(vec: &Vec<u8>) -> Vec<HashMap<String, serde_json::Value>> {
+fn nix_output(vec: &[u8]) -> Vec<HashMap<String, serde_json::Value>> {
     serde_json::from_slice(vec).unwrap()
 }
 
@@ -253,6 +253,6 @@ fn build_corrosion() -> Option<BinHandle> {
             .get("outputs")?
             .get("out")?
             .to_string()
-            .replace("\"", ""),
+            .replace('\"', ""),
     })
 }

@@ -50,22 +50,27 @@ impl<T: Debug> Debug for CorroReceiver<T> {
 }
 
 /// Create a bounded channel which tracks capacity with a label
-pub fn bounded<T: Send + 'static>(
+pub fn bounded<T: Send + 'static, ID: Into<Option<String>>>(
     capacity: usize,
-    label: &'static str,
+    name: &'static str,
+    id: ID,
 ) -> (CorroSender<T>, CorroReceiver<T>) {
-    gauge!("corro.runtime.channel.max_capacity", "channel_name" => label).set(capacity as f64);
+    let id: String = id.into().unwrap_or_default();
+
+    gauge!("corro.runtime.channel.max_capacity", "channel_name" => name, "channel_id" => id.clone())
+        .set(capacity as f64);
 
     // Count the number of sends and receives going through the channel
-    let send_count = counter!("corro.runtime.channel.send_count", "channel_name" => label);
-    let recv_count = counter!("corro.runtime.channel.recv_count", "channel_name" => label);
+    let send_count = counter!("corro.runtime.channel.send_count", "channel_name" => name, "channel_id" => id.clone());
+    let recv_count = counter!("corro.runtime.channel.recv_count", "channel_name" => name, "channel_id" => id.clone());
 
     // How many times did we fail to send
-    let failed_sends = counter!("corro.runtime.channel.failed_send_count", "channel_name" => label);
+    let failed_sends = counter!("corro.runtime.channel.failed_send_count", "channel_name" => name, "channel_id" => id.clone());
 
     // Track current capacity and send time over time
-    let capacity_gauge = gauge!("corro.runtime.channel.capacity", "channel_name" => label);
-    let send_time = histogram!("corro.runtime.channel.send_delay", "channel_name" => label);
+    let capacity_gauge = gauge!("corro.runtime.channel.capacity", "channel_name" => name, "channel_id" => id.clone());
+    let send_time =
+        histogram!("corro.runtime.channel.send_delay", "channel_name" => name, "channel_id" => id);
 
     let (tx, rx) = channel(capacity);
 

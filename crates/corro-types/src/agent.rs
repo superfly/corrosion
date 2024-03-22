@@ -505,9 +505,9 @@ impl SplitPool {
     }
 
     fn new(path: PathBuf, write_sema: Arc<Semaphore>, read: SqlitePool, write: SqlitePool) -> Self {
-        let (priority_tx, mut priority_rx) = bounded(256, "priority");
-        let (normal_tx, mut normal_rx) = bounded(512, "normal");
-        let (low_tx, mut low_rx) = bounded(1024, "low");
+        let (priority_tx, mut priority_rx) = bounded(256, "priority", None);
+        let (normal_tx, mut normal_rx) = bounded(512, "normal", None);
+        let (low_tx, mut low_rx) = bounded(1024, "low", None);
 
         tokio::spawn(async move {
             loop {

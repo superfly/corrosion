@@ -73,9 +73,9 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         );
     }
 
-    let (to_send_tx, to_send_rx) = bounded(pconf.to_send_channel_len, "to_send");
+    let (to_send_tx, to_send_rx) = bounded(pconf.to_send_channel_len, "to_send", None);
     let (notifications_tx, notifications_rx) =
-        bounded(pconf.notifications_channel_len, "notifications");
+        bounded(pconf.notifications_channel_len, "notifications", None);
 
     //// Start the main SWIM runtime loop
     runtime_loop(

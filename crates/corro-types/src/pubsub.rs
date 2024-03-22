@@ -43,6 +43,7 @@ use crate::{
     agent::SplitPool,
     api::QueryEvent,
     base::CrsqlDbVersion,
+    channel::{CorroReceiver, CorroSender},
     schema::{Schema, Table},
     sqlite::CrConn,
 };
@@ -275,7 +276,7 @@ struct InnerMatcherHandle {
     parsed: ParsedSelect,
     col_names: Vec<ColumnName>,
     cancel: CancellationToken,
-    changes_tx: mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>,
+    changes_tx: CorroSender<(MatchCandidates, CrsqlDbVersion)>,
     last_change_rx: watch::Receiver<ChangeId>,
 }
 
@@ -490,7 +491,7 @@ pub struct Matcher {
     cancel: CancellationToken,
     state: StateLock,
     last_change_tx: watch::Sender<ChangeId>,
-    changes_rx: mpsc::Receiver<(MatchCandidates, CrsqlDbVersion)>,
+    changes_rx: CorroReceiver<(MatchCandidates, CrsqlDbVersion)>,
 }
 
 #[derive(Debug, Clone)]
@@ -704,10 +705,10 @@ impl Matcher {
 
         let (last_change_tx, last_change_rx) = watch::channel(ChangeId(0));
 
-        // big channel to not miss anything
-        let (changes_tx, changes_rx) = mpsc::channel(20480);
-
         let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
+        // big channel to not miss anything
+        let (changes_tx, changes_rx) =
+            crate::channel::bounded(20480, "sub_changes", sql_hash.clone());
 
         let handle = MatcherHandle {
             inner: Arc::new(InnerMatcherHandle {
@@ -1017,7 +1018,7 @@ impl Matcher {
         let mut buf = MatchCandidates::new();
         let mut buf_count = 0;
 
-        const MAX_BATCHED_CHANGES: usize = 50;
+        const MAX_BATCHED_CHANGES: usize = 100;
 
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
 
