@@ -1023,7 +1023,7 @@ impl Matcher {
         let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
 
         // max duration of aggregating candidates
-        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(100));
+        let mut process_changes_interval = tokio::time::interval(Duration::from_millis(200));
 
         loop {
             enum Branch {
