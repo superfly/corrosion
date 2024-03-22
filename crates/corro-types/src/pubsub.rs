@@ -14,7 +14,7 @@ use corro_api_types::{
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
-use metrics::counter;
+use metrics::{counter, histogram, Histogram};
 use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::{
     params_from_iter,
@@ -476,6 +476,10 @@ impl MatcherHandle {
 
 type StateLock = Arc<(Mutex<MatcherState>, Condvar)>;
 
+struct MatcherMetrics {
+    handle_candidates_time: Histogram,
+}
+
 pub struct Matcher {
     pub id: Uuid,
     pub hash: String,
@@ -492,6 +496,7 @@ pub struct Matcher {
     state: StateLock,
     last_change_tx: watch::Sender<ChangeId>,
     changes_rx: CorroReceiver<(MatchCandidates, CrsqlDbVersion)>,
+    metrics: MatcherMetrics,
 }
 
 #[derive(Debug, Clone)]
@@ -731,7 +736,7 @@ impl Matcher {
 
         let matcher = Self {
             id,
-            hash: sql_hash,
+            hash: sql_hash.clone(),
             query: stmt,
             cached_statements: statements,
             pks,
@@ -745,6 +750,9 @@ impl Matcher {
             state,
             last_change_tx,
             changes_rx,
+            metrics: MatcherMetrics {
+                handle_candidates_time: histogram!("corro.subs.handle.candidates.seconds", "sql_hash" => sql_hash),
+            },
         };
 
         Ok((matcher, handle))
@@ -1348,6 +1356,7 @@ impl Matcher {
         candidates: MatchCandidates,
         last_db_version: CrsqlDbVersion,
     ) -> Result<(), MatcherError> {
+        let start = Instant::now();
         let mut tables = IndexSet::new();
 
         if candidates.is_empty() {
@@ -1604,6 +1613,8 @@ impl Matcher {
         trace!("inserted new db version: {last_db_version}");
 
         tx.commit()?;
+
+        self.metrics.handle_candidates_time.record(start.elapsed());
 
         trace!("committed!");
 
