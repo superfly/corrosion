@@ -135,6 +135,9 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     }
     {
         let conn = agent.pool().read().await?;
+
+        let start = Instant::now();
+
         let actor_ids: Vec<ActorId> = conn
             .prepare("SELECT DISTINCT actor_id FROM __corro_bookkeeping")?
             .query_map([], |row| row.get(0))
@@ -178,6 +181,8 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                 .await
                 .replace_actor(actor_id, bv);
         }
+
+        info!("Loaded state in {:?}", start.elapsed());
     }
 
     spawn_counted(
