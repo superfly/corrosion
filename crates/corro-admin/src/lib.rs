@@ -92,6 +92,7 @@ pub enum Command {
     Locks { top: usize },
     Cluster(ClusterCommand),
     Actor(ActorCommand),
+    CompactEmpties,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +199,12 @@ async fn handle_conn(
                         Err(e) => send_error(&mut stream, e).await,
                     }
                     send_success(&mut stream).await;
+                }
+                Command::CompactEmpties => {
+                    info_log(&mut stream, "compacting empty versions...").await;
+                    let pool = agent.pool();
+                    
+                    // clear_overwritten_versions(&agent, agent.booked(), pool).await;
                 }
                 Command::Locks { top } => {
                     info_log(&mut stream, "gathering top locks").await;
