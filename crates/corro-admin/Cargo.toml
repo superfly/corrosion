@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 camino = { workspace = true }
 corro-types = { path = "../corro-types" }
+corro-agent = { path = "../corro-agent" }
 futures = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
