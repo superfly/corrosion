@@ -1,9 +1,15 @@
 use std::{iter::Peekable, ops::RangeInclusive};
 
 pub use corro_api_types::{row_to_change, Change, SqliteValue};
-use tracing::trace;
+use corro_base_types::{CrsqlDbVersion, Version};
+use rusqlite::{named_params, Connection};
+use tracing::{debug, trace};
 
-use crate::base::CrsqlSeq;
+use crate::{
+    agent::{Agent, BookedVersions, ChangeError, VersionsSnapshot},
+    base::CrsqlSeq,
+    broadcast::Timestamp,
+};
 
 pub struct ChunkedChanges<I: Iterator> {
     iter: Peekable<I>,
@@ -114,6 +120,118 @@ where
 }
 
 pub const MAX_CHANGES_BYTE_SIZE: usize = 8 * 1024;
+
+pub struct InsertChangesInfo {
+    pub version: Version,
+    pub db_version: CrsqlDbVersion,
+    pub last_seq: CrsqlSeq,
+    pub ts: Timestamp,
+    pub snap: VersionsSnapshot,
+}
+
+pub fn insert_local_changes(
+    agent: &Agent,
+    tx: &Connection,
+    book_writer: &mut tokio::sync::RwLockWriteGuard<'_, BookedVersions>,
+) -> Result<Option<InsertChangesInfo>, ChangeError> {
+    let actor_id = agent.actor_id();
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+
+    let db_version: CrsqlDbVersion = tx
+        .prepare_cached("SELECT crsql_next_db_version()")
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
+        })?
+        .query_row((), |row| row.get(0))
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
+        })?;
+
+    let has_changes: bool = tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE db_version = ?);")
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
+        })?
+        .query_row([db_version], |row| row.get(0))
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
+        })?;
+
+    if !has_changes {
+        return Ok(None);
+    }
+
+    let last_version = book_writer.last().unwrap_or_default();
+    trace!("last_version: {last_version}");
+    let version = last_version + 1;
+    trace!("version: {version}");
+
+    let last_seq: CrsqlSeq = tx
+        .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(version),
+        })?
+        .query_row([db_version], |row| row.get(0))
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(version),
+        })?;
+
+    let versions = version..=version;
+
+    tx.prepare_cached(
+        r#"
+                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
+                    VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
+            "#,
+    )
+    .map_err(|source| ChangeError::Rusqlite {
+        source,
+        actor_id: Some(actor_id),
+        version: Some(version),
+    })?
+    .execute(named_params! {
+        ":actor_id": actor_id,
+        ":start_version": version,
+        ":db_version": db_version,
+        ":last_seq": last_seq,
+        ":ts": ts
+    })
+    .map_err(|source| ChangeError::Rusqlite {
+        source,
+        actor_id: Some(actor_id),
+        version: Some(version),
+    })?;
+
+    debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
+
+    let mut snap = book_writer.snapshot();
+    snap.insert_db(tx, [versions].into())
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(version),
+        })?;
+
+    Ok(Some(InsertChangesInfo {
+        version,
+        db_version,
+        last_seq,
+        ts,
+        snap,
+    }))
+}
 
 #[cfg(test)]
 mod tests {
