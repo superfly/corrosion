@@ -27,7 +27,7 @@ use uuid::Uuid;
 pub use error::{SyncClientError, SyncRecvError};
 pub use run_root::start_with_config;
 pub use setup::{setup, AgentOptions};
-pub use util::process_multiple_changes;
+pub use util::{process_multiple_changes, clear_overwritten_versions};
 
 pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
 pub const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(15); // 1 minute oughta be enough, we're constantly
