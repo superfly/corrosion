@@ -203,14 +203,32 @@ async fn handle_conn(
                 }
                 Command::CompactEmpties => {
                     info_log(&mut stream, "compacting empty versions...").await;
-                    let pool = agent.pool();
 
-                    match clear_overwritten_versions(&agent, &bookie, pool).await {
-                        Some(()) => send_success(&mut stream).await,
-                        None => {
+                    let (tx, mut rx) = mpsc::channel(4);
+                    let (done_tx, done_rx) = oneshot::channel::<Option<()>>();
+
+                    let bookie = bookie.clone();
+                    let agent = agent.clone();
+                    tokio::task::spawn(async move {
+                        let pool = agent.pool();
+                        match clear_overwritten_versions(&agent, &bookie, pool, Some(tx)).await {
+                            Some(()) => done_tx.send(Some(())),
+                            None => done_tx.send(None),
+                        }
+                    });
+
+                    while let Some(msg) = rx.recv().await {
+                        info_log(&mut stream, msg).await;
+                    }
+
+                    // when this loop exists it means our writer has
+                    // gone away/ the task completed
+                    match done_rx.await {
+                        Ok(Some(())) => send_success(&mut stream).await,
+                        _ => {
                             send_error(
                                 &mut stream,
-                                "failed to compact empties (check the node logs for details)",
+                                "Failed to compact empties (check node logs for details)",
                             )
                             .await
                         }

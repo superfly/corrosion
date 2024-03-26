@@ -56,6 +56,7 @@ use rusqlite::{
 use spawn::spawn_counted;
 use tokio::{
     net::TcpListener,
+    sync::mpsc::Sender,
     task::block_in_place,
     time::{sleep, timeout},
 };
@@ -139,7 +140,7 @@ pub async fn clear_overwritten_versions_loop(agent: Agent, bookie: Bookie, sleep
         sleep(sleep_duration).await;
         info!("Starting compaction...");
 
-        if clear_overwritten_versions(&agent, &bookie, pool)
+        if clear_overwritten_versions(&agent, &bookie, pool, None)
             .await
             .is_none()
         {
@@ -153,6 +154,7 @@ pub async fn clear_overwritten_versions(
     agent: &Agent,
     bookie: &Bookie,
     pool: &SplitPool,
+    feedback: Option<Sender<String>>,
 ) -> Option<()> {
     let start = Instant::now();
 
@@ -169,6 +171,14 @@ pub async fn clear_overwritten_versions(
     let mut deleted = 0;
 
     let mut db_elapsed = Duration::new(0, 0);
+
+    if let Some(ref tx) = feedback {
+        tx.send(format!(
+            "Compacting changes for {} actors",
+            bookie_clone.len()
+        ))
+        .await;
+    }
 
     for (actor_id, booked) in bookie_clone {
         // pull the current db version -> version map at the present time
@@ -266,6 +276,16 @@ pub async fn clear_overwritten_versions(
                     }
                 }
             }
+        }
+
+        if let Some(ref tx) = feedback {
+            if tx
+                .send(format!("Finshed compacting changes from actor {actor_id}"))
+                .await
+                .is_err()
+            {
+                error!("failed to send feedback payload to caller");
+            };
         }
 
         tokio::time::sleep(Duration::from_secs(1)).await;
