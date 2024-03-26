@@ -206,6 +206,11 @@ pub async fn clear_overwritten_versions(
             return None;
         }
 
+        if let Some(ref tx) = feedback {
+            tx.send(format!("Starting change compaction for {actor_id}"))
+                .await;
+        }
+
         // we're using a read connection here, starting a read-only transaction
         // this should be representative of the state of current versions from the actor
         let cleared_versions = match pool.read().await {
@@ -280,7 +285,7 @@ pub async fn clear_overwritten_versions(
 
         if let Some(ref tx) = feedback {
             if tx
-                .send(format!("Finshed compacting changes from actor {actor_id}"))
+                .send(format!("Finshed compacting changes for {actor_id}"))
                 .await
                 .is_err()
             {
