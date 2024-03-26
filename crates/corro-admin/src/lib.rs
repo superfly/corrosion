@@ -1,6 +1,7 @@
 use std::{fmt::Display, time::Duration};
 
 use camino::Utf8PathBuf;
+use corro_agent::agent::clear_overwritten_versions;
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, Bookie, KnownVersion, LockKind, LockMeta, LockState},
@@ -203,8 +204,17 @@ async fn handle_conn(
                 Command::CompactEmpties => {
                     info_log(&mut stream, "compacting empty versions...").await;
                     let pool = agent.pool();
-                    
-                    // clear_overwritten_versions(&agent, agent.booked(), pool).await;
+
+                    match clear_overwritten_versions(&agent, &bookie, pool).await {
+                        Some(()) => send_success(&mut stream).await,
+                        None => {
+                            send_error(
+                                &mut stream,
+                                "failed to compact empties (check the node logs for details)",
+                            )
+                            .await
+                        }
+                    }
                 }
                 Command::Locks { top } => {
                     info_log(&mut stream, "gathering top locks").await;

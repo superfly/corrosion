@@ -716,6 +716,7 @@ name = "corro-admin"
 version = "0.1.0"
 dependencies = [
  "camino",
+ "corro-agent",
  "corro-types",
  "futures",
  "rusqlite",
