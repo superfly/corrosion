@@ -177,10 +177,21 @@ pub async fn clear_overwritten_versions(
             "Compacting changes for {} actors",
             bookie_clone.len()
         ))
-        .await;
+        .await
+        .unwrap();
     }
 
     for (actor_id, booked) in bookie_clone {
+        if let Some(ref tx) = feedback {
+            if tx
+                .send(format!("Starting change compaction for {actor_id}"))
+                .await
+                .is_err()
+            {
+                error!("failed to send feedback payload to caller");
+            };
+        }
+
         // pull the current db version -> version map at the present time
         // these are only updated _after_ a transaction has been committed, via a write lock
         // so it should be representative of the current state.
@@ -197,18 +208,30 @@ pub async fn clear_overwritten_versions(
                 Ok(booked) => booked.current_versions(),
                 Err(_) => {
                     info!(%actor_id, "timed out acquiring read lock on bookkeeping, skipping for now");
+
+                    if let Some(ref tx) = feedback {
+                        if tx
+                            .send("timed out acquiring read lock on bookkeeping".into())
+                            .await
+                            .is_err()
+                        {
+                            error!("failed to send feedback payload to caller");
+                        };
+                    }
+
                     return None;
                 }
             }
         };
 
         if versions.is_empty() {
-            return None;
-        }
+            if let Some(ref tx) = feedback {
+                if tx.send("No versions to compact".into()).await.is_err() {
+                    error!("failed to send feedback payload to caller");
+                };
+            }
 
-        if let Some(ref tx) = feedback {
-            tx.send(format!("Starting change compaction for {actor_id}"))
-                .await;
+            return None;
         }
 
         // we're using a read connection here, starting a read-only transaction
@@ -229,16 +252,47 @@ pub async fn clear_overwritten_versions(
                             cleared.len(),
                             start.elapsed()
                         );
+
+                        if let Some(ref tx) = feedback {
+                            if tx
+                                .send(format!("Aggregated {} DB versions to clear", cleared.len()))
+                                .await
+                                .is_err()
+                            {
+                                error!("failed to send feedback payload to caller");
+                            };
+                        }
+
                         cleared
                     }
                     Err(e) => {
                         error!("could not get cleared versions: {e}");
+
+                        if let Some(ref tx) = feedback {
+                            if tx
+                                .send(format!("failed to get cleared versions: {e}"))
+                                .await
+                                .is_err()
+                            {
+                                error!("failed to send feedback payload to caller");
+                            };
+                        }
+
                         return None;
                     }
                 }
             }
             Err(e) => {
                 error!("could not get read connection: {e}");
+                if let Some(ref tx) = feedback {
+                    if tx
+                        .send(format!("failed to get read connection: {e}"))
+                        .await
+                        .is_err()
+                    {
+                        error!("failed to send feedback payload to caller");
+                    };
+                }
                 return None;
             }
         };
@@ -276,6 +330,15 @@ pub async fn clear_overwritten_versions(
                     // schedule for clearing in the background task
                     if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
                         error!("could not schedule version to be cleared: {e}");
+                        if let Some(ref tx) = feedback {
+                            if tx
+                                .send(format!("failed to schedule version to be cleared: {e}"))
+                                .await
+                                .is_err()
+                            {
+                                error!("failed to send feedback payload to caller");
+                            };
+                        }
                     } else {
                         inserted += 1;
                     }
