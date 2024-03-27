@@ -624,7 +624,6 @@ enum Command {
     Tls(TlsCommand),
 
     /// Clear overwritten versions
-    #[command(subcommand)]
     CompactEmpties,
 }
 
