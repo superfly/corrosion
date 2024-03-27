@@ -6,6 +6,7 @@ use std::{
     fmt,
     future::poll_fn,
     net::SocketAddr,
+    ops::Deref,
     str::{FromStr, Utf8Error},
     sync::Arc,
 };
@@ -14,17 +15,14 @@ use bytes::Buf;
 use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
-    agent::{Agent, CurrentVersion, KnownDbVersion},
-    base::{CrsqlDbVersion, CrsqlSeq},
-    broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset, Timestamp},
-    change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
+    agent::{Agent, ChangeError, CurrentVersion, KnownDbVersion},
+    broadcast::broadcast_changes,
+    change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
-use itertools::Itertools;
-use metrics::counter;
 use pgwire::{
     api::{
         results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
@@ -46,8 +44,7 @@ use pgwire::{
 };
 use postgres_types::{FromSql, Type};
 use rusqlite::{
-    functions::FunctionFlags, named_params, types::ValueRef, vtab::eponymous_only_module,
-    Connection, Statement,
+    functions::FunctionFlags, types::ValueRef, vtab::eponymous_only_module, Connection, Statement,
 };
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
@@ -338,42 +335,41 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
 }
 
 #[derive(Debug, Default)]
-enum TxState {
-    Started {
-        kind: OpenTxKind,
-        write_permit: Option<OwnedSemaphorePermit>,
+enum TxState<'conn> {
+    Implicit {
+        tx: TxGuard<'conn>,
+    },
+    Explicit {
+        tx: TxGuard<'conn>,
+        failed: bool,
     },
     #[default]
     Ended,
 }
 
-impl TxState {
-    fn implicit() -> Self {
-        Self::Started {
-            kind: OpenTxKind::Implicit,
-            write_permit: None,
-        }
+impl<'conn> TxState<'conn> {
+    fn implicit(conn: &'conn Connection) -> rusqlite::Result<Self> {
+        Ok(Self::Implicit {
+            tx: TxGuard::start(conn)?,
+        })
     }
-    fn explicit() -> Self {
-        Self::Started {
-            kind: OpenTxKind::Explicit,
-            write_permit: None,
-        }
+    fn explicit(conn: &'conn Connection) -> rusqlite::Result<Self> {
+        Ok(Self::Explicit {
+            tx: TxGuard::start(conn)?,
+            failed: false,
+        })
     }
 
     fn is_writing(&self) -> bool {
-        matches!(
-            self,
-            TxState::Started {
-                write_permit: Some(_),
-                ..
-            }
-        )
+        match self {
+            TxState::Implicit { tx } | TxState::Explicit { tx, .. } => tx.has_write_permit(),
+            TxState::Ended => false,
+        }
     }
 
     fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
         match self {
-            TxState::Started { write_permit, .. } => *write_permit = Some(permit),
+            TxState::Implicit { tx } | TxState::Explicit { tx, .. } => tx.set_write_permit(permit),
             TxState::Ended => {
                 // do nothing, maybe bomb?
             }
@@ -381,49 +377,45 @@ impl TxState {
     }
 
     fn is_implicit(&self) -> bool {
-        matches!(
-            self,
-            TxState::Started {
-                kind: OpenTxKind::Implicit,
-                ..
-            }
-        )
+        matches!(self, TxState::Implicit { .. })
     }
     fn is_explicit(&self) -> bool {
-        matches!(
-            self,
-            TxState::Started {
-                kind: OpenTxKind::Explicit,
-                ..
-            }
-        )
+        matches!(self, TxState::Explicit { .. })
     }
     fn is_ended(&self) -> bool {
         matches!(self, TxState::Ended)
     }
 
-    fn start_implicit(&mut self) {
-        *self = Self::implicit()
+    fn start_implicit(&mut self, conn: &'conn Connection) -> rusqlite::Result<()> {
+        *self = Self::implicit(conn)?;
+        Ok(())
     }
 
-    fn start_explicit(&mut self) {
-        *self = Self::explicit()
+    fn start_explicit(&mut self, conn: &'conn Connection) -> rusqlite::Result<()> {
+        *self = Self::explicit(conn)?;
+        Ok(())
     }
 
-    fn end(&mut self) -> Option<OwnedSemaphorePermit> {
-        let permit = match self {
-            TxState::Started { write_permit, .. } => write_permit.take(),
+    fn set_failed(&mut self) {
+        if let TxState::Explicit { failed, .. } = self {
+            *failed = true;
+        }
+    }
+
+    fn is_failed(&self) -> bool {
+        match self {
+            TxState::Explicit { failed, .. } => *failed,
+            _ => false,
+        }
+    }
+
+    fn take_tx(&mut self) -> Option<TxGuard<'conn>> {
+        let prev = std::mem::take(self);
+        match prev {
+            TxState::Implicit { tx } | TxState::Explicit { tx, .. } => Some(tx),
             TxState::Ended => None,
-        };
-        *self = TxState::Ended;
-        permit
+        }
     }
-}
-
-#[derive(Debug)]
-enum OpenTxKind {
-    Implicit,
-    Explicit,
 }
 
 async fn peek_for_sslrequest(
@@ -759,6 +751,7 @@ pub async fn start(
                                                 .into(),
                                         )?;
                                         discard_until_sync = true;
+                                        session.tx_state.set_failed();
                                         continue;
                                     }
                                 };
@@ -787,6 +780,7 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                             discard_until_sync = true;
+                                            session.tx_state.set_failed();
                                             continue;
                                         }
 
@@ -810,6 +804,7 @@ pub async fn start(
                                                         .into(),
                                                 )?;
                                                 discard_until_sync = true;
+                                                session.tx_state.set_failed();
                                                 continue;
                                             }
                                         };
@@ -863,6 +858,7 @@ pub async fn start(
                                                     back_tx
                                                         .blocking_send((e.into(), true).into())?;
                                                     discard_until_sync = true;
+                                                    session.tx_state.set_failed();
                                                     continue 'outer;
                                                 }
                                             };
@@ -916,6 +912,7 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                             discard_until_sync = true;
+                                            session.tx_state.set_failed();
                                         }
                                         Some(Prepared::Empty) => {
                                             back_tx.blocking_send(
@@ -977,6 +974,7 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                             discard_until_sync = true;
+                                            session.tx_state.set_failed();
                                         }
                                         Some(Portal::Empty { .. }) => {
                                             back_tx.blocking_send(
@@ -1051,6 +1049,7 @@ pub async fn start(
                                                 .into(),
                                         )?;
                                         discard_until_sync = true;
+                                        session.tx_state.set_failed();
                                         continue;
                                     }
                                 }
@@ -1081,6 +1080,7 @@ pub async fn start(
                                                 .into(),
                                         )?;
                                         discard_until_sync = true;
+                                        session.tx_state.set_failed();
                                         continue;
                                     }
                                     Some(Prepared::Empty) => {
@@ -1115,6 +1115,7 @@ pub async fn start(
                                                         .into(),
                                                 )?;
                                                 discard_until_sync = true;
+                                                session.tx_state.set_failed();
                                                 continue;
                                             }
                                         };
@@ -1156,6 +1157,7 @@ pub async fn start(
                                                         .into(),
                                                 )?;
                                                 discard_until_sync = true;
+                                                session.tx_state.set_failed();
                                                 continue;
                                             }
                                         };
@@ -1193,6 +1195,7 @@ pub async fn start(
                                                                 .into(),
                                                         )?;
                                                         discard_until_sync = true;
+                                                        session.tx_state.set_failed();
                                                         continue 'outer;
                                                     }
                                                     continue;
@@ -1220,6 +1223,7 @@ pub async fn start(
                                                             .into(),
                                                     )?;
                                                     discard_until_sync = true;
+                                                    session.tx_state.set_failed();
                                                     continue 'outer;
                                                 }
                                                 Some(param_type) => {
@@ -1369,6 +1373,7 @@ pub async fn start(
                                                                 ).into(),
                                                             )?;
                                                             discard_until_sync = true;
+                                                            session.tx_state.set_failed();
                                                             continue 'outer;
                                                         }
                                                     }
@@ -1404,7 +1409,7 @@ pub async fn start(
                                 )?;
                             }
                             PgWireFrontendMessage::Sync(_) => {
-                                send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                send_ready(&mut session, discard_until_sync, &back_tx)?;
 
                                 // reset this
                                 discard_until_sync = false;
@@ -1447,6 +1452,7 @@ pub async fn start(
                                                 .into(),
                                         )?;
                                         discard_until_sync = true;
+                                        session.tx_state.set_failed();
                                         continue;
                                     }
                                 };
@@ -1474,8 +1480,9 @@ pub async fn start(
                                     })?;
 
                                     discard_until_sync = true;
+                                    session.tx_state.set_failed();
 
-                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                    send_ready(&mut session, discard_until_sync, &back_tx)?;
                                     continue;
                                 }
                             }
@@ -1497,12 +1504,8 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
-                                        send_ready(
-                                            &mut session,
-                                            &conn,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
+                                        session.tx_state.set_failed();
+                                        send_ready(&mut session, discard_until_sync, &back_tx)?;
                                         continue;
                                     }
                                 };
@@ -1518,7 +1521,7 @@ pub async fn start(
                                             .into(),
                                     )?;
 
-                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                    send_ready(&mut session, discard_until_sync, &back_tx)?;
                                     continue;
                                 }
 
@@ -1530,48 +1533,41 @@ pub async fn start(
                                             message: e.try_into()?,
                                             flush: true,
                                         })?;
-                                        send_ready(
-                                            &mut session,
-                                            &conn,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
+                                        session.tx_state.set_failed();
+                                        send_ready(&mut session, discard_until_sync, &back_tx)?;
                                         continue 'outer;
                                     }
                                 }
 
                                 // automatically commit an implicit tx
                                 if session.tx_state.is_implicit() {
-                                    trace!("committing IMPLICIT tx");
-                                    let _permit = session.tx_state.end();
-
-                                    if let Err(e) = session.handle_commit(&conn) {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
+                                    if let Some(tx) = session.tx_state.take_tx() {
+                                        trace!("committing IMPLICIT tx");
+                                        if let Err(e) = session.handle_commit(tx) {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
                                                     .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        send_ready(
-                                            &mut session,
-                                            &conn,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
-                                        continue;
+                                            )?;
+                                            discard_until_sync = true;
+                                            session.tx_state.set_failed();
+                                            send_ready(&mut session, discard_until_sync, &back_tx)?;
+                                            continue;
+                                        }
+                                        trace!("committed IMPLICIT tx");
                                     }
-                                    trace!("committed IMPLICIT tx");
                                 }
 
-                                send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                send_ready(&mut session, discard_until_sync, &back_tx)?;
                             }
                             PgWireFrontendMessage::Terminate(_) => {
                                 break;
@@ -1642,6 +1638,7 @@ pub async fn start(
                                                 .into(),
                                         )?;
                                         discard_until_sync = true;
+                                        session.tx_state.set_failed();
                                         continue;
                                     }
                                 }
@@ -1738,19 +1735,23 @@ pub async fn start(
     Ok(PgServer { local_addr })
 }
 
-struct Session {
+struct Session<'conn> {
     agent: Agent,
-    tx_state: TxState,
+    tx_state: TxState<'conn>,
 }
 
-impl Session {
+impl<'conn> Session<'conn> {
     fn handle_query(
         &mut self,
-        conn: &Connection,
+        conn: &'conn Connection,
         cmd: &ParsedCmd,
         back_tx: &Sender<BackendResponse>,
         send_row_desc: bool,
     ) -> Result<(), QueryError> {
+        if self.tx_state.is_failed() && !cmd.is_rollback() {
+            return Err(QueryError::AbortedTx);
+        }
+
         if cmd.is_show() {
             back_tx
                 .blocking_send(
@@ -1779,28 +1780,34 @@ impl Session {
 
         // need to start an implicit transaction
         if self.tx_state.is_ended() && !cmd.is_begin() {
-            conn.execute_batch("BEGIN")?;
             trace!("started IMPLICIT tx");
-            self.tx_state.start_implicit();
+            self.tx_state.start_implicit(conn)?;
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
-            trace!("committing IMPLICIT tx");
-            let _permit = self.tx_state.end();
+            // this starts a new transaction, commits the previous implicit one
+            if let Some(tx) = self.tx_state.take_tx() {
+                trace!("committing IMPLICIT tx");
+                self.handle_commit(tx)?;
+                trace!("committed IMPLICIT tx");
+            }
+        }
 
-            self.handle_commit(conn)?;
-            trace!("committed IMPLICIT tx");
+        // prevent nested transactions!
+        if cmd.is_begin() && !self.tx_state.is_ended() {
+            return Err(QueryError::NestedTransaction);
         }
 
         let count = if cmd.is_begin() {
-            conn.execute_batch("BEGIN")?;
-            self.tx_state.start_explicit();
+            self.tx_state.start_explicit(conn)?;
             0
         } else if cmd.is_commit() {
-            let _permit = self.tx_state.end();
-            self.handle_commit(conn)?;
+            if let Some(tx) = self.tx_state.take_tx() {
+                self.handle_commit(tx)?;
+            }
             0
         } else if cmd.is_rollback() {
-            let _permit = self.tx_state.end();
-            conn.execute_batch("ROLLBACK")?;
+            if let Some(tx) = self.tx_state.take_tx() {
+                tx.rollback()?;
+            }
             0
         } else {
             let mut prepped = if cmd.is_pg() {
@@ -1890,17 +1897,11 @@ impl Session {
             )
             .map_err(|_| QueryError::BackendResponseSendFailed)?;
 
-        if cmd.is_begin() {
-            trace!("setting EXPLICIT tx");
-            // explicit tx
-            self.tx_state.start_explicit();
-        }
-
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_execute<'conn>(
+    fn handle_execute(
         &mut self,
         conn: &'conn Connection,
         prepped: &mut Statement<'conn>,
@@ -1934,21 +1935,19 @@ impl Session {
         if self.tx_state.is_ended() {
             if !cmd.is_begin() && !prepped.readonly() {
                 // NOT in a tx and statement mutates DB...
-                conn.execute_batch("BEGIN")?;
-
-                self.tx_state.start_implicit();
+                self.tx_state.start_implicit(conn)?;
                 opened_implicit_tx = true;
             } else if cmd.is_begin() {
-                conn.execute_batch("BEGIN")?;
-                self.tx_state.start_explicit();
+                self.tx_state.start_explicit(conn)?;
             }
         }
 
         let mut count = 0;
 
         if cmd.is_commit() {
-            let _permit = self.tx_state.end();
-            self.handle_commit(conn)?;
+            if let Some(tx) = self.tx_state.take_tx() {
+                self.handle_commit(tx)?;
+            }
         } else {
             if !self.tx_state.is_writing() && !prepped.readonly() {
                 trace!("statement writes, acquiring permit...");
@@ -2089,8 +2088,9 @@ impl Session {
             }
 
             if opened_implicit_tx {
-                let _permit = self.tx_state.end();
-                self.handle_commit(conn)?;
+                if let Some(tx) = self.tx_state.take_tx() {
+                    self.handle_commit(tx)?;
+                }
             }
         }
 
@@ -2111,161 +2111,139 @@ impl Session {
         Ok(())
     }
 
-    fn handle_commit(&self, conn: &Connection) -> rusqlite::Result<()> {
+    fn handle_commit(&self, tx: TxGuard) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
-        let actor_id = self.agent.actor_id();
-
-        let ts = Timestamp::from(self.agent.clock().new_timestamp());
-
-        let db_version: CrsqlDbVersion = conn
-            .prepare_cached("SELECT crsql_next_db_version()")?
-            .query_row((), |row| row.get(0))?;
-
-        let has_changes: bool = conn
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE db_version = ?);")?
-            .query_row([db_version], |row| row.get(0))?;
-
-        if !has_changes {
-            conn.execute_batch("COMMIT")?;
-            return Ok(());
-        }
-
-        let last_seq: CrsqlSeq = conn
-            .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
-            .query_row([db_version], |row| row.get(0))?;
-
         let mut book_writer = self
             .agent
             .booked()
             .blocking_write("handle_write_tx(book_writer)");
 
-        let last_version = book_writer.last().unwrap_or_default();
-        trace!("last_version: {last_version}");
-        let version = last_version + 1;
-        trace!("version: {version}");
+        let actor_id = self.agent.actor_id();
 
-        conn.prepare_cached(
-            r#"
-                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
-                    VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
-            "#,
-        )?
-        .execute(named_params! {
-            ":actor_id": actor_id,
-            ":start_version": version,
-            ":db_version": db_version,
-            ":last_seq": last_seq,
-            ":ts": ts
+        let insert_info = insert_local_changes(&self.agent, &tx, &mut book_writer)?;
+
+        tx.commit().map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
         })?;
 
-        debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
-
-        conn.execute_batch("COMMIT")?;
-
-        trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
-
-        book_writer.insert(
+        if let Some(InsertChangesInfo {
             version,
-            KnownDbVersion::Current(CurrentVersion {
-                db_version,
-                last_seq,
-                ts,
-            }),
-        );
+            db_version,
+            last_seq,
+            ts,
+        }) = insert_info
+        {
+            trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        drop(book_writer);
+            book_writer.insert(
+                version,
+                KnownDbVersion::Current(CurrentVersion {
+                    db_version,
+                    last_seq,
+                    ts,
+                }),
+            );
+            drop(book_writer);
 
-        spawn_counted({
             let agent = self.agent.clone();
-            async move {
-                let conn = agent.pool().read().await?;
 
-                block_in_place(|| {
-                    let agent = agent.clone();
-                    // TODO: make this more generic so both sync and local changes can use it.
-                    let mut prepped = conn.prepare_cached(
-                        r#"
-                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                        FROM crsql_changes
-                        WHERE db_version = ?
-                        ORDER BY seq ASC
-                "#,
-                    )?;
-                    let rows = prepped.query_map([db_version], row_to_change)?;
-                    let chunked =
-                        ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
-                    for changes_seqs in chunked {
-                        match changes_seqs {
-                            Ok((changes, seqs)) => {
-                                for (table_name, count) in
-                                    changes.iter().counts_by(|change| &change.table)
-                                {
-                                    counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "local").increment(count as u64);
-                                }
-
-                                trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
-
-                                agent.subs_manager().match_changes(&changes, db_version);
-
-                                let tx_bcast = agent.tx_bcast().clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = tx_bcast
-                                        .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
-                                            ChangeV1 {
-                                                actor_id,
-                                                changeset: Changeset::Full {
-                                                    version,
-                                                    changes,
-                                                    seqs,
-                                                    last_seq,
-                                                    ts,
-                                                },
-                                            },
-                                        )))
-                                        .await
-                                    {
-                                        error!("could not send change message for broadcast: {e}");
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                                break;
-                            }
-                        }
-                    }
-                    Ok::<_, rusqlite::Error>(())
-                })?;
-
-                Ok::<_, BoxError>(())
-            }
-        });
+            spawn_counted(async move {
+                broadcast_changes(agent, db_version, last_seq, version, ts).await
+            });
+        }
 
         Ok(())
     }
 }
 
+#[derive(Debug)]
+struct TxGuard<'conn> {
+    conn: &'conn Connection,
+    write_permit: Option<OwnedSemaphorePermit>,
+    ended: bool,
+}
+
+impl<'conn> TxGuard<'conn> {
+    fn start(conn: &'conn Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch("BEGIN")?;
+        Ok(Self {
+            conn,
+            write_permit: None,
+            ended: false,
+        })
+    }
+
+    fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
+        self.write_permit = Some(permit);
+    }
+
+    fn has_write_permit(&self) -> bool {
+        self.write_permit.is_some()
+    }
+
+    fn commit(mut self) -> rusqlite::Result<()> {
+        self.commit_()
+    }
+
+    fn commit_(&mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        self.ended = true;
+        Ok(())
+    }
+
+    fn rollback(mut self) -> rusqlite::Result<()> {
+        self.rollback_()
+    }
+
+    fn rollback_(&mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
+        self.ended = true;
+        Ok(())
+    }
+}
+
+impl<'conn> Drop for TxGuard<'conn> {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        // default rollback if not commited!
+        _ = self.rollback_();
+    }
+}
+
+impl<'conn> Deref for TxGuard<'conn> {
+    type Target = Connection;
+
+    #[inline]
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
 fn send_ready(
     session: &mut Session,
-    conn: &Connection,
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
     let ready_status = if session.tx_state.is_implicit() {
-        let _permit = session.tx_state.end(); // do this first, in case of failure
-        if discard_until_sync {
-            // an error occured, rollback implicit tx!
-            warn!("receive Sync message w/ an error to send, rolling back implicit tx");
-            conn.execute_batch("ROLLBACK")?;
-        } else {
-            // no error, commit implicit tx
-            warn!("receive Sync message, committing implicit tx");
-            session.handle_commit(conn)?;
+        if let Some(tx) = session.tx_state.take_tx() {
+            if discard_until_sync {
+                // an error occured, rollback implicit tx!
+                warn!("receive Sync message w/ an error to send, rolling back implicit tx");
+                tx.rollback()?;
+            } else {
+                // no error, commit implicit tx
+                warn!("receive Sync message, committing implicit tx");
+                session.handle_commit(tx)?;
+            }
         }
 
         READY_STATUS_IDLE
     } else if session.tx_state.is_explicit() {
-        if discard_until_sync {
+        if discard_until_sync || session.tx_state.is_failed() {
             READY_STATUS_FAILED_TRANSACTION_BLOCK
         } else {
             READY_STATUS_TRANSACTION_BLOCK
@@ -2299,6 +2277,12 @@ enum QueryError {
     BackendResponseSendFailed,
     #[error("could not acquire write permit")]
     PermitAcquire(#[from] AcquireError),
+    #[error(transparent)]
+    Change(#[from] ChangeError),
+    #[error("nested transactions are not supported, use savepoints for a similar functionality")]
+    NestedTransaction,
+    #[error("current transaction is aborted, commands ignored until end of transaction block")]
+    AbortedTx,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2324,6 +2308,15 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
                 ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
             QueryError::BackendResponseSendFailed => return Err(ChannelClosed),
+            QueryError::Change(e) => {
+                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
+            }
+            QueryError::NestedTransaction => {
+                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), value.to_string()).into()
+            }
+            QueryError::AbortedTx => {
+                ErrorInfo::new("ERROR".to_owned(), "25P02".to_owned(), value.to_string()).into()
+            }
         }))
     }
 }
@@ -3327,6 +3320,29 @@ mod tests {
             println!("updated_at: {updated_at:?}");
 
             assert_eq!(future, updated_at);
+        }
+
+        {
+            let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
+            tokio::spawn(client_conn);
+
+            let tx = client.transaction().await?;
+            let res = tx
+                .batch_execute("INSERT INTO nonexistenttable VALUES (1)")
+                .await;
+            assert!(res.is_err());
+
+            let res = tx
+                .batch_execute("INSERT INTO nonexistenttable VALUES (1)")
+                .await;
+            assert_eq!(
+                res.err().unwrap().code().unwrap(),
+                &tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION
+            );
+
+            tx.rollback().await?;
+
+            assert!(client.query_one("SELECT 1", &[]).await.is_ok());
         }
 
         tripwire_tx.send(()).await.ok();
