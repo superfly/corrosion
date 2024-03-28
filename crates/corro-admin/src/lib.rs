@@ -207,6 +207,8 @@ async fn handle_conn(
                     let (tx, mut rx) = mpsc::channel(4);
                     let (done_tx, done_rx) = oneshot::channel::<Option<String>>();
 
+                    let started = std::time::Instant::now();
+
                     let bookie = bookie.clone();
                     let agent = agent.clone();
                     tokio::task::spawn(async move {
@@ -224,7 +226,19 @@ async fn handle_conn(
                     // when this loop exists it means our writer has
                     // gone away/ the task completed
                     match done_rx.await {
-                        Ok(None) => send_success(&mut stream).await,
+                        Ok(None) => {
+                            let elapsed = started.elapsed().as_secs_f64();
+                            info_log(
+                                &mut stream,
+                                format!(
+                                    "Finished compacting empty versions!  Took {} seconds ({} minutes)",
+                                    elapsed,
+                                    elapsed / 60.0
+                                ),
+                            )
+                            .await;
+                            send_success(&mut stream).await
+                        }
                         Ok(Some(err)) => {
                             send_error(
                                 &mut stream,
