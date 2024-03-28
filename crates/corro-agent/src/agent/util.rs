@@ -346,6 +346,9 @@ pub async fn clear_overwritten_versions(
                 } else {
                     inserted += empties_len;
                 }
+
+                // take a lil nap
+                tokio::task::yield_now().await;
             }
         }
 
@@ -846,7 +849,7 @@ pub async fn process_completed_empties(
         for ranges in v.chunks(25) {
             let mut conn = agent.pool().write_low().await?;
             block_in_place(|| {
-                let mut tx = conn.immediate_transaction()?;
+                let mut tx = conn.transaction()?;
 
                 for range in ranges {
                     let mut sp = tx.savepoint()?;
@@ -870,6 +873,8 @@ pub async fn process_completed_empties(
 
                 Ok::<_, eyre::Report>(())
             })?;
+
+            tokio::task::yield_now().await;
         }
     }
 
