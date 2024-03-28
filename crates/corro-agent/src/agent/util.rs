@@ -189,7 +189,7 @@ pub async fn clear_overwritten_versions(
                 .is_err()
             {
                 error!("failed to send feedback payload to caller");
-            };
+            }
         }
 
         // pull the current db version -> version map at the present time
@@ -216,7 +216,7 @@ pub async fn clear_overwritten_versions(
                             .is_err()
                         {
                             error!("failed to send feedback payload to caller");
-                        };
+                        }
                     }
 
                     return None;
@@ -228,7 +228,7 @@ pub async fn clear_overwritten_versions(
             if let Some(ref tx) = feedback {
                 if tx.send("No versions to compact".into()).await.is_err() {
                     error!("failed to send feedback payload to caller");
-                };
+                }
             }
 
             return None;
@@ -260,7 +260,7 @@ pub async fn clear_overwritten_versions(
                                 .is_err()
                             {
                                 error!("failed to send feedback payload to caller");
-                            };
+                            }
                         }
 
                         cleared
@@ -275,7 +275,7 @@ pub async fn clear_overwritten_versions(
                                 .is_err()
                             {
                                 error!("failed to send feedback payload to caller");
-                            };
+                            }
                         }
 
                         return None;
@@ -291,7 +291,7 @@ pub async fn clear_overwritten_versions(
                         .is_err()
                     {
                         error!("failed to send feedback payload to caller");
-                    };
+                    }
                 }
                 return None;
             }
@@ -321,27 +321,30 @@ pub async fn clear_overwritten_versions(
                     }
                 }
 
-                // find any affected cleared ranges
-                for range in to_clear
+                let mut empties_map: BTreeMap<ActorId, RangeInclusiveSet<Version>> =
+                    BTreeMap::new();
+                to_clear
                     .iter()
-                    .filter_map(|(_, v)| bookedw.cleared.get(v))
+                    .filter_map(|(_, v)| bookedw.cleared.get(v).cloned())
                     .dedup()
-                {
-                    // schedule for clearing in the background task
-                    if let Err(e) = agent.tx_empty().try_send((actor_id, range.clone())) {
-                        error!("could not schedule version to be cleared: {e}");
-                        if let Some(ref tx) = feedback {
-                            if tx
-                                .send(format!("failed to schedule version to be cleared: {e}"))
-                                .await
-                                .is_err()
-                            {
-                                error!("failed to send feedback payload to caller");
-                            };
+                    .for_each(|versions| {
+                        empties_map.entry(actor_id).or_default().insert(versions);
+                    });
+                let empties_len = empties_map.len();
+
+                if let Err(e) = process_completed_empties(agent.clone(), empties_map).await {
+                    error!("could not schedule version to be cleared: {e}");
+                    if let Some(ref tx) = feedback {
+                        if tx
+                            .send(format!("failed to schedule version to be cleared: {e}"))
+                            .await
+                            .is_err()
+                        {
+                            error!("failed to send feedback payload to caller");
                         }
-                    } else {
-                        inserted += 1;
                     }
+                } else {
+                    inserted += empties_len;
                 }
             }
         }
