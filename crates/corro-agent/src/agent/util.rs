@@ -142,7 +142,7 @@ pub async fn clear_overwritten_versions_loop(agent: Agent, bookie: Bookie, sleep
 
         if clear_overwritten_versions(&agent, &bookie, pool, None)
             .await
-            .is_none()
+            .is_err()
         {
             continue;
         }
@@ -155,7 +155,7 @@ pub async fn clear_overwritten_versions(
     bookie: &Bookie,
     pool: &SplitPool,
     feedback: Option<Sender<String>>,
-) -> Option<()> {
+) -> Result<(), String> {
     let start = Instant::now();
 
     let bookie_clone = {
@@ -183,13 +183,9 @@ pub async fn clear_overwritten_versions(
 
     for (actor_id, booked) in bookie_clone {
         if let Some(ref tx) = feedback {
-            if tx
-                .send(format!("Starting change compaction for {actor_id}"))
+            tx.send(format!("Starting change compaction for {actor_id}"))
                 .await
-                .is_err()
-            {
-                error!("failed to send feedback payload to caller");
-            }
+                .map_err(|e| format!("{e}"))?;
         }
 
         // pull the current db version -> version map at the present time
@@ -210,25 +206,21 @@ pub async fn clear_overwritten_versions(
                     info!(%actor_id, "timed out acquiring read lock on bookkeeping, skipping for now");
 
                     if let Some(ref tx) = feedback {
-                        if tx
-                            .send("timed out acquiring read lock on bookkeeping".into())
+                        tx.send("timed out acquiring read lock on bookkeeping".into())
                             .await
-                            .is_err()
-                        {
-                            error!("failed to send feedback payload to caller");
-                        }
+                            .map_err(|e| format!("{e}"))?;
                     }
 
-                    return None;
+                    return Err("Timed out acquiring read lock on bookkeeping".into());
                 }
             }
         };
 
         if versions.is_empty() {
             if let Some(ref tx) = feedback {
-                if tx.send("No versions to compact".into()).await.is_err() {
-                    error!("failed to send feedback payload to caller");
-                }
+                tx.send("No versions to compact".into())
+                    .await
+                    .map_err(|e| format!("{e}"))?;
             }
             continue;
         }
@@ -253,13 +245,9 @@ pub async fn clear_overwritten_versions(
                         );
 
                         if let Some(ref tx) = feedback {
-                            if tx
-                                .send(format!("Aggregated {} DB versions to clear", cleared.len()))
+                            tx.send(format!("Aggregated {} DB versions to clear", cleared.len()))
                                 .await
-                                .is_err()
-                            {
-                                error!("failed to send feedback payload to caller");
-                            }
+                                .map_err(|e| format!("{e}"))?;
                         }
 
                         cleared
@@ -268,31 +256,23 @@ pub async fn clear_overwritten_versions(
                         error!("could not get cleared versions: {e}");
 
                         if let Some(ref tx) = feedback {
-                            if tx
-                                .send(format!("failed to get cleared versions: {e}"))
+                            tx.send(format!("failed to get cleared versions: {e}"))
                                 .await
-                                .is_err()
-                            {
-                                error!("failed to send feedback payload to caller");
-                            }
+                                .map_err(|e| format!("{e}"))?;
                         }
 
-                        return None;
+                        return Err("failed to cleared versions".into());
                     }
                 }
             }
             Err(e) => {
                 error!("could not get read connection: {e}");
                 if let Some(ref tx) = feedback {
-                    if tx
-                        .send(format!("failed to get read connection: {e}"))
+                    tx.send(format!("failed to get read connection: {e}"))
                         .await
-                        .is_err()
-                    {
-                        error!("failed to send feedback payload to caller");
-                    }
+                        .map_err(|e| format!("{e}"))?;
                 }
-                return None;
+                return Err("could not get read connection".into());
             }
         };
 
@@ -330,41 +310,29 @@ pub async fn clear_overwritten_versions(
                     if let Err(e) = agent.tx_empty().send((actor_id, range.clone())).await {
                         error!("could not schedule version to be cleared: {e}");
                         if let Some(ref tx) = feedback {
-                            if tx
-                                .send(format!("failed to get queue compaction set: {e}"))
+                            tx.send(format!("failed to get queue compaction set: {e}"))
                                 .await
-                                .is_err()
-                            {
-                                error!("failed to send feedback payload to caller");
-                            }
+                                .map_err(|e| format!("{e}"))?;
                         }
                     } else {
                         inserted += 1;
                     }
 
-                    if let Some(ref tx) = feedback {
-                        if tx
-                            .send(format!("Queued {inserted} empty versions to compact"))
-                            .await
-                            .is_err()
-                        {
-                            error!("failed to send feedback payload to caller");
-                        }
-                    }
-
                     tokio::task::yield_now().await;
+                }
+
+                if let Some(ref tx) = feedback {
+                    tx.send(format!("Queued {inserted} empty versions to compact"))
+                        .await
+                        .map_err(|e| format!("{e}"))?;
                 }
             }
         }
 
         if let Some(ref tx) = feedback {
-            if tx
-                .send(format!("Finshed compacting changes for {actor_id}"))
+            tx.send(format!("Finshed compacting changes for {actor_id}"))
                 .await
-                .is_err()
-            {
-                error!("failed to send feedback payload to caller");
-            };
+                .map_err(|e| format!("{e}"))?;
         }
 
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -376,7 +344,7 @@ pub async fn clear_overwritten_versions(
             start.elapsed()
     );
 
-    Some(())
+    Ok(())
 }
 
 /// Load the existing known member state and addresses
