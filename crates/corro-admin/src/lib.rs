@@ -205,15 +205,17 @@ async fn handle_conn(
                     info_log(&mut stream, "compacting empty versions...").await;
 
                     let (tx, mut rx) = mpsc::channel(4);
-                    let (done_tx, done_rx) = oneshot::channel::<Option<()>>();
+                    let (done_tx, done_rx) = oneshot::channel::<Option<String>>();
+
+                    let started = std::time::Instant::now();
 
                     let bookie = bookie.clone();
                     let agent = agent.clone();
                     tokio::task::spawn(async move {
                         let pool = agent.pool();
                         match clear_overwritten_versions(&agent, &bookie, pool, Some(tx)).await {
-                            Some(()) => done_tx.send(Some(())),
-                            None => done_tx.send(None),
+                            Ok(()) => done_tx.send(None),
+                            Err(e) => done_tx.send(Some(e)),
                         }
                     });
 
@@ -224,7 +226,26 @@ async fn handle_conn(
                     // when this loop exists it means our writer has
                     // gone away/ the task completed
                     match done_rx.await {
-                        Ok(Some(())) => send_success(&mut stream).await,
+                        Ok(None) => {
+                            let elapsed = started.elapsed().as_secs_f64();
+                            info_log(
+                                &mut stream,
+                                format!(
+                                    "Finished compacting empty versions!  Took {} seconds ({} minutes)",
+                                    elapsed,
+                                    elapsed / 60.0
+                                ),
+                            )
+                            .await;
+                            send_success(&mut stream).await
+                        }
+                        Ok(Some(err)) => {
+                            send_error(
+                                &mut stream,
+                                format!("An error occured while compacting empties: {err}"),
+                            )
+                            .await
+                        }
                         _ => {
                             send_error(
                                 &mut stream,
