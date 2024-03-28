@@ -178,7 +178,7 @@ pub async fn clear_overwritten_versions(
             bookie_clone.len()
         ))
         .await
-        .unwrap();
+        .map_err(|e| format!("{e}"))?;
     }
 
     for (actor_id, booked) in bookie_clone {
@@ -230,8 +230,7 @@ pub async fn clear_overwritten_versions(
                     error!("failed to send feedback payload to caller");
                 }
             }
-
-            return None;
+            continue;
         }
 
         // we're using a read connection here, starting a read-only transaction
@@ -321,34 +320,40 @@ pub async fn clear_overwritten_versions(
                     }
                 }
 
-                let mut empties_map: BTreeMap<ActorId, RangeInclusiveSet<Version>> =
-                    BTreeMap::new();
-                to_clear
+                // find any affected cleared ranges
+                for range in to_clear
                     .iter()
-                    .filter_map(|(_, v)| bookedw.cleared.get(v).cloned())
+                    .filter_map(|(_, v)| bookedw.cleared.get(v))
                     .dedup()
-                    .for_each(|versions| {
-                        empties_map.entry(actor_id).or_default().insert(versions);
-                    });
-                let empties_len = empties_map.len();
+                {
+                    // schedule for clearing in the background task
+                    if let Err(e) = agent.tx_empty().send((actor_id, range.clone())).await {
+                        error!("could not schedule version to be cleared: {e}");
+                        if let Some(ref tx) = feedback {
+                            if tx
+                                .send(format!("failed to get queue compaction set: {e}"))
+                                .await
+                                .is_err()
+                            {
+                                error!("failed to send feedback payload to caller");
+                            }
+                        }
+                    } else {
+                        inserted += 1;
+                    }
 
-                if let Err(e) = process_completed_empties(agent.clone(), empties_map).await {
-                    error!("could not schedule version to be cleared: {e}");
                     if let Some(ref tx) = feedback {
                         if tx
-                            .send(format!("failed to schedule version to be cleared: {e}"))
+                            .send(format!("Queued {inserted} empty versions to compact"))
                             .await
                             .is_err()
                         {
                             error!("failed to send feedback payload to caller");
                         }
                     }
-                } else {
-                    inserted += empties_len;
-                }
 
-                // take a lil nap
-                tokio::task::yield_now().await;
+                    tokio::task::yield_now().await;
+                }
             }
         }
 
@@ -849,7 +854,7 @@ pub async fn process_completed_empties(
         for ranges in v.chunks(25) {
             let mut conn = agent.pool().write_low().await?;
             block_in_place(|| {
-                let mut tx = conn.transaction()?;
+                let mut tx = conn.immediate_transaction()?;
 
                 for range in ranges {
                     let mut sp = tx.savepoint()?;
@@ -873,8 +878,6 @@ pub async fn process_completed_empties(
 
                 Ok::<_, eyre::Report>(())
             })?;
-
-            tokio::task::yield_now().await;
         }
     }
 
