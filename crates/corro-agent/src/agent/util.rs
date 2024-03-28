@@ -346,6 +346,9 @@ pub async fn clear_overwritten_versions(
                 } else {
                     inserted += empties_len;
                 }
+
+                // take a lil nap
+                tokio::task::yield_now().await;
             }
         }
 
