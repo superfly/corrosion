@@ -227,21 +227,23 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 eyre::bail!("corrosion is currently running, shut it down before restoring!");
             }
 
-            let db_path = match cli.db_path() {
-                Ok(db_path) => db_path,
+            let config = match cli.config() {
+                Ok(config) => config,
                 Err(_e) => {
                     eyre::bail!(
-                        "path to current database is required either via --db-path or specified in the config file passed as --config"
+                        "path to current database is required via the config file passed as --config"
                     );
                 }
             };
+
+            let db_path = &config.db.path;
 
             if *self_actor_id || actor_id.is_some() {
                 let site_id: Uuid = {
                     if let Some(actor_id) = actor_id {
                         *actor_id
                     } else {
-                        let conn = Connection::open(&db_path)?;
+                        let conn = Connection::open(db_path)?;
                         conn.query_row(
                             "SELECT site_id FROM crsql_site_id WHERE ordinal = 0;",
                             [],
@@ -263,7 +265,6 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                     warn!("snapshot database did not know about the current actor id");
                 }
 
-                // FIXME: find the old site_id for ordinal 0 and fix crsql_clock tables
                 let inserted = conn.execute(
                     "INSERT OR REPLACE INTO crsql_site_id (ordinal, site_id) VALUES (0, ?)",
                     [site_id],
@@ -273,19 +274,43 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 }
 
                 if let Some(ordinal) = ordinal {
-                    let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+                    if ordinal == 0 {
+                        warn!("skipping clock table site_id rewrite: ordinal was 0 and therefore did not change");
+                    } else {
+                        info!("rewriting clock tables site_id");
+                        let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
 
-                    for table in tables {
-                        let n = conn.execute(
-                            &format!("UPDATE \"{table}\" SET site_id = 0 WHERE site_id = ?"),
-                            [ordinal],
-                        )?;
-                        info!("Updated {n} rows in {table}");
+                        for table in tables {
+                            let n = conn.execute(
+                                &format!("UPDATE \"{table}\" SET site_id = 0 WHERE site_id = ?"),
+                                [ordinal],
+                            )?;
+                            info!("Updated {n} rows in {table}");
+                        }
                     }
                 }
             }
 
-            if path.as_path() == db_path.as_std_path() {
+            let subs_path = config.db.subscriptions_path();
+
+            info!("removing subscriptions at {subs_path}");
+            match tokio::fs::remove_dir_all(subs_path).await {
+                Ok(_) => {
+                    info!("cleared subscriptions");
+                }
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        info!("no subscriptions to delete.");
+                    }
+                    _ => {
+                        eyre::bail!(
+                            "aborting restore! could not delete previous subscriptions: {e}"
+                        )
+                    }
+                },
+            }
+
+            if path == db_path {
                 info!("reused the db path, not copying database into place");
             } else {
                 let restored =
@@ -562,7 +587,7 @@ enum Command {
 
     /// Restore the Corrosion DB from a backup
     Restore {
-        path: PathBuf,
+        path: Utf8PathBuf,
         #[arg(long, default_value = "false")]
         self_actor_id: bool,
         #[arg(long)]
