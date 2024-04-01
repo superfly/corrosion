@@ -37,6 +37,7 @@ shellwords = { version = "1" }
 spawn = { path = "../spawn" }
 sqlite3-restore = { path = "../sqlite3-restore" }
 tempfile = { workspace = true }
+thiserror = { workspace = true }
 tikv-jemallocator = "0.5"
 time = { workspace = true }
 tokio = { workspace = true }

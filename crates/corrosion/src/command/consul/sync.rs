@@ -2,9 +2,9 @@ use consul_client::{AgentCheck, AgentService, Client};
 use corro_api_types::ColumnType;
 use corro_client::CorrosionClient;
 use corro_types::{api::Statement, config::ConsulConfig};
+use futures::future::select;
 use metrics::{histogram, counter};
 use serde::{Deserialize, Serialize};
-use spawn::{spawn_counted, wait_for_all_pending_handles};
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
@@ -12,7 +12,7 @@ use std::{
     path::Path,
     time::{Duration, Instant, SystemTime},
 };
-use tokio::time::{interval, timeout};
+use tokio::{signal::unix::{signal, SignalKind}, time::{interval, timeout}};
 use tracing::{debug, error, info, trace};
 
 const CONSUL_PULL_INTERVAL: Duration = Duration::from_secs(1);
@@ -22,7 +22,15 @@ pub async fn run<P: AsRef<Path>>(
     api_addr: SocketAddr,
     db_path: P,
 ) -> eyre::Result<()> {
-    let (mut tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    let sigterm_recv = sigterm.recv();
+    tokio::pin!(sigterm_recv);
+    let sigint_recv = sigint.recv();
+    tokio::pin!(sigint_recv);
+
+    let mut stop_signal = select(sigterm_recv, sigint_recv);
 
     let node: &'static str = Box::leak(
         hostname::get()?
@@ -79,39 +87,39 @@ pub async fn run<P: AsRef<Path>>(
 
     let mut pull_interval = interval(CONSUL_PULL_INTERVAL);
 
-    spawn_counted(async move {
-        info!("Starting consul pull interval");
-        loop {
-            tokio::select! {
-                _ = pull_interval.tick() => {
-                    let res = update_consul(&consul, node, &corrosion, &mut consul_services, &mut consul_checks, false).await;
-                    debug!("got results: {res:?}");
+    info!("Starting consul pull interval");
+    loop {
+        let res = tokio::select! {
+            _ = pull_interval.tick() => {
+                update_consul(&consul, node, &corrosion, &mut consul_services, &mut consul_checks, false).await
+            },
+            _ = &mut stop_signal => {
+                debug!("tripped consul loop");
+                break;
+            }
+        };
 
-                    match res {
-                        Ok((svc_stats, check_stats)) => {
-                            if !svc_stats.is_zero() {
-                                info!("updated consul services: {svc_stats:?}");    
-                            }
-                            if !check_stats.is_zero() {
-                                info!("updated consul checks: {check_stats:?}");    
-                            }
-                        }
-                        Err(e) => {
-                            error!("could not update consul: {e}");
-                        }
-                    }
+        debug!("got results: {res:?}");
+
+        match res {
+            Ok((svc_stats, check_stats)) => {
+                if !svc_stats.is_zero() {
+                    info!("updated consul services: {svc_stats:?}");    
+                }
+                if !check_stats.is_zero() {
+                    info!("updated consul checks: {check_stats:?}");    
+                }
+            }
+            Err(e) => match e {
+                UpdateError::Execute(ExecuteError::Sqlite(_)) => {
+                    return Err(e.into());
                 },
-                _ = &mut tripwire => {
-                    debug!("tripped consul loop");
-                    break;
+                e => {
+                    error!("non-fatal update error, continuing. error: {e}");
                 }
             }
         }
-    });
-
-    tripwire_worker.await;
-
-    wait_for_all_pending_handles().await;
+    }
 
     Ok(())
 }
@@ -405,28 +413,38 @@ fn update_checks(
     ops
 }
 
-pub async fn update_consul(
+#[derive(Debug, thiserror::Error)]
+enum UpdateError {
+    #[error("consul: {0}")]
+    Consul(#[from] consul_client::Error),
+    #[error("timed out")]
+    TimedOut,
+    #[error(transparent)]
+    Execute(#[from] ExecuteError)
+}
+
+async fn update_consul(
     consul: &Client,
     node: &'static str,
     corrosion: &CorrosionClient,
     service_hashes: &mut HashMap<String, u64>,
     check_hashes: &mut HashMap<String, u64>,
     skip_hash_check: bool,
-) -> eyre::Result<(ApplyStats, ApplyStats)> {
+) -> Result<(ApplyStats, ApplyStats), UpdateError> {
     let fut_services = async {
         let start = Instant::now();
         match timeout(Duration::from_secs(5), consul.agent_services()).await {
             Ok(Ok(services)) => {
                 histogram!("corro_consul.consul.response.time.seconds").record(start.elapsed().as_secs_f64());
-                Ok::<_, eyre::Report>(update_services(services, service_hashes, skip_hash_check))
+                Ok(update_services(services, service_hashes, skip_hash_check))
             }
             Ok(Err(e)) => {
                 counter!("corro_consul.consul.response.errors", "error" => e.to_string(), "type" => "services").increment(1);
                 Err(e.into())
             }
-            Err(e) => {
+            Err(_e) => {
                 counter!("corro_consul.consul.response.errors", "error" => "timed out", "type" => "services").increment(1);
-                Err(e.into())
+                Err(UpdateError::TimedOut)
             }
         }
         
@@ -437,22 +455,30 @@ pub async fn update_consul(
         match timeout(Duration::from_secs(5), consul.agent_checks()).await {
             Ok(Ok(checks)) => {
                 histogram!("corro_consul.consul.response.time.seconds").record(start.elapsed().as_secs_f64());
-                Ok::<_, eyre::Report>(update_checks(checks, check_hashes, skip_hash_check))
+                Ok(update_checks(checks, check_hashes, skip_hash_check))
             }
             Ok(Err(e)) => {
                 counter!("corro_consul.consul.response.errors", "error" => e.to_string(), "type" => "checks").increment(1);
                 Err(e.into())
             }
-            Err(e) => {
+            Err(_e) => {
                 counter!("corro_consul.consul.response.errors", "error" => "timed out", "type" => "checks").increment(1);
-                Err(e.into())
+                Err(UpdateError::TimedOut)
             }
         }
     };
 
     let (svcs, checks) = tokio::try_join!(fut_services, fut_checks)?;
 
-    execute(node, corrosion, svcs, service_hashes, checks, check_hashes).await
+    execute(node, corrosion, svcs, service_hashes, checks, check_hashes).await.map_err(UpdateError::from)
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ExecuteError {
+    #[error("client: {0}")]
+    Client(#[from]corro_client::Error),
+    #[error("sqlite: {0}")]
+    Sqlite(String)
 }
 
 async fn execute(
@@ -462,7 +488,7 @@ async fn execute(
     service_hashes: &mut HashMap<String, u64>,
     checks: Vec<ConsulCheckOp>,
     check_hashes: &mut HashMap<String, u64>,
-) -> eyre::Result<(ApplyStats, ApplyStats)> {
+) -> Result<(ApplyStats, ApplyStats), ExecuteError> {
     let updated_at = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("could not get system time")
@@ -513,7 +539,16 @@ async fn execute(
     
 
     if !statements.is_empty() {
-        corrosion.execute(&statements).await?;
+        if let Some(e) = corrosion.execute(&statements).await?.results.into_iter().find_map(|res| {
+            match res {
+                corro_api_types::ExecResult::Execute { .. } => None,
+                corro_api_types::ExecResult::Error { error } => {
+                    Some(error)
+                },
+            }
+        }) {
+            return Err(ExecuteError::Sqlite(e));
+        }
     }
 
     let mut svc_stats = ApplyStats::default();
@@ -547,6 +582,7 @@ mod tests {
 
     use corro_tests::launch_test_agent;
     use rusqlite::OptionalExtension;
+    use spawn::wait_for_all_pending_handles;
     use tokio::time::sleep;
     use tripwire::Tripwire;
 
