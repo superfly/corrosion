@@ -169,7 +169,13 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
 
                 if gaps_count == 0 {
                     info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
-                    let _ = agent.tx_apply().send((actor_id, *version)).await;
+                    let tx_apply = agent.tx_apply().clone();
+                    let version = *version;
+                    tokio::spawn(async move {
+                        if let Err(e) = tx_apply.send((actor_id, version)).await {
+                            error!("could not schedule buffered changes application: {e}");
+                        }
+                    });
                 }
             }
 
