@@ -132,7 +132,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let (tx_changes, rx_changes) = bounded(conf.perf.changes_channel_len, "changes");
     let (tx_foca, rx_foca) = bounded(conf.perf.foca_channel_len, "foca");
 
-    let subs_manager = SubsManager::default();
+    let subs_path = &conf.db.subscriptions_path();
+    let subs_manager = SubsManager::with_path(subs_path.clone());
 
     let opts = AgentOptions {
         gossip_server_endpoint,
