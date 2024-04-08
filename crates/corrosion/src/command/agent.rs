@@ -5,7 +5,7 @@ use camino::Utf8PathBuf;
 use corro_admin::AdminConfig;
 use corro_types::config::{Config, PrometheusConfig};
 use metrics::gauge;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use spawn::wait_for_all_pending_handles;
 use tokio_metrics::RuntimeMonitor;
 use tracing::{error, info};
@@ -86,6 +86,10 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
 fn setup_prometheus(addr: SocketAddr) -> eyre::Result<()> {
     PrometheusBuilder::new()
         .with_http_listener(addr)
+        .set_buckets_for_metric(
+            Matcher::Suffix("chunk_size".into()),
+            &[1.0, 10.0, 75.0, 250.0, 375.0, 500.0, 650.0],
+        )?
         .set_buckets(&[
             0.001, // 1ms
             0.005, // 5ms

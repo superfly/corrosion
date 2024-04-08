@@ -1377,13 +1377,17 @@ pub async fn process_multiple_changes(
         Ok::<_, ChangeError>(changesets)
     })?;
 
+    let mut change_chunk_size = 0;
+    
     for (_actor_id, changeset, db_version, _src) in changesets {
+        change_chunk_size += changeset.changes().len();
         agent
             .subs_manager()
             .match_changes(changeset.changes(), db_version);
     }
 
     histogram!("corro.agent.changes.processing.time.seconds").record(start.elapsed());
+    histogram!("corro.agent.changes.processing.chunk_size").record(change_chunk_size as f64);
 
     Ok(())
 }
