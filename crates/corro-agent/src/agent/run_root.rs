@@ -140,6 +140,9 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
             .query_map([], |row| row.get(0))
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
 
+        // not strictly required, but we don't need to keep it open
+        drop(conn);
+
         let pool = agent.pool();
 
         let mut buf = futures::stream::iter(
@@ -150,10 +153,10 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                 .map(|actor_id| {
                     let pool = pool.clone();
                     async move {
-                        tokio::spawn(async move {
-                            let conn = pool.read().await?;
+                        tokio::task::spawn_blocking(move || {
+                            let conn = pool.read_blocking()?;
 
-                            block_in_place(|| BookedVersions::from_conn(&conn, actor_id))
+                            BookedVersions::from_conn(&conn, actor_id)
                                 .map(|bv| (actor_id, bv))
                                 .map_err(eyre::Report::from)
                         })
@@ -161,7 +164,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                     }
                 }),
         )
-        .buffer_unordered(8);
+        .buffer_unordered(2);
 
         while let Some((actor_id, bv)) = TryStreamExt::try_next(&mut buf).await? {
             for (version, partial) in bv.partials.iter() {
