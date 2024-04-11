@@ -312,6 +312,7 @@ pub async fn clear_overwritten_versions(
                         inserted += 1;
                     });
 
+                let start = Instant::now();
                 if let Err(e) = process_completed_empties(agent.clone(), empties).await {
                     if let Some(ref tx) = feedback {
                         tx.send(format!("Could not process empties: {e}"))
@@ -319,6 +320,7 @@ pub async fn clear_overwritten_versions(
                             .map_err(|e| format!("failed to send{e}"))?;
                     }
                 }
+                db_elapsed += start.elapsed();
 
                 if let Some(ref tx) = feedback {
                     tx.send(format!("Queued {inserted} empty versions to compact"))
@@ -1382,7 +1384,7 @@ pub async fn process_multiple_changes(
     })?;
 
     let mut change_chunk_size = 0;
-    
+
     for (_actor_id, changeset, db_version, _src) in changesets {
         change_chunk_size += changeset.changes().len();
         agent
