@@ -835,7 +835,7 @@ pub async fn process_completed_empties(
 
         for ranges in v.chunks(25) {
             let mut conn = if trace {
-                agent.pool().write_priority().await?
+                agent.pool().write_normal().await?
             } else {
                 agent.pool().write_low().await?
             };
