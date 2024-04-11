@@ -50,6 +50,7 @@ tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
 uuid = { workspace = true }
+dhat = "0.3.3"
 
 [build-dependencies]
 build-info-build = { workspace = true }

@@ -50,7 +50,7 @@ pub static API_CLIENT: OnceCell<CorrosionApiClient> = OnceCell::new();
 build_info::build_info!(pub fn version);
 
 #[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
     if matches!(cli.command, Command::Agent) {
@@ -493,6 +493,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
 }
 
 fn main() {
+    let _profiler = dhat::Profiler::new_heap();
     let cli: Cli = Cli::parse();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
