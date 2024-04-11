@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
     sync::{
-        broadcast,
+        broadcast::{self, error::RecvError},
         mpsc::{self, error::TryRecvError},
         RwLock as TokioRwLock,
     },
@@ -725,17 +725,23 @@ async fn forward_sub_to_sender(
 
     loop {
         let (event_buf, meta) = tokio::select! {
-            Ok((event_buf, meta)) = sub_rx.recv() => {
-                (event_buf, meta)
+            res = sub_rx.recv() => {
+                match res {
+                    Ok((event_buf, meta)) => (event_buf, meta),
+                    Err(RecvError::Lagged(skipped)) => {
+                        warn!(sub_id = %handle.id(), "subscription skipped {} events, aborting", skipped);
+                        return;
+                    },
+                    Err(RecvError::Closed) => {
+                        info!(sub_id = %handle.id(), "events subcription ran out");
+                        return;
+                    },
+                }
             },
             _ = handle.cancelled() => {
                 info!(sub_id = %handle.id(), "subscription cancelled, aborting forwarding bytes to subscriber");
                 return;
             },
-            else => {
-                info!(sub_id = %handle.id(), "events subcription ran out");
-                return;
-            }
         };
 
         if skip_rows
@@ -769,28 +775,33 @@ async fn forward_bytes_to_body_sender(
     loop {
         let to_send = tokio::select! {
             biased;
-            Some((event_buf, meta)) = rx.recv() => {
-                match meta {
-                    QueryEventMeta::EndOfQuery(Some(change_id)) |
-                    QueryEventMeta::Change(change_id) => {
-                        if !last_change_id.is_zero() && change_id > last_change_id + 1 {
-                            warn!(%sub_id, "non-contiguous change id (> + 1) received: {change_id:?}, last seen: {last_change_id:?}");
-                        } else if !last_change_id.is_zero() && change_id == last_change_id {
-                            warn!(%sub_id, "duplicate change id received: {change_id:?}, last seen: {last_change_id:?}");
-                        } else if change_id < last_change_id {
-                            warn!(%sub_id, "smaller change id received: {change_id:?}, last seen: {last_change_id:?}");
+            res = rx.recv() => {
+                match res {
+                    Some((event_buf, meta)) => {
+                        match meta {
+                            QueryEventMeta::EndOfQuery(Some(change_id)) |
+                            QueryEventMeta::Change(change_id) => {
+                                if !last_change_id.is_zero() && change_id > last_change_id + 1 {
+                                    warn!(%sub_id, "non-contiguous change id (> + 1) received: {change_id:?}, last seen: {last_change_id:?}");
+                                } else if !last_change_id.is_zero() && change_id == last_change_id {
+                                    warn!(%sub_id, "duplicate change id received: {change_id:?}, last seen: {last_change_id:?}");
+                                } else if change_id < last_change_id {
+                                    warn!(%sub_id, "smaller change id received: {change_id:?}, last seen: {last_change_id:?}");
+                                }
+                                last_change_id = change_id;
+                            },
+                            _ => {
+                                // do nothing
+                            }
                         }
-                        last_change_id = change_id;
+                        buf.extend_from_slice(&event_buf);
+                        if buf.len() >= 64*1024 {
+                            buf.split().freeze()
+                        } else {
+                            continue;
+                        }
                     },
-                    _ => {
-                        // do nothing
-                    }
-                }
-                buf.extend_from_slice(&event_buf);
-                if buf.len() >= 64*1024 {
-                    buf.split().freeze()
-                } else {
-                    continue;
+                    None => break,
                 }
             },
             _ = &mut send_deadline => {
@@ -808,7 +819,6 @@ async fn forward_bytes_to_body_sender(
             _ = &mut tripwire => {
                 break;
             }
-            else => break,
         };
 
         if let Err(e) = tx.send_data(to_send).await {
