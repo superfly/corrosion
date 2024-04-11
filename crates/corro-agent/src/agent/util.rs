@@ -312,8 +312,14 @@ pub async fn clear_overwritten_versions(
                         inserted += 1;
                     });
 
+                if let Some(ref tx) = feedback {
+                    tx.send(format!("Process {inserted} empty versions to compact..."))
+                        .await
+                        .map_err(|e| format!("{e}"))?;
+                }
+
                 let start = Instant::now();
-                if let Err(e) = process_completed_empties(agent.clone(), empties).await {
+                if let Err(e) = process_completed_empties(agent.clone(), empties, true).await {
                     if let Some(ref tx) = feedback {
                         tx.send(format!("Could not process empties: {e}"))
                             .await
@@ -321,12 +327,6 @@ pub async fn clear_overwritten_versions(
                     }
                 }
                 db_elapsed += start.elapsed();
-
-                if let Some(ref tx) = feedback {
-                    tx.send(format!("Queued {inserted} empty versions to compact"))
-                        .await
-                        .map_err(|e| format!("{e}"))?;
-                }
 
                 tokio::task::yield_now().await;
             }
@@ -787,11 +787,14 @@ pub async fn write_empties_loop(
 
         let empties_to_process = std::mem::take(&mut empties);
 
-        debug!("Scheduling {} empties ranges to clear", empties_to_process.len());
-        
+        debug!(
+            "Scheduling {} empties ranges to clear",
+            empties_to_process.len()
+        );
+
         // TODO: replace with a JoinSet and max concurrency
         spawn_counted(
-            process_completed_empties(agent.clone(), empties_to_process)
+            process_completed_empties(agent.clone(), empties_to_process, false)
                 .inspect_err(|e| error!("could not process empties: {e}")),
         );
 
@@ -805,7 +808,7 @@ pub async fn write_empties_loop(
 
     if !empties.is_empty() {
         info!("Inserting last unprocessed empties before shut down");
-        if let Err(e) = process_completed_empties(agent, empties).await {
+        if let Err(e) = process_completed_empties(agent, empties, false).await {
             error!("could not process empties: {e}");
         }
     }
@@ -815,11 +818,14 @@ pub async fn write_empties_loop(
 pub async fn process_completed_empties(
     agent: Agent,
     empties: BTreeMap<ActorId, RangeInclusiveSet<Version>>,
+    trace: bool,
 ) -> eyre::Result<()> {
-    debug!(
-        "processing empty versions (count: {})",
-        empties.values().map(RangeInclusiveSet::len).sum::<usize>()
-    );
+    if trace {
+        debug!(
+            "processing empty versions (count: {})",
+            empties.values().map(RangeInclusiveSet::len).sum::<usize>()
+        );
+    }
 
     let mut inserted = 0;
 
@@ -830,16 +836,22 @@ pub async fn process_completed_empties(
         for ranges in v.chunks(25) {
             let mut conn = agent.pool().write_low().await?;
             block_in_place(|| {
-                debug!("empties: Getting an immediate transaction now...");
+                if trace {
+                    debug!("empties: Getting an immediate transaction now...");
+                }
                 let mut tx = conn.immediate_transaction()?;
 
-                debug!("empties: Got transaction");
-                
+                if trace {
+                    debug!("empties: Got transaction");
+                }
+
                 for range in ranges {
                     let mut sp = tx.savepoint()?;
                     match store_empty_changeset(&sp, actor_id, range.clone()) {
                         Ok(count) => {
-                            debug!("empties: inserted {count} thingies");
+                            if trace {
+                                debug!("empties: inserted {count} thingies");
+                            }
                             inserted += count;
                             sp.commit()?;
                         }
@@ -863,7 +875,9 @@ pub async fn process_completed_empties(
 
     let elapsed = start.elapsed();
 
-    debug!("upserted {inserted} empty version ranges in {elapsed:?}");
+    if trace {
+        debug!("upserted {inserted} empty version ranges in {elapsed:?}");
+    }
 
     counter!("corro.agent.empties.committed").increment(inserted as u64);
     histogram!("corro.agent.empties.commit.second").record(elapsed);
