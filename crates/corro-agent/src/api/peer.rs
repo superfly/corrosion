@@ -1627,7 +1627,6 @@ mod tests {
 
         process_multiple_changes(
             agent.clone(),
-            bookie.clone(),
             vec![
                 (
                     ChangeV1 {

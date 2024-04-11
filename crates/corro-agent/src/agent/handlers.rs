@@ -439,7 +439,6 @@ pub async fn handle_changes(
             debug!(count = %tmp_count, "spawning processing multiple changes from beginning of loop");
             join_set.spawn(util::process_multiple_changes(
                 agent.clone(),
-                bookie.clone(),
                 std::mem::take(&mut buf),
             ));
 
@@ -554,7 +553,6 @@ pub async fn handle_changes(
                     debug!(%count, "spawning processing multiple changes from max wait interval");
                     join_set.spawn(util::process_multiple_changes(
                         agent.clone(),
-                        bookie.clone(),
                         queue.drain(..).collect(),
                     ));
                     count = 0;
@@ -586,12 +584,8 @@ pub async fn handle_changes(
         queue.push_back((change, src, Instant::now()));
         if count >= max_changes_chunk {
             // drain and process current changes!
-            if let Err(e) = util::process_multiple_changes(
-                agent.clone(),
-                bookie.clone(),
-                queue.drain(..).collect(),
-            )
-            .await
+            if let Err(e) =
+                util::process_multiple_changes(agent.clone(), queue.drain(..).collect()).await
             {
                 error!("could not process last multiple changes: {e}");
             }
@@ -602,8 +596,7 @@ pub async fn handle_changes(
     }
 
     // process the last changes we got!
-    if let Err(e) = util::process_multiple_changes(agent, bookie, queue.into_iter().collect()).await
-    {
+    if let Err(e) = util::process_multiple_changes(agent, queue.into_iter().collect()).await {
         error!("could not process multiple changes: {e}");
     }
 }

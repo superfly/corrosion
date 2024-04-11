@@ -31,7 +31,7 @@ use corro_types::{
         Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion, SplitPool,
     },
     base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
+    broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput, Timestamp},
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
@@ -992,41 +992,71 @@ pub async fn process_fully_buffered_changes(
     let mut conn = agent.pool().write_normal().await?;
     debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
 
-    let booked = {
-        bookie
-            .write(format!(
-                "process_fully_buffered(ensure):{}",
-                actor_id.as_simple()
-            ))
-            .await
-            .ensure(actor_id)
-    };
+    // let booked = {
+    //     bookie
+    //         .write(format!(
+    //             "process_fully_buffered(ensure):{}",
+    //             actor_id.as_simple()
+    //         ))
+    //         .await
+    //         .ensure(actor_id)
+    // };
 
-    let mut bookedw = booked
-        .write(format!(
-            "process_fully_buffered(booked writer):{}",
-            actor_id.as_simple()
-        ))
-        .await;
-    debug!(%actor_id, %version, "acquired Booked write lock to process fully buffered changes");
+    // let mut bookedw = booked
+    //     .write(format!(
+    //         "process_fully_buffered(booked writer):{}",
+    //         actor_id.as_simple()
+    //     ))
+    //     .await;
+    // debug!(%actor_id, %version, "acquired Booked write lock to process fully buffered changes");
 
     let inserted = block_in_place(|| {
         let (last_seq, ts) = {
-            match bookedw.partials.get(&version) {
-                Some(PartialVersion { seqs, last_seq, ts }) => {
-                    if seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).count() != 0 {
-                        error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
-                        // TODO: return an error here
-                        return Ok(false);
-                    }
-                    (*last_seq, *ts)
-                }
-                None => {
-                    warn!(%actor_id, %version, "version not found in cache, returning");
-                    return Ok(false);
-                }
+        let tx = conn.transaction()?;
+
+        let last_seq_ts: Option<(CrsqlSeq, Timestamp)> = tx.prepare_cached("SELECT last_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ? LIMIT 1")?.query_row(params![actor_id.as_bytes(), version], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+
+        let (last_seq, ts) = match last_seq_ts {
+            Some(last_seq_ts) => last_seq_ts,
+            None => {
+                warn!(%actor_id, %version, "last_seq not found in cache, returning");
+                return Ok(false);
             }
         };
+
+        let mut prepped = tx.prepare_cached("SELECT start_seq, end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?")?;
+        let seqs = prepped
+            .query_map(params![actor_id.as_bytes(), version], |row| {
+                Ok(row.get(0)?..=row.get(1)?)
+            })?
+            .collect::<Result<RangeInclusiveSet<CrsqlSeq>, _>>()?;
+
+        if seqs.is_empty() {
+            warn!(%actor_id, %version, "version not found in cache, returning");
+            return Ok(false);
+        } else if seqs.gaps(&(CrsqlSeq(0)..=last_seq)).count() != 0 {
+            error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
+            return Ok(false);
+        }
+
+        (last_seq, ts)
+    };
+        // let (last_seq, ts) = {
+        //     match bookedw.partials.get(&version) {
+        //         Some(PartialVersion { seqs, last_seq, ts }) => {
+        //             if seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).count() != 0 {
+        //                 error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
+        //                 // TODO: return an error here
+        //                 return Ok(false);
+        //             }
+        //             (*last_seq, *ts)
+        //         }
+        //         None => {
+        //             warn!(%actor_id, %version, "version not found in cache, returning");
+        //             return Ok(false);
+        //         }
+        //     }
+        // };
 
         let tx = conn.immediate_transaction()?;
 
@@ -1109,9 +1139,9 @@ pub async fn process_fully_buffered_changes(
         tx.commit()?;
 
         let inserted = if let Some(known_version) = known_version {
-            bookedw.insert(version, known_version);
+            // bookedw.insert(version, known_version);
 
-            drop(bookedw);
+            // drop(bookedw);
 
             true
         } else {
@@ -1124,10 +1154,9 @@ pub async fn process_fully_buffered_changes(
     Ok(inserted)
 }
 
-#[tracing::instrument(skip(agent, bookie, changes), err)]
+#[tracing::instrument(skip(agent, changes), err)]
 pub async fn process_multiple_changes(
     agent: Agent,
-    bookie: Bookie,
     changes: Vec<(ChangeV1, ChangeSource, Instant)>,
 ) -> Result<(), ChangeError> {
     let start = Instant::now();
@@ -1136,36 +1165,145 @@ pub async fn process_multiple_changes(
 
     let mut seen = HashSet::new();
     let mut unknown_changes = Vec::with_capacity(changes.len());
-    for (change, src, queued_at) in changes {
-        histogram!("corro.agent.changes.queued.seconds").record(queued_at.elapsed());
-        let versions = change.versions();
-        let seqs = change.seqs();
-        if !seen.insert((change.actor_id, versions, seqs.cloned())) {
-            continue;
-        }
-        if bookie
-            .write(format!(
-                "process_multiple_changes(ensure):{}",
-                change.actor_id.as_simple()
-            ))
-            .await
-            .ensure(change.actor_id)
-            .read(format!(
-                "process_multiple_changes(contains?):{}",
-                change.actor_id.as_simple()
-            ))
-            .await
-            .contains_all(change.versions(), change.seqs())
-        {
-            continue;
-        }
-
-        unknown_changes.push((change, src));
-    }
-
-    unknown_changes.sort_by_key(|(change, _src)| change.actor_id);
 
     let mut conn = agent.pool().write_normal().await?;
+
+    let mut partials = BTreeMap::new();
+
+    block_in_place(|| {
+        let tx = conn.transaction()?;
+        for (change, src, queued_at) in changes {
+            histogram!("corro.agent.changes.queued.seconds").record(queued_at.elapsed());
+            let versions = change.versions();
+            let seqs = change.seqs();
+            if !seen.insert((change.actor_id, versions, seqs.cloned())) {
+                continue;
+            }
+
+            match &change.changeset {
+                Changeset::Empty { versions } => {
+                    let ranges = tx
+                        .prepare_cached(
+                            "
+                    SELECT start_version, coalesce(end_version, start_version)
+                        FROM __corro_bookkeeping
+                        WHERE actor_id = :actor_id AND
+                        (
+                            -- start_version is between start and end of range AND no end_version
+                            ( start_version BETWEEN :start AND :end AND end_version IS NULL ) OR
+                            
+                            -- start_version and end_version are within the range
+                            ( start_version >= :start AND end_version <= :end ) OR
+        
+                            -- range being inserted is partially contained within another
+                            ( start_version <= :end AND end_version >= :end )
+                        )",
+                        )?
+                        .query_map(
+                            named_params![
+                                ":actor_id": change.actor_id,
+                                ":start": versions.start(),
+                                ":end": versions.end(),
+                            ],
+                            |row| Ok(row.get(0)?..=row.get(1)?),
+                        )?
+                        .collect::<Result<RangeInclusiveSet<Version>, _>>()?;
+
+                    // insert every gap in the unknown changes to process
+                    for gap in ranges.gaps(versions) {
+                        unknown_changes.push((
+                            ChangeV1 {
+                                actor_id: change.actor_id,
+                                changeset: Changeset::Empty { versions: gap },
+                            },
+                            src,
+                        ));
+                    }
+                }
+                Changeset::Full {
+                    version,
+                    changes,
+                    seqs,
+                    last_seq,
+                    ts,
+                } => {
+                    let exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_bookkeeping WHERE actor_id = :actor_id AND :version BETWEEN start_version AND COALESCE(end_version, start_version))")?.query_row(named_params![
+                        ":actor_id": change.actor_id,
+                        ":version": version,
+                    ],|row| row.get(0))?;
+
+                    if exists {
+                        continue;
+                    }
+
+                    let ranges = tx
+                        .prepare_cached(
+                            "
+                    SELECT start_seq, coalesce(end_seq, start_seq)
+                        FROM __corro_seq_bookkeeping
+                        WHERE site_id = :actor_id AND
+                        (
+                            -- start_version is between start and end of range AND no end_version
+                            ( start_seq BETWEEN :start AND :end AND end_seq IS NULL ) OR
+                            
+                            -- start_seq and end_seq are within the range
+                            ( start_seq >= :start AND end_seq <= :end ) OR
+        
+                            -- range being inserted is partially contained within another
+                            ( start_seq <= :end AND end_seq >= :end )
+                        )",
+                        )?
+                        .query_map(
+                            named_params![
+                                ":actor_id": change.actor_id,
+                                ":start": seqs.start(),
+                                ":end": seqs.end(),
+                            ],
+                            |row| Ok(row.get(0)?..=row.get(1)?),
+                        )?
+                        .collect::<Result<RangeInclusiveSet<CrsqlSeq>, _>>()?;
+
+                        partials.insert((change.actor_id, *version), ranges.clone());
+
+                    if !ranges.is_empty() {
+                        for gap in ranges.gaps(seqs) {
+                            unknown_changes.push((
+                                ChangeV1 {
+                                    actor_id: change.actor_id,
+                                    changeset: Changeset::Full {
+                                        version: *version,
+                                        changes: changes
+                                            .iter()
+                                            .filter_map(|change| {
+                                                if gap.contains(&change.seq) {
+                                                    Some(change.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .collect(),
+                                        seqs: gap,
+                                        last_seq: *last_seq,
+                                        ts: *ts,
+                                    },
+                                },
+                                src,
+                            ));
+                        }
+
+                        continue;
+                    }
+
+                    // if we're here, we need to handle this change
+                    unknown_changes.push((change, src));
+                }
+            }
+        }
+
+        Ok::<_, rusqlite::Error>(())
+    }).map_err(|e| ChangeError::Rusqlite{source: e, actor_id: None, version: None})?;
+
+    unknown_changes.sort_by_key(|(change, _src)| change.actor_id);
 
     let changesets = block_in_place(|| {
         let start = Instant::now();
@@ -1187,32 +1325,12 @@ pub async fn process_multiple_changes(
             .group_by(|(change, _src)| change.actor_id)
             .into_iter()
         {
-            // get a lock on the actor id's booked writer if we didn't already
             {
-                let booked = {
-                    bookie
-                        .blocking_write(format!(
-                            "process_multiple_changes(for_actor_blocking):{}",
-                            actor_id.as_simple()
-                        ))
-                        .ensure(actor_id)
-                };
-                let booked_write = booked.blocking_write(format!(
-                    "process_multiple_changes(booked writer):{}",
-                    actor_id.as_simple()
-                ));
-
                 let mut seen = RangeInclusiveMap::new();
 
                 for (change, src) in changes {
                     trace!("handling a single changeset: {change:?}");
                     let seqs = change.seqs();
-                    if booked_write.contains_all(change.versions(), change.seqs()) {
-                        trace!(
-                            "previously unknown versions are now deemed known, aborting inserts"
-                        );
-                        continue;
-                    }
 
                     let versions = change.versions();
 
@@ -1337,38 +1455,28 @@ pub async fn process_multiple_changes(
         debug!("committed {count} changes in {:?}", start.elapsed());
 
         for (actor_id, knowns) in knowns {
-            let booked = {
-                bookie
-                    .blocking_write(format!(
-                        "process_multiple_changes(for_actor_blocking):{}",
-                        actor_id.as_simple()
-                    ))
-                    .ensure(actor_id)
-            };
-            let mut booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer, post commit):{}",
-                actor_id.as_simple()
-            ));
-
             for (versions, known) in knowns {
                 let version = *versions.start();
-                // this merges partial version seqs
-                if let Some(PartialVersion { seqs, last_seq, .. }) =
-                    booked_write.insert_many(versions, known)
-                {
-                    let full_seqs_range = CrsqlSeq(0)..=last_seq;
-                    let gaps_count = seqs.gaps(&full_seqs_range).count();
-                    if gaps_count == 0 {
-                        // if we have no gaps, then we can schedule applying all these changes.
-                        debug!(%actor_id, %version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
-                        let tx_apply = agent.tx_apply().clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = tx_apply.send((actor_id, version)).await {
-                                error!("could not send trigger for applying fully buffered changes later: {e}");
-                            }
-                        });
-                    } else {
-                        debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs");
+
+                if let KnownDbVersion::Partial(pversion) = known {
+                    if let Some(ranges) = partials.get_mut(&(actor_id, version)) {
+                        ranges.extend(pversion.seqs);
+
+                        let full_seqs_range = CrsqlSeq(0)..=pversion.last_seq;
+                        let gaps_count = ranges.gaps(&full_seqs_range).count();
+
+                        if gaps_count == 0 {
+                            // if we have no gaps, then we can schedule applying all these changes.
+                            debug!(%actor_id, %version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {ranges:?}, expected full seqs: {full_seqs_range:?}");
+                            let tx_apply = agent.tx_apply().clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tx_apply.send((actor_id, version)).await {
+                                    error!("could not send trigger for applying fully buffered changes later: {e}");
+                                }
+                            });
+                        } else {
+                            debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs");
+                        }
                     }
                 }
             }
@@ -1378,7 +1486,7 @@ pub async fn process_multiple_changes(
     })?;
 
     let mut change_chunk_size = 0;
-    
+
     for (_actor_id, changeset, db_version, _src) in changesets {
         change_chunk_size += changeset.changes().len();
         agent
