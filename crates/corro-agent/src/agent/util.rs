@@ -300,25 +300,24 @@ pub async fn clear_overwritten_versions(
                     }
                 }
 
-                // find any affected cleared ranges
-                for range in to_clear
+                let mut empties: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
+
+                // find and batch any affected cleared ranges
+                to_clear
                     .iter()
                     .filter_map(|(_, v)| bookedw.cleared.get(v))
                     .dedup()
-                {
-                    // schedule for clearing in the background task
-                    if let Err(e) = agent.tx_empty().send((actor_id, range.clone())).await {
-                        error!("could not schedule version to be cleared: {e}");
-                        if let Some(ref tx) = feedback {
-                            tx.send(format!("failed to get queue compaction set: {e}"))
-                                .await
-                                .map_err(|e| format!("{e}"))?;
-                        }
-                    } else {
+                    .for_each(|range| {
+                        empties.entry(actor_id).or_default().insert(range.clone());
                         inserted += 1;
-                    }
+                    });
 
-                    tokio::task::yield_now().await;
+                if let Err(e) = process_completed_empties(agent.clone(), empties).await {
+                    if let Some(ref tx) = feedback {
+                        tx.send(format!("Could not process empties: {e}"))
+                            .await
+                            .map_err(|e| format!("failed to send{e}"))?;
+                    }
                 }
 
                 if let Some(ref tx) = feedback {
@@ -326,13 +325,18 @@ pub async fn clear_overwritten_versions(
                         .await
                         .map_err(|e| format!("{e}"))?;
                 }
+
+                tokio::task::yield_now().await;
             }
         }
 
         if let Some(ref tx) = feedback {
-            tx.send(format!("Finshed compacting changes for {actor_id}"))
-                .await
-                .map_err(|e| format!("{e}"))?;
+            tx.send(format!(
+                "Finshed compacting changes for {actor_id}, resulting in {} deleted rows",
+                deleted - inserted
+            ))
+            .await
+            .map_err(|e| format!("{e}"))?;
         }
 
         tokio::time::sleep(Duration::from_secs(1)).await;
