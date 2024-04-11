@@ -834,7 +834,11 @@ pub async fn process_completed_empties(
         let v = empties.into_iter().collect::<Vec<_>>();
 
         for ranges in v.chunks(25) {
-            let mut conn = agent.pool().write_low().await?;
+            let mut conn = if trace {
+                agent.pool().write_priority().await?
+            } else {
+                agent.pool().write_low().await?
+            };
             block_in_place(|| {
                 if trace {
                     debug!("empties: Getting an immediate transaction now...");
