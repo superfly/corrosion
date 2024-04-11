@@ -787,6 +787,8 @@ pub async fn write_empties_loop(
 
         let empties_to_process = std::mem::take(&mut empties);
 
+        debug!("Scheduling {} empties ranges to clear", empties_to_process.len());
+        
         // TODO: replace with a JoinSet and max concurrency
         spawn_counted(
             process_completed_empties(agent.clone(), empties_to_process)
@@ -828,12 +830,16 @@ pub async fn process_completed_empties(
         for ranges in v.chunks(25) {
             let mut conn = agent.pool().write_low().await?;
             block_in_place(|| {
+                debug!("empties: Getting an immediate transaction now...");
                 let mut tx = conn.immediate_transaction()?;
 
+                debug!("empties: Got transaction");
+                
                 for range in ranges {
                     let mut sp = tx.savepoint()?;
                     match store_empty_changeset(&sp, actor_id, range.clone()) {
                         Ok(count) => {
+                            debug!("empties: inserted {count} thingies");
                             inserted += count;
                             sp.commit()?;
                         }
