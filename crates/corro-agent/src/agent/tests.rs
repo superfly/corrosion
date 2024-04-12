@@ -698,7 +698,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
     let ta3_transport = Transport::new(&ta3.agent.config().gossip, rtt_tx.clone()).await?;
     let ta4_transport = Transport::new(&ta4.agent.config().gossip, rtt_tx.clone()).await?;
 
-    for _ in 0..4 {
+    for _ in 0..6 {
         let res = parallel_sync(
             &ta2.agent,
             &ta2_transport,
@@ -738,7 +738,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     let mut ta_counts = vec![];
 
