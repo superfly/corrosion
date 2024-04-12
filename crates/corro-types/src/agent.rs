@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
@@ -30,7 +30,7 @@ use tokio::{
     sync::{oneshot, Semaphore},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use tripwire::Tripwire;
 
 use crate::{
@@ -252,9 +252,25 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         Box::new(create_corro_subs as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(refactor_corro_members as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(crsqlite_v0_16_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(create_bookkeeping_gaps as fn(&Transaction) -> rusqlite::Result<()>),
     ];
 
     crate::sqlite::migrate(conn, migrations)
+}
+
+fn create_bookkeeping_gaps(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+        -- store known needed versions
+        CREATE TABLE __corro_bookkeeping_gaps (
+            actor_id BLOB NOT NULL,
+            start INTEGER NOT NULL,
+            end INTEGER NOT NULL,
+
+            PRIMARY KEY (actor_id, start)
+        ) WITHOUT ROWID;
+    "#,
+    )
 }
 
 // since crsqlite 0.16, site_id is NOT NULL in clock tables
@@ -645,19 +661,6 @@ impl DerefMut for WriteConn {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum KnownDbVersion {
-    Partial(PartialVersion),
-    Current(CurrentVersion),
-    Cleared,
-}
-
-impl KnownDbVersion {
-    pub fn is_cleared(&self) -> bool {
-        matches!(self, KnownDbVersion::Cleared)
-    }
-}
-
 pub struct CountedTokioRwLock<T> {
     registry: LockRegistry,
     lock: Arc<TokioRwLock<T>>,
@@ -996,16 +999,6 @@ impl Drop for LockTracker {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CurrentVersion {
-    // cr-sqlite db version
-    pub db_version: CrsqlDbVersion,
-    // actual last sequence originally produced
-    pub last_seq: CrsqlSeq,
-    // timestamp when the change was produced by the source
-    pub ts: Timestamp,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PartialVersion {
     // range of sequences recorded
     pub seqs: RangeInclusiveSet<CrsqlSeq>,
@@ -1015,50 +1008,67 @@ pub struct PartialVersion {
     pub ts: Timestamp,
 }
 
-impl From<PartialVersion> for KnownDbVersion {
-    fn from(partial: PartialVersion) -> Self {
-        KnownDbVersion::Partial(partial)
-    }
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CurrentVersion {
+    pub db_version: CrsqlDbVersion,
+    pub last_seq: CrsqlSeq,
+    pub ts: Timestamp,
 }
 
-#[derive(Debug)]
-pub enum KnownVersion<'a> {
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum KnownDbVersion {
     Cleared,
-    Current(&'a CurrentVersion),
-    Partial(&'a PartialVersion),
+    Current(CurrentVersion),
+    Partial(PartialVersion),
 }
 
-impl<'a> KnownVersion<'a> {
-    pub fn is_cleared(&self) -> bool {
-        matches!(self, KnownVersion::Cleared)
-    }
-}
-
-impl<'a> From<KnownVersion<'a>> for KnownDbVersion {
-    fn from(value: KnownVersion<'a>) -> Self {
-        match value {
-            KnownVersion::Cleared => KnownDbVersion::Cleared,
-            KnownVersion::Current(current) => KnownDbVersion::Current(current.clone()),
-            KnownVersion::Partial(partial) => KnownDbVersion::Partial(partial.clone()),
-        }
-    }
-}
-
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct BookedVersions {
-    pub cleared: RangeInclusiveSet<Version>,
-    pub current: BTreeMap<Version, CurrentVersion>,
+    actor_id: ActorId,
     pub partials: BTreeMap<Version, PartialVersion>,
     sync_need: RangeInclusiveSet<Version>,
     last: Option<Version>,
 }
 
 impl BookedVersions {
+    pub fn new(actor_id: ActorId) -> Self {
+        Self {
+            actor_id,
+            partials: Default::default(),
+            sync_need: Default::default(),
+            last: Default::default(),
+        }
+    }
+
+    pub fn persist(&self, conn: &mut Connection) -> rusqlite::Result<()> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let affected = tx
+            .prepare_cached("DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?")?
+            .execute([self.actor_id])?;
+        info!("deleted {affected} __corro_bookkeeping_gaps rows");
+
+        let mut inserted = 0;
+        for range in self.sync_need.iter() {
+            tx.prepare_cached(
+                "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?, ?, ?)",
+            )?
+            .execute(params![self.actor_id, range.start(), range.end()])?;
+            inserted += 1;
+        }
+
+        info!("inserted {inserted} __corro_bookkeeping_gaps rows");
+
+        tx.commit()?;
+
+        Ok(())
+    }
+
     pub fn from_conn(conn: &Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
-        let mut bv = Self::default();
-        let mut prepped = conn.prepare_cached(
-            "SELECT start_version, end_version, db_version, last_seq, ts FROM __corro_bookkeeping WHERE actor_id = ?",
-        )?;
+        let mut bv = BookedVersions::new(actor_id);
+
+        let mut prepped = conn
+            .prepare_cached("SELECT start, end FROM __corro_bookkeeping_gaps WHERE actor_id = ?")?;
         let mut rows = prepped.query([actor_id])?;
 
         loop {
@@ -1067,21 +1077,20 @@ impl BookedVersions {
                 None => break,
                 Some(row) => {
                     let start_v = row.get(0)?;
-                    let end_v: Option<Version> = row.get(1)?;
-                    bv.insert_many(
-                        start_v..=end_v.unwrap_or(start_v),
-                        match row.get(2)? {
-                            Some(db_version) => KnownDbVersion::Current(CurrentVersion {
-                                db_version,
-                                last_seq: row.get(3)?,
-                                ts: row.get(4)?,
-                            }),
-                            None => KnownDbVersion::Cleared,
-                        },
-                    );
+                    let end_v = row.get(1)?;
+
+                    bv.sync_need.insert(start_v..=end_v);
                 }
             }
         }
+
+        // fetch the biggest version we know (for now)
+        bv.last = conn
+            .prepare_cached(
+                "SELECT MAX(start_version) FROM __corro_bookkeeping WHERE actor_id = ?",
+            )?
+            .query_row([actor_id], |row| row.get(0))
+            .optional()?;
 
         let mut prepped = conn.prepare_cached(
             "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
@@ -1092,18 +1101,17 @@ impl BookedVersions {
             let row = rows.next()?;
             match row {
                 None => break,
-                Some(row) => match bv.partials.entry(row.get(0)?) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(PartialVersion {
+                Some(row) => {
+                    let version = row.get(0)?;
+                    bv.insert(
+                        version,
+                        KnownDbVersion::Partial(PartialVersion {
                             seqs: RangeInclusiveSet::from_iter(vec![row.get(1)?..=row.get(2)?]),
                             last_seq: row.get(3)?,
                             ts: row.get(4)?,
-                        });
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        entry.get_mut().seqs.insert(row.get(1)?..=row.get(2)?);
-                    }
-                },
+                        }),
+                    );
+                }
             }
         }
 
@@ -1111,28 +1119,22 @@ impl BookedVersions {
     }
 
     pub fn contains_version(&self, version: &Version) -> bool {
-        self.cleared.contains(version)
-            || self.current.contains_key(version)
+        !self.sync_need.contains(version) && &self.last.unwrap_or_default() >= version
             || self.partials.contains_key(version)
     }
 
-    pub fn get(&self, version: &Version) -> Option<KnownVersion> {
-        self.cleared
-            .get(version)
-            .map(|_| KnownVersion::Cleared)
-            .or_else(|| self.current.get(version).map(KnownVersion::Current))
-            .or_else(|| self.partials.get(version).map(KnownVersion::Partial))
+    pub fn get_partial(&self, version: &Version) -> Option<&PartialVersion> {
+        self.partials.get(version)
     }
 
     pub fn contains(&self, version: Version, seqs: Option<&RangeInclusive<CrsqlSeq>>) -> bool {
         self.contains_version(&version)
             && seqs
-                .map(|check_seqs| match self.get(&version) {
-                    Some(KnownVersion::Cleared) | Some(KnownVersion::Current(_)) => true,
-                    Some(KnownVersion::Partial(partial)) => {
-                        check_seqs.clone().all(|seq| partial.seqs.contains(&seq))
-                    }
-                    None => false,
+                .map(|check_seqs| match self.partials.get(&version) {
+                    Some(partial) => check_seqs.clone().all(|seq| partial.seqs.contains(&seq)),
+                    // if `contains_version` is true but we don't have a partial version,
+                    // then we must have it as a fully applied or cleared version
+                    None => true,
                 })
                 .unwrap_or(true)
     }
@@ -1145,53 +1147,26 @@ impl BookedVersions {
         versions.all(|version| self.contains(version, seqs))
     }
 
-    pub fn contains_current(&self, version: &Version) -> bool {
-        self.current.contains_key(version)
-    }
-
-    pub fn current_versions(&self) -> BTreeMap<CrsqlDbVersion, Version> {
-        self.current
-            .iter()
-            .map(|(version, current)| (current.db_version, *version))
-            .collect()
-    }
-
     pub fn last(&self) -> Option<Version> {
         self.last
     }
 
-    pub fn insert(&mut self, version: Version, known_version: KnownDbVersion) {
-        self.insert_many(version..=version, known_version);
-    }
-
-    pub fn insert_many(
+    pub fn insert(
         &mut self,
-        versions: RangeInclusive<Version>,
+        version: Version,
         known_version: KnownDbVersion,
     ) -> Option<PartialVersion> {
         let ret = match known_version {
-            KnownDbVersion::Partial(partial) => {
-                Some(match self.partials.entry(*versions.start()) {
-                    btree_map::Entry::Vacant(entry) => entry.insert(partial).clone(),
-                    btree_map::Entry::Occupied(mut entry) => {
-                        let got = entry.get_mut();
-                        got.seqs.extend(partial.seqs);
-                        got.clone()
-                    }
-                })
-            }
-            KnownDbVersion::Current(current) => {
-                let version = *versions.start();
-                self.partials.remove(&version);
-                self.current.insert(version, current);
-                None
-            }
-            KnownDbVersion::Cleared => {
-                for version in versions.clone() {
-                    self.partials.remove(&version);
-                    self.current.remove(&version);
+            KnownDbVersion::Partial(partial) => Some(match self.partials.entry(version) {
+                btree_map::Entry::Vacant(entry) => entry.insert(partial).clone(),
+                btree_map::Entry::Occupied(mut entry) => {
+                    let got = entry.get_mut();
+                    got.seqs.extend(partial.seqs);
+                    got.clone()
                 }
-                self.cleared.insert(versions.clone());
+            }),
+            _ => {
+                self.partials.remove(&version);
                 None
             }
         };
@@ -1199,18 +1174,15 @@ impl BookedVersions {
         // update last known version
         let old_last = self
             .last
-            .replace(std::cmp::max(
-                *versions.end(),
-                self.last.unwrap_or_default(),
-            ))
+            .replace(std::cmp::max(version, self.last.unwrap_or_default()))
             .unwrap_or_default();
 
-        if old_last < *versions.start() {
+        if old_last < version {
             // add these as needed!
-            self.sync_need.insert((old_last + 1)..=*versions.start());
+            self.sync_need.insert((old_last + 1)..=version);
         }
 
-        self.sync_need.remove(versions);
+        self.sync_need.remove(version..=version);
 
         ret
     }
@@ -1286,7 +1258,7 @@ impl BookieInner {
             .or_insert_with(|| {
                 Booked(Arc::new(CountedTokioRwLock::new(
                     self.registry.clone(),
-                    Default::default(),
+                    BookedVersions::new(actor_id),
                 )))
             })
             .clone()

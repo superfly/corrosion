@@ -8,9 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::{BufMut, BytesMut};
 use compact_str::format_compact;
 use corro_types::actor::ClusterId;
-use corro_types::agent::{
-    Agent, CurrentVersion, KnownDbVersion, KnownVersion, PartialVersion, SplitPool,
-};
+use corro_types::agent::{Agent, PartialVersion, SplitPool};
 use corro_types::base::{CrsqlSeq, Version};
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
@@ -28,7 +26,7 @@ use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rand::seq::SliceRandom;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{params, Connection};
+use rusqlite::{named_params, params, Connection, OptionalExtension};
 use speedy::Writable;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{self, unbounded_channel, Sender};
@@ -357,47 +355,54 @@ fn handle_known_version(
     conn: &mut Connection,
     actor_id: ActorId,
     version: Version,
-    init_known: KnownDbVersion,
+    init_known: Option<PartialVersion>,
     booked: &Booked,
     seqs_needed: Vec<RangeInclusive<CrsqlSeq>>,
-    last_seq: CrsqlSeq,
-    ts: Timestamp,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
     debug!(%actor_id, %version, "handle known version! known: {init_known:?}, seqs_needed: {seqs_needed:?}");
+
     let mut seqs_iter = seqs_needed.into_iter();
     while let Some(range_needed) = seqs_iter.by_ref().next() {
         match &init_known {
-            KnownDbVersion::Current(CurrentVersion { db_version, .. }) => {
-                let bw = booked.blocking_write(format_compact!(
-                    "sync_handle_known[{version}]:{}",
-                    actor_id.as_simple()
-                ));
-                match bw.get(&version) {
-                    Some(known) => {
-                        // a current version cannot go back to a partial version
-                        if known.is_cleared() {
-                            debug!(%actor_id, %version, "in-memory bookkeeping has been cleared, aborting.");
-                            break;
-                        }
-                    }
-                    None => {
-                        warn!(%actor_id, %version, "in-memory bookkeeping vanished, aborting.");
-                        break;
-                    }
-                }
-
+            // we either haev cleared this version or we have it fully, NOT A PARTIAL!
+            None => {
                 // this is a read transaction!
                 let tx = conn.transaction()?;
 
+                let last_seq_ts: Option<(CrsqlSeq, Timestamp)> = tx.prepare_cached("SELECT last_seq, ts FROM __corro_bookkeeping WHERE actor_id = :actor_id AND start_version = :version")?.query_row(
+                    named_params! {
+                        ":actor_id": actor_id,
+                        ":version": version
+                    },
+                    |row| Ok((row.get(0)?, row.get(1)?))
+                ).optional()?;
+
+                let (last_seq, ts) = match last_seq_ts {
+                    None => {
+                        // empty version!
+                        sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(
+                            ChangeV1 {
+                                actor_id,
+                                changeset: Changeset::Empty {
+                                    versions: version..=version,
+                                },
+                            },
+                        )))?;
+                        continue;
+                    }
+                    Some(res) => res,
+                };
+
                 let mut prepped = tx.prepare_cached(
                     r#"
-                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                        FROM crsql_changes
-                        WHERE site_id = ?
-                        AND db_version = ?
-                        AND seq >= ? AND seq <= ?
-                        ORDER BY seq ASC
+                    SELECT c."table", c.pk, c.cid, c.val, c.col_version, c.db_version, c.seq, c.site_id, c.cl
+                        FROM __corro_bookkeeping AS bk
+                        INNER JOIN crsql_changes AS c ON c.site_id = bk.actor_id AND c.db_version = bk.db_version
+                        WHERE bk.actor_id = :actor_id
+                          AND bk.start_version = :version
+                          AND c.seq >= :start_seq AND c.seq <= :end_seq
+                        ORDER BY c.seq ASC
                 "#,
                 )?;
 
@@ -405,12 +410,14 @@ fn handle_known_version(
                 let end_seq = range_needed.end();
 
                 let rows = prepped.query_map(
-                    params![actor_id, db_version, start_seq, end_seq],
+                    named_params! {
+                        ":actor_id": actor_id,
+                        ":version": version,
+                        ":start_seq": start_seq,
+                        ":end_seq": end_seq
+                    },
                     row_to_change,
                 )?;
-
-                // drop write lock!
-                drop(bw);
 
                 send_change_chunks(
                     sender,
@@ -421,7 +428,7 @@ fn handle_known_version(
                     ts,
                 )?;
             }
-            KnownDbVersion::Partial(PartialVersion { seqs, .. }) => {
+            Some(PartialVersion { seqs, .. }) => {
                 let mut partial_seqs = seqs.clone();
                 let mut range_needed = range_needed.clone();
 
@@ -452,33 +459,25 @@ fn handle_known_version(
                             "sync_handle_known(partial)[{version}]:{}",
                             actor_id.as_simple()
                         ));
-                        let maybe_current_version = match bw.get(&version) {
-                            Some(known) => match known {
-                                KnownVersion::Partial(PartialVersion { seqs, .. }) => {
-                                    if seqs != &partial_seqs {
-                                        warn!(%actor_id, %version, "different partial sequences, updating! range_needed: {range_needed:?}");
-                                        partial_seqs = seqs.clone();
-                                        if let Some(new_start_seq) = last_sent_seq.take() {
-                                            range_needed =
-                                                (new_start_seq + 1)..=*range_needed.end();
-                                        }
-                                        continue 'outer;
-                                    }
-                                    None
+
+                        let still_partial = if let Some(PartialVersion { seqs, .. }) =
+                            bw.get_partial(&version)
+                        {
+                            if seqs != &partial_seqs {
+                                warn!(%actor_id, %version, "different partial sequences, updating! range_needed: {range_needed:?}");
+                                partial_seqs = seqs.clone();
+                                if let Some(new_start_seq) = last_sent_seq.take() {
+                                    range_needed = (new_start_seq + 1)..=*range_needed.end();
                                 }
-                                known @ KnownVersion::Current(_) => Some(known.into()),
-                                KnownVersion::Cleared => {
-                                    debug!(%actor_id, %version, "in-memory bookkeeping has been cleared, aborting.");
-                                    break;
-                                }
-                            },
-                            None => {
-                                warn!(%actor_id, %version, "in-memory bookkeeping vanished!");
-                                break;
+                                continue 'outer;
                             }
+                            true
+                        } else {
+                            // not a partial anymore
+                            false
                         };
 
-                        if let Some(current) = maybe_current_version {
+                        if !still_partial {
                             warn!(%actor_id, %version, "switched from partial to current version");
 
                             // drop write lock
@@ -496,11 +495,9 @@ fn handle_known_version(
                                 conn,
                                 actor_id,
                                 version,
-                                current,
+                                None,
                                 booked,
                                 seqs_needed,
-                                last_seq,
-                                ts,
                                 sender,
                             );
                         }
@@ -509,12 +506,15 @@ fn handle_known_version(
                         let tx = conn.transaction()?;
 
                         // first check if we do have the sequence...
-                        let still_exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ? AND start_seq <= ? AND end_seq >= ?)")?.query_row(params![actor_id, version, start_seq, end_seq], |row| row.get(0))?;
+                        let last_seq_ts: Option<(CrsqlSeq, Timestamp)> = tx.prepare_cached("SELECT last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ? AND start_seq <= ? AND end_seq >= ?")?.query_row(params![actor_id, version, start_seq, end_seq], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
 
-                        if !still_exists {
-                            warn!(%actor_id, %version, "seqs bookkeeping indicated buffered changes were gone, aborting!");
-                            break 'outer;
-                        }
+                        let (last_seq, ts) = match last_seq_ts {
+                            None => {
+                                warn!(%actor_id, %version, "seqs bookkeeping indicated buffered changes were gone, aborting!");
+                                break 'outer;
+                            }
+                            Some(res) => res,
+                        };
 
                         // the data is still valid because we just checked __corro_seq_bookkeeping and
                         // we're in a transaction (of "read" type since the first select)
@@ -557,7 +557,6 @@ fn handle_known_version(
                     break;
                 }
             }
-            KnownDbVersion::Cleared => unreachable!(),
         }
     }
 
@@ -569,25 +568,29 @@ async fn process_version(
     pool: &SplitPool,
     actor_id: ActorId,
     version: Version,
-    known_version: KnownDbVersion,
+    known_version: Option<PartialVersion>,
     booked: &Booked,
     mut seqs_needed: Vec<RangeInclusive<CrsqlSeq>>,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
     let mut conn = pool.read().await?;
 
-    let (last_seq, ts) = {
-        let (last_seq, ts) = match &known_version {
-            KnownDbVersion::Current(CurrentVersion { last_seq, ts, .. }) => (*last_seq, *ts),
-            KnownDbVersion::Partial(PartialVersion { last_seq, ts, .. }) => (*last_seq, *ts),
-            KnownDbVersion::Cleared => return Ok(()),
-        };
-        if seqs_needed.is_empty() {
-            seqs_needed = vec![(CrsqlSeq(0)..=last_seq)];
-        }
+    // let (last_seq, ts) = {
+    //     let (last_seq, ts) = match &known_version {
+    //         KnownDbVersion::Current(CurrentVersion { last_seq, ts, .. }) => (*last_seq, *ts),
+    //         Some(PartialVersion { last_seq, ts, .. }) => (*last_seq, *ts),
+    //         KnownDbVersion::Cleared => return Ok(()),
+    //     };
+    //     if seqs_needed.is_empty() {
+    //         seqs_needed = vec![(CrsqlSeq(0)..=last_seq)];
+    //     }
 
-        (last_seq, ts)
-    };
+    //     (last_seq, ts)
+    // };
+
+    if seqs_needed.is_empty() {
+        seqs_needed = vec![(CrsqlSeq(0)..=CrsqlSeq(u32::MAX as u64))];
+    }
 
     block_in_place(|| {
         handle_known_version(
@@ -597,8 +600,6 @@ async fn process_version(
             known_version,
             booked,
             seqs_needed,
-            last_seq,
-            ts,
             sender,
         )
     })?;
@@ -685,7 +686,7 @@ async fn process_sync(
             6,
         );
 
-    let mut current_haves = vec![];
+    let mut to_process = vec![];
     let mut partial_needs = vec![];
 
     loop {
@@ -717,8 +718,6 @@ async fn process_sync(
                 None => continue,
             };
 
-            let mut cleared: RangeInclusiveSet<Version> = RangeInclusiveSet::new();
-
             {
                 let read = booked.read("process_need(full)").await;
 
@@ -726,64 +725,54 @@ async fn process_sync(
                     match need {
                         SyncNeedV1::Full { versions } => {
                             for version in versions {
-                                match read.get(&version) {
-                                    Some(KnownVersion::Cleared) => {
-                                        cleared.insert(version..=version);
-                                    }
-                                    Some(known) => {
-                                        current_haves.push((version, KnownDbVersion::from(known)));
-                                    }
-                                    None => continue,
+                                if !read.contains_version(&version) {
+                                    continue;
                                 }
+
+                                to_process.push(version);
                             }
                         }
-                        SyncNeedV1::Partial { version, seqs } => match read.get(&version) {
-                            Some(KnownVersion::Cleared) => {
-                                cleared.insert(version..=version);
+                        SyncNeedV1::Partial { version, seqs } => {
+                            if !read.contains_version(&version) {
+                                continue;
                             }
-                            Some(known) => {
-                                partial_needs.push((version, KnownDbVersion::from(known), seqs));
-                            }
-                            None => continue,
-                        },
+
+                            partial_needs.push((
+                                version,
+                                read.get_partial(&version).cloned(),
+                                seqs,
+                            ));
+                        }
                     }
                 }
             }
 
-            for versions in cleared {
-                let sender = sender.clone();
-                if job_tx
-                    .send(Box::pin(async move {
-                        sender
-                            .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                                actor_id,
-                                changeset: Changeset::Empty { versions },
-                            })))
-                            .await
-                            .map_err(eyre::Report::from)
-                    }))
-                    .is_err()
-                {
-                    eyre::bail!("could not send into job channel");
-                }
-            }
+            // for versions in cleared {
+            //     let sender = sender.clone();
+            //     if job_tx
+            //         .send(Box::pin(async move {
+            //             sender
+            //                 .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+            //                     actor_id,
+            //                     changeset: Changeset::Empty { versions },
+            //                 })))
+            //                 .await
+            //                 .map_err(eyre::Report::from)
+            //         }))
+            //         .is_err()
+            //     {
+            //         eyre::bail!("could not send into job channel");
+            //     }
+            // }
 
-            for (version, known_version) in current_haves.drain(..) {
+            for version in to_process.drain(..) {
                 let pool = pool.clone();
                 let booked = booked.clone();
                 let sender = sender.clone();
                 if job_tx
                     .send(Box::pin(async move {
-                        process_version(
-                            &pool,
-                            actor_id,
-                            version,
-                            known_version,
-                            &booked,
-                            vec![],
-                            &sender,
-                        )
-                        .await
+                        process_version(&pool, actor_id, version, None, &booked, vec![], &sender)
+                            .await
                     }))
                     .is_err()
                 {
@@ -1562,7 +1551,6 @@ mod tests {
     };
     use hyper::StatusCode;
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
     use tripwire::Tripwire;
 
     use crate::{
@@ -1597,7 +1585,23 @@ mod tests {
 
         let actor_id = ActorId(uuid::Uuid::new_v4());
 
-        let ts = agent.clock().new_timestamp().into();
+        let ts: Timestamp = agent.clock().new_timestamp().into();
+
+        let ts_str = ts.to_string();
+        println!(
+            "TS: {ts_str} {} {ts:?} ({}.{})",
+            ts.0 .0,
+            ts.0.to_duration().as_secs(),
+            ts.0.to_duration().subsec_nanos()
+        );
+        let parsed: uhlc::NTP64 = ts_str.parse().unwrap();
+        println!(
+            "TS: {parsed} {} {:?} ({}.{})",
+            parsed.0,
+            Timestamp(parsed),
+            parsed.to_duration().as_secs(),
+            parsed.to_duration().subsec_nanos()
+        );
 
         let change1 = Change {
             table: TableName("tests".into()),
@@ -1661,25 +1665,13 @@ mod tests {
         )
         .await?;
 
-        let known1 = KnownDbVersion::Current(CurrentVersion {
-            db_version: CrsqlDbVersion(1),
-            last_seq: CrsqlSeq(0),
-            ts,
-        });
-
-        let known2 = KnownDbVersion::Current(CurrentVersion {
-            db_version: CrsqlDbVersion(2),
-            last_seq: CrsqlSeq(0), // original last seq
-            ts,
-        });
-
         let booked = bookie.read("test").await.get(&actor_id).cloned().unwrap();
 
         {
             let read = booked.read("test").await;
 
-            assert_eq!(KnownDbVersion::from(read.get(&Version(1)).unwrap()), known1);
-            assert_eq!(KnownDbVersion::from(read.get(&Version(2)).unwrap()), known2);
+            assert!(read.contains_version(&Version(1)));
+            assert!(read.contains_version(&Version(2)));
         }
 
         {
@@ -1705,11 +1697,9 @@ mod tests {
                     &mut conn,
                     actor_id,
                     Version(1),
-                    known1,
+                    None,
                     &booked,
                     vec![CrsqlSeq(0)..=CrsqlSeq(0)],
-                    CrsqlSeq(0),
-                    ts,
                     &tx,
                 )
             })?;
@@ -1734,11 +1724,9 @@ mod tests {
                     &mut conn,
                     actor_id,
                     Version(2),
-                    known2,
+                    None,
                     &booked,
                     vec![CrsqlSeq(0)..=CrsqlSeq(0)],
-                    CrsqlSeq(0),
-                    ts,
                     &tx,
                 )
             })?;
@@ -1758,14 +1746,6 @@ mod tests {
                 }))
             );
         }
-
-        // make_broadcastable_change(&agent, |tx| {
-        //     tx.execute("INSERT INTO test (id, text) VALUES (1, \"one\")", [])
-        // })?;
-
-        // make_broadcastable_change(&agent, |tx| {
-        //     tx.execute("INSERT INTO test (id, text) VALUES (2, \"two\")", [])
-        // })?;
 
         Ok(())
     }

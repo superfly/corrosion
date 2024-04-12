@@ -232,7 +232,7 @@ pub enum TimestampParseError {
     Parse(ParseNTP64Error),
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd)]
 #[serde(transparent)]
 pub struct Timestamp(pub NTP64);
 
@@ -248,6 +248,13 @@ impl Timestamp {
 
     pub fn zero() -> Self {
         Timestamp(NTP64(0))
+    }
+}
+
+// formatting to humantime and then parsing again incurs oddness, so lets compare secs and subsec_nanos
+impl PartialEq for Timestamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_secs() == other.0.as_secs() && self.0.subsec_nanos() == other.0.subsec_nanos()
     }
 }
 

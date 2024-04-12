@@ -4,13 +4,14 @@ use camino::Utf8PathBuf;
 use corro_agent::agent::clear_overwritten_versions;
 use corro_types::{
     actor::{ActorId, ClusterId},
-    agent::{Agent, Bookie, KnownVersion, LockKind, LockMeta, LockState},
-    base::Version,
-    broadcast::{FocaCmd, FocaInput},
+    agent::{Agent, Bookie, LockKind, LockMeta, LockState},
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    broadcast::{FocaCmd, FocaInput, Timestamp},
     sqlite::SqlitePoolError,
     sync::generate_sync,
 };
 use futures::{SinkExt, TryStreamExt};
+use rusqlite::{named_params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spawn::spawn_counted;
@@ -388,7 +389,7 @@ async fn handle_conn(
                     send_success(&mut stream).await;
                 }
                 Command::Actor(ActorCommand::Version { actor_id, version }) => {
-                    let json = {
+                    let json: Result<serde_json::Value, rusqlite::Error> = {
                         let bookie = bookie.read("admin actor version").await;
                         let booked = match bookie.get(&actor_id) {
                             Some(booked) => booked,
@@ -399,17 +400,40 @@ async fn handle_conn(
                             }
                         };
                         let booked_read = booked.read("admin actor version booked").await;
-                        match booked_read.get(&version) {
-                            Some(known) => match known {
-                                KnownVersion::Cleared => {
-                                    Ok(serde_json::Value::String("cleared".into()))
+                        if booked_read.contains_version(&version) {
+                            match booked_read.get_partial(&version) {
+                                Some(partial) => {
+                                    Ok(serde_json::json!({"partial": partial}))
+                                    // serde_json::to_value(partial)
+                                    // .map(|v| serde_json::json!({"partial": v}))
+                                },
+                                None => {
+                                    match agent.pool().read().await {
+                                        Ok(conn) => match conn.prepare_cached("SELECT db_version, last_seq, ts FROM __corro_bookkeeping WHERE actor_id = :actor_id AND start_version = :version") {
+                                            Ok(mut prepped) => match prepped.query_row(named_params! {":actor_id": actor_id, ":version": version}, |row| Ok((row.get::<_, Option<CrsqlDbVersion>>(0)?, row.get::<_, Option<CrsqlSeq>>(1)?, row.get::<_, Option<Timestamp>>(2)?))).optional() {
+                                                Ok(Some((Some(db_version), Some(last_seq), Some(ts)))) => {
+                                                    Ok(serde_json::json!({"current": {"db_version": db_version, "last_seq": last_seq, "ts": ts}}))
+                                                },
+                                                Ok(_) => {
+                                                    Ok(serde_json::Value::String("cleared".into()))
+                                                }
+                                                Err(e) => {
+                                                    Err(e)
+                                                }
+                                            },
+                                            Err(e) => {
+                                                Err(e)
+                                            }
+                                        },
+                                        Err(e) => {
+                                            _ = send_error(&mut stream, e).await;
+                                            continue;
+                                        }
+                                    }
                                 }
-                                KnownVersion::Current(known) => serde_json::to_value(known)
-                                    .map(|v| serde_json::json!({"current": v})),
-                                KnownVersion::Partial(known) => serde_json::to_value(known)
-                                    .map(|v| serde_json::json!({"partial": v})),
-                            },
-                            None => Ok(serde_json::Value::Null),
+                            }
+                        } else {
+                            Ok(serde_json::Value::Null)
                         }
                     };
 
