@@ -409,17 +409,18 @@ fn handle_known_version(
                     "#,
                 )?;
 
+                let start_seq = range_needed.start();
+                let end_seq = range_needed.end();
+
                 let rows = prepped.query_map(
                     named_params! {
                         ":actor_id": actor_id,
                         ":version": version,
-                        ":end_seq": last_seq
+                        ":start_seq": start_seq,
+                        ":end_seq": end_seq
                     },
                     row_to_change,
                 )?;
-
-                let start_seq = range_needed.start();
-                let end_seq = range_needed.end();
 
                 send_change_chunks(
                     sender,
