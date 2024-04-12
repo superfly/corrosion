@@ -30,7 +30,7 @@ use tokio::{
     sync::{oneshot, Semaphore},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use tripwire::Tripwire;
 
 use crate::{
@@ -495,6 +495,24 @@ impl SplitPool {
             .max_size(20)
             .create_pool_transform(rusqlite_to_crsqlite)?;
         debug!("built RO pool");
+
+        tokio::spawn({
+            let ro_pool = ro_pool.clone();
+            async move {
+                let mut reap_interval = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    reap_interval.tick().await;
+                    ro_pool.retain(|_, metrics| {
+                        if metrics.last_used() < Duration::from_secs(30) {
+                            info!("Reaping a SQLite read-only connection from the pool");
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+            }
+        });
 
         Ok(Self::new(
             path.as_ref().to_owned(),

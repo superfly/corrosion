@@ -52,6 +52,11 @@ impl Config {
         self
     }
 
+    pub fn queue_mode(mut self, mode: QueueMode) -> Self {
+        self.pool.queue_mode = mode;
+        self
+    }
+
     pub fn create_pool(&self) -> Result<RusqlitePool, CreatePoolError> {
         self.builder(noop_transform)
             .map_err(CreatePoolError::Config)?
