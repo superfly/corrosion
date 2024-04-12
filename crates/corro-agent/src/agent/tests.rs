@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 use spawn::wait_for_all_pending_handles;
 use tokio::time::{sleep, timeout, MissedTickBehavior};
-use tracing::{debug, info_span};
+use tracing::{debug, info_span, warn};
 use tripwire::Tripwire;
 
 use crate::agent::util::*;
@@ -261,7 +261,7 @@ async fn chill_test() -> eyre::Result<()> {
     configurable_stress_test(2, 1, 1).await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stress_test() -> eyre::Result<()> {
     configurable_stress_test(30, 10, 200).await
 }
@@ -409,12 +409,41 @@ pub async fn configurable_stress_test(
 
     println!("expecting {changes_count} ops");
 
+    // tokio::spawn({
+    //     let bookies = agents
+    //         .iter()
+    //         .map(|a| (a.agent.actor_id(), a.bookie.clone()))
+    //         .collect::<Vec<_>>();
+    //     async move {
+    //         loop {
+    //             tokio::time::sleep(Duration::from_secs(1)).await;
+    //             for (actor_id, bookie) in bookies.iter() {
+    //                 let registry = bookie.registry();
+    //                 let r = registry.map.read();
+
+    //                 for v in r.values() {
+    //                     debug!(%actor_id, "GOT A LOCK {v:?}");
+    //                 }
+    //             }
+    //         }
+    //     }
+    // });
+
     let start = Instant::now();
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        interval.tick().await;
+        debug!("looping");
+        for ta in agents.iter() {
+            let registry = ta.bookie.registry();
+            let r = registry.map.read();
+
+            for v in r.values() {
+                warn!(actor_id = %ta.agent.actor_id(), "GOT A LOCK {v:?}");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
         println!("checking status after {}s", start.elapsed().as_secs_f32());
         let mut v = vec![];
         for ta in agents.iter() {
@@ -460,6 +489,8 @@ pub async fn configurable_stress_test(
         {
             break;
         }
+
+        println!("we're not done yet...");
 
         if start.elapsed() > Duration::from_secs(30) {
             let conn = agents[0].agent.pool().read().await?;
