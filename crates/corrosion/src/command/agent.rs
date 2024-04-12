@@ -93,9 +93,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
     };
 
     for (actor_id, booked) in bookie_clone {
-        if let Err(e) =
-            persist_booked_versions(agent.pool(), booked.read("persist").await.deref()).await
-        {
+        if let Err(e) = persist_booked_versions(agent.pool(), &booked).await {
             error!(%actor_id, "could not persist booked versions: {e}");
         }
     }

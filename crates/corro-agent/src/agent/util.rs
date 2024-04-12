@@ -28,8 +28,8 @@ use crate::{
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
-        Agent, BookedVersions, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion,
-        SplitPool,
+        Agent, Booked, BookedVersions, Bookie, ChangeError, CurrentVersion, KnownDbVersion,
+        PartialVersion, SplitPool,
     },
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
@@ -341,8 +341,9 @@ pub async fn clear_overwritten_versions(
     Ok(())
 }
 
-pub async fn persist_booked_versions(pool: &SplitPool, bv: &BookedVersions) -> eyre::Result<()> {
+pub async fn persist_booked_versions(pool: &SplitPool, booked: &Booked) -> eyre::Result<()> {
     let mut conn = pool.write_low().await?;
+    let bv = booked.read("persist").await;
     block_in_place(|| bv.persist(&mut conn))?;
     Ok(())
 }
