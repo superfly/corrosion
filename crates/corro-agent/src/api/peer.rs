@@ -397,23 +397,15 @@ fn handle_known_version(
 
             let mut seqs_iter = seqs_needed.into_iter();
             while let Some(range_needed) = seqs_iter.by_ref().next() {
-                // let mut prepped = tx.prepare_cached(
-                //     r#"
-                //         SELECT c."table", c.pk, c.cid, c.val, c.col_version, c.db_version, c.seq, c.site_id, c.cl
-                //             FROM __corro_bookkeeping AS bk
-                //         INNER JOIN crsql_changes AS c ON c.site_id = bk.actor_id AND c.db_version = bk.db_version
-                //             WHERE bk.actor_id = :actor_id
-                //             AND bk.start_version = :version
-                //             AND c.seq >= :start_seq AND c.seq <= :end_seq
-                //             ORDER BY c.seq ASC
-                //     "#,
-                // )?;
-
                 let mut prepped = tx.prepare_cached(
                     r#"
-                        SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                            FROM crsql_changes WHERE site_id = :actor_id AND db_version IS (SELECT db_version FROM __corro_bookkeeping WHERE actor_id = :actor_id AND start_version = :version) AND seq >= :start_seq AND seq <= :end_seq
-                            ORDER BY seq ASC
+                        SELECT c."table", c.pk, c.cid, c.val, c.col_version, c.db_version, c.seq, c.site_id, c.cl
+                            FROM __corro_bookkeeping AS bk
+                        INNER JOIN crsql_changes AS c ON c.site_id = bk.actor_id AND c.db_version = bk.db_version
+                            WHERE bk.actor_id = :actor_id
+                            AND bk.start_version = :version
+                            AND c.seq >= :start_seq AND c.seq <= :end_seq
+                            ORDER BY c.seq ASC
                     "#,
                 )?;
 
