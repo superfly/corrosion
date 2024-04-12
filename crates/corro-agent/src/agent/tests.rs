@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    ops::Deref,
     time::{Duration, Instant},
 };
 
@@ -12,11 +13,14 @@ use rand::{
 use serde::Deserialize;
 use serde_json::json;
 use spawn::wait_for_all_pending_handles;
-use tokio::time::{sleep, timeout, MissedTickBehavior};
+use tokio::{
+    sync::mpsc,
+    time::{sleep, timeout, MissedTickBehavior},
+};
 use tracing::{debug, info_span, warn};
 use tripwire::Tripwire;
 
-use crate::agent::util::*;
+use crate::{agent::util::*, api::peer::parallel_sync, transport::Transport};
 use corro_tests::*;
 use corro_types::{
     actor::ActorId,
@@ -683,58 +687,93 @@ async fn large_tx_sync() -> eyre::Result<()> {
             .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
     assert_eq!(db_version, CrsqlDbVersion(counts.len() as u64));
 
-    sleep(Duration::from_secs(2)).await;
+    println!("expected count: {expected_count}");
 
-    let ta2 = launch_test_agent(
-        |conf| {
-            conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
-                .build()
-        },
-        tripwire.clone(),
-    )
-    .await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta3 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta4 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
-    sleep(Duration::from_secs(1)).await;
+    let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
+    let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
+    let ta3_transport = Transport::new(&ta3.agent.config().gossip, rtt_tx.clone()).await?;
+    let ta4_transport = Transport::new(&ta4.agent.config().gossip, rtt_tx.clone()).await?;
 
-    let ta3 = launch_test_agent(
-        |conf| {
-            conf.bootstrap(vec![ta2.agent.gossip_addr().to_string()])
-                .build()
-        },
-        tripwire.clone(),
-    )
-    .await?;
+    for _ in 0..4 {
+        let res = parallel_sync(
+            &ta2.agent,
+            &ta2_transport,
+            vec![(ta1.agent.actor_id(), ta1.agent.gossip_addr())],
+            generate_sync(&ta2.bookie, ta2.agent.actor_id()).await,
+        )
+        .await?;
 
-    sleep(Duration::from_secs(1)).await;
+        println!("ta2 synced {res}");
 
-    let ta4 = launch_test_agent(
-        |conf| {
-            conf.bootstrap(vec![ta3.agent.gossip_addr().to_string()])
-                .build()
-        },
-        tripwire.clone(),
-    )
-    .await?;
+        let res = parallel_sync(
+            &ta3.agent,
+            &ta3_transport,
+            vec![
+                (ta1.agent.actor_id(), ta1.agent.gossip_addr()),
+                (ta2.agent.actor_id(), ta2.agent.gossip_addr()),
+            ],
+            generate_sync(&ta3.bookie, ta3.agent.actor_id()).await,
+        )
+        .await?;
 
-    sleep(Duration::from_secs(20)).await;
+        println!("ta3 synced {res}");
 
-    for ta in [ta2, ta3, ta4] {
-        let agent = ta.agent;
+        let res = parallel_sync(
+            &ta4.agent,
+            &ta4_transport,
+            vec![
+                (ta3.agent.actor_id(), ta3.agent.gossip_addr()),
+                (ta2.agent.actor_id(), ta2.agent.gossip_addr()),
+            ],
+            generate_sync(&ta4.bookie, ta4.agent.actor_id()).await,
+        )
+        .await?;
+
+        println!("ta4 synced {res}");
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut ta_counts = vec![];
+
+    for (name, ta) in [("ta2", &ta2), ("ta3", &ta3), ("ta4", &ta4)] {
+        let agent = &ta.agent;
         let conn = agent.pool().read().await?;
 
         let count: u64 = conn
             .prepare_cached("SELECT COUNT(*) FROM testsbool;")?
             .query_row((), |row| row.get(0))?;
 
-        println!("{:#?}", generate_sync(&ta.bookie, agent.actor_id()).await);
+        println!(
+            "{name}: {:#?}",
+            generate_sync(&ta.bookie, agent.actor_id()).await
+        );
+
+        println!(
+            "{name}: bookie: {:?}",
+            ta.bookie
+                .read("test")
+                .await
+                .get(&ta1.agent.actor_id())
+                .unwrap()
+                .read("test")
+                .await
+                .deref()
+        );
 
         if count as usize != expected_count {
-            let buf_count: u64 =
-                conn.query_row("select count(*) from __corro_buffered_changes", [], |row| {
-                    row.get(0)
-                })?;
+            let buf_count: Vec<(Version, u64)> = conn
+                .prepare("select version,count(*) from __corro_buffered_changes group by version")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             println!(
-                "BUFFERED COUNT: {buf_count} (actor_id: {})",
+                "{name}: BUFFERED COUNT: {buf_count:?} (actor_id: {})",
                 agent.actor_id()
             );
 
@@ -742,14 +781,16 @@ async fn large_tx_sync() -> eyre::Result<()> {
                 .prepare("select start_seq, end_seq from __corro_seq_bookkeeping")?
                 .query_map([], |row| Ok(row.get::<_, u64>(0)?..=row.get::<_, u64>(1)?))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            println!("ranges: {ranges:?}");
+            println!("{name}: ranges: {ranges:?}");
         }
 
+        ta_counts.push((name, agent.actor_id(), count as usize));
+    }
+
+    for (name, actor_id, count) in ta_counts {
         assert_eq!(
-            count as usize,
-            expected_count,
-            "actor {} did not reach 10K rows",
-            agent.actor_id()
+            count, expected_count,
+            "{name}: actor {actor_id} did not reach 10K rows",
         );
     }
 

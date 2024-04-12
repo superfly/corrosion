@@ -1022,7 +1022,7 @@ pub enum KnownDbVersion {
     Partial(PartialVersion),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BookedVersions {
     actor_id: ActorId,
     pub partials: BTreeMap<Version, PartialVersion>,

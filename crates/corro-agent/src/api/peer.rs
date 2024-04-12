@@ -367,7 +367,7 @@ fn handle_known_version(
             // this is a read transaction!
             let tx = conn.transaction()?;
 
-            let last_seq_ts: Option<(CrsqlSeq, Timestamp)> = tx.prepare_cached("SELECT last_seq, ts FROM __corro_bookkeeping WHERE actor_id = :actor_id AND start_version = :version")?.query_row(
+            let last_seq_ts: Option<(Option<CrsqlSeq>, Option<Timestamp>)> = tx.prepare_cached("SELECT last_seq, ts FROM __corro_bookkeeping WHERE actor_id = :actor_id AND start_version = :version")?.query_row(
                 named_params! {
                     ":actor_id": actor_id,
                     ":version": version
@@ -376,7 +376,7 @@ fn handle_known_version(
             ).optional()?;
 
             let (last_seq, ts) = match last_seq_ts {
-                None => {
+                None | Some((None, _)) | Some((_, None)) => {
                     // empty version!
                     // TODO: optimize by sending the full range found...
                     sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
@@ -387,7 +387,7 @@ fn handle_known_version(
                     })))?;
                     return Ok(());
                 }
-                Some(res) => res,
+                Some((Some(last_seq), Some(ts))) => (last_seq, ts),
             };
 
             if seqs_needed.is_empty() {
@@ -397,15 +397,23 @@ fn handle_known_version(
 
             let mut seqs_iter = seqs_needed.into_iter();
             while let Some(range_needed) = seqs_iter.by_ref().next() {
+                // let mut prepped = tx.prepare_cached(
+                //     r#"
+                //         SELECT c."table", c.pk, c.cid, c.val, c.col_version, c.db_version, c.seq, c.site_id, c.cl
+                //             FROM __corro_bookkeeping AS bk
+                //         INNER JOIN crsql_changes AS c ON c.site_id = bk.actor_id AND c.db_version = bk.db_version
+                //             WHERE bk.actor_id = :actor_id
+                //             AND bk.start_version = :version
+                //             AND c.seq >= :start_seq AND c.seq <= :end_seq
+                //             ORDER BY c.seq ASC
+                //     "#,
+                // )?;
+
                 let mut prepped = tx.prepare_cached(
                     r#"
-                        SELECT c."table", c.pk, c.cid, c.val, c.col_version, c.db_version, c.seq, c.site_id, c.cl
-                            FROM __corro_bookkeeping AS bk
-                            INNER JOIN crsql_changes AS c ON c.site_id = bk.actor_id AND c.db_version = bk.db_version
-                            WHERE bk.actor_id = :actor_id
-                            AND bk.start_version = :version
-                            AND c.seq >= :start_seq AND c.seq <= :end_seq
-                            ORDER BY c.seq ASC
+                        SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                            FROM crsql_changes WHERE site_id = :actor_id AND db_version IS (SELECT db_version FROM __corro_bookkeeping WHERE actor_id = :actor_id AND start_version = :version) AND seq >= :start_seq AND seq <= :end_seq
+                            ORDER BY seq ASC
                     "#,
                 )?;
 
@@ -491,26 +499,27 @@ fn handle_known_version(
                         if !still_partial {
                             warn!(%actor_id, %version, "switched from partial to current version");
 
-                            // drop write lock
-                            drop(bw);
+                            return Ok(());
+                            // // drop write lock
+                            // drop(bw);
 
-                            // restart the seqs_needed here!
-                            let mut seqs_needed: Vec<RangeInclusive<CrsqlSeq>> =
-                                seqs_iter.collect();
-                            if let Some(new_start_seq) = last_sent_seq.take() {
-                                range_needed = (new_start_seq + 1)..=*range_needed.end();
-                            }
-                            seqs_needed.insert(0, range_needed);
+                            // // restart the seqs_needed here!
+                            // let mut seqs_needed: Vec<RangeInclusive<CrsqlSeq>> =
+                            //     seqs_iter.collect();
+                            // if let Some(new_start_seq) = last_sent_seq.take() {
+                            //     range_needed = (new_start_seq + 1)..=*range_needed.end();
+                            // }
+                            // seqs_needed.insert(0, range_needed);
 
-                            return handle_known_version(
-                                conn,
-                                actor_id,
-                                version,
-                                None,
-                                booked,
-                                seqs_needed,
-                                sender,
-                            );
+                            // return handle_known_version(
+                            //     conn,
+                            //     actor_id,
+                            //     version,
+                            //     None,
+                            //     booked,
+                            //     seqs_needed,
+                            //     sender,
+                            // );
                         }
 
                         // this is a read transaction!
@@ -694,7 +703,7 @@ async fn process_sync(
                                     continue;
                                 }
 
-                                to_process.push(version);
+                                to_process.push((version, read.get_partial(&version).cloned()));
                             }
                         }
                         SyncNeedV1::Partial { version, seqs } => {
@@ -712,7 +721,7 @@ async fn process_sync(
                 }
             }
 
-            for version in to_process.drain(..) {
+            for (version, partial) in to_process.drain(..) {
                 let pool = pool.clone();
                 let booked = booked.clone();
                 let sender = sender.clone();
@@ -724,7 +733,7 @@ async fn process_sync(
                             &mut conn,
                             actor_id,
                             version,
-                            None,
+                            partial,
                             &booked,
                             vec![],
                             &sender,
@@ -1217,6 +1226,13 @@ pub async fn parallel_sync(
                             count += changes_len;
                             counter!("corro.sync.changes.recv", "actor_id" => actor_id.to_string())
                                 .increment(changes_len as u64);
+
+                            debug!(
+                                "handling versions: {:?}, seqs: {:?}, len: {changes_len}",
+                                change.versions(),
+                                change.seqs()
+                            );
+
                             tx_changes
                                 .send((change, ChangeSource::Sync))
                                 .await

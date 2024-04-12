@@ -12,7 +12,7 @@ use corro_types::{
         row_to_change, ColumnName, ExecResponse, ExecResult, QueryEvent, Statement,
         TableStatRequest, TableStatResponse,
     },
-    base::{CrsqlDbVersion, CrsqlSeq},
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeV1, Changeset, Timestamp},
     change::{ChunkedChanges, SqliteValue, MAX_CHANGES_BYTE_SIZE},
     schema::{apply_schema, parse_sql},
@@ -39,7 +39,7 @@ pub mod pubsub;
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     f: F,
-) -> Result<(T, Duration), ChangeError>
+) -> Result<(T, Option<Version>, Duration), ChangeError>
 where
     F: Fn(&Transaction) -> Result<T, ChangeError>,
 {
@@ -104,7 +104,7 @@ where
                 actor_id: Some(actor_id),
                 version: None,
             })?;
-            return Ok((ret, start.elapsed()));
+            return Ok((ret, None, start.elapsed()));
         }
 
         let last_version = book_writer.last().unwrap_or_default();
@@ -237,7 +237,7 @@ where
             Ok::<_, eyre::Report>(())
         });
 
-        Ok::<_, ChangeError>((ret, elapsed))
+        Ok::<_, ChangeError>((ret, Some(version), elapsed))
     })
 }
 
@@ -285,6 +285,7 @@ pub async fn api_v1_transactions(
                     error: "at least 1 statement is required".into(),
                 }],
                 time: 0.0,
+                version: None,
             }),
         );
     }
@@ -317,7 +318,7 @@ pub async fn api_v1_transactions(
     })
     .await;
 
-    let (results, elapsed) = match res {
+    let (results, version, elapsed) = match res {
         Ok(res) => res,
         Err(e) => {
             error!("could not execute statement(s): {e}");
@@ -328,6 +329,7 @@ pub async fn api_v1_transactions(
                         error: e.to_string(),
                     }],
                     time: 0.0,
+                    version: None,
                 }),
             );
         }
@@ -338,6 +340,7 @@ pub async fn api_v1_transactions(
         axum::Json(ExecResponse {
             results,
             time: elapsed.as_secs_f64(),
+            version,
         }),
     )
 }
@@ -634,6 +637,7 @@ pub async fn api_v1_db_schema(
                     error: "at least 1 statement is required".into(),
                 }],
                 time: 0.0,
+                version: None,
             }),
         );
     }
@@ -649,6 +653,7 @@ pub async fn api_v1_db_schema(
                     error: e.to_string(),
                 }],
                 time: 0.0,
+                version: None,
             }),
         );
     }
@@ -658,6 +663,7 @@ pub async fn api_v1_db_schema(
         axum::Json(ExecResponse {
             results: vec![],
             time: start.elapsed().as_secs_f64(),
+            version: None,
         }),
     )
 }
