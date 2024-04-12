@@ -404,7 +404,7 @@ fn handle_known_version(
                             INNER JOIN crsql_changes AS c ON c.site_id = bk.actor_id AND c.db_version = bk.db_version
                             WHERE bk.actor_id = :actor_id
                             AND bk.start_version = :version
-                            AND c.seq >= :start_seq, c.seq <= :end_seq
+                            AND c.seq >= :start_seq AND c.seq <= :end_seq
                             ORDER BY c.seq ASC
                     "#,
                 )?;
@@ -573,35 +573,6 @@ fn handle_known_version(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn process_version(
-    pool: &SplitPool,
-    actor_id: ActorId,
-    version: Version,
-    partial: Option<PartialVersion>,
-    booked: &Booked,
-    seqs_needed: Vec<RangeInclusive<CrsqlSeq>>,
-    sender: &Sender<SyncMessage>,
-) -> eyre::Result<()> {
-    let mut conn = pool.read().await?;
-
-    block_in_place(|| {
-        handle_known_version(
-            &mut conn,
-            actor_id,
-            version,
-            partial,
-            booked,
-            seqs_needed,
-            sender,
-        )
-    })?;
-
-    trace!("done processing version: {version} for actor_id: {actor_id}");
-
-    Ok(())
-}
-
 fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     sender: &Sender<SyncMessage>,
     mut chunked: ChunkedChanges<I>,
@@ -744,13 +715,26 @@ async fn process_sync(
                 let pool = pool.clone();
                 let booked = booked.clone();
                 let sender = sender.clone();
-                if job_tx
-                    .send(Box::pin(async move {
-                        process_version(&pool, actor_id, version, None, &booked, vec![], &sender)
-                            .await
-                    }))
-                    .is_err()
-                {
+                let fut = Box::pin(async move {
+                    let mut conn = pool.read().await?;
+
+                    block_in_place(|| {
+                        handle_known_version(
+                            &mut conn,
+                            actor_id,
+                            version,
+                            None,
+                            &booked,
+                            vec![],
+                            &sender,
+                        )
+                    })?;
+
+                    trace!("done processing version: {version} for actor_id: {actor_id}");
+                    Ok(())
+                });
+
+                if job_tx.send(fut).is_err() {
                     eyre::bail!("could not send into job channel");
                 }
             }
@@ -759,10 +743,13 @@ async fn process_sync(
                 let pool = pool.clone();
                 let booked = booked.clone();
                 let sender = sender.clone();
-                if job_tx
-                    .send(Box::pin(async move {
-                        process_version(
-                            &pool,
+
+                let fut = Box::pin(async move {
+                    let mut conn = pool.read().await?;
+
+                    block_in_place(|| {
+                        handle_known_version(
+                            &mut conn,
                             actor_id,
                             version,
                             partial,
@@ -770,10 +757,13 @@ async fn process_sync(
                             seqs_needed,
                             &sender,
                         )
-                        .await
-                    }))
-                    .is_err()
-                {
+                    })?;
+
+                    trace!("done processing version: {version} for actor_id: {actor_id}");
+                    Ok(())
+                });
+
+                if job_tx.send(fut).is_err() {
                     eyre::bail!("could not send into job channel");
                 }
             }
