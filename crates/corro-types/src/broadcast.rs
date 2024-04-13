@@ -382,6 +382,7 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
             }
             _ => {}
         };
+        
         if let Err(e) = self.notifications.try_send(notification) {
             counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications")
                 .increment(1);

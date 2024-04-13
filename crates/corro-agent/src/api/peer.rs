@@ -592,16 +592,25 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
             Some(Ok((changes, seqs))) => {
                 let start = Instant::now();
 
-                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Full {
-                        version,
-                        changes,
-                        seqs,
-                        last_seq,
-                        ts,
-                    },
-                })))?;
+                if changes.is_empty() && *seqs.start() == CrsqlSeq(0) && *seqs.end() == last_seq {
+                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Empty {
+                            versions: version..=version,
+                        },
+                    })))?;
+                } else {
+                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Full {
+                            version,
+                            changes,
+                            seqs,
+                            last_seq,
+                            ts,
+                        },
+                    })))?;
+                }
 
                 let elapsed = start.elapsed();
 
@@ -1700,6 +1709,80 @@ mod tests {
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
                         ts,
+                    }
+                }))
+            );
+        }
+
+        let change3 = Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![1i64.into()])?,
+            cid: ColumnName("text".into()),
+            val: "one override".into(),
+            col_version: 2,
+            db_version: CrsqlDbVersion(3),
+            seq: CrsqlSeq(0),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        process_multiple_changes(
+            agent.clone(),
+            bookie.clone(),
+            vec![(
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(3),
+                        changes: vec![change3.clone()],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            )],
+        )
+        .await?;
+
+        {
+            let (tx, mut rx) = mpsc::channel(5);
+            let mut conn = agent.pool().read().await?;
+
+            {
+                let mut prepped = conn.prepare("SELECT * FROM crsql_changes;")?;
+                let mut rows = prepped.query([])?;
+
+                loop {
+                    let row = rows.next()?;
+                    if row.is_none() {
+                        break;
+                    }
+
+                    println!("ROW: {row:?}");
+                }
+            }
+
+            block_in_place(|| {
+                handle_known_version(
+                    &mut conn,
+                    actor_id,
+                    Version(1),
+                    None,
+                    &booked,
+                    vec![CrsqlSeq(0)..=CrsqlSeq(0)],
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty {
+                        versions: Version(1)..=Version(1)
                     }
                 }))
             );
