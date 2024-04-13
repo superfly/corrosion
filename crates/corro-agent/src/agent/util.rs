@@ -28,8 +28,8 @@ use crate::{
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
-        Agent, Booked, BookedVersions, Bookie, ChangeError, CurrentVersion, KnownDbVersion,
-        PartialVersion, SplitPool,
+        Agent, Booked, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion,
+        SplitPool,
     },
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},

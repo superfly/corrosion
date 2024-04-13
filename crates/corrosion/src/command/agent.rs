@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, ops::Deref, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
 use build_info::VersionControl;
 use camino::Utf8PathBuf;

@@ -1,6 +1,6 @@
 //! Start the root agent tasks
 
-use std::{ops::Deref, time::Duration};
+use std::time::Duration;
 
 use crate::{
     agent::{
