@@ -1026,7 +1026,7 @@ pub enum KnownDbVersion {
 pub struct BookedVersions {
     actor_id: ActorId,
     pub partials: BTreeMap<Version, PartialVersion>,
-    sync_need: RangeInclusiveSet<Version>,
+    needed: RangeInclusiveSet<Version>,
     last: Option<Version>,
 }
 
@@ -1035,7 +1035,7 @@ impl BookedVersions {
         Self {
             actor_id,
             partials: Default::default(),
-            sync_need: Default::default(),
+            needed: Default::default(),
             last: Default::default(),
         }
     }
@@ -1049,7 +1049,7 @@ impl BookedVersions {
         info!("deleted {affected} __corro_bookkeeping_gaps rows");
 
         let mut inserted = 0;
-        for range in self.sync_need.iter() {
+        for range in self.needed.iter() {
             tx.prepare_cached(
                 "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?, ?, ?)",
             )?
@@ -1079,7 +1079,7 @@ impl BookedVersions {
                     let start_v = row.get(0)?;
                     let end_v = row.get(1)?;
 
-                    bv.sync_need.insert(start_v..=end_v);
+                    bv.needed.insert(start_v..=end_v);
                 }
             }
         }
@@ -1119,8 +1119,14 @@ impl BookedVersions {
     }
 
     pub fn contains_version(&self, version: &Version) -> bool {
-        !self.sync_need.contains(version) && &self.last.unwrap_or_default() >= version
-            || self.partials.contains_key(version)
+        // corrosion knows about a version if...
+
+        // it's not in the list of needed versions
+        !self.needed.contains(version) &&
+        // the last known version is bigger than the requested version
+        &self.last.unwrap_or_default() >= version ||
+        // the version is in the partials versions
+        self.partials.contains_key(version)
     }
 
     pub fn get_partial(&self, version: &Version) -> Option<&PartialVersion> {
@@ -1179,16 +1185,16 @@ impl BookedVersions {
 
         if old_last < version {
             // add these as needed!
-            self.sync_need.insert((old_last + 1)..=version);
+            self.needed.insert((old_last + 1)..=version);
         }
 
-        self.sync_need.remove(version..=version);
+        self.needed.remove(version..=version);
 
         ret
     }
 
     pub fn sync_need(&self) -> &RangeInclusiveSet<Version> {
-        &self.sync_need
+        &self.needed
     }
 }
 
