@@ -1188,7 +1188,7 @@ impl BookedVersions {
         conn: &Connection, // usually a `Transaction`
         versions: &RangeInclusive<Version>,
     ) -> rusqlite::Result<()> {
-        let deleted: Vec<RangeInclusive<Version>> = conn
+        let mut new_ranges: RangeInclusiveSet<Version> = conn
             .prepare_cached(
                 "DELETE FROM __corro_bookkeeping_gaps
                     WHERE actor_id = :actor_id AND
@@ -1202,11 +1202,11 @@ impl BookedVersions {
                         ( :end BETWEEN start AND end ) OR
 
                         -- checked range encompasses full range
-                        -- (:start)---|------|---(:end)
-                        ( start >= :start AND end <= :end ) OR
+                        -- (:start) |------| (:end)
+                        ( :start <= start AND :end >= end ) OR
 
                         -- start = end + 1 (to collapse ranges)
-                        ( start = :end + 1) OR
+                        ( start = :end + 1 ) OR
 
                         -- end = start - 1 (to collapse ranges)
                         ( end = :start - 1 )
@@ -1220,11 +1220,8 @@ impl BookedVersions {
                     ":end": versions.end(),
                 ],
                 |row| Ok(row.get(0)?..=row.get(1)?),
-            )
-            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
-
-        // re-compute the ranges
-        let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
+            )?
+            .collect::<Result<_, _>>()?;
 
         let current_last = self.last.unwrap_or_default();
         // this could be 0 < 1 and could create a weird range of `1..=1` even if we just

@@ -1065,7 +1065,7 @@ pub async fn process_fully_buffered_changes(
 
             tx.prepare_cached(
                 "
-                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
+                INSERT OR IGNORE INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
                     VALUES (
                         :actor_id,
                         :version,
@@ -1078,7 +1078,6 @@ pub async fn process_fully_buffered_changes(
                 ":actor_id": actor_id,
                 ":version": version,
                 ":db_version": db_version,
-             // ":start_version": 0,
                 ":last_seq": last_seq,
                 ":ts": ts
             })?;
@@ -1300,7 +1299,7 @@ pub async fn process_multiple_changes(
                         let version = versions.start();
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
                         tx.prepare_cached("
-                            INSERT INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  last_seq,  ts)
+                            INSERT OR IGNORE INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  last_seq,  ts)
                                                     VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?
                             .execute(named_params!{
                                 ":actor_id": actor_id,
