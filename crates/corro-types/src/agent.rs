@@ -1194,13 +1194,22 @@ impl BookedVersions {
                     WHERE actor_id = :actor_id AND
                     (
                         -- :start of checked range is between any start and end in db
+                        -- |-----(:start)-----|
                         ( :start BETWEEN start AND end ) OR
                         
                         -- :end of checked range is between any start and end in db
+                        -- |------(:end)------|
                         ( :end BETWEEN start AND end ) OR
 
                         -- checked range encompasses full range
-                        ( start >= :start AND end <= :end )
+                        -- (:start)---|------|---(:end)
+                        ( start >= :start AND end <= :end ) OR
+
+                        -- start = end + 1 (to collapse ranges)
+                        ( start = :end + 1) OR
+
+                        -- end = start - 1 (to collapse ranges)
+                        ( end = :start - 1 )
                     )
                     RETURNING start, end",
             )?
