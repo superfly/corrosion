@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, params, Connection, Transaction};
+use rusqlite::{named_params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
@@ -30,7 +30,7 @@ use tokio::{
     sync::{oneshot, Semaphore},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
 use crate::{
@@ -1184,74 +1184,130 @@ impl BookedVersions {
     }
 
     pub fn insert_db(
-        &mut self,
+        &mut self,         // only because we want 1 mt a time here
         conn: &Connection, // usually a `Transaction`
         versions: &RangeInclusive<Version>,
     ) -> rusqlite::Result<()> {
-        let mut new_ranges: RangeInclusiveSet<Version> = conn
-            .prepare_cached(
-                "DELETE FROM __corro_bookkeeping_gaps
-                    WHERE actor_id = :actor_id AND
-                    (
-                        -- :start of checked range is between any start and end in db
-                        -- |-----(:start)-----|
-                        ( :start BETWEEN start AND end ) OR
-                        
-                        -- :end of checked range is between any start and end in db
-                        -- |------(:end)------|
-                        ( :end BETWEEN start AND end ) OR
+        let overlapping = self.needed.overlapping(versions);
 
-                        -- checked range encompasses full range
-                        -- (:start) |------| (:end)
-                        ( :start <= start AND :end >= end ) OR
+        let mut new_ranges: RangeInclusiveSet<Version> = Default::default();
+        let mut delete_ranges = vec![];
+        for range in overlapping {
+            new_ranges.insert(range.clone());
+            delete_ranges.push(range.clone());
+        }
 
-                        -- start = end + 1 (to collapse ranges)
-                        ( start = :end + 1 ) OR
+        if let Some(range) = self.needed.get(&Version(versions.start().0 - 1)) {
+            new_ranges.insert(range.clone());
+            delete_ranges.push(range.clone());
+        }
 
-                        -- end = start - 1 (to collapse ranges)
-                        ( end = :start - 1 )
-                    )
-                    RETURNING start, end",
-            )?
-            .query_map(
-                named_params![
-                    ":actor_id": self.actor_id,
-                    ":start": versions.start(),
-                    ":end": versions.end(),
-                ],
-                |row| Ok(row.get(0)?..=row.get(1)?),
-            )?
-            .collect::<Result<_, _>>()?;
+        if let Some(range) = self.needed.get(&Version(versions.end().0 + 1)) {
+            new_ranges.insert(range.clone());
+            delete_ranges.push(range.clone());
+        }
 
         let current_last = self.last.unwrap_or_default();
-        // this could be 0 < 1 and could create a weird range of `1..=1` even if we just
-        // inserted 1, but that should be fixed by the remove afterwards
         if current_last < *versions.start() {
-            // last max version was smaller than the start of the range here
-            // this means there's now a gap!
-            new_ranges.insert((current_last + 1)..=*versions.start());
+            let range = (current_last + 1)..=*versions.start();
+            new_ranges.insert(range.clone());
+            for range in self.needed.overlapping(&range) {
+                new_ranges.insert(range.clone());
+                delete_ranges.push(range.clone());
+            }
         }
 
-        // remove the inserted versions from these ranges
-        // NOTE: load bearing
         new_ranges.remove(versions.clone());
 
-        // insert new versions ranges
-        for range in new_ranges.clone() {
-            conn.prepare_cached(
-                "
-                INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT (actor_id, start)
-                        DO UPDATE SET
-                            end = excluded.end
-                        WHERE excluded.end > end -- this isn't really possible,
-                                                 -- but if it does happen, we want to 
-                                                 -- err on the side of caution
-            ",
-            )?
-            .execute(params![self.actor_id, range.start(), range.end()])?;
+        trace!("delete: {delete_ranges:?}");
+        trace!("new: {new_ranges:?}");
+
+        for range in delete_ranges {
+            conn
+            .prepare_cached("DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = :actor_id AND start = :start AND end = :end")?
+            .execute(named_params! {
+                ":actor_id": self.actor_id,
+                ":start": range.start(),
+                ":end": range.end()
+            })?;
         }
+
+        for range in new_ranges {
+            conn.prepare_cached(
+                "INSERT INTO __corro_bookkeeping_gaps VALUES (:actor_id, :start, :end)",
+            )?
+            .execute(named_params! {
+                ":actor_id": self.actor_id,
+                ":start": range.start(),
+                ":end": range.end()
+            })?;
+        }
+
+        // // gather all ranges that might include a version we've applied
+        // let mut new_ranges: RangeInclusiveSet<Version> = conn
+        //     .prepare_cached(
+        //         "DELETE FROM __corro_bookkeeping_gaps
+        //             WHERE actor_id = :actor_id AND
+        //             (
+        //                 -- :start of checked range is between any start and end in db
+        //                 -- S-----(:start)-----E
+        //                 ( :start BETWEEN start AND end ) OR
+
+        //                 -- :end of checked range is between any start and end in db
+        //                 -- S------(:end)------E
+        //                 ( :end BETWEEN start AND end ) OR
+
+        //                 -- checked range encompasses full range
+        //                 -- (:start) ... S------E ... (:end)
+        //                 ( :start <= start AND :end >= end ) OR
+
+        //                 -- start = end + 1 (to collapse ranges)
+        //                 ( start = :end + 1 ) OR
+
+        //                 -- end = start - 1 (to collapse ranges)
+        //                 ( end = :start - 1 )
+        //             )
+        //             RETURNING start, end",
+        //     )?
+        //     .query_map(
+        //         named_params![
+        //             ":actor_id": self.actor_id,
+        //             ":start": versions.start(),
+        //             ":end": versions.end(),
+        //         ],
+        //         |row| Ok(row.get(0)?..=row.get(1)?),
+        //     )?
+        //     .collect::<Result<_, _>>()?;
+
+        // let current_last = self.last.unwrap_or_default();
+        // // this could be 0 < 1 and could create a weird range of `1..=1` even if we just
+        // // inserted 1, but that should be fixed by the remove afterwards
+        // if current_last < *versions.start() {
+        //     // last max version was smaller than the start of the range here
+        //     // this means there's now a gap!
+        //     new_ranges.insert((current_last + 1)..=*versions.start());
+        // }
+
+        // // remove the inserted versions from these ranges
+        // // NOTE: load bearing
+        // new_ranges.remove(versions.clone());
+
+        // // insert new versions ranges
+        // for range in new_ranges.clone() {
+        //     conn.prepare_cached(
+        //         "
+        //         INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end)
+        //             VALUES (?, ?, ?)
+        //             ON CONFLICT (actor_id, start)
+        //                 DO UPDATE SET
+        //                     end = excluded.end
+        //                 WHERE excluded.end > end -- this isn't really possible,
+        //                                          -- but if it does happen, we want to
+        //                                          -- err on the side of caution
+        //     ",
+        //     )?
+        //     .execute(params![self.actor_id, range.start(), range.end()])?;
+        // }
 
         Ok(())
     }
@@ -1260,6 +1316,8 @@ impl BookedVersions {
         &self.needed
     }
 }
+
+pub struct MemoryInsert {}
 
 pub type BookedInner = Arc<CountedTokioRwLock<BookedVersions>>;
 
