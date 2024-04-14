@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
+use rusqlite::{named_params, params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
@@ -1022,7 +1022,7 @@ pub enum KnownDbVersion {
     Partial(PartialVersion),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BookedVersions {
     actor_id: ActorId,
     pub partials: BTreeMap<Version, PartialVersion>,
@@ -1067,8 +1067,7 @@ impl BookedVersions {
             .prepare_cached(
                 "SELECT MAX(start_version) FROM __corro_bookkeeping WHERE actor_id = ?",
             )?
-            .query_row([actor_id], |row| row.get(0))
-            .optional()?;
+            .query_row([actor_id], |row| row.get(0))?;
 
         // fetch known partial sequences
         let mut prepped = conn.prepare_cached(
@@ -1192,19 +1191,16 @@ impl BookedVersions {
         let deleted: Vec<RangeInclusive<Version>> = conn
             .prepare_cached(
                 "DELETE FROM __corro_bookkeeping_gaps
-                    WHERE actor_id = :actor_id AND start = :start AND
-                    (   
-                        -- start and end are within the range
-                        ( start >= :start AND end <= :end ) OR
+                    WHERE actor_id = :actor_id AND
+                    (
+                        -- :start of checked range is between any start and end in db
+                        ( :start BETWEEN start AND end ) OR
+                        
+                        -- :end of checked range is between any start and end in db
+                        ( :end BETWEEN start AND end ) OR
 
-                        -- range being inserted is partially contained within another
-                        ( start <= :end AND end >= :end ) OR
-
-                        -- start = end + 1 (to collapse ranges)
-                        ( start = :end + 1) OR
-
-                        -- end = start - 1 (to collapse ranges)
-                        ( end = :start - 1 )
+                        -- checked range encompasses full range
+                        ( start >= :start AND end <= :end )
                     )
                     RETURNING start, end",
             )?
@@ -1220,16 +1216,21 @@ impl BookedVersions {
 
         // re-compute the ranges
         let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
-        new_ranges.insert(versions.clone());
 
-        // we should never have deleted non-contiguous seq ranges, abort!
-        if new_ranges.len() > 1 {
-            warn!("deleted non-contiguous __corro_bookkeeping_gaps ranges! {new_ranges:?}");
-            // this serves as a failsafe
-            return Err(rusqlite::Error::StatementChangedRows(new_ranges.len()));
+        let current_last = self.last.unwrap_or_default();
+        // this could be 0 < 1 and could create a weird range of `1..=1` even if we just
+        // inserted 1, but that should be fixed by the remove afterwards
+        if current_last < *versions.start() {
+            // last max version was smaller than the start of the range here
+            // this means there's now a gap!
+            new_ranges.insert((current_last + 1)..=*versions.start());
         }
 
-        // insert new seq ranges, there should only be one...
+        // remove the inserted versions from these ranges
+        // NOTE: load bearing
+        new_ranges.remove(versions.clone());
+
+        // insert new versions ranges
         for range in new_ranges.clone() {
             conn.prepare_cached(
                 "
@@ -1390,5 +1391,157 @@ impl Bookie {
 
     pub fn registry(&self) -> &LockRegistry {
         self.0.registry()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_booked_insert_db() -> rusqlite::Result<()> {
+        let mut conn = CrConn::init(Connection::open_in_memory()?)?;
+        migrate(&mut conn)?;
+
+        let actor_id = ActorId::default();
+        let mut bv = BookedVersions::new(actor_id);
+
+        let mut all = RangeInclusiveSet::new();
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(1)..=Version(20))?;
+        expect_gaps(&conn, &bv, &all, vec![])?;
+
+        // try from an empty state again
+        let mut bv = BookedVersions::new(actor_id);
+        let mut all = RangeInclusiveSet::new();
+
+        // insert a non-1 first version
+        insert_everywhere(&conn, &mut bv, &mut all, Version(2)..=Version(20))?;
+        expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(1)])?;
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(1)..=Version(1))?;
+        expect_gaps(&conn, &bv, &all, vec![])?;
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(25)..=Version(25))?;
+        expect_gaps(&conn, &bv, &all, vec![Version(21)..=Version(24)])?;
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(30)..=Version(35))?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![Version(21)..=Version(24), Version(26)..=Version(29)],
+        )?;
+
+        // NOTE: overlapping partially from the end
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(19)..=Version(22))?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![Version(23)..=Version(24), Version(26)..=Version(29)],
+        )?;
+
+        // NOTE: overlapping partially from the start
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(24)..=Version(25))?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![Version(23)..=Version(23), Version(26)..=Version(29)],
+        )?;
+
+        // NOTE: overlapping 2 ranges
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(23)..=Version(27))?;
+        expect_gaps(&conn, &bv, &all, vec![Version(28)..=Version(29)])?;
+
+        // NOTE: ineffective insert of already known ranges
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(1)..=Version(20))?;
+        expect_gaps(&conn, &bv, &all, vec![Version(28)..=Version(29)])?;
+
+        // NOTE: overlapping no ranges, but encompassing a full range
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(27)..=Version(30))?;
+        expect_gaps(&conn, &bv, &all, vec![])?;
+
+        // NOTE: touching multiple ranges, partially
+
+        // create gap 36..=39
+        insert_everywhere(&conn, &mut bv, &mut all, Version(40)..=Version(45))?;
+        // create gap 46..=49
+        insert_everywhere(&conn, &mut bv, &mut all, Version(50)..=Version(55))?;
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(38)..=Version(47))?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![Version(36)..=Version(37), Version(48)..=Version(49)],
+        )?;
+
+        // test loading a bv from the conn, they should be identical!
+        let mut bv2 = BookedVersions::from_conn(&conn, actor_id)?;
+        // manually set the last version because there's nothing in `__corro_bookkeeping`
+        bv2.last = Some(Version(55));
+
+        assert_eq!(bv, bv2);
+
+        Ok(())
+    }
+
+    fn insert_everywhere(
+        conn: &Connection,
+        bv: &mut BookedVersions,
+        all_versions: &mut RangeInclusiveSet<Version>,
+        versions: RangeInclusive<Version>,
+    ) -> rusqlite::Result<()> {
+        all_versions.insert(versions.clone());
+        bv.insert_db(conn, &versions)?;
+        bv.insert_memory(versions.clone(), KnownDbVersion::Cleared);
+        Ok(())
+    }
+
+    fn expect_gaps(
+        conn: &Connection,
+        bv: &BookedVersions,
+        all_versions: &RangeInclusiveSet<Version>,
+        expected: Vec<RangeInclusive<Version>>,
+    ) -> rusqlite::Result<()> {
+        let gaps: Vec<(ActorId, Version, Version)> = conn
+            .prepare_cached("SELECT actor_id, start, end FROM __corro_bookkeeping_gaps")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(
+            gaps,
+            expected
+                .clone()
+                .into_iter()
+                .map(|expected| (bv.actor_id, *expected.start(), *expected.end()))
+                .collect::<Vec<_>>()
+        );
+
+        for range in all_versions.iter() {
+            assert!(bv.contains_all(range.clone(), None));
+        }
+
+        for range in expected {
+            for v in range {
+                assert!(!bv.contains(v, None), "expected not to contain {v}");
+                assert!(bv.needed.contains(&v), "expected needed to contain {v}");
+            }
+        }
+
+        assert_eq!(
+            bv.last,
+            all_versions.iter().last().map(|range| *range.end()),
+            "expected last version not to increment"
+        );
+
+        Ok(())
     }
 }
