@@ -1,5 +1,7 @@
 //! Start the root agent tasks
 
+use std::time::Instant;
+
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_cleanup},
@@ -124,6 +126,8 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         let mut w = bookie.write("init").await;
         w.insert(agent.actor_id(), agent.booked().clone());
     }
+
+    let start = Instant::now();
     {
         let conn = agent.pool().read().await?;
         let actor_ids: Vec<ActorId> = conn
@@ -155,7 +159,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                     }
                 }),
         )
-        .buffer_unordered(2);
+        .buffer_unordered(4);
 
         while let Some((actor_id, bv)) = TryStreamExt::try_next(&mut buf).await? {
             for (version, partial) in bv.partials.iter() {
@@ -179,6 +183,8 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                 .replace_actor(actor_id, bv);
         }
     }
+
+    info!("Bookkeeping fully loaded in {:?}", start.elapsed());
 
     spawn_counted(
         util::sync_loop(

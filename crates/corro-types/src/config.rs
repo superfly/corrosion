@@ -7,7 +7,7 @@ pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
 
 const fn default_apply_queue() -> usize {
-    600
+    200
 }
 
 /// Used for the apply channel
