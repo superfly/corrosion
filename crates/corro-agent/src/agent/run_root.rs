@@ -1,13 +1,9 @@
 //! Start the root agent tasks
 
-use std::time::Duration;
-
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_cleanup},
-        metrics, setup,
-        util::{self, persist_booked_versions},
-        AgentOptions,
+        metrics, setup, util, AgentOptions,
     },
     broadcast::runtime_loop,
 };
@@ -21,7 +17,7 @@ use corro_types::{
 
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use spawn::spawn_counted;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use tripwire::Tripwire;
 
 /// Start a new agent with an existing configuration
@@ -183,44 +179,6 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                 .replace_actor(actor_id, bv);
         }
     }
-
-    spawn_counted({
-        let pool = agent.pool().clone();
-        let bookie = bookie.clone();
-        let mut tripwire = tripwire.clone();
-        async move {
-            let persist_interval = Duration::from_secs(300);
-
-            loop {
-                tokio::select! {
-                    _ = &mut tripwire => break,
-                    _ = tokio::time::sleep(persist_interval) => {}
-                }
-
-                debug!("persisting all sync need gaps");
-
-                let bookie_clone = {
-                    bookie
-                        .read("gather_booked_for_persist")
-                        .await
-                        .iter()
-                        .map(|(actor_id, booked)| (*actor_id, booked.clone()))
-                        .collect::<Vec<_>>()
-                };
-
-                for (actor_id, booked) in bookie_clone {
-                    if let Err(e) = persist_booked_versions(&pool, &booked).await {
-                        error!(%actor_id, "could not persist booked versions: {e}");
-                    }
-
-                    // let others use the write connection
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-
-            debug!("persist loop is done");
-        }
-    });
 
     spawn_counted(
         util::sync_loop(

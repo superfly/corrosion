@@ -126,6 +126,8 @@ where
                 version: Some(version),
             })?;
 
+        let versions = version..=version;
+
         let elapsed = {
             tx.prepare_cached(
                 r#"
@@ -153,6 +155,14 @@ where
 
             debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
+            book_writer
+                .insert_db(&tx, &versions)
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: Some(version),
+                })?;
+
             tx.commit().map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),
@@ -163,8 +173,8 @@ where
 
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        book_writer.insert(
-            version,
+        book_writer.insert_memory(
+            versions,
             KnownDbVersion::Current(CurrentVersion {
                 db_version,
                 last_seq,

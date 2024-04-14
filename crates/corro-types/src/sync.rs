@@ -300,7 +300,7 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             Some(v) => v,
         };
 
-        let need: Vec<_> = bookedr.sync_need().iter().cloned().collect();
+        let need: Vec<_> = bookedr.needed().iter().cloned().collect();
 
         if !need.is_empty() {
             state.need.insert(actor_id, need);

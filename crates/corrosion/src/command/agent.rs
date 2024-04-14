@@ -3,7 +3,6 @@ use std::{net::SocketAddr, time::Duration};
 use build_info::VersionControl;
 use camino::Utf8PathBuf;
 use corro_admin::AdminConfig;
-use corro_agent::agent::util::persist_booked_versions;
 use corro_types::config::{Config, PrometheusConfig};
 use metrics::gauge;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
@@ -80,23 +79,6 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
     tripwire_worker.await;
 
     wait_for_all_pending_handles().await;
-
-    // Finally, persist all booked versions
-
-    let bookie_clone = {
-        bookie
-            .read("gather_booked_for_persist")
-            .await
-            .iter()
-            .map(|(actor_id, booked)| (*actor_id, booked.clone()))
-            .collect::<Vec<_>>()
-    };
-
-    for (actor_id, booked) in bookie_clone {
-        if let Err(e) = persist_booked_versions(agent.pool(), &booked).await {
-            error!(%actor_id, "could not persist booked versions: {e}");
-        }
-    }
 
     Ok(())
 }

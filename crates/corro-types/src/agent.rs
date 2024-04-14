@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
@@ -30,7 +30,7 @@ use tokio::{
     sync::{oneshot, Semaphore},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info};
+use tracing::{debug, error, warn};
 use tripwire::Tripwire;
 
 use crate::{
@@ -1040,33 +1040,10 @@ impl BookedVersions {
         }
     }
 
-    pub fn persist(&self, conn: &mut Connection) -> rusqlite::Result<()> {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-
-        let affected = tx
-            .prepare_cached("DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?")?
-            .execute([self.actor_id])?;
-        info!("deleted {affected} __corro_bookkeeping_gaps rows");
-
-        let mut inserted = 0;
-        for range in self.needed.iter() {
-            tx.prepare_cached(
-                "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?, ?, ?)",
-            )?
-            .execute(params![self.actor_id, range.start(), range.end()])?;
-            inserted += 1;
-        }
-
-        info!("inserted {inserted} __corro_bookkeeping_gaps rows");
-
-        tx.commit()?;
-
-        Ok(())
-    }
-
     pub fn from_conn(conn: &Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
         let mut bv = BookedVersions::new(actor_id);
 
+        // fetch the sync's needed version gaps
         let mut prepped = conn
             .prepare_cached("SELECT start, end FROM __corro_bookkeeping_gaps WHERE actor_id = ?")?;
         let mut rows = prepped.query([actor_id])?;
@@ -1084,7 +1061,8 @@ impl BookedVersions {
             }
         }
 
-        // fetch the biggest version we know (for now)
+        // fetch the biggest version we know, a partial version might override
+        // this below
         bv.last = conn
             .prepare_cached(
                 "SELECT MAX(start_version) FROM __corro_bookkeeping WHERE actor_id = ?",
@@ -1092,6 +1070,7 @@ impl BookedVersions {
             .query_row([actor_id], |row| row.get(0))
             .optional()?;
 
+        // fetch known partial sequences
         let mut prepped = conn.prepare_cached(
             "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
         )?;
@@ -1103,8 +1082,9 @@ impl BookedVersions {
                 None => break,
                 Some(row) => {
                     let version = row.get(0)?;
-                    bv.insert(
-                        version,
+                    // NOTE: use normal insert logic to have a consistent behavior
+                    bv.insert_memory(
+                        version..=version,
                         KnownDbVersion::Partial(PartialVersion {
                             seqs: RangeInclusiveSet::from_iter(vec![row.get(1)?..=row.get(2)?]),
                             last_seq: row.get(3)?,
@@ -1123,10 +1103,10 @@ impl BookedVersions {
 
         // it's not in the list of needed versions
         !self.needed.contains(version) &&
-        // the last known version is bigger than the requested version
-        &self.last.unwrap_or_default() >= version ||
-        // the version is in the partials versions
-        self.partials.contains_key(version)
+        // and the last known version is bigger than the requested version
+        self.last.unwrap_or_default() >= *version
+        // we don't need to look at partials because if we have a partial
+        // then it fulfills the previous conditions
     }
 
     pub fn get_partial(&self, version: &Version) -> Option<&PartialVersion> {
@@ -1157,22 +1137,29 @@ impl BookedVersions {
         self.last
     }
 
-    pub fn insert(
+    // used when the commit has succeeded
+    pub fn insert_memory(
         &mut self,
-        version: Version,
+        versions: RangeInclusive<Version>,
         known_version: KnownDbVersion,
     ) -> Option<PartialVersion> {
         let ret = match known_version {
-            KnownDbVersion::Partial(partial) => Some(match self.partials.entry(version) {
-                btree_map::Entry::Vacant(entry) => entry.insert(partial).clone(),
-                btree_map::Entry::Occupied(mut entry) => {
-                    let got = entry.get_mut();
-                    got.seqs.extend(partial.seqs);
-                    got.clone()
-                }
-            }),
+            // insert a partial
+            KnownDbVersion::Partial(partial) => {
+                Some(match self.partials.entry(*versions.start()) {
+                    btree_map::Entry::Vacant(entry) => entry.insert(partial).clone(),
+                    btree_map::Entry::Occupied(mut entry) => {
+                        let got = entry.get_mut();
+                        got.seqs.extend(partial.seqs);
+                        got.clone()
+                    }
+                })
+            }
+            // any other kind: remove from partials
             _ => {
-                self.partials.remove(&version);
+                for version in versions.clone() {
+                    self.partials.remove(&version);
+                }
                 None
             }
         };
@@ -1180,20 +1167,83 @@ impl BookedVersions {
         // update last known version
         let old_last = self
             .last
-            .replace(std::cmp::max(version, self.last.unwrap_or_default()))
+            .replace(std::cmp::max(
+                *versions.end(),
+                self.last.unwrap_or_default(),
+            ))
             .unwrap_or_default();
 
-        if old_last < version {
-            // add these as needed!
-            self.needed.insert((old_last + 1)..=version);
+        if old_last < *versions.start() {
+            // last max version was smaller than the start of the range here
+            // this means there's now a gap!
+            self.needed.insert((old_last + 1)..=*versions.start());
         }
 
-        self.needed.remove(version..=version);
+        self.needed.remove(versions);
 
         ret
     }
 
-    pub fn sync_need(&self) -> &RangeInclusiveSet<Version> {
+    pub fn insert_db(
+        &mut self,
+        conn: &Connection, // usually a `Transaction`
+        versions: &RangeInclusive<Version>,
+    ) -> rusqlite::Result<()> {
+        let deleted: Vec<RangeInclusive<Version>> = conn
+            .prepare_cached(
+                "DELETE FROM __corro_bookkeeping_gaps
+                    WHERE actor_id = :actor_id AND start = :start AND
+                    (   
+                        -- start and end are within the range
+                        ( start >= :start AND end <= :end ) OR
+
+                        -- range being inserted is partially contained within another
+                        ( start <= :end AND end >= :end ) OR
+
+                        -- start = end + 1 (to collapse ranges)
+                        ( start = :end + 1) OR
+
+                        -- end = start - 1 (to collapse ranges)
+                        ( end = :start - 1 )
+                    )
+                    RETURNING start, end",
+            )?
+            .query_map(
+                named_params![
+                    ":actor_id": self.actor_id,
+                    ":start": versions.start(),
+                    ":end": versions.end(),
+                ],
+                |row| Ok(row.get(0)?..=row.get(1)?),
+            )
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        // re-compute the ranges
+        let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
+        new_ranges.insert(versions.clone());
+
+        // we should never have deleted non-contiguous seq ranges, abort!
+        if new_ranges.len() > 1 {
+            warn!("deleted non-contiguous __corro_bookkeeping_gaps ranges! {new_ranges:?}");
+            // this serves as a failsafe
+            return Err(rusqlite::Error::StatementChangedRows(new_ranges.len()));
+        }
+
+        // insert new seq ranges, there should only be one...
+        for range in new_ranges.clone() {
+            conn.prepare_cached(
+                "
+                INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end)
+                    VALUES (?, ?, ?);
+            ",
+            )?
+            .execute(params![self.actor_id, range.start(), range.end()])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn needed(&self) -> &RangeInclusiveSet<Version> {
         &self.needed
     }
 }

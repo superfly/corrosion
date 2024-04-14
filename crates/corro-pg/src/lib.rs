@@ -2160,12 +2160,15 @@ impl Session {
 
         debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
+        let versions = version..=version;
+        book_writer.insert_db(conn, &versions)?;
+
         conn.execute_batch("COMMIT")?;
 
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        book_writer.insert(
-            version,
+        book_writer.insert_memory(
+            versions,
             KnownDbVersion::Current(CurrentVersion {
                 db_version,
                 last_seq,

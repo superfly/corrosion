@@ -28,8 +28,7 @@ use crate::{
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
-        Agent, Booked, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion,
-        SplitPool,
+        Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion, SplitPool,
     },
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
@@ -338,13 +337,6 @@ pub async fn clear_overwritten_versions(
     //         start.elapsed()
     // );
 
-    Ok(())
-}
-
-pub async fn persist_booked_versions(pool: &SplitPool, booked: &Booked) -> eyre::Result<()> {
-    let mut conn = pool.write_low().await?;
-    let bv = booked.read("persist").await;
-    block_in_place(|| bv.persist(&mut conn))?;
     Ok(())
 }
 
@@ -1093,33 +1085,28 @@ pub async fn process_fully_buffered_changes(
 
             debug!(%actor_id, %version, "inserted bookkeeping row after buffered insert");
 
-            Some(KnownDbVersion::Current(CurrentVersion {
+            KnownDbVersion::Current(CurrentVersion {
                 db_version,
                 last_seq,
                 ts,
-            }))
+            })
         } else {
             if let Err(e) = agent.tx_empty().try_send((actor_id, version..=version)) {
                 error!(%actor_id, "could not schedule empties for clear: {e}");
             }
 
             debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
-            Some(KnownDbVersion::Cleared)
+            KnownDbVersion::Cleared
         };
+
+        let versions = version..=version;
+        bookedw.insert_db(&tx, &versions)?;
 
         tx.commit()?;
 
-        let inserted = if let Some(known_version) = known_version {
-            bookedw.insert(version, known_version);
+        bookedw.insert_memory(versions, known_version);
 
-            drop(bookedw);
-
-            true
-        } else {
-            false
-        };
-
-        Ok::<_, rusqlite::Error>(inserted)
+        Ok::<_, rusqlite::Error>(true)
     }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
 
     Ok(inserted)
@@ -1285,6 +1272,20 @@ pub async fn process_multiple_changes(
 
         for (actor_id, knowns) in knowns.iter_mut() {
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} knowns", knowns.len());
+
+            let booked = {
+                bookie
+                    .blocking_write(format!(
+                        "process_multiple_changes(for_actor_blocking):{}",
+                        actor_id.as_simple()
+                    ))
+                    .ensure(*actor_id)
+            };
+            let mut booked_write = booked.blocking_write(format!(
+                "process_multiple_changes(booked writer, post commit):{}",
+                actor_id.as_simple()
+            ));
+
             for (versions, known) in knowns.iter_mut() {
                 match known {
                     KnownDbVersion::Partial { .. } => {
@@ -1316,6 +1317,15 @@ pub async fn process_multiple_changes(
                         }
                     }
                 }
+
+                booked_write
+                    .insert_db(&tx, versions)
+                    .map_err(|source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: Some(*actor_id),
+                        version: None,
+                    })?;
+
                 debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserted bookkeeping row");
             }
         }
@@ -1352,32 +1362,23 @@ pub async fn process_multiple_changes(
             ));
 
             for (versions, known) in knowns {
-                match known {
-                    KnownDbVersion::Cleared => {
-                        for version in versions {
-                            booked_write.insert(version, KnownDbVersion::Cleared);
-                        }
-                    }
-                    known => {
-                        let version = *versions.start();
-                        if let Some(PartialVersion { seqs, last_seq, .. }) =
-                            booked_write.insert(version, known)
-                        {
-                            let full_seqs_range = CrsqlSeq(0)..=last_seq;
-                            let gaps_count = seqs.gaps(&full_seqs_range).count();
-                            if gaps_count == 0 {
-                                // if we have no gaps, then we can schedule applying all these changes.
-                                debug!(%actor_id, %version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
-                                let tx_apply = agent.tx_apply().clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = tx_apply.send((actor_id, version)).await {
-                                        error!("could not send trigger for applying fully buffered changes later: {e}");
-                                    }
-                                });
-                            } else {
-                                debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs");
+                let version = *versions.start();
+                if let Some(PartialVersion { seqs, last_seq, .. }) =
+                    booked_write.insert_memory(versions, known)
+                {
+                    let full_seqs_range = CrsqlSeq(0)..=last_seq;
+                    let gaps_count = seqs.gaps(&full_seqs_range).count();
+                    if gaps_count == 0 {
+                        // if we have no gaps, then we can schedule applying all these changes.
+                        debug!(%actor_id, %version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
+                        let tx_apply = agent.tx_apply().clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tx_apply.send((actor_id, version)).await {
+                                error!("could not send trigger for applying fully buffered changes later: {e}");
                             }
-                        }
+                        });
+                    } else {
+                        debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs");
                     }
                 }
             }
