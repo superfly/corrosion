@@ -1235,7 +1235,13 @@ impl BookedVersions {
             conn.prepare_cached(
                 "
                 INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end)
-                    VALUES (?, ?, ?);
+                    VALUES (?, ?, ?)
+                    ON CONFLICT (actor_id, start)
+                        DO UPDATE SET
+                            end = excluded.end
+                        WHERE excluded.end > end -- this isn't really possible,
+                                                 -- but if it does happen, we want to 
+                                                 -- err on the side of caution
             ",
             )?
             .execute(params![self.actor_id, range.start(), range.end()])?;
@@ -1411,15 +1417,26 @@ mod tests {
         insert_everywhere(&conn, &mut bv, &mut all, Version(1)..=Version(20))?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
+        insert_everywhere(&conn, &mut bv, &mut all, Version(1)..=Version(10))?;
+        expect_gaps(&conn, &bv, &all, vec![])?;
+
         // try from an empty state again
         let mut bv = BookedVersions::new(actor_id);
         let mut all = RangeInclusiveSet::new();
 
         // insert a non-1 first version
-        insert_everywhere(&conn, &mut bv, &mut all, Version(2)..=Version(20))?;
-        expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(1)])?;
+        insert_everywhere(&conn, &mut bv, &mut all, Version(5)..=Version(20))?;
+        expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(4)])?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, Version(1)..=Version(1))?;
+        // insert a further change that does not overlap a gap
+        insert_everywhere(&conn, &mut bv, &mut all, Version(6)..=Version(7))?;
+        expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(4)])?;
+
+        // insert a further change that does overlap a gap
+        insert_everywhere(&conn, &mut bv, &mut all, Version(3)..=Version(7))?;
+        expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(2)])?;
+
+        insert_everywhere(&conn, &mut bv, &mut all, Version(1)..=Version(2))?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
         insert_everywhere(&conn, &mut bv, &mut all, Version(25)..=Version(25))?;
