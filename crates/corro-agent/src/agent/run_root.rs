@@ -43,7 +43,6 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         lock_registry,
         rx_bcast,
         rx_apply,
-        rx_empty,
         rx_clear_buf,
         rx_changes,
         rx_foca,
@@ -101,11 +100,11 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     )
     .await?;
 
-    spawn_counted(util::write_empties_loop(
-        agent.clone(),
-        rx_empty,
-        tripwire.clone(),
-    ));
+    // spawn_counted(util::write_empties_loop(
+    //     agent.clone(),
+    //     rx_empty,
+    //     tripwire.clone(),
+    // ));
 
     tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
 

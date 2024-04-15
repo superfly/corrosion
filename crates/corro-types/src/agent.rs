@@ -63,7 +63,6 @@ pub struct AgentConfig {
 
     pub tx_bcast: CorroSender<BroadcastInput>,
     pub tx_apply: CorroSender<(ActorId, Version)>,
-    pub tx_empty: CorroSender<(ActorId, RangeInclusive<Version>)>,
     pub tx_clear_buf: CorroSender<(ActorId, RangeInclusive<Version>)>,
     pub tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
     pub tx_foca: CorroSender<FocaInput>,
@@ -90,7 +89,6 @@ pub struct AgentInner {
     booked: Booked,
     tx_bcast: CorroSender<BroadcastInput>,
     tx_apply: CorroSender<(ActorId, Version)>,
-    tx_empty: CorroSender<(ActorId, RangeInclusive<Version>)>,
     tx_clear_buf: CorroSender<(ActorId, RangeInclusive<Version>)>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
     tx_foca: CorroSender<FocaInput>,
@@ -120,7 +118,6 @@ impl Agent {
             booked: config.booked,
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
-            tx_empty: config.tx_empty,
             tx_clear_buf: config.tx_clear_buf,
             tx_changes: config.tx_changes,
             tx_foca: config.tx_foca,
@@ -178,10 +175,6 @@ impl Agent {
 
     pub fn tx_changes(&self) -> &CorroSender<(ChangeV1, ChangeSource)> {
         &self.0.tx_changes
-    }
-
-    pub fn tx_empty(&self) -> &CorroSender<(ActorId, RangeInclusive<Version>)> {
-        &self.0.tx_empty
     }
 
     pub fn tx_clear_buf(&self) -> &CorroSender<(ActorId, RangeInclusive<Version>)> {
@@ -483,6 +476,8 @@ pub enum ChangeError {
         actor_id: Option<ActorId>,
         version: Option<Version>,
     },
+    #[error("non-contiguous empties range delete")]
+    NonContiguousDelete,
 }
 
 #[derive(Debug, thiserror::Error)]

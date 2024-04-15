@@ -28,13 +28,15 @@ use crate::{
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
-        Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion, SplitPool,
+        Agent, Booked, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion,
+        SplitPool,
     },
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
+    sqlite::CrConn,
 };
 
 use axum::{
@@ -901,7 +903,7 @@ pub fn store_empty_changeset(
     conn: &Connection,
     actor_id: ActorId,
     versions: RangeInclusive<Version>,
-) -> eyre::Result<usize> {
+) -> Result<usize, ChangeError> {
     // first, delete "current" versions, they're now gone!
     let deleted: Vec<RangeInclusive<Version>> = conn
         .prepare_cached(
@@ -926,7 +928,12 @@ pub fn store_empty_changeset(
                     ( end_version = :start - 1 )
                 )
             RETURNING start_version, end_version",
-        )?
+        )
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
+        })?
         .query_map(
             named_params![
                 ":actor_id": actor_id,
@@ -938,7 +945,12 @@ pub fn store_empty_changeset(
                 Ok(start..=row.get::<_, Option<Version>>(1)?.unwrap_or(start))
             },
         )
-        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
+        })?;
 
     if !deleted.is_empty() {
         debug!(
@@ -954,8 +966,7 @@ pub fn store_empty_changeset(
     // we should never have deleted non-contiguous ranges, abort!
     if new_ranges.len() > 1 {
         warn!("deleted non-contiguous ranges! {new_ranges:?}");
-        // this serves as a failsafe
-        eyre::bail!("deleted non-contiguous ranges: {new_ranges:?}");
+        return Err(ChangeError::NonContiguousDelete);
     }
 
     let mut inserted = 0;
@@ -968,8 +979,16 @@ pub fn store_empty_changeset(
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, last_seq, ts)
                     VALUES (?, ?, ?, NULL, NULL, NULL);
             ",
-        )?
-        .execute(params![actor_id, range.start(), range.end()])?;
+        ).map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
+        })?
+        .execute(params![actor_id, range.start(), range.end()]).map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
+        })?;
     }
 
     Ok(inserted)
@@ -1021,11 +1040,17 @@ pub async fn process_fully_buffered_changes(
             }
         };
 
-        let tx = conn.immediate_transaction()?;
+        let tx = conn
+            .immediate_transaction()
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
 
         info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
-        let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?")?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional()?;
+        let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional().map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
 
         let start = Instant::now();
 
@@ -1041,8 +1066,8 @@ pub async fn process_fully_buffered_changes(
                               AND version = ?
                             ORDER BY db_version ASC, seq ASC
                             "#,
-            )?
-            .execute(params![max_db_version, actor_id.as_bytes(), version])?;
+            ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
+            .execute(params![max_db_version, actor_id.as_bytes(), version]).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
             info!(%actor_id, %version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
         } else {
             info!(%actor_id, %version, "No buffered rows, skipped insertion into crsql_changes");
@@ -1053,14 +1078,29 @@ pub async fn process_fully_buffered_changes(
         }
 
         let rows_impacted: i64 = tx
-            .prepare_cached("SELECT crsql_rows_impacted()")?
-            .query_row((), |row| row.get(0))?;
+            .prepare_cached("SELECT crsql_rows_impacted()")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?
+            .query_row((), |row| row.get(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
 
         debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
         if rows_impacted > 0 {
-            let db_version: CrsqlDbVersion =
-                tx.query_row("SELECT crsql_next_db_version()", [], |row| row.get(0))?;
+            let db_version: CrsqlDbVersion = tx
+                .query_row("SELECT crsql_next_db_version()", [], |row| row.get(0))
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: Some(version),
+                })?;
             debug!("db version: {db_version}");
 
             tx.prepare_cached(
@@ -1073,32 +1113,41 @@ pub async fn process_fully_buffered_changes(
                         :last_seq,
                         :ts
                     );",
-            )?
+            ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
             .execute(named_params! {
                 ":actor_id": actor_id,
                 ":version": version,
                 ":db_version": db_version,
                 ":last_seq": last_seq,
                 ":ts": ts
-            })?;
+            }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
 
             debug!(%actor_id, %version, "inserted bookkeeping row after buffered insert");
         } else {
-            if let Err(e) = agent.tx_empty().try_send((actor_id, version..=version)) {
-                error!(%actor_id, "could not schedule empties for clear: {e}");
-            }
+            store_empty_changeset(&tx, actor_id, version..=version)?;
 
             debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
         };
 
-        let needed_changes = bookedw.insert_db(&tx, [version..=version].into())?;
+        let needed_changes =
+            bookedw
+                .insert_db(&tx, [version..=version].into())
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: Some(version),
+                })?;
 
-        tx.commit()?;
+        tx.commit().map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(version),
+        })?;
 
         bookedw.apply_needed_changes(needed_changes);
 
-        Ok::<_, rusqlite::Error>(true)
-    }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
+        Ok::<_, ChangeError>(true)
+    })?;
 
     Ok(inserted)
 }
@@ -1114,7 +1163,7 @@ pub async fn process_multiple_changes(
     debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
     let mut seen = HashSet::new();
-    let mut unknown_changes = Vec::with_capacity(changes.len());
+    let mut unknown_changes: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for (change, src, queued_at) in changes {
         histogram!("corro.agent.changes.queued.seconds").record(queued_at.elapsed());
         let versions = change.versions();
@@ -1139,10 +1188,11 @@ pub async fn process_multiple_changes(
             continue;
         }
 
-        unknown_changes.push((change, src));
+        unknown_changes
+            .entry(change.actor_id)
+            .or_default()
+            .push((change, src));
     }
-
-    unknown_changes.sort_by_key(|(change, _src)| change.actor_id);
 
     let mut conn = agent.pool().write_normal().await?;
 
@@ -1163,11 +1213,7 @@ pub async fn process_multiple_changes(
 
         // let mut writers: BTreeMap<ActorId, _> = Default::default();
 
-        for (actor_id, changes) in unknown_changes
-            .into_iter()
-            .group_by(|(change, _src)| change.actor_id)
-            .into_iter()
-        {
+        for (actor_id, changes) in unknown_changes {
             let booked = {
                 bookie
                     .blocking_write(format!(
@@ -1211,11 +1257,6 @@ pub async fn process_multiple_changes(
 
                 // optimizing this, insert later!
                 let known = if change.is_complete() && change.is_empty() {
-                    // we never want to block here
-                    if let Err(e) = agent.tx_empty().try_send((actor_id, change.versions())) {
-                        error!("could not send empty changed versions into channel: {e}");
-                    }
-
                     KnownDbVersion::Cleared
                 } else {
                     if let Some(seqs) = change.seqs() {
@@ -1301,9 +1342,7 @@ pub async fn process_multiple_changes(
                     }
                     KnownDbVersion::Cleared => {
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
-                        if let Err(e) = agent.tx_empty().try_send((*actor_id, versions.clone())) {
-                            error!("could not schedule version to be cleared: {e}");
-                        }
+                        store_empty_changeset(&tx, *actor_id, versions.clone())?;
                     }
                 }
 

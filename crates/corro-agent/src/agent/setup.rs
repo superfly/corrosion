@@ -50,7 +50,6 @@ pub struct AgentOptions {
     pub api_listener: TcpListener,
     pub rx_bcast: CorroReceiver<BroadcastInput>,
     pub rx_apply: CorroReceiver<(ActorId, Version)>,
-    pub rx_empty: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
     pub rx_clear_buf: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
     pub rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     pub rx_foca: CorroReceiver<FocaInput>,
@@ -144,7 +143,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     );
 
     let (tx_bcast, rx_bcast) = bounded(conf.perf.bcast_channel_len, "bcast");
-    let (tx_empty, rx_empty) = bounded(conf.perf.empties_channel_len, "empty");
     let (tx_changes, rx_changes) = bounded(conf.perf.changes_channel_len, "changes");
     let (tx_foca, rx_foca) = bounded(conf.perf.foca_channel_len, "foca");
 
@@ -172,7 +170,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         lock_registry,
         rx_bcast,
         rx_apply,
-        rx_empty,
         rx_clear_buf,
         rx_changes,
         rx_foca,
@@ -194,7 +191,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         booked,
         tx_bcast,
         tx_apply,
-        tx_empty,
         tx_clear_buf,
         tx_changes,
         tx_foca,
