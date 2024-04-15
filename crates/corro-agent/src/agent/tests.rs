@@ -265,7 +265,7 @@ async fn chill_test() -> eyre::Result<()> {
     configurable_stress_test(2, 1, 1).await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stress_test() -> eyre::Result<()> {
     configurable_stress_test(30, 10, 200).await
 }
@@ -444,7 +444,7 @@ pub async fn configurable_stress_test(
             let r = registry.map.read();
 
             for v in r.values() {
-                warn!(actor_id = %ta.agent.actor_id(), "GOT A LOCK {v:?}");
+                println!("{}: GOT A LOCK {v:?}", ta.agent.actor_id());
             }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -512,6 +512,21 @@ pub async fn configurable_stress_test(
         }
     }
     println!("fully disseminated in {}s", start.elapsed().as_secs_f32());
+
+    println!("checking gaps in db...");
+    for ta in agents {
+        let conn = ta.agent.pool().read().await?;
+        let gaps_count: u64 =
+            conn.query_row("SELECT count(*) FROM __corro_bookkeeping_gaps", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(
+            gaps_count,
+            0,
+            "expected {} to have 0 gaps in DB",
+            ta.agent.actor_id()
+        );
+    }
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
@@ -690,13 +705,13 @@ async fn large_tx_sync() -> eyre::Result<()> {
     println!("expected count: {expected_count}");
 
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
-    // let ta3 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
-    // let ta4 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta3 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta4 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
     let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
     let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
-    // let ta3_transport = Transport::new(&ta3.agent.config().gossip, rtt_tx.clone()).await?;
-    // let ta4_transport = Transport::new(&ta4.agent.config().gossip, rtt_tx.clone()).await?;
+    let ta3_transport = Transport::new(&ta3.agent.config().gossip, rtt_tx.clone()).await?;
+    let ta4_transport = Transport::new(&ta4.agent.config().gossip, rtt_tx.clone()).await?;
 
     for _ in 0..6 {
         let res = parallel_sync(
@@ -709,31 +724,31 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         println!("ta2 synced {res}");
 
-        // let res = parallel_sync(
-        //     &ta3.agent,
-        //     &ta3_transport,
-        //     vec![
-        //         (ta1.agent.actor_id(), ta1.agent.gossip_addr()),
-        //         (ta2.agent.actor_id(), ta2.agent.gossip_addr()),
-        //     ],
-        //     generate_sync(&ta3.bookie, ta3.agent.actor_id()).await,
-        // )
-        // .await?;
+        let res = parallel_sync(
+            &ta3.agent,
+            &ta3_transport,
+            vec![
+                (ta1.agent.actor_id(), ta1.agent.gossip_addr()),
+                (ta2.agent.actor_id(), ta2.agent.gossip_addr()),
+            ],
+            generate_sync(&ta3.bookie, ta3.agent.actor_id()).await,
+        )
+        .await?;
 
-        // println!("ta3 synced {res}");
+        println!("ta3 synced {res}");
 
-        // let res = parallel_sync(
-        //     &ta4.agent,
-        //     &ta4_transport,
-        //     vec![
-        //         (ta3.agent.actor_id(), ta3.agent.gossip_addr()),
-        //         (ta2.agent.actor_id(), ta2.agent.gossip_addr()),
-        //     ],
-        //     generate_sync(&ta4.bookie, ta4.agent.actor_id()).await,
-        // )
-        // .await?;
+        let res = parallel_sync(
+            &ta4.agent,
+            &ta4_transport,
+            vec![
+                (ta3.agent.actor_id(), ta3.agent.gossip_addr()),
+                (ta2.agent.actor_id(), ta2.agent.gossip_addr()),
+            ],
+            generate_sync(&ta4.bookie, ta4.agent.actor_id()).await,
+        )
+        .await?;
 
-        // println!("ta4 synced {res}");
+        println!("ta4 synced {res}");
 
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -742,8 +757,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
     let mut ta_counts = vec![];
 
-    for (name, ta) in [("ta2", &ta2)] {
-        //("ta3", &ta3), ("ta4", &ta4)] {
+    for (name, ta) in [("ta2", &ta2), ("ta3", &ta3), ("ta4", &ta4)] {
         let agent = &ta.agent;
         let conn = agent.pool().read().await?;
 

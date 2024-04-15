@@ -7,7 +7,7 @@ use axum::{response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
-    agent::{Agent, ChangeError, CurrentVersion, KnownDbVersion},
+    agent::{Agent, ChangeError},
     api::{
         row_to_change, ColumnName, ExecResponse, ExecResult, QueryEvent, Statement,
         TableStatRequest, TableStatResponse,
@@ -128,7 +128,7 @@ where
 
         let versions = version..=version;
 
-        let elapsed = {
+        let (elapsed, needed_changes) = {
             tx.prepare_cached(
                 r#"
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
@@ -155,32 +155,26 @@ where
 
             debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
-            book_writer
-                .insert_db(&tx, &versions)
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(actor_id),
-                    version: Some(version),
-                })?;
+            let needed_changes =
+                book_writer
+                    .insert_db(&tx, [versions].into())
+                    .map_err(|source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: Some(actor_id),
+                        version: Some(version),
+                    })?;
 
             tx.commit().map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),
                 version: Some(version),
             })?;
-            start.elapsed()
+            (start.elapsed(), needed_changes)
         };
 
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        book_writer.insert_memory(
-            versions,
-            KnownDbVersion::Current(CurrentVersion {
-                db_version,
-                last_seq,
-                ts,
-            }),
-        );
+        book_writer.apply_needed_changes(needed_changes);
         drop(book_writer);
 
         let agent = agent.clone();

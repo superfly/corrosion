@@ -14,7 +14,7 @@ use bytes::Buf;
 use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
-    agent::{Agent, CurrentVersion, KnownDbVersion},
+    agent::Agent,
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset, Timestamp},
     change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
@@ -2160,21 +2160,13 @@ impl Session {
 
         debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
-        let versions = version..=version;
-        book_writer.insert_db(conn, &versions)?;
+        let needed_changes = book_writer.insert_db(conn, [version..=version].into())?;
 
         conn.execute_batch("COMMIT")?;
 
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        book_writer.insert_memory(
-            versions,
-            KnownDbVersion::Current(CurrentVersion {
-                db_version,
-                last_seq,
-                ts,
-            }),
-        );
+        book_writer.apply_needed_changes(needed_changes);
 
         drop(book_writer);
 
