@@ -444,7 +444,12 @@ pub async fn configurable_stress_test(
             let r = registry.map.read();
 
             for v in r.values() {
-                println!("{}: GOT A LOCK {v:?}", ta.agent.actor_id());
+                println!(
+                    "{}: GOT A LOCK: {} has been locked for {:?}",
+                    ta.agent.actor_id(),
+                    v.label,
+                    v.started_at.elapsed()
+                );
             }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;

@@ -1177,7 +1177,7 @@ pub async fn process_multiple_changes(
                     .ensure(actor_id)
             };
             let booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer):{}",
+                "process_multiple_changes(booked writer, unknown changes):{}",
                 actor_id.as_simple()
             ));
 
@@ -1274,7 +1274,7 @@ pub async fn process_multiple_changes(
                     .ensure(*actor_id)
             };
             let mut booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer):{actor_id}",
+                "process_multiple_changes(booked writer, during knowns):{actor_id}",
             ));
 
             for (versions, known) in knowns.iter() {
@@ -1358,7 +1358,7 @@ pub async fn process_multiple_changes(
                     .ensure(actor_id)
             };
             let mut booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer):{actor_id}",
+                "process_multiple_changes(booked writer, before apply needed):{actor_id}",
             ));
 
             if let Some(needed_changes) = needed_changes.remove(&actor_id) {
