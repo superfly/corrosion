@@ -30,8 +30,10 @@ pub use setup::{setup, AgentOptions};
 pub use util::{clear_overwritten_versions, process_multiple_changes};
 
 pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
-pub const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(15); // 1 minute oughta be enough, we're constantly
-                                                                // getting broadcasts randomly + targetted
+#[cfg(test)]
+pub const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+pub const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(15);
 pub const RANDOM_NODES_CHOICES: usize = 10;
 
 pub const CHECK_EMPTIES_TO_INSERT_AFTER: Duration = Duration::from_secs(120);
