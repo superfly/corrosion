@@ -506,7 +506,7 @@ pub async fn configurable_stress_test(
             for ta in agents.iter() {
                 let conn = ta.agent.pool().read().await?;
                 let mut per_actor: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
-                let mut prepped = conn.prepare("SELECT site_id, start_version, coalesce(end_version, start_version) FROM __corro_bookkeeping;")?;
+                let mut prepped = conn.prepare("SELECT actor_id, start_version, coalesce(end_version, start_version) FROM __corro_bookkeeping;")?;
                 let mut rows = prepped.query(())?;
 
                 while let Ok(Some(row)) = rows.next() {
