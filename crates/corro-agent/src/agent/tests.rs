@@ -17,7 +17,7 @@ use tokio::{
     sync::mpsc,
     time::{sleep, timeout, MissedTickBehavior},
 };
-use tracing::{debug, info_span, warn};
+use tracing::{debug, info_span};
 use tripwire::Tripwire;
 
 use crate::{agent::util::*, api::peer::parallel_sync, transport::Transport};

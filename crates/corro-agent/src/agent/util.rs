@@ -16,9 +16,7 @@ use std::{
 };
 
 use crate::{
-    agent::{
-        handlers, CountedExecutor, CHECK_EMPTIES_TO_INSERT_AFTER, MAX_SYNC_BACKOFF, TO_CLEAR_COUNT,
-    },
+    agent::{handlers, CountedExecutor, MAX_SYNC_BACKOFF, TO_CLEAR_COUNT},
     api::public::{
         api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
         pubsub::{api_v1_sub_by_id, api_v1_subs},
@@ -28,15 +26,13 @@ use crate::{
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
-        Agent, Booked, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion,
-        SplitPool,
+        Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion, SplitPool,
     },
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
-    sqlite::CrConn,
 };
 
 use axum::{
@@ -47,9 +43,8 @@ use axum::{
     BoxError, Extension, Router, TypedHeader,
 };
 use foca::Member;
-use futures::{FutureExt, TryFutureExt};
+use futures::FutureExt;
 use hyper::{server::conn::AddrIncoming, StatusCode};
-use itertools::Itertools;
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{
@@ -727,131 +722,6 @@ pub async fn clear_buffered_meta_loop(
             Ok::<_, eyre::Report>(())
         });
     }
-}
-
-const MAX_EMPTIES_BATCH_SIZE: u64 = 40;
-
-/// Clear empty versions from the database in chunks to avoid locking
-/// the database for too long.
-///
-/// We are given versions to clear either by receiving empty
-/// changesets, or when calling
-/// [`find_cleared_db_versions`](self::find_cleared_db_versions)
-/// periodically.
-pub async fn write_empties_loop(
-    agent: Agent,
-    mut rx_empty: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
-    mut tripwire: Tripwire,
-) {
-    let mut empties: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
-
-    let next_empties_check = tokio::time::sleep(CHECK_EMPTIES_TO_INSERT_AFTER);
-    tokio::pin!(next_empties_check);
-
-    let mut count = 0;
-
-    loop {
-        tokio::select! {
-            maybe_empty = rx_empty.recv() => match maybe_empty {
-                Some((actor_id, versions)) => {
-                    empties.entry(actor_id).or_default().insert(versions);
-                    count += 1;
-                    if count < MAX_EMPTIES_BATCH_SIZE {
-                        continue;
-                    }
-                },
-                None => {
-                    debug!("empties queue is done");
-                    break;
-                }
-            },
-            _ = &mut next_empties_check => {
-                next_empties_check.as_mut().reset(tokio::time::Instant::now() + CHECK_EMPTIES_TO_INSERT_AFTER);
-                if empties.is_empty() {
-                    continue;
-                }
-            },
-            _ = &mut tripwire => break
-        }
-
-        let empties_to_process = std::mem::take(&mut empties);
-
-        // TODO: replace with a JoinSet and max concurrency
-        spawn_counted(
-            process_completed_empties(agent.clone(), empties_to_process)
-                .inspect_err(|e| error!("could not process empties: {e}")),
-        );
-
-        count = 0;
-    }
-    info!("Draining empty versions to process...");
-    // drain empties channel
-    while let Ok((actor_id, versions)) = rx_empty.try_recv() {
-        empties.entry(actor_id).or_default().insert(versions);
-    }
-
-    if !empties.is_empty() {
-        info!("Inserting last unprocessed empties before shut down");
-        if let Err(e) = process_completed_empties(agent, empties).await {
-            error!("could not process empties: {e}");
-        }
-    }
-}
-
-#[tracing::instrument(skip_all, err)]
-pub async fn process_completed_empties(
-    agent: Agent,
-    empties: BTreeMap<ActorId, RangeInclusiveSet<Version>>,
-) -> eyre::Result<()> {
-    debug!(
-        "processing empty versions (count: {})",
-        empties.values().map(RangeInclusiveSet::len).sum::<usize>()
-    );
-
-    let mut inserted = 0;
-
-    let start = Instant::now();
-    for (actor_id, empties) in empties {
-        let v = empties.into_iter().collect::<Vec<_>>();
-
-        for ranges in v.chunks(25) {
-            let mut conn = agent.pool().write_low().await?;
-            block_in_place(|| {
-                let mut tx = conn.immediate_transaction()?;
-
-                for range in ranges {
-                    let mut sp = tx.savepoint()?;
-                    match store_empty_changeset(&sp, actor_id, range.clone()) {
-                        Ok(count) => {
-                            inserted += count;
-                            sp.commit()?;
-                        }
-                        Err(e) => {
-                            error!(%actor_id, "could not store empty changeset for versions {range:?}: {e}");
-                            sp.rollback()?;
-                            continue;
-                        }
-                    }
-                    if let Err(e) = agent.tx_clear_buf().try_send((actor_id, range.clone())) {
-                        error!(%actor_id, "could not schedule buffered meta clear: {e}");
-                    }
-                }
-
-                tx.commit()?;
-
-                Ok::<_, eyre::Report>(())
-            })?;
-        }
-    }
-
-    let elapsed = start.elapsed();
-
-    debug!("upserted {inserted} empty version ranges in {elapsed:?}");
-
-    counter!("corro.agent.empties.committed").increment(inserted as u64);
-    histogram!("corro.agent.empties.commit.second").record(elapsed);
-
-    Ok(())
 }
 
 #[tracing::instrument(skip_all, err)]
