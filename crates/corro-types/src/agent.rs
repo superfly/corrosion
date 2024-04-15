@@ -1142,6 +1142,7 @@ impl BookedVersions {
         versions: RangeInclusive<Version>,
         known_version: KnownDbVersion,
     ) -> Option<PartialVersion> {
+        debug!(actor_id = %self.actor_id, "insert memory {versions:?}");
         let ret = match known_version {
             // insert a partial
             KnownDbVersion::Partial(partial) => {
@@ -1173,12 +1174,14 @@ impl BookedVersions {
             .unwrap_or_default();
 
         if old_last < *versions.start() {
+            debug!(actor_id = %self.actor_id, "memory inserting {:?}", (old_last + 1)..=*versions.start());
             // last max version was smaller than the start of the range here
             // this means there's now a gap!
             self.needed.insert((old_last + 1)..=*versions.start());
         }
 
         self.needed.remove(versions);
+        debug!(actor_id = %self.actor_id, "memory needed {:?}", self.needed);
 
         ret
     }
@@ -1188,28 +1191,39 @@ impl BookedVersions {
         conn: &Connection, // usually a `Transaction`
         versions: &RangeInclusive<Version>,
     ) -> rusqlite::Result<()> {
+        debug!("wants to insert into db {versions:?}");
+        debug!("needed: {:?}", self.needed);
         let overlapping = self.needed.overlapping(versions);
 
         let mut new_ranges: RangeInclusiveSet<Version> = Default::default();
-        let mut delete_ranges = vec![];
+        let mut delete_ranges = vec![versions.clone()];
         for range in overlapping {
+            debug!(actor_id = %self.actor_id, "overlapping: {range:?}");
             new_ranges.insert(range.clone());
             delete_ranges.push(range.clone());
         }
 
-        if let Some(range) = self.needed.get(&Version(versions.start().0 - 1)) {
-            new_ranges.insert(range.clone());
-            delete_ranges.push(range.clone());
-        }
+        // // reproducing the rangemap collapsing logic
+        // if let Some(range) = self.needed.get(&Version(versions.start().0 - 1)) {
+        //     debug!(actor_id = %self.actor_id, "got a start - 1: {range:?}");
+        //     new_ranges.insert(range.clone());
+        //     delete_ranges.push(range.clone());
+        // }
 
-        if let Some(range) = self.needed.get(&Version(versions.end().0 + 1)) {
-            new_ranges.insert(range.clone());
-            delete_ranges.push(range.clone());
-        }
+        // // reproducing the rangemap collapsing logic
+        // if let Some(range) = self.needed.get(&Version(versions.end().0 + 1)) {
+        //     debug!(actor_id = %self.actor_id, "got a end + 1: {range:?}");
+        //     new_ranges.insert(range.clone());
+        //     delete_ranges.push(range.clone());
+        // }
 
+        // either a max or 0
+        // TODO: figure out if we want to use 0 instead of None in the struct by default
         let current_last = self.last.unwrap_or_default();
+
         if current_last < *versions.start() {
             let range = (current_last + 1)..=*versions.start();
+            debug!("inserting more recent range: {range:?}");
             new_ranges.insert(range.clone());
             for range in self.needed.overlapping(&range) {
                 new_ranges.insert(range.clone());
@@ -1217,12 +1231,14 @@ impl BookedVersions {
             }
         }
 
+        // we now know the applied versions
         new_ranges.remove(versions.clone());
 
-        trace!("delete: {delete_ranges:?}");
-        trace!("new: {new_ranges:?}");
+        debug!(actor_id = %self.actor_id, "delete: {delete_ranges:?}");
+        debug!(actor_id = %self.actor_id, "new: {new_ranges:?}");
 
         for range in delete_ranges {
+            debug!(actor_id = %self.actor_id, "deleting {range:?}");
             conn
             .prepare_cached("DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = :actor_id AND start = :start AND end = :end")?
             .execute(named_params! {
@@ -1233,6 +1249,7 @@ impl BookedVersions {
         }
 
         for range in new_ranges {
+            debug!(actor_id = %self.actor_id, "inserting {range:?}");
             conn.prepare_cached(
                 "INSERT INTO __corro_bookkeeping_gaps VALUES (:actor_id, :start, :end)",
             )?

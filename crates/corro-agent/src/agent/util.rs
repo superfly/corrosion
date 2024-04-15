@@ -1269,6 +1269,8 @@ pub async fn process_multiple_changes(
 
         let mut count = 0;
 
+        let mut writers: BTreeMap<ActorId, _> = Default::default();
+
         for (actor_id, knowns) in knowns.iter_mut() {
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} knowns", knowns.len());
 
@@ -1280,7 +1282,8 @@ pub async fn process_multiple_changes(
                     ))
                     .ensure(*actor_id)
             };
-            let mut booked_write = booked.blocking_write(format!(
+
+            let mut booked_write = booked.blocking_write_owned(format!(
                 "process_multiple_changes(booked writer, post commit):{}",
                 actor_id.as_simple()
             ));
@@ -1327,6 +1330,7 @@ pub async fn process_multiple_changes(
 
                 debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserted bookkeeping row");
             }
+            writers.insert(*actor_id, booked_write);
         }
 
         debug!("inserted {count} new changesets");
@@ -1347,18 +1351,13 @@ pub async fn process_multiple_changes(
         debug!("committed {count} changes in {:?}", start.elapsed());
 
         for (actor_id, knowns) in knowns {
-            let booked = {
-                bookie
-                    .blocking_write(format!(
-                        "process_multiple_changes(for_actor_blocking):{}",
-                        actor_id.as_simple()
-                    ))
-                    .ensure(actor_id)
+            let mut booked_write = match writers.remove(&actor_id) {
+                Some(booked_write) => booked_write,
+                None => {
+                    // impossible?
+                    unreachable!();
+                }
             };
-            let mut booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer, post commit):{}",
-                actor_id.as_simple()
-            ));
 
             for (versions, known) in knowns {
                 let version = *versions.start();
