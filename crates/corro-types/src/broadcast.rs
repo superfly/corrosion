@@ -180,7 +180,7 @@ impl Changeset {
 
     pub fn len(&self) -> usize {
         match self {
-            Changeset::Empty { .. } => 0,
+            Changeset::Empty { .. } => 1,
             Changeset::Full { changes, .. } => changes.len(),
         }
     }
