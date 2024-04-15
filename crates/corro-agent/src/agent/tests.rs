@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::SocketAddr,
     ops::Deref,
     time::{Duration, Instant},
@@ -10,6 +10,7 @@ use hyper::StatusCode;
 use rand::{
     distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::IteratorRandom, SeedableRng,
 };
+use rangemap::RangeInclusiveSet;
 use serde::Deserialize;
 use serde_json::json;
 use spawn::wait_for_all_pending_handles;
@@ -335,7 +336,10 @@ pub async fn configurable_stress_test(
 
     let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
 
-    let addrs: Vec<SocketAddr> = agents.iter().map(|ta| ta.agent.api_addr()).collect();
+    let addrs: Vec<(ActorId, SocketAddr)> = agents
+        .iter()
+        .map(|ta| (ta.agent.actor_id(), ta.agent.api_addr()))
+        .collect();
 
     let iter = (0..input_count).flat_map(|n| {
         serde_json::from_value::<Vec<Statement>>(json!([
@@ -359,55 +363,52 @@ pub async fn configurable_stress_test(
         .unwrap()
     });
 
-    tokio::spawn(async move {
-        tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
+    let actor_versions = tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
+        let addrs = addrs.clone();
+        let client = client.clone();
+        move |statements| {
             let addrs = addrs.clone();
             let client = client.clone();
-            move |statements| {
-                let addrs = addrs.clone();
-                let client = client.clone();
-                Ok(async move {
-                    let mut rng = StdRng::from_entropy();
-                    let chosen = addrs.iter().choose(&mut rng).unwrap();
+            Ok(async move {
+                let mut rng = StdRng::from_entropy();
+                let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
 
-                    let res = client
-                        .request(
-                            hyper::Request::builder()
-                                .method(hyper::Method::POST)
-                                .uri(format!("http://{chosen}/v1/transactions"))
-                                .header(hyper::header::CONTENT_TYPE, "application/json")
-                                .body(serde_json::to_vec(&statements)?.into())?,
-                        )
-                        .await?;
+                let res = client
+                    .request(
+                        hyper::Request::builder()
+                            .method(hyper::Method::POST)
+                            .uri(format!("http://{chosen}/v1/transactions"))
+                            .header(hyper::header::CONTENT_TYPE, "application/json")
+                            .body(serde_json::to_vec(&statements)?.into())?,
+                    )
+                    .await?;
 
-                    if res.status() != StatusCode::OK {
-                        eyre::bail!("unexpected status code: {}", res.status());
-                    }
+                if res.status() != StatusCode::OK {
+                    eyre::bail!("unexpected status code: {}", res.status());
+                }
 
-                    let body: ExecResponse =
-                        serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+                let body: ExecResponse =
+                    serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
 
-                    for (i, statement) in statements.iter().enumerate() {
-                        if !matches!(
-                            body.results[i],
-                            ExecResult::Execute {
-                                rows_affected: 1,
-                                ..
-                            }
-                        ) {
-                            eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
+                for (i, statement) in statements.iter().enumerate() {
+                    if !matches!(
+                        body.results[i],
+                        ExecResult::Execute {
+                            rows_affected: 1,
+                            ..
                         }
+                    ) {
+                        eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
                     }
+                }
 
-                    Ok::<_, eyre::Report>(())
-                })
-            }
-        })
-        .try_buffer_unordered(10)
-        .try_collect::<Vec<()>>()
-        .await?;
-        Ok::<_, eyre::Report>(())
-    });
+                Ok::<_, eyre::Report>((*actor_id, statements.len()))
+            })
+        }
+    })
+    .try_buffer_unordered(10)
+    .try_collect::<BTreeMap<_, _>>()
+    .await?;
 
     let changes_count = 4 * input_count;
 
@@ -502,12 +503,40 @@ pub async fn configurable_stress_test(
         println!("we're not done yet...");
 
         if start.elapsed() > Duration::from_secs(30) {
-            let conn = agents[0].agent.pool().read().await?;
-            let mut prepped = conn.prepare("SELECT * FROM crsql_changes;")?;
-            let mut rows = prepped.query(())?;
+            for ta in agents.iter() {
+                let conn = ta.agent.pool().read().await?;
+                let mut per_actor: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
+                let mut prepped = conn.prepare("SELECT site_id, start_version, coalesce(end_version, start_version) FROM __corro_bookkeeping;")?;
+                let mut rows = prepped.query(())?;
 
-            while let Ok(Some(row)) = rows.next() {
-                println!("row: {row:?}");
+                while let Ok(Some(row)) = rows.next() {
+                    per_actor
+                        .entry(row.get(0)?)
+                        .or_default()
+                        .insert(row.get(1)?..=row.get(2)?);
+                }
+
+                for (actor_id, versions) in per_actor {
+                    if let Some(versions_len) = actor_versions.get(&actor_id) {
+                        let full_range = Version(1)..=Version(*versions_len as u64 + 1);
+                        let gaps = versions.gaps(&full_range);
+                        for gap in gaps {
+                            println!("{} gap! {actor_id} => {gap:?}", ta.agent.actor_id());
+                        }
+                    }
+                }
+
+                let recorded_gaps = conn
+                    .prepare("SELECT actor_id, start, end FROM __corro_bookkeeping_gaps")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<Result<Vec<(ActorId, Version, Version)>, _>>()?;
+
+                for (actor_id, start, end) in recorded_gaps {
+                    println!(
+                        "{} recorded gap: {actor_id} => {start}..={end}",
+                        ta.agent.actor_id()
+                    );
+                }
             }
 
             panic!(
