@@ -517,7 +517,9 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 .args(splitted_cmd)
                 .spawn()?
                 .wait()?;
+
             info!("Exited with code: {:?}", exit.code());
+            std::process::exit(exit.code().unwrap_or(1));
         }
     }
 
