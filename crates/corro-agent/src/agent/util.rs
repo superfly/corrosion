@@ -1265,14 +1265,6 @@ pub async fn process_multiple_changes(
         debug!("committed {count} changes in {:?}", start.elapsed());
 
         for (actor_id, knowns) in knowns {
-            // let mut booked_write = match writers.remove(&actor_id) {
-            //     Some(booked_write) => booked_write,
-            //     None => {
-            //         // impossible?
-            //         unreachable!();
-            //     }
-            // };
-
             let booked = {
                 bookie
                     .blocking_write(format!(
