@@ -630,21 +630,27 @@ pub async fn sync_loop(
         match branch {
             Branch::Tick => {
                 // ignoring here, there is trying and logging going on inside
-                match handlers::handle_sync(&agent, &bookie, &transport)
-                    .preemptible(&mut tripwire)
-                    .await
+                match tokio::time::timeout(
+                    Duration::from_secs(300),
+                    handlers::handle_sync(&agent, &bookie, &transport),
+                )
+                .preemptible(&mut tripwire)
+                .await
                 {
                     tripwire::Outcome::Preempted(_) => {
                         warn!("aborted sync by tripwire");
                         break;
                     }
-                    tripwire::Outcome::Completed(res) => {
-                        if let Err(e) = res {
+                    tripwire::Outcome::Completed(res) => match res {
+                        Ok(Err(e)) => {
                             error!("could not sync: {e}");
                             // keep syncing until we successfully sync
-                            continue;
                         }
-                    }
+                        Err(_e) => {
+                            warn!("timed out waiting for sync to complete!");
+                        }
+                        Ok(Ok(_)) => {}
+                    },
                 }
                 next_sync_at
                     .as_mut()
