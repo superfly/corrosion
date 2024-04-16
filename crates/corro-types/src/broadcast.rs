@@ -180,7 +180,7 @@ impl Changeset {
 
     pub fn len(&self) -> usize {
         match self {
-            Changeset::Empty { .. } => 1,
+            Changeset::Empty { versions } => (versions.end().0 - versions.start().0 + 1) as usize,
             Changeset::Full { changes, .. } => changes.len(),
         }
     }
@@ -382,7 +382,7 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
             }
             _ => {}
         };
-        
+
         if let Err(e) = self.notifications.try_send(notification) {
             counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications")
                 .increment(1);
