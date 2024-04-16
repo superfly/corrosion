@@ -539,37 +539,37 @@ pub async fn handle_changes(
                     }
                 }
 
-                match &change.changeset {
-                    Changeset::Empty {versions} => {
-                        let mut range = versions.clone().peekable();
+                // match &change.changeset {
+                //     Changeset::Empty {versions} => {
+                //         let mut range = versions.clone().peekable();
 
-                        while range.peek().is_some() {
-                            if let Some(first) = range.next() {
-                                let mut last = first;
-                                for _ in 0..4 {
-                                    if let Some(next) = range.next() {
-                                        last = next;
-                                    }
-                                }
-                                let new_change = ChangeV1{actor_id: change.actor_id, changeset: Changeset::Empty { versions: first..=last }};
-                                let change_len = new_change.len();
-                                queue.push_back((new_change, src, Instant::now()));
-                                count += change_len;
-                            }
-                            // let mut chunk = range.by_ref().take(5);
-                            // if let (Some(first), Some(last)) = (chunk.first(), chunk.last()) {
-                            //     let new_change = ChangeV1{actor_id: change.actor_id, changeset: Changeset::Empty { versions: first..=last }};
-                            //     let change_len = new_change.len();
-                            //     queue.push_back((new_change, src, Instant::now()));
-                            //     count += change_len;
-                            // }
-                        }
-                        continue;
-                    },
-                    Changeset::Full {..} => {
-                        // fall-through
-                    }
-                }
+                //         while range.peek().is_some() {
+                //             if let Some(first) = range.next() {
+                //                 let mut last = first;
+                //                 for _ in 0..4 {
+                //                     if let Some(next) = range.next() {
+                //                         last = next;
+                //                     }
+                //                 }
+                //                 let new_change = ChangeV1{actor_id: change.actor_id, changeset: Changeset::Empty { versions: first..=last }};
+                //                 let change_len = new_change.len();
+                //                 queue.push_back((new_change, src, Instant::now()));
+                //                 count += change_len;
+                //             }
+                //             // let mut chunk = range.by_ref().take(5);
+                //             // if let (Some(first), Some(last)) = (chunk.first(), chunk.last()) {
+                //             //     let new_change = ChangeV1{actor_id: change.actor_id, changeset: Changeset::Empty { versions: first..=last }};
+                //             //     let change_len = new_change.len();
+                //             //     queue.push_back((new_change, src, Instant::now()));
+                //             //     count += change_len;
+                //             // }
+                //         }
+                //         continue;
+                //     },
+                //     Changeset::Full {..} => {
+                //         // fall-through
+                //     }
+                // }
 
                 queue.push_back((change, src, Instant::now()));
 
