@@ -1177,17 +1177,6 @@ pub async fn process_multiple_changes(
 
             let mut all_versions = RangeInclusiveSet::new();
 
-            let booked = {
-                bookie
-                    .blocking_write(format!(
-                        "process_multiple_changes(for_actor_blocking):{actor_id}",
-                    ))
-                    .ensure(*actor_id)
-            };
-            let mut booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer, during knowns):{actor_id}",
-            ));
-
             for (versions, known) in knowns.iter() {
                 match known {
                     KnownDbVersion::Partial { .. } => {}
@@ -1220,6 +1209,17 @@ pub async fn process_multiple_changes(
 
                 debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserted bookkeeping row");
             }
+
+            let booked = {
+                bookie
+                    .blocking_write(format!(
+                        "process_multiple_changes(for_actor_blocking):{actor_id}",
+                    ))
+                    .ensure(*actor_id)
+            };
+            let mut booked_write = booked.blocking_write(format!(
+                "process_multiple_changes(booked writer, during knowns):{actor_id}",
+            ));
 
             needed_changes.insert(
                 *actor_id,
