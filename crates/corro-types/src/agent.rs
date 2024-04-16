@@ -255,7 +255,7 @@ fn create_bookkeeping_gaps(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         r#"
         -- store known needed versions
-        CREATE TABLE __corro_bookkeeping_gaps (
+        CREATE TABLE IF NOT EXISTS __corro_bookkeeping_gaps (
             actor_id BLOB NOT NULL,
             start INTEGER NOT NULL,
             end INTEGER NOT NULL,
