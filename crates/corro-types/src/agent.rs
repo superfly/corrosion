@@ -1003,6 +1003,16 @@ pub struct PartialVersion {
     pub ts: Timestamp,
 }
 
+impl PartialVersion {
+    pub fn is_complete(&self) -> bool {
+        self.seqs.gaps(&self.full_range()).count() == 0
+    }
+
+    pub fn full_range(&self) -> RangeInclusive<CrsqlSeq> {
+        CrsqlSeq(1)..=self.last_seq
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CurrentVersion {
     pub db_version: CrsqlDbVersion,

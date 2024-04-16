@@ -307,7 +307,12 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
         }
 
         {
-            for (v, partial) in bookedr.partials.iter() {
+            for (v, partial) in bookedr
+                .partials
+                .iter()
+                // don't set partial if it is effectively complete
+                .filter(|(_, partial)| !partial.is_complete())
+            {
                 state.partial_need.entry(actor_id).or_default().insert(
                     *v,
                     partial
