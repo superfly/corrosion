@@ -781,6 +781,16 @@ pub fn store_empty_changeset(
         DELETE FROM __corro_bookkeeping 
             WHERE
                 actor_id = :actor_id AND
+                start_version >= COALESCE((
+                    SELECT start_version
+                        FROM __corro_bookkeeping
+                        WHERE
+                            actor_id = :actor_id AND
+                            start_version < :start
+                        ORDER BY start_version DESC
+                        LIMIT 1
+                ), 1)
+                AND
                 (
                     -- start_version is between start and end of range AND no end_version
                     ( start_version BETWEEN :start AND :end AND end_version IS NULL ) OR
@@ -822,6 +832,8 @@ pub fn store_empty_changeset(
             version: None,
         })?;
 
+    // println!("deleted: {deleted:?}");
+
     if !deleted.is_empty() {
         debug!(
             "deleted {} still-live versions from database's bookkeeping",
@@ -840,6 +852,8 @@ pub fn store_empty_changeset(
     }
 
     let mut inserted = 0;
+
+    // println!("inserting: {new_ranges:?}");
 
     for range in new_ranges {
         // insert cleared versions
