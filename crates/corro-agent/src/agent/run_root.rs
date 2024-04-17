@@ -130,7 +130,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     {
         let conn = agent.pool().read().await?;
         let actor_ids: Vec<ActorId> = conn
-            .prepare("SELECT DISTINCT actor_id FROM __corro_bookkeeping")?
+            .prepare("SELECT site_id FROM crsql_site_id WHERE ordinal > 0")?
             .query_map([], |row| row.get(0))
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
 
