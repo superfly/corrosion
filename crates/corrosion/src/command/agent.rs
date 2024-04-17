@@ -49,8 +49,8 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
         .expect("could not start agent");
 
     corro_admin::start_server(
-        agent,
-        bookie,
+        agent.clone(),
+        bookie.clone(),
         AdminConfig {
             listen_path: config.admin.uds_path.clone(),
             config_path: config_path.clone(),

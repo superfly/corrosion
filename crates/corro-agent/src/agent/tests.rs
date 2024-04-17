@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::SocketAddr,
+    ops::Deref,
     time::{Duration, Instant},
 };
 
@@ -9,14 +10,18 @@ use hyper::StatusCode;
 use rand::{
     distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::IteratorRandom, SeedableRng,
 };
+use rangemap::RangeInclusiveSet;
 use serde::Deserialize;
 use serde_json::json;
 use spawn::wait_for_all_pending_handles;
-use tokio::time::{sleep, timeout, MissedTickBehavior};
+use tokio::{
+    sync::mpsc,
+    time::{sleep, timeout, MissedTickBehavior},
+};
 use tracing::{debug, info_span};
 use tripwire::Tripwire;
 
-use crate::agent::util::*;
+use crate::{agent::util::*, api::peer::parallel_sync, transport::Transport};
 use corro_tests::*;
 use corro_types::{
     actor::ActorId,
@@ -331,7 +336,10 @@ pub async fn configurable_stress_test(
 
     let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
 
-    let addrs: Vec<SocketAddr> = agents.iter().map(|ta| ta.agent.api_addr()).collect();
+    let addrs: Vec<(ActorId, SocketAddr)> = agents
+        .iter()
+        .map(|ta| (ta.agent.actor_id(), ta.agent.api_addr()))
+        .collect();
 
     let iter = (0..input_count).flat_map(|n| {
         serde_json::from_value::<Vec<Statement>>(json!([
@@ -355,66 +363,97 @@ pub async fn configurable_stress_test(
         .unwrap()
     });
 
-    tokio::spawn(async move {
-        tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
+    let actor_versions = tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
+        let addrs = addrs.clone();
+        let client = client.clone();
+        move |statements| {
             let addrs = addrs.clone();
             let client = client.clone();
-            move |statements| {
-                let addrs = addrs.clone();
-                let client = client.clone();
-                Ok(async move {
-                    let mut rng = StdRng::from_entropy();
-                    let chosen = addrs.iter().choose(&mut rng).unwrap();
+            Ok(async move {
+                let mut rng = StdRng::from_entropy();
+                let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
 
-                    let res = client
-                        .request(
-                            hyper::Request::builder()
-                                .method(hyper::Method::POST)
-                                .uri(format!("http://{chosen}/v1/transactions"))
-                                .header(hyper::header::CONTENT_TYPE, "application/json")
-                                .body(serde_json::to_vec(&statements)?.into())?,
-                        )
-                        .await?;
+                let res = client
+                    .request(
+                        hyper::Request::builder()
+                            .method(hyper::Method::POST)
+                            .uri(format!("http://{chosen}/v1/transactions"))
+                            .header(hyper::header::CONTENT_TYPE, "application/json")
+                            .body(serde_json::to_vec(&statements)?.into())?,
+                    )
+                    .await?;
 
-                    if res.status() != StatusCode::OK {
-                        eyre::bail!("unexpected status code: {}", res.status());
-                    }
+                if res.status() != StatusCode::OK {
+                    eyre::bail!("unexpected status code: {}", res.status());
+                }
 
-                    let body: ExecResponse =
-                        serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+                let body: ExecResponse =
+                    serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
 
-                    for (i, statement) in statements.iter().enumerate() {
-                        if !matches!(
-                            body.results[i],
-                            ExecResult::Execute {
-                                rows_affected: 1,
-                                ..
-                            }
-                        ) {
-                            eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
+                for (i, statement) in statements.iter().enumerate() {
+                    if !matches!(
+                        body.results[i],
+                        ExecResult::Execute {
+                            rows_affected: 1,
+                            ..
                         }
+                    ) {
+                        eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
                     }
+                }
 
-                    Ok::<_, eyre::Report>(())
-                })
-            }
-        })
-        .try_buffer_unordered(10)
-        .try_collect::<Vec<()>>()
-        .await?;
-        Ok::<_, eyre::Report>(())
-    });
+                Ok::<_, eyre::Report>((*actor_id, statements.len()))
+            })
+        }
+    })
+    .try_buffer_unordered(10)
+    .try_collect::<BTreeMap<_, _>>()
+    .await?;
 
     let changes_count = 4 * input_count;
 
     println!("expecting {changes_count} ops");
+
+    // tokio::spawn({
+    //     let bookies = agents
+    //         .iter()
+    //         .map(|a| (a.agent.actor_id(), a.bookie.clone()))
+    //         .collect::<Vec<_>>();
+    //     async move {
+    //         loop {
+    //             tokio::time::sleep(Duration::from_secs(1)).await;
+    //             for (actor_id, bookie) in bookies.iter() {
+    //                 let registry = bookie.registry();
+    //                 let r = registry.map.read();
+
+    //                 for v in r.values() {
+    //                     debug!(%actor_id, "GOT A LOCK {v:?}");
+    //                 }
+    //             }
+    //         }
+    //     }
+    // });
 
     let start = Instant::now();
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        interval.tick().await;
+        debug!("looping");
+        for ta in agents.iter() {
+            let registry = ta.bookie.registry();
+            let r = registry.map.read();
+
+            for v in r.values() {
+                println!(
+                    "{}: GOT A LOCK: {} has been locked for {:?}",
+                    ta.agent.actor_id(),
+                    v.label,
+                    v.started_at.elapsed()
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
         println!("checking status after {}s", start.elapsed().as_secs_f32());
         let mut v = vec![];
         for ta in agents.iter() {
@@ -461,13 +500,43 @@ pub async fn configurable_stress_test(
             break;
         }
 
-        if start.elapsed() > Duration::from_secs(30) {
-            let conn = agents[0].agent.pool().read().await?;
-            let mut prepped = conn.prepare("SELECT * FROM crsql_changes;")?;
-            let mut rows = prepped.query(())?;
+        println!("we're not done yet...");
 
-            while let Ok(Some(row)) = rows.next() {
-                println!("row: {row:?}");
+        if start.elapsed() > Duration::from_secs(30) {
+            for ta in agents.iter() {
+                let conn = ta.agent.pool().read().await?;
+                let mut per_actor: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
+                let mut prepped = conn.prepare("SELECT actor_id, start_version, coalesce(end_version, start_version) FROM __corro_bookkeeping;")?;
+                let mut rows = prepped.query(())?;
+
+                while let Ok(Some(row)) = rows.next() {
+                    per_actor
+                        .entry(row.get(0)?)
+                        .or_default()
+                        .insert(row.get(1)?..=row.get(2)?);
+                }
+
+                for (actor_id, versions) in per_actor {
+                    if let Some(versions_len) = actor_versions.get(&actor_id) {
+                        let full_range = Version(1)..=Version(*versions_len as u64 + 1);
+                        let gaps = versions.gaps(&full_range);
+                        for gap in gaps {
+                            println!("{} gap! {actor_id} => {gap:?}", ta.agent.actor_id());
+                        }
+                    }
+                }
+
+                let recorded_gaps = conn
+                    .prepare("SELECT actor_id, start, end FROM __corro_bookkeeping_gaps")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<Result<Vec<(ActorId, Version, Version)>, _>>()?;
+
+                for (actor_id, start, end) in recorded_gaps {
+                    println!(
+                        "{} recorded gap: {actor_id} => {start}..={end}",
+                        ta.agent.actor_id()
+                    );
+                }
             }
 
             panic!(
@@ -477,6 +546,21 @@ pub async fn configurable_stress_test(
         }
     }
     println!("fully disseminated in {}s", start.elapsed().as_secs_f32());
+
+    println!("checking gaps in db...");
+    for ta in agents {
+        let conn = ta.agent.pool().read().await?;
+        let gaps_count: u64 =
+            conn.query_row("SELECT count(*) FROM __corro_bookkeeping_gaps", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(
+            gaps_count,
+            0,
+            "expected {} to have 0 gaps in DB",
+            ta.agent.actor_id()
+        );
+    }
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
@@ -652,58 +736,93 @@ async fn large_tx_sync() -> eyre::Result<()> {
             .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
     assert_eq!(db_version, CrsqlDbVersion(counts.len() as u64));
 
-    sleep(Duration::from_secs(2)).await;
+    println!("expected count: {expected_count}");
 
-    let ta2 = launch_test_agent(
-        |conf| {
-            conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
-                .build()
-        },
-        tripwire.clone(),
-    )
-    .await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta3 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta4 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
-    sleep(Duration::from_secs(1)).await;
+    let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
+    let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
+    let ta3_transport = Transport::new(&ta3.agent.config().gossip, rtt_tx.clone()).await?;
+    let ta4_transport = Transport::new(&ta4.agent.config().gossip, rtt_tx.clone()).await?;
 
-    let ta3 = launch_test_agent(
-        |conf| {
-            conf.bootstrap(vec![ta2.agent.gossip_addr().to_string()])
-                .build()
-        },
-        tripwire.clone(),
-    )
-    .await?;
+    for _ in 0..6 {
+        let res = parallel_sync(
+            &ta2.agent,
+            &ta2_transport,
+            vec![(ta1.agent.actor_id(), ta1.agent.gossip_addr())],
+            generate_sync(&ta2.bookie, ta2.agent.actor_id()).await,
+        )
+        .await?;
 
-    sleep(Duration::from_secs(1)).await;
+        println!("ta2 synced {res}");
 
-    let ta4 = launch_test_agent(
-        |conf| {
-            conf.bootstrap(vec![ta3.agent.gossip_addr().to_string()])
-                .build()
-        },
-        tripwire.clone(),
-    )
-    .await?;
+        let res = parallel_sync(
+            &ta3.agent,
+            &ta3_transport,
+            vec![
+                (ta1.agent.actor_id(), ta1.agent.gossip_addr()),
+                (ta2.agent.actor_id(), ta2.agent.gossip_addr()),
+            ],
+            generate_sync(&ta3.bookie, ta3.agent.actor_id()).await,
+        )
+        .await?;
 
-    sleep(Duration::from_secs(20)).await;
+        println!("ta3 synced {res}");
 
-    for ta in [ta2, ta3, ta4] {
-        let agent = ta.agent;
+        let res = parallel_sync(
+            &ta4.agent,
+            &ta4_transport,
+            vec![
+                (ta3.agent.actor_id(), ta3.agent.gossip_addr()),
+                (ta2.agent.actor_id(), ta2.agent.gossip_addr()),
+            ],
+            generate_sync(&ta4.bookie, ta4.agent.actor_id()).await,
+        )
+        .await?;
+
+        println!("ta4 synced {res}");
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let mut ta_counts = vec![];
+
+    for (name, ta) in [("ta2", &ta2), ("ta3", &ta3), ("ta4", &ta4)] {
+        let agent = &ta.agent;
         let conn = agent.pool().read().await?;
 
         let count: u64 = conn
             .prepare_cached("SELECT COUNT(*) FROM testsbool;")?
             .query_row((), |row| row.get(0))?;
 
-        println!("{:#?}", generate_sync(&ta.bookie, agent.actor_id()).await);
+        println!(
+            "{name}: {:#?}",
+            generate_sync(&ta.bookie, agent.actor_id()).await
+        );
+
+        println!(
+            "{name}: bookie: {:?}",
+            ta.bookie
+                .read("test")
+                .await
+                .get(&ta1.agent.actor_id())
+                .unwrap()
+                .read("test")
+                .await
+                .deref()
+        );
 
         if count as usize != expected_count {
-            let buf_count: u64 =
-                conn.query_row("select count(*) from __corro_buffered_changes", [], |row| {
-                    row.get(0)
-                })?;
+            let buf_count: Vec<(Version, u64)> = conn
+                .prepare("select version,count(*) from __corro_buffered_changes group by version")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             println!(
-                "BUFFERED COUNT: {buf_count} (actor_id: {})",
+                "{name}: BUFFERED COUNT: {buf_count:?} (actor_id: {})",
                 agent.actor_id()
             );
 
@@ -711,14 +830,16 @@ async fn large_tx_sync() -> eyre::Result<()> {
                 .prepare("select start_seq, end_seq from __corro_seq_bookkeeping")?
                 .query_map([], |row| Ok(row.get::<_, u64>(0)?..=row.get::<_, u64>(1)?))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            println!("ranges: {ranges:?}");
+            println!("{name}: ranges: {ranges:?}");
         }
 
+        ta_counts.push((name, agent.actor_id(), count as usize));
+    }
+
+    for (name, actor_id, count) in ta_counts {
         assert_eq!(
-            count as usize,
-            expected_count,
-            "actor {} did not reach 10K rows",
-            agent.actor_id()
+            count, expected_count,
+            "{name}: actor {actor_id} did not reach 10K rows",
         );
     }
 

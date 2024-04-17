@@ -180,7 +180,7 @@ impl Changeset {
 
     pub fn len(&self) -> usize {
         match self {
-            Changeset::Empty { .. } => 0,
+            Changeset::Empty { .. } => 0, //(versions.end().0 - versions.start().0 + 1) as usize,
             Changeset::Full { changes, .. } => changes.len(),
         }
     }
@@ -232,7 +232,7 @@ pub enum TimestampParseError {
     Parse(ParseNTP64Error),
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd)]
 #[serde(transparent)]
 pub struct Timestamp(pub NTP64);
 
@@ -248,6 +248,13 @@ impl Timestamp {
 
     pub fn zero() -> Self {
         Timestamp(NTP64(0))
+    }
+}
+
+// formatting to humantime and then parsing again incurs oddness, so lets compare secs and subsec_nanos
+impl PartialEq for Timestamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_secs() == other.0.as_secs() && self.0.subsec_nanos() == other.0.subsec_nanos()
     }
 }
 
@@ -375,6 +382,7 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
             }
             _ => {}
         };
+
         if let Err(e) = self.notifications.try_send(notification) {
             counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications")
                 .increment(1);

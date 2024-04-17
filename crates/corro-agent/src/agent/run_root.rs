@@ -1,5 +1,7 @@
 //! Start the root agent tasks
 
+use std::time::Instant;
+
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_cleanup},
@@ -41,7 +43,6 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         lock_registry,
         rx_bcast,
         rx_apply,
-        rx_empty,
         rx_clear_buf,
         rx_changes,
         rx_foca,
@@ -99,11 +100,11 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     )
     .await?;
 
-    spawn_counted(util::write_empties_loop(
-        agent.clone(),
-        rx_empty,
-        tripwire.clone(),
-    ));
+    // spawn_counted(util::write_empties_loop(
+    //     agent.clone(),
+    //     rx_empty,
+    //     tripwire.clone(),
+    // ));
 
     tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
 
@@ -124,10 +125,12 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         let mut w = bookie.write("init").await;
         w.insert(agent.actor_id(), agent.booked().clone());
     }
+
+    let start = Instant::now();
     {
         let conn = agent.pool().read().await?;
         let actor_ids: Vec<ActorId> = conn
-            .prepare("SELECT DISTINCT actor_id FROM __corro_bookkeeping")?
+            .prepare("SELECT site_id FROM crsql_site_id WHERE ordinal > 0")?
             .query_map([], |row| row.get(0))
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
 
@@ -155,7 +158,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                     }
                 }),
         )
-        .buffer_unordered(2);
+        .buffer_unordered(4);
 
         while let Some((actor_id, bv)) = TryStreamExt::try_next(&mut buf).await? {
             for (version, partial) in bv.partials.iter() {
@@ -179,6 +182,8 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                 .replace_actor(actor_id, bv);
         }
     }
+
+    info!("Bookkeeping fully loaded in {:?}", start.elapsed());
 
     spawn_counted(
         util::sync_loop(
