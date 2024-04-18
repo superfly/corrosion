@@ -127,15 +127,14 @@ enum StmtTag {
 }
 
 impl StmtTag {
-    fn into_command_complete(self, rows: usize, conn: &Connection) -> CommandComplete {
+    fn into_command_complete(self, rows: usize, changes: usize) -> CommandComplete {
         if self.returns_num_rows() {
             self.tag(Some(rows)).into()
         } else if self.returns_rows_affected() {
-            let changes = conn.changes();
             if matches!(self, StmtTag::Insert) {
                 CommandComplete::new(format!("INSERT 0 {changes}"))
             } else {
-                self.tag(Some(changes as usize)).into()
+                self.tag(Some(changes)).into()
             }
         } else {
             self.tag(None).into()
@@ -1790,6 +1789,10 @@ impl Session {
             trace!("committed IMPLICIT tx");
         }
 
+        let tag = cmd.tag();
+
+        let mut changes = 0usize;
+
         let count = if cmd.is_begin() {
             conn.execute_batch("BEGIN")?;
             self.tx_state.start_explicit();
@@ -1875,6 +1878,11 @@ impl Session {
                     .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
                     .map_err(|_| QueryError::BackendResponseSendFailed)?;
             }
+
+            if tag.returns_rows_affected() {
+                changes = conn.changes() as usize;
+            }
+
             count
         };
 
@@ -1882,7 +1890,7 @@ impl Session {
             .blocking_send(
                 (
                     PgWireBackendMessage::CommandComplete(
-                        cmd.tag().into_command_complete(count, conn),
+                        tag.into_command_complete(count, changes),
                     ),
                     true,
                 )
@@ -1944,7 +1952,10 @@ impl Session {
             }
         }
 
+        let tag = cmd.tag();
+
         let mut count = 0;
+        let mut changes = 0usize;
 
         if cmd.is_commit() {
             let _permit = self.tx_state.end();
@@ -2088,20 +2099,25 @@ impl Session {
                     .map_err(|_| QueryError::BackendResponseSendFailed)?;
             }
 
+            if tag.returns_rows_affected() {
+                changes = conn.changes() as usize;
+            }
+
             if opened_implicit_tx {
                 let _permit = self.tx_state.end();
                 self.handle_commit(conn)?;
             }
         }
 
-        let tag = cmd.tag();
         trace!("done w/ rows, computing tag: {tag:?}");
 
         // done!
         back_tx
             .blocking_send(
                 (
-                    PgWireBackendMessage::CommandComplete(tag.into_command_complete(count, conn)),
+                    PgWireBackendMessage::CommandComplete(
+                        tag.into_command_complete(count, changes),
+                    ),
                     true,
                 )
                     .into(),
@@ -3224,6 +3240,8 @@ mod tests {
             let (affected, exec_elapsed) = affected_res?;
 
             println!("after execute, affected: {affected}, sema elapsed: {sema_elapsed:?}, exec elapsed: {exec_elapsed:?}");
+
+            assert_eq!(affected, 1);
 
             assert!(exec_elapsed > sema_elapsed);
 
