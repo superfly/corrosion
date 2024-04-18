@@ -3241,6 +3241,8 @@ mod tests {
 
             println!("after execute, affected: {affected}, sema elapsed: {sema_elapsed:?}, exec elapsed: {exec_elapsed:?}");
 
+            assert_eq!(affected, 1);
+
             assert!(exec_elapsed > sema_elapsed);
 
             let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
