@@ -5,16 +5,6 @@
 //! a similar API facade, handle the same kinds of data, etc) should
 //! be pulled out of this file in future.
 
-use std::{
-    cmp,
-    collections::{BTreeMap, BTreeSet, HashSet},
-    convert::Infallible,
-    net::SocketAddr,
-    ops::RangeInclusive,
-    sync::{atomic::AtomicI64, Arc},
-    time::{Duration, Instant},
-};
-
 use crate::{
     agent::{handlers, CountedExecutor, MAX_SYNC_BACKOFF, TO_CLEAR_COUNT},
     api::public::{
@@ -33,6 +23,15 @@ use corro_types::{
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
+};
+use std::{
+    cmp,
+    collections::{BTreeMap, BTreeSet, HashSet},
+    convert::Infallible,
+    net::SocketAddr,
+    ops::RangeInclusive,
+    sync::{atomic::AtomicI64, Arc},
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -384,7 +383,7 @@ pub async fn setup_http_api_handler(
     tripwire: &Tripwire,
     subs_bcast_cache: BcastCache,
     subs_manager: &SubsManager,
-    api_listener: TcpListener,
+    (api_listener, extra_listeners): (TcpListener, Vec<TcpListener>),
 ) -> eyre::Result<()> {
     let api = Router::new()
         // transactions
@@ -485,9 +484,24 @@ pub async fn setup_http_api_handler(
         .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http());
 
+    spawn_server_on_bind(api_listener, api.clone(), &tripwire)?;
+
+    for extra_addr in extra_listeners {
+        spawn_server_on_bind(extra_addr, api.clone(), &tripwire)?;
+    }
+
+    Ok(())
+}
+
+fn spawn_server_on_bind(
+    api_listener: TcpListener,
+    api: Router,
+    tripwire: &Tripwire,
+) -> eyre::Result<()> {
     let api_addr = api_listener.local_addr()?;
-    info!("Starting public API server on tcp/{api_addr}");
+    info!("Starting API listener on tcp/{api_addr}");
     let mut incoming = AddrIncoming::from_listener(api_listener)?;
+
     incoming.set_nodelay(true);
     spawn_counted(
         axum::Server::builder(incoming)
@@ -784,7 +798,7 @@ pub fn store_empty_changeset(
     let deleted: Vec<RangeInclusive<Version>> = conn
         .prepare_cached(
             "
-        DELETE FROM __corro_bookkeeping 
+        DELETE FROM __corro_bookkeeping
             WHERE
                 actor_id = :actor_id AND
                 start_version >= COALESCE((
@@ -800,7 +814,7 @@ pub fn store_empty_changeset(
                 (
                     -- start_version is between start and end of range AND no end_version
                     ( start_version BETWEEN :start AND :end AND end_version IS NULL ) OR
-                    
+
                     -- start_version and end_version are within the range
                     ( start_version >= :start AND end_version <= :end ) OR
 
@@ -1389,7 +1403,7 @@ pub fn process_incomplete_version(
             "
             DELETE FROM __corro_seq_bookkeeping
                 WHERE site_id = :actor_id AND version = :version AND
-                (   
+                (
                     -- start_seq and end_seq are within the range
                     ( start_seq >= :start AND end_seq <= :end ) OR
 

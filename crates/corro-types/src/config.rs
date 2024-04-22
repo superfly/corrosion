@@ -116,6 +116,8 @@ impl DbConfig {
 pub struct ApiConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
+    #[serde(alias = "extra_addrs")]
+    pub extra_bind_addrs: Vec<SocketAddr>,
     #[serde(alias = "authz", default)]
     pub authorization: Option<AuthzConfig>,
     #[serde(default)]
@@ -281,6 +283,7 @@ pub struct ConfigBuilder {
     pub db_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
     api_addr: Option<SocketAddr>,
+    extra_api_addrs: Vec<SocketAddr>,
     external_addr: Option<SocketAddr>,
     admin_path: Option<Utf8PathBuf>,
     prometheus_addr: Option<SocketAddr>,
@@ -306,6 +309,11 @@ impl ConfigBuilder {
 
     pub fn api_addr(mut self, addr: SocketAddr) -> Self {
         self.api_addr = Some(addr);
+        self
+    }
+
+    pub fn extra_api_addr(mut self, addr: SocketAddr) -> Self {
+        self.extra_api_addrs.push(addr);
         self
     }
 
@@ -373,6 +381,7 @@ impl ConfigBuilder {
             },
             api: ApiConfig {
                 bind_addr: self.api_addr.ok_or(ConfigBuilderError::ApiAddrRequired)?,
+                extra_bind_addrs: self.extra_api_addrs,
                 authorization: None,
                 pg: None,
             },
