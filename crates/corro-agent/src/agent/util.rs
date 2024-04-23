@@ -383,7 +383,7 @@ pub async fn setup_http_api_handler(
     tripwire: &Tripwire,
     subs_bcast_cache: BcastCache,
     subs_manager: &SubsManager,
-    (api_listener, extra_listeners): (TcpListener, Vec<TcpListener>),
+    api_listener: TcpListener,
 ) -> eyre::Result<()> {
     let api = Router::new()
         // transactions
@@ -484,20 +484,6 @@ pub async fn setup_http_api_handler(
         .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http());
 
-    spawn_server_on_bind(api_listener, api.clone(), &tripwire)?;
-
-    for extra_addr in extra_listeners {
-        spawn_server_on_bind(extra_addr, api.clone(), &tripwire)?;
-    }
-
-    Ok(())
-}
-
-fn spawn_server_on_bind(
-    api_listener: TcpListener,
-    api: Router,
-    tripwire: &Tripwire,
-) -> eyre::Result<()> {
     let api_addr = api_listener.local_addr()?;
     info!("Starting API listener on tcp/{api_addr}");
     let mut incoming = AddrIncoming::from_listener(api_listener)?;

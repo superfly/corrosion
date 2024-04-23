@@ -39,7 +39,6 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         gossip_server_endpoint,
         transport,
         api_listener,
-        extra_api_listeners,
         tripwire,
         lock_registry,
         rx_bcast,
@@ -97,7 +96,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         &tripwire,
         subs_bcast_cache,
         &subs_manager,
-        (api_listener, extra_api_listeners),
+        api_listener,
     )
     .await?;
 

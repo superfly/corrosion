@@ -577,7 +577,7 @@ impl Cli {
         Ok(if let Some(api_addr) = self.api_addr {
             api_addr
         } else {
-            self.config()?.api.bind_addr
+            self.config()?.api.bind_addr.first().unwrap().clone()
         })
     }
 
