@@ -132,7 +132,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let transport = Transport::new(&conf.gossip, rtt_tx).await?;
 
-    let api_listener = TcpListener::bind(conf.api.bind_addr).await?;
+    let api_listener = TcpListener::bind(conf.api.bind_addr.as_slice()).await?;
     let api_addr = api_listener.local_addr()?;
 
     let clock = Arc::new(

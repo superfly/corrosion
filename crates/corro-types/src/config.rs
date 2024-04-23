@@ -2,6 +2,7 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
+use serde_with::{formats::PreferOne, serde_as, OneOrMany};
 
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
@@ -112,10 +113,12 @@ impl DbConfig {
     }
 }
 
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     #[serde(alias = "addr")]
-    pub bind_addr: SocketAddr,
+    #[serde_as(deserialize_as = "OneOrMany<_, PreferOne>")]
+    pub bind_addr: Vec<SocketAddr>,
     #[serde(alias = "authz", default)]
     pub authorization: Option<AuthzConfig>,
     #[serde(default)]
@@ -280,7 +283,7 @@ impl Config {
 pub struct ConfigBuilder {
     pub db_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
-    api_addr: Option<SocketAddr>,
+    api_addr: Vec<SocketAddr>,
     external_addr: Option<SocketAddr>,
     admin_path: Option<Utf8PathBuf>,
     prometheus_addr: Option<SocketAddr>,
@@ -305,12 +308,7 @@ impl ConfigBuilder {
     }
 
     pub fn api_addr(mut self, addr: SocketAddr) -> Self {
-        self.api_addr = Some(addr);
-        self
-    }
-
-    pub fn external_addr(mut self, addr: SocketAddr) -> Self {
-        self.external_addr = Some(addr);
+        self.api_addr.push(addr);
         self
     }
 
@@ -364,6 +362,10 @@ impl ConfigBuilder {
             open_telemetry: None,
         };
 
+        if self.api_addr.is_empty() {
+            return Err(ConfigBuilderError::ApiAddrRequired);
+        }
+
         Ok(Config {
             db: DbConfig {
                 path: db_path,
@@ -372,7 +374,7 @@ impl ConfigBuilder {
                 clear_overwritten_secs: None,
             },
             api: ApiConfig {
-                bind_addr: self.api_addr.ok_or(ConfigBuilderError::ApiAddrRequired)?,
+                bind_addr: self.api_addr,
                 authorization: None,
                 pg: None,
             },
