@@ -383,7 +383,7 @@ pub async fn setup_http_api_handler(
     tripwire: &Tripwire,
     subs_bcast_cache: BcastCache,
     subs_manager: &SubsManager,
-    api_listener: TcpListener,
+    api_listeners: Vec<TcpListener>,
 ) -> eyre::Result<()> {
     let api = Router::new()
         // transactions
@@ -484,25 +484,27 @@ pub async fn setup_http_api_handler(
         .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http());
 
-    let api_addr = api_listener.local_addr()?;
-    info!("Starting API listener on tcp/{api_addr}");
-    let mut incoming = AddrIncoming::from_listener(api_listener)?;
+    for api_listener in api_listeners {
+        let api_addr = api_listener.local_addr()?;
+        info!("Starting API listener on tcp/{api_addr}");
+        let mut incoming = AddrIncoming::from_listener(api_listener)?;
 
-    incoming.set_nodelay(true);
-    spawn_counted(
-        axum::Server::builder(incoming)
-            .executor(CountedExecutor)
-            .serve(
-                api.clone()
-                    .into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(
-                tripwire
-                    .clone()
-                    .inspect(move |_| info!("corrosion api http tripped {api_addr}")),
-            )
-            .inspect(|_| info!("corrosion api is done")),
-    );
+        incoming.set_nodelay(true);
+        spawn_counted(
+            axum::Server::builder(incoming)
+                .executor(CountedExecutor)
+                .serve(
+                    api.clone()
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(
+                    tripwire
+                        .clone()
+                        .inspect(move |_| info!("corrosion api http tripped {api_addr}")),
+                )
+                .inspect(|_| info!("corrosion api is done")),
+        );
+    }
 
     Ok(())
 }

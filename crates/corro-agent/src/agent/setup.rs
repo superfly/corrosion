@@ -47,7 +47,7 @@ pub struct AgentOptions {
     pub lock_registry: LockRegistry,
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
-    pub api_listener: TcpListener,
+    pub api_listeners: Vec<TcpListener>,
     pub rx_bcast: CorroReceiver<BroadcastInput>,
     pub rx_apply: CorroReceiver<(ActorId, Version)>,
     pub rx_clear_buf: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
@@ -132,8 +132,11 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let transport = Transport::new(&conf.gossip, rtt_tx).await?;
 
-    let api_listener = TcpListener::bind(conf.api.bind_addr.as_slice()).await?;
-    let api_addr = api_listener.local_addr()?;
+    let mut api_listeners = Vec::with_capacity(conf.api.bind_addr.len());
+    for addr in conf.api.bind_addr.iter() {
+        api_listeners.push(TcpListener::bind(addr).await?);
+    }
+    let api_addr = api_listeners.first().unwrap().local_addr()?;
 
     let clock = Arc::new(
         uhlc::HLCBuilder::default()
@@ -166,7 +169,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let opts = AgentOptions {
         gossip_server_endpoint,
         transport,
-        api_listener,
+        api_listeners,
         lock_registry,
         rx_bcast,
         rx_apply,

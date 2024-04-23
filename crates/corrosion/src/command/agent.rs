@@ -59,8 +59,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
     )?;
 
     if !config.db.schema_paths.is_empty() {
-        let client =
-            corro_client::CorrosionApiClient::new(config.api.bind_addr.first().unwrap().clone());
+        let client = corro_client::CorrosionApiClient::new(*config.api.bind_addr.first().unwrap());
         match client
             .schema_from_paths(config.db.schema_paths.as_slice())
             .await
