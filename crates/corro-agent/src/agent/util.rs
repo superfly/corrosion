@@ -591,13 +591,7 @@ pub fn find_cleared_db_versions(
 ///
 /// Actual sync logic is handled by
 /// [`handle_sync`](crate::agent::handlers::handle_sync).
-pub async fn sync_loop(
-    agent: Agent,
-    bookie: Bookie,
-    transport: Transport,
-    mut rx_apply: CorroReceiver<(ActorId, Version)>,
-    mut tripwire: Tripwire,
-) {
+pub async fn sync_loop(agent: Agent, bookie: Bookie, transport: Transport, mut tripwire: Tripwire) {
     let mut sync_backoff = backoff::Backoff::new(0)
         .timeout_range(Duration::from_secs(1), MAX_SYNC_BACKOFF)
         .iter();
@@ -605,75 +599,69 @@ pub async fn sync_loop(
     tokio::pin!(next_sync_at);
 
     loop {
-        enum Branch {
-            Tick,
-            BackgroundApply { actor_id: ActorId, version: Version },
-        }
-
-        let branch = tokio::select! {
+        tokio::select! {
             biased;
 
-            maybe_item = rx_apply.recv() => match maybe_item {
-                Some((actor_id, version)) => Branch::BackgroundApply{actor_id, version},
-                None => {
-                    debug!("background applies queue is closed, breaking out of loop");
-                    break;
-                }
-            },
-
             _ = &mut next_sync_at => {
-                Branch::Tick
+                ()
             },
             _ = &mut tripwire => {
                 break;
             }
         };
 
-        match branch {
-            Branch::Tick => {
-                // ignoring here, there is trying and logging going on inside
-                match tokio::time::timeout(
-                    Duration::from_secs(300),
-                    handlers::handle_sync(&agent, &bookie, &transport),
-                )
-                .preemptible(&mut tripwire)
-                .await
-                {
-                    tripwire::Outcome::Preempted(_) => {
-                        warn!("aborted sync by tripwire");
-                        break;
-                    }
-                    tripwire::Outcome::Completed(res) => match res {
-                        Ok(Err(e)) => {
-                            error!("could not sync: {e}");
-                            // keep syncing until we successfully sync
-                        }
-                        Err(_e) => {
-                            warn!("timed out waiting for sync to complete!");
-                        }
-                        Ok(Ok(_)) => {}
-                    },
-                }
-                next_sync_at
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + sync_backoff.next().unwrap());
+        // ignoring here, there is trying and logging going on inside
+        match tokio::time::timeout(
+            Duration::from_secs(300),
+            handlers::handle_sync(&agent, &bookie, &transport),
+        )
+        .preemptible(&mut tripwire)
+        .await
+        {
+            tripwire::Outcome::Preempted(_) => {
+                warn!("aborted sync by tripwire");
+                break;
             }
-            Branch::BackgroundApply { actor_id, version } => {
-                debug!(%actor_id, %version, "picked up background apply of buffered changes");
-                match process_fully_buffered_changes(&agent, &bookie, actor_id, version).await {
-                    Ok(false) => {
-                        warn!(%actor_id, %version, "did not apply buffered changes");
-                    }
-                    Ok(true) => {
-                        debug!(%actor_id, %version, "succesfully applied buffered changes");
-                    }
-                    Err(e) => {
-                        error!(%actor_id, %version, "could not apply fully buffered changes: {e}");
-                    }
+            tripwire::Outcome::Completed(res) => match res {
+                Ok(Err(e)) => {
+                    error!("could not sync: {e}");
+                    // keep syncing until we successfully sync
                 }
+                Err(_e) => {
+                    warn!("timed out waiting for sync to complete!");
+                }
+                Ok(Ok(_)) => {}
+            },
+        }
+        next_sync_at
+            .as_mut()
+            .reset(tokio::time::Instant::now() + sync_backoff.next().unwrap());
+    }
+}
+
+pub async fn apply_fully_buffered_changes_loop(
+    agent: Agent,
+    bookie: Bookie,
+    mut rx_apply: CorroReceiver<(ActorId, Version)>,
+) {
+    info!("Starting apply_fully_buffered_changes loop");
+
+    while let Some((actor_id, version)) = rx_apply.recv().await {
+        debug!(%actor_id, %version, "picked up background apply of buffered changes");
+        match process_fully_buffered_changes(&agent, &bookie, actor_id, version).await {
+            Ok(false) => {
+                warn!(%actor_id, %version, "did not apply buffered changes");
+            }
+            Ok(true) => {
+                debug!(%actor_id, %version, "succesfully applied buffered changes");
+            }
+            Err(e) => {
+                error!(%actor_id, %version, "could not apply fully buffered changes: {e}");
             }
         }
     }
+
+    info!("fully_buffered_changes_loop ended");
 }
 
 /// Compact the database by finding cleared versions
