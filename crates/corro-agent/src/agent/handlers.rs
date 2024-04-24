@@ -410,7 +410,7 @@ pub async fn handle_changes(
     mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     mut tripwire: Tripwire,
 ) {
-    let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
+    let config_max_changes_chunk: usize = agent.config().perf.apply_queue_len;
     let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
     let mut buf_cost = 0;
@@ -422,13 +422,24 @@ pub async fn handle_changes(
         agent.config().perf.apply_queue_timeout as u64,
     ));
 
-    const MAX_SEEN_CACHE_LEN: usize = 10000;
-    const KEEP_SEEN_CACHE_SIZE: usize = 1000;
+    const MAX_SEEN_CACHE_LEN: usize = 100000;
+    const KEEP_SEEN_CACHE_SIZE: usize = 10000;
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
+        let queue_len = queue.len();
+        let max_changes_chunk = if queue_len > 16 * config_max_changes_chunk {
+            config_max_changes_chunk * 6
+        } else if queue_len > 8 * config_max_changes_chunk {
+            config_max_changes_chunk * 4
+        } else if queue_len > 4 * config_max_changes_chunk {
+            config_max_changes_chunk * 2
+        } else {
+            config_max_changes_chunk
+        };
+
         while buf_cost >= max_changes_chunk && join_set.len() < MAX_CONCURRENT {
             // we're already bigger than the minimum size of changes batch
             // so we want to accumulate at least that much and process them
