@@ -667,7 +667,13 @@ pub async fn handle_sync(
     }
 
     let start = Instant::now();
-    let n = parallel_sync(agent, transport, chosen.clone(), sync_state).await?;
+    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state).await {
+        Ok(n) => n,
+        Err(e)  => {
+            error!("failed to execute parallel sync: {e:?}");
+            return Err(e.into());
+        }
+    };
 
     let elapsed = start.elapsed();
     if n > 0 {
