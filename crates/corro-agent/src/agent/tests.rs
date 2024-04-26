@@ -999,6 +999,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         [actor_id],
     )?;
 
+    // store an empty version 1..=2 when 1 was considered non-empty
     {
         let tx = conn.transaction()?;
         assert_eq!(
@@ -1035,6 +1036,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         [actor_id],
     )?;
 
+    // insert empty version 5..=7 that does not overlap with anything else
     {
         let tx = conn.transaction()?;
         assert_eq!(
@@ -1082,6 +1084,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         }
     );
 
+    // insert empty changes 3..=6 which touches non-empty version 3 and empty versions 5..=7
     {
         let tx = conn.transaction()?;
         assert_eq!(
@@ -1120,6 +1123,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         [actor_id],
     )?;
 
+    // insert changes that hae the same start as already emptied rows, but go up higher
     {
         let tx = conn.transaction()?;
         assert_eq!(
@@ -1161,6 +1165,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
             end_version: None
         }
     );
+
+    // insert changes that hae the same start as already emptied rows, but go up higher
 
     {
         let tx = conn.transaction()?;
@@ -1208,6 +1214,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         "INSERT INTO __corro_bookkeeping (actor_id, start_version) VALUES (?, 13)",
         [actor_id],
     )?;
+
+    // insert empties that don't touch any other rows
 
     {
         let tx = conn.transaction()?;
@@ -1268,6 +1276,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         }
     );
 
+
+    // empties multiple non-empty versions (12 and 13) and touches already emptied version (14)
     {
         let tx = conn.transaction()?;
         assert_eq!(
@@ -1310,6 +1320,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         [actor_id],
     )?;
 
+    // empties a version in between 2 ranges of empties
     {
         let tx = conn.transaction()?;
         assert_eq!(
@@ -1340,6 +1351,40 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
             actor_id,
             start_version: Version(1),
             end_version: Some(Version(18))
+        }
+    );
+
+    // empties versions overlapping the end of a previous range
+    {
+        let tx = conn.transaction()?;
+        assert_eq!(
+            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23))?,
+            1
+        );
+        tx.commit()?;
+    }
+
+    let rows = conn
+        .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+        .query_map([], |row| {
+            Ok(CorroBook {
+                actor_id: row.get(0)?,
+                start_version: row.get(1)?,
+                end_version: row.get(2)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+    println!("rows: {rows:?}");
+
+    assert_eq!(rows.len(), 1);
+
+    assert_eq!(
+        rows[0],
+        CorroBook {
+            actor_id,
+            start_version: Version(1),
+            end_version: Some(Version(23))
         }
     );
 
