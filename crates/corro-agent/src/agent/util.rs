@@ -789,6 +789,7 @@ pub fn store_empty_changeset(
         DELETE FROM __corro_bookkeeping
             WHERE
                 actor_id = :actor_id AND
+                -- try to find the previous range
                 start_version >= COALESCE((
                     SELECT start_version
                         FROM __corro_bookkeeping
@@ -799,20 +800,34 @@ pub fn store_empty_changeset(
                         LIMIT 1
                 ), 1)
                 AND
+                -- try to find the next range
+                start_version <= COALESCE((
+                    SELECT start_version
+                        FROM __corro_bookkeeping
+                        WHERE
+                            actor_id = :actor_id AND
+                            start_version > :end
+                        ORDER BY start_version ASC
+                        LIMIT 1
+                ), :end + 1)
+                AND
                 (
-                    -- start_version is between start and end of range AND no end_version
+                    -- [:start]---[start_version]---[:end]
                     ( start_version BETWEEN :start AND :end AND end_version IS NULL ) OR
 
-                    -- start_version and end_version are within the range
+                    -- [start_version]---[:start]---[:end]---[end_version]
                     ( start_version >= :start AND end_version <= :end ) OR
 
-                    -- range being inserted is partially contained within another
+                    -- [:start]---[start_version]---[:end]---[end_version]
                     ( start_version <= :end AND end_version >= :end ) OR
 
-                    -- start_version = end + 1 (to collapse ranges)
+                    -- [start_version]---[:start]---[end_version]---[:end]
+                    ( start_version <= :start AND end_version <= :end ) OR
+
+                    -- ---[:end][start_version]
                     ( start_version = :end + 1 AND end_version IS NOT NULL ) OR
 
-                    -- end_version = start - 1 (to collapse ranges)
+                    -- [end_version][:start]---
                     ( end_version = :start - 1 )
                 )
             RETURNING start_version, end_version",
