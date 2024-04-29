@@ -367,7 +367,7 @@ fn handle_known_version(
             // this is a read transaction!
             let tx = conn.transaction()?;
 
-            let last_seq_ts: Option<(Option<CrsqlSeq>, Option<Timestamp>)> = tx.prepare_cached("SELECT last_seq, ts FROM __corro_bookkeeping WHERE actor_id = :actor_id AND start_version = :version")?.query_row(
+            let last_seq_ts: Option<(Option<CrsqlSeq>, Option<Timestamp>)> = tx.prepare_cached("SELECT last_seq, ts FROM __corro_bookkeeping WHERE actor_id = :actor_id AND (:version BETWEEN start_version AND COALESCE(end_version, start_version))")?.query_row(
                 named_params! {
                     ":actor_id": actor_id,
                     ":version": version
