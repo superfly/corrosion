@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -359,7 +359,7 @@ fn handle_known_version(
     booked: &Booked,
     mut seqs_needed: Vec<RangeInclusive<CrsqlSeq>>,
     sender: &Sender<SyncMessage>,
-) -> eyre::Result<()> {
+) -> eyre::Result<Option<(ActorId, Version)>> {
     debug!(%actor_id, %version, "handle known version! partial? {partial:?}");
 
     match partial {
@@ -379,13 +379,13 @@ fn handle_known_version(
                 None | Some((None, _)) | Some((_, None)) => {
                     // empty version!
                     // TODO: optimize by sending the full range found...
-                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                        actor_id,
-                        changeset: Changeset::Empty {
-                            versions: version..=version,
-                        },
-                    })))?;
-                    return Ok(());
+                    // sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    //     actor_id,
+                    //     changeset: Changeset::Empty {
+                    //         versions: version..=version,
+                    //     },
+                    // })))?;
+                    return Ok(Some((actor_id, version)));
                 }
                 Some((Some(last_seq), Some(ts))) => (last_seq, ts),
             };
@@ -491,7 +491,7 @@ fn handle_known_version(
                         if !still_partial {
                             warn!(%actor_id, %version, "switched from partial to current version");
 
-                            return Ok(());
+                            return Ok(None);
                             // // drop write lock
                             // drop(bw);
 
@@ -572,7 +572,7 @@ fn handle_known_version(
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
@@ -661,121 +661,170 @@ async fn process_sync(
             6,
         );
 
+    let (cleared_tx, cleared_rx) = unbounded_channel();
+    let cleared_chunks =
+        UnboundedReceiverStream::new(cleared_rx).chunks_timeout(1000, Duration::from_secs(1));
+    tokio::pin!(cleared_chunks);
+
     let mut to_process = vec![];
     let mut partial_needs = vec![];
 
     loop {
-        let reqs = tokio::select! {
-            maybe_reqs = chunked_reqs.next() => match maybe_reqs {
-                Some(reqs) => reqs,
-                None => break,
+        enum Branch {
+            Reqs(Vec<Vec<(ActorId, Vec<SyncNeedV1>)>>),
+            Cleared(Vec<(ActorId, Version)>),
+        }
+
+        let branch = tokio::select! {
+            Some(reqs) = chunked_reqs.next() => {
+                Branch::Reqs(reqs)
             },
             Some(res) = buf.next() => {
                 res?;
                 continue;
+            },
+            Some(chunk) = cleared_chunks.next() => {
+                Branch::Cleared(chunk)
             },
             else => {
                 break;
             }
         };
 
-        let agg = reqs
-            .into_iter()
-            .flatten()
-            .group_by(|req| req.0)
-            .into_iter()
-            .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
-            .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
+        match branch {
+            Branch::Cleared(chunk) => {
+                let mut agg: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
+                for (actor_id, version) in chunk {
+                    agg.entry(actor_id).or_default().insert(version..=version);
+                }
 
-        for (actor_id, needs) in agg {
-            let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() } {
-                Some(booked) => booked,
-                None => continue,
-            };
-
-            {
-                let read = booked.read("process_need(full)").await;
-
-                for need in needs {
-                    match need {
-                        SyncNeedV1::Full { versions } => {
-                            for version in versions {
-                                if !read.contains_version(&version) {
-                                    continue;
-                                }
-
-                                to_process.push((version, read.get_partial(&version).cloned()));
-                            }
-                        }
-                        SyncNeedV1::Partial { version, seqs } => {
-                            if !read.contains_version(&version) {
-                                continue;
-                            }
-
-                            partial_needs.push((
-                                version,
-                                read.get_partial(&version).cloned(),
-                                seqs,
-                            ));
-                        }
+                for (actor_id, ranges) in agg {
+                    for versions in ranges {
+                        sender
+                            .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                                actor_id,
+                                changeset: Changeset::Empty { versions },
+                            })))
+                            .await?;
                     }
                 }
             }
+            Branch::Reqs(reqs) => {
+                let agg = reqs
+                    .into_iter()
+                    .flatten()
+                    .group_by(|req| req.0)
+                    .into_iter()
+                    .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
+                    .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
 
-            for (version, partial) in to_process.drain(..) {
-                let pool = pool.clone();
-                let booked = booked.clone();
-                let sender = sender.clone();
-                let fut = Box::pin(async move {
-                    let mut conn = pool.read().await?;
+                for (actor_id, needs) in agg {
+                    let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() }
+                    {
+                        Some(booked) => booked,
+                        None => continue,
+                    };
 
-                    block_in_place(|| {
-                        handle_known_version(
-                            &mut conn,
-                            actor_id,
-                            version,
-                            partial,
-                            &booked,
-                            vec![],
-                            &sender,
-                        )
-                    })?;
+                    {
+                        let read = booked.read("process_need(full)").await;
 
-                    trace!("done processing version: {version} for actor_id: {actor_id}");
-                    Ok(())
-                });
+                        for need in needs {
+                            match need {
+                                SyncNeedV1::Full { versions } => {
+                                    for version in versions {
+                                        if !read.contains_version(&version) {
+                                            continue;
+                                        }
 
-                if job_tx.send(fut).is_err() {
-                    eyre::bail!("could not send into job channel");
-                }
-            }
+                                        to_process
+                                            .push((version, read.get_partial(&version).cloned()));
+                                    }
+                                }
+                                SyncNeedV1::Partial { version, seqs } => {
+                                    if !read.contains_version(&version) {
+                                        continue;
+                                    }
 
-            for (version, partial, seqs_needed) in partial_needs.drain(..) {
-                let pool = pool.clone();
-                let booked = booked.clone();
-                let sender = sender.clone();
+                                    partial_needs.push((
+                                        version,
+                                        read.get_partial(&version).cloned(),
+                                        seqs,
+                                    ));
+                                }
+                            }
+                        }
+                    }
 
-                let fut = Box::pin(async move {
-                    let mut conn = pool.read().await?;
+                    for (version, partial) in to_process.drain(..) {
+                        let pool = pool.clone();
+                        let booked = booked.clone();
+                        let sender = sender.clone();
+                        let cleared_tx = cleared_tx.clone();
+                        let fut = Box::pin(async move {
+                            let mut conn = pool.read().await?;
 
-                    block_in_place(|| {
-                        handle_known_version(
-                            &mut conn,
-                            actor_id,
-                            version,
-                            partial,
-                            &booked,
-                            seqs_needed,
-                            &sender,
-                        )
-                    })?;
+                            let maybe_cleared = block_in_place(|| {
+                                handle_known_version(
+                                    &mut conn,
+                                    actor_id,
+                                    version,
+                                    partial,
+                                    &booked,
+                                    vec![],
+                                    &sender,
+                                )
+                            })?;
 
-                    trace!("done processing version: {version} for actor_id: {actor_id}");
-                    Ok(())
-                });
+                            if let Some(cleared) = maybe_cleared {
+                                if cleared_tx.send(cleared).is_err() {
+                                    eyre::bail!("cleared versions channel is closed");
+                                }
+                            }
 
-                if job_tx.send(fut).is_err() {
-                    eyre::bail!("could not send into job channel");
+                            trace!("done processing version: {version} for actor_id: {actor_id}");
+                            Ok(())
+                        });
+
+                        if job_tx.send(fut).is_err() {
+                            eyre::bail!("could not send into job channel");
+                        }
+                    }
+
+                    for (version, partial, seqs_needed) in partial_needs.drain(..) {
+                        let pool = pool.clone();
+                        let booked = booked.clone();
+                        let sender = sender.clone();
+                        let cleared_tx = cleared_tx.clone();
+
+                        let fut = Box::pin(async move {
+                            let mut conn = pool.read().await?;
+
+                            let maybe_cleared = block_in_place(|| {
+                                handle_known_version(
+                                    &mut conn,
+                                    actor_id,
+                                    version,
+                                    partial,
+                                    &booked,
+                                    seqs_needed,
+                                    &sender,
+                                )
+                            })?;
+
+                            if let Some(cleared) = maybe_cleared {
+                                if cleared_tx.send(cleared).is_err() {
+                                    eyre::bail!("cleared versions channel is closed");
+                                }
+                            }
+
+                            trace!("done processing version: {version} for actor_id: {actor_id}");
+                            Ok(())
+                        });
+
+                        if job_tx.send(fut).is_err() {
+                            eyre::bail!("could not send into job channel");
+                        }
+                    }
                 }
             }
         }
