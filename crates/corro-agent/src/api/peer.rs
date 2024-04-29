@@ -376,7 +376,8 @@ fn handle_known_version(
             ).optional()?;
 
             let (last_seq, ts) = match last_seq_ts {
-                None | Some((None, _)) | Some((_, None)) => {
+                None => return Ok(None),
+                Some((None, _)) | Some((_, None)) => {
                     // empty version!
                     // TODO: optimize by sending the full range found...
                     // sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
