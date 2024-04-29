@@ -843,6 +843,8 @@ async fn large_tx_sync() -> eyre::Result<()> {
         );
     }
 
+    println!("now waiting for all futures to end");
+
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;
@@ -1275,7 +1277,6 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
             end_version: Some(Version(14))
         }
     );
-
 
     // empties multiple non-empty versions (12 and 13) and touches already emptied version (14)
     {

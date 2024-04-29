@@ -676,15 +676,21 @@ async fn process_sync(
         }
 
         let branch = tokio::select! {
-            Some(reqs) = chunked_reqs.next() => {
-                Branch::Reqs(reqs)
+            maybe_reqs = chunked_reqs.next() => match maybe_reqs {
+                Some(reqs) => {
+                    Branch::Reqs(reqs)
+                },
+                None => break
             },
             Some(res) = buf.next() => {
                 res?;
                 continue;
             },
-            Some(chunk) = cleared_chunks.next() => {
-                Branch::Cleared(chunk)
+            maybe_chunk = cleared_chunks.next() => match maybe_chunk {
+                Some(chunk) => {
+                    Branch::Cleared(chunk)
+                },
+                None => break
             },
             else => {
                 break;
