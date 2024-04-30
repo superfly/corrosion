@@ -949,6 +949,7 @@ pub async fn parallel_sync(
     members: Vec<(ActorId, SocketAddr)>,
     our_sync_state: SyncStateV1,
 ) -> Result<usize, SyncError> {
+    let start = Instant::now();
     trace!(
         self_actor_id = %agent.actor_id(),
         "parallel syncing w/ {}",
@@ -1266,9 +1267,10 @@ pub async fn parallel_sync(
 
     // now handle receiving changesets!
 
-    let counts = FuturesUnordered::from_iter(readers.into_iter().map(|(actor_id, mut read)| {
-        let tx_changes = agent.tx_changes().clone();
-        async move {
+    let mut counts =
+        FuturesUnordered::from_iter(readers.into_iter().map(|(actor_id, mut read)| {
+            let tx_changes = agent.tx_changes().clone();
+            async move {
             let mut count = 0;
 
             loop {
@@ -1320,20 +1322,30 @@ pub async fn parallel_sync(
 
             debug!(%actor_id, %count, "done reading sync messages");
 
-            Ok(count)
+            Ok::<_, SyncError>((actor_id, count))
         }
         .instrument(info_span!("read_sync_requests_responses", %actor_id))
-    }))
-    .collect::<Vec<Result<usize, SyncError>>>()
-    .await;
+        }));
 
-    for res in counts.iter() {
-        if let Err(e) = res {
-            error!("could not properly recv from peer: {e}");
+    let mut total = 0;
+
+    while let Some(res) = counts.next().await {
+        match res {
+            Ok((actor_id, n)) => {
+                let elapsed = start.elapsed();
+                info!(
+                    "synced {n} changes w/ {actor_id} in {elapsed:?} @ {} changes/s",
+                    n as f64 / elapsed.as_secs_f64(),
+                );
+                total += n;
+            }
+            Err(e) => {
+                error!("could not properly recv from peer: {e}");
+            }
         }
     }
 
-    Ok(counts.into_iter().flatten().sum::<usize>())
+    Ok(total)
 }
 
 #[tracing::instrument(skip(agent, bookie, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]

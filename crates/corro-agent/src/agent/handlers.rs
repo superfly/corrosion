@@ -666,28 +666,11 @@ pub async fn handle_sync(
         return Ok(());
     }
 
-    let start = Instant::now();
-    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state).await {
-        Ok(n) => n,
-        Err(e)  => {
-            error!("failed to execute parallel sync: {e:?}");
-            return Err(e.into());
-        }
-    };
-
-    let elapsed = start.elapsed();
-    if n > 0 {
-        info!(
-            "synced {n} changes w/ {} in {}s @ {} changes/s",
-            chosen
-                .into_iter()
-                .map(|(actor_id, _)| actor_id.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            elapsed.as_secs_f64(),
-            n as f64 / elapsed.as_secs_f64()
-        );
+    if let Err(e) = parallel_sync(agent, transport, chosen.clone(), sync_state).await {
+        error!("failed to execute parallel sync: {e:?}");
+        return Err(e.into());
     }
+
     Ok(())
 }
 
