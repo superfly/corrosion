@@ -1,5 +1,6 @@
 #!/bin/bash
 
+export RUST_LOG=info,corro=debug
 
 # Tests (with coverage + generating JUnit XML report)
 export NEXTEST_PROFILE=ci

@@ -782,6 +782,7 @@ pub fn store_empty_changeset(
     actor_id: ActorId,
     versions: RangeInclusive<Version>,
 ) -> Result<usize, ChangeError> {
+    debug!(%actor_id, "attempting to delete versions range {versions:?}");
     // first, delete "current" versions, they're now gone!
     let deleted: Vec<RangeInclusive<Version>> = conn
         .prepare_cached(
@@ -789,42 +790,42 @@ pub fn store_empty_changeset(
         DELETE FROM __corro_bookkeeping
             WHERE
                 actor_id = :actor_id AND
-                -- try to find the previous range
                 start_version >= COALESCE((
+                    -- try to find the previous range
                     SELECT start_version
                         FROM __corro_bookkeeping
                         WHERE
                             actor_id = :actor_id AND
-                            start_version < :start
+                            start_version < :start -- AND end_version IS NOT NULL
                         ORDER BY start_version DESC
                         LIMIT 1
                 ), 1)
                 AND
-                -- try to find the next range
                 start_version <= COALESCE((
+                    -- try to find the next range
                     SELECT start_version
                         FROM __corro_bookkeeping
                         WHERE
                             actor_id = :actor_id AND
-                            start_version > :end
+                            start_version > :end -- AND end_version IS NOT NULL
                         ORDER BY start_version ASC
                         LIMIT 1
                 ), :end + 1)
                 AND
                 (
                     -- [:start]---[start_version]---[:end]
-                    ( start_version BETWEEN :start AND :end AND end_version IS NULL ) OR
+                    ( start_version BETWEEN :start AND :end ) OR
 
                     -- [start_version]---[:start]---[:end]---[end_version]
-                    ( start_version >= :start AND end_version <= :end ) OR
+                    ( start_version <= :start AND end_version >= :end ) OR
 
                     -- [:start]---[start_version]---[:end]---[end_version]
                     ( start_version <= :end AND end_version >= :end ) OR
 
-                    -- [start_version]---[:start]---[end_version]---[:end]
-                    ( start_version <= :start AND end_version <= :end ) OR
+                    -- [:start]---[end_version]---[:end]
+                    ( end_version BETWEEN :start AND :end ) OR
 
-                    -- ---[:end][start_version]
+                    -- ---[:end][start_version]---[end_version]
                     ( start_version = :end + 1 AND end_version IS NOT NULL ) OR
 
                     -- [end_version][:start]---
@@ -855,7 +856,7 @@ pub fn store_empty_changeset(
             version: None,
         })?;
 
-    // println!("deleted: {deleted:?}");
+    debug!("deleted: {deleted:?}");
 
     if !deleted.is_empty() {
         debug!(
@@ -867,6 +868,8 @@ pub fn store_empty_changeset(
     // re-compute the ranges
     let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
     new_ranges.insert(versions);
+
+    debug!("new ranges: {new_ranges:?}");
 
     // we should never have deleted non-contiguous ranges, abort!
     if new_ranges.len() > 1 {
@@ -1407,16 +1410,22 @@ pub fn process_incomplete_version(
             DELETE FROM __corro_seq_bookkeeping
                 WHERE site_id = :actor_id AND version = :version AND
                 (
-                    -- start_seq and end_seq are within the range
-                    ( start_seq >= :start AND end_seq <= :end ) OR
+                    -- [:start]---[start_seq]---[:end]
+                    ( start_seq BETWEEN :start AND :end ) OR
 
-                    -- range being inserted is partially contained within another
+                    -- [start_seq]---[:start]---[:end]---[end_seq]
+                    ( start_seq <= :start AND end_seq >= :end ) OR
+
+                    -- [:start]---[start_seq]---[:end]---[end_seq]
                     ( start_seq <= :end AND end_seq >= :end ) OR
 
-                    -- start_seq = end + 1 (to collapse ranges)
-                    ( start_seq = :end + 1) OR
+                    -- [:start]---[end_seq]---[:end]
+                    ( end_seq BETWEEN :start AND :end ) OR
 
-                    -- end_seq = start - 1 (to collapse ranges)
+                    -- ---[:end][start_seq]---[end_seq]
+                    ( start_seq = :end + 1 AND end_seq ) OR
+
+                    -- [end_seq][:start]---
                     ( end_seq = :start - 1 )
                 )
                 RETURNING start_seq, end_seq
@@ -1439,7 +1448,7 @@ pub fn process_incomplete_version(
 
     // we should never have deleted non-contiguous seq ranges, abort!
     if new_ranges.len() > 1 {
-        warn!("deleted non-contiguous ranges! {new_ranges:?}");
+        warn!("deleted non-contiguous seq ranges! {new_ranges:?}");
         // this serves as a failsafe
         return Err(rusqlite::Error::StatementChangedRows(new_ranges.len()));
     }

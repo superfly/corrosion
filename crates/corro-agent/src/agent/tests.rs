@@ -843,6 +843,8 @@ async fn large_tx_sync() -> eyre::Result<()> {
         );
     }
 
+    println!("now waiting for all futures to end");
+
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;
@@ -980,6 +982,7 @@ async fn many_small_changes() -> eyre::Result<()> {
 
 #[test]
 fn test_store_empty_changeset() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
     let mut conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
 
     corro_types::sqlite::setup_conn(&mut conn)?;
@@ -1276,7 +1279,6 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         }
     );
 
-
     // empties multiple non-empty versions (12 and 13) and touches already emptied version (14)
     {
         let tx = conn.transaction()?;
@@ -1385,6 +1387,282 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
             actor_id,
             start_version: Version(1),
             end_version: Some(Version(23))
+        }
+    );
+
+    // live version after empty range
+
+    conn.execute(
+        "INSERT INTO __corro_bookkeeping (actor_id, start_version) VALUES (?, 24)",
+        [actor_id],
+    )?;
+
+    {
+        let tx = conn.transaction()?;
+        assert_eq!(
+            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23))?,
+            1
+        );
+        tx.commit()?;
+    }
+
+    let rows = conn
+        .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+        .query_map([], |row| {
+            Ok(CorroBook {
+                actor_id: row.get(0)?,
+                start_version: row.get(1)?,
+                end_version: row.get(2)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+    println!("rows: {rows:?}");
+
+    assert_eq!(rows.len(), 2);
+
+    assert_eq!(
+        rows[0],
+        CorroBook {
+            actor_id,
+            start_version: Version(1),
+            end_version: Some(Version(23))
+        }
+    );
+
+    assert_eq!(
+        rows[1],
+        CorroBook {
+            actor_id,
+            start_version: Version(24),
+            end_version: None
+        }
+    );
+
+    // live version before empty range
+
+    conn.execute(
+        "UPDATE __corro_bookkeeping SET start_version = 2 WHERE actor_id = ? AND start_version = 1",
+        [actor_id],
+    )?;
+
+    conn.execute(
+        "INSERT INTO __corro_bookkeeping (actor_id, start_version) VALUES (?, 1)",
+        [actor_id],
+    )?;
+
+    {
+        let tx = conn.transaction()?;
+        assert_eq!(
+            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23))?,
+            1
+        );
+        tx.commit()?;
+    }
+
+    let rows = conn
+        .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping ORDER BY start_version ASC")?
+        .query_map([], |row| {
+            Ok(CorroBook {
+                actor_id: row.get(0)?,
+                start_version: row.get(1)?,
+                end_version: row.get(2)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+    println!("rows: {rows:?}");
+
+    assert_eq!(rows.len(), 3);
+
+    assert_eq!(
+        rows[0],
+        CorroBook {
+            actor_id,
+            start_version: Version(1),
+            end_version: None
+        }
+    );
+
+    assert_eq!(
+        rows[1],
+        CorroBook {
+            actor_id,
+            start_version: Version(2),
+            end_version: Some(Version(23))
+        }
+    );
+
+    assert_eq!(
+        rows[2],
+        CorroBook {
+            actor_id,
+            start_version: Version(24),
+            end_version: None
+        }
+    );
+
+    // live version after empty range, with a gap
+
+    conn.execute(
+        "INSERT INTO __corro_bookkeeping (actor_id, start_version) VALUES (?, 29)",
+        [actor_id],
+    )?;
+
+    {
+        let tx = conn.transaction()?;
+        assert_eq!(
+            store_empty_changeset(&tx, actor_id, Version(1)..=Version(24))?,
+            1
+        );
+        tx.commit()?;
+    }
+
+    let rows = conn
+        .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+        .query_map([], |row| {
+            Ok(CorroBook {
+                actor_id: row.get(0)?,
+                start_version: row.get(1)?,
+                end_version: row.get(2)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+    println!("rows: {rows:?}");
+
+    {
+        let tx = conn.transaction()?;
+        assert_eq!(
+            store_empty_changeset(&tx, actor_id, Version(26)..=Version(27))?,
+            1
+        );
+        tx.commit()?;
+    }
+
+    let rows = conn
+        .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+        .query_map([], |row| {
+            Ok(CorroBook {
+                actor_id: row.get(0)?,
+                start_version: row.get(1)?,
+                end_version: row.get(2)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+    println!("rows: {rows:?}");
+
+    assert_eq!(rows.len(), 3);
+
+    assert_eq!(
+        rows[0],
+        CorroBook {
+            actor_id,
+            start_version: Version(1),
+            end_version: Some(Version(24))
+        }
+    );
+
+    assert_eq!(
+        rows[1],
+        CorroBook {
+            actor_id,
+            start_version: Version(26),
+            end_version: Some(Version(27))
+        }
+    );
+
+    assert_eq!(
+        rows[2],
+        CorroBook {
+            actor_id,
+            start_version: Version(29),
+            end_version: None
+        }
+    );
+
+    // live version before empty range, with a gap
+
+    {
+        let tx = conn.transaction()?;
+        assert_eq!(
+            store_empty_changeset(&tx, actor_id, Version(1)..=Version(29))?,
+            1
+        );
+        tx.commit()?;
+    }
+
+    {
+        let tx = conn.transaction()?;
+        assert_eq!(
+            store_empty_changeset(&tx, actor_id, Version(40)..=Version(45))?,
+            1
+        );
+        tx.commit()?;
+    }
+
+    {
+        let tx = conn.transaction()?;
+        assert_eq!(
+            store_empty_changeset(&tx, actor_id, Version(35)..=Version(37))?,
+            1
+        );
+        tx.commit()?;
+    }
+
+    let rows = conn
+        .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+        .query_map([], |row| {
+            Ok(CorroBook {
+                actor_id: row.get(0)?,
+                start_version: row.get(1)?,
+                end_version: row.get(2)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+    println!("rows: {rows:?}");
+
+    let rows = conn
+        .prepare("SELECT actor_id, start_version, end_version FROM __corro_bookkeeping")?
+        .query_map([], |row| {
+            Ok(CorroBook {
+                actor_id: row.get(0)?,
+                start_version: row.get(1)?,
+                end_version: row.get(2)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+    println!("rows: {rows:?}");
+
+    assert_eq!(rows.len(), 3);
+
+    assert_eq!(
+        rows[0],
+        CorroBook {
+            actor_id,
+            start_version: Version(1),
+            end_version: Some(Version(29))
+        }
+    );
+
+    assert_eq!(
+        rows[1],
+        CorroBook {
+            actor_id,
+            start_version: Version(35),
+            end_version: Some(Version(37))
+        }
+    );
+
+    assert_eq!(
+        rows[2],
+        CorroBook {
+            actor_id,
+            start_version: Version(40),
+            end_version: Some(Version(45))
         }
     );
 
