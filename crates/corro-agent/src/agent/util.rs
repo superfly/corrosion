@@ -1410,16 +1410,22 @@ pub fn process_incomplete_version(
             DELETE FROM __corro_seq_bookkeeping
                 WHERE site_id = :actor_id AND version = :version AND
                 (
-                    -- start_seq and end_seq are within the range
-                    ( start_seq >= :start AND end_seq <= :end ) OR
+                    -- [:start]---[start_seq]---[:end]
+                    ( start_seq BETWEEN :start AND :end ) OR
 
-                    -- range being inserted is partially contained within another
+                    -- [start_seq]---[:start]---[:end]---[end_seq]
+                    ( start_seq <= :start AND end_seq >= :end ) OR
+
+                    -- [:start]---[start_seq]---[:end]---[end_seq]
                     ( start_seq <= :end AND end_seq >= :end ) OR
 
-                    -- start_seq = end + 1 (to collapse ranges)
-                    ( start_seq = :end + 1) OR
+                    -- [:start]---[end_seq]---[:end]
+                    ( end_seq BETWEEN :start AND :end ) OR
 
-                    -- end_seq = start - 1 (to collapse ranges)
+                    -- ---[:end][start_seq]---[end_seq]
+                    ( start_seq = :end + 1 AND end_seq ) OR
+
+                    -- [end_seq][:start]---
                     ( end_seq = :start - 1 )
                 )
                 RETURNING start_seq, end_seq
@@ -1442,7 +1448,7 @@ pub fn process_incomplete_version(
 
     // we should never have deleted non-contiguous seq ranges, abort!
     if new_ranges.len() > 1 {
-        warn!("deleted non-contiguous ranges! {new_ranges:?}");
+        warn!("deleted non-contiguous seq ranges! {new_ranges:?}");
         // this serves as a failsafe
         return Err(rusqlite::Error::StatementChangedRows(new_ranges.len()));
     }
