@@ -190,11 +190,16 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
             agent.clone(),
             bookie.clone(),
             transport.clone(),
-            rx_apply,
             tripwire.clone(),
         )
         .inspect(|_| info!("corrosion agent sync loop is done")),
     );
+
+    spawn_counted(util::apply_fully_buffered_changes_loop(
+        agent.clone(),
+        bookie.clone(),
+        rx_apply,
+    ));
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
