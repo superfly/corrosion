@@ -602,36 +602,29 @@ pub async fn sync_loop(agent: Agent, bookie: Bookie, transport: Transport, mut t
         tokio::select! {
             biased;
 
-            _ = &mut next_sync_at => {
-                ()
-            },
+            _ = &mut next_sync_at => {},
             _ = &mut tripwire => {
                 break;
             }
         };
 
         // ignoring here, there is trying and logging going on inside
-        match tokio::time::timeout(
-            Duration::from_secs(300),
-            handlers::handle_sync(&agent, &bookie, &transport),
-        )
-        .preemptible(&mut tripwire)
-        .await
+        // match tokio::time::timeout(
+        //     Duration::from_secs(300),
+        match handlers::handle_sync(&agent, &bookie, &transport)
+            // )
+            .preemptible(&mut tripwire)
+            .await
         {
             tripwire::Outcome::Preempted(_) => {
                 warn!("aborted sync by tripwire");
                 break;
             }
-            tripwire::Outcome::Completed(res) => match res {
-                Ok(Err(e)) => {
+            tripwire::Outcome::Completed(res) => {
+                if let Err(e) = res {
                     error!("could not sync: {e}");
-                    // keep syncing until we successfully sync
                 }
-                Err(_e) => {
-                    warn!("timed out waiting for sync to complete!");
-                }
-                Ok(Ok(_)) => {}
-            },
+            }
         }
         next_sync_at
             .as_mut()

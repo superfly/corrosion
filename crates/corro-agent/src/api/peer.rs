@@ -696,6 +696,9 @@ async fn process_sync(
                     Branch::Cleared(chunk)
                 },
                 None => break
+            },
+            else => {
+                break;
             }
         };
 
