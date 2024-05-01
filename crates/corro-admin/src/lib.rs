@@ -192,24 +192,60 @@ async fn collapse_gaps(
     let start = Instant::now();
     block_in_place(|| {
         let tx = conn.transaction()?;
-        for range in bv.needed().iter() {
-            let versions = tx
+        let versions = tx
                 .prepare_cached(
                     "
-                    SELECT distinct start_version, coalesce(end_version, start_version)
-                        from __corro_bookkeeping, generate_series(?,?,1)
-                        where actor_id = ? and
-                        value between start_version and coalesce(end_version, start_version)
+                    SELECT distinct bk.start_version, coalesce(bk.end_version, bk.start_version)
+                        FROM __corro_bookkeeping_gaps AS g
+                        INNER JOIN __corro_bookkeeping AS bk ON bk.actor_id = g.actor_id AND start_version >= COALESCE((
+                            -- try to find the previous range
+                            SELECT start_version
+                                FROM __corro_bookkeeping
+                                WHERE
+                                    actor_id = g.actor_id AND
+                                    start_version < g.start -- AND end_version IS NOT NULL
+                                ORDER BY start_version DESC
+                                LIMIT 1
+                        ), 1)
+                        AND
+                        start_version <= COALESCE((
+                            -- try to find the next range
+                            SELECT start_version
+                                FROM __corro_bookkeeping
+                                WHERE
+                                    actor_id = g.actor_id AND
+                                    start_version > g.end-- AND end_version IS NOT NULL
+                                ORDER BY start_version ASC
+                                LIMIT 1
+                        ), g.end+ 1) AND (
+                            -- [g.start]---[start_version]---[g.end]
+                            ( start_version BETWEEN g.start AND g.end ) OR
+
+                            -- [start_version]---[g.start]---[g.end]---[end_version]
+                            ( start_version <= g.start AND end_version >= g.end ) OR
+
+                            -- [g.start]---[start_version]---[g.end]---[end_version]
+                            ( start_version <= g.end AND end_version >= g.end ) OR
+
+                            -- [g.start]---[end_version]---[g.end]
+                            ( end_version BETWEEN g.start AND g.end ) OR
+
+                            -- ---[g.end][start_version]---[end_version]
+                            ( start_version = g.end + 1 AND end_version IS NOT NULL ) OR
+
+                            -- [end_version][g.start]---
+                            ( end_version = g.start - 1 )
+                        )
+                        where g.actor_id = ?
                 ",
                 )?
                 .query_map(
-                    rusqlite::params![range.start(), range.end(), actor_id],
+                    rusqlite::params![actor_id],
                     |row| Ok(row.get(0)?..=row.get(1)?),
                 )?
                 .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<Version>>>()?;
 
-            snap.insert_db(&tx, versions)?;
-        }
+        snap.insert_db(&tx, versions)?;
 
         tx.commit()
     })?;
