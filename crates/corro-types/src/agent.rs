@@ -1,6 +1,6 @@
 use std::{
     cmp,
-    collections::{btree_map, BTreeMap, HashMap, HashSet},
+    collections::{btree_map, BTreeMap, BTreeSet, HashMap, HashSet},
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
@@ -1032,7 +1032,7 @@ pub enum KnownDbVersion {
 pub struct BookedVersions {
     actor_id: ActorId,
     pub partials: BTreeMap<Version, PartialVersion>,
-    needed: RangeInclusiveSet<Version>,
+    needed: HashSet<RangeInclusive<Version>>,
     max: Option<Version>,
 }
 
@@ -1117,7 +1117,7 @@ impl BookedVersions {
         // corrosion knows about a version if...
 
         // it's not in the list of needed versions
-        !self.needed.contains(version) &&
+        !self.needed.iter().any(|range| range.start() <= version && version <= range.end()) &&
         // and the last known version is bigger than the requested version
         self.max.unwrap_or_default() >= *version
         // we don't need to look at partials because if we have a partial
@@ -1157,7 +1157,7 @@ impl BookedVersions {
             for version in range.clone() {
                 self.partials.remove(&version);
             }
-            self.needed.remove(range);
+            self.needed.remove(&range);
         }
 
         for range in std::mem::take(&mut changes.insert_set) {
@@ -1235,6 +1235,22 @@ impl BookedVersions {
         Ok(changes)
     }
 
+    fn overlapping_needs<'a>(
+        &'a self,
+        versions: &'a RangeInclusive<Version>,
+    ) -> impl Iterator<Item = &RangeInclusive<Version>> + 'a {
+        self.needed.iter().filter(|range| {
+            // fully contained
+            (range.start() <= versions.start() && range.end() <= versions.end()) ||
+            // partially contained at the end
+            (range.start() <= versions.end() && range.end() >= versions.start()) ||
+            // partially contained at the start
+            (range.start() <= versions.start() && range.end() >= versions.start()) ||
+            // fully contained within
+            (range.start() >= versions.start() && range.end() >= versions.end())
+        })
+    }
+
     fn compute_gaps_change(&self, versions: RangeInclusiveSet<Version>) -> GapsChanges {
         trace!("needed: {:?}", self.needed);
 
@@ -1252,10 +1268,8 @@ impl BookedVersions {
             // only update the max if it's bigger
             changes.max = cmp::max(changes.max, Some(*versions.end()));
 
-            let overlapping = self.needed.overlapping(&versions);
-
             // iterate all partially or fully overlapping changes
-            for range in overlapping {
+            for range in self.overlapping_needs(&versions) {
                 trace!(actor_id = %self.actor_id, "overlapping: {range:?}");
                 // insert the overlapping range in the set (collapses ajoining ranges)
                 changes.insert_set.insert(range.clone());
@@ -1264,7 +1278,11 @@ impl BookedVersions {
             }
 
             // check if there's a previous range with an end version = start version - 1
-            if let Some(range) = self.needed.get(&Version(versions.start().0 - 1)) {
+            if let Some(range) = self
+                .needed
+                .iter()
+                .find(|range| range.end() == &Version(versions.start().0 - 1))
+            {
                 trace!(actor_id = %self.actor_id, "got a start - 1: {range:?}");
                 // insert the collapsible range
                 changes.insert_set.insert(range.clone());
@@ -1273,7 +1291,11 @@ impl BookedVersions {
             }
 
             // check if there's a next range with an start version = end version + 1
-            if let Some(range) = self.needed.get(&Version(versions.end().0 + 1)) {
+            if let Some(range) = self
+                .needed
+                .iter()
+                .find(|range| range.start() == &Version(versions.end().0 + 1))
+            {
                 trace!(actor_id = %self.actor_id, "got a end + 1: {range:?}");
                 // insert the collapsible range
                 changes.insert_set.insert(range.clone());
@@ -1291,7 +1313,7 @@ impl BookedVersions {
                 let range = gap_start..=*versions.start();
                 trace!("inserting gap between max + 1 and start: {range:?}");
                 changes.insert_set.insert(range.clone());
-                for range in self.needed.overlapping(&range) {
+                for range in self.overlapping_needs(&range) {
                     changes.insert_set.insert(range.clone());
                     changes.remove_ranges.insert(range.clone());
                 }
@@ -1303,7 +1325,7 @@ impl BookedVersions {
         changes
     }
 
-    pub fn needed(&self) -> &RangeInclusiveSet<Version> {
+    pub fn needed(&self) -> &HashSet<RangeInclusive<Version>> {
         &self.needed
     }
 }
@@ -1631,9 +1653,12 @@ mod tests {
         }
 
         for range in expected {
+            assert!(
+                bv.needed.contains(&range),
+                "expected needed to contain {range:?}"
+            );
             for v in range {
                 assert!(!bv.contains(v, None), "expected not to contain {v}");
-                assert!(bv.needed.contains(&v), "expected needed to contain {v}");
             }
         }
 
