@@ -70,7 +70,7 @@ pub fn start_server(
                 }
             };
 
-            spawn_counted({
+            tokio::spawn({
                 let agent = agent.clone();
                 let bookie = bookie.clone();
                 let config = config.clone();

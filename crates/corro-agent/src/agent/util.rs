@@ -54,7 +54,7 @@ use tokio::{net::TcpListener, sync::mpsc::Sender, task::block_in_place, time::sl
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
-use tripwire::{PreemptibleFutureExt, Tripwire};
+use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
 use super::BcastCache;
 
@@ -643,10 +643,13 @@ pub async fn apply_fully_buffered_changes_loop(
     agent: Agent,
     bookie: Bookie,
     mut rx_apply: CorroReceiver<(ActorId, Version)>,
+    mut tripwire: Tripwire,
 ) {
     info!("Starting apply_fully_buffered_changes loop");
 
-    while let Some((actor_id, version)) = rx_apply.recv().await {
+    while let Outcome::Completed(Some((actor_id, version))) =
+        rx_apply.recv().preemptible(&mut tripwire).await
+    {
         debug!(%actor_id, %version, "picked up background apply of buffered changes");
         match process_fully_buffered_changes(&agent, &bookie, actor_id, version).await {
             Ok(false) => {

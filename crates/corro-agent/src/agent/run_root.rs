@@ -285,6 +285,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         agent.clone(),
         bookie.clone(),
         rx_apply,
+        tripwire.clone(),
     ));
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
