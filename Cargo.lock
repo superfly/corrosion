@@ -719,6 +719,7 @@ dependencies = [
  "corro-agent",
  "corro-types",
  "futures",
+ "rangemap",
  "rusqlite",
  "serde",
  "serde_json",

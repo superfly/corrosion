@@ -453,6 +453,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Sync(SyncCommand::ReconcileGaps) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::ReconcileGaps,
+            ))
+            .await?;
+        }
         Command::Locks { top } => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Locks { top: *top })
@@ -714,6 +721,8 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
+    /// Reconcile gaps between memory and DB
+    ReconcileGaps,
 }
 
 #[derive(Subcommand)]

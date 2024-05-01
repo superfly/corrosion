@@ -1205,6 +1205,10 @@ impl BookedVersions {
         }
     }
 
+    pub fn actor_id(&self) -> ActorId {
+        self.actor_id
+    }
+
     pub fn from_conn(conn: &mut Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
         trace!("from_conn");
         let mut bv = BookedVersions::new(actor_id);

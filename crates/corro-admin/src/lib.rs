@@ -1,10 +1,13 @@
-use std::{fmt::Display, time::Duration};
+use std::{
+    fmt::Display,
+    time::{Duration, Instant},
+};
 
 use camino::Utf8PathBuf;
 use corro_agent::agent::clear_overwritten_versions;
 use corro_types::{
     actor::{ActorId, ClusterId},
-    agent::{Agent, Bookie, LockKind, LockMeta, LockState},
+    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{FocaCmd, FocaInput, Timestamp},
     sqlite::SqlitePoolError,
@@ -100,6 +103,7 @@ pub enum Command {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncCommand {
     Generate,
+    ReconcileGaps,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +181,44 @@ impl From<LockMeta> for LockMetaElapsed {
     }
 }
 
+async fn collapse_gaps(
+    stream: &mut FramedStream,
+    conn: &mut rusqlite::Connection,
+    bv: &mut BookedVersions,
+) -> rusqlite::Result<()> {
+    let actor_id = bv.actor_id();
+    let mut snap = bv.snapshot();
+    _ = info_log(stream, format!("collapsing ranges for {actor_id}")).await;
+    let start = Instant::now();
+    block_in_place(|| {
+        let tx = conn.transaction()?;
+        for range in bv.needed().iter() {
+            let versions = tx
+                .prepare_cached(
+                    "
+                    SELECT distinct start_version, coalesce(end_version, start_version)
+                        from __corro_bookkeeping, generate_series(?,?,1)
+                        where actor_id = ? and
+                        value between start_version and coalesce(end_version, start_version)
+                ",
+                )?
+                .query_map(
+                    rusqlite::params![range.start(), range.end(), actor_id],
+                    |row| Ok(row.get(0)?..=row.get(1)?),
+                )?
+                .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<Version>>>()?;
+
+            snap.insert_db(&tx, versions)?;
+        }
+
+        tx.commit()
+    })?;
+    _ = info_log(stream, format!("collapsed ranges in {:?}", start.elapsed())).await;
+
+    bv.commit_snapshot(snap);
+    Ok(())
+}
+
 async fn handle_conn(
     agent: Agent,
     bookie: &Bookie,
@@ -201,6 +243,35 @@ async fn handle_conn(
                         Err(e) => send_error(&mut stream, e).await,
                     }
                     send_success(&mut stream).await;
+                }
+                Command::Sync(SyncCommand::ReconcileGaps) => {
+                    let actor_ids: Vec<_> = {
+                        let r = bookie.read("admin sync reconcile gaps").await;
+                        r.keys().copied().collect()
+                    };
+
+                    for actor_id in actor_ids {
+                        {
+                            let booked = bookie
+                                .read(format!("admin sync reconcile gaps get actor {actor_id}"))
+                                .await
+                                .get(&actor_id)
+                                .unwrap()
+                                .clone();
+
+                            let mut conn = agent.pool().write_normal().await.unwrap();
+                            let mut bv = booked
+                                .write("admin sync reconcile gaps booked versions")
+                                .await;
+
+                            if let Err(e) = collapse_gaps(&mut stream, &mut conn, &mut bv).await {
+                                _ = send_error(&mut stream, e).await;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+
+                    _ = send_success(&mut stream).await;
                 }
                 Command::CompactEmpties => {
                     info_log(&mut stream, "compacting empty versions...").await;
