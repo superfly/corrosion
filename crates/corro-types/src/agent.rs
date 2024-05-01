@@ -1240,12 +1240,12 @@ impl BookedVersions {
         versions: &'a RangeInclusive<Version>,
     ) -> impl Iterator<Item = &RangeInclusive<Version>> + 'a {
         self.needed.iter().filter(|range| {
-            // fully contained
-            (range.start() <= versions.start() && range.end() <= versions.end()) ||
-            // partially contained at the end
-            (range.start() <= versions.end() && range.end() >= versions.start()) ||
-            // partially contained at the start
+            // range is fully inside provided versions
+            (range.start() >= versions.start() && range.end() <= versions.end()) ||
+            // range is partially contained at the start
             (range.start() <= versions.start() && range.end() >= versions.start()) ||
+            // range is partially contained at the end
+            (range.start() <= versions.end() && range.end() >= versions.end()) ||
             // fully contained within
             (range.start() >= versions.start() && range.end() >= versions.end())
         })
