@@ -92,7 +92,7 @@ pub fn spawn_incoming_connection_handlers(
     tokio::spawn(async move {
         let remote_addr = connecting.remote_address();
         // let local_ip = connecting.local_ip().unwrap();
-        debug!("got a connection from {remote_addr}");
+        trace!("got a connection from {remote_addr}");
 
         let conn = match connecting.await {
             Ok(conn) => conn,
@@ -104,7 +104,7 @@ pub fn spawn_incoming_connection_handlers(
 
         counter!("corro.peer.connection.accept.total").increment(1);
 
-        debug!("accepted a QUIC conn from {remote_addr}");
+        trace!("accepted a QUIC conn from {remote_addr}");
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
@@ -669,7 +669,7 @@ pub async fn handle_sync(
     let start = Instant::now();
     let n = match parallel_sync(agent, transport, chosen.clone(), sync_state).await {
         Ok(n) => n,
-        Err(e)  => {
+        Err(e) => {
             error!("failed to execute parallel sync: {e:?}");
             return Err(e.into());
         }
