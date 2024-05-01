@@ -390,6 +390,14 @@ fn handle_known_version(
                 None => return Ok(None),
                 Some((None, _)) | Some((_, None)) => {
                     // cleared version! return it, this is going to be chunked
+
+                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Empty {
+                            versions: version..=version,
+                        },
+                    })))?;
+
                     return Ok(Some((actor_id, version)));
                 }
                 Some((Some(last_seq), Some(ts))) => (last_seq, ts),
@@ -666,10 +674,10 @@ async fn process_sync(
             6,
         );
 
-    let (cleared_tx, cleared_rx) = unbounded_channel();
-    let cleared_chunks =
-        UnboundedReceiverStream::new(cleared_rx).chunks_timeout(1000, Duration::from_secs(1));
-    tokio::pin!(cleared_chunks);
+    // let (cleared_tx, cleared_rx) = unbounded_channel();
+    // let cleared_chunks =
+    //     UnboundedReceiverStream::new(cleared_rx).chunks_timeout(1000, Duration::from_secs(1));
+    // tokio::pin!(cleared_chunks);
 
     let mut to_process = vec![];
     let mut partial_needs = vec![];
@@ -677,7 +685,7 @@ async fn process_sync(
     loop {
         enum Branch {
             Reqs(Vec<Vec<(ActorId, Vec<SyncNeedV1>)>>),
-            Cleared(Vec<(ActorId, Version)>),
+            // Cleared(Vec<(ActorId, Version)>),
         }
 
         let branch = tokio::select! {
@@ -691,35 +699,35 @@ async fn process_sync(
                 res?;
                 continue;
             },
-            maybe_chunk = cleared_chunks.next() => match maybe_chunk {
-                Some(chunk) => {
-                    Branch::Cleared(chunk)
-                },
-                None => break
-            },
+            // maybe_chunk = cleared_chunks.next() => match maybe_chunk {
+            //     Some(chunk) => {
+            //         Branch::Cleared(chunk)
+            //     },
+            //     None => break
+            // },
             else => {
                 break;
             }
         };
 
         match branch {
-            Branch::Cleared(chunk) => {
-                let mut agg: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
-                for (actor_id, version) in chunk {
-                    agg.entry(actor_id).or_default().insert(version..=version);
-                }
+            // Branch::Cleared(chunk) => {
+            //     let mut agg: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
+            //     for (actor_id, version) in chunk {
+            //         agg.entry(actor_id).or_default().insert(version..=version);
+            //     }
 
-                for (actor_id, ranges) in agg {
-                    for versions in ranges {
-                        sender
-                            .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                                actor_id,
-                                changeset: Changeset::Empty { versions },
-                            })))
-                            .await?;
-                    }
-                }
-            }
+            //     for (actor_id, ranges) in agg {
+            //         for versions in ranges {
+            //             sender
+            //                 .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+            //                     actor_id,
+            //                     changeset: Changeset::Empty { versions },
+            //                 })))
+            //                 .await?;
+            //         }
+            //     }
+            // }
             Branch::Reqs(reqs) => {
                 let agg = reqs
                     .into_iter()
@@ -770,11 +778,11 @@ async fn process_sync(
                         let pool = pool.clone();
                         let booked = booked.clone();
                         let sender = sender.clone();
-                        let cleared_tx = cleared_tx.clone();
+                        // let cleared_tx = cleared_tx.clone();
                         let fut = Box::pin(async move {
                             let mut conn = pool.read().await?;
 
-                            let maybe_cleared = block_in_place(|| {
+                            let _maybe_cleared = block_in_place(|| {
                                 handle_known_version(
                                     &mut conn,
                                     actor_id,
@@ -786,11 +794,11 @@ async fn process_sync(
                                 )
                             })?;
 
-                            if let Some(cleared) = maybe_cleared {
-                                if cleared_tx.send(cleared).is_err() {
-                                    eyre::bail!("cleared versions channel is closed");
-                                }
-                            }
+                            // if let Some(cleared) = maybe_cleared {
+                            //     if cleared_tx.send(cleared).is_err() {
+                            //         eyre::bail!("cleared versions channel is closed");
+                            //     }
+                            // }
 
                             trace!("done processing version: {version} for actor_id: {actor_id}");
                             Ok(())
@@ -805,12 +813,12 @@ async fn process_sync(
                         let pool = pool.clone();
                         let booked = booked.clone();
                         let sender = sender.clone();
-                        let cleared_tx = cleared_tx.clone();
+                        // let cleared_tx = cleared_tx.clone();
 
                         let fut = Box::pin(async move {
                             let mut conn = pool.read().await?;
 
-                            let maybe_cleared = block_in_place(|| {
+                            let _maybe_cleared = block_in_place(|| {
                                 handle_known_version(
                                     &mut conn,
                                     actor_id,
@@ -822,11 +830,11 @@ async fn process_sync(
                                 )
                             })?;
 
-                            if let Some(cleared) = maybe_cleared {
-                                if cleared_tx.send(cleared).is_err() {
-                                    eyre::bail!("cleared versions channel is closed");
-                                }
-                            }
+                            // if let Some(cleared) = maybe_cleared {
+                            //     if cleared_tx.send(cleared).is_err() {
+                            //         eyre::bail!("cleared versions channel is closed");
+                            //     }
+                            // }
 
                             trace!("done processing version: {version} for actor_id: {actor_id}");
                             Ok(())
