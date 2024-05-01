@@ -188,7 +188,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                     let versions = tx
                         .prepare_cached(
                             "
-                        SELECT distinct start_version, coalesce(end_version)
+                        SELECT distinct start_version, coalesce(end_version, start_version)
                             from __corro_bookkeeping, generate_series(?,?,1)
                             where actor_id = ? and
                             value between start_version and coalesce(end_version, start_version)
