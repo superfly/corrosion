@@ -149,7 +149,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                     let pool = pool.clone();
                     async move {
                         tokio::spawn(async move {
-                            let mut conn = pool.write_normal().await?;
+                            let mut conn = pool.read().await?;
 
                             tokio::task::block_in_place(|| {
                                 BookedVersions::from_conn(&mut conn, actor_id)
@@ -178,37 +178,6 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                     });
                 }
             }
-
-            // {
-            //     let mut conn = pool.write_normal().await?;
-            //     rusqlite::vtab::series::load_module(&conn)?;
-
-            //     let mut snap = bv.snapshot();
-
-            //     let tx = conn.transaction()?;
-            //     for range in bv.needed().iter() {
-            //         let versions = tx
-            //             .prepare_cached(
-            //                 "
-            //             SELECT distinct start_version, coalesce(end_version, start_version)
-            //                 from __corro_bookkeeping, generate_series(?,?,1)
-            //                 where actor_id = ? and
-            //                 value between start_version and coalesce(end_version, start_version)
-            //         ",
-            //             )?
-            //             .query_map(
-            //                 rusqlite::params![range.start(), range.end(), actor_id],
-            //                 |row| Ok(row.get(0)?..=row.get(1)?),
-            //             )?
-            //             .collect::<rusqlite::Result<RangeInclusiveSet<Version>>>()?;
-
-            //         snap = snap.insert_db(&tx, versions)?;
-            //     }
-
-            //     tx.commit()?;
-
-            //     bv.apply_snapshot(snap);
-            // }
 
             bookie
                 .write("replace_actor")

@@ -1280,45 +1280,45 @@ impl BookedVersions {
         }
         if count != collapsed_count {
             warn!(%actor_id, "mismatched count of ranges needed, fixing DB");
-            let start = Instant::now();
-            let tx = conn.transaction()?;
-            tx.execute(
-                "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
-                [actor_id],
-            )?;
-            for range in snap.needed.iter() {
-                tx.execute(
-                    "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?, ?, ?)",
-                    params![actor_id, range.start(), range.end()],
-                )?;
-            }
-            tx.commit()?;
-            info!(%actor_id, "collapsed ranges in {:?}", start.elapsed());
+            // let start = Instant::now();
+            // let tx = conn.transaction()?;
+            // tx.execute(
+            //     "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
+            //     [actor_id],
+            // )?;
+            // for range in snap.needed.iter() {
+            //     tx.execute(
+            //         "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?, ?, ?)",
+            //         params![actor_id, range.start(), range.end()],
+            //     )?;
+            // }
+            // tx.commit()?;
+            // info!(%actor_id, "collapsed ranges in {:?}", start.elapsed());
         }
 
-        let start = Instant::now();
-        let tx = conn.transaction()?;
-        for range in snap.needed.clone().iter() {
-            let versions = tx
-                .prepare_cached(
-                    "
-                SELECT distinct start_version, coalesce(end_version, start_version)
-                    from __corro_bookkeeping, generate_series(?,?,1)
-                    where actor_id = ? and
-                    value between start_version and coalesce(end_version, start_version)
-            ",
-                )?
-                .query_map(
-                    rusqlite::params![range.start(), range.end(), actor_id],
-                    |row| Ok(row.get(0)?..=row.get(1)?),
-                )?
-                .collect::<rusqlite::Result<RangeInclusiveSet<Version>>>()?;
+        // let start = Instant::now();
+        // let tx = conn.transaction()?;
+        // for range in snap.needed.clone().iter() {
+        //     let versions = tx
+        //         .prepare_cached(
+        //             "
+        //         SELECT distinct start_version, coalesce(end_version, start_version)
+        //             from __corro_bookkeeping, generate_series(?,?,1)
+        //             where actor_id = ? and
+        //             value between start_version and coalesce(end_version, start_version)
+        //     ",
+        //         )?
+        //         .query_map(
+        //             rusqlite::params![range.start(), range.end(), actor_id],
+        //             |row| Ok(row.get(0)?..=row.get(1)?),
+        //         )?
+        //         .collect::<rusqlite::Result<RangeInclusiveSet<Version>>>()?;
 
-            snap.insert_db(&tx, versions)?;
-        }
+        //     snap.insert_db(&tx, versions)?;
+        // }
 
-        tx.commit()?;
-        info!(%actor_id, "reconciled gaps in {:?}", start.elapsed());
+        // tx.commit()?;
+        // info!(%actor_id, "reconciled gaps in {:?}", start.elapsed());
 
         bv.commit_snapshot(snap);
 
