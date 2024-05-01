@@ -26,7 +26,7 @@ use corro_types::{
 };
 use std::{
     cmp,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{btree_map::Entry, BTreeMap, BTreeSet, HashSet},
     convert::Infallible,
     net::SocketAddr,
     ops::RangeInclusive,
@@ -1023,14 +1023,14 @@ pub async fn process_fully_buffered_changes(
             debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
         };
 
-        let needed_changes =
-            bookedw
-                .insert_db(&tx, [version..=version].into())
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(actor_id),
-                    version: Some(version),
-                })?;
+        let snap = bookedw
+            .snapshot()
+            .insert_db(&tx, [version..=version].into())
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
 
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
@@ -1038,7 +1038,7 @@ pub async fn process_fully_buffered_changes(
             version: Some(version),
         })?;
 
-        bookedw.apply_needed_changes(needed_changes);
+        bookedw.apply_snapshot(snap);
 
         Ok::<_, ChangeError>(true)
     })?;
@@ -1194,7 +1194,7 @@ pub async fn process_multiple_changes(
         }
 
         let mut count = 0;
-        let mut needed_changes = BTreeMap::new();
+        let mut snapshots = BTreeMap::new();
 
         for (actor_id, knowns) in knowns.iter_mut() {
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} knowns", knowns.len());
@@ -1241,14 +1241,21 @@ pub async fn process_multiple_changes(
                     ))
                     .ensure(*actor_id)
             };
-            let mut booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer, during knowns):{actor_id}",
-            ));
 
-            needed_changes.insert(
+            // FIXME: here we're making dangerous assumptions that nothing will modify booked versions
+            let snap = match snapshots.remove(actor_id) {
+                Some(snap) => snap,
+                None => {
+                    let mut booked_write = booked.blocking_write(format!(
+                        "process_multiple_changes(booked writer, during knowns):{actor_id}",
+                    ));
+                    booked_write.snapshot()
+                }
+            };
+
+            snapshots.insert(
                 *actor_id,
-                booked_write
-                    .insert_db(&tx, all_versions)
+                snap.insert_db(&tx, all_versions)
                     .map_err(|source| ChangeError::Rusqlite {
                         source,
                         actor_id: Some(*actor_id),
@@ -1286,8 +1293,8 @@ pub async fn process_multiple_changes(
                 "process_multiple_changes(booked writer, before apply needed):{actor_id}",
             ));
 
-            if let Some(needed_changes) = needed_changes.remove(&actor_id) {
-                booked_write.apply_needed_changes(needed_changes);
+            if let Some(snap) = snapshots.remove(&actor_id) {
+                booked_write.apply_snapshot(snap);
             }
 
             for (versions, known) in knowns {
