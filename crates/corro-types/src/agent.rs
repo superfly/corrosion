@@ -31,7 +31,7 @@ use tokio::{
     sync::{oneshot, Semaphore},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use tripwire::Tripwire;
 
 use crate::{
@@ -1279,7 +1279,8 @@ impl BookedVersions {
             collapsed_count += 1;
         }
         if count != collapsed_count {
-            warn!("mismatched count of ranges needed, fixing DB");
+            warn!(%actor_id, "mismatched count of ranges needed, fixing DB");
+            let start = Instant::now();
             let tx = conn.transaction()?;
             tx.execute(
                 "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
@@ -1292,8 +1293,10 @@ impl BookedVersions {
                 )?;
             }
             tx.commit()?;
+            info!(%actor_id, "collapsed ranges in {:?}", start.elapsed());
         }
 
+        let start = Instant::now();
         let tx = conn.transaction()?;
         for range in snap.needed.clone().iter() {
             let versions = tx
@@ -1315,6 +1318,7 @@ impl BookedVersions {
         }
 
         tx.commit()?;
+        info!(%actor_id, "reconciled gaps in {:?}", start.elapsed());
 
         bv.commit_snapshot(snap);
 
