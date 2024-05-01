@@ -148,12 +148,14 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                 .map(|actor_id| {
                     let pool = pool.clone();
                     async move {
-                        tokio::task::spawn_blocking(move || {
-                            let conn = pool.read_blocking()?;
+                        tokio::spawn(async move {
+                            let mut conn = pool.write_normal().await?;
 
-                            BookedVersions::from_conn(&conn, actor_id)
-                                .map(|bv| (actor_id, bv))
-                                .map_err(eyre::Report::from)
+                            tokio::task::block_in_place(|| {
+                                BookedVersions::from_conn(&mut conn, actor_id)
+                                    .map(|bv| (actor_id, bv))
+                                    .map_err(eyre::Report::from)
+                            })
                         })
                         .await?
                     }
@@ -161,7 +163,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         )
         .buffer_unordered(4);
 
-        while let Some((actor_id, mut bv)) = TryStreamExt::try_next(&mut buf).await? {
+        while let Some((actor_id, bv)) = TryStreamExt::try_next(&mut buf).await? {
             for (version, partial) in bv.partials.iter() {
                 let gaps_count = partial.seqs.gaps(&(CrsqlSeq(0)..=partial.last_seq)).count();
 

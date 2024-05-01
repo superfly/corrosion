@@ -19,7 +19,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, Connection, Transaction};
+use rusqlite::{named_params, params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
@@ -571,8 +571,8 @@ impl SplitPool {
 
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn dedicated(&self) -> rusqlite::Result<Connection> {
-        let mut conn = rusqlite::Connection::open(&self.0.path)?;
-        setup_conn(&mut conn)?;
+        let conn = rusqlite::Connection::open(&self.0.path)?;
+        setup_conn(&conn)?;
         Ok(conn)
     }
 
@@ -1028,19 +1028,20 @@ pub enum KnownDbVersion {
     Partial(PartialVersion),
 }
 
+#[derive(Debug)]
 pub struct VersionsSnapshot {
     actor_id: ActorId,
-    needed: HashSet<RangeInclusive<Version>>,
-    partials: BTreeSet<Version>,
+    needed: RangeInclusiveSet<Version>,
+    partials: BTreeMap<Version, PartialVersion>,
     max: Option<Version>,
 }
 
 impl VersionsSnapshot {
     pub fn insert_db(
-        mut self,          // only because we want 1 mt a time here
+        &mut self,         // only because we want 1 mt a time here
         conn: &Connection, // usually a `Transaction`
         versions: RangeInclusiveSet<Version>,
-    ) -> rusqlite::Result<Self> {
+    ) -> rusqlite::Result<()> {
         trace!("wants to insert into db {versions:?}");
         let mut changes = self.compute_gaps_change(versions);
 
@@ -1064,7 +1065,7 @@ impl VersionsSnapshot {
             for version in range.clone() {
                 self.partials.remove(&version);
             }
-            self.needed.remove(&range);
+            self.needed.remove(range);
         }
 
         for range in std::mem::take(&mut changes.insert_set) {
@@ -1094,23 +1095,7 @@ impl VersionsSnapshot {
 
         self.max = changes.max.take();
 
-        Ok(self)
-    }
-
-    fn overlapping_needs<'a>(
-        &'a self,
-        versions: &'a RangeInclusive<Version>,
-    ) -> impl Iterator<Item = &RangeInclusive<Version>> + 'a {
-        self.needed.iter().filter(|range| {
-            // range is fully inside provided versions
-            (range.start() >= versions.start() && range.end() <= versions.end()) ||
-            // range is partially contained at the start
-            (range.start() <= versions.start() && range.end() >= versions.start()) ||
-            // range is partially contained at the end
-            (range.start() <= versions.end() && range.end() >= versions.end()) ||
-            // fully contained within
-            (range.start() >= versions.start() && range.end() >= versions.end())
-        })
+        Ok(())
     }
 
     fn compute_gaps_change(&self, versions: RangeInclusiveSet<Version>) -> GapsChanges {
@@ -1131,7 +1116,7 @@ impl VersionsSnapshot {
             changes.max = cmp::max(changes.max, Some(*versions.end()));
 
             // iterate all partially or fully overlapping changes
-            for range in self.overlapping_needs(&versions) {
+            for range in self.needed.overlapping(&versions) {
                 trace!(actor_id = %self.actor_id, "overlapping: {range:?}");
                 // insert the overlapping range in the set (collapses ajoining ranges)
                 changes.insert_set.insert(range.clone());
@@ -1140,11 +1125,7 @@ impl VersionsSnapshot {
             }
 
             // check if there's a previous range with an end version = start version - 1
-            if let Some(range) = self
-                .needed
-                .iter()
-                .find(|range| range.end() == &Version(versions.start().0 - 1))
-            {
+            if let Some(range) = self.needed.get(&Version(versions.start().0 - 1)) {
                 trace!(actor_id = %self.actor_id, "got a start - 1: {range:?}");
                 // insert the collapsible range
                 changes.insert_set.insert(range.clone());
@@ -1153,11 +1134,7 @@ impl VersionsSnapshot {
             }
 
             // check if there's a next range with an start version = end version + 1
-            if let Some(range) = self
-                .needed
-                .iter()
-                .find(|range| range.start() == &Version(versions.end().0 + 1))
-            {
+            if let Some(range) = self.needed.get(&Version(versions.end().0 + 1)) {
                 trace!(actor_id = %self.actor_id, "got a end + 1: {range:?}");
                 // insert the collapsible range
                 changes.insert_set.insert(range.clone());
@@ -1175,7 +1152,7 @@ impl VersionsSnapshot {
                 let range = gap_start..=*versions.start();
                 trace!("inserting gap between max + 1 and start: {range:?}");
                 changes.insert_set.insert(range.clone());
-                for range in self.overlapping_needs(&range) {
+                for range in self.needed.overlapping(&range) {
                     changes.insert_set.insert(range.clone());
                     changes.remove_ranges.insert(range.clone());
                 }
@@ -1191,20 +1168,21 @@ impl VersionsSnapshot {
 // this struct must be drained!
 impl Drop for VersionsSnapshot {
     fn drop(&mut self) {
+        trace!("dropping snapshot: {self:?}");
+        if !self.needed.is_empty() {
+            warn!(actor_id = %self.actor_id, "needed versions from snapshot were not drained: {:?}", self.needed);
+        }
         debug_assert!(
             self.needed.is_empty(),
-            "gaps changes insert set was not drained!"
+            "needed versions from snapshot were not drained"
         );
-        if !self.needed.is_empty() {
-            warn!(actor_id = %self.actor_id, "gaps: did not properly drain inserted versions set: {:?}", self.needed);
+        if !self.partials.is_empty() {
+            warn!(actor_id = %self.actor_id, "partials were not drained: {:?}", self.partials);
         }
         debug_assert!(
             self.partials.is_empty(),
-            "gaps changes remove ranges was not drained!"
+            "partials from snapshot were not drained!"
         );
-        if !self.partials.is_empty() {
-            warn!(actor_id = %self.actor_id, "gaps: did not properly drain remove ranges: {:?}", self.partials);
-        }
         debug_assert!(self.max.is_none(), "max value was not applied");
     }
 }
@@ -1213,7 +1191,7 @@ impl Drop for VersionsSnapshot {
 pub struct BookedVersions {
     actor_id: ActorId,
     pub partials: BTreeMap<Version, PartialVersion>,
-    needed: HashSet<RangeInclusive<Version>>,
+    needed: RangeInclusiveSet<Version>,
     max: Option<Version>,
 }
 
@@ -1227,7 +1205,8 @@ impl BookedVersions {
         }
     }
 
-    pub fn from_conn(conn: &Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
+    pub fn from_conn(conn: &mut Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
+        trace!("from_conn");
         let mut bv = BookedVersions::new(actor_id);
 
         // fetch the biggest version we know, a partial version might override
@@ -1238,55 +1217,106 @@ impl BookedVersions {
             )?
             .query_row([actor_id], |row| row.get(0))?;
 
-        // fetch known partial sequences
-        let mut prepped = conn.prepare_cached(
+        {
+            // fetch known partial sequences
+            let mut prepped = conn.prepare_cached(
             "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
-        )?;
-        let mut rows = prepped.query([actor_id])?;
+            )?;
+            let mut rows = prepped.query([actor_id])?;
 
-        loop {
-            let row = rows.next()?;
-            match row {
-                None => break,
-                Some(row) => {
-                    let version = row.get(0)?;
-                    bv.max = std::cmp::max(Some(version), bv.max);
-                    // NOTE: use normal insert logic to have a consistent behavior
-                    bv.insert_partial(
-                        version,
-                        PartialVersion {
-                            seqs: RangeInclusiveSet::from_iter(vec![row.get(1)?..=row.get(2)?]),
-                            last_seq: row.get(3)?,
-                            ts: row.get(4)?,
-                        },
-                    );
+            loop {
+                let row = rows.next()?;
+                match row {
+                    None => break,
+                    Some(row) => {
+                        let version = row.get(0)?;
+                        // NOTE: use normal insert logic to have a consistent behavior
+                        bv.insert_partial(
+                            version,
+                            PartialVersion {
+                                seqs: RangeInclusiveSet::from_iter(vec![row.get(1)?..=row.get(2)?]),
+                                last_seq: row.get(3)?,
+                                ts: row.get(4)?,
+                            },
+                        );
+                    }
                 }
             }
         }
 
         let mut snap = bv.snapshot();
 
-        // fetch the sync's needed version gaps
-        let mut prepped = conn
-            .prepare_cached("SELECT start, end FROM __corro_bookkeeping_gaps WHERE actor_id = ?")?;
-        let mut rows = prepped.query([actor_id])?;
+        // number of ranges we've inserted
+        let mut count = 0;
 
-        loop {
-            let row = rows.next()?;
-            match row {
-                None => break,
-                Some(row) => {
-                    let start_v = row.get(0)?;
-                    let end_v = row.get(1)?;
+        {
+            // fetch the sync's needed version gaps
+            let mut prepped = conn.prepare_cached(
+                "SELECT start, end FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
+            )?;
+            let mut rows = prepped.query([actor_id])?;
 
-                    // TODO: don't do this manually...
-                    snap.needed.insert(start_v..=end_v);
-                    snap.max = cmp::max(snap.max, Some(end_v));
+            loop {
+                let row = rows.next()?;
+                match row {
+                    None => break,
+                    Some(row) => {
+                        let start_v = row.get(0)?;
+                        let end_v = row.get(1)?;
+
+                        count += 1;
+
+                        // TODO: don't do this manually...
+                        snap.needed.insert(start_v..=end_v);
+                        snap.max = cmp::max(snap.max, Some(end_v));
+                    }
                 }
             }
         }
 
-        bv.apply_snapshot(snap);
+        let mut collapsed_count = 0;
+        for _ in snap.needed.iter() {
+            collapsed_count += 1;
+        }
+        if count != collapsed_count {
+            warn!("mismatched count of ranges needed, fixing DB");
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
+                [actor_id],
+            )?;
+            for range in snap.needed.iter() {
+                tx.execute(
+                    "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?, ?, ?)",
+                    params![actor_id, range.start(), range.end()],
+                )?;
+            }
+            tx.commit()?;
+        }
+
+        let tx = conn.transaction()?;
+        for range in snap.needed.clone().iter() {
+            let versions = tx
+                .prepare_cached(
+                    "
+                SELECT distinct start_version, coalesce(end_version, start_version)
+                    from __corro_bookkeeping, generate_series(?,?,1)
+                    where actor_id = ? and
+                    value between start_version and coalesce(end_version, start_version)
+            ",
+                )?
+                .query_map(
+                    rusqlite::params![range.start(), range.end(), actor_id],
+                    |row| Ok(row.get(0)?..=row.get(1)?),
+                )?
+                .collect::<rusqlite::Result<RangeInclusiveSet<Version>>>()?;
+
+            snap.insert_db(&tx, versions)?;
+        }
+
+        tx.commit()?;
+
+        bv.commit_snapshot(snap);
 
         Ok(bv)
     }
@@ -1330,13 +1360,21 @@ impl BookedVersions {
         self.max
     }
 
-    pub fn apply_snapshot(&mut self, mut snap: VersionsSnapshot) {
-        let new_partials = std::mem::take(&mut snap.partials);
-
-        self.partials.retain(|v, _| new_partials.contains(v));
-
+    pub fn commit_snapshot(&mut self, mut snap: VersionsSnapshot) {
+        debug!("comitting snapshot");
         self.needed = std::mem::take(&mut snap.needed);
+        self.partials = std::mem::take(&mut snap.partials);
         self.max = snap.max.take();
+    }
+
+    pub fn snapshot(&self) -> VersionsSnapshot {
+        trace!("creating snapshot");
+        VersionsSnapshot {
+            actor_id: self.actor_id,
+            needed: self.needed.clone(),
+            partials: self.partials.clone(),
+            max: self.max,
+        }
     }
 
     // used when the commit has succeeded
@@ -1344,7 +1382,10 @@ impl BookedVersions {
         debug!(actor_id = %self.actor_id, "insert partial {version:?}");
 
         match self.partials.entry(version) {
-            btree_map::Entry::Vacant(entry) => entry.insert(partial).clone(),
+            btree_map::Entry::Vacant(entry) => {
+                self.max = cmp::max(self.max, Some(version));
+                entry.insert(partial).clone()
+            }
             btree_map::Entry::Occupied(mut entry) => {
                 let got = entry.get_mut();
                 got.seqs.extend(partial.seqs);
@@ -1353,16 +1394,7 @@ impl BookedVersions {
         }
     }
 
-    pub fn snapshot(&self) -> VersionsSnapshot {
-        VersionsSnapshot {
-            actor_id: self.actor_id,
-            needed: self.needed.clone(),
-            partials: self.partials.keys().copied().collect(),
-            max: self.max,
-        }
-    }
-
-    pub fn needed(&self) -> &HashSet<RangeInclusive<Version>> {
+    pub fn needed(&self) -> &RangeInclusiveSet<Version> {
         &self.needed
     }
 }
@@ -1529,6 +1561,7 @@ mod tests {
         _ = tracing_subscriber::fmt::try_init();
 
         let mut conn = CrConn::init(Connection::open_in_memory()?)?;
+        setup_conn(&conn)?;
         migrate(&mut conn)?;
 
         let actor_id = ActorId::default();
@@ -1623,7 +1656,7 @@ mod tests {
         )?;
 
         // test loading a bv from the conn, they should be identical!
-        let mut bv2 = BookedVersions::from_conn(&conn, actor_id)?;
+        let mut bv2 = BookedVersions::from_conn(&mut conn, actor_id)?;
         // manually set the last version because there's nothing in `__corro_bookkeeping`
         bv2.max = Some(Version(55));
 
@@ -1639,10 +1672,9 @@ mod tests {
         versions: RangeInclusive<Version>,
     ) -> rusqlite::Result<()> {
         all_versions.insert(versions.clone());
-        let snap = bv
-            .snapshot()
-            .insert_db(conn, RangeInclusiveSet::from([versions]))?;
-        bv.apply_snapshot(snap);
+        let mut snap = bv.snapshot();
+        snap.insert_db(conn, RangeInclusiveSet::from([versions]))?;
+        bv.commit_snapshot(snap);
         Ok(())
     }
 
@@ -1671,12 +1703,9 @@ mod tests {
         }
 
         for range in expected {
-            assert!(
-                bv.needed.contains(&range),
-                "expected needed to contain {range:?}"
-            );
             for v in range {
                 assert!(!bv.contains(v, None), "expected not to contain {v}");
+                assert!(bv.needed.contains(&v), "expected needed to contain {v:?}");
             }
         }
 

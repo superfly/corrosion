@@ -155,9 +155,8 @@ where
 
             debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
-            let snap = book_writer
-                .snapshot()
-                .insert_db(&tx, [versions].into())
+            let mut snap = book_writer.snapshot();
+            snap.insert_db(&tx, [versions].into())
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
                     actor_id: Some(actor_id),
@@ -174,7 +173,7 @@ where
 
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        book_writer.apply_snapshot(snap);
+        book_writer.commit_snapshot(snap);
         drop(book_writer);
 
         let agent = agent.clone();

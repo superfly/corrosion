@@ -1023,9 +1023,8 @@ pub async fn process_fully_buffered_changes(
             debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
         };
 
-        let snap = bookedw
-            .snapshot()
-            .insert_db(&tx, [version..=version].into())
+        let mut snap = bookedw.snapshot();
+        snap.insert_db(&tx, [version..=version].into())
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),
@@ -1038,7 +1037,7 @@ pub async fn process_fully_buffered_changes(
             version: Some(version),
         })?;
 
-        bookedw.apply_snapshot(snap);
+        bookedw.commit_snapshot(snap);
 
         Ok::<_, ChangeError>(true)
     })?;
@@ -1243,25 +1242,24 @@ pub async fn process_multiple_changes(
             };
 
             // FIXME: here we're making dangerous assumptions that nothing will modify booked versions
-            let snap = match snapshots.remove(actor_id) {
+            let mut snap = match snapshots.remove(actor_id) {
                 Some(snap) => snap,
                 None => {
-                    let mut booked_write = booked.blocking_write(format!(
+                    let booked_write = booked.blocking_write(format!(
                         "process_multiple_changes(booked writer, during knowns):{actor_id}",
                     ));
                     booked_write.snapshot()
                 }
             };
 
-            snapshots.insert(
-                *actor_id,
-                snap.insert_db(&tx, all_versions)
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: Some(*actor_id),
-                        version: None,
-                    })?,
-            );
+            snap.insert_db(&tx, all_versions)
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(*actor_id),
+                    version: None,
+                })?;
+
+            snapshots.insert(*actor_id, snap);
         }
 
         debug!("inserted {count} new changesets");
@@ -1294,7 +1292,7 @@ pub async fn process_multiple_changes(
             ));
 
             if let Some(snap) = snapshots.remove(&actor_id) {
-                booked_write.apply_snapshot(snap);
+                booked_write.commit_snapshot(snap);
             }
 
             for (versions, known) in knowns {

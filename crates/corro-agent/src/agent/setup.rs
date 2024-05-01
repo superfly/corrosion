@@ -155,13 +155,13 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let booked = Booked::new(BookedVersions::new(actor_id), lock_registry.clone());
 
     // asynchronously load it up!
-    tokio::task::spawn_blocking({
+    tokio::spawn({
         let pool = pool.clone();
         // acquiring the lock here means everything will have to wait for it to be ready
         let mut booked = booked.write_owned("init").await;
-        move || {
-            let conn = pool.read_blocking()?;
-            *booked.deref_mut().deref_mut() = BookedVersions::from_conn(&conn, actor_id)?;
+        async move {
+            let mut conn = pool.write_normal().await?;
+            *booked.deref_mut().deref_mut() = BookedVersions::from_conn(&mut conn, actor_id)?;
             Ok::<_, eyre::Report>(())
         }
     });
