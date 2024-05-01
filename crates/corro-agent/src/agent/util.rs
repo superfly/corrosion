@@ -770,7 +770,8 @@ pub fn store_empty_changeset(
     actor_id: ActorId,
     versions: RangeInclusive<Version>,
 ) -> Result<usize, ChangeError> {
-    debug!(%actor_id, "attempting to delete versions range {versions:?}");
+    trace!(%actor_id, "attempting to delete versions range {versions:?}");
+    let start = Instant::now();
     // first, delete "current" versions, they're now gone!
     let deleted: Vec<RangeInclusive<Version>> = conn
         .prepare_cached(
@@ -844,20 +845,13 @@ pub fn store_empty_changeset(
             version: None,
         })?;
 
-    debug!("deleted: {deleted:?}");
-
-    if !deleted.is_empty() {
-        debug!(
-            "deleted {} still-live versions from database's bookkeeping",
-            deleted.len()
-        );
-    }
+    debug!(%actor_id, "deleted: {deleted:?} in {:?}", start.elapsed());
 
     // re-compute the ranges
     let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
     new_ranges.insert(versions);
 
-    debug!("new ranges: {new_ranges:?}");
+    debug!(%actor_id, "new ranges: {new_ranges:?}");
 
     // we should never have deleted non-contiguous ranges, abort!
     if new_ranges.len() > 1 {
@@ -888,6 +882,8 @@ pub fn store_empty_changeset(
             version: None,
         })?;
     }
+
+    debug!(%actor_id, "stored empty changesets in {:?} (total)", start.elapsed());
 
     Ok(inserted)
 }
