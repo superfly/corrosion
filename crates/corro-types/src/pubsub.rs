@@ -1093,6 +1093,7 @@ impl Matcher {
 
             match branch {
                 Branch::NewCandidates((candidates, db_version)) => {
+                    let start = Instant::now();
                     if let Err(e) = block_in_place(|| {
                         self.handle_candidates(&mut state_conn, candidates, db_version)
                     }) {
@@ -1101,6 +1102,7 @@ impl Matcher {
                         }
                         break;
                     }
+                    debug!(sub_id = %self.id, "processed {buf_count} changes for subscription in {:?}", start.elapsed());
                     buf_count = 0;
                 }
                 Branch::PurgeOldChanges => {
