@@ -1074,6 +1074,9 @@ impl Matcher {
                     }
                 },
                 _ = process_changes_interval.tick() => {
+                    if buf_count == 0 {
+                        continue;
+                    }
                     if let Some(db_version) = last_db_version.take(){
                         Branch::NewCandidates((std::mem::take(&mut buf), db_version))
                     } else {

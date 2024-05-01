@@ -1,5 +1,6 @@
 use std::{
-    collections::{btree_map, BTreeMap, HashMap},
+    cmp,
+    collections::{btree_map, BTreeMap, HashMap, HashSet},
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
@@ -1048,12 +1049,25 @@ impl BookedVersions {
     pub fn from_conn(conn: &Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
         let mut bv = BookedVersions::new(actor_id);
 
+        // fetch the biggest version we know, a partial version might override
+        // this below
+        bv.max = conn
+            .prepare_cached(
+                "SELECT MAX(start_version) FROM __corro_bookkeeping WHERE actor_id = ?",
+            )?
+            .query_row([actor_id], |row| row.get(0))?;
+
+        let mut changes = GapsChanges {
+            actor_id,
+            max: bv.max,
+            insert_set: Default::default(),
+            remove_ranges: Default::default(),
+        };
+
         // fetch the sync's needed version gaps
         let mut prepped = conn
             .prepare_cached("SELECT start, end FROM __corro_bookkeeping_gaps WHERE actor_id = ?")?;
         let mut rows = prepped.query([actor_id])?;
-
-        let mut changes = NeededChanges::default();
 
         loop {
             let row = rows.next()?;
@@ -1067,14 +1081,6 @@ impl BookedVersions {
                 }
             }
         }
-
-        // fetch the biggest version we know, a partial version might override
-        // this below
-        bv.max = conn
-            .prepare_cached(
-                "SELECT MAX(start_version) FROM __corro_bookkeeping WHERE actor_id = ?",
-            )?
-            .query_row([actor_id], |row| row.get(0))?;
 
         bv.apply_needed_changes(changes);
 
@@ -1146,9 +1152,8 @@ impl BookedVersions {
         self.max
     }
 
-    pub fn apply_needed_changes(&mut self, mut changes: NeededChanges) {
+    pub fn apply_needed_changes(&mut self, mut changes: GapsChanges) {
         for range in std::mem::take(&mut changes.remove_ranges) {
-            self.max = std::cmp::max(self.max, Some(*range.end()));
             for version in range.clone() {
                 self.partials.remove(&version);
             }
@@ -1156,9 +1161,10 @@ impl BookedVersions {
         }
 
         for range in std::mem::take(&mut changes.insert_set) {
-            self.max = std::cmp::max(self.max, Some(*range.end()));
             self.needed.insert(range);
         }
+
+        self.max = changes.max.take();
     }
 
     // used when the commit has succeeded
@@ -1179,68 +1185,27 @@ impl BookedVersions {
         &mut self,         // only because we want 1 mt a time here
         conn: &Connection, // usually a `Transaction`
         versions: RangeInclusiveSet<Version>,
-    ) -> rusqlite::Result<NeededChanges> {
+    ) -> rusqlite::Result<GapsChanges> {
         trace!("wants to insert into db {versions:?}");
-        trace!("needed: {:?}", self.needed);
-
-        let mut changes = NeededChanges::default();
-        for versions in versions {
-            changes.remove_ranges.push(versions.clone());
-
-            let overlapping = self.needed.overlapping(&versions);
-
-            for range in overlapping {
-                trace!(actor_id = %self.actor_id, "overlapping: {range:?}");
-                changes.insert_set.insert(range.clone());
-                changes.remove_ranges.push(range.clone());
-            }
-
-            // reproducing the rangemap collapsing logic
-            if let Some(range) = self.needed.get(&Version(versions.start().0 - 1)) {
-                trace!(actor_id = %self.actor_id, "got a start - 1: {range:?}");
-                changes.insert_set.insert(range.clone());
-                changes.remove_ranges.push(range.clone());
-            }
-
-            // reproducing the rangemap collapsing logic
-            if let Some(range) = self.needed.get(&Version(versions.end().0 + 1)) {
-                trace!(actor_id = %self.actor_id, "got a end + 1: {range:?}");
-                changes.insert_set.insert(range.clone());
-                changes.remove_ranges.push(range.clone());
-            }
-
-            // either a max or 0
-            // TODO: figure out if we want to use 0 instead of None in the struct by default
-            let current_max = self.max.unwrap_or_default();
-
-            if current_max + 1 < *versions.start() {
-                let start = current_max + 1;
-
-                let range = start..=*versions.start();
-                trace!("inserting gap between max + 1 and start: {range:?}");
-                changes.insert_set.insert(range.clone());
-                for range in self.needed.overlapping(&range) {
-                    changes.insert_set.insert(range.clone());
-                    changes.remove_ranges.push(range.clone());
-                }
-            }
-
-            // we now know the applied versions
-            changes.insert_set.remove(versions.clone());
-        }
+        let changes = self.compute_gaps_change(versions);
 
         trace!(actor_id = %self.actor_id, "delete: {:?}", changes.remove_ranges);
         trace!(actor_id = %self.actor_id, "new: {:?}", changes.insert_set);
 
+        // those are actual ranges we had stored and will change, remove them from the DB
         for range in changes.remove_ranges.iter() {
             debug!(actor_id = %self.actor_id, "deleting {range:?}");
-            conn
+            let count = conn
                 .prepare_cached("DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = :actor_id AND start = :start AND end = :end")?
                 .execute(named_params! {
                     ":actor_id": self.actor_id,
                     ":start": range.start(),
                     ":end": range.end()
                 })?;
+            if count != 1 {
+                warn!(actor_id = %self.actor_id, "did not delete gap from db: {range:?}");
+            }
+            debug_assert_eq!(count, 1, "ineffective deletion of gaps in-db: {range:?}");
         }
 
         for range in changes.insert_set.iter() {
@@ -1270,28 +1235,107 @@ impl BookedVersions {
         Ok(changes)
     }
 
+    fn compute_gaps_change(&self, versions: RangeInclusiveSet<Version>) -> GapsChanges {
+        trace!("needed: {:?}", self.needed);
+
+        let mut changes = GapsChanges {
+            // for logging purposes
+            actor_id: self.actor_id,
+            // set as the current max
+            max: self.max,
+
+            insert_set: Default::default(),
+            remove_ranges: Default::default(),
+        };
+
+        for versions in versions {
+            // only update the max if it's bigger
+            changes.max = cmp::max(changes.max, Some(*versions.end()));
+
+            let overlapping = self.needed.overlapping(&versions);
+
+            // iterate all partially or fully overlapping changes
+            for range in overlapping {
+                trace!(actor_id = %self.actor_id, "overlapping: {range:?}");
+                // insert the overlapping range in the set (collapses ajoining ranges)
+                changes.insert_set.insert(range.clone());
+                // remove the range, they'll be added back from the insert set ^
+                changes.remove_ranges.insert(range.clone());
+            }
+
+            // check if there's a previous range with an end version = start version - 1
+            if let Some(range) = self.needed.get(&Version(versions.start().0 - 1)) {
+                trace!(actor_id = %self.actor_id, "got a start - 1: {range:?}");
+                // insert the collapsible range
+                changes.insert_set.insert(range.clone());
+                // remove the collapsible range
+                changes.remove_ranges.insert(range.clone());
+            }
+
+            // check if there's a next range with an start version = end version + 1
+            if let Some(range) = self.needed.get(&Version(versions.end().0 + 1)) {
+                trace!(actor_id = %self.actor_id, "got a end + 1: {range:?}");
+                // insert the collapsible range
+                changes.insert_set.insert(range.clone());
+                // remove the collapsible range
+                changes.remove_ranges.insert(range.clone());
+            }
+
+            // either a max or 0
+            // TODO: figure out if we want to use 0 instead of None in the struct by default
+            let current_max = self.max.unwrap_or_default();
+
+            // check if there's a gap created between our current max and the start version we just inserted
+            let gap_start = current_max + 1;
+            if gap_start < *versions.start() {
+                let range = gap_start..=*versions.start();
+                trace!("inserting gap between max + 1 and start: {range:?}");
+                changes.insert_set.insert(range.clone());
+                for range in self.needed.overlapping(&range) {
+                    changes.insert_set.insert(range.clone());
+                    changes.remove_ranges.insert(range.clone());
+                }
+            }
+
+            // we now know the applied versions
+            changes.insert_set.remove(versions.clone());
+        }
+        changes
+    }
+
     pub fn needed(&self) -> &RangeInclusiveSet<Version> {
         &self.needed
     }
 }
 
-#[derive(Debug, Default)]
-pub struct NeededChanges {
+#[derive(Debug)]
+pub struct GapsChanges {
+    actor_id: ActorId,
+    max: Option<Version>,
     insert_set: RangeInclusiveSet<Version>,
-    remove_ranges: Vec<RangeInclusive<Version>>,
+    remove_ranges: HashSet<RangeInclusive<Version>>,
 }
 
-// // this struct must be drained!
-// impl Drop for NeededChanges {
-//     fn drop(&mut self) {
-//         if !self.insert_set.is_empty() {
-//             panic!("NeededChanges: did not properly drain new ranges");
-//         }
-//         if !self.remove_ranges.is_empty() {
-//             panic!("NeededChanges: did not properly drain new ranges");
-//         }
-//     }
-// }
+// this struct must be drained!
+impl Drop for GapsChanges {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.insert_set.is_empty(),
+            "gaps changes insert set was not drained!"
+        );
+        if !self.insert_set.is_empty() {
+            warn!(actor_id = %self.actor_id, "gaps: did not properly drain inserted versions set: {:?}", self.insert_set);
+        }
+        debug_assert!(
+            self.remove_ranges.is_empty(),
+            "gaps changes remove ranges was not drained!"
+        );
+        if !self.remove_ranges.is_empty() {
+            warn!(actor_id = %self.actor_id, "gaps: did not properly drain remove ranges: {:?}", self.remove_ranges);
+        }
+        debug_assert!(self.max.is_none(), "max value was not applied");
+    }
+}
 
 pub type BookedInner = Arc<CountedTokioRwLock<BookedVersions>>;
 
