@@ -33,7 +33,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
 
                 counter!("corro.peer.stream.accept.total", "type" => "uni").increment(1);
 
-                debug!(
+                trace!(
                     "accepted a unidirectional stream from {}",
                     conn.remote_address()
                 );

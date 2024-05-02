@@ -597,6 +597,12 @@ impl From<i64> for SqliteValue {
     }
 }
 
+impl From<f64> for SqliteValue {
+    fn from(value: f64) -> Self {
+        Self::Real(Real(value))
+    }
+}
+
 impl FromSql for SqliteValue {
     fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         Ok(match value {

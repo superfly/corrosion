@@ -19,3 +19,4 @@ tokio-serde = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tripwire = { path = "../tripwire" }
+rangemap = { workspace = true }

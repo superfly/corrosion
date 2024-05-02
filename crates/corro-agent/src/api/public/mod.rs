@@ -128,7 +128,7 @@ where
 
         let versions = version..=version;
 
-        let (elapsed, needed_changes) = {
+        let (elapsed, snap) = {
             tx.prepare_cached(
                 r#"
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
@@ -155,26 +155,25 @@ where
 
             debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
-            let needed_changes =
-                book_writer
-                    .insert_db(&tx, [versions].into())
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: Some(actor_id),
-                        version: Some(version),
-                    })?;
+            let mut snap = book_writer.snapshot();
+            snap.insert_db(&tx, [versions].into())
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: Some(version),
+                })?;
 
             tx.commit().map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),
                 version: Some(version),
             })?;
-            (start.elapsed(), needed_changes)
+            (start.elapsed(), snap)
         };
 
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        book_writer.apply_needed_changes(needed_changes);
+        book_writer.commit_snapshot(snap);
         drop(book_writer);
 
         let agent = agent.clone();

@@ -147,12 +147,14 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                 .map(|actor_id| {
                     let pool = pool.clone();
                     async move {
-                        tokio::task::spawn_blocking(move || {
-                            let conn = pool.read_blocking()?;
+                        tokio::spawn(async move {
+                            let conn = pool.read().await?;
 
-                            BookedVersions::from_conn(&conn, actor_id)
-                                .map(|bv| (actor_id, bv))
-                                .map_err(eyre::Report::from)
+                            tokio::task::block_in_place(|| {
+                                BookedVersions::from_conn(&conn, actor_id)
+                                    .map(|bv| (actor_id, bv))
+                                    .map_err(eyre::Report::from)
+                            })
                         })
                         .await?
                     }
@@ -199,6 +201,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         agent.clone(),
         bookie.clone(),
         rx_apply,
+        tripwire.clone(),
     ));
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");

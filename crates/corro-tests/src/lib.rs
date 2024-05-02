@@ -28,6 +28,18 @@ pub const TEST_SCHEMA: &str = r#"
             id INTEGER NOT NULL PRIMARY KEY,
             b boolean not null default false
         );
+
+        CREATE TABLE IF NOT EXISTS wide (
+            id1 BLOB NOT NULL,
+            id2 TEXT NOT NULL,
+
+            int INTEGER NOT NULL DEFAULT 1,
+            float REAL NOT NULL DEFAULT 1.0,
+
+            blob BLOB,
+
+            PRIMARY KEY (id1, id2)
+        );
     "#;
 
 #[derive(Clone)]

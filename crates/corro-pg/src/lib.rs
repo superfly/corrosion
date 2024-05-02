@@ -2176,13 +2176,14 @@ impl Session {
 
         debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
 
-        let needed_changes = book_writer.insert_db(conn, [version..=version].into())?;
+        let mut snap = book_writer.snapshot();
+        snap.insert_db(conn, [version..=version].into())?;
 
         conn.execute_batch("COMMIT")?;
 
         trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        book_writer.apply_needed_changes(needed_changes);
+        book_writer.commit_snapshot(snap);
 
         drop(book_writer);
 

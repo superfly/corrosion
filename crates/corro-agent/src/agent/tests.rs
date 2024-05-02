@@ -985,7 +985,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let mut conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
 
-    corro_types::sqlite::setup_conn(&mut conn)?;
+    corro_types::sqlite::setup_conn(&conn)?;
     migrate(&mut conn)?;
 
     let actor_id = ActorId(uuid::Uuid::new_v4());

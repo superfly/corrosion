@@ -1,14 +1,13 @@
 use std::cmp;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
-use compact_str::format_compact;
 use corro_types::actor::ClusterId;
-use corro_types::agent::{Agent, PartialVersion, SplitPool};
+use corro_types::agent::{Agent, SplitPool};
 use corro_types::base::{CrsqlSeq, Version};
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
@@ -26,7 +25,7 @@ use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rand::seq::SliceRandom;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, params, Connection, OptionalExtension};
+use rusqlite::{named_params, Connection};
 use speedy::Writable;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{self, unbounded_channel, Sender};
@@ -42,10 +41,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::agent::SyncRecvError;
 use crate::transport::{Transport, TransportError};
 
-use corro_types::{
-    actor::ActorId,
-    agent::{Booked, Bookie},
-};
+use corro_types::{actor::ActorId, agent::Bookie};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -351,57 +347,109 @@ const MIN_CHANGES_BYTES_PER_MESSAGE: usize = 1024;
 const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
 
 #[allow(clippy::too_many_arguments)]
-fn handle_known_version(
+fn handle_need(
     conn: &mut Connection,
     actor_id: ActorId,
-    version: Version,
-    partial: Option<PartialVersion>,
-    booked: &Booked,
-    mut seqs_needed: Vec<RangeInclusive<CrsqlSeq>>,
+    need: SyncNeedV1,
     sender: &Sender<SyncMessage>,
-) -> eyre::Result<Option<(ActorId, Version)>> {
-    debug!(%actor_id, %version, "handle known version! partial? {partial:?}");
+) -> eyre::Result<()> {
+    debug!(%actor_id, "handle known versions! need: {need:?}");
 
-    match partial {
-        None => {
-            // this is a read transaction!
-            let tx = conn.transaction()?;
+    let mut empties = RangeInclusiveSet::new();
 
-            let last_seq_ts: Option<(Option<CrsqlSeq>, Option<Timestamp>)> = tx
-                .prepare_cached(
-                    "
-                SELECT last_seq, ts
-                    FROM __corro_bookkeeping
-                    WHERE
-                        actor_id = :actor_id AND
-                        (:version BETWEEN start_version AND COALESCE(end_version, start_version))
-            ",
-                )?
-                .query_row(
-                    named_params! {
-                        ":actor_id": actor_id,
-                        ":version": version
-                    },
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+    // this is a read transaction!
+    let tx = conn.transaction()?;
+
+    let mut prepped = tx.prepare_cached(
+        "
+        SELECT start_version, end_version, last_seq, ts
+            FROM __corro_bookkeeping
+            WHERE
+                actor_id = :actor_id
+                AND
+                start_version >= COALESCE((
+                    -- try to find the previous range
+                    SELECT start_version
+                        FROM __corro_bookkeeping
+                        WHERE
+                            actor_id = :actor_id AND
+                            start_version < :start -- AND end_version IS NOT NULL
+                        ORDER BY start_version DESC
+                        LIMIT 1
+                ), 1)
+                AND
+                start_version <= COALESCE((
+                    -- try to find the next range
+                    SELECT start_version
+                        FROM __corro_bookkeeping
+                        WHERE
+                            actor_id = :actor_id AND
+                            start_version > :end -- AND end_version IS NOT NULL
+                        ORDER BY start_version ASC
+                        LIMIT 1
+                ), :end + 1)
+                AND
+                (
+                    -- [:start]---[start_version]---[:end]
+                    ( start_version BETWEEN :start AND :end ) OR
+
+                    -- [start_version]---[:start]---[:end]---[end_version]
+                    ( start_version <= :start AND end_version >= :end ) OR
+
+                    -- [:start]---[start_version]---[:end]---[end_version]
+                    ( start_version <= :end AND end_version >= :end ) OR
+
+                    -- [:start]---[end_version]---[:end]
+                    ( end_version BETWEEN :start AND :end )
                 )
-                .optional()?;
+            ",
+    )?;
 
-            let (last_seq, ts) = match last_seq_ts {
-                None => return Ok(None),
-                Some((None, _)) | Some((_, None)) => {
-                    // cleared version! return it, this is going to be chunked
-                    return Ok(Some((actor_id, version)));
+    match need {
+        SyncNeedV1::Full { versions } => {
+            let mut rows = prepped.query(named_params! {
+                ":actor_id": actor_id,
+                ":start": versions.start(),
+                ":end": versions.end(),
+            })?;
+
+            let mut unprocessed = RangeInclusiveSet::new();
+            unprocessed.insert(versions.clone());
+
+            loop {
+                let row = match rows.next()? {
+                    Some(row) => row,
+                    None => {
+                        break;
+                    }
+                };
+
+                let version: Version = row.get(0)?;
+                let end_version: Option<Version> = row.get(1)?;
+
+                if let Some(end_version) = end_version {
+                    // cleared versions!
+
+                    // pick the biggest start between ours and the versions
+                    let start_version = cmp::max(version, *versions.start());
+
+                    // pick the smallest end between ours and the versions
+                    let end_version = cmp::min(end_version, *versions.end());
+
+                    empties.insert(start_version..=end_version);
+
+                    // we have now processed this range!
+                    unprocessed.remove(start_version..=end_version);
+
+                    continue;
                 }
-                Some((Some(last_seq), Some(ts))) => (last_seq, ts),
-            };
 
-            if seqs_needed.is_empty() {
-                // no seqs provided, use 0..=last_seq
-                seqs_needed = vec![CrsqlSeq(0)..=last_seq];
-            }
+                debug!(%actor_id, ?version, "not empty");
 
-            let mut seqs_iter = seqs_needed.into_iter();
-            while let Some(range_needed) = seqs_iter.by_ref().next() {
+                // since this is not a cleared version, those aren't supposed to fail!
+                let last_seq: CrsqlSeq = row.get(2)?;
+                let ts: Timestamp = row.get(3)?;
+
                 let mut prepped = tx.prepare_cached(
                     r#"
                         SELECT c."table", c.pk, c.cid, c.val, c.col_version, c.db_version, c.seq, c.site_id, c.cl
@@ -409,149 +457,65 @@ fn handle_known_version(
                         INNER JOIN crsql_changes AS c ON c.site_id = bk.actor_id AND c.db_version = bk.db_version
                             WHERE bk.actor_id = :actor_id
                             AND bk.start_version = :version
-                            AND c.seq >= :start_seq AND c.seq <= :end_seq
                             ORDER BY c.seq ASC
                     "#,
                 )?;
 
-                let start_seq = range_needed.start();
-                let end_seq = range_needed.end();
-
                 let rows = prepped.query_map(
                     named_params! {
                         ":actor_id": actor_id,
-                        ":version": version,
-                        ":start_seq": start_seq,
-                        ":end_seq": end_seq
+                        ":version": version
                     },
                     row_to_change,
                 )?;
 
-                send_change_chunks(
+                if let Some(empty) = send_change_chunks(
                     sender,
-                    ChunkedChanges::new(rows, *start_seq, *end_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
+                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
                     actor_id,
                     version,
                     last_seq,
                     ts,
-                )?;
-            }
-        }
-        Some(PartialVersion { seqs, last_seq, .. }) => {
-            if seqs_needed.is_empty() {
-                // if no seqs provided, use 0..=last_seq
-                seqs_needed = vec![CrsqlSeq(0)..=last_seq];
+                )? {
+                    empties.insert(empty..=empty);
+                }
             }
 
-            let mut seqs_iter = seqs_needed.into_iter();
-            while let Some(range_needed) = seqs_iter.by_ref().next() {
-                let mut partial_seqs = seqs.clone();
-                let mut range_needed = range_needed.clone();
+            // now process the last unprocessed in case we have partials
+            for versions in unprocessed {
+                for version in versions {
+                    let seqs = tx
+                        .prepare_cached("
+                        SELECT start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = :actor_id AND version = :version
+                        ")?.query_map(named_params!{
+                            ":actor_id": actor_id,
+                            ":version": version
+                        },|row| Ok((row.get(0)?..=row.get(1)?, row.get(2)?, row.get(3)?)))?.collect::<rusqlite::Result<Vec<(RangeInclusive<CrsqlSeq>, CrsqlSeq, Timestamp)>>>()?;
 
-                let mut last_sent_seq = None;
-
-                'outer: loop {
-                    let overlapping: Vec<RangeInclusive<CrsqlSeq>> =
-                        partial_seqs.overlapping(&range_needed).cloned().collect();
-
-                    for range in overlapping {
-                        // since there can be partial overlap, we need to only
-                        // send back the specific range we have or else we risk
-                        // sending bad data and creating inconsistencies
-
-                        // pick the biggest start
-                        // e.g. if 0..=10 is needed, and we have 2..=7 then
-                        //      we need to fetch from 2
-                        let start_seq = cmp::max(range.start(), range_needed.start());
-
-                        // pick the smallest end
-                        // e.g. if 0..=10 is needed, and we have 2..=7 then
-                        //      we need to stop at 7
-                        let end_seq = cmp::min(range.end(), range_needed.end());
-
-                        debug!("partial, effective range: {start_seq}..={end_seq}");
-
-                        let bw = booked.blocking_write(format_compact!(
-                            "sync_handle_known(partial)[{version}]:{}",
-                            actor_id.as_simple()
-                        ));
-
-                        let still_partial = if let Some(PartialVersion { seqs, .. }) =
-                            bw.get_partial(&version)
-                        {
-                            if seqs != &partial_seqs {
-                                warn!(%actor_id, %version, "different partial sequences, updating! range_needed: {range_needed:?}");
-                                partial_seqs = seqs.clone();
-                                if let Some(new_start_seq) = last_sent_seq.take() {
-                                    range_needed = (new_start_seq + 1)..=*range_needed.end();
-                                }
-                                continue 'outer;
-                            }
-                            true
-                        } else {
-                            // not a partial anymore
-                            false
-                        };
-
-                        if !still_partial {
-                            warn!(%actor_id, %version, "switched from partial to current version");
-
-                            return Ok(None);
-                            // // drop write lock
-                            // drop(bw);
-
-                            // // restart the seqs_needed here!
-                            // let mut seqs_needed: Vec<RangeInclusive<CrsqlSeq>> =
-                            //     seqs_iter.collect();
-                            // if let Some(new_start_seq) = last_sent_seq.take() {
-                            //     range_needed = (new_start_seq + 1)..=*range_needed.end();
-                            // }
-                            // seqs_needed.insert(0, range_needed);
-
-                            // return handle_known_version(
-                            //     conn,
-                            //     actor_id,
-                            //     version,
-                            //     None,
-                            //     booked,
-                            //     seqs_needed,
-                            //     sender,
-                            // );
-                        }
-
-                        // this is a read transaction!
-                        let tx = conn.transaction()?;
-
-                        // first check if we do have the sequence...
-                        let last_seq_ts: Option<(CrsqlSeq, Timestamp)> = tx.prepare_cached("SELECT last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ? AND start_seq <= ? AND end_seq >= ?")?.query_row(params![actor_id, version, start_seq, end_seq], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
-
-                        let (last_seq, ts) = match last_seq_ts {
-                            None => {
-                                warn!(%actor_id, %version, "seqs bookkeeping indicated buffered changes were gone, aborting!");
-                                break 'outer;
-                            }
-                            Some(res) => res,
-                        };
-
-                        // the data is still valid because we just checked __corro_seq_bookkeeping and
-                        // we're in a transaction (of "read" type since the first select)
+                    for (range_needed, last_seq, ts) in seqs {
                         let mut prepped = tx.prepare_cached(
                             r#"
-                            SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                                FROM __corro_buffered_changes
-                                WHERE site_id = ?
-                                  AND version = ?
-                                  AND seq >= ? AND seq <= ?
-                                  ORDER BY seq ASC"#,
+                                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                                    FROM __corro_buffered_changes
+                                    WHERE site_id = :actor_id
+                                        AND version = :version
+                                        AND seq BETWEEN :start_seq AND :end_seq
+                                    ORDER BY seq ASC
+                            "#,
                         )?;
+
+                        let start_seq = range_needed.start();
+                        let end_seq = range_needed.end();
 
                         let rows = prepped.query_map(
-                            params![actor_id, version, start_seq, end_seq],
+                            named_params! {
+                                ":actor_id": actor_id,
+                                ":version": version,
+                                ":start_seq": start_seq,
+                                ":end_seq": end_seq
+                            },
                             row_to_change,
                         )?;
-
-                        // drop write lock!
-                        drop(bw);
 
                         send_change_chunks(
                             sender,
@@ -566,18 +530,181 @@ fn handle_known_version(
                             last_seq,
                             ts,
                         )?;
-
-                        debug!(%actor_id, %version, "done sending chunks of partial changes");
-
-                        last_sent_seq = Some(*end_seq);
                     }
-                    break;
+                }
+            }
+
+            if !empties.is_empty() {
+                for versions in empties {
+                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Empty { versions },
+                    })))?;
+                }
+            }
+        }
+        SyncNeedV1::Partial { version, seqs } => {
+            let mut rows = prepped.query(named_params! {
+                ":actor_id": actor_id,
+                ":start": version,
+                ":end": version,
+            })?;
+
+            match rows.next()? {
+                Some(row) => {
+                    let version: Version = row.get(0)?;
+                    let end_version: Option<Version> = row.get(1)?;
+
+                    if end_version.is_some() {
+                        // send this one right away
+
+                        sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(
+                            ChangeV1 {
+                                actor_id,
+                                changeset: Changeset::Empty {
+                                    versions: version..=version,
+                                },
+                            },
+                        )))?;
+                        return Ok(());
+                    }
+
+                    // since this is not a cleared version, those aren't supposed to fail!
+                    let last_seq: CrsqlSeq = row.get(2)?;
+                    let ts: Timestamp = row.get(3)?;
+
+                    for range_needed in seqs {
+                        let mut prepped = tx.prepare_cached(
+                            r#"
+                                SELECT c."table", c.pk, c.cid, c.val, c.col_version, c.db_version, c.seq, c.site_id, c.cl
+                                    FROM __corro_bookkeeping AS bk
+                                INNER JOIN crsql_changes AS c ON c.site_id = bk.actor_id AND c.db_version = bk.db_version
+                                    WHERE bk.actor_id = :actor_id
+                                    AND bk.start_version = :version
+                                    AND c.seq BETWEEN :start AND :end
+                                    ORDER BY c.seq ASC
+                            "#,
+                        )?;
+
+                        let rows = prepped.query_map(
+                            named_params! {
+                                ":actor_id": actor_id,
+                                ":version": version,
+                                ":start": range_needed.start(),
+                                ":end": range_needed.end(),
+                            },
+                            row_to_change,
+                        )?;
+
+                        if let Some(empty) = send_change_chunks(
+                            sender,
+                            ChunkedChanges::new(
+                                rows,
+                                *range_needed.start(),
+                                *range_needed.end(),
+                                MAX_CHANGES_BYTES_PER_MESSAGE,
+                            ),
+                            actor_id,
+                            version,
+                            last_seq,
+                            ts,
+                        )? {
+                            sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(
+                                ChangeV1 {
+                                    actor_id,
+                                    changeset: Changeset::Empty {
+                                        versions: empty..=empty,
+                                    },
+                                },
+                            )))?;
+                        }
+                    }
+                }
+                None => {
+                    for seqs_range in seqs {
+                        let seqs = tx
+                            .prepare_cached(
+                                "
+                                SELECT start_seq, end_seq, last_seq, ts
+                                    FROM __corro_seq_bookkeeping
+                                    WHERE
+                                        site_id = :actor_id AND
+                                        version = :version AND
+                                        (
+                                            -- [:start]---[start_seq]---[:end]
+                                            ( start_seq BETWEEN :start AND :end ) OR
+                        
+                                            -- [start_seq]---[:start]---[:end]---[end_seq]
+                                            ( start_seq <= :start AND end_seq >= :end ) OR
+                        
+                                            -- [:start]---[start_seq]---[:end]---[end_seq]
+                                            ( start_seq <= :end AND end_seq >= :end ) OR
+                        
+                                            -- [:start]---[end_seq]---[:end]
+                                            ( end_seq BETWEEN :start AND :end )
+                                        )
+                                ",
+                            )?
+                            .query_map(
+                                named_params! {
+                                    ":actor_id": actor_id,
+                                    ":version": version,
+                                    ":start": seqs_range.start(),
+                                    ":end": seqs_range.end(),
+                                },
+                                |row| Ok((row.get(0)?..=row.get(1)?, row.get(2)?, row.get(3)?)),
+                            )?
+                            .collect::<rusqlite::Result<
+                                Vec<(RangeInclusive<CrsqlSeq>, CrsqlSeq, Timestamp)>,
+                            >>()?;
+
+                        for (range_needed, last_seq, ts) in seqs {
+                            let mut prepped = tx.prepare_cached(
+                                        r#"
+                                            SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                                                FROM __corro_buffered_changes
+                                                WHERE site_id = :actor_id
+                                                    AND version = :version
+                                                    AND seq BETWEEN :start_seq AND :end_seq
+                                                ORDER BY seq ASC
+                                        "#,
+                                    )?;
+
+                            // scope query to only the sequences we have
+                            let start_seq = cmp::max(range_needed.start(), seqs_range.start());
+                            let end_seq = cmp::min(range_needed.end(), seqs_range.end());
+
+                            let rows = prepped.query_map(
+                                named_params! {
+                                    ":actor_id": actor_id,
+                                    ":version": version,
+                                    ":start_seq": start_seq,
+                                    ":end_seq": end_seq
+                                },
+                                row_to_change,
+                            )?;
+
+                            send_change_chunks(
+                                sender,
+                                ChunkedChanges::new(
+                                    rows,
+                                    *start_seq,
+                                    *end_seq,
+                                    MAX_CHANGES_BYTES_PER_MESSAGE,
+                                ),
+                                actor_id,
+                                version,
+                                last_seq,
+                                ts,
+                            )?;
+                        }
+                    }
                 }
             }
         }
     }
 
-    Ok(None)
+    Ok(())
 }
 
 fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
@@ -587,7 +714,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     version: Version,
     last_seq: CrsqlSeq,
     ts: Timestamp,
-) -> eyre::Result<()> {
+) -> eyre::Result<Option<Version>> {
     let mut max_buf_size = chunked.max_buf_size();
     loop {
         if sender.is_closed() {
@@ -598,12 +725,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
                 let start = Instant::now();
 
                 if changes.is_empty() && *seqs.start() == CrsqlSeq(0) && *seqs.end() == last_seq {
-                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                        actor_id,
-                        changeset: Changeset::Empty {
-                            versions: version..=version,
-                        },
-                    })))?;
+                    return Ok(Some(version));
                 } else {
                     sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                         actor_id,
@@ -644,7 +766,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 async fn process_sync(
@@ -666,18 +788,9 @@ async fn process_sync(
             6,
         );
 
-    let (cleared_tx, cleared_rx) = unbounded_channel();
-    let cleared_chunks =
-        UnboundedReceiverStream::new(cleared_rx).chunks_timeout(1000, Duration::from_secs(1));
-    tokio::pin!(cleared_chunks);
-
-    let mut to_process = vec![];
-    let mut partial_needs = vec![];
-
     loop {
         enum Branch {
             Reqs(Vec<Vec<(ActorId, Vec<SyncNeedV1>)>>),
-            Cleared(Vec<(ActorId, Version)>),
         }
 
         let branch = tokio::select! {
@@ -691,35 +804,12 @@ async fn process_sync(
                 res?;
                 continue;
             },
-            maybe_chunk = cleared_chunks.next() => match maybe_chunk {
-                Some(chunk) => {
-                    Branch::Cleared(chunk)
-                },
-                None => break
-            },
             else => {
                 break;
             }
         };
 
         match branch {
-            Branch::Cleared(chunk) => {
-                let mut agg: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
-                for (actor_id, version) in chunk {
-                    agg.entry(actor_id).or_default().insert(version..=version);
-                }
-
-                for (actor_id, ranges) in agg {
-                    for versions in ranges {
-                        sender
-                            .send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                                actor_id,
-                                changeset: Changeset::Empty { versions },
-                            })))
-                            .await?;
-                    }
-                }
-            }
             Branch::Reqs(reqs) => {
                 let agg = reqs
                     .into_iter()
@@ -730,105 +820,38 @@ async fn process_sync(
                     .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
 
                 for (actor_id, needs) in agg {
-                    let booked = match { bookie.read("process_sync").await.get(&actor_id).cloned() }
-                    {
-                        Some(booked) => booked,
+                    let booked = bookie
+                        .read("process_sync get actor")
+                        .await
+                        .get(&actor_id)
+                        .cloned();
+                    let booked = match booked {
+                        Some(b) => b,
                         None => continue,
                     };
+                    let booked_read = booked.read("process_sync check needs").await;
 
-                    {
-                        let read = booked.read("process_need(full)").await;
-
-                        for need in needs {
-                            match need {
-                                SyncNeedV1::Full { versions } => {
-                                    for version in versions {
-                                        if !read.contains_version(&version) {
-                                            continue;
-                                        }
-
-                                        to_process
-                                            .push((version, read.get_partial(&version).cloned()));
-                                    }
+                    for need in needs {
+                        match &need {
+                            SyncNeedV1::Full { versions } => {
+                                if versions.clone().all(|v| booked_read.needed().contains(&v)) {
+                                    continue;
                                 }
-                                SyncNeedV1::Partial { version, seqs } => {
-                                    if !read.contains_version(&version) {
-                                        continue;
-                                    }
-
-                                    partial_needs.push((
-                                        version,
-                                        read.get_partial(&version).cloned(),
-                                        seqs,
-                                    ));
+                            }
+                            SyncNeedV1::Partial { version, .. } => {
+                                if booked_read.needed().contains(version) {
+                                    continue;
                                 }
                             }
                         }
-                    }
 
-                    for (version, partial) in to_process.drain(..) {
                         let pool = pool.clone();
-                        let booked = booked.clone();
                         let sender = sender.clone();
-                        let cleared_tx = cleared_tx.clone();
                         let fut = Box::pin(async move {
                             let mut conn = pool.read().await?;
 
-                            let maybe_cleared = block_in_place(|| {
-                                handle_known_version(
-                                    &mut conn,
-                                    actor_id,
-                                    version,
-                                    partial,
-                                    &booked,
-                                    vec![],
-                                    &sender,
-                                )
-                            })?;
+                            block_in_place(|| handle_need(&mut conn, actor_id, need, &sender))?;
 
-                            if let Some(cleared) = maybe_cleared {
-                                if cleared_tx.send(cleared).is_err() {
-                                    eyre::bail!("cleared versions channel is closed");
-                                }
-                            }
-
-                            trace!("done processing version: {version} for actor_id: {actor_id}");
-                            Ok(())
-                        });
-
-                        if job_tx.send(fut).is_err() {
-                            eyre::bail!("could not send into job channel");
-                        }
-                    }
-
-                    for (version, partial, seqs_needed) in partial_needs.drain(..) {
-                        let pool = pool.clone();
-                        let booked = booked.clone();
-                        let sender = sender.clone();
-                        let cleared_tx = cleared_tx.clone();
-
-                        let fut = Box::pin(async move {
-                            let mut conn = pool.read().await?;
-
-                            let maybe_cleared = block_in_place(|| {
-                                handle_known_version(
-                                    &mut conn,
-                                    actor_id,
-                                    version,
-                                    partial,
-                                    &booked,
-                                    seqs_needed,
-                                    &sender,
-                                )
-                            })?;
-
-                            if let Some(cleared) = maybe_cleared {
-                                if cleared_tx.send(cleared).is_err() {
-                                    eyre::bail!("cleared versions channel is closed");
-                                }
-                            }
-
-                            trace!("done processing version: {version} for actor_id: {actor_id}");
                             Ok(())
                         });
 
@@ -1593,6 +1616,7 @@ mod tests {
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
     use hyper::StatusCode;
+    use rand::{Rng, RngCore};
     use tempfile::TempDir;
     use tripwire::Tripwire;
 
@@ -1604,7 +1628,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_handle_known_version() -> eyre::Result<()> {
+    async fn test_handle_need() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
 
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
@@ -1720,13 +1744,12 @@ mod tests {
             }
 
             block_in_place(|| {
-                handle_known_version(
+                handle_need(
                     &mut conn,
                     actor_id,
-                    Version(1),
-                    None,
-                    &booked,
-                    vec![CrsqlSeq(0)..=CrsqlSeq(0)],
+                    SyncNeedV1::Full {
+                        versions: Version(1)..=Version(1),
+                    },
                     &tx,
                 )
             })?;
@@ -1747,13 +1770,13 @@ mod tests {
             );
 
             block_in_place(|| {
-                handle_known_version(
+                handle_need(
                     &mut conn,
                     actor_id,
-                    Version(2),
-                    None,
-                    &booked,
-                    vec![CrsqlSeq(0)..=CrsqlSeq(0)],
+                    SyncNeedV1::Partial {
+                        version: Version(2),
+                        seqs: vec![CrsqlSeq(0)..=CrsqlSeq(0)],
+                    },
                     &tx,
                 )
             })?;
@@ -1765,7 +1788,7 @@ mod tests {
                     actor_id,
                     changeset: Changeset::Full {
                         version: Version(2),
-                        changes: vec![change2],
+                        changes: vec![change2.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
                         ts,
@@ -1825,13 +1848,13 @@ mod tests {
             }
 
             block_in_place(|| {
-                handle_known_version(
+                handle_need(
                     &mut conn,
                     actor_id,
-                    Version(1),
-                    None,
-                    &booked,
-                    vec![CrsqlSeq(0)..=CrsqlSeq(0)],
+                    SyncNeedV1::Partial {
+                        version: Version(1),
+                        seqs: vec![CrsqlSeq(0)..=CrsqlSeq(0)],
+                    },
                     &tx,
                 )
             })?;
@@ -1843,6 +1866,338 @@ mod tests {
                     actor_id,
                     changeset: Changeset::Empty {
                         versions: Version(1)..=Version(1)
+                    }
+                }))
+            );
+        }
+
+        {
+            let (tx, mut rx) = mpsc::channel(5);
+            let mut conn = agent.pool().read().await?;
+
+            block_in_place(|| {
+                handle_need(
+                    &mut conn,
+                    actor_id,
+                    SyncNeedV1::Full {
+                        versions: Version(1)..=Version(6),
+                    },
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(2),
+                        changes: vec![change2],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(3),
+                        changes: vec![change3.clone()],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty {
+                        versions: Version(1)..=Version(1)
+                    }
+                }))
+            );
+        }
+
+        // overwrite v2
+        let change4 = Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![2i64.into()])?,
+            cid: ColumnName("text".into()),
+            val: "two override".into(),
+            col_version: 2,
+            db_version: CrsqlDbVersion(4),
+            seq: CrsqlSeq(0),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        process_multiple_changes(
+            agent.clone(),
+            bookie.clone(),
+            vec![(
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(4),
+                        changes: vec![change4.clone()],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            )],
+        )
+        .await?;
+
+        let ts2 = agent.clock().new_timestamp().into();
+
+        let mut rng = rand::thread_rng();
+
+        let len = 10u64;
+        let mut last_seq = 0u64;
+
+        let changes = (0u64..len)
+            .map(|i| {
+                let mut b = vec![0u8; 16];
+                rng.fill_bytes(&mut b);
+
+                let int: i64 = rng.sample(rand::distributions::Standard);
+                let float: f64 = rng.sample(rand::distributions::Standard);
+                [
+                    ("int", int.into()),
+                    ("float", float.into()),
+                    ("blob", b.into()),
+                ]
+                .into_iter()
+                .map(|(col, val)| {
+                    let c = Change {
+                        table: TableName("wide".into()),
+                        pk: pack_columns(&vec![
+                            i.to_be_bytes().to_vec().into(),
+                            i.to_string().into(),
+                        ])
+                        .unwrap(),
+                        cid: ColumnName(col.into()),
+                        val,
+                        col_version: 1,
+                        db_version: CrsqlDbVersion(5),
+                        seq: CrsqlSeq(last_seq),
+                        site_id: actor_id.to_bytes(),
+                        cl: 1,
+                    };
+                    last_seq += 1;
+                    c
+                })
+                .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        last_seq -= 1;
+        let last_seq = CrsqlSeq(last_seq);
+
+        let changes_v1 = changes
+            .iter()
+            .map(|changes| {
+                let seqs = changes.first().unwrap().seq..=changes.last().unwrap().seq;
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(5),
+                        changes: changes.clone(),
+                        seqs,
+                        last_seq,
+                        ts: ts2,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+
+        process_multiple_changes(
+            agent.clone(),
+            bookie.clone(),
+            changes_v1
+                .iter()
+                .map(|change| (change.clone(), ChangeSource::Sync, Instant::now()))
+                .collect(),
+        )
+        .await?;
+
+        {
+            let (tx, mut rx) = mpsc::channel(5);
+            let mut conn = agent.pool().read().await?;
+
+            block_in_place(|| {
+                handle_need(
+                    &mut conn,
+                    actor_id,
+                    SyncNeedV1::Full {
+                        versions: Version(1)..=Version(1000),
+                    },
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(3),
+                        changes: vec![change3],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(4),
+                        changes: vec![change4],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(5),
+                        changes: changes.iter().flatten().cloned().collect(),
+                        seqs: CrsqlSeq(0)..=last_seq,
+                        last_seq,
+                        ts: ts2,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty {
+                        versions: Version(1)..=Version(2)
+                    }
+                }))
+            );
+        }
+
+        {
+            let (tx, mut rx) = mpsc::channel(5);
+            let mut conn = agent.pool().read().await?;
+
+            block_in_place(|| {
+                handle_need(
+                    &mut conn,
+                    actor_id,
+                    SyncNeedV1::Partial {
+                        version: Version(5),
+                        seqs: vec![CrsqlSeq(4)..=CrsqlSeq(7)],
+                    },
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(5),
+                        changes: changes
+                            .iter()
+                            .flatten()
+                            .enumerate()
+                            .filter_map(|(i, c)| if (4..=7).contains(&i) {
+                                Some(c.clone())
+                            } else {
+                                None
+                            })
+                            .collect(),
+                        seqs: CrsqlSeq(4)..=CrsqlSeq(7),
+                        last_seq,
+                        ts: ts2,
+                    }
+                }))
+            );
+
+            block_in_place(|| {
+                handle_need(
+                    &mut conn,
+                    actor_id,
+                    SyncNeedV1::Partial {
+                        version: Version(5),
+                        seqs: vec![CrsqlSeq(2)..=CrsqlSeq(2), CrsqlSeq(15)..=CrsqlSeq(24)],
+                    },
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(5),
+                        changes: changes
+                            .iter()
+                            .flatten()
+                            .enumerate()
+                            .filter_map(|(i, c)| if i == 2 { Some(c.clone()) } else { None })
+                            .collect(),
+                        seqs: CrsqlSeq(2)..=CrsqlSeq(2),
+                        last_seq,
+                        ts: ts2,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(5),
+                        changes: changes
+                            .iter()
+                            .flatten()
+                            .enumerate()
+                            .filter_map(|(i, c)| if (15..=24).contains(&i) {
+                                Some(c.clone())
+                            } else {
+                                None
+                            })
+                            .collect(),
+                        seqs: CrsqlSeq(15)..=CrsqlSeq(24),
+                        last_seq,
+                        ts: ts2,
                     }
                 }))
             );

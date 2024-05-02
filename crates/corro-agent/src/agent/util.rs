@@ -54,7 +54,7 @@ use tokio::{net::TcpListener, sync::mpsc::Sender, task::block_in_place, time::sl
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
-use tripwire::{PreemptibleFutureExt, Tripwire};
+use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
 use super::BcastCache;
 
@@ -602,9 +602,7 @@ pub async fn sync_loop(agent: Agent, bookie: Bookie, transport: Transport, mut t
         tokio::select! {
             biased;
 
-            _ = &mut next_sync_at => {
-                ()
-            },
+            _ = &mut next_sync_at => {},
             _ = &mut tripwire => {
                 break;
             }
@@ -643,10 +641,13 @@ pub async fn apply_fully_buffered_changes_loop(
     agent: Agent,
     bookie: Bookie,
     mut rx_apply: CorroReceiver<(ActorId, Version)>,
+    mut tripwire: Tripwire,
 ) {
     info!("Starting apply_fully_buffered_changes loop");
 
-    while let Some((actor_id, version)) = rx_apply.recv().await {
+    while let Outcome::Completed(Some((actor_id, version))) =
+        rx_apply.recv().preemptible(&mut tripwire).await
+    {
         debug!(%actor_id, %version, "picked up background apply of buffered changes");
         match process_fully_buffered_changes(&agent, &bookie, actor_id, version).await {
             Ok(false) => {
@@ -770,7 +771,8 @@ pub fn store_empty_changeset(
     actor_id: ActorId,
     versions: RangeInclusive<Version>,
 ) -> Result<usize, ChangeError> {
-    debug!(%actor_id, "attempting to delete versions range {versions:?}");
+    trace!(%actor_id, "attempting to delete versions range {versions:?}");
+    let start = Instant::now();
     // first, delete "current" versions, they're now gone!
     let deleted: Vec<RangeInclusive<Version>> = conn
         .prepare_cached(
@@ -844,20 +846,13 @@ pub fn store_empty_changeset(
             version: None,
         })?;
 
-    debug!("deleted: {deleted:?}");
-
-    if !deleted.is_empty() {
-        debug!(
-            "deleted {} still-live versions from database's bookkeeping",
-            deleted.len()
-        );
-    }
+    debug!(%actor_id, "deleted: {deleted:?} in {:?}", start.elapsed());
 
     // re-compute the ranges
     let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
     new_ranges.insert(versions);
 
-    debug!("new ranges: {new_ranges:?}");
+    debug!(%actor_id, "new ranges: {new_ranges:?}");
 
     // we should never have deleted non-contiguous ranges, abort!
     if new_ranges.len() > 1 {
@@ -888,6 +883,8 @@ pub fn store_empty_changeset(
             version: None,
         })?;
     }
+
+    debug!(%actor_id, "stored empty changesets in {:?} (total)", start.elapsed());
 
     Ok(inserted)
 }
@@ -1027,14 +1024,13 @@ pub async fn process_fully_buffered_changes(
             debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
         };
 
-        let needed_changes =
-            bookedw
-                .insert_db(&tx, [version..=version].into())
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(actor_id),
-                    version: Some(version),
-                })?;
+        let mut snap = bookedw.snapshot();
+        snap.insert_db(&tx, [version..=version].into())
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
 
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
@@ -1042,7 +1038,7 @@ pub async fn process_fully_buffered_changes(
             version: Some(version),
         })?;
 
-        bookedw.apply_needed_changes(needed_changes);
+        bookedw.commit_snapshot(snap);
 
         Ok::<_, ChangeError>(true)
     })?;
@@ -1198,7 +1194,7 @@ pub async fn process_multiple_changes(
         }
 
         let mut count = 0;
-        let mut needed_changes = BTreeMap::new();
+        let mut snapshots = BTreeMap::new();
 
         for (actor_id, knowns) in knowns.iter_mut() {
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} knowns", knowns.len());
@@ -1245,20 +1241,26 @@ pub async fn process_multiple_changes(
                     ))
                     .ensure(*actor_id)
             };
-            let mut booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer, during knowns):{actor_id}",
-            ));
 
-            needed_changes.insert(
-                *actor_id,
-                booked_write
-                    .insert_db(&tx, all_versions)
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: Some(*actor_id),
-                        version: None,
-                    })?,
-            );
+            // FIXME: here we're making dangerous assumptions that nothing will modify booked versions
+            let mut snap = match snapshots.remove(actor_id) {
+                Some(snap) => snap,
+                None => {
+                    let booked_write = booked.blocking_write(format!(
+                        "process_multiple_changes(booked writer, during knowns):{actor_id}",
+                    ));
+                    booked_write.snapshot()
+                }
+            };
+
+            snap.insert_db(&tx, all_versions)
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(*actor_id),
+                    version: None,
+                })?;
+
+            snapshots.insert(*actor_id, snap);
         }
 
         debug!("inserted {count} new changesets");
@@ -1290,8 +1292,8 @@ pub async fn process_multiple_changes(
                 "process_multiple_changes(booked writer, before apply needed):{actor_id}",
             ));
 
-            if let Some(needed_changes) = needed_changes.remove(&actor_id) {
-                booked_write.apply_needed_changes(needed_changes);
+            if let Some(snap) = snapshots.remove(&actor_id) {
+                booked_write.commit_snapshot(snap);
             }
 
             for (versions, known) in knowns {
@@ -1312,7 +1314,7 @@ pub async fn process_multiple_changes(
                             }
                         });
                     } else {
-                        debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs");
+                        debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs: {:?}", seqs.gaps(&full_seqs_range).collect::<Vec<_>>());
                     }
                 }
             }
