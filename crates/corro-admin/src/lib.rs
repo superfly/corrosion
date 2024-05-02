@@ -307,7 +307,7 @@ async fn handle_conn(
                                 .unwrap()
                                 .clone();
 
-                            let mut conn = agent.pool().write_normal().await.unwrap();
+                            let mut conn = agent.pool().write_low().await.unwrap();
                             let mut bv = booked
                                 .write("admin sync reconcile gaps booked versions")
                                 .await;
@@ -316,7 +316,6 @@ async fn handle_conn(
                                 _ = send_error(&mut stream, e).await;
                             }
                         }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
 
                     _ = send_success(&mut stream).await;
