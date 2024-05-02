@@ -1106,8 +1106,6 @@ impl VersionsSnapshot {
         trace!("needed: {:?}", self.needed);
 
         let mut changes = GapsChanges {
-            // for logging purposes
-            actor_id: self.actor_id,
             // set as the current max
             max: self.max,
 
@@ -1362,7 +1360,6 @@ impl BookedVersions {
 
 #[derive(Debug)]
 pub struct GapsChanges {
-    actor_id: ActorId,
     max: Option<Version>,
     insert_set: RangeInclusiveSet<Version>,
     remove_ranges: HashSet<RangeInclusive<Version>>,
