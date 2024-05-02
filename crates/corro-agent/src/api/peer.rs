@@ -355,6 +355,8 @@ fn handle_need(
 ) -> eyre::Result<()> {
     debug!(%actor_id, "handle known versions! need: {need:?}");
 
+    let mut empties = RangeInclusiveSet::new();
+
     // this is a read transaction!
     let tx = conn.transaction()?;
 
@@ -434,13 +436,7 @@ fn handle_need(
                     // pick the smallest end between ours and the versions
                     let end_version = cmp::min(end_version, *versions.end());
 
-                    // send this one right away
-                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                        actor_id,
-                        changeset: Changeset::Empty {
-                            versions: start_version..=end_version,
-                        },
-                    })))?;
+                    empties.insert(start_version..=end_version);
 
                     // we have now processed this range!
                     unprocessed.remove(start_version..=end_version);
@@ -473,14 +469,16 @@ fn handle_need(
                     row_to_change,
                 )?;
 
-                send_change_chunks(
+                if let Some(empty) = send_change_chunks(
                     sender,
                     ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
                     actor_id,
                     version,
                     last_seq,
                     ts,
-                )?;
+                )? {
+                    empties.insert(empty..=empty);
+                }
             }
 
             // now process the last unprocessed in case we have partials
@@ -535,6 +533,15 @@ fn handle_need(
                     }
                 }
             }
+
+            if !empties.is_empty() {
+                for versions in empties {
+                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Empty { versions },
+                    })))?;
+                }
+            }
         }
         SyncNeedV1::Partial { version, seqs } => {
             let mut rows = prepped.query(named_params! {
@@ -550,6 +557,7 @@ fn handle_need(
 
                     if end_version.is_some() {
                         // send this one right away
+
                         sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(
                             ChangeV1 {
                                 actor_id,
@@ -588,7 +596,7 @@ fn handle_need(
                             row_to_change,
                         )?;
 
-                        send_change_chunks(
+                        if let Some(empty) = send_change_chunks(
                             sender,
                             ChunkedChanges::new(
                                 rows,
@@ -600,7 +608,16 @@ fn handle_need(
                             version,
                             last_seq,
                             ts,
-                        )?;
+                        )? {
+                            sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(
+                                ChangeV1 {
+                                    actor_id,
+                                    changeset: Changeset::Empty {
+                                        versions: empty..=empty,
+                                    },
+                                },
+                            )))?;
+                        }
                     }
                 }
                 None => {
@@ -697,7 +714,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     version: Version,
     last_seq: CrsqlSeq,
     ts: Timestamp,
-) -> eyre::Result<()> {
+) -> eyre::Result<Option<Version>> {
     let mut max_buf_size = chunked.max_buf_size();
     loop {
         if sender.is_closed() {
@@ -708,12 +725,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
                 let start = Instant::now();
 
                 if changes.is_empty() && *seqs.start() == CrsqlSeq(0) && *seqs.end() == last_seq {
-                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                        actor_id,
-                        changeset: Changeset::Empty {
-                            versions: version..=version,
-                        },
-                    })))?;
+                    return Ok(Some(version));
                 } else {
                     sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                         actor_id,
@@ -754,7 +766,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 async fn process_sync(
@@ -1879,17 +1891,6 @@ mod tests {
                 msg,
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
-                    changeset: Changeset::Empty {
-                        versions: Version(1)..=Version(1)
-                    }
-                }))
-            );
-
-            let msg = rx.recv().await.unwrap();
-            assert_eq!(
-                msg,
-                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
                     changeset: Changeset::Full {
                         version: Version(2),
                         changes: vec![change2],
@@ -1911,6 +1912,17 @@ mod tests {
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
                         ts,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty {
+                        versions: Version(1)..=Version(1)
                     }
                 }))
             );
@@ -2042,28 +2054,6 @@ mod tests {
                 msg,
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
-                    changeset: Changeset::Empty {
-                        versions: Version(1)..=Version(1)
-                    }
-                }))
-            );
-
-            let msg = rx.recv().await.unwrap();
-            assert_eq!(
-                msg,
-                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Empty {
-                        versions: Version(2)..=Version(2)
-                    }
-                }))
-            );
-
-            let msg = rx.recv().await.unwrap();
-            assert_eq!(
-                msg,
-                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
                     changeset: Changeset::Full {
                         version: Version(3),
                         changes: vec![change3],
@@ -2100,6 +2090,17 @@ mod tests {
                         seqs: CrsqlSeq(0)..=last_seq,
                         last_seq,
                         ts: ts2,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty {
+                        versions: Version(1)..=Version(2)
                     }
                 }))
             );
