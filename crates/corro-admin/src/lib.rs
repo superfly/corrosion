@@ -190,7 +190,7 @@ async fn collapse_gaps(
     let mut snap = bv.snapshot();
     _ = info_log(stream, format!("collapsing ranges for {actor_id}")).await;
     let start = Instant::now();
-    block_in_place(|| {
+    let (deleted, inserted) = block_in_place(|| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let versions = tx
                 .prepare_cached(
@@ -245,23 +245,34 @@ async fn collapse_gaps(
                 )?
                 .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<Version>>>()?;
 
-        tx.execute(
+        let deleted = tx.execute(
             "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
             [actor_id],
         )?;
 
+        let mut inserted = 0;
         for range in snap.needed().iter() {
             tx.prepare_cached(
                 "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?,?,?);",
             )?
             .execute(params![actor_id, range.start(), range.end()])?;
+            inserted += 1;
         }
 
         snap.insert_db(&tx, versions)?;
 
-        tx.commit()
+        tx.commit()?;
+
+        Ok::<_, rusqlite::Error>((deleted, inserted))
     })?;
-    _ = info_log(stream, format!("collapsed ranges in {:?}", start.elapsed())).await;
+    _ = info_log(
+        stream,
+        format!(
+            "collapsed ranges in {:?} (deleted: {deleted}, inserted: {inserted})",
+            start.elapsed()
+        ),
+    )
+    .await;
 
     bv.commit_snapshot(snap);
     Ok(())
