@@ -250,7 +250,7 @@ async fn collapse_gaps(
             [actor_id],
         )?;
 
-        for range in versions.iter() {
+        for range in snap.needed().iter() {
             tx.prepare_cached(
                 "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?,?,?);",
             )?
