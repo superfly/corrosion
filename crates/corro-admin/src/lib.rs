@@ -14,7 +14,7 @@ use corro_types::{
     sync::generate_sync,
 };
 use futures::{SinkExt, TryStreamExt};
-use rusqlite::{named_params, OptionalExtension};
+use rusqlite::{named_params, params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spawn::spawn_counted;
@@ -244,6 +244,18 @@ async fn collapse_gaps(
                     |row| Ok(row.get(0)?..=row.get(1)?),
                 )?
                 .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<Version>>>()?;
+
+        tx.execute(
+            "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
+            [actor_id],
+        )?;
+
+        for range in versions.iter() {
+            tx.prepare_cached(
+                "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?,?,?);",
+            )?
+            .execute(params![actor_id, range.start(), range.end()])?;
+        }
 
         snap.insert_db(&tx, versions)?;
 
