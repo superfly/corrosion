@@ -2096,8 +2096,105 @@ mod tests {
                     actor_id,
                     changeset: Changeset::Full {
                         version: Version(5),
-                        changes: changes.into_iter().flatten().collect(),
+                        changes: changes.iter().flatten().cloned().collect(),
                         seqs: CrsqlSeq(0)..=last_seq,
+                        last_seq,
+                        ts: ts2,
+                    }
+                }))
+            );
+        }
+
+        {
+            let (tx, mut rx) = mpsc::channel(5);
+            let mut conn = agent.pool().read().await?;
+
+            block_in_place(|| {
+                handle_need(
+                    &mut conn,
+                    actor_id,
+                    SyncNeedV1::Partial {
+                        version: Version(5),
+                        seqs: vec![CrsqlSeq(4)..=CrsqlSeq(7)],
+                    },
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(5),
+                        changes: changes
+                            .iter()
+                            .flatten()
+                            .enumerate()
+                            .filter_map(|(i, c)| if (4..=7).contains(&i) {
+                                Some(c.clone())
+                            } else {
+                                None
+                            })
+                            .collect(),
+                        seqs: CrsqlSeq(4)..=CrsqlSeq(7),
+                        last_seq,
+                        ts: ts2,
+                    }
+                }))
+            );
+
+            block_in_place(|| {
+                handle_need(
+                    &mut conn,
+                    actor_id,
+                    SyncNeedV1::Partial {
+                        version: Version(5),
+                        seqs: vec![CrsqlSeq(2)..=CrsqlSeq(2), CrsqlSeq(15)..=CrsqlSeq(24)],
+                    },
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(5),
+                        changes: changes
+                            .iter()
+                            .flatten()
+                            .enumerate()
+                            .filter_map(|(i, c)| if i == 2 { Some(c.clone()) } else { None })
+                            .collect(),
+                        seqs: CrsqlSeq(2)..=CrsqlSeq(2),
+                        last_seq,
+                        ts: ts2,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(5),
+                        changes: changes
+                            .iter()
+                            .flatten()
+                            .enumerate()
+                            .filter_map(|(i, c)| if (15..=24).contains(&i) {
+                                Some(c.clone())
+                            } else {
+                                None
+                            })
+                            .collect(),
+                        seqs: CrsqlSeq(15)..=CrsqlSeq(24),
                         last_seq,
                         ts: ts2,
                     }
