@@ -191,7 +191,7 @@ async fn collapse_gaps(
     _ = info_log(stream, format!("collapsing ranges for {actor_id}")).await;
     let start = Instant::now();
     block_in_place(|| {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let versions = tx
                 .prepare_cached(
                     "
