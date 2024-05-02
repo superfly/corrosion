@@ -77,7 +77,7 @@ pub fn collect_metrics(agent: &Agent, transport: &Transport) {
         }) {
         Ok(mapped) => {
             for (actor_id, sum) in mapped {
-                gauge!("corro.db.gaps.rows.total", "actor_id" => actor_id.to_string()).set(sum as f64)
+                gauge!("corro.db.gaps.sum", "actor_id" => actor_id.to_string()).set(sum as f64)
             }
         }
         Err(e) => {

@@ -51,6 +51,7 @@ tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
 uuid = { workspace = true }
 shell-words = "1.1.0"
+metrics-util = { workspace = true }
 
 [build-dependencies]
 build-info-build = { workspace = true }
