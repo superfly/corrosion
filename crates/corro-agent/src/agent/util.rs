@@ -26,7 +26,7 @@ use corro_types::{
 };
 use std::{
     cmp,
-    collections::{btree_map::Entry, BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     convert::Infallible,
     net::SocketAddr,
     ops::RangeInclusive,
@@ -602,9 +602,7 @@ pub async fn sync_loop(agent: Agent, bookie: Bookie, transport: Transport, mut t
         tokio::select! {
             biased;
 
-            _ = &mut next_sync_at => {
-                ()
-            },
+            _ = &mut next_sync_at => {},
             _ = &mut tripwire => {
                 break;
             }

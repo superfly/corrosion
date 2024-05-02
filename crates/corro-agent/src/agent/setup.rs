@@ -160,9 +160,9 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         // acquiring the lock here means everything will have to wait for it to be ready
         let mut booked = booked.write_owned("init").await;
         async move {
-            let mut conn = pool.read().await?;
+            let conn = pool.read().await?;
             *booked.deref_mut().deref_mut() =
-                tokio::task::block_in_place(|| BookedVersions::from_conn(&mut conn, actor_id))?;
+                tokio::task::block_in_place(|| BookedVersions::from_conn(&conn, actor_id))?;
             Ok::<_, eyre::Report>(())
         }
     });

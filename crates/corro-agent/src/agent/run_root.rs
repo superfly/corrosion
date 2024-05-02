@@ -1,6 +1,6 @@
 //! Start the root agent tasks
 
-use std::{ops::RangeInclusive, time::Instant};
+use std::time::Instant;
 
 use crate::{
     agent::{
@@ -12,13 +12,12 @@ use crate::{
 use corro_types::{
     actor::ActorId,
     agent::{Agent, BookedVersions, Bookie},
-    base::{CrsqlSeq, Version},
+    base::CrsqlSeq,
     channel::bounded,
     config::{Config, PerfConfig},
 };
 
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
 use tracing::{error, info};
 use tripwire::Tripwire;
@@ -149,10 +148,10 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                     let pool = pool.clone();
                     async move {
                         tokio::spawn(async move {
-                            let mut conn = pool.read().await?;
+                            let conn = pool.read().await?;
 
                             tokio::task::block_in_place(|| {
-                                BookedVersions::from_conn(&mut conn, actor_id)
+                                BookedVersions::from_conn(&conn, actor_id)
                                     .map(|bv| (actor_id, bv))
                                     .map_err(eyre::Report::from)
                             })
@@ -187,58 +186,6 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     }
 
     info!("Bookkeeping fully loaded in {:?}", start.elapsed());
-
-    // tokio::spawn({
-    //     let pool = agent.pool().clone();
-    //     let bookie = bookie.clone();
-    //     async move {
-    //         let actor_ids: Vec<_> = {
-    //             let r = bookie.read("cleanup gaps").await;
-    //             r.keys().copied().collect()
-    //         };
-
-    //         for actor_id in actor_ids {
-    //             let mut conn = pool.write_low().await?;
-    //             let booked = {
-    //                 bookie
-    //                     .read("cleanup gaps per actor")
-    //                     .await
-    //                     .get(&actor_id)
-    //                     .cloned()
-    //                     .unwrap()
-    //             };
-    //             let mut w = booked.write("cleanup gaps booked write").await;
-
-    //             let mut snap = w.snapshot();
-
-    //             let tx = conn.transaction()?;
-    //             for range in w.needed().iter() {
-    //                 let versions = tx
-    //                     .prepare_cached(
-    //                         "
-    //                     SELECT distinct start_version, coalesce(end_version)
-    //                         from __corro_bookkeeping, generate_series(?,?,1)
-    //                         where actor_id = ? and
-    //                         value between start_version and coalesce(end_version, start_version)
-    //                 ",
-    //                     )?
-    //                     .query_map(
-    //                         rusqlite::params![range.start(), range.end(), actor_id],
-    //                         |row| Ok(row.get(0)?..=row.get(1)?),
-    //                     )?
-    //                     .collect::<rusqlite::Result<RangeInclusiveSet<Version>>>()?;
-
-    //                 snap = snap.insert_db(&tx, versions)?;
-    //             }
-
-    //             tx.commit()?;
-
-    //             w.apply_snapshot(snap);
-    //         }
-
-    //         Ok::<_, eyre::Report>(())
-    //     }
-    // });
 
     spawn_counted(
         util::sync_loop(

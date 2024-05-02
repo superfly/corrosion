@@ -1,6 +1,6 @@
 use std::{
     cmp,
-    collections::{btree_map, BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{btree_map, BTreeMap, HashMap, HashSet},
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
@@ -19,7 +19,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, params, Connection, Transaction};
+use rusqlite::{named_params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
@@ -31,7 +31,7 @@ use tokio::{
     sync::{oneshot, Semaphore},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
 use crate::{
@@ -1254,9 +1254,6 @@ impl BookedVersions {
 
         let mut snap = bv.snapshot();
 
-        // number of ranges we've inserted
-        let mut count = 0;
-
         {
             // fetch the sync's needed version gaps
             let mut prepped = conn.prepare_cached(
@@ -1271,8 +1268,6 @@ impl BookedVersions {
                     Some(row) => {
                         let start_v = row.get(0)?;
                         let end_v = row.get(1)?;
-
-                        count += 1;
 
                         // TODO: don't do this manually...
                         snap.needed.insert(start_v..=end_v);
@@ -1622,7 +1617,7 @@ mod tests {
         )?;
 
         // test loading a bv from the conn, they should be identical!
-        let mut bv2 = BookedVersions::from_conn(&mut conn, actor_id)?;
+        let mut bv2 = BookedVersions::from_conn(&conn, actor_id)?;
         // manually set the last version because there's nothing in `__corro_bookkeeping`
         bv2.max = Some(Version(55));
 

@@ -40,7 +40,7 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
 
 pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     init_cr_conn(&mut conn)?;
-    setup_conn(&mut conn)?;
+    setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
     Ok(CrConn(conn))
 }

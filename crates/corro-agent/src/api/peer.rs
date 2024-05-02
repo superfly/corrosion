@@ -1,14 +1,13 @@
 use std::cmp;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
-use compact_str::format_compact;
 use corro_types::actor::ClusterId;
-use corro_types::agent::{Agent, PartialVersion, SplitPool};
+use corro_types::agent::{Agent, SplitPool};
 use corro_types::base::{CrsqlSeq, Version};
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
@@ -26,7 +25,7 @@ use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rand::seq::SliceRandom;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, params, Connection, OptionalExtension};
+use rusqlite::{named_params, Connection};
 use speedy::Writable;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{self, unbounded_channel, Sender};
@@ -42,10 +41,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::agent::SyncRecvError;
 use crate::transport::{Transport, TransportError};
 
-use corro_types::{
-    actor::ActorId,
-    agent::{Booked, Bookie},
-};
+use corro_types::{actor::ActorId, agent::Bookie};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -812,7 +808,31 @@ async fn process_sync(
                     .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
 
                 for (actor_id, needs) in agg {
+                    let booked = bookie
+                        .read("process_sync get actor")
+                        .await
+                        .get(&actor_id)
+                        .cloned();
+                    let booked = match booked {
+                        Some(b) => b,
+                        None => continue,
+                    };
+                    let booked_read = booked.read("process_sync check needs").await;
+
                     for need in needs {
+                        match &need {
+                            SyncNeedV1::Full { versions } => {
+                                if versions.clone().all(|v| booked_read.needed().contains(&v)) {
+                                    continue;
+                                }
+                            }
+                            SyncNeedV1::Partial { version, .. } => {
+                                if booked_read.needed().contains(version) {
+                                    continue;
+                                }
+                            }
+                        }
+
                         let pool = pool.clone();
                         let sender = sender.clone();
                         let fut = Box::pin(async move {
@@ -1949,8 +1969,7 @@ mod tests {
                     ("blob", b.into()),
                 ]
                 .into_iter()
-                .enumerate()
-                .map(|(seq, (col, val))| {
+                .map(|(col, val)| {
                     let c = Change {
                         table: TableName("wide".into()),
                         pk: pack_columns(&vec![

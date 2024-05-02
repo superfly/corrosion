@@ -2386,7 +2386,7 @@ mod tests {
         let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1))).await?;
         {
             let mut conn = pool.write_priority().await?;
-            setup_conn(&mut conn)?;
+            setup_conn(&conn)?;
             migrate(&mut conn)?;
             let tx = conn.transaction()?;
             apply_schema(&tx, &Schema::default(), &mut schema)?;
@@ -2507,7 +2507,7 @@ mod tests {
         let mut conn = pool.write_priority().await.unwrap();
 
         {
-            setup_conn(&mut conn).unwrap();
+            setup_conn(&conn).unwrap();
             migrate(&mut conn).unwrap();
             let tx = conn.transaction().unwrap();
             apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
@@ -2544,7 +2544,7 @@ mod tests {
             )
             .expect("could not init crsql");
 
-            setup_conn(&mut conn2).unwrap();
+            setup_conn(&conn2).unwrap();
 
             {
                 let tx = conn2.transaction().unwrap();
@@ -2591,11 +2591,11 @@ mod tests {
             }
         }
 
-        let mut matcher_conn =
+        let matcher_conn =
             CrConn::init(rusqlite::Connection::open(&db_path).expect("could not open conn"))
                 .expect("could not init crconn");
 
-        setup_conn(&mut matcher_conn).unwrap();
+        setup_conn(&matcher_conn).unwrap();
 
         let mut last_change_id = None;
 
