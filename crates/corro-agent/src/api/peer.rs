@@ -452,6 +452,8 @@ fn handle_need(
                     continue;
                 }
 
+                debug!(%actor_id, ?version, "not empty");
+
                 // since this is not a cleared version, those aren't supposed to fail!
                 let last_seq: CrsqlSeq = row.get(2)?;
                 let ts: Timestamp = row.get(3)?;
@@ -1582,6 +1584,7 @@ mod tests {
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
     use hyper::StatusCode;
+    use rand::{Rng, RngCore};
     use tempfile::TempDir;
     use tripwire::Tripwire;
 
@@ -1593,7 +1596,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_handle_known_version() -> eyre::Result<()> {
+    async fn test_handle_need() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
 
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
@@ -1753,7 +1756,7 @@ mod tests {
                     actor_id,
                     changeset: Changeset::Full {
                         version: Version(2),
-                        changes: vec![change2],
+                        changes: vec![change2.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
                         ts,
@@ -1831,6 +1834,253 @@ mod tests {
                     actor_id,
                     changeset: Changeset::Empty {
                         versions: Version(1)..=Version(1)
+                    }
+                }))
+            );
+        }
+
+        {
+            let (tx, mut rx) = mpsc::channel(5);
+            let mut conn = agent.pool().read().await?;
+
+            block_in_place(|| {
+                handle_need(
+                    &mut conn,
+                    actor_id,
+                    SyncNeedV1::Full {
+                        versions: Version(1)..=Version(6),
+                    },
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty {
+                        versions: Version(1)..=Version(1)
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(2),
+                        changes: vec![change2],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(3),
+                        changes: vec![change3.clone()],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    }
+                }))
+            );
+        }
+
+        // overwrite v2
+        let change4 = Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![2i64.into()])?,
+            cid: ColumnName("text".into()),
+            val: "two override".into(),
+            col_version: 2,
+            db_version: CrsqlDbVersion(4),
+            seq: CrsqlSeq(0),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        process_multiple_changes(
+            agent.clone(),
+            bookie.clone(),
+            vec![(
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(4),
+                        changes: vec![change4.clone()],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            )],
+        )
+        .await?;
+
+        let ts2 = agent.clock().new_timestamp().into();
+
+        let mut rng = rand::thread_rng();
+
+        let len = 10u64;
+        let mut last_seq = 0u64;
+
+        let changes = (0u64..len)
+            .map(|i| {
+                let mut b = vec![0u8; 16];
+                rng.fill_bytes(&mut b);
+
+                let int: i64 = rng.sample(rand::distributions::Standard);
+                let float: f64 = rng.sample(rand::distributions::Standard);
+                [
+                    ("int", int.into()),
+                    ("float", float.into()),
+                    ("blob", b.into()),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(seq, (col, val))| {
+                    let c = Change {
+                        table: TableName("wide".into()),
+                        pk: pack_columns(&vec![
+                            i.to_be_bytes().to_vec().into(),
+                            i.to_string().into(),
+                        ])
+                        .unwrap(),
+                        cid: ColumnName(col.into()),
+                        val,
+                        col_version: 1,
+                        db_version: CrsqlDbVersion(5),
+                        seq: CrsqlSeq(last_seq),
+                        site_id: actor_id.to_bytes(),
+                        cl: 1,
+                    };
+                    last_seq += 1;
+                    c
+                })
+                .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        last_seq -= 1;
+        let last_seq = CrsqlSeq(last_seq);
+
+        let changes_v1 = changes
+            .iter()
+            .map(|changes| {
+                let seqs = changes.first().unwrap().seq..=changes.last().unwrap().seq;
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(5),
+                        changes: changes.clone(),
+                        seqs,
+                        last_seq,
+                        ts: ts2,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+
+        process_multiple_changes(
+            agent.clone(),
+            bookie.clone(),
+            changes_v1
+                .iter()
+                .map(|change| (change.clone(), ChangeSource::Sync, Instant::now()))
+                .collect(),
+        )
+        .await?;
+
+        {
+            let (tx, mut rx) = mpsc::channel(5);
+            let mut conn = agent.pool().read().await?;
+
+            block_in_place(|| {
+                handle_need(
+                    &mut conn,
+                    actor_id,
+                    SyncNeedV1::Full {
+                        versions: Version(1)..=Version(1000),
+                    },
+                    &tx,
+                )
+            })?;
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty {
+                        versions: Version(1)..=Version(1)
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Empty {
+                        versions: Version(2)..=Version(2)
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(3),
+                        changes: vec![change3],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(4),
+                        changes: vec![change4],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts,
+                    }
+                }))
+            );
+
+            let msg = rx.recv().await.unwrap();
+            assert_eq!(
+                msg,
+                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(5),
+                        changes: changes.into_iter().flatten().collect(),
+                        seqs: CrsqlSeq(0)..=last_seq,
+                        last_seq,
+                        ts: ts2,
                     }
                 }))
             );

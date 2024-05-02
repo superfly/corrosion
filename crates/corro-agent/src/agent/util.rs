@@ -1316,7 +1316,7 @@ pub async fn process_multiple_changes(
                             }
                         });
                     } else {
-                        debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs");
+                        debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs: {:?}", seqs.gaps(&full_seqs_range).collect::<Vec<_>>());
                     }
                 }
             }
