@@ -15,9 +15,13 @@ use crate::{
 };
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
+    agent::{
+        find_overwritten_versions, Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion,
+        PartialVersion,
+    },
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
+    change::store_empty_changeset,
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
@@ -117,71 +121,6 @@ pub async fn initialise_foca(agent: &Agent) {
     } else {
         warn!("No existing cluster member state to load!  This seems sus");
     }
-}
-
-/// Prune the database
-pub fn find_overwritten_versions(
-    conn: &Connection,
-) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<Version>>> {
-    let mut prepped = conn.prepare_cached("
-            SELECT v.rowid, v.db_version, si.site_id, count(c.*), bk.start_version
-                FROM __corro_versions_impacted
-                INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
-                INNER JOIN crsql_changes AS c ON c.site_id = si.site_id AND c.db_version = v.db_version
-                INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
-                GROUP BY si.site_id, v.db_version
-            ")?;
-
-    let mut rows = prepped.query([])?;
-
-    let mut all_rowids = vec![];
-
-    let mut all_versions: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
-
-    loop {
-        let row = match rows.next()? {
-            Some(row) => row,
-            None => break,
-        };
-
-        let rowid: i64 = row.get(0)?;
-        all_rowids.push(rowid);
-
-        let db_version: CrsqlDbVersion = row.get(1)?;
-
-        let actor_id = match row.get::<_, Option<ActorId>>(2)? {
-            Some(actor_id) => actor_id,
-            None => {
-                warn!("missing actor_id for an impacted version with db_version = {db_version}");
-                continue;
-            }
-        };
-
-        let count: u64 = row.get(3)?;
-
-        if count == 0 {
-            let version = match row.get::<_, Option<Version>>(2)? {
-                Some(version) => version,
-                None => {
-                    warn!("missing start_version for an impacted version: actor_id = {actor_id}, db_version = {db_version}");
-                    continue;
-                }
-            };
-
-            all_versions
-                .entry(actor_id)
-                .or_default()
-                .insert(version..=version);
-        }
-    }
-
-    // TODO: do that from a temp table in a single statement...
-    for rowid in all_rowids {
-        conn.prepare_cached("DELETE FROM __corro_impacted_versions WHERE rowid = ?")?
-            .execute([rowid])?;
-    }
-
-    Ok(all_versions)
 }
 
 /// Load the existing known member state and addresses
@@ -614,129 +553,6 @@ pub fn process_single_version(
     Ok((known, changeset))
 }
 
-pub fn store_empty_changeset(
-    conn: &Connection,
-    actor_id: ActorId,
-    versions: RangeInclusive<Version>,
-) -> Result<usize, ChangeError> {
-    trace!(%actor_id, "attempting to delete versions range {versions:?}");
-    let start = Instant::now();
-    // first, delete "current" versions, they're now gone!
-    let deleted: Vec<RangeInclusive<Version>> = conn
-        .prepare_cached(
-            "
-        DELETE FROM __corro_bookkeeping
-            WHERE
-                actor_id = :actor_id AND
-                start_version >= COALESCE((
-                    -- try to find the previous range
-                    SELECT start_version
-                        FROM __corro_bookkeeping
-                        WHERE
-                            actor_id = :actor_id AND
-                            start_version < :start -- AND end_version IS NOT NULL
-                        ORDER BY start_version DESC
-                        LIMIT 1
-                ), 1)
-                AND
-                start_version <= COALESCE((
-                    -- try to find the next range
-                    SELECT start_version
-                        FROM __corro_bookkeeping
-                        WHERE
-                            actor_id = :actor_id AND
-                            start_version > :end -- AND end_version IS NOT NULL
-                        ORDER BY start_version ASC
-                        LIMIT 1
-                ), :end + 1)
-                AND
-                (
-                    -- [:start]---[start_version]---[:end]
-                    ( start_version BETWEEN :start AND :end ) OR
-
-                    -- [start_version]---[:start]---[:end]---[end_version]
-                    ( start_version <= :start AND end_version >= :end ) OR
-
-                    -- [:start]---[start_version]---[:end]---[end_version]
-                    ( start_version <= :end AND end_version >= :end ) OR
-
-                    -- [:start]---[end_version]---[:end]
-                    ( end_version BETWEEN :start AND :end ) OR
-
-                    -- ---[:end][start_version]---[end_version]
-                    ( start_version = :end + 1 AND end_version IS NOT NULL ) OR
-
-                    -- [end_version][:start]---
-                    ( end_version = :start - 1 )
-                )
-            RETURNING start_version, end_version",
-        )
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: Some(actor_id),
-            version: None,
-        })?
-        .query_map(
-            named_params![
-                ":actor_id": actor_id,
-                ":start": versions.start(),
-                ":end": versions.end(),
-            ],
-            |row| {
-                let start = row.get(0)?;
-                Ok(start..=row.get::<_, Option<Version>>(1)?.unwrap_or(start))
-            },
-        )
-        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: Some(actor_id),
-            version: None,
-        })?;
-
-    debug!(%actor_id, "deleted: {deleted:?} in {:?}", start.elapsed());
-
-    // re-compute the ranges
-    let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
-    new_ranges.insert(versions);
-
-    debug!(%actor_id, "new ranges: {new_ranges:?}");
-
-    // we should never have deleted non-contiguous ranges, abort!
-    if new_ranges.len() > 1 {
-        warn!("deleted non-contiguous ranges! {new_ranges:?}");
-        return Err(ChangeError::NonContiguousDelete);
-    }
-
-    let mut inserted = 0;
-
-    // println!("inserting: {new_ranges:?}");
-
-    for range in new_ranges {
-        // insert cleared versions
-        inserted += conn
-        .prepare_cached(
-            "
-                INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, last_seq, ts)
-                    VALUES (?, ?, ?, NULL, NULL, NULL);
-            ",
-        ).map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: Some(actor_id),
-            version: None,
-        })?
-        .execute(params![actor_id, range.start(), range.end()]).map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: Some(actor_id),
-            version: None,
-        })?;
-    }
-
-    debug!(%actor_id, "stored empty changesets in {:?} (total)", start.elapsed());
-
-    Ok(inserted)
-}
-
 #[tracing::instrument(skip(agent, bookie), err)]
 pub async fn process_fully_buffered_changes(
     agent: &Agent,
@@ -871,6 +687,19 @@ pub async fn process_fully_buffered_changes(
 
             debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
         };
+
+        let overwritten =
+            find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
+
+        for (actor_id, versions_set) in overwritten {
+            for versions in versions_set {
+                store_empty_changeset(&tx, actor_id, versions)?;
+            }
+        }
 
         let mut snap = bookedw.snapshot();
         snap.insert_db(&tx, [version..=version].into())
@@ -1112,6 +941,19 @@ pub async fn process_multiple_changes(
         }
 
         debug!("inserted {count} new changesets");
+
+        let overwritten =
+            find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
+
+        for (actor_id, versions_set) in overwritten {
+            for versions in versions_set {
+                store_empty_changeset(&tx, actor_id, versions)?;
+            }
+        }
 
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,

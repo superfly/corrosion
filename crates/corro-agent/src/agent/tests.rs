@@ -28,6 +28,7 @@ use corro_types::{
     agent::migrate,
     api::{ExecResponse, ExecResult, Statement},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
+    change::store_empty_changeset,
     sqlite::CrConn,
     sync::generate_sync,
 };

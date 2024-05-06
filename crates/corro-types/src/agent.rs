@@ -1558,6 +1558,71 @@ impl Bookie {
     }
 }
 
+/// Prune the database
+pub fn find_overwritten_versions(
+    conn: &Connection,
+) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<Version>>> {
+    let mut prepped = conn.prepare_cached("
+            SELECT v.rowid, v.db_version, si.site_id, count(c.*), bk.start_version
+                FROM __corro_versions_impacted
+                INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
+                INNER JOIN crsql_changes AS c ON c.site_id = si.site_id AND c.db_version = v.db_version
+                INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
+                GROUP BY si.site_id, v.db_version
+            ")?;
+
+    let mut rows = prepped.query([])?;
+
+    let mut all_rowids = vec![];
+
+    let mut all_versions: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
+
+    loop {
+        let row = match rows.next()? {
+            Some(row) => row,
+            None => break,
+        };
+
+        let rowid: i64 = row.get(0)?;
+        all_rowids.push(rowid);
+
+        let db_version: CrsqlDbVersion = row.get(1)?;
+
+        let actor_id = match row.get::<_, Option<ActorId>>(2)? {
+            Some(actor_id) => actor_id,
+            None => {
+                warn!("missing actor_id for an impacted version with db_version = {db_version}");
+                continue;
+            }
+        };
+
+        let count: u64 = row.get(3)?;
+
+        if count == 0 {
+            let version = match row.get::<_, Option<Version>>(2)? {
+                Some(version) => version,
+                None => {
+                    warn!("missing start_version for an impacted version: actor_id = {actor_id}, db_version = {db_version}");
+                    continue;
+                }
+            };
+
+            all_versions
+                .entry(actor_id)
+                .or_default()
+                .insert(version..=version);
+        }
+    }
+
+    // TODO: do that from a temp table in a single statement...
+    for rowid in all_rowids {
+        conn.prepare_cached("DELETE FROM __corro_impacted_versions WHERE rowid = ?")?
+            .execute([rowid])?;
+    }
+
+    Ok(all_versions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
