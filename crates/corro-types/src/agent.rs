@@ -1577,15 +1577,13 @@ pub fn find_overwritten_versions(
 ) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<Version>>> {
     debug!("find_overwritten_versions");
     let mut prepped = conn.prepare_cached("
-        SELECT v.rowid, v.db_version, si.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
+        SELECT v.db_version, si.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
             FROM __corro_versions_impacted AS v
             INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
             INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
         ")?;
 
     let mut rows = prepped.query([])?;
-
-    let mut all_rowids = vec![];
 
     let mut all_versions: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
 
@@ -1595,13 +1593,10 @@ pub fn find_overwritten_versions(
             None => break,
         };
 
-        let rowid: i64 = row.get(0)?;
-        all_rowids.push(rowid);
-
-        let db_version: CrsqlDbVersion = row.get(1)?;
+        let db_version: CrsqlDbVersion = row.get(0)?;
         trace!("db version: {db_version}");
 
-        let actor_id = match row.get::<_, Option<ActorId>>(2)? {
+        let actor_id = match row.get::<_, Option<ActorId>>(1)? {
             Some(actor_id) => actor_id,
             None => {
                 warn!("missing actor_id for an impacted version with db_version = {db_version}");
@@ -1610,10 +1605,10 @@ pub fn find_overwritten_versions(
         };
         trace!("actor_id: {actor_id}");
 
-        let exists: bool = row.get(3)?;
+        let exists: bool = row.get(2)?;
 
         if !exists {
-            let version = match row.get::<_, Option<Version>>(4)? {
+            let version = match row.get::<_, Option<Version>>(3)? {
                 Some(version) => version,
                 None => {
                     warn!("missing start_version for an impacted version: actor_id = {actor_id}, db_version = {db_version}");
@@ -1628,11 +1623,8 @@ pub fn find_overwritten_versions(
         }
     }
 
-    // TODO: do that from a temp table in a single statement...
-    for rowid in all_rowids {
-        conn.prepare_cached("DELETE FROM __corro_versions_impacted WHERE rowid = ?")?
-            .execute([rowid])?;
-    }
+    conn.prepare_cached("DELETE FROM __corro_versions_impacted")?
+        .execute([])?;
 
     Ok(all_versions)
 }
