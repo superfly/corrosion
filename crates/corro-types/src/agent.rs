@@ -516,26 +516,31 @@ pub fn create_clock_change_trigger(
     "))
 }
 
+fn create_all_clock_change_triggers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut prepped = conn.prepare(
+        "SELECT tbl_name FROM sqlite_schema WHERE type='table' AND tbl_name LIKE '%__crsql_clock'",
+    )?;
+
+    let mut rows = prepped.query([])?;
+
+    loop {
+        let tbl_name = match rows.next()? {
+            Some(row) => row.get_ref(0)?,
+            None => break,
+        };
+
+        create_clock_change_trigger(conn, tbl_name.as_str()?.trim_end_matches("__crsql_clock"))?;
+    }
+
+    Ok(())
+}
+
 fn transform_write_conn(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     let mut conn = rusqlite_to_crsqlite(conn)?;
 
     let tx = conn.transaction()?;
-    {
-        let mut prepped = tx.prepare(
-            "SELECT tbl_name FROM sqlite_schema WHERE type='table' AND tbl_name LIKE '%__crsql_clock'",
-        )?;
 
-        let mut rows = prepped.query([])?;
-
-        loop {
-            let tbl_name = match rows.next()? {
-                Some(row) => row.get_ref(0)?,
-                None => break,
-            };
-
-            create_clock_change_trigger(&tx, tbl_name.as_str()?.trim_end_matches("__crsql_clock"))?;
-        }
-    }
+    create_all_clock_change_triggers(&tx)?;
 
     tx.commit()?;
 
@@ -1566,13 +1571,11 @@ pub fn find_overwritten_versions(
     conn: &Connection,
 ) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<Version>>> {
     let mut prepped = conn.prepare_cached("
-            SELECT v.rowid, v.db_version, si.site_id, count(c.*), bk.start_version
-                FROM __corro_versions_impacted
-                INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
-                INNER JOIN crsql_changes AS c ON c.site_id = si.site_id AND c.db_version = v.db_version
-                INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
-                GROUP BY si.site_id, v.db_version
-            ")?;
+        SELECT v.rowid, v.db_version, si.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
+            FROM __corro_versions_impacted AS v
+            INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
+            INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
+        ")?;
 
     let mut rows = prepped.query([])?;
 
@@ -1599,9 +1602,9 @@ pub fn find_overwritten_versions(
             }
         };
 
-        let count: u64 = row.get(3)?;
+        let exists: bool = row.get(3)?;
 
-        if count == 0 {
+        if !exists {
             let version = match row.get::<_, Option<Version>>(2)? {
                 Some(version) => version,
                 None => {

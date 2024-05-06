@@ -28,7 +28,7 @@ use corro_types::{
 };
 use std::{
     cmp,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
     ops::RangeInclusive,
@@ -48,9 +48,7 @@ use futures::FutureExt;
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{
-    named_params, params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction,
-};
+use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
 use spawn::spawn_counted;
 use tokio::{net::TcpListener, task::block_in_place};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
@@ -317,59 +315,6 @@ async fn require_authz<B>(
     }
 
     Ok(next.run(request).await)
-}
-
-// DOCME: provide some context for this function
-// TODO: move to a more appropriate module?
-#[tracing::instrument(skip_all)]
-pub fn find_cleared_db_versions(
-    tx: &Transaction,
-    actor_id: &ActorId,
-) -> rusqlite::Result<BTreeSet<CrsqlDbVersion>> {
-    let clock_site_id: Option<u64> = match tx
-        .prepare_cached("SELECT ordinal FROM crsql_site_id WHERE site_id = ?")?
-        .query_row([actor_id], |row| row.get(0))
-        .optional()?
-    {
-        Some(ordinal) => Some(ordinal),
-        None => {
-            warn!(actor_id = %actor_id, "could not find crsql ordinal for actor");
-            return Ok(Default::default());
-        }
-    };
-
-    let tables = tx
-        .prepare_cached(
-            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'",
-        )?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<BTreeSet<String>, _>>()?;
-
-    if tables.is_empty() {
-        // means there's no schema trakced by cr-sqlite or corrosion.
-        return Ok(BTreeSet::new());
-    }
-
-    let mut params: Vec<&dyn ToSql> = vec![actor_id];
-    let to_clear_query = format!(
-        "SELECT DISTINCT db_version FROM __corro_bookkeeping WHERE actor_id = ? AND db_version IS NOT NULL
-            EXCEPT SELECT db_version FROM ({});",
-        tables
-            .iter()
-            .map(|table| {
-                params.push(&clock_site_id);
-                format!("SELECT DISTINCT db_version FROM {table} WHERE site_id = ?")
-            })
-            .collect::<Vec<_>>()
-            .join(" UNION ")
-    );
-
-    let cleared_db_versions: BTreeSet<CrsqlDbVersion> = tx
-        .prepare_cached(&to_clear_query)?
-        .query_map(params_from_iter(params.into_iter()), |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-
-    Ok(cleared_db_versions)
 }
 
 /// Periodically initiate a sync with many other nodes.  Before we do

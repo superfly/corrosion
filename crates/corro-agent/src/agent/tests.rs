@@ -21,7 +21,7 @@ use tokio::{
 use tracing::{debug, info_span};
 use tripwire::Tripwire;
 
-use crate::{agent::util::*, api::peer::parallel_sync, transport::Transport};
+use crate::{api::peer::parallel_sync, transport::Transport};
 use corro_tests::*;
 use corro_types::{
     actor::ActorId,
@@ -566,122 +566,6 @@ pub async fn configurable_stress_test(
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;
-
-    Ok(())
-}
-
-#[test]
-fn test_in_memory_versions_compaction() -> eyre::Result<()> {
-    let mut conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
-
-    migrate(&mut conn)?;
-
-    conn.execute_batch(
-        "
-            CREATE TABLE foo (a INTEGER NOT NULL PRIMARY KEY, b INTEGER);
-            SELECT crsql_as_crr('foo');
-
-            CREATE TABLE foo2 (a INTEGER NOT NULL PRIMARY KEY, b INTEGER);
-            SELECT crsql_as_crr('foo2');
-
-            CREATE INDEX fooclock ON foo__crsql_clock (site_id, db_version);
-            CREATE INDEX foo2clock ON foo2__crsql_clock (site_id, db_version);
-            ",
-    )?;
-
-    // db version 1
-    conn.execute("INSERT INTO foo (a) VALUES (1)", ())?;
-
-    // invalid, but whatever
-    conn.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version) SELECT crsql_site_id(), 1, crsql_db_version()", [])?;
-
-    // db version 2
-    conn.execute("DELETE FROM foo;", ())?;
-
-    // invalid, but whatever
-    conn.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version) SELECT crsql_site_id(), 2, crsql_db_version()", [])?;
-
-    let db_version: CrsqlDbVersion =
-        conn.query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-
-    assert_eq!(db_version, CrsqlDbVersion(2));
-
-    {
-        let mut prepped = conn.prepare("SELECT * FROM __corro_bookkeeping")?;
-        let mut rows = prepped.query([])?;
-
-        println!("bookkeeping rows:");
-        while let Ok(Some(row)) = rows.next() {
-            println!("row: {row:?}");
-        }
-    }
-
-    {
-        let mut prepped =
-            conn.prepare("SELECT * FROM foo2__crsql_clock UNION SELECT * FROM foo__crsql_clock;")?;
-        let mut rows = prepped.query([])?;
-
-        println!("all clock rows:");
-        while let Ok(Some(row)) = rows.next() {
-            println!("row: {row:?}");
-        }
-    }
-
-    {
-        let mut prepped = conn.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT db_version FROM foo2__crsql_clock WHERE site_id = ? UNION SELECT DISTINCT db_version FROM foo__crsql_clock WHERE site_id = ?;")?;
-        let mut rows = prepped.query([0, 0])?;
-
-        println!("matching clock rows:");
-        while let Ok(Some(row)) = rows.next() {
-            println!("row: {row:?}");
-        }
-    }
-
-    let tx = conn.immediate_transaction()?;
-    let actor_id: ActorId = tx.query_row("SELECT crsql_site_id()", [], |row| row.get(0))?;
-
-    let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
-
-    println!("to_clear: {to_clear:?}");
-
-    assert!(to_clear.contains(&CrsqlDbVersion(1)));
-    assert!(!to_clear.contains(&CrsqlDbVersion(2)));
-
-    tx.execute("DELETE FROM __corro_bookkeeping WHERE db_version = 1", [])?;
-    tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version) SELECT crsql_site_id(), 1, 1", [])?;
-
-    let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
-    assert!(to_clear.is_empty());
-
-    tx.execute("INSERT INTO foo2 (a) VALUES (2)", ())?;
-
-    // invalid, but whatever
-    tx.execute("INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version) SELECT crsql_site_id(), 3, crsql_db_version()", [])?;
-
-    tx.commit()?;
-
-    let tx = conn.immediate_transaction()?;
-    let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
-    assert!(to_clear.is_empty());
-
-    tx.execute("INSERT INTO foo (a) VALUES (1)", ())?;
-    tx.commit()?;
-
-    let tx = conn.immediate_transaction()?;
-    let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
-
-    assert!(to_clear.contains(&CrsqlDbVersion(2)));
-    assert!(!to_clear.contains(&CrsqlDbVersion(3)));
-    assert!(!to_clear.contains(&CrsqlDbVersion(4)));
-
-    tx.execute("DELETE FROM __corro_bookkeeping WHERE db_version = 2", [])?;
-    tx.execute(
-        "UPDATE __corro_bookkeeping SET end_version = 2 WHERE start_version = 1;",
-        [],
-    )?;
-    let to_clear = find_cleared_db_versions(&tx, &actor_id)?;
-
-    assert!(to_clear.is_empty());
 
     Ok(())
 }
