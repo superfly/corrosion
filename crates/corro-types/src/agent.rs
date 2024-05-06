@@ -247,9 +247,23 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         Box::new(refactor_corro_members as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(crsqlite_v0_16_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_bookkeeping_gaps as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
     ];
 
     crate::sqlite::migrate(conn, migrations)
+}
+
+fn create_impacted_versions(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "
+        CREATE TABLE __corro_versions_impacted (
+            site_id INTEGER NOT NULL,
+            db_version INTEGER NOT NULL,
+
+            PRIMARY KEY (site_id, db_version)
+        );
+    ",
+    )
 }
 
 fn create_bookkeeping_gaps(tx: &Transaction) -> rusqlite::Result<()> {
@@ -491,6 +505,40 @@ pub enum SplitPoolCreateError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
+fn create_clock_change_trigger(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!("
+    CREATE TRIGGER {name}__corro_clock_changed UPDATE OF site_id, db_version ON {name}__crsql_clock BEGIN
+        INSERT OR IGNORE INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version);
+    END
+    "))
+}
+
+fn transform_write_conn(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+    let mut conn = rusqlite_to_crsqlite(conn)?;
+
+    let tx = conn.transaction()?;
+    {
+        let mut prepped = tx.prepare(
+            "SELECT tbl_name FROM sqlite_schema WHERE type='table' AND tbl_name LIKE '%__crsql_clock'",
+        )?;
+
+        let mut rows = prepped.query([])?;
+
+        loop {
+            let tbl_name = match rows.next()? {
+                Some(row) => row.get_ref(0)?,
+                None => break,
+            };
+
+            create_clock_change_trigger(&tx, tbl_name.as_str()?)?;
+        }
+    }
+
+    tx.commit()?;
+
+    Ok(conn)
+}
+
 impl SplitPool {
     pub async fn create<P: AsRef<Path>>(
         path: P,
@@ -498,7 +546,7 @@ impl SplitPool {
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
             .max_size(1)
-            .create_pool_transform(rusqlite_to_crsqlite)?;
+            .create_pool_transform(transform_write_conn)?;
 
         debug!("built RW pool");
 

@@ -217,13 +217,5 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         tripwire.clone(),
     ));
 
-    if let Some(secs) = agent.config().db.clear_overwritten_secs {
-        tokio::spawn(util::clear_overwritten_versions_loop(
-            agent.clone(),
-            bookie.clone(),
-            secs,
-        ));
-    }
-
     Ok(bookie)
 }

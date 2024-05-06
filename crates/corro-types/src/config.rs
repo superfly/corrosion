@@ -95,8 +95,6 @@ pub struct DbConfig {
     pub schema_paths: Vec<Utf8PathBuf>,
     #[serde(default)]
     pub subscriptions_path: Option<Utf8PathBuf>,
-    #[serde(default)]
-    pub clear_overwritten_secs: Option<u64>,
 }
 
 impl DbConfig {
@@ -371,7 +369,6 @@ impl ConfigBuilder {
                 path: db_path,
                 schema_paths: self.schema_paths,
                 subscriptions_path: None,
-                clear_overwritten_secs: None,
             },
             api: ApiConfig {
                 bind_addr: self.api_addr,

@@ -4,7 +4,6 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
-use corro_agent::agent::clear_overwritten_versions;
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
@@ -97,7 +96,6 @@ pub enum Command {
     Locks { top: usize },
     Cluster(ClusterCommand),
     Actor(ActorCommand),
-    CompactEmpties,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,60 +329,60 @@ async fn handle_conn(
 
                     _ = send_success(&mut stream).await;
                 }
-                Command::CompactEmpties => {
-                    info_log(&mut stream, "compacting empty versions...").await;
+                // Command::CompactEmpties => {
+                //     info_log(&mut stream, "compacting empty versions...").await;
 
-                    let (tx, mut rx) = mpsc::channel(4);
-                    let (done_tx, done_rx) = oneshot::channel::<Option<String>>();
+                //     let (tx, mut rx) = mpsc::channel(4);
+                //     let (done_tx, done_rx) = oneshot::channel::<Option<String>>();
 
-                    let started = std::time::Instant::now();
+                //     let started = std::time::Instant::now();
 
-                    let bookie = bookie.clone();
-                    let agent = agent.clone();
-                    tokio::task::spawn(async move {
-                        let pool = agent.pool();
-                        match clear_overwritten_versions(&agent, &bookie, pool, Some(tx)).await {
-                            Ok(()) => done_tx.send(None),
-                            Err(e) => done_tx.send(Some(e)),
-                        }
-                    });
+                //     let bookie = bookie.clone();
+                //     let agent = agent.clone();
+                //     tokio::task::spawn(async move {
+                //         let pool = agent.pool();
+                //         match clear_overwritten_versions(&agent, &bookie, pool, Some(tx)).await {
+                //             Ok(()) => done_tx.send(None),
+                //             Err(e) => done_tx.send(Some(e)),
+                //         }
+                //     });
 
-                    while let Some(msg) = rx.recv().await {
-                        info_log(&mut stream, msg).await;
-                    }
+                //     while let Some(msg) = rx.recv().await {
+                //         info_log(&mut stream, msg).await;
+                //     }
 
-                    // when this loop exists it means our writer has
-                    // gone away/ the task completed
-                    match done_rx.await {
-                        Ok(None) => {
-                            let elapsed = started.elapsed().as_secs_f64();
-                            info_log(
-                                &mut stream,
-                                format!(
-                                    "Finished compacting empty versions!  Took {} seconds ({} minutes)",
-                                    elapsed,
-                                    elapsed / 60.0
-                                ),
-                            )
-                            .await;
-                            send_success(&mut stream).await
-                        }
-                        Ok(Some(err)) => {
-                            send_error(
-                                &mut stream,
-                                format!("An error occured while compacting empties: {err}"),
-                            )
-                            .await
-                        }
-                        _ => {
-                            send_error(
-                                &mut stream,
-                                "Failed to compact empties (check node logs for details)",
-                            )
-                            .await
-                        }
-                    }
-                }
+                //     // when this loop exists it means our writer has
+                //     // gone away/ the task completed
+                //     match done_rx.await {
+                //         Ok(None) => {
+                //             let elapsed = started.elapsed().as_secs_f64();
+                //             info_log(
+                //                 &mut stream,
+                //                 format!(
+                //                     "Finished compacting empty versions!  Took {} seconds ({} minutes)",
+                //                     elapsed,
+                //                     elapsed / 60.0
+                //                 ),
+                //             )
+                //             .await;
+                //             send_success(&mut stream).await
+                //         }
+                //         Ok(Some(err)) => {
+                //             send_error(
+                //                 &mut stream,
+                //                 format!("An error occured while compacting empties: {err}"),
+                //             )
+                //             .await
+                //         }
+                //         _ => {
+                //             send_error(
+                //                 &mut stream,
+                //                 "Failed to compact empties (check node logs for details)",
+                //             )
+                //             .await
+                //         }
+                //     }
+                // }
                 Command::Locks { top } => {
                     info_log(&mut stream, "gathering top locks").await;
                     let registry = bookie.registry();
