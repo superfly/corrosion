@@ -505,9 +505,12 @@ pub enum SplitPoolCreateError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
-fn create_clock_change_trigger(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<()> {
+pub fn create_clock_change_trigger(
+    conn: &rusqlite::Connection,
+    name: &str,
+) -> rusqlite::Result<()> {
     conn.execute_batch(&format!("
-    CREATE TRIGGER {name}__corro_clock_changed UPDATE OF site_id, db_version ON {name}__crsql_clock BEGIN
+    CREATE TRIGGER IF NOT EXISTS {name}__corro_clock_changed UPDATE OF site_id, db_version ON {name}__crsql_clock BEGIN
         INSERT OR IGNORE INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version);
     END
     "))
@@ -530,7 +533,7 @@ fn transform_write_conn(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> 
                 None => break,
             };
 
-            create_clock_change_trigger(&tx, tbl_name.as_str()?)?;
+            create_clock_change_trigger(&tx, tbl_name.as_str()?.trim_end_matches("__crsql_clock"))?;
         }
     }
 
