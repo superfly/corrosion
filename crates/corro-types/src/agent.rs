@@ -511,7 +511,7 @@ pub fn create_clock_change_trigger(
 ) -> rusqlite::Result<()> {
     conn.execute_batch(&format!("
     CREATE TRIGGER IF NOT EXISTS {name}__corro_clock_changed UPDATE OF site_id, db_version ON {name}__crsql_clock BEGIN
-        INSERT OR IGNORE INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version);
+        INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version) ON CONFLICT (site_id, db_version) DO NOTHING;
     END
     "))
 }
@@ -636,6 +636,11 @@ impl SplitPool {
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
         rusqlite_to_crsqlite(conn)
+    }
+
+    pub fn client_dedicated_write(&self) -> rusqlite::Result<CrConn> {
+        let conn = rusqlite::Connection::open(&self.0.path)?;
+        transform_write_conn(conn)
     }
 
     // get a high priority write connection (e.g. client input)
@@ -1570,6 +1575,7 @@ impl Bookie {
 pub fn find_overwritten_versions(
     conn: &Connection,
 ) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<Version>>> {
+    debug!("find_overwritten_versions");
     let mut prepped = conn.prepare_cached("
         SELECT v.rowid, v.db_version, si.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
             FROM __corro_versions_impacted AS v
@@ -1593,6 +1599,7 @@ pub fn find_overwritten_versions(
         all_rowids.push(rowid);
 
         let db_version: CrsqlDbVersion = row.get(1)?;
+        trace!("db version: {db_version}");
 
         let actor_id = match row.get::<_, Option<ActorId>>(2)? {
             Some(actor_id) => actor_id,
@@ -1601,11 +1608,12 @@ pub fn find_overwritten_versions(
                 continue;
             }
         };
+        trace!("actor_id: {actor_id}");
 
         let exists: bool = row.get(3)?;
 
         if !exists {
-            let version = match row.get::<_, Option<Version>>(2)? {
+            let version = match row.get::<_, Option<Version>>(4)? {
                 Some(version) => version,
                 None => {
                     warn!("missing start_version for an impacted version: actor_id = {actor_id}, db_version = {db_version}");
@@ -1622,7 +1630,7 @@ pub fn find_overwritten_versions(
 
     // TODO: do that from a temp table in a single statement...
     for rowid in all_rowids {
-        conn.prepare_cached("DELETE FROM __corro_impacted_versions WHERE rowid = ?")?
+        conn.prepare_cached("DELETE FROM __corro_versions_impacted WHERE rowid = ?")?
             .execute([rowid])?;
     }
 
