@@ -549,7 +549,7 @@ pub async fn start(
 
                 let (mut sink, mut stream) = framed.split();
 
-                let conn = agent.pool().client_dedicated_write().unwrap();
+                let conn = agent.pool().client_dedicated().unwrap();
                 trace!("opened connection");
 
                 let cancel = CancellationToken::new();

@@ -263,7 +263,10 @@ fn create_impacted_versions(tx: &Transaction) -> rusqlite::Result<()> {
             PRIMARY KEY (site_id, db_version)
         );
     ",
-    )
+    )?;
+
+    // create current triggers
+    create_all_clock_change_triggers(tx)
 }
 
 fn create_bookkeeping_gaps(tx: &Transaction) -> rusqlite::Result<()> {
@@ -549,18 +552,6 @@ pub fn create_all_clock_change_triggers(conn: &rusqlite::Connection) -> rusqlite
     Ok(())
 }
 
-fn transform_write_conn(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
-    let mut conn = rusqlite_to_crsqlite(conn)?;
-
-    let tx = conn.transaction()?;
-
-    create_all_clock_change_triggers(&tx)?;
-
-    tx.commit()?;
-
-    Ok(conn)
-}
-
 impl SplitPool {
     pub async fn create<P: AsRef<Path>>(
         path: P,
@@ -568,7 +559,7 @@ impl SplitPool {
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
             .max_size(1)
-            .create_pool_transform(transform_write_conn)?;
+            .create_pool_transform(rusqlite_to_crsqlite)?;
 
         debug!("built RW pool");
 
@@ -650,11 +641,6 @@ impl SplitPool {
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
         rusqlite_to_crsqlite(conn)
-    }
-
-    pub fn client_dedicated_write(&self) -> rusqlite::Result<CrConn> {
-        let conn = rusqlite::Connection::open(&self.0.path)?;
-        transform_write_conn(conn)
     }
 
     // get a high priority write connection (e.g. client input)

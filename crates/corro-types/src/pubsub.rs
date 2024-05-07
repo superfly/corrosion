@@ -2360,7 +2360,7 @@ mod tests {
 
     use crate::{
         actor::ActorId,
-        agent::{create_all_clock_change_triggers, migrate},
+        agent::migrate,
         schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
     };
@@ -2546,7 +2546,6 @@ mod tests {
 
             setup_conn(&conn2).unwrap();
             migrate(&mut conn2).unwrap();
-            create_all_clock_change_triggers(&conn2).unwrap();
 
             {
                 let tx = conn2.transaction().unwrap();
