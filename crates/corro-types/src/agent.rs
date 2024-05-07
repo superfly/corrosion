@@ -513,7 +513,7 @@ pub fn create_clock_change_trigger(
     let q = format!("
     CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_updated
         AFTER UPDATE ON {name}__crsql_clock FOR EACH ROW
-            WHEN old.site_id != new.site_id OR old.db_version != new.db_version
+            WHEN old.site_id = 0 AND (old.site_id != new.site_id OR old.db_version != new.db_version)
         BEGIN
             INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
                 ON CONFLICT (site_id, db_version) DO NOTHING;
@@ -521,6 +521,7 @@ pub fn create_clock_change_trigger(
 
     CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_deleted
         AFTER DELETE ON {name}__crsql_clock FOR EACH ROW
+            WHEN old.site_id = 0
         BEGIN
             INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
                 ON CONFLICT (site_id, db_version) DO NOTHING;
