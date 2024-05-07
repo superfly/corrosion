@@ -509,10 +509,23 @@ pub fn create_clock_change_trigger(
     conn: &rusqlite::Connection,
     name: &str,
 ) -> rusqlite::Result<()> {
+    debug!("creating clock change trigger for table {name}");
     conn.execute_batch(&format!("
-    CREATE TRIGGER IF NOT EXISTS {name}__corro_clock_changed UPDATE OF site_id, db_version ON {name}__crsql_clock BEGIN
-        INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version) ON CONFLICT (site_id, db_version) DO NOTHING;
-    END
+    CREATE TRIGGER IF NOT EXISTS {name}__corro_clock_changed
+        AFTER UPDATE OF site_id, db_version ON {name}__crsql_clock
+        FOR EACH ROW WHEN old.site_id != new.site_id OR old.db_version != new.db_version
+        BEGIN
+            INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
+                ON CONFLICT (site_id, db_version) DO NOTHING;
+        END;
+
+    CREATE TRIGGER IF NOT EXISTS {name}__corro_clock_deleted
+        AFTER DELETE ON {name}__crsql_clock
+        FOR EACH ROW
+        BEGIN
+            INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
+                ON CONFLICT (site_id, db_version) DO NOTHING;
+        END;
     "))
 }
 
@@ -1576,6 +1589,7 @@ pub fn find_overwritten_versions(
     conn: &Connection,
 ) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<Version>>> {
     debug!("find_overwritten_versions");
+
     let mut prepped = conn.prepare_cached("
         SELECT v.db_version, si.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
             FROM __corro_versions_impacted AS v
@@ -1607,7 +1621,10 @@ pub fn find_overwritten_versions(
 
         let exists: bool = row.get(2)?;
 
+        debug!("exists? {exists}");
+
         if !exists {
+            debug!("version is gone now");
             let version = match row.get::<_, Option<Version>>(3)? {
                 Some(version) => version,
                 None => {

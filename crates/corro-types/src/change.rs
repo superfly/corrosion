@@ -216,6 +216,16 @@ pub fn insert_local_changes(
         version: Some(version),
     })?;
 
+    debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
+
+    let mut snap = book_writer.snapshot();
+    snap.insert_db(tx, [versions].into())
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(version),
+        })?;
+
     let overwritten = find_overwritten_versions(tx).map_err(|source| ChangeError::Rusqlite {
         source,
         actor_id: Some(actor_id),
@@ -227,16 +237,6 @@ pub fn insert_local_changes(
             store_empty_changeset(tx, actor_id, versions)?;
         }
     }
-
-    debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
-
-    let mut snap = book_writer.snapshot();
-    snap.insert_db(tx, [versions].into())
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: Some(actor_id),
-            version: Some(version),
-        })?;
 
     Ok(Some(InsertChangesInfo {
         version,

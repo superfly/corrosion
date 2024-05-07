@@ -633,6 +633,14 @@ pub async fn process_fully_buffered_changes(
             debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
         };
 
+        let mut snap = bookedw.snapshot();
+        snap.insert_db(&tx, [version..=version].into())
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
+
         let overwritten =
             find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
                 source,
@@ -645,14 +653,6 @@ pub async fn process_fully_buffered_changes(
                 store_empty_changeset(&tx, actor_id, versions)?;
             }
         }
-
-        let mut snap = bookedw.snapshot();
-        snap.insert_db(&tx, [version..=version].into())
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: Some(version),
-            })?;
 
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,

@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::Extension;
 use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
 use hyper::StatusCode;
 use rand::{
@@ -21,13 +22,21 @@ use tokio::{
 use tracing::{debug, info_span};
 use tripwire::Tripwire;
 
-use crate::{api::peer::parallel_sync, transport::Transport};
+use crate::{
+    agent::process_multiple_changes,
+    api::{
+        peer::parallel_sync,
+        public::{api_v1_db_schema, api_v1_transactions},
+    },
+    transport::Transport,
+};
 use corro_tests::*;
 use corro_types::{
     actor::ActorId,
     agent::migrate,
-    api::{ExecResponse, ExecResult, Statement},
+    api::{row_to_change, ExecResponse, ExecResult, Statement},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
+    broadcast::{ChangeSource, ChangeV1, Changeset},
     change::store_empty_changeset,
     sqlite::CrConn,
     sync::generate_sync,
@@ -1550,6 +1559,183 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
             end_version: Some(Version(45))
         }
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    // setup the schema, for both nodes
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta1.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+
+    assert_eq!(status_code, StatusCode::OK);
+
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta2.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+
+    assert_eq!(status_code, StatusCode::OK);
+
+    let (status_code, body) = api_v1_transactions(
+        Extension(ta1.agent.clone()),
+        axum::Json(vec![Statement::WithParams(
+            "insert into tests (id, text) values (?,?)".into(),
+            vec!["service-id".into(), "service-name".into()],
+        )]),
+    )
+    .await;
+
+    assert_eq!(status_code, StatusCode::OK);
+
+    let version = body.0.version.unwrap();
+
+    assert_eq!(version, Version(1));
+
+    let conn = ta1.agent.pool().read().await?;
+
+    // check locally that everything is in order
+
+    let bk: Vec<(ActorId, Version, Option<Version>, CrsqlDbVersion)> = conn
+        .prepare(
+            "SELECT actor_id, start_version, end_version, db_version FROM __corro_bookkeeping",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    assert_eq!(
+        bk,
+        vec![(ta1.agent.actor_id(), version, None, CrsqlDbVersion(1))]
+    );
+
+    let mut changes = vec![];
+    let mut prepped = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes"#)?;
+    let mut rows = prepped.query([])?;
+
+    while let Some(row) = rows.next()? {
+        changes.push(row_to_change(row)?);
+    }
+
+    let last_seq = CrsqlSeq((changes.len() - 1) as u64);
+
+    // apply changes on actor #2
+
+    process_multiple_changes(
+        ta2.agent.clone(),
+        ta2.bookie.clone(),
+        vec![(
+            ChangeV1 {
+                actor_id: ta1.agent.actor_id(),
+                changeset: Changeset::Full {
+                    version,
+                    changes,
+                    seqs: CrsqlSeq(0)..=last_seq,
+                    last_seq,
+                    ts: ta1.agent.clock().new_timestamp().into(),
+                },
+            },
+            ChangeSource::Broadcast,
+            Instant::now(),
+        )],
+    )
+    .await?;
+
+    let (status_code, body) = api_v1_transactions(
+        Extension(ta1.agent.clone()),
+        axum::Json(vec![Statement::WithParams(
+            "insert or replace into tests (id, text) values (?,?)".into(),
+            vec!["service-id".into(), "service-name-overwrite".into()],
+        )]),
+    )
+    .await;
+
+    assert_eq!(status_code, StatusCode::OK);
+
+    let version = body.0.version.unwrap();
+
+    assert_eq!(version, Version(2));
+
+    let bk: Vec<(ActorId, Version, Option<Version>, Option<CrsqlDbVersion>)> = conn
+        .prepare(
+            "SELECT actor_id, start_version, end_version, db_version FROM __corro_bookkeeping",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    assert_eq!(
+        bk,
+        vec![
+            (ta1.agent.actor_id(), Version(1), Some(Version(1)), None),
+            (ta1.agent.actor_id(), version, None, Some(CrsqlDbVersion(2)))
+        ]
+    );
+
+    let mut changes = vec![];
+    let mut prepped = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = 2"#)?;
+    let mut rows = prepped.query([])?;
+
+    while let Some(row) = rows.next()? {
+        changes.push(row_to_change(row)?);
+    }
+
+    let last_seq = CrsqlSeq((changes.len() - 1) as u64);
+
+    process_multiple_changes(
+        ta2.agent.clone(),
+        ta2.bookie.clone(),
+        vec![(
+            ChangeV1 {
+                actor_id: ta1.agent.actor_id(),
+                changeset: Changeset::Full {
+                    version,
+                    changes,
+                    seqs: CrsqlSeq(0)..=last_seq,
+                    last_seq,
+                    ts: ta1.agent.clock().new_timestamp().into(),
+                },
+            },
+            ChangeSource::Broadcast,
+            Instant::now(),
+        )],
+    )
+    .await?;
+
+    let conn = ta2.agent.pool().read().await?;
+
+    let bk: Vec<(ActorId, Version, Option<Version>, Option<CrsqlDbVersion>)> = conn
+        .prepare(
+            "SELECT actor_id, start_version, end_version, db_version FROM __corro_bookkeeping",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    assert_eq!(
+        bk,
+        vec![
+            (ta1.agent.actor_id(), Version(1), Some(Version(1)), None),
+            (ta1.agent.actor_id(), version, None, Some(CrsqlDbVersion(2)))
+        ]
+    );
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
 
     Ok(())
 }
