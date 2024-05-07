@@ -2360,7 +2360,7 @@ mod tests {
 
     use crate::{
         actor::ActorId,
-        agent::migrate,
+        agent::{create_all_clock_change_triggers, migrate},
         schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
     };
@@ -2545,6 +2545,8 @@ mod tests {
             .expect("could not init crsql");
 
             setup_conn(&conn2).unwrap();
+            migrate(&mut conn2).unwrap();
+            create_all_clock_change_triggers(&conn2).unwrap();
 
             {
                 let tx = conn2.transaction().unwrap();
@@ -2567,6 +2569,7 @@ mod tests {
             let tx = conn2.transaction().unwrap();
 
             for change in changes {
+                debug!("change: {change:?}");
                 tx.prepare_cached(
                     r#"
                     INSERT INTO crsql_changes

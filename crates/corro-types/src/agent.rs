@@ -510,26 +510,26 @@ pub fn create_clock_change_trigger(
     name: &str,
 ) -> rusqlite::Result<()> {
     debug!("creating clock change trigger for table {name}");
-    conn.execute_batch(&format!("
-    CREATE TRIGGER IF NOT EXISTS {name}__corro_clock_changed
-        AFTER UPDATE OF site_id, db_version ON {name}__crsql_clock
-        FOR EACH ROW WHEN old.site_id != new.site_id OR old.db_version != new.db_version
+    let q = format!("
+    CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_updated
+        AFTER UPDATE ON {name}__crsql_clock FOR EACH ROW
+            WHEN old.site_id != new.site_id OR old.db_version != new.db_version
         BEGIN
             INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
                 ON CONFLICT (site_id, db_version) DO NOTHING;
         END;
 
-    CREATE TRIGGER IF NOT EXISTS {name}__corro_clock_deleted
-        AFTER DELETE ON {name}__crsql_clock
-        FOR EACH ROW
+    CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_deleted
+        AFTER DELETE ON {name}__crsql_clock FOR EACH ROW
         BEGIN
             INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
                 ON CONFLICT (site_id, db_version) DO NOTHING;
         END;
-    "))
+    ");
+    conn.execute_batch(&q)
 }
 
-fn create_all_clock_change_triggers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+pub fn create_all_clock_change_triggers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let mut prepped = conn.prepare(
         "SELECT tbl_name FROM sqlite_schema WHERE type='table' AND tbl_name LIKE '%__crsql_clock'",
     )?;
