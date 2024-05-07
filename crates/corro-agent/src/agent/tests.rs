@@ -1620,37 +1620,37 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
         vec![(ta1.agent.actor_id(), version, None, CrsqlDbVersion(1))]
     );
 
-    // let mut changes = vec![];
-    // let mut prepped = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes"#)?;
-    // let mut rows = prepped.query([])?;
+    let mut changes = vec![];
+    let mut prepped = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes"#)?;
+    let mut rows = prepped.query([])?;
 
-    // while let Some(row) = rows.next()? {
-    //     changes.push(row_to_change(row)?);
-    // }
+    while let Some(row) = rows.next()? {
+        changes.push(row_to_change(row)?);
+    }
 
-    // let last_seq = CrsqlSeq((changes.len() - 1) as u64);
+    let last_seq = CrsqlSeq((changes.len() - 1) as u64);
 
-    // // apply changes on actor #2
+    // apply changes on actor #2
 
-    // process_multiple_changes(
-    //     ta2.agent.clone(),
-    //     ta2.bookie.clone(),
-    //     vec![(
-    //         ChangeV1 {
-    //             actor_id: ta1.agent.actor_id(),
-    //             changeset: Changeset::Full {
-    //                 version,
-    //                 changes,
-    //                 seqs: CrsqlSeq(0)..=last_seq,
-    //                 last_seq,
-    //                 ts: ta1.agent.clock().new_timestamp().into(),
-    //             },
-    //         },
-    //         ChangeSource::Broadcast,
-    //         Instant::now(),
-    //     )],
-    // )
-    // .await?;
+    process_multiple_changes(
+        ta2.agent.clone(),
+        ta2.bookie.clone(),
+        vec![(
+            ChangeV1 {
+                actor_id: ta1.agent.actor_id(),
+                changeset: Changeset::Full {
+                    version,
+                    changes,
+                    seqs: CrsqlSeq(0)..=last_seq,
+                    last_seq,
+                    ts: ta1.agent.clock().new_timestamp().into(),
+                },
+            },
+            ChangeSource::Broadcast,
+            Instant::now(),
+        )],
+    )
+    .await?;
 
     let (status_code, body) = api_v1_transactions(
         Extension(ta1.agent.clone()),
@@ -1684,54 +1684,59 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
         ]
     );
 
-    // let mut changes = vec![];
-    // let mut prepped = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = 2"#)?;
-    // let mut rows = prepped.query([])?;
+    let mut changes = vec![];
+    let mut prepped = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = 2"#)?;
+    let mut rows = prepped.query([])?;
 
-    // while let Some(row) = rows.next()? {
-    //     changes.push(row_to_change(row)?);
-    // }
+    while let Some(row) = rows.next()? {
+        changes.push(row_to_change(row)?);
+    }
 
-    // let last_seq = CrsqlSeq((changes.len() - 1) as u64);
+    let last_seq = CrsqlSeq((changes.len() - 1) as u64);
 
-    // process_multiple_changes(
-    //     ta2.agent.clone(),
-    //     ta2.bookie.clone(),
-    //     vec![(
-    //         ChangeV1 {
-    //             actor_id: ta1.agent.actor_id(),
-    //             changeset: Changeset::Full {
-    //                 version,
-    //                 changes,
-    //                 seqs: CrsqlSeq(0)..=last_seq,
-    //                 last_seq,
-    //                 ts: ta1.agent.clock().new_timestamp().into(),
-    //             },
-    //         },
-    //         ChangeSource::Broadcast,
-    //         Instant::now(),
-    //     )],
-    // )
-    // .await?;
+    process_multiple_changes(
+        ta2.agent.clone(),
+        ta2.bookie.clone(),
+        vec![(
+            ChangeV1 {
+                actor_id: ta1.agent.actor_id(),
+                changeset: Changeset::Full {
+                    version,
+                    changes,
+                    seqs: CrsqlSeq(0)..=last_seq,
+                    last_seq,
+                    ts: ta1.agent.clock().new_timestamp().into(),
+                },
+            },
+            ChangeSource::Broadcast,
+            Instant::now(),
+        )],
+    )
+    .await?;
 
-    // let conn = ta2.agent.pool().read().await?;
+    let conn = ta2.agent.pool().read().await?;
 
-    // let bk: Vec<(ActorId, Version, Option<Version>, Option<CrsqlDbVersion>)> = conn
-    //     .prepare(
-    //         "SELECT actor_id, start_version, end_version, db_version FROM __corro_bookkeeping",
-    //     )?
-    //     .query_map([], |row| {
-    //         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-    //     })?
-    //     .collect::<rusqlite::Result<Vec<_>>>()?;
+    let bk: Vec<(ActorId, Version, Option<Version>, Option<CrsqlDbVersion>)> = conn
+        .prepare(
+            "SELECT actor_id, start_version, end_version, db_version FROM __corro_bookkeeping",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    // assert_eq!(
-    //     bk,
-    //     vec![
-    //         (ta1.agent.actor_id(), Version(1), Some(Version(1)), None),
-    //         (ta1.agent.actor_id(), version, None, Some(CrsqlDbVersion(2)))
-    //     ]
-    // );
+    assert_eq!(
+        bk,
+        vec![
+            (
+                ta1.agent.actor_id(),
+                Version(1),
+                None,
+                Some(CrsqlDbVersion(1))
+            ),
+            (ta1.agent.actor_id(), version, None, Some(CrsqlDbVersion(2)))
+        ]
+    );
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
