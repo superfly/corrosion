@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
-    ops::Deref,
+    ops::{Deref, RangeInclusive},
     time::{Duration, Instant},
 };
 
@@ -31,6 +31,8 @@ use crate::{
     transport::Transport,
 };
 use corro_tests::*;
+use corro_types::agent::Agent;
+use corro_types::change::Change;
 use corro_types::{
     actor::ActorId,
     agent::migrate,
@@ -90,12 +92,6 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
     assert_eq!(db_version, CrsqlDbVersion(1));
 
     println!("body: {body:?}");
-
-    #[derive(Debug, Deserialize)]
-    struct TestRecord {
-        id: i64,
-        text: String,
-    }
 
     let svc: TestRecord = ta1.agent.pool().read().await?.query_row(
         "SELECT id, text FROM tests WHERE id = 1;",
@@ -422,7 +418,8 @@ pub async fn configurable_stress_test(
             *acc.entry(item.0).or_insert(0) += item.1
         }
         future::ready(Ok(acc))
-    }).await?;
+    })
+    .await?;
 
     let changes_count: i64 = 4 * input_count as i64;
 
@@ -530,12 +527,15 @@ pub async fn configurable_stress_test(
                         .insert(row.get(1)?..=row.get(2)?);
                 }
 
-
                 let actual_count: i64 =
                     conn.query_row("SELECT count(*) FROM crsql_changes;", (), |row| row.get(0))?;
                 debug!("actual count: {actual_count}");
                 if actual_count != changes_count {
-                    println!("{}: still missing {} rows in crsql_changes", ta.agent.actor_id(), changes_count - actual_count);
+                    println!(
+                        "{}: still missing {} rows in crsql_changes",
+                        ta.agent.actor_id(),
+                        changes_count - actual_count
+                    );
                 }
 
                 for (actor_id, versions) in per_actor {
@@ -550,7 +550,10 @@ pub async fn configurable_stress_test(
 
                 let sync = generate_sync(&ta.bookie, ta.agent.actor_id()).await;
                 for (actor, versions) in sync.need {
-                    println!("{}: in-memory gap: {actor:?} from {versions:?}", ta.agent.actor_id());
+                    println!(
+                        "{}: in-memory gap: {actor:?} from {versions:?}",
+                        ta.agent.actor_id()
+                    );
                 }
 
                 let recorded_gaps = conn
@@ -761,6 +764,325 @@ async fn large_tx_sync() -> eyre::Result<()> {
     wait_for_all_pending_handles().await;
 
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct TestRecord {
+    id: i64,
+    text: String,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_process_multiple_changes() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    // setup the schema, for both nodes
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta1.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+
+    assert_eq!(status_code, StatusCode::OK);
+
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta2.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    // make about 50 transactions to ta1
+    insert_rows(ta1.agent.clone(), 1, 50).await;
+
+    // sent 1-5
+    let rows = get_rows(ta1.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    // check ta2 bookie
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![Version(1)..=Version(5)],
+        vec![],
+        vec![],
+        vec![],
+    )
+    .await?;
+
+    // sent: 1-5, 9-10
+    let rows = get_rows(ta1.agent.clone(), vec![(Version(9)..=Version(10), None)]).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    // check for gap 6-8
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![],
+        vec![Version(6)..=Version(8)],
+        vec![],
+        vec![],
+    )
+    .await?;
+
+    // create more gaps plus send partials
+    // sent 1-5, 9-10, 15-16*, 20
+    // * indicates partial version
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![
+            (Version(20)..=Version(20), None),
+            (Version(15)..=Version(16), Some(CrsqlSeq(0)..=CrsqlSeq(0))),
+        ],
+    )
+    .await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    // check for gap 11-14 and 17-19
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![],
+        vec![Version(11)..=Version(14), Version(17)..=Version(19)],
+        vec![(Version(15)..=Version(16), CrsqlSeq(0)..=CrsqlSeq(0))],
+        vec![],
+    )
+    .await?;
+
+    // clear versions 21-25. max version is now 55
+    insert_rows(ta1.agent.clone(), 21, 25).await;
+    // send non-contiguous cleared versions
+    // sent 1-5, 9-10, 15-16*, 20, 21, 25
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![
+            (Version(21)..=Version(21), None),
+            (Version(25)..=Version(25), None),
+        ],
+    )
+    .await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![],
+        vec![],
+        vec![],
+        vec![Version(21)..=Version(21), Version(25)..=Version(25)],
+    )
+    .await?;
+
+    // send some missing gaps, partials and cleared version
+    // sent 1-5, 9-10, 14-18, 20, 23-25
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![
+            (Version(14)..=Version(18), None),
+            (Version(15)..=Version(16), Some(CrsqlSeq(1)..=CrsqlSeq(3))),
+            (Version(23)..=Version(24), None),
+        ],
+    )
+    .await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![Version(14)..=Version(18), Version(15)..=Version(16)],
+        vec![
+            Version(11)..=Version(13),
+            Version(19)..=Version(19),
+            Version(22)..=Version(22),
+        ],
+        vec![],
+        vec![Version(23)..=Version(25)],
+    )
+    .await?;
+
+    // sent 1-25
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![
+            (Version(6)..=Version(8), None),
+            (Version(11)..=Version(19), None),
+            (Version(22)..=Version(22), None),
+        ],
+    )
+    .await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![Version(1)..=Version(20)],
+        vec![],
+        vec![],
+        vec![Version(21)..=Version(25)],
+    )
+    .await?;
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+async fn check_bookie_versions(
+    ta: TestAgent,
+    actor_id: ActorId,
+    complete: Vec<RangeInclusive<Version>>,
+    gap: Vec<RangeInclusive<Version>>,
+    partials: Vec<(RangeInclusive<Version>, RangeInclusive<CrsqlSeq>)>,
+    cleared: Vec<RangeInclusive<Version>>,
+) -> eyre::Result<()> {
+    let conn = ta.agent.pool().read().await?;
+    let booked = ta.bookie.write("test").await.ensure(actor_id);
+    let bookedv = booked.read("test").await;
+
+    for versions in complete {
+        for version in versions.clone() {
+            let bk: Vec<(ActorId, Version, Option<Version>)> = conn
+                .prepare(
+                    "SELECT actor_id, start_version, end_version FROM __corro_bookkeeping where start_version = ?",
+                )?
+                .query_map([version], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(bk, vec![(actor_id, version, None)]);
+
+            // should not be in gaps
+            assert!(!conn.prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping_gaps WHERE actor_id = ? and ? between start and end)")?
+                .query_row((actor_id, version), |row| row.get(0))?);
+        }
+        bookedv.contains_all(versions.clone(), Some(&(CrsqlSeq(0)..=CrsqlSeq(3))));
+    }
+
+    for versions in partials {
+        for version in versions.0.clone() {
+            let bk: Vec<(ActorId, Version, CrsqlSeq, CrsqlSeq)> = conn
+                .prepare(
+                    "SELECT site_id, version, start_seq, end_seq FROM __corro_seq_bookkeeping where version = ?",
+                )?
+                .query_map([version], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(
+                bk,
+                vec![(
+                    actor_id,
+                    version,
+                    *versions.clone().1.start(),
+                    *versions.clone().1.end()
+                )]
+            );
+
+            // should not be in gaps
+            assert!(!conn.prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping_gaps WHERE actor_id = ? and ? BETWEEN start and end)")?
+                .query_row((actor_id, version), |row| row.get(0))?);
+
+            let partial = bookedv.get_partial(&version);
+            assert_ne!(partial, None);
+        }
+        bookedv.contains_all(versions.0.clone(), Some(&(CrsqlSeq(0)..=CrsqlSeq(3))));
+    }
+
+    for versions in gap {
+        for version in versions.clone() {
+            let needed = bookedv.needed();
+            assert!(
+                needed.contains(&version),
+                "{version:?} should be in {needed:?}"
+            );
+        }
+        assert!(conn.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping_gaps WHERE actor_id = ? and start = ? and end = ?)")?
+            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?);
+    }
+
+    for versions in cleared {
+        assert!(conn.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping WHERE actor_id = ? and start_version = ? and end_version = ?)")?
+            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?);
+    }
+
+    Ok(())
+}
+
+async fn get_rows(
+    agent: Agent,
+    v: Vec<(RangeInclusive<Version>, Option<RangeInclusive<CrsqlSeq>>)>,
+) -> eyre::Result<Vec<(ChangeV1, ChangeSource, Instant)>> {
+    let mut result = vec![];
+
+    let conn = agent.pool().read().await?;
+    for versions in v {
+        for version in versions.0 {
+            let mut query =
+                r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+            FROM crsql_changes where db_version = ?"#
+                    .to_string();
+            let changes: Vec<Change>;
+            let seqs = if let Some(seq) = versions.1.clone() {
+                let seq_query = " and seq >= ? and seq <= ?";
+                query = query + seq_query;
+                let mut prepped = conn.prepare(&query)?;
+                changes = prepped
+                    .query_map((version, seq.start(), seq.end()), row_to_change)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                seq
+            } else {
+                let mut prepped = conn.prepare(&query)?;
+                changes = prepped
+                    .query_map([version], row_to_change)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                CrsqlSeq(0)..=CrsqlSeq(3)
+            };
+
+            result.push((
+                ChangeV1 {
+                    actor_id: agent.actor_id(),
+                    changeset: Changeset::Full {
+                        version,
+                        changes,
+                        seqs,
+                        last_seq: CrsqlSeq(3),
+                        ts: agent.clock().new_timestamp().into(),
+                    },
+                },
+                ChangeSource::Broadcast,
+                Instant::now(),
+            ))
+        }
+    }
+    Ok(result)
+}
+
+async fn insert_rows(agent: Agent, start: i64, n: i64) {
+    // check locally that everything is in order
+    for i in start..=n {
+        let (status_code, _) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::Json(vec![Statement::WithParams(
+                "INSERT OR REPLACE INTO tests3 (id,text,text2, num, num2) VALUES (?,?,?,?,?)"
+                    .into(),
+                vec![
+                    i.into(),
+                    "service-name".into(),
+                    "second text".into(),
+                    (i + 20).into(),
+                    (i + 100).into(),
+                ],
+            )]),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK);
+
+        // let version = body.0.version.unwrap();
+        // assert_eq!(version, Version(i as u64));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
