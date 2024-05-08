@@ -2545,6 +2545,7 @@ mod tests {
             .expect("could not init crsql");
 
             setup_conn(&conn2).unwrap();
+            migrate(&mut conn2).unwrap();
 
             {
                 let tx = conn2.transaction().unwrap();
@@ -2567,6 +2568,7 @@ mod tests {
             let tx = conn2.transaction().unwrap();
 
             for change in changes {
+                debug!("change: {change:?}");
                 tx.prepare_cached(
                     r#"
                     INSERT INTO crsql_changes

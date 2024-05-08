@@ -247,9 +247,26 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         Box::new(refactor_corro_members as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(crsqlite_v0_16_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_bookkeeping_gaps as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
     ];
 
     crate::sqlite::migrate(conn, migrations)
+}
+
+fn create_impacted_versions(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "
+        CREATE TABLE __corro_versions_impacted (
+            site_id INTEGER NOT NULL,
+            db_version INTEGER NOT NULL,
+
+            PRIMARY KEY (site_id, db_version)
+        );
+    ",
+    )?;
+
+    // create current triggers
+    create_all_clock_change_triggers(tx)
 }
 
 fn create_bookkeeping_gaps(tx: &Transaction) -> rusqlite::Result<()> {
@@ -489,6 +506,50 @@ pub enum SplitPoolCreateError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Rusqlite(#[from] rusqlite::Error),
+}
+
+pub fn create_clock_change_trigger(
+    conn: &rusqlite::Connection,
+    name: &str,
+) -> rusqlite::Result<()> {
+    debug!("creating clock change trigger for table {name}");
+    let q = format!("
+    CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_updated
+        AFTER UPDATE ON {name}__crsql_clock FOR EACH ROW
+            WHEN old.site_id = 0 AND (old.site_id != new.site_id OR old.db_version != new.db_version)
+        BEGIN
+            INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
+                ON CONFLICT (site_id, db_version) DO NOTHING;
+        END;
+
+    CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_deleted
+        AFTER DELETE ON {name}__crsql_clock FOR EACH ROW
+            WHEN old.site_id = 0
+        BEGIN
+            INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
+                ON CONFLICT (site_id, db_version) DO NOTHING;
+        END;
+    ");
+    conn.execute_batch(&q)
+}
+
+pub fn create_all_clock_change_triggers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut prepped = conn.prepare(
+        "SELECT tbl_name FROM sqlite_schema WHERE type='table' AND tbl_name LIKE '%__crsql_clock'",
+    )?;
+
+    let mut rows = prepped.query([])?;
+
+    loop {
+        let tbl_name = match rows.next()? {
+            Some(row) => row.get_ref(0)?,
+            None => break,
+        };
+
+        create_clock_change_trigger(conn, tbl_name.as_str()?.trim_end_matches("__crsql_clock"))?;
+    }
+
+    Ok(())
 }
 
 impl SplitPool {
@@ -1508,6 +1569,68 @@ impl Bookie {
     pub fn registry(&self) -> &LockRegistry {
         self.0.registry()
     }
+}
+
+/// Prune the database
+pub fn find_overwritten_versions(
+    conn: &Connection,
+) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<Version>>> {
+    debug!("find_overwritten_versions");
+
+    let mut prepped = conn.prepare_cached("
+        SELECT v.db_version, si.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
+            FROM __corro_versions_impacted AS v
+            INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
+            INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
+        ")?;
+
+    let mut rows = prepped.query([])?;
+
+    let mut all_versions: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
+
+    loop {
+        let row = match rows.next()? {
+            Some(row) => row,
+            None => break,
+        };
+
+        let db_version: CrsqlDbVersion = row.get(0)?;
+        trace!("db version: {db_version}");
+
+        let actor_id = match row.get::<_, Option<ActorId>>(1)? {
+            Some(actor_id) => actor_id,
+            None => {
+                warn!("missing actor_id for an impacted version with db_version = {db_version}");
+                continue;
+            }
+        };
+        trace!("actor_id: {actor_id}");
+
+        let exists: bool = row.get(2)?;
+
+        debug!("exists? {exists}");
+
+        if !exists {
+            debug!("version is gone now");
+            let version = match row.get::<_, Option<Version>>(3)? {
+                Some(version) => version,
+                None => {
+                    warn!("missing start_version for an impacted version: actor_id = {actor_id}, db_version = {db_version}");
+                    continue;
+                }
+            };
+
+            all_versions
+                .entry(actor_id)
+                .or_default()
+                .insert(version..=version);
+        }
+    }
+
+    conn.prepare_cached("DELETE FROM __corro_versions_impacted")?
+        .execute([])?;
+
+    Ok(all_versions)
 }
 
 #[cfg(test)]

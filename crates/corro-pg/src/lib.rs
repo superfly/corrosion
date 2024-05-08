@@ -14,17 +14,14 @@ use bytes::Buf;
 use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
-    agent::Agent,
-    base::{CrsqlDbVersion, CrsqlSeq},
-    broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset, Timestamp},
-    change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
+    agent::{Agent, ChangeError},
+    broadcast::broadcast_changes,
+    change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
-use itertools::Itertools;
-use metrics::counter;
 use pgwire::{
     api::{
         results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
@@ -46,8 +43,7 @@ use pgwire::{
 };
 use postgres_types::{FromSql, Type};
 use rusqlite::{
-    functions::FunctionFlags, named_params, types::ValueRef, vtab::eponymous_only_module,
-    Connection, Statement,
+    functions::FunctionFlags, types::ValueRef, vtab::eponymous_only_module, Connection, Statement,
 };
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
@@ -2127,131 +2123,42 @@ impl Session {
         Ok(())
     }
 
-    fn handle_commit(&self, conn: &Connection) -> rusqlite::Result<()> {
+    fn handle_commit(&self, conn: &Connection) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
-        let actor_id = self.agent.actor_id();
-
-        let ts = Timestamp::from(self.agent.clock().new_timestamp());
-
-        let db_version: CrsqlDbVersion = conn
-            .prepare_cached("SELECT crsql_next_db_version()")?
-            .query_row((), |row| row.get(0))?;
-
-        let has_changes: bool = conn
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE db_version = ?);")?
-            .query_row([db_version], |row| row.get(0))?;
-
-        if !has_changes {
-            conn.execute_batch("COMMIT")?;
-            return Ok(());
-        }
-
-        let last_seq: CrsqlSeq = conn
-            .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")?
-            .query_row([db_version], |row| row.get(0))?;
 
         let mut book_writer = self
             .agent
             .booked()
             .blocking_write("handle_write_tx(book_writer)");
 
-        let last_version = book_writer.last().unwrap_or_default();
-        trace!("last_version: {last_version}");
-        let version = last_version + 1;
-        trace!("version: {version}");
+        let actor_id = self.agent.actor_id();
 
-        conn.prepare_cached(
-            r#"
-                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
-                    VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
-            "#,
-        )?
-        .execute(named_params! {
-            ":actor_id": actor_id,
-            ":start_version": version,
-            ":db_version": db_version,
-            ":last_seq": last_seq,
-            ":ts": ts
-        })?;
+        let insert_info = insert_local_changes(&self.agent, conn, &mut book_writer)?;
+        conn.execute_batch("COMMIT")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
 
-        debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
+        if let Some(InsertChangesInfo {
+            version,
+            db_version,
+            last_seq,
+            ts,
+            snap,
+        }) = insert_info
+        {
+            trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        let mut snap = book_writer.snapshot();
-        snap.insert_db(conn, [version..=version].into())?;
+            book_writer.commit_snapshot(snap);
 
-        conn.execute_batch("COMMIT")?;
-
-        trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
-
-        book_writer.commit_snapshot(snap);
-
-        drop(book_writer);
-
-        spawn_counted({
             let agent = self.agent.clone();
-            async move {
-                let conn = agent.pool().read().await?;
 
-                block_in_place(|| {
-                    let agent = agent.clone();
-                    // TODO: make this more generic so both sync and local changes can use it.
-                    let mut prepped = conn.prepare_cached(
-                        r#"
-                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                        FROM crsql_changes
-                        WHERE db_version = ?
-                        ORDER BY seq ASC
-                "#,
-                    )?;
-                    let rows = prepped.query_map([db_version], row_to_change)?;
-                    let chunked =
-                        ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
-                    for changes_seqs in chunked {
-                        match changes_seqs {
-                            Ok((changes, seqs)) => {
-                                for (table_name, count) in
-                                    changes.iter().counts_by(|change| &change.table)
-                                {
-                                    counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "local").increment(count as u64);
-                                }
-
-                                trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
-
-                                agent.subs_manager().match_changes(&changes, db_version);
-
-                                let tx_bcast = agent.tx_bcast().clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = tx_bcast
-                                        .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
-                                            ChangeV1 {
-                                                actor_id,
-                                                changeset: Changeset::Full {
-                                                    version,
-                                                    changes,
-                                                    seqs,
-                                                    last_seq,
-                                                    ts,
-                                                },
-                                            },
-                                        )))
-                                        .await
-                                    {
-                                        error!("could not send change message for broadcast: {e}");
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                                break;
-                            }
-                        }
-                    }
-                    Ok::<_, rusqlite::Error>(())
-                })?;
-
-                Ok::<_, BoxError>(())
-            }
-        });
+            spawn_counted(async move {
+                broadcast_changes(agent, db_version, last_seq, version, ts).await
+            });
+        }
 
         Ok(())
     }
@@ -2311,6 +2218,8 @@ enum QueryError {
     BackendResponseSendFailed,
     #[error("could not acquire write permit")]
     PermitAcquire(#[from] AcquireError),
+    #[error(transparent)]
+    Change(#[from] ChangeError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2336,6 +2245,9 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
                 ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
             QueryError::BackendResponseSendFailed => return Err(ChannelClosed),
+            QueryError::Change(e) => {
+                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
+            }
         }))
     }
 }

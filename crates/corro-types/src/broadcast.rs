@@ -6,8 +6,9 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use corro_api_types::Change;
+use corro_api_types::{row_to_change, Change};
 use foca::{Identity, Member, Notification, Runtime, Timer};
+use itertools::Itertools;
 use metrics::counter;
 use rusqlite::{
     types::{FromSql, FromSqlError},
@@ -16,14 +17,20 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::block_in_place,
+};
 use tracing::{error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
     actor::{Actor, ActorId, ClusterId},
+    agent::Agent,
     base::{CrsqlDbVersion, CrsqlSeq, Version},
+    change::{ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
+    sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
 };
 
@@ -424,4 +431,78 @@ impl<T> DispatchRuntime<T> {
             buf: BytesMut::new(),
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BroadcastError {
+    #[error(transparent)]
+    Pool(#[from] SqlitePoolError),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+}
+
+pub async fn broadcast_changes(
+    agent: Agent,
+    db_version: CrsqlDbVersion,
+    last_seq: CrsqlSeq,
+    version: Version,
+    ts: Timestamp,
+) -> Result<(), BroadcastError> {
+    let actor_id = agent.actor_id();
+    let conn = agent.pool().read().await?;
+
+    block_in_place(|| {
+        // TODO: make this more generic so both sync and local changes can use it.
+        let mut prepped = conn.prepare_cached(
+            r#"
+                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                        FROM crsql_changes
+                        WHERE db_version = ?
+                        ORDER BY seq ASC
+                "#,
+        )?;
+        let rows = prepped.query_map([db_version], row_to_change)?;
+        let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+        for changes_seqs in chunked {
+            match changes_seqs {
+                Ok((changes, seqs)) => {
+                    for (table_name, count) in changes.iter().counts_by(|change| &change.table) {
+                        counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "local").increment(count as u64);
+                    }
+
+                    trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
+
+                    agent.subs_manager().match_changes(&changes, db_version);
+
+                    let tx_bcast = agent.tx_bcast().clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = tx_bcast
+                            .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
+                                ChangeV1 {
+                                    actor_id,
+                                    changeset: Changeset::Full {
+                                        version,
+                                        changes,
+                                        seqs,
+                                        last_seq,
+                                        ts,
+                                    },
+                                },
+                            )))
+                            .await
+                        {
+                            error!("could not send change message for broadcast: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                    break;
+                }
+            }
+        }
+        Ok::<_, rusqlite::Error>(())
+    })?;
+
+    Ok(())
 }
