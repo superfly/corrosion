@@ -31,7 +31,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust specified toolchain
+      - name: Set default Rust toolchain
+        run: rustup default stable-x86_64-apple-darwin
+      
+      - name: Display Rust toolchain information
         run: rustup show
         
       - name: Install cargo-nextest
