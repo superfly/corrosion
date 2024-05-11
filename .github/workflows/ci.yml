@@ -30,8 +30,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Display Rust toolchain information
+
+      - name: Install and Display Rust specified toolchain
         run: rustup show
         
       - name: Install cargo-nextest
