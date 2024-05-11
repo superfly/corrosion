@@ -1,0 +1,6 @@
+[toolchain]
+channel = "nightly-2023-12-03"
+targets = [
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu"
+]

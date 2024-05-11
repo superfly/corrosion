@@ -31,8 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set default Rust toolchain
-        run: rustup default stable-x86_64-apple-darwin
+      # - name: Set default Rust toolchain
+      #   run: rustup default stable-${{ matrix.target }}
       
       - name: Display Rust toolchain information
         run: rustup show
