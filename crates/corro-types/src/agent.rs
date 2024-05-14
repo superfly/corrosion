@@ -1668,10 +1668,9 @@ mod tests {
         insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(1), Version(4)..=Version(4)])?;
         expect_gaps(&conn, &bv, &all, vec![Version(2)..=Version(3)])?;
 
-        // fillgap
+        // fill gap
         insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(3)..=Version(3), Version(2)..=Version(2)])?;
         expect_gaps(&conn, &bv, &all, vec![])?;
-
 
         // try from an empty state again
         let mut bv = BookedVersions::new(actor_id);
