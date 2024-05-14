@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::Extension;
-use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
+use futures::{future, stream::FuturesUnordered, StreamExt, TryStreamExt};
 use hyper::StatusCode;
 use rand::{
     distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::IteratorRandom, SeedableRng,
@@ -417,13 +417,12 @@ pub async fn configurable_stress_test(
         }
     })
     .try_buffer_unordered(10)
-    .try_collect::<Vec<(ActorId, usize)>>().await?
-    .into_iter().fold(BTreeMap::new(), |mut acc, item| {
+    .try_fold(BTreeMap::new(), |mut acc, item| {
         {
             *acc.entry(item.0).or_insert(0) += item.1
         }
-        acc
-    });
+        future::ready(Ok(acc))
+    }).await?;
 
     let changes_count: i64 = 4 * input_count as i64;
 
