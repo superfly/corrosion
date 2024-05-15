@@ -1,4 +1,4 @@
-use futures::{stream::Stream, StreamExt};
+use futures::{stream::Stream};
 use futures_util::stream::{select, Select};
 use std::{
     future::Future,
@@ -7,11 +7,13 @@ use std::{
 };
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
+#[cfg(windows)]
+use tokio::signal::windows::ctrl_c;
+#[cfg(windows)]
+use tokio_stream::wrappers::CtrlCStream;
 use tokio::{
-    signal::windows::ctrl_c,
     sync::{mpsc, watch},
 };
-use tokio_stream::wrappers::CtrlCStream;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, warn};
 
