@@ -27,8 +27,8 @@ pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-x86_64.dylib");
 pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-x86_64.so");
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-aarch64.so");
-
-// TODO: support windows
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-windows-x86_64.dll");
 
 // need to keep this alive!
 static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {

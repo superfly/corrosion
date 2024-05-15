@@ -1,17 +1,21 @@
-use futures::stream::Stream;
+use futures::{stream::Stream, StreamExt};
 use futures_util::stream::{select, Select};
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::{
-    signal::unix::{signal, SignalKind},
+    signal::windows::ctrl_c,
     sync::{mpsc, watch},
 };
+use tokio_stream::wrappers::CtrlCStream;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, warn};
 
+#[cfg(unix)]
 use crate::signalstream::SignalStream;
 
 /// A `Future` that completes once the program is requested to shutdown. This
@@ -51,10 +55,21 @@ impl Tripwire {
     }
 
     /// Listen for SIGTERM and SIGINT
-    pub fn new_signals() -> (Self, TripwireWorker<Select<SignalStream, SignalStream>>) {
-        let sigterms = SignalStream::new(signal(SignalKind::terminate()).unwrap());
-        let sigints = SignalStream::new(signal(SignalKind::interrupt()).unwrap());
-        Self::new(select(sigterms, sigints))
+    pub fn new_signals() -> (Self, TripwireWorker<Select<impl Stream, impl Stream>>) {
+        #[cfg(unix)]
+        {
+            // For non-Windows platforms, create signal streams for SIGTERM and SIGINT
+            let sigterms = SignalStream::new(signal(SignalKind::terminate()).unwrap());
+            let sigints = SignalStream::new(signal(SignalKind::interrupt()).unwrap());
+            Self::new(select(sigterms, sigints))
+        }
+        #[cfg(windows)]
+        {
+            // For Windows platforms, create two Ctrl-C signal streams to meet the requirement of `select`
+            let ctrl_c1 = CtrlCStream::new(ctrl_c().unwrap());
+            let ctrl_c2 = CtrlCStream::new(ctrl_c().unwrap());
+            Self::new(select(ctrl_c1, ctrl_c2))
+        }
     }
 
     /// Returns an Arc of the current [TripwireState]
