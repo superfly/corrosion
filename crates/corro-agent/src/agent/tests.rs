@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::Extension;
-use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
+use futures::{future, stream::FuturesUnordered, StreamExt, TryStreamExt};
 use hyper::StatusCode;
 use rand::{
     distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::IteratorRandom, SeedableRng,
@@ -412,15 +412,19 @@ pub async fn configurable_stress_test(
                     }
                 }
 
-                Ok::<_, eyre::Report>((*actor_id, statements.len()))
+                Ok::<_, eyre::Report>((*actor_id, 1))
             })
         }
     })
     .try_buffer_unordered(10)
-    .try_collect::<BTreeMap<_, _>>()
-    .await?;
+    .try_fold(BTreeMap::new(), |mut acc, item| {
+        {
+            *acc.entry(item.0).or_insert(0) += item.1
+        }
+        future::ready(Ok(acc))
+    }).await?;
 
-    let changes_count = 4 * input_count;
+    let changes_count: i64 = 4 * input_count as i64;
 
     println!("expecting {changes_count} ops");
 
@@ -526,14 +530,27 @@ pub async fn configurable_stress_test(
                         .insert(row.get(1)?..=row.get(2)?);
                 }
 
+
+                let actual_count: i64 =
+                    conn.query_row("SELECT count(*) FROM crsql_changes;", (), |row| row.get(0))?;
+                debug!("actual count: {actual_count}");
+                if actual_count != changes_count {
+                    println!("{}: still missing {} rows in crsql_changes", ta.agent.actor_id(), changes_count - actual_count);
+                }
+
                 for (actor_id, versions) in per_actor {
                     if let Some(versions_len) = actor_versions.get(&actor_id) {
-                        let full_range = Version(1)..=Version(*versions_len as u64 + 1);
+                        let full_range = Version(1)..=Version(*versions_len as u64);
                         let gaps = versions.gaps(&full_range);
                         for gap in gaps {
-                            println!("{} gap! {actor_id} => {gap:?}", ta.agent.actor_id());
+                            println!("{} db gap! {actor_id} => {gap:?}", ta.agent.actor_id());
                         }
                     }
+                }
+
+                let sync = generate_sync(&ta.bookie, ta.agent.actor_id()).await;
+                for (actor, versions) in sync.need {
+                    println!("{}: in-memory gap: {actor:?} from {versions:?}", ta.agent.actor_id());
                 }
 
                 let recorded_gaps = conn
