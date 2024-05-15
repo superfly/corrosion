@@ -1,4 +1,4 @@
-use futures::{stream::Stream};
+use futures::stream::Stream;
 use futures_util::stream::{select, Select};
 use std::{
     future::Future,
@@ -9,11 +9,9 @@ use std::{
 use tokio::signal::unix::{signal, SignalKind};
 #[cfg(windows)]
 use tokio::signal::windows::ctrl_c;
+use tokio::sync::{mpsc, watch};
 #[cfg(windows)]
 use tokio_stream::wrappers::CtrlCStream;
-use tokio::{
-    sync::{mpsc, watch},
-};
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, warn};
 
@@ -57,21 +55,20 @@ impl Tripwire {
     }
 
     /// Listen for SIGTERM and SIGINT
-    pub fn new_signals() -> (Self, TripwireWorker<Select<impl Stream, impl Stream>>) {
-        #[cfg(unix)]
-        {
-            // For non-Windows platforms, create signal streams for SIGTERM and SIGINT
-            let sigterms = SignalStream::new(signal(SignalKind::terminate()).unwrap());
-            let sigints = SignalStream::new(signal(SignalKind::interrupt()).unwrap());
-            Self::new(select(sigterms, sigints))
-        }
-        #[cfg(windows)]
-        {
-            // For Windows platforms, create two Ctrl-C signal streams to meet the requirement of `select`
-            let ctrl_c1 = CtrlCStream::new(ctrl_c().unwrap());
-            let ctrl_c2 = CtrlCStream::new(ctrl_c().unwrap());
-            Self::new(select(ctrl_c1, ctrl_c2))
-        }
+    #[cfg(unix)]
+    pub fn new_signals() -> (Self, TripwireWorker<Select<SignalStream, SignalStream>>) {
+        // For non-Windows platforms, create signal streams for SIGTERM and SIGINT
+        let sigterms = SignalStream::new(signal(SignalKind::terminate()).unwrap());
+        let sigints = SignalStream::new(signal(SignalKind::interrupt()).unwrap());
+        Self::new(select(sigterms, sigints))
+    }
+
+    #[cfg(windows)]
+    pub fn new_signals() -> (Self, TripwireWorker<Select<CtrlCStream, CtrlCStream>>) {
+        // For Windows platforms, create two Ctrl-C signal streams to meet the requirement of `select`
+        let ctrl_c1 = CtrlCStream::new(ctrl_c().unwrap());
+        let ctrl_c2 = CtrlCStream::new(ctrl_c().unwrap());
+        Self::new(select(ctrl_c1, ctrl_c2))
     }
 
     /// Returns an Arc of the current [TripwireState]
