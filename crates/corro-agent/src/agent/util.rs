@@ -5,27 +5,8 @@
 //! a similar API facade, handle the same kinds of data, etc) should
 //! be pulled out of this file in future.
 
-use crate::{
-    agent::{handlers, CountedExecutor, MAX_SYNC_BACKOFF, TO_CLEAR_COUNT},
-    api::public::{
-        api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
-        pubsub::{api_v1_sub_by_id, api_v1_subs},
-    },
-    transport::Transport,
-};
-use corro_types::{
-    actor::{Actor, ActorId},
-    agent::{
-        find_overwritten_versions, Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion,
-        PartialVersion,
-    },
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
-    change::store_empty_changeset,
-    channel::CorroReceiver,
-    config::AuthzConfig,
-    pubsub::SubsManager,
-};
+use std::error::Error;
+use std::io::Read;
 use std::{
     cmp,
     collections::{BTreeMap, HashSet},
@@ -49,12 +30,36 @@ use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
-use spawn::spawn_counted;
 use tokio::{net::TcpListener, task::block_in_place};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
+
+use corro_types::agent::PoolError;
+use corro_types::{
+    actor::{Actor, ActorId},
+    agent::{
+        find_overwritten_versions, Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion,
+        PartialVersion,
+    },
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
+    change::store_empty_changeset,
+    channel::CorroReceiver,
+    config::AuthzConfig,
+    pubsub::SubsManager,
+};
+use spawn::spawn_counted;
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+
+use crate::{
+    agent::{handlers, CountedExecutor, MAX_SYNC_BACKOFF, TO_CLEAR_COUNT},
+    api::public::{
+        api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
+        pubsub::{api_v1_sub_by_id, api_v1_subs},
+    },
+    transport::Transport,
+};
 
 use super::BcastCache;
 
@@ -1222,4 +1227,38 @@ pub fn check_buffered_meta_to_clear(
     }
 
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+}
+
+pub async fn clear_empty_versions(agent: Agent, actor_id: ActorId) -> eyre::Result<()> {
+    let start = Instant::now();
+
+    let query = r#"SELECT start_version FROM __corro_bookkeeping WHERE actor_id = :actor_id AND end_version IS null AND db_version
+    NOT IN (SELECT DISTINCT db_version FROM crsql_changes WHERE site_id = :actor_id)"#;
+
+    let conn = agent
+        .pool()
+        .read()
+        .await?;
+    let overwritten_versions: RangeInclusiveSet<Version> = conn
+        .prepare(query)?
+        .query_map(named_params! {":actor_id": actor_id}, |row| {
+            Ok(row.get(0)?..=row.get(0)?)
+        })?
+        .collect::<rusqlite::Result<RangeInclusiveSet<Version>>>()?;
+
+    let total = overwritten_versions.len();
+    debug!("got {total} ranges to clear for actor {actor_id}");
+
+    let mut conn = agent.pool().write_normal().await?;
+    let tx = conn
+        .immediate_transaction()?;
+    for v in overwritten_versions {
+        store_empty_changeset(&tx, actor_id, v)?;
+    }
+
+    tx.commit()?;
+
+    debug!("cleared empty versions for actor {actor_id} in {:?}", start.elapsed());
+
+    Ok(())
 }

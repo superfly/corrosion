@@ -1,22 +1,17 @@
+use std::error::Error;
+use std::ops::RangeInclusive;
 use std::{
     fmt::Display,
     time::{Duration, Instant},
 };
 
 use camino::Utf8PathBuf;
-use corro_types::{
-    actor::{ActorId, ClusterId},
-    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{FocaCmd, FocaInput, Timestamp},
-    sqlite::SqlitePoolError,
-    sync::generate_sync,
-};
+use corro_agent::agent::util;
 use futures::{SinkExt, TryStreamExt};
-use rusqlite::{named_params, params, OptionalExtension};
+use rangemap::RangeInclusiveSet;
+use rusqlite::{named_params, params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use spawn::spawn_counted;
 use time::OffsetDateTime;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -26,6 +21,17 @@ use tokio::{
 use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
+
+use corro_types::change::store_empty_changeset;
+use corro_types::{
+    actor::{ActorId, ClusterId},
+    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    broadcast::{FocaCmd, FocaInput, Timestamp},
+    sqlite::SqlitePoolError,
+    sync::generate_sync,
+};
+use spawn::spawn_counted;
 use tripwire::Tripwire;
 
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +102,7 @@ pub enum Command {
     Locks { top: usize },
     Cluster(ClusterCommand),
     Actor(ActorCommand),
+    CompactEmpties,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -519,6 +526,21 @@ async fn handle_conn(
                     }
 
                     send_success(&mut stream).await;
+                }
+                Command::CompactEmpties => {
+                    let actor_ids: Vec<_> = {
+                        let r = bookie.read("admin compact empties").await;
+                        r.keys().copied().collect()
+                    };
+
+                    for actor_id in actor_ids {
+                        info_log(&mut stream, format!("compacting empties for {}", actor_id)).await;
+                        if let Err(e) = util::clear_empty_versions(agent.clone(), actor_id).await {
+                            _ = send_error(&mut stream, e).await;
+                        }
+                    }
+
+                    _ = send_success(&mut stream).await;
                 }
             },
             Ok(None) => {
