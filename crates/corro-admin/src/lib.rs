@@ -539,12 +539,12 @@ async fn handle_conn(
                             if let Err(e) =
                                 util::clear_empty_versions(agent.clone(), actor_id, Some(&tx)).await
                             {
-                                done_tx.send(Some(format!("{e}")));
+                                done_tx.send(Some(format!("{e}"))).unwrap();
                                 return;
                             }
                         }
 
-                        done_tx.send(None);
+                        done_tx.send(None).unwrap();
                     });
 
                     while let Some(msg) = rx.recv().await {
