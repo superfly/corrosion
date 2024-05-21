@@ -19,7 +19,6 @@ use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
 
-
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
@@ -533,12 +532,15 @@ async fn handle_conn(
                     let (tx, mut rx) = mpsc::channel(4);
                     let (done_tx, done_rx) = oneshot::channel::<Option<String>>();
 
-                    let thagent = agent.clone();
+                    let agent = agent.clone();
+                    let started = std::time::Instant::now();
                     tokio::task::spawn(async move {
                         for actor_id in actor_ids {
-                            tx.send(format!("compacting empties for {}", actor_id)).await;
-                            if let Err(e) = util::clear_empty_versions(thagent.clone(), actor_id, Some(&tx)).await {
-                                tx.send(format!("error - {e}"));
+                            if let Err(e) =
+                                util::clear_empty_versions(agent.clone(), actor_id, Some(&tx)).await
+                            {
+                                done_tx.send(Some(format!("{e}")));
+                                return;
                             }
                         }
 
@@ -549,14 +551,32 @@ async fn handle_conn(
                         info_log(&mut stream, msg).await;
                     }
 
-                    // for actor_id in actor_ids {
-                    //     info_log(&mut stream, format!("compacting empties for {}", actor_id)).await;
-                    //     if let Err(e) = util::clear_empty_versions(agent.clone(), actor_id).await {
-                    //         _ = send_error(&mut stream, e).await;
-                    //     }
-                    // }
-
-                    _ = send_success(&mut stream).await;
+                    match done_rx.await {
+                        Ok(None) => {
+                            let elapsed = started.elapsed().as_secs_f64();
+                            info_log(&mut stream, format!(
+                                    "Finished compacting empty versions!  Took {} seconds ({} minutes)",
+                                    elapsed,
+                                    elapsed / 60.0
+                                ),
+                            ).await;
+                            send_success(&mut stream).await
+                        }
+                        Ok(Some(err)) => {
+                            send_error(
+                                &mut stream,
+                                format!("An error occured while compacting empties: {err}"),
+                            )
+                            .await
+                        }
+                        _ => {
+                            send_error(
+                                &mut stream,
+                                "Failed to compact empties (check node logs for details)",
+                            )
+                            .await
+                        }
+                    }
                 }
             },
             Ok(None) => {
