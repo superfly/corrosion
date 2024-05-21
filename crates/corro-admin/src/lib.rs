@@ -298,7 +298,7 @@ async fn handle_conn(
                 Command::Ping => send_success(&mut stream).await,
                 Command::Sync(SyncCommand::Generate) => {
                     info_log(&mut stream, "generating sync...").await;
-                    let sync_state = generate_sync(bookie, agent.actor_id()).await;
+                    let sync_state = generate_sync(bookie, agent.clone().actor_id()).await;
                     match serde_json::to_value(&sync_state) {
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,
@@ -530,12 +530,31 @@ async fn handle_conn(
                         r.keys().copied().collect()
                     };
 
-                    for actor_id in actor_ids {
-                        info_log(&mut stream, format!("compacting empties for {}", actor_id)).await;
-                        if let Err(e) = util::clear_empty_versions(agent.clone(), actor_id).await {
-                            _ = send_error(&mut stream, e).await;
+                    let (tx, mut rx) = mpsc::channel(4);
+                    let (done_tx, done_rx) = oneshot::channel::<Option<String>>();
+
+                    let thagent = agent.clone();
+                    tokio::task::spawn(async move {
+                        for actor_id in actor_ids {
+                            tx.send(format!("compacting empties for {}", actor_id)).await;
+                            if let Err(e) = util::clear_empty_versions(thagent.clone(), actor_id, Some(&tx)).await {
+                                tx.send(format!("error - {e}"));
+                            }
                         }
+
+                        done_tx.send(None);
+                    });
+
+                    while let Some(msg) = rx.recv().await {
+                        info_log(&mut stream, msg).await;
                     }
+
+                    // for actor_id in actor_ids {
+                    //     info_log(&mut stream, format!("compacting empties for {}", actor_id)).await;
+                    //     if let Err(e) = util::clear_empty_versions(agent.clone(), actor_id).await {
+                    //         _ = send_error(&mut stream, e).await;
+                    //     }
+                    // }
 
                     _ = send_success(&mut stream).await;
                 }

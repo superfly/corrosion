@@ -28,7 +28,7 @@ use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction};
-use tokio::{net::TcpListener, task::block_in_place};
+use tokio::{net::TcpListener, task::block_in_place, sync::mpsc::Sender};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
@@ -1226,7 +1226,7 @@ pub fn check_buffered_meta_to_clear(
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
 }
 
-pub async fn clear_empty_versions(agent: Agent, actor_id: ActorId) -> eyre::Result<()> {
+pub async fn clear_empty_versions(agent: Agent, actor_id: ActorId, feedback: Option<&Sender<String>>) -> eyre::Result<()> {
     let start = Instant::now();
 
     let query = r#"SELECT start_version FROM __corro_bookkeeping WHERE actor_id = :actor_id AND end_version IS null AND db_version
@@ -1236,6 +1236,7 @@ pub async fn clear_empty_versions(agent: Agent, actor_id: ActorId) -> eyre::Resu
         .pool()
         .read()
         .await?;
+
     let overwritten_versions: RangeInclusiveSet<Version> = conn
         .prepare(query)?
         .query_map(named_params! {":actor_id": actor_id}, |row| {
@@ -1244,6 +1245,10 @@ pub async fn clear_empty_versions(agent: Agent, actor_id: ActorId) -> eyre::Resu
         .collect::<rusqlite::Result<RangeInclusiveSet<Version>>>()?;
 
     let total = overwritten_versions.len();
+
+    if let Some(ref tx) = feedback {
+        tx.send(format!("got {total} ranges to clear for actor {actor_id}")).await?
+    }
     debug!("got {total} ranges to clear for actor {actor_id}");
 
     let mut conn = agent.pool().write_normal().await?;
@@ -1254,7 +1259,11 @@ pub async fn clear_empty_versions(agent: Agent, actor_id: ActorId) -> eyre::Resu
     }
 
     tx.commit()?;
+    drop(conn);
 
+    if let Some(ref tx) = feedback {
+        tx.send(format!("cleared empty versions for actor {actor_id} in {:?}", start.elapsed())).await?
+    }
     debug!("cleared empty versions for actor {actor_id} in {:?}", start.elapsed());
 
     Ok(())
