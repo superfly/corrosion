@@ -36,7 +36,6 @@ use corro_types::{
 use spawn::wait_for_all_pending_handles;
 use tripwire::Tripwire;
 
-use crate::api::public::api_v1_queries;
 use crate::{
     agent::{process_multiple_changes, util::clear_empty_versions},
     api::{
@@ -849,6 +848,10 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     )
     .await?;
 
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
     Ok(())
 }
 
@@ -1105,7 +1108,11 @@ async fn get_rows(
                 [version],
                 |row| row.get(0),
             )?;
-            let last = count - 1;
+            let mut last = 4;
+            // count will be zero for cleared versions
+            if count > 0 {
+                last = count - 1;
+            }
             let mut query =
                 r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
             FROM crsql_changes where db_version = ?"#
@@ -1161,7 +1168,7 @@ async fn insert_rows(agent: Agent, start: i64, n: i64) {
         );
         // println!("statement - {:?}", statement);
 
-        let (status_code, body) =
+        let (status_code, _) =
             api_v1_transactions(Extension(agent.clone()), axum::Json(vec![statement])).await;
         assert_eq!(status_code, StatusCode::OK);
         // let version = body.0.version.unwrap();

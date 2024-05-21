@@ -489,6 +489,10 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Db(DbCommand::CompactEmpties) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::CompactEmpties).await?;
+        }
         Command::Db(DbCommand::Lock { cmd }) => {
             let config = match cli.config() {
                 Ok(config) => config,
@@ -768,4 +772,7 @@ enum TlsClientCommand {
 enum DbCommand {
     /// Acquires the lock on the DB
     Lock { cmd: String },
+
+    /// Compacts cleared versions in the bookkeeping table
+    CompactEmpties
 }

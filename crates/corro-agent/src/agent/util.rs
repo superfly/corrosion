@@ -5,8 +5,6 @@
 //! a similar API facade, handle the same kinds of data, etc) should
 //! be pulled out of this file in future.
 
-use std::error::Error;
-use std::io::Read;
 use std::{
     cmp,
     collections::{BTreeMap, HashSet},
@@ -35,7 +33,6 @@ use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
 
-use corro_types::agent::PoolError;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{

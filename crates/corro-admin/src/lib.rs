@@ -1,5 +1,3 @@
-use std::error::Error;
-use std::ops::RangeInclusive;
 use std::{
     fmt::Display,
     time::{Duration, Instant},
@@ -8,8 +6,7 @@ use std::{
 use camino::Utf8PathBuf;
 use corro_agent::agent::util;
 use futures::{SinkExt, TryStreamExt};
-use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, params, Connection, OptionalExtension};
+use rusqlite::{named_params, params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -22,7 +19,7 @@ use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
 
-use corro_types::change::store_empty_changeset;
+
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
