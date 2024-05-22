@@ -1261,24 +1261,16 @@ pub async fn clear_empty_versions(
     }
     debug!("got {total} ranges to clear for actor {actor_id}");
 
-    // process empty version in chunks of 10
-    // for chunks in overwritten_versions.iter().chunks(10) {
-    //     let mut conn = agent.pool().write_low().await?;
-    //     let tx = conn.immediate_transaction()?;
-    //     for v in ch {
-    //         store_empty_changeset(&tx, actor_id, v)?;
-    //     }
-    //     tx.commit()?;
-    //
-    //     // yield a bit at the end
-    //     tokio::task::yield_now().await;
-    // }
-
     let mut chunk: Vec<RangeInclusive<Version>> = vec![];
     for v in overwritten_versions {
         chunk.push(v);
 
         if chunk.len() == 10 {
+            if let Some(ref tx) = feedback {
+                tx.send("clearing next ten empty ranges".to_string())
+                    .await?
+            }
+
             let mut conn = agent.pool().write_low().await?;
             let tx = conn.immediate_transaction()?;
             for v in chunk {

@@ -297,7 +297,7 @@ async fn handle_conn(
                 Command::Ping => send_success(&mut stream).await,
                 Command::Sync(SyncCommand::Generate) => {
                     info_log(&mut stream, "generating sync...").await;
-                    let sync_state = generate_sync(bookie, agent.clone().actor_id()).await;
+                    let sync_state = generate_sync(bookie, agent.actor_id()).await;
                     match serde_json::to_value(&sync_state) {
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,
@@ -306,8 +306,7 @@ async fn handle_conn(
                 }
                 Command::Sync(SyncCommand::ReconcileGaps) => {
                     let actor_ids: Vec<_> = {
-                        let r = bookie.read("admin sync reconcile gaps").await;
-                        r.keys().copied().collect()
+                        bookie.read("admin sync reconcile gaps").await.clone().into_keys().collect()
                     };
 
                     for actor_id in actor_ids {
@@ -530,28 +529,26 @@ async fn handle_conn(
                     };
 
                     let (tx, mut rx) = mpsc::channel(4);
-                    let (done_tx, done_rx) = oneshot::channel::<Option<String>>();
 
                     let agent = agent.clone();
                     let started = std::time::Instant::now();
-                    tokio::task::spawn(async move {
+                    let done = tokio::task::spawn(async move {
                         for actor_id in actor_ids {
                             if let Err(e) =
                                 util::clear_empty_versions(agent.clone(), actor_id, Some(&tx)).await
                             {
-                                done_tx.send(Some(format!("{e}"))).unwrap();
-                                return;
+                                return Some(format!("{e}"));
                             }
                         }
 
-                        done_tx.send(None).unwrap();
+                        None
                     });
 
                     while let Some(msg) = rx.recv().await {
                         info_log(&mut stream, msg).await;
                     }
 
-                    match done_rx.await {
+                    match done.await {
                         Ok(None) => {
                             let elapsed = started.elapsed().as_secs_f64();
                             info_log(&mut stream, format!(
