@@ -486,8 +486,10 @@ pub enum PoolError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChangeError {
-    #[error("could not acquire pooled connection: {0}")]
+    #[error("could not acquire pooled write connection: {0}")]
     Pool(#[from] PoolError),
+    #[error("could not acquire pooled read connection: {0}")]
+    SqlitePool(#[from] SqlitePoolError),
     #[error("rusqlite: {source} (actor_id: {actor_id:?}, version: {version:?})")]
     Rusqlite {
         source: rusqlite::Error,
@@ -1638,8 +1640,8 @@ pub fn find_overwritten_versions(
 
 #[cfg(test)]
 mod tests {
-    use rangemap::range_inclusive_set;
     use super::*;
+    use rangemap::range_inclusive_set;
 
     #[test]
     fn test_booked_insert_db() -> rusqlite::Result<()> {
@@ -1654,10 +1656,20 @@ mod tests {
 
         let mut all = RangeInclusiveSet::new();
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(20)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(1)..=Version(20)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(10)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(1)..=Version(10)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
         // try from an empty state again
@@ -1665,11 +1677,21 @@ mod tests {
         let mut all = RangeInclusiveSet::new();
 
         // create 2:=3 gap
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(1), Version(4)..=Version(4)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(1)..=Version(1), Version(4)..=Version(4)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(2)..=Version(3)])?;
 
         // fill gap
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(3)..=Version(3), Version(2)..=Version(2)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(3)..=Version(3), Version(2)..=Version(2)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
         // try from an empty state again
@@ -1677,24 +1699,54 @@ mod tests {
         let mut all = RangeInclusiveSet::new();
 
         // insert a non-1 first version
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(5)..=Version(20)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(5)..=Version(20)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(4)])?;
 
         // insert a further change that does not overlap a gap
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(6)..=Version(7)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(6)..=Version(7)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(4)])?;
 
         // insert a further change that does overlap a gap
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(3)..=Version(7)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(3)..=Version(7)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(2)])?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(2)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(1)..=Version(2)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(25)..=Version(25)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(25)..=Version(25)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(21)..=Version(24)])?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(30)..=Version(35)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(30)..=Version(35)],
+        )?;
         expect_gaps(
             &conn,
             &bv,
@@ -1704,7 +1756,12 @@ mod tests {
 
         // NOTE: overlapping partially from the end
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(19)..=Version(22)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(19)..=Version(22)],
+        )?;
         expect_gaps(
             &conn,
             &bv,
@@ -1714,7 +1771,12 @@ mod tests {
 
         // NOTE: overlapping partially from the start
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(24)..=Version(25)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(24)..=Version(25)],
+        )?;
         expect_gaps(
             &conn,
             &bv,
@@ -1724,27 +1786,57 @@ mod tests {
 
         // NOTE: overlapping 2 ranges
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(23)..=Version(27)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(23)..=Version(27)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(28)..=Version(29)])?;
 
         // NOTE: ineffective insert of already known ranges
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(20)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(1)..=Version(20)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(28)..=Version(29)])?;
 
         // NOTE: overlapping no ranges, but encompassing a full range
 
-        insert_everywhere(&conn, &mut bv, &mut all,  range_inclusive_set![Version(27)..=Version(30)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(27)..=Version(30)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
         // NOTE: touching multiple ranges, partially
 
         // create gap 36..=39
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(40)..=Version(45)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(40)..=Version(45)],
+        )?;
         // create gap 46..=49
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(50)..=Version(55)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(50)..=Version(55)],
+        )?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(38)..=Version(47)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(38)..=Version(47)],
+        )?;
         expect_gaps(
             &conn,
             &bv,
@@ -1768,7 +1860,7 @@ mod tests {
         all_versions: &mut RangeInclusiveSet<Version>,
         versions: RangeInclusiveSet<Version>,
     ) -> rusqlite::Result<()> {
-        all_versions.extend(versions.clone().into_iter());
+        all_versions.extend(versions.clone());
         let mut snap = bv.snapshot();
         snap.insert_db(conn, versions)?;
         bv.commit_snapshot(snap);

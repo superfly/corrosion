@@ -506,7 +506,7 @@ pub async fn configurable_stress_test(
         }
         if v.len() == agents.len()
             && v.iter()
-                .all(|(n, needed)| *n == changes_count as i64 && *needed == 0)
+                .all(|(n, needed)| *n == changes_count && *needed == 0)
         {
             break;
         }
