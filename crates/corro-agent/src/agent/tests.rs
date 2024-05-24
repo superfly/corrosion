@@ -831,7 +831,18 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     )
     .await?;
 
-    clear_empty_versions(ta2.agent.clone(), ta1.agent.actor_id(), None).await?;
+    clear_empty_versions(ta2.agent.clone(), ta1.agent.actor_id(), None, Some(1)).await?;
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![],
+        vec![],
+        vec![],
+        vec![Version(1)..=Version(1)],
+    )
+    .await?;
+
+    clear_empty_versions(ta2.agent.clone(), ta1.agent.actor_id(), None, None).await?;
 
     check_bookie_versions(
         ta2.clone(),

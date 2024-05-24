@@ -1226,10 +1226,34 @@ pub fn check_buffered_meta_to_clear(
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
 }
 
+pub async fn clear_empty_versions_loop(agent: Agent, bookie: Bookie, tripwire: Tripwire) {
+    info!("Starting clear_empty_versions_changes loop");
+    'outer: loop {
+        let actor_ids: Vec<_> = {
+            let r = bookie.read("compact empties loop").await;
+            r.keys().copied().collect()
+        };
+
+        for actor_id in actor_ids {
+            if tripwire.is_shutting_down() {
+                break 'outer;
+            }
+
+            if let Err(e) = clear_empty_versions(agent.clone(), actor_id, None, Some(100)).await {
+                error!(%actor_id, "could not clear empty versions - {e}");
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    info!("clear_empty_versions ended");
+}
+
 pub async fn clear_empty_versions(
     agent: Agent,
     actor_id: ActorId,
     feedback: Option<&Sender<String>>,
+    limit: Option<i64>,
 ) -> eyre::Result<()> {
     if let Some(ref tx) = feedback {
         tx.send(format!("compacting empty versions for {actor_id}"))
@@ -1238,13 +1262,17 @@ pub async fn clear_empty_versions(
 
     let start = Instant::now();
 
-    let query = r#"SELECT start_version FROM __corro_bookkeeping WHERE actor_id = :actor_id AND end_version IS null AND db_version
-    NOT IN (SELECT DISTINCT db_version FROM crsql_changes WHERE site_id = :actor_id)"#;
+    let mut query = r#"SELECT start_version FROM __corro_bookkeeping WHERE actor_id = :actor_id AND end_version IS null AND db_version
+    NOT IN (SELECT DISTINCT db_version FROM crsql_changes WHERE site_id = :actor_id)"#.to_string();
+
+    if let Some(n) = limit {
+        query = query.to_owned() + format!(" LIMIT {n}").as_str();
+    }
 
     let conn = agent.pool().read().await?;
 
     let overwritten_versions: RangeInclusiveSet<Version> = conn
-        .prepare(query)?
+        .prepare(&query)?
         .query_map(named_params! {":actor_id": actor_id}, |row| {
             Ok(row.get(0)?..=row.get(0)?)
         })?
@@ -1265,10 +1293,9 @@ pub async fn clear_empty_versions(
     for v in overwritten_versions {
         chunk.push(v);
 
-        if chunk.len() == 10 {
+        if chunk.len() == 5 {
             if let Some(ref tx) = feedback {
-                tx.send("clearing next ten empty ranges".to_string())
-                    .await?
+                tx.send("clearing next 5 empty ranges".to_string()).await?
             }
 
             let mut conn = agent.pool().write_low().await?;
@@ -1278,7 +1305,6 @@ pub async fn clear_empty_versions(
             }
             tx.commit()?;
             chunk = vec![];
-            // tokio::task::yield_now().await;
         }
     }
 

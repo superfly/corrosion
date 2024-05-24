@@ -306,7 +306,12 @@ async fn handle_conn(
                 }
                 Command::Sync(SyncCommand::ReconcileGaps) => {
                     let actor_ids: Vec<_> = {
-                        bookie.read("admin sync reconcile gaps").await.clone().into_keys().collect()
+                        bookie
+                            .read("admin sync reconcile gaps")
+                            .await
+                            .clone()
+                            .into_keys()
+                            .collect()
                     };
 
                     for actor_id in actor_ids {
@@ -532,10 +537,11 @@ async fn handle_conn(
 
                     let agent = agent.clone();
                     let started = std::time::Instant::now();
-                    let done = tokio::task::spawn(async move {
+                    let done = tokio::task::spawn_local(async move {
                         for actor_id in actor_ids {
                             if let Err(e) =
-                                util::clear_empty_versions(agent.clone(), actor_id, Some(&tx)).await
+                                util::clear_empty_versions(agent.clone(), actor_id, Some(&tx), None)
+                                    .await
                             {
                                 return Some(format!("{e}"));
                             }

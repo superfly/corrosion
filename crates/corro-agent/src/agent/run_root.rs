@@ -203,6 +203,11 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         rx_apply,
         tripwire.clone(),
     ));
+    tokio::spawn(util::clear_empty_versions_loop(
+        agent.clone(),
+        bookie.clone(),
+        tripwire.clone(),
+    ));
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
