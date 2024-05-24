@@ -766,6 +766,7 @@ dependencies = [
  "hyper",
  "indexmap 2.1.0",
  "itertools",
+ "log",
  "metrics",
  "opentelemetry",
  "parking_lot",

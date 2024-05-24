@@ -55,6 +55,7 @@ uhlc = { workspace = true }
 uuid = { workspace = true }
 corro-pg = { path = "../corro-pg" }
 indexmap = { workspace = true }
+log = "0.4.17"
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
