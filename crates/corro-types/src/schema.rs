@@ -167,7 +167,7 @@ impl Schema {
 
     pub fn view_stmt(&self) -> String {
         if self.tables.is_empty() {
-            return r#"SELECT
+            return r#"CREATE VIEW __corro_changes AS SELECT
                 NULL as "table",
                 NULL as pk,
                 NULL as cid,
