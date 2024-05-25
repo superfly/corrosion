@@ -1228,6 +1228,9 @@ pub fn check_buffered_meta_to_clear(
 
 pub async fn clear_empty_versions_loop(agent: Agent, bookie: Bookie, tripwire: Tripwire) {
     info!("Starting clear_empty_versions_changes loop");
+
+    // tokio::time::sleep(Duration::from_secs(1)).await;
+
     'outer: loop {
         let actor_ids: Vec<_> = {
             let r = bookie.read("compact empties loop").await;
@@ -1244,6 +1247,7 @@ pub async fn clear_empty_versions_loop(agent: Agent, bookie: Bookie, tripwire: T
             }
             tokio::task::yield_now().await;
         }
+        // tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     info!("clear_empty_versions ended");
@@ -1264,31 +1268,35 @@ pub async fn clear_empty_versions(
     let start = Instant::now();
 
     let mut query = r#"SELECT start_version FROM __corro_bookkeeping WHERE actor_id = :actor_id AND end_version IS null AND db_version
-    NOT IN (SELECT DISTINCT db_version FROM crsql_changes WHERE site_id = :actor_id)"#.to_string();
+    NOT IN (SELECT DISTINCT db_version FROM __corro_changes WHERE site_id = :actor_id)"#.to_string();
 
     if let Some(n) = limit {
-        query = query.to_owned() + format!(" LIMIT {n}").as_str();
+        query = format!("{query} LIMIT {n}");
     }
 
-    let conn = agent.pool().read().await?;
+    let overwritten_versions: RangeInclusiveSet<Version> = {
+        let conn = agent.pool().read().await?;
 
-    let overwritten_versions: RangeInclusiveSet<Version> = conn
-        .prepare(&query)?
-        .query_map(named_params! {":actor_id": actor_id}, |row| {
-            Ok(row.get(0)?..=row.get(0)?)
+        block_in_place(|| {
+            debug!(%self_actor_id, "running query to find cleared...");
+            conn.prepare(&query)?
+                .query_map(named_params! {":actor_id": actor_id}, |row| {
+                    Ok(row.get(0)?..=row.get(0)?)
+                })?
+                .collect::<rusqlite::Result<RangeInclusiveSet<Version>>>()
         })?
-        .collect::<rusqlite::Result<RangeInclusiveSet<Version>>>()?;
+    };
 
-    let total = overwritten_versions.len();
+    // let total = overwritten_versions.len();
 
-    if let Some(ref tx) = feedback {
-        tx.send(format!(
-            "got {total} ranges to clear for actor {actor_id} in {:?} ",
-            start.elapsed()
-        ))
-        .await?
-    }
-    debug!(%self_actor_id, "got {total} ranges - {overwritten_versions:?} to clear for actor {actor_id}");
+    // if let Some(ref tx) = feedback {
+    //     tx.send(format!(
+    //         "got {total} ranges to clear for actor {actor_id} in {:?} ",
+    //         start.elapsed()
+    //     ))
+    //     .await?
+    // }
+    // debug!(%self_actor_id, "got {total} ranges - {overwritten_versions:?} to clear for actor {actor_id}");
 
     // let mut chunk: Vec<RangeInclusive<Version>> = vec![];
     // for v in overwritten_versions {

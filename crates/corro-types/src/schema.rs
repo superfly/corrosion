@@ -164,6 +164,76 @@ impl Schema {
 
         Ok(())
     }
+
+    pub fn view_stmt(&self) -> String {
+        if self.tables.is_empty() {
+            return r#"SELECT
+                NULL as "table",
+                NULL as pk,
+                NULL as cid,
+                NULL as val,
+                NULL as col_version,
+                NULL as db_version,
+                NULL as seq,
+                NULL as site_id,
+                NULL as cl
+                FROM sqlite_schema
+                LIMIT 0
+                "#
+            .into();
+        }
+
+        let unions: Vec<String> = self
+            .tables
+            .iter()
+            .map(|(name, table)| {
+                let pk_list = table
+                    .pk
+                    .iter()
+                    .map(|pk| format!("pk_tbl.{pk}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+
+                let pk_names = table
+                .pk
+                .iter().map(|pk| format!("'{}'", escape_ident_as_value(pk))).collect::<Vec<_>>().join(",");
+
+                format!(
+                    "SELECT
+                      '{table_name_val}' as tbl,
+                      crsql_pack_columns({pk_list}) as pk,
+                      t1.col_name as cid,
+                      corro_get_value('{table_name_val}', t1.col_name, {pk_names}, {pk_list}) as val,
+                      t1.col_version as col_version,
+                      t1.db_version as db_version,
+                      site_tbl.site_id as site_id,
+                      t1.seq as seq,
+                      COALESCE(t2.col_version, 1) as cl
+                  FROM \"{table_name_ident}__crsql_clock\" AS t1
+                  JOIN \"{table_name_ident}__crsql_pks\" AS pk_tbl ON t1.key = pk_tbl.__crsql_key
+                  LEFT JOIN crsql_site_id AS site_tbl ON t1.site_id = site_tbl.ordinal
+                  LEFT JOIN \"{table_name_ident}__crsql_clock\" AS t2 ON
+                  t1.key = t2.key AND t2.col_name = '{sentinel}'",
+                    table_name_val = escape_ident_as_value(name),
+                    table_name_ident = escape_ident(name),
+                    sentinel = "-1"
+                )
+            })
+            .collect();
+
+        format!(
+            r#"CREATE VIEW __corro_changes AS SELECT tbl AS "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM ({})"#,
+            unions.join(" UNION ALL ")
+        )
+    }
+}
+
+pub fn escape_ident(ident: &str) -> String {
+    ident.replace('"', "\"\"")
+}
+
+pub fn escape_ident_as_value(ident: &str) -> String {
+    ident.replace('\'', "''")
 }
 
 #[derive(Debug, thiserror::Error)]

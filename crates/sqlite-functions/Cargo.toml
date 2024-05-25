@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
+enquote = { workspace = true }
+hex = { workspace = true }

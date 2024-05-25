@@ -3158,7 +3158,9 @@ mod tests {
 
             assert!(exec_elapsed > sema_elapsed);
 
-            let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
+            let row = client
+                .query_one("SELECT * FROM __corro_changes", &[])
+                .await?;
             println!("CHANGE ROW: {row:?}");
 
             let row = client

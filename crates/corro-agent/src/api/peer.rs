@@ -1730,7 +1730,7 @@ mod tests {
             let mut conn = agent.pool().read().await?;
 
             {
-                let mut prepped = conn.prepare("SELECT * FROM crsql_changes;")?;
+                let mut prepped = conn.prepare("SELECT * FROM __corro_changes;")?;
                 let mut rows = prepped.query([])?;
 
                 loop {
@@ -1834,7 +1834,7 @@ mod tests {
             let mut conn = agent.pool().read().await?;
 
             {
-                let mut prepped = conn.prepare("SELECT * FROM crsql_changes;")?;
+                let mut prepped = conn.prepare("SELECT * FROM __corro_changes;")?;
                 let mut rows = prepped.query([])?;
 
                 loop {

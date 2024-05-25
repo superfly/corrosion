@@ -456,7 +456,7 @@ pub async fn broadcast_changes(
         let mut prepped = conn.prepare_cached(
             r#"
                     SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                        FROM crsql_changes
+                        FROM __corro_changes
                         WHERE db_version = ?
                         ORDER BY seq ASC
                 "#,

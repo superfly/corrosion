@@ -1643,7 +1643,7 @@ impl Matcher {
             let mut changes_prepped = state_conn.prepare_cached(
                 r#"
             SELECT DISTINCT "table", pk
-                FROM crsql_changes
+                FROM __corro_changes
                     WHERE db_version > ?
                       AND db_version <= ? -- TODO: allow going over?
                       AND ("table", cid) IN __corro_sub.columns -- only care about table/columns touched by the query
@@ -2554,7 +2554,7 @@ mod tests {
             }
 
             let changes = {
-                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = ? ORDER BY seq ASC"#).unwrap();
+                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM __corro_changes WHERE db_version = ? ORDER BY seq ASC"#).unwrap();
                 let rows = prepped.query_map([1], row_to_change).unwrap();
 
                 let mut changes = vec![];

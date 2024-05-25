@@ -15,8 +15,7 @@ use rangemap::RangeInclusiveSet;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::{
-    sync::mpsc,
-    time::{sleep, timeout, MissedTickBehavior},
+    sync::mpsc, task::block_in_place, time::{sleep, timeout, MissedTickBehavior}
 };
 use tracing::{debug, info_span};
 
@@ -474,14 +473,14 @@ pub async fn configurable_stress_test(
 
             let conn = ta.agent.pool().read().await?;
             let counts: HashMap<ActorId, i64> = conn
-                .prepare_cached("SELECT site_id, count(*) FROM crsql_changes GROUP BY site_id;")?
+                .prepare_cached("SELECT site_id, count(*) FROM __corro_changes GROUP BY site_id;")?
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
 
             debug!("versions count: {counts:?}");
 
             let actual_count: i64 =
-                conn.query_row("SELECT count(*) FROM crsql_changes;", (), |row| row.get(0))?;
+                conn.query_row("SELECT count(*) FROM __corro_changes;", (), |row| row.get(0))?;
             debug!("actual count: {actual_count}");
 
             debug!(
@@ -529,11 +528,11 @@ pub async fn configurable_stress_test(
                 }
 
                 let actual_count: i64 =
-                    conn.query_row("SELECT count(*) FROM crsql_changes;", (), |row| row.get(0))?;
+                    conn.query_row("SELECT count(*) FROM __corro_changes;", (), |row| row.get(0))?;
                 debug!("actual count: {actual_count}");
                 if actual_count != changes_count {
                     println!(
-                        "{}: still missing {} rows in crsql_changes",
+                        "{}: still missing {} rows in __corro_changes",
                         ta.agent.actor_id(),
                         changes_count - actual_count
                     );
@@ -890,6 +889,8 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     .await;
     assert_eq!(status_code, StatusCode::OK);
 
+    // tokio::time::sleep(Duration::from_secs(1)).await;
+
     // make about 50 transactions to ta1
     insert_rows(ta1.agent.clone(), 1, 50).await;
 
@@ -1035,6 +1036,7 @@ async fn check_bookie_versions(
     let booked = ta.bookie.write("test").await.ensure(actor_id);
     let bookedv = booked.read("test").await;
 
+    block_in_place(|| {
     for versions in complete {
         for version in versions.clone() {
             let bk: Vec<(ActorId, Version, Option<Version>)> = conn
@@ -1104,6 +1106,7 @@ async fn check_bookie_versions(
     }
 
     Ok(())
+})
 }
 
 async fn get_rows(
@@ -1123,23 +1126,33 @@ async fn get_rows(
         seq: i64,
         // cl: i64,
     }
+
+    block_in_place(|| {
     // let conn = agent.pool().read().await.unwrap();
-    let changes = conn.prepare(r#"SELECT  col_name, col_version, db_version, seq FROM tests3__crsql_clock"#).unwrap()
-        .query_map([], |row|{
-            Ok(CorroBook {
-                // table: row.get(0)?,
-                cid: row.get(0)?,
-                // val: row.get(3)?,
-                // pk: row.get(1)?,
-                col_version: row.get(1)?,
-                db_version: row.get(2)?,
-                seq: row.get(3)?,
-                // cl: row.get(8)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    println!("{:?}: get clocksss crsql_clock - {:?}", agent.actor_id(), changes);
-    let changes = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes"#).unwrap()
+    let changes = 
+        conn.prepare(r#"SELECT  col_name, col_version, db_version, seq FROM tests3__crsql_clock"#)
+            .unwrap()
+            .query_map([], |row| {
+                Ok(CorroBook {
+                    // table: row.get(0)?,
+                    cid: row.get(0)?,
+                    // val: row.get(3)?,
+                    // pk: row.get(1)?,
+                    col_version: row.get(1)?,
+                    db_version: row.get(2)?,
+                    seq: row.get(3)?,
+                    // cl: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    ?;
+    println!(
+        "{:?}: get clocksss crsql_clock - {:?}",
+        agent.actor_id(),
+        changes
+    );
+    let changes = 
+        conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM __corro_changes"#).unwrap()
         .query_map([], |row|{
             Ok(CorroBook {
                 // table: row.get(0)?,
@@ -1152,14 +1165,18 @@ async fn get_rows(
                 // cl: rowsite_id.get(8)?,
             })
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    println!("{:?}: get rowss crsql_changes - {:?}", agent.actor_id(), changes);
-
+        .collect::<rusqlite::Result<Vec<_>>>()
+    ?;
+    println!(
+        "{:?}: get rowss crsql_changes - {:?}",
+        agent.actor_id(),
+        changes
+    );
 
     for versions in v {
         for version in versions.0 {
             let count: u64 = conn.query_row(
-                "SELECT COUNT(*) FROM crsql_changes where db_version = ?",
+                "SELECT COUNT(*) FROM __corro_changes where db_version = ?",
                 [version],
                 |row| row.get(0),
             )?;
@@ -1170,7 +1187,7 @@ async fn get_rows(
             }
             let mut query =
                 r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-            FROM crsql_changes where db_version = ?"#
+            FROM __corro_changes where db_version = ?"#
                     .to_string();
             let changes: Vec<Change>;
             let seqs = if let Some(seq) = versions.1.clone() {
@@ -1205,7 +1222,7 @@ async fn get_rows(
             ))
         }
     }
-    Ok(result)
+    Ok(result)})
 }
 
 async fn insert_rows(agent: Agent, start: i64, n: i64) {
@@ -2105,7 +2122,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
     );
 
     let mut changes = vec![];
-    let mut prepped = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes"#)?;
+    let mut prepped = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM __corro_changes"#)?;
     let mut rows = prepped.query([])?;
 
     while let Some(row) = rows.next()? {
@@ -2169,7 +2186,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
     );
 
     let mut changes = vec![];
-    let mut prepped = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = 2"#)?;
+    let mut prepped = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM __corro_changes WHERE db_version = 2"#)?;
     let mut rows = prepped.query([])?;
 
     while let Some(row) = rows.next()? {

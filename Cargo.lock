@@ -3758,6 +3758,8 @@ dependencies = [
 name = "sqlite-functions"
 version = "0.1.0"
 dependencies = [
+ "enquote",
+ "hex",
  "rusqlite",
  "serde_json",
 ]

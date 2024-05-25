@@ -154,7 +154,7 @@ pub fn insert_local_changes(
         })?;
 
     let has_changes: bool = tx
-        .prepare_cached("SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE db_version = ?);")
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_changes WHERE db_version = ?);")
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
@@ -177,7 +177,7 @@ pub fn insert_local_changes(
     trace!("version: {version}");
 
     let last_seq: CrsqlSeq = tx
-        .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")
+        .prepare_cached("SELECT MAX(seq) FROM __corro_changes WHERE db_version = ?")
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),

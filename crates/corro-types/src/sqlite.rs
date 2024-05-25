@@ -7,7 +7,7 @@ use once_cell::sync::Lazy;
 use rusqlite::{params, Connection, Transaction};
 use sqlite_pool::SqliteConn;
 use tempfile::TempDir;
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace};
 
 pub type SqlitePool = sqlite_pool::Pool<CrConn>;
 pub type SqlitePoolError = sqlite_pool::PoolError;
@@ -82,6 +82,7 @@ impl DerefMut for CrConn {
 
 impl Drop for CrConn {
     fn drop(&mut self) {
+        debug!("CrConn dropped, pool must have been drained!");
         if let Err(e) = self.execute_batch("select crsql_finalize();") {
             error!("could not crsql_finalize: {e}");
         }
