@@ -165,7 +165,14 @@ impl Schema {
         Ok(())
     }
 
-    pub fn view_stmt(&self) -> String {
+    pub fn create_changes_view(&self, conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(&format!(
+            "DROP VIEW IF EXISTS __corro_changes; {}",
+            self.view_stmt()
+        ))
+    }
+
+    fn view_stmt(&self) -> String {
         if self.tables.is_empty() {
             return r#"CREATE VIEW __corro_changes AS SELECT
                 NULL as "table",
@@ -705,6 +712,8 @@ pub fn apply_schema(
             ))?;
         }
     }
+
+    new_schema.create_changes_view(&tx)?;
 
     Ok(())
 }

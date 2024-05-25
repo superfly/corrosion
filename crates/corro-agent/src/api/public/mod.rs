@@ -474,11 +474,6 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
             info!("Updated {n} rows in __corro_schema for table {tbl_name}");
         }
 
-        let view_stmt = new_schema.view_stmt();
-        println!("view stmt: {view_stmt}");
-
-        tx.execute_batch(&format!("DROP VIEW IF EXISTS __corro_changes; {view_stmt}",))?;
-
         tx.commit()?;
 
         Ok::<_, eyre::Report>(())

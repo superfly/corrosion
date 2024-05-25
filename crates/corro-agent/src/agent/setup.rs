@@ -90,10 +90,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
 
-        conn.execute_batch(&format!(
-            "DROP VIEW IF EXISTS __corro_changes; {}",
-            schema.view_stmt()
-        ))?;
+        schema.create_changes_view(&conn)?;
 
         schema
     };
