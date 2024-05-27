@@ -224,13 +224,18 @@ impl Schema {
                     .map(|(name, _)| format!("{}", name))
                     .collect();
 
-                let pivot_row = col_names
-                    .iter()
-                    .map(|col| {
-                        format!("SELECT {pk_names}, '{col}' as col, {col} as val from {name}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" UNION ALL ");
+                let pivot_row = if col_names.len() > 0 {
+                    col_names
+                        .iter()
+                        .map(|col| {
+                            format!("SELECT {pk_names}, '{col}' as col, {col} as val from {name}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" UNION ALL ")
+                } else {
+                    // account for cases where table has only primary keys
+                    format!("SELECT {pk_names}, -1 as col, NULL as val from {name}")
+                };
 
                 values_table.push(format!("val_{name} AS ({pivot_row})"));
                 format!(
@@ -247,7 +252,7 @@ impl Schema {
                   FROM \"{table_name_ident}__crsql_clock\" AS t1
                   JOIN \"{table_name_ident}__crsql_pks\" AS pk_tbl ON t1.key = pk_tbl.__crsql_key
                   LEFT JOIN crsql_site_id AS site_tbl ON t1.site_id = site_tbl.ordinal
-                  LEFT JOIN val_{name} ON {on_clause}
+                  LEFT JOIN val_{name} ON {on_clause} and t1.col_name = val_{name}.col
                   LEFT JOIN \"{table_name_ident}__crsql_clock\" AS t2 ON
                   t1.key = t2.key AND t2.col_name = '{sentinel}'",
                     table_name_val = escape_ident_as_value(name),
