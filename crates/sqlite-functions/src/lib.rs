@@ -18,7 +18,7 @@ fn add_corro_get_value(db: &Connection) -> Result<()> {
     db.create_scalar_function(
         "corro_get_value",
         -1,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        FunctionFlags::SQLITE_UTF8,
         move |ctx| {
             assert!(
                 ctx.len() >= 4,
@@ -48,12 +48,14 @@ fn add_corro_get_value(db: &Connection) -> Result<()> {
 
             let conn = unsafe { ctx.get_connection() }?;
 
-            let mut prepped = conn.prepare_cached(&format!(
+            let q = format!(
                 "SELECT {} FROM {} WHERE {}",
                 col_name.as_str()?,
                 tbl_name.as_str()?,
                 conditions.join(" AND ")
-            ))?;
+            );
+
+            let mut prepped = conn.prepare_cached(&q)?;
             let val: SqliteValue = prepped.query_row(params_from_iter(values), |row| row.get(0))?;
 
             Ok(val)

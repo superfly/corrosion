@@ -1247,7 +1247,7 @@ pub async fn clear_empty_versions_loop(agent: Agent, bookie: Bookie, tripwire: T
             }
             tokio::task::yield_now().await;
         }
-        // tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     info!("clear_empty_versions ended");

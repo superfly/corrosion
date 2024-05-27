@@ -166,10 +166,9 @@ impl Schema {
     }
 
     pub fn create_changes_view(&self, conn: &Connection) -> rusqlite::Result<()> {
-        conn.execute_batch(&format!(
-            "DROP VIEW IF EXISTS __corro_changes; {}",
-            self.view_stmt()
-        ))
+        let stmt = self.view_stmt();
+        trace!("view stmt: {stmt}");
+        conn.execute_batch(&format!("DROP VIEW IF EXISTS __corro_changes; {stmt}",))
     }
 
     fn view_stmt(&self) -> String {
@@ -210,7 +209,7 @@ impl Schema {
                       '{table_name_val}' as tbl,
                       crsql_pack_columns({pk_list}) as pk,
                       t1.col_name as cid,
-                      corro_get_value('{table_name_val}', t1.col_name, {pk_names}, {pk_list}) as val,
+                      CASE t1.col_name WHEN '{sentinel}' THEN NULL ELSE corro_get_value('{table_name_val}', t1.col_name, {pk_names}, {pk_list}) END as val,
                       t1.col_version as col_version,
                       t1.db_version as db_version,
                       site_tbl.site_id as site_id,

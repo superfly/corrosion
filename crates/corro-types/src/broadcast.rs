@@ -455,11 +455,11 @@ pub async fn broadcast_changes(
         // TODO: make this more generic so both sync and local changes can use it.
         let mut prepped = conn.prepare_cached(
             r#"
-                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                        FROM __corro_changes
-                        WHERE db_version = ?
-                        ORDER BY seq ASC
-                "#,
+                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                    FROM __corro_changes
+                    WHERE db_version = ?
+                    ORDER BY seq ASC
+            "#,
         )?;
         let rows = prepped.query_map([db_version], row_to_change)?;
         let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
