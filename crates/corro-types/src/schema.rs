@@ -205,7 +205,7 @@ impl Schema {
                 let on_clause = table
                     .pk
                     .iter()
-                    .map(|pk| format!("pk_tbl.{pk} = val_{name}.{pk}"))
+                    .map(|pk| format!("pk_tbl.{pk} = {name}.{pk}"))
                     .collect::<Vec<_>>()
                     .join(" AND ");
 
@@ -224,18 +224,13 @@ impl Schema {
                     .map(|(name, _)| format!("{}", name))
                     .collect();
 
-                let pivot_row = if col_names.len() > 0 {
-                    col_names
+                let pivot_row = col_names
                         .iter()
                         .map(|col| {
-                            format!("SELECT {pk_names}, '{col}' as col, {col} as val from {name}")
+                            format!("WHEN '{col}' THEN {name}.{col}")
                         })
                         .collect::<Vec<_>>()
-                        .join(" UNION ALL ")
-                } else {
-                    // account for cases where table has only primary keys
-                    format!("SELECT {pk_names}, -1 as col, NULL as val from {name}")
-                };
+                        .join(" ");
 
                 values_table.push(format!("val_{name} AS ({pivot_row})"));
                 format!(
@@ -243,7 +238,7 @@ impl Schema {
                       '{table_name_val}' as tbl,
                       crsql_pack_columns({pk_list}) as pk,
                       t1.col_name as cid,
-                      CASE t1.col_name WHEN '{sentinel}' THEN NULL ELSE val_{name}.val END as val,
+                      CASE t1.col_name WHEN '{sentinel}' THEN NULL {pivot_row} END as val,
                       t1.col_version as col_version,
                       t1.db_version as db_version,
                       site_tbl.site_id as site_id,
@@ -252,7 +247,7 @@ impl Schema {
                   FROM \"{table_name_ident}__crsql_clock\" AS t1
                   JOIN \"{table_name_ident}__crsql_pks\" AS pk_tbl ON t1.key = pk_tbl.__crsql_key
                   LEFT JOIN crsql_site_id AS site_tbl ON t1.site_id = site_tbl.ordinal
-                  LEFT JOIN val_{name} ON {on_clause} and t1.col_name = val_{name}.col
+                  LEFT JOIN {name} ON {on_clause}
                   LEFT JOIN \"{table_name_ident}__crsql_clock\" AS t2 ON
                   t1.key = t2.key AND t2.col_name = '{sentinel}'",
                     table_name_val = escape_ident_as_value(name),
@@ -263,8 +258,7 @@ impl Schema {
             .collect();
 
         format!(
-            r#"CREATE VIEW __corro_changes AS SELECT tbl AS "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM (WITH {} {})"#,
-            values_table.join(", "),
+            r#"CREATE VIEW __corro_changes AS SELECT tbl AS "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM ({})"#,
             unions.join(" UNION ALL ")
         )
     }
