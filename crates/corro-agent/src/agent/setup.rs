@@ -78,7 +78,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         })
     }?;
 
-    info!("Actor ID: {actor_id}");
+    info!("Actor ID: {actor_id}, path - {}", conf.db.path);
 
     let write_sema = Arc::new(Semaphore::new(1));
 

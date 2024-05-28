@@ -1288,7 +1288,7 @@ pub async fn clear_empty_versions(
         ))
         .await?
     }
-    debug!(%self_actor_id, "got {total} ranges - {overwritten_versions:?} to clear for actor {actor_id}");
+    // debug!(%self_actor_id, "got {total} ranges - {overwritten_versions:?} to clear for actor {actor_id}");
 
     // let mut chunk: Vec<RangeInclusive<Version>> = vec![];
     // for v in overwritten_versions {
