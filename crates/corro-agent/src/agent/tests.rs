@@ -820,44 +820,44 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     )
     .await?;
     // find and clear empty versions
-    // process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
-    // check_bookie_versions(
-    //     ta2.clone(),
-    //     ta1.agent.actor_id(),
-    //     vec![Version(1)..=Version(50)],
-    //     vec![],
-    //     vec![],
-    //     vec![],
-    // )
-    // .await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![Version(1)..=Version(50)],
+        vec![],
+        vec![],
+        vec![],
+    )
+    .await?;
 
-    // clear_empty_versions(ta2.agent.clone(), ta1.agent.actor_id(), None, Some(1)).await?;
-    // check_bookie_versions(
-    //     ta2.clone(),
-    //     ta1.agent.actor_id(),
-    //     vec![],
-    //     vec![],
-    //     vec![],
-    //     vec![Version(1)..=Version(1)],
-    // )
-    // .await?;
-    //
-    // clear_empty_versions(ta2.agent.clone(), ta1.agent.actor_id(), None, None).await?;
-    //
-    // check_bookie_versions(
-    //     ta2.clone(),
-    //     ta1.agent.actor_id(),
-    //     vec![],
-    //     vec![],
-    //     vec![],
-    //     vec![
-    //         Version(1)..=Version(5),
-    //         Version(10)..=Version(10),
-    //         Version(23)..=Version(25),
-    //         Version(30)..=Version(30),
-    //     ],
-    // )
-    // .await?;
+    clear_empty_versions(ta2.agent.clone(), ta1.agent.actor_id(), None, Some(1)).await?;
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![],
+        vec![],
+        vec![],
+        vec![Version(1)..=Version(1)],
+    )
+    .await?;
+
+    clear_empty_versions(ta2.agent.clone(), ta1.agent.actor_id(), None, None).await?;
+
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![],
+        vec![],
+        vec![],
+        vec![
+            Version(1)..=Version(5),
+            Version(10)..=Version(10),
+            Version(23)..=Version(25),
+            Version(30)..=Version(30),
+        ],
+    )
+    .await?;
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
@@ -895,7 +895,6 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
 
     // sent 1-5
     let rows = get_rows(ta1.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
-    debug!("rows - {:?}", rows);
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
     // check ta2 bookie
     check_bookie_versions(
@@ -908,113 +907,113 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     )
     .await?;
 
-    // // sent: 1-5, 9-10
-    // let rows = get_rows(ta1.agent.clone(), vec![(Version(9)..=Version(10), None)]).await?;
-    // process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
-    // // check for gap 6-8
-    // check_bookie_versions(
-    //     ta2.clone(),
-    //     ta1.agent.actor_id(),
-    //     vec![],
-    //     vec![Version(6)..=Version(8)],
-    //     vec![],
-    //     vec![],
-    // )
-    // .await?;
-    //
-    // // create more gaps plus send partials
-    // // sent 1-5, 9-10, 15-16*, 20
-    // // * indicates partial version
-    // let rows = get_rows(
-    //     ta1.agent.clone(),
-    //     vec![
-    //         (Version(20)..=Version(20), None),
-    //         (Version(15)..=Version(16), Some(CrsqlSeq(0)..=CrsqlSeq(0))),
-    //     ],
-    // )
-    // .await?;
-    // process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
-    // // check for gap 11-14 and 17-19
-    // check_bookie_versions(
-    //     ta2.clone(),
-    //     ta1.agent.actor_id(),
-    //     vec![],
-    //     vec![Version(11)..=Version(14), Version(17)..=Version(19)],
-    //     vec![(Version(15)..=Version(16), CrsqlSeq(0)..=CrsqlSeq(0))],
-    //     vec![],
-    // )
-    // .await?;
-    //
-    // // clear versions 21-25. max version is now 55
-    // insert_rows(ta1.agent.clone(), 21, 25).await;
-    // // send non-contiguous cleared versions
-    // // sent 1-5, 9-10, 15-16*, 20, 21, 25
-    // let rows = get_rows(
-    //     ta1.agent.clone(),
-    //     vec![
-    //         (Version(21)..=Version(21), None),
-    //         (Version(25)..=Version(25), None),
-    //     ],
-    // )
-    // .await?;
-    // process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
-    //
-    // check_bookie_versions(
-    //     ta2.clone(),
-    //     ta1.agent.actor_id(),
-    //     vec![],
-    //     vec![],
-    //     vec![],
-    //     vec![Version(21)..=Version(21), Version(25)..=Version(25)],
-    // )
-    // .await?;
-    //
-    // // send some missing gaps, partials and cleared version
-    // // sent 1-5, 9-10, 14-18, 20, 23-25
-    // let rows = get_rows(
-    //     ta1.agent.clone(),
-    //     vec![
-    //         (Version(14)..=Version(18), None),
-    //         (Version(15)..=Version(16), Some(CrsqlSeq(1)..=CrsqlSeq(3))),
-    //         (Version(23)..=Version(24), None),
-    //     ],
-    // )
-    // .await?;
-    // process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
-    // check_bookie_versions(
-    //     ta2.clone(),
-    //     ta1.agent.actor_id(),
-    //     vec![Version(14)..=Version(18), Version(15)..=Version(16)],
-    //     vec![
-    //         Version(11)..=Version(13),
-    //         Version(19)..=Version(19),
-    //         Version(22)..=Version(22),
-    //     ],
-    //     vec![],
-    //     vec![Version(23)..=Version(25)],
-    // )
-    // .await?;
-    //
-    // // sent 1-25
-    // let rows = get_rows(
-    //     ta1.agent.clone(),
-    //     vec![
-    //         (Version(6)..=Version(8), None),
-    //         (Version(11)..=Version(19), None),
-    //         (Version(22)..=Version(22), None),
-    //     ],
-    // )
-    // .await?;
-    // process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
-    // check_bookie_versions(
-    //     ta2.clone(),
-    //     ta1.agent.actor_id(),
-    //     vec![Version(1)..=Version(20)],
-    //     vec![],
-    //     vec![],
-    //     vec![Version(21)..=Version(25)],
-    // )
-    // .await?;
+    // sent: 1-5, 9-10
+    let rows = get_rows(ta1.agent.clone(), vec![(Version(9)..=Version(10), None)]).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    // check for gap 6-8
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![],
+        vec![Version(6)..=Version(8)],
+        vec![],
+        vec![],
+    )
+    .await?;
+
+    // create more gaps plus send partials
+    // sent 1-5, 9-10, 15-16*, 20
+    // * indicates partial version
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![
+            (Version(20)..=Version(20), None),
+            (Version(15)..=Version(16), Some(CrsqlSeq(0)..=CrsqlSeq(0))),
+        ],
+    )
+    .await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    // check for gap 11-14 and 17-19
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![],
+        vec![Version(11)..=Version(14), Version(17)..=Version(19)],
+        vec![(Version(15)..=Version(16), CrsqlSeq(0)..=CrsqlSeq(0))],
+        vec![],
+    )
+    .await?;
+
+    // clear versions 21-25. max version is now 55
+    insert_rows(ta1.agent.clone(), 21, 25).await;
+    // send non-contiguous cleared versions
+    // sent 1-5, 9-10, 15-16*, 20, 21, 25
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![
+            (Version(21)..=Version(21), None),
+            (Version(25)..=Version(25), None),
+        ],
+    )
+    .await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![],
+        vec![],
+        vec![],
+        vec![Version(21)..=Version(21), Version(25)..=Version(25)],
+    )
+    .await?;
+
+    // send some missing gaps, partials and cleared version
+    // sent 1-5, 9-10, 14-18, 20, 23-25
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![
+            (Version(14)..=Version(18), None),
+            (Version(15)..=Version(16), Some(CrsqlSeq(1)..=CrsqlSeq(3))),
+            (Version(23)..=Version(24), None),
+        ],
+    )
+    .await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![Version(14)..=Version(18), Version(15)..=Version(16)],
+        vec![
+            Version(11)..=Version(13),
+            Version(19)..=Version(19),
+            Version(22)..=Version(22),
+        ],
+        vec![],
+        vec![Version(23)..=Version(25)],
+    )
+    .await?;
+
+    // sent 1-25
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![
+            (Version(6)..=Version(8), None),
+            (Version(11)..=Version(19), None),
+            (Version(22)..=Version(22), None),
+        ],
+    )
+    .await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![Version(1)..=Version(20)],
+        vec![],
+        vec![],
+        vec![Version(21)..=Version(25)],
+    )
+    .await?;
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;

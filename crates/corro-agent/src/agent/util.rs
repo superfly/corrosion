@@ -805,6 +805,7 @@ pub async fn process_multiple_changes(
                             continue;
                         }
                     };
+                    debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "got known to insert: {known:?}");
                     known
                 };
 
@@ -1238,10 +1239,10 @@ pub async fn clear_empty_versions_loop(agent: Agent, bookie: Bookie, tripwire: T
                 break 'outer;
             }
 
-            if let Err(e) = clear_empty_versions(agent.clone(), actor_id, None, Some(100)).await {
+            if let Err(e) = clear_empty_versions(agent.clone(), actor_id, None, Some(50)).await {
                 error!(%actor_id, "could not clear empty versions - {e}");
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
@@ -1287,48 +1288,48 @@ pub async fn clear_empty_versions(
         ))
         .await?
     }
-    // debug!(%self_actor_id, "got {total} ranges - {overwritten_versions:?} to clear for actor {actor_id}");
+    debug!(%self_actor_id, "got {total} ranges - {overwritten_versions:?} to clear for actor {actor_id}");
 
-    // let mut chunk: Vec<RangeInclusive<Version>> = vec![];
-    // for v in overwritten_versions {
-    //     chunk.push(v);
-    //
-    //     if chunk.len() == 5 {
-    //         if let Some(ref tx) = feedback {
-    //             tx.send("clearing next 5 empty ranges".to_string()).await?
-    //         }
-    //
-    //         let mut conn = agent.pool().write_low().await?;
-    //         let tx = conn.immediate_transaction()?;
-    //         for v in chunk {
-    //             store_empty_changeset(&tx, actor_id, v)?;
-    //         }
-    //         tx.commit()?;
-    //         chunk = vec![];
-    //     }
-    // }
-    //
-    // // the rest in the chunks
-    // {
-    //     let mut conn = agent.pool().write_low().await?;
-    //     let tx = conn.immediate_transaction()?;
-    //     for v in chunk {
-    //         store_empty_changeset(&tx, actor_id, v)?;
-    //     }
-    //     tx.commit()?;
-    // }
+    let mut chunk: Vec<RangeInclusive<Version>> = vec![];
+    for v in overwritten_versions {
+        chunk.push(v);
 
-    // if let Some(ref tx) = feedback {
-    //     tx.send(format!(
-    //         "cleared empty versions for actor {actor_id} in {:?}",
-    //         start.elapsed()
-    //     ))
-    //     .await?
-    // }
-    // debug!(
-    //     "cleared empty versions for actor {actor_id} in {:?}",
-    //     start.elapsed()
-    // );
+        if chunk.len() == 5 {
+            if let Some(ref tx) = feedback {
+                tx.send("clearing next 5 empty ranges".to_string()).await?
+            }
+
+            let mut conn = agent.pool().write_low().await?;
+            let tx = conn.immediate_transaction()?;
+            for v in chunk {
+                store_empty_changeset(&tx, actor_id, v)?;
+            }
+            tx.commit()?;
+            chunk = vec![];
+        }
+    }
+
+    // the rest in the chunks
+    {
+        let mut conn = agent.pool().write_low().await?;
+        let tx = conn.immediate_transaction()?;
+        for v in chunk {
+            store_empty_changeset(&tx, actor_id, v)?;
+        }
+        tx.commit()?;
+    }
+
+    if let Some(ref tx) = feedback {
+        tx.send(format!(
+            "cleared empty versions for actor {actor_id} in {:?}",
+            start.elapsed()
+        ))
+        .await?
+    }
+    debug!(
+        "cleared empty versions for actor {actor_id} in {:?}",
+        start.elapsed()
+    );
 
     Ok(())
 }
