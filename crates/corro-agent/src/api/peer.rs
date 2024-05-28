@@ -1060,7 +1060,7 @@ pub async fn parallel_sync(
 
                     let needs = our_sync_state.compute_available_needs(&their_sync_state);
 
-                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
+                    debug!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs - {needs:?}");
 
                     Ok::<_, SyncError>((needs, tx, read))
                 }.await
