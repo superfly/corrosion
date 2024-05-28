@@ -805,7 +805,6 @@ pub async fn process_multiple_changes(
                             continue;
                         }
                     };
-                    debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "got known to insert: {known:?}");
                     known
                 };
 
@@ -1242,7 +1241,7 @@ pub async fn clear_empty_versions_loop(agent: Agent, bookie: Bookie, tripwire: T
             if let Err(e) = clear_empty_versions(agent.clone(), actor_id, None, Some(100)).await {
                 error!(%actor_id, "could not clear empty versions - {e}");
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
 

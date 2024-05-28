@@ -1311,7 +1311,7 @@ pub async fn parallel_sync(
                             counter!("corro.sync.changes.recv", "actor_id" => actor_id.to_string())
                                 .increment(changes_len as u64);
 
-                            debug!(
+                            debug!(%actor_id,
                                 "handling versions: {:?}, seqs: {:?}, len: {changes_len}",
                                 change.versions(),
                                 change.seqs()

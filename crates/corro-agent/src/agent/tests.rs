@@ -1112,49 +1112,6 @@ async fn get_rows(
 ) -> eyre::Result<Vec<(ChangeV1, ChangeSource, Instant)>> {
     let mut result = vec![];
     let conn = agent.pool().read().await?;
-    #[derive(Debug)]
-    struct CorroBook {
-        // table: String,
-        cid: String,
-        // pk: Vec<u8>,
-        // val: i64,
-        col_version: i64,
-        db_version: CrsqlDbVersion,
-        seq: i64,
-        // cl: i64,
-    }
-    // let conn = agent.pool().read().await.unwrap();
-    let changes = conn.prepare(r#"SELECT  col_name, col_version, db_version, seq FROM tests3__crsql_clock"#).unwrap()
-        .query_map([], |row|{
-            Ok(CorroBook {
-                // table: row.get(0)?,
-                cid: row.get(0)?,
-                // val: row.get(3)?,
-                // pk: row.get(1)?,
-                col_version: row.get(1)?,
-                db_version: row.get(2)?,
-                seq: row.get(3)?,
-                // cl: row.get(8)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    println!("{:?}: get clocksss crsql_clock - {:?}", agent.actor_id(), changes);
-    let changes = conn.prepare(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes"#).unwrap()
-        .query_map([], |row|{
-            Ok(CorroBook {
-                // table: row.get(0)?,
-                cid: row.get(2)?,
-                // val: row.get(3)?,
-                // pk: row.get(1)?,
-                col_version: row.get(4)?,
-                db_version: row.get(5)?,
-                seq: row.get(6)?,
-                // cl: rowsite_id.get(8)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    println!("{:?}: get rowss crsql_changes - {:?}", agent.actor_id(), changes);
-
 
     for versions in v {
         for version in versions.0 {
