@@ -1060,7 +1060,7 @@ pub async fn parallel_sync(
 
                     let needs = our_sync_state.compute_available_needs(&their_sync_state);
 
-                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
+                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs - {needs:?}");
 
                     Ok::<_, SyncError>((needs, tx, read))
                 }.await
@@ -1070,7 +1070,7 @@ pub async fn parallel_sync(
     .collect::<Vec<(ActorId, SocketAddr, Result<_, SyncError>)>>()
     .await;
 
-    debug!("collected member needs and such!");
+    debug!(self_actor_id = %agent.actor_id(), "collected member needs and such!");
 
     #[allow(clippy::manual_try_fold)]
     let syncers = results
@@ -1311,7 +1311,7 @@ pub async fn parallel_sync(
                             counter!("corro.sync.changes.recv", "actor_id" => actor_id.to_string())
                                 .increment(changes_len as u64);
 
-                            debug!(%actor_id,
+                            debug!(self_actor_id = %agent.actor_id(), %actor_id,
                                 "handling versions: {:?}, seqs: {:?}, len: {changes_len}",
                                 change.versions(),
                                 change.seqs()

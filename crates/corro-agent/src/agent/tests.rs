@@ -699,10 +699,10 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         println!("ta4 synced {res}");
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut ta_counts = vec![];
 
