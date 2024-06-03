@@ -1251,7 +1251,7 @@ pub async fn clear_empty_versions_loop(agent: Agent, tripwire: Tripwire) {
             };
 
             let start = Instant::now();
-            let overwritten = match find_overwritten_versions(&tx, Some(10)) {
+            let overwritten = match find_overwritten_versions(&tx, Some(100)) {
                 Ok(overwritten) => overwritten,
                 Err(e) => {
                     error!(%self_actor_id, "error getting overwritten version: {e}");
