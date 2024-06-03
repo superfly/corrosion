@@ -536,7 +536,8 @@ pub fn create_clock_change_trigger(
     let q = format!("
     CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_updated
         AFTER UPDATE ON {name}__crsql_clock FOR EACH ROW
-            WHEN old.site_id != new.site_id OR old.db_version != new.db_version
+            WHEN (old.site_id != new.site_id OR old.db_version != new.db_version) AND NOT EXISTS
+            (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = old.site_id AND c.db_version = old.db_version)
         BEGIN
             INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
                 ON CONFLICT (site_id, db_version) DO NOTHING;
@@ -1596,25 +1597,23 @@ impl Bookie {
 /// Prune the database
 pub fn find_overwritten_versions(
     conn: &Connection,
-    limit: Option<i64>
+    limit: Option<i64>,
 ) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<Version>>> {
     debug!("find_overwritten_versions");
 
-    let mut query = "SELECT v.db_version, si.site_id, v.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
+    let limit = limit.unwrap_or(-1);
+
+    let query = "SELECT v.db_version, si.site_id, v.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
             FROM __corro_versions_impacted AS v
             INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
-            INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
-      ".to_string();
-    if let Some(limit) = limit {
-        query = query + format!(" LIMIT {limit}").as_str();
-    };
+            INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version LIMIT ?".to_string();
     let mut prepped = conn.prepare_cached(&query)?;
 
-    let mut rows = prepped.query([])?;
+    let mut rows = prepped.query([limit])?;
 
     let mut all_versions: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
 
-    let mut stmt = conn.prepare_cached("DELETE FROM __corro_versions_impacted where db_version = ? and site_id = ?")?;
+    let mut where_clause = vec![];
     loop {
         let row = match rows.next()? {
             Some(row) => row,
@@ -1653,17 +1652,28 @@ pub fn find_overwritten_versions(
                 .insert(version..=version);
         }
 
-        let ordinal: CrsqlDbVersion = row.get(2)?;
-        stmt.execute((db_version, ordinal))?;
+        if limit != -1 {
+            let ordinal: CrsqlDbVersion = row.get(2)?;
+            where_clause.push(format!(
+                "(site_id = {ordinal}) and db_version = {db_version}"
+            ));
+        }
     }
+
+    let mut delete_query = "DELETE from __corro_versions_impacted".to_string();
+    if where_clause.len() > 0 {
+        delete_query = delete_query + " WHERE " + &where_clause.join(" OR ");
+    }
+
+    conn.prepare_cached(&delete_query)?.execute([])?;
 
     Ok(all_versions)
 }
 
 #[cfg(test)]
 mod tests {
-    use rangemap::range_inclusive_set;
     use super::*;
+    use rangemap::range_inclusive_set;
 
     #[test]
     fn test_booked_insert_db() -> rusqlite::Result<()> {
@@ -1678,10 +1688,20 @@ mod tests {
 
         let mut all = RangeInclusiveSet::new();
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(20)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(1)..=Version(20)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(10)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(1)..=Version(10)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
         // try from an empty state again
@@ -1689,11 +1709,21 @@ mod tests {
         let mut all = RangeInclusiveSet::new();
 
         // create 2:=3 gap
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(1), Version(4)..=Version(4)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(1)..=Version(1), Version(4)..=Version(4)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(2)..=Version(3)])?;
 
         // fill gap
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(3)..=Version(3), Version(2)..=Version(2)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(3)..=Version(3), Version(2)..=Version(2)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
         // try from an empty state again
@@ -1701,24 +1731,54 @@ mod tests {
         let mut all = RangeInclusiveSet::new();
 
         // insert a non-1 first version
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(5)..=Version(20)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(5)..=Version(20)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(4)])?;
 
         // insert a further change that does not overlap a gap
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(6)..=Version(7)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(6)..=Version(7)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(4)])?;
 
         // insert a further change that does overlap a gap
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(3)..=Version(7)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(3)..=Version(7)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(2)])?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(2)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(1)..=Version(2)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(25)..=Version(25)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(25)..=Version(25)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(21)..=Version(24)])?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(30)..=Version(35)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(30)..=Version(35)],
+        )?;
         expect_gaps(
             &conn,
             &bv,
@@ -1728,7 +1788,12 @@ mod tests {
 
         // NOTE: overlapping partially from the end
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(19)..=Version(22)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(19)..=Version(22)],
+        )?;
         expect_gaps(
             &conn,
             &bv,
@@ -1738,7 +1803,12 @@ mod tests {
 
         // NOTE: overlapping partially from the start
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(24)..=Version(25)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(24)..=Version(25)],
+        )?;
         expect_gaps(
             &conn,
             &bv,
@@ -1748,27 +1818,57 @@ mod tests {
 
         // NOTE: overlapping 2 ranges
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(23)..=Version(27)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(23)..=Version(27)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(28)..=Version(29)])?;
 
         // NOTE: ineffective insert of already known ranges
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(1)..=Version(20)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(1)..=Version(20)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![Version(28)..=Version(29)])?;
 
         // NOTE: overlapping no ranges, but encompassing a full range
 
-        insert_everywhere(&conn, &mut bv, &mut all,  range_inclusive_set![Version(27)..=Version(30)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(27)..=Version(30)],
+        )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
         // NOTE: touching multiple ranges, partially
 
         // create gap 36..=39
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(40)..=Version(45)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(40)..=Version(45)],
+        )?;
         // create gap 46..=49
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(50)..=Version(55)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(50)..=Version(55)],
+        )?;
 
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![Version(38)..=Version(47)])?;
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![Version(38)..=Version(47)],
+        )?;
         expect_gaps(
             &conn,
             &bv,

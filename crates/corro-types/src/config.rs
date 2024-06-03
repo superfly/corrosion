@@ -10,8 +10,11 @@ const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
 const fn default_apply_queue() -> usize {
     100
 }
+const fn default_clear_loop_lim() -> i64 {
+    100
+}
 
-/// Used for the apply channel
+/// Used for the apply channeldefault_clear_loop_lim
 const fn default_huge_channel() -> usize {
     2048
 }
@@ -181,6 +184,8 @@ pub struct PerfConfig {
     pub apply_queue_timeout: usize,
     #[serde(default = "default_apply_queue")]
     pub apply_queue_len: usize,
+    #[serde(default = "default_clear_loop_lim")]
+    pub clear_version_lim: i64,
 }
 
 impl Default for PerfConfig {
@@ -197,6 +202,7 @@ impl Default for PerfConfig {
             foca_channel_len: default_small_channel(),
             apply_queue_timeout: default_apply_timeout(),
             apply_queue_len: default_apply_queue(),
+            clear_version_lim: default_clear_loop_lim(),
         }
     }
 }

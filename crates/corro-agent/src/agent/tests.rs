@@ -2105,14 +2105,14 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     assert_eq!(version, Version(2));
 
-    let bk: Vec<(ActorId, Version, Option<Version>, Option<CrsqlDbVersion>)> = conn
-        .prepare(
-            "SELECT actor_id, start_version, end_version, db_version FROM __corro_bookkeeping",
-        )?
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // let bk: Vec<(ActorId, Version, Option<Version>, Option<CrsqlDbVersion>)> = conn
+    //     .prepare(
+    //         "SELECT actor_id, start_version, end_version, db_version FROM __corro_bookkeeping",
+    //     )?
+    //     .query_map([], |row| {
+    //         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    //     })?
+    //     .collect::<rusqlite::Result<Vec<_>>>()?;
 
     // assert_eq!(
     //     bk,
