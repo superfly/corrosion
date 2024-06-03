@@ -248,9 +248,29 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         Box::new(crsqlite_v0_16_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_bookkeeping_gaps as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(recreate_corro_db_triggers as fn(&Transaction) -> rusqlite::Result<()>),
     ];
 
     crate::sqlite::migrate(conn, migrations)
+}
+
+fn recreate_corro_db_triggers(tx: &Transaction) -> rusqlite::Result<()> {
+    let mut prepped = tx.prepare(
+        "SELECT name FROM sqlite_schema WHERE type='trigger' AND (name LIKE '%__corro_db_version_updated' OR name LIKE '%__corro_db_version_deleted')",
+    )?;
+
+    let mut rows = prepped.query([])?;
+
+    loop {
+        let trigger_name = match rows.next()? {
+            Some(row) => row.get_ref(0)?,
+            None => break,
+        };
+
+        tx.execute_batch(format!("DROP TRIGGER IF EXISTS {}", trigger_name.as_str()?).as_str())?;
+    }
+
+    create_all_clock_change_triggers(tx)
 }
 
 fn create_impacted_versions(tx: &Transaction) -> rusqlite::Result<()> {
