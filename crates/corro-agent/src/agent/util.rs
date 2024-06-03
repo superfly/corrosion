@@ -1127,7 +1127,7 @@ pub fn process_complete_version(
 
     debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
 
-    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize, "debug: {} {} {}", seqs.end().0, seqs.start().0, len);
+    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize);
 
     let mut impactful_changeset = vec![];
 

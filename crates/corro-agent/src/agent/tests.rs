@@ -785,7 +785,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         Extension(ta1.agent.clone()),
         axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
     )
-        .await;
+    .await;
 
     assert_eq!(status_code, StatusCode::OK);
 
@@ -793,7 +793,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         Extension(ta2.agent.clone()),
         axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
     )
-        .await;
+    .await;
     assert_eq!(status_code, StatusCode::OK);
 
     // make about 50 transactions to ta1
@@ -817,13 +817,14 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
             (Version(60)..=Version(60), None),
         ],
     )
-        .await?;
+    .await?;
     // find and clear empty versions
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        vec![Version(1)..=Version(50),
+        vec![
+            Version(1)..=Version(50),
             Version(51)..=Version(55),
             Version(56)..=Version(56),
             Version(57)..=Version(59),
@@ -833,7 +834,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         vec![],
         vec![],
     )
-        .await?;
+    .await?;
 
     // sleep a little so empties loop runs
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -850,7 +851,8 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
             Version(23)..=Version(25),
             Version(30)..=Version(30),
         ],
-    ).await?;
+    )
+    .await?;
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
