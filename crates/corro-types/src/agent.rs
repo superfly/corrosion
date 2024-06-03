@@ -516,7 +516,7 @@ pub fn create_clock_change_trigger(
     let q = format!("
     CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_updated
         AFTER UPDATE ON {name}__crsql_clock FOR EACH ROW
-            WHEN old.site_id = 0 AND (old.site_id != new.site_id OR old.db_version != new.db_version)
+            WHEN old.site_id != new.site_id OR old.db_version != new.db_version
         BEGIN
             INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
                 ON CONFLICT (site_id, db_version) DO NOTHING;
@@ -524,7 +524,6 @@ pub fn create_clock_change_trigger(
 
     CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_deleted
         AFTER DELETE ON {name}__crsql_clock FOR EACH ROW
-            WHEN old.site_id = 0
         BEGIN
             INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
                 ON CONFLICT (site_id, db_version) DO NOTHING;
@@ -1584,8 +1583,7 @@ pub fn find_overwritten_versions(
         SELECT v.db_version, si.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
             FROM __corro_versions_impacted AS v
             INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
-            INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
-        ")?;
+            INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version")?;
 
     let mut rows = prepped.query([])?;
 

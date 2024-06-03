@@ -641,18 +641,18 @@ pub async fn process_fully_buffered_changes(
                 version: Some(version),
             })?;
 
-        let overwritten =
-            find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: Some(version),
-            })?;
-
-        for (actor_id, versions_set) in overwritten {
-            for versions in versions_set {
-                store_empty_changeset(&tx, actor_id, versions)?;
-            }
-        }
+        // let overwritten =
+        //     find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
+        //         source,
+        //         actor_id: Some(actor_id),
+        //         version: Some(version),
+        //     })?;
+        //
+        // for (actor_id, versions_set) in overwritten {
+        //     for versions in versions_set {
+        //         store_empty_changeset(&tx, actor_id, versions)?;
+        //     }
+        // }
 
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
@@ -887,18 +887,18 @@ pub async fn process_multiple_changes(
 
         debug!("inserted {count} new changesets");
 
-        let overwritten =
-            find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: None,
-                version: None,
-            })?;
-
-        for (actor_id, versions_set) in overwritten {
-            for versions in versions_set {
-                store_empty_changeset(&tx, actor_id, versions)?;
-            }
-        }
+        // let overwritten =
+        //     find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
+        //         source,
+        //         actor_id: None,
+        //         version: None,
+        //     })?;
+        //
+        // for (actor_id, versions_set) in overwritten {
+        //     for versions in versions_set {
+        //         store_empty_changeset(&tx, actor_id, versions)?;
+        //     }
+        // }
 
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
@@ -1127,7 +1127,7 @@ pub fn process_complete_version(
 
     debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
 
-    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize);
+    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize, "debug: {} {} {}", seqs.end().0, seqs.start().0, len);
 
     let mut impactful_changeset = vec![];
 
@@ -1222,4 +1222,89 @@ pub fn check_buffered_meta_to_clear(
     }
 
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+}
+
+pub async fn clear_empty_versions_loop(agent: Agent, tripwire: Tripwire) {
+    let self_actor_id = agent.actor_id();
+    info!(%self_actor_id, "Starting clear_empty_versions_changes loop");
+
+    loop {
+        if tripwire.is_shutting_down() {
+            break;
+        }
+
+        let start = Instant::now();
+        let overwritten_versions = {
+            let mut conn = match agent.pool().write_low().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!(%self_actor_id, "failed to get read connection for find_overwritten_version: {e}");
+                    continue;
+                }
+            };
+            let tx = match conn.immediate_transaction() {
+                Ok(tx) => tx,
+                Err(e) => {
+                    error!(%self_actor_id, "failed to get write connection for find_overwritten_version: {e}");
+                    continue;
+                }
+            };
+
+            let overwritten = match find_overwritten_versions(&tx) {
+                Ok(overwritten) => overwritten,
+                Err(e) => {
+                    error!(%self_actor_id, "error getting overwritten version: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = tx.commit() {
+                error!(%self_actor_id, "error committing transaction for clearing ovoerwritten versions: {e}");
+            };
+            overwritten
+        };
+
+        debug!(%self_actor_id, "got ranges to clear for {} actors in {:?}", overwritten_versions.len(), start.elapsed());
+        {
+            let mut conn = match agent.pool().write_low().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!(%self_actor_id, "failed to get write connection: {e}");
+                    continue;
+                }
+            };
+
+            let tx = match conn.immediate_transaction() {
+                Ok(tx) => tx,
+                Err(e) => {
+                    error!(%self_actor_id, "error getting transaction to find overwritten version: {e}");
+                    continue;
+                }
+            };
+
+            let start = Instant::now();
+            let mut count = 0;
+            for (actor_id, versions) in overwritten_versions {
+                for version in versions {
+                    let res = store_empty_changeset(&tx, actor_id, version);
+                    match res {
+                        Ok(size) => {
+                            count += size;
+                        }
+                        Err(e) => {
+                            error!(%self_actor_id, "error storing empty changeset: {e}");
+                        }
+                    }
+                }
+            }
+
+            if let Err(e) = tx.commit() {
+                error!(%self_actor_id, "error committing transaction for clearing ovoerwritten versions: {e}");
+            }
+            info!(%self_actor_id, "cleared {count} version ranges in {:?}", start.elapsed());
+        }
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    info!("clear_empty_versions ended");
 }

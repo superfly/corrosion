@@ -773,6 +773,93 @@ struct TestRecord {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_clear_empty_versions() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    // setup the schema, for both nodes
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta1.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+        .await;
+
+    assert_eq!(status_code, StatusCode::OK);
+
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta2.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+        .await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    // make about 50 transactions to ta1
+    insert_rows(ta1.agent.clone(), 1, 50).await;
+    // send them all
+    let rows = get_rows(ta1.agent.clone(), vec![(Version(1)..=Version(50), None)]).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+
+    // overwrite different version ranges
+    insert_rows(ta1.agent.clone(), 1, 5).await;
+    insert_rows(ta1.agent.clone(), 10, 10).await;
+    insert_rows(ta1.agent.clone(), 23, 25).await;
+    insert_rows(ta1.agent.clone(), 30, 31).await;
+
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![
+            (Version(51)..=Version(55), None),
+            (Version(56)..=Version(56), None),
+            (Version(57)..=Version(59), None),
+            (Version(60)..=Version(60), None),
+        ],
+    )
+        .await?;
+    // find and clear empty versions
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![Version(1)..=Version(50),
+            Version(51)..=Version(55),
+            Version(56)..=Version(56),
+            Version(57)..=Version(59),
+            Version(60)..=Version(60),
+        ],
+        vec![],
+        vec![],
+        vec![],
+    )
+        .await?;
+
+    // sleep a little so empties loop runs
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![],
+        vec![],
+        vec![],
+        vec![
+            Version(1)..=Version(5),
+            Version(10)..=Version(10),
+            Version(23)..=Version(25),
+            Version(30)..=Version(30),
+        ],
+    ).await?;
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_process_multiple_changes() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
 
@@ -928,6 +1015,65 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     Ok(())
 }
 
+async fn get_rows(
+    agent: Agent,
+    v: Vec<(RangeInclusive<Version>, Option<RangeInclusive<CrsqlSeq>>)>,
+) -> eyre::Result<Vec<(ChangeV1, ChangeSource, Instant)>> {
+    let mut result = vec![];
+    let conn = agent.pool().read().await?;
+
+    for versions in v {
+        for version in versions.0 {
+            let count: u64 = conn.query_row(
+                "SELECT COUNT(*) FROM crsql_changes where db_version = ?",
+                [version],
+                |row| row.get(0),
+            )?;
+            let mut last = 4;
+            // count will be zero for cleared versions
+            if count > 0 {
+                last = count - 1;
+            }
+            let mut query =
+                r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+            FROM crsql_changes where db_version = ?"#
+                    .to_string();
+            let changes: Vec<Change>;
+            let seqs = if let Some(seq) = versions.1.clone() {
+                let seq_query = " and seq >= ? and seq <= ?";
+                query = query + seq_query;
+                let mut prepped = conn.prepare(&query)?;
+                changes = prepped
+                    .query_map((version, seq.start(), seq.end()), row_to_change)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                seq
+            } else {
+                let mut prepped = conn.prepare(&query)?;
+                changes = prepped
+                    .query_map([version], row_to_change)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                CrsqlSeq(0)..=CrsqlSeq(last)
+            };
+
+            result.push((
+                ChangeV1 {
+                    actor_id: agent.actor_id(),
+                    changeset: Changeset::Full {
+                        version,
+                        changes,
+                        seqs,
+                        last_seq: CrsqlSeq(last),
+                        ts: agent.clock().new_timestamp().into(),
+                    },
+                },
+                ChangeSource::Broadcast,
+                Instant::now(),
+            ))
+        }
+    }
+    Ok(result)
+}
+
 async fn check_bookie_versions(
     ta: TestAgent,
     actor_id: ActorId,
@@ -1005,59 +1151,10 @@ async fn check_bookie_versions(
     for versions in cleared {
         assert!(conn.prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping WHERE actor_id = ? and start_version = ? and end_version = ?)")?
-            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?);
+            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?, "version {versions:?} not in cleared in bookkeeping table");
     }
 
     Ok(())
-}
-
-async fn get_rows(
-    agent: Agent,
-    v: Vec<(RangeInclusive<Version>, Option<RangeInclusive<CrsqlSeq>>)>,
-) -> eyre::Result<Vec<(ChangeV1, ChangeSource, Instant)>> {
-    let mut result = vec![];
-
-    let conn = agent.pool().read().await?;
-    for versions in v {
-        for version in versions.0 {
-            let mut query =
-                r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-            FROM crsql_changes where db_version = ?"#
-                    .to_string();
-            let changes: Vec<Change>;
-            let seqs = if let Some(seq) = versions.1.clone() {
-                let seq_query = " and seq >= ? and seq <= ?";
-                query = query + seq_query;
-                let mut prepped = conn.prepare(&query)?;
-                changes = prepped
-                    .query_map((version, seq.start(), seq.end()), row_to_change)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                seq
-            } else {
-                let mut prepped = conn.prepare(&query)?;
-                changes = prepped
-                    .query_map([version], row_to_change)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                CrsqlSeq(0)..=CrsqlSeq(3)
-            };
-
-            result.push((
-                ChangeV1 {
-                    actor_id: agent.actor_id(),
-                    changeset: Changeset::Full {
-                        version,
-                        changes,
-                        seqs,
-                        last_seq: CrsqlSeq(3),
-                        ts: agent.clock().new_timestamp().into(),
-                    },
-                },
-                ChangeSource::Broadcast,
-                Instant::now(),
-            ))
-        }
-    }
-    Ok(result)
 }
 
 async fn insert_rows(agent: Agent, start: i64, n: i64) {

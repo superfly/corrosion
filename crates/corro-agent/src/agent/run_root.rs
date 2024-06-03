@@ -204,6 +204,11 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         tripwire.clone(),
     ));
 
+    spawn_counted(util::clear_empty_versions_loop(
+        agent.clone(),
+        tripwire.clone(),
+    ));
+
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
     //// Start an incoming (corrosion) connection handler.  This
