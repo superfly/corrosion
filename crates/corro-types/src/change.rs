@@ -8,7 +8,7 @@ use tracing::{debug, trace, warn};
 
 use crate::{
     actor::ActorId,
-    agent::{find_overwritten_versions, Agent, BookedVersions, ChangeError, VersionsSnapshot},
+    agent::{Agent, BookedVersions, ChangeError, VersionsSnapshot},
     base::CrsqlSeq,
     broadcast::Timestamp,
 };
@@ -226,17 +226,17 @@ pub fn insert_local_changes(
             version: Some(version),
         })?;
 
-    let overwritten = find_overwritten_versions(tx, None).map_err(|source| ChangeError::Rusqlite {
-        source,
-        actor_id: Some(actor_id),
-        version: Some(version),
-    })?;
-
-    for (actor_id, versions_set) in overwritten {
-        for versions in versions_set {
-            store_empty_changeset(tx, actor_id, versions)?;
-        }
-    }
+    // let overwritten = find_overwritten_versions(tx, None).map_err(|source| ChangeError::Rusqlite {
+    //     source,
+    //     actor_id: Some(actor_id),
+    //     version: Some(version),
+    // })?;
+    //
+    // for (actor_id, versions_set) in overwritten {
+    //     for versions in versions_set {
+    //         store_empty_changeset(tx, actor_id, versions)?;
+    //     }
+    // }
 
     Ok(Some(InsertChangesInfo {
         version,
