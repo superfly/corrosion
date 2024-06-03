@@ -226,7 +226,7 @@ pub fn insert_local_changes(
             version: Some(version),
         })?;
 
-    let overwritten = find_overwritten_versions(tx).map_err(|source| ChangeError::Rusqlite {
+    let overwritten = find_overwritten_versions(tx, None).map_err(|source| ChangeError::Rusqlite {
         source,
         actor_id: Some(actor_id),
         version: Some(version),

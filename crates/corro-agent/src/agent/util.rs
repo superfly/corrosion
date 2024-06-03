@@ -1233,37 +1233,6 @@ pub async fn clear_empty_versions_loop(agent: Agent, tripwire: Tripwire) {
             break;
         }
 
-        let start = Instant::now();
-        let overwritten_versions = {
-            let mut conn = match agent.pool().write_low().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    error!(%self_actor_id, "failed to get read connection for find_overwritten_version: {e}");
-                    continue;
-                }
-            };
-            let tx = match conn.immediate_transaction() {
-                Ok(tx) => tx,
-                Err(e) => {
-                    error!(%self_actor_id, "failed to get write connection for find_overwritten_version: {e}");
-                    continue;
-                }
-            };
-
-            let overwritten = match find_overwritten_versions(&tx) {
-                Ok(overwritten) => overwritten,
-                Err(e) => {
-                    error!(%self_actor_id, "error getting overwritten version: {e}");
-                    continue;
-                }
-            };
-            if let Err(e) = tx.commit() {
-                error!(%self_actor_id, "error committing transaction for clearing ovoerwritten versions: {e}");
-            };
-            overwritten
-        };
-
-        debug!(%self_actor_id, "got ranges to clear for {} actors in {:?}", overwritten_versions.len(), start.elapsed());
         {
             let mut conn = match agent.pool().write_low().await {
                 Ok(conn) => conn,
@@ -1282,8 +1251,18 @@ pub async fn clear_empty_versions_loop(agent: Agent, tripwire: Tripwire) {
             };
 
             let start = Instant::now();
+            let overwritten = match find_overwritten_versions(&tx, Some(10)) {
+                Ok(overwritten) => overwritten,
+                Err(e) => {
+                    error!(%self_actor_id, "error getting overwritten version: {e}");
+                    continue;
+                }
+            };
+
+            debug!(%self_actor_id, "got ranges to clear for {} actors in {:?}", overwritten.len(), start.elapsed());
+            let start = Instant::now();
             let mut count = 0;
-            for (actor_id, versions) in overwritten_versions {
+            for (actor_id, versions) in overwritten {
                 for version in versions {
                     let res = store_empty_changeset(&tx, actor_id, version);
                     match res {

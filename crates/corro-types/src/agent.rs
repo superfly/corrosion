@@ -1576,19 +1576,25 @@ impl Bookie {
 /// Prune the database
 pub fn find_overwritten_versions(
     conn: &Connection,
+    limit: Option<i64>
 ) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<Version>>> {
     debug!("find_overwritten_versions");
 
-    let mut prepped = conn.prepare_cached("
-        SELECT v.db_version, si.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
+    let mut query = "SELECT v.db_version, si.site_id, v.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
             FROM __corro_versions_impacted AS v
             INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
-            INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version")?;
+            INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
+      ".to_string();
+    if let Some(limit) = limit {
+        query = query + format!(" LIMIT {limit}").as_str();
+    };
+    let mut prepped = conn.prepare_cached(&query)?;
 
     let mut rows = prepped.query([])?;
 
     let mut all_versions: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
 
+    let mut stmt = conn.prepare_cached("DELETE FROM __corro_versions_impacted where db_version = ? and site_id = ?")?;
     loop {
         let row = match rows.next()? {
             Some(row) => row,
@@ -1607,13 +1613,13 @@ pub fn find_overwritten_versions(
         };
         trace!("actor_id: {actor_id}");
 
-        let exists: bool = row.get(2)?;
+        let exists: bool = row.get(3)?;
 
         debug!("exists? {exists}");
 
         if !exists {
             debug!("version is gone now");
-            let version = match row.get::<_, Option<Version>>(3)? {
+            let version = match row.get::<_, Option<Version>>(4)? {
                 Some(version) => version,
                 None => {
                     warn!("missing start_version for an impacted version: actor_id = {actor_id}, db_version = {db_version}");
@@ -1626,10 +1632,10 @@ pub fn find_overwritten_versions(
                 .or_default()
                 .insert(version..=version);
         }
-    }
 
-    conn.prepare_cached("DELETE FROM __corro_versions_impacted")?
-        .execute([])?;
+        let ordinal: CrsqlDbVersion = row.get(2)?;
+        stmt.execute((db_version, ordinal))?;
+    }
 
     Ok(all_versions)
 }
