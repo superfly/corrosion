@@ -538,7 +538,7 @@ pub fn create_clock_change_trigger(
     CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_updated
         AFTER UPDATE ON {name}__crsql_clock FOR EACH ROW
             WHEN (old.site_id != new.site_id OR old.db_version != new.db_version) AND NOT EXISTS
-                (SELECT q 1 FROM crsql_changes AS c
+                (SELECT 1 FROM crsql_changes AS c
                     WHERE c.site_id = (select site_id FROM crsql_site_id WHERE ordinal = old.site_id)
                     AND c.db_version = old.db_version)
         BEGIN
