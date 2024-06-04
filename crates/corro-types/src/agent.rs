@@ -249,6 +249,7 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         Box::new(create_bookkeeping_gaps as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(recreate_corro_db_triggers as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(recreate_corro_db_triggers as fn(&Transaction) -> rusqlite::Result<()>),
     ];
 
     crate::sqlite::migrate(conn, migrations)
