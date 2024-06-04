@@ -40,7 +40,7 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
 
 pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     init_cr_conn(&mut conn)?;
-    setup_conn(&mut conn)?;
+    setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
     Ok(CrConn(conn))
 }
@@ -108,7 +108,7 @@ fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-pub fn setup_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
     // WAL journal mode and synchronous NORMAL for best performance / crash resilience compromise
     conn.execute_batch(
         r#"
@@ -117,6 +117,8 @@ pub fn setup_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             PRAGMA recursive_triggers = ON;
         "#,
     )?;
+
+    rusqlite::vtab::series::load_module(conn)?;
 
     Ok(())
 }

@@ -7,7 +7,7 @@ use std::{
 };
 
 use compact_str::CompactString;
-use corro_base_types::{CrsqlDbVersion, CrsqlSeq};
+use corro_base_types::{CrsqlDbVersion, CrsqlSeq, Version};
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
     Row, ToSql,
@@ -210,6 +210,7 @@ impl From<&str> for Statement {
 pub struct ExecResponse {
     pub results: Vec<ExecResult>,
     pub time: f64,
+    pub version: Option<Version>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -593,6 +594,12 @@ impl From<u16> for SqliteValue {
 impl From<i64> for SqliteValue {
     fn from(value: i64) -> Self {
         Self::Integer(value)
+    }
+}
+
+impl From<f64> for SqliteValue {
+    fn from(value: f64) -> Self {
+        Self::Real(Real(value))
     }
 }
 

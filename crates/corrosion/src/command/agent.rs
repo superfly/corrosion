@@ -5,7 +5,8 @@ use camino::Utf8PathBuf;
 use corro_admin::AdminConfig;
 use corro_types::config::{Config, PrometheusConfig};
 use metrics::gauge;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use metrics_util::MetricKindMask;
 use spawn::wait_for_all_pending_handles;
 use tokio_metrics::RuntimeMonitor;
 use tracing::{error, info};
@@ -29,15 +30,23 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
             (unknown.clone(), unknown.clone())
         };
 
-        gauge!(
-            "corro.build.info",
-            "version" => info.crate_info.version.to_string(),
-            "ts" => info.timestamp.to_string(),
-            "rustc_version" => info.compiler.version.to_string(),
-            "git_commit" => git_commit,
-            "git_branch" => git_branch,
-        )
-        .set(1.0);
+        // required because gauges are subject to a idle timeout, so we need to touch this frequently
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+
+                gauge!(
+                    "corro.build.info",
+                    "version" => info.crate_info.version.to_string(),
+                    "ts" => info.timestamp.to_string(),
+                    "rustc_version" => info.compiler.version.to_string(),
+                    "git_commit" => git_commit.clone(),
+                    "git_branch" => git_branch.clone(),
+                )
+                .set(1.0);
+            }
+        });
 
         start_tokio_runtime_reporter();
     }
@@ -49,8 +58,8 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
         .expect("could not start agent");
 
     corro_admin::start_server(
-        agent,
-        bookie,
+        agent.clone(),
+        bookie.clone(),
         AdminConfig {
             listen_path: config.admin.uds_path.clone(),
             config_path: config_path.clone(),
@@ -59,7 +68,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
     )?;
 
     if !config.db.schema_paths.is_empty() {
-        let client = corro_client::CorrosionApiClient::new(config.api.bind_addr);
+        let client = corro_client::CorrosionApiClient::new(*config.api.bind_addr.first().unwrap());
         match client
             .schema_from_paths(config.db.schema_paths.as_slice())
             .await
@@ -86,6 +95,11 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
 fn setup_prometheus(addr: SocketAddr) -> eyre::Result<()> {
     PrometheusBuilder::new()
         .with_http_listener(addr)
+        .idle_timeout(MetricKindMask::GAUGE, Some(Duration::from_secs(120)))
+        .set_buckets_for_metric(
+            Matcher::Suffix("chunk_size".into()),
+            &[1.0, 10.0, 75.0, 250.0, 375.0, 500.0, 650.0],
+        )?
         .set_buckets(&[
             0.001, // 1ms
             0.005, // 5ms

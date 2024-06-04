@@ -1,16 +1,19 @@
-use std::{fmt::Display, time::Duration};
+use std::{
+    fmt::Display,
+    time::{Duration, Instant},
+};
 
 use camino::Utf8PathBuf;
-use corro_agent::agent::clear_overwritten_versions;
 use corro_types::{
     actor::{ActorId, ClusterId},
-    agent::{Agent, Bookie, KnownVersion, LockKind, LockMeta, LockState},
-    base::Version,
-    broadcast::{FocaCmd, FocaInput},
+    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    broadcast::{FocaCmd, FocaInput, Timestamp},
     sqlite::SqlitePoolError,
     sync::generate_sync,
 };
 use futures::{SinkExt, TryStreamExt};
+use rusqlite::{named_params, params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spawn::spawn_counted;
@@ -69,7 +72,7 @@ pub fn start_server(
                 }
             };
 
-            spawn_counted({
+            tokio::spawn({
                 let agent = agent.clone();
                 let bookie = bookie.clone();
                 let config = config.clone();
@@ -93,12 +96,12 @@ pub enum Command {
     Locks { top: usize },
     Cluster(ClusterCommand),
     Actor(ActorCommand),
-    CompactEmpties,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncCommand {
     Generate,
+    ReconcileGaps,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +179,103 @@ impl From<LockMeta> for LockMetaElapsed {
     }
 }
 
+async fn collapse_gaps(
+    stream: &mut FramedStream,
+    conn: &mut rusqlite::Connection,
+    bv: &mut BookedVersions,
+) -> rusqlite::Result<()> {
+    let actor_id = bv.actor_id();
+    let mut snap = bv.snapshot();
+    _ = info_log(stream, format!("collapsing ranges for {actor_id}")).await;
+    let start = Instant::now();
+    let (deleted, inserted) = block_in_place(|| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let versions = tx
+                .prepare_cached(
+                    "
+                    SELECT distinct bk.start_version, coalesce(bk.end_version, bk.start_version)
+                        FROM __corro_bookkeeping_gaps AS g
+                        INNER JOIN __corro_bookkeeping AS bk ON bk.actor_id = g.actor_id AND start_version >= COALESCE((
+                            -- try to find the previous range
+                            SELECT start_version
+                                FROM __corro_bookkeeping
+                                WHERE
+                                    actor_id = g.actor_id AND
+                                    start_version < g.start -- AND end_version IS NOT NULL
+                                ORDER BY start_version DESC
+                                LIMIT 1
+                        ), 1)
+                        AND
+                        start_version <= COALESCE((
+                            -- try to find the next range
+                            SELECT start_version
+                                FROM __corro_bookkeeping
+                                WHERE
+                                    actor_id = g.actor_id AND
+                                    start_version > g.end-- AND end_version IS NOT NULL
+                                ORDER BY start_version ASC
+                                LIMIT 1
+                        ), g.end+ 1) AND (
+                            -- [g.start]---[start_version]---[g.end]
+                            ( start_version BETWEEN g.start AND g.end ) OR
+
+                            -- [start_version]---[g.start]---[g.end]---[end_version]
+                            ( start_version <= g.start AND end_version >= g.end ) OR
+
+                            -- [g.start]---[start_version]---[g.end]---[end_version]
+                            ( start_version <= g.end AND end_version >= g.end ) OR
+
+                            -- [g.start]---[end_version]---[g.end]
+                            ( end_version BETWEEN g.start AND g.end ) OR
+
+                            -- ---[g.end][start_version]---[end_version]
+                            ( start_version = g.end + 1 AND end_version IS NOT NULL ) OR
+
+                            -- [end_version][g.start]---
+                            ( end_version = g.start - 1 )
+                        )
+                        where g.actor_id = ?
+                ",
+                )?
+                .query_map(
+                    rusqlite::params![actor_id],
+                    |row| Ok(row.get(0)?..=row.get(1)?),
+                )?
+                .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<Version>>>()?;
+
+        let deleted = tx.execute(
+            "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
+            [actor_id],
+        )?;
+
+        let mut inserted = 0;
+        for range in snap.needed().iter() {
+            tx.prepare_cached(
+                "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?,?,?);",
+            )?
+            .execute(params![actor_id, range.start(), range.end()])?;
+            inserted += 1;
+        }
+
+        snap.insert_db(&tx, versions)?;
+
+        tx.commit()?;
+
+        Ok::<_, rusqlite::Error>((deleted, inserted))
+    })?;
+    _ = info_log(
+        stream,
+        format!(
+            "collapsed ranges in {:?} (deleted: {deleted}, inserted: {inserted})",
+            start.elapsed()
+        ),
+    )
+    .await;
+
+    bv.commit_snapshot(snap);
+    Ok(())
+}
+
 async fn handle_conn(
     agent: Agent,
     bookie: &Bookie,
@@ -201,59 +301,33 @@ async fn handle_conn(
                     }
                     send_success(&mut stream).await;
                 }
-                Command::CompactEmpties => {
-                    info_log(&mut stream, "compacting empty versions...").await;
+                Command::Sync(SyncCommand::ReconcileGaps) => {
+                    let actor_ids: Vec<_> = {
+                        let r = bookie.read("admin sync reconcile gaps").await;
+                        r.keys().copied().collect()
+                    };
 
-                    let (tx, mut rx) = mpsc::channel(4);
-                    let (done_tx, done_rx) = oneshot::channel::<Option<String>>();
+                    for actor_id in actor_ids {
+                        {
+                            let booked = bookie
+                                .read(format!("admin sync reconcile gaps get actor {actor_id}"))
+                                .await
+                                .get(&actor_id)
+                                .unwrap()
+                                .clone();
 
-                    let started = std::time::Instant::now();
+                            let mut conn = agent.pool().write_low().await.unwrap();
+                            let mut bv = booked
+                                .write("admin sync reconcile gaps booked versions")
+                                .await;
 
-                    let bookie = bookie.clone();
-                    let agent = agent.clone();
-                    tokio::task::spawn(async move {
-                        let pool = agent.pool();
-                        match clear_overwritten_versions(&agent, &bookie, pool, Some(tx)).await {
-                            Ok(()) => done_tx.send(None),
-                            Err(e) => done_tx.send(Some(e)),
-                        }
-                    });
-
-                    while let Some(msg) = rx.recv().await {
-                        info_log(&mut stream, msg).await;
-                    }
-
-                    // when this loop exists it means our writer has
-                    // gone away/ the task completed
-                    match done_rx.await {
-                        Ok(None) => {
-                            let elapsed = started.elapsed().as_secs_f64();
-                            info_log(
-                                &mut stream,
-                                format!(
-                                    "Finished compacting empty versions!  Took {} seconds ({} minutes)",
-                                    elapsed,
-                                    elapsed / 60.0
-                                ),
-                            )
-                            .await;
-                            send_success(&mut stream).await
-                        }
-                        Ok(Some(err)) => {
-                            send_error(
-                                &mut stream,
-                                format!("An error occured while compacting empties: {err}"),
-                            )
-                            .await
-                        }
-                        _ => {
-                            send_error(
-                                &mut stream,
-                                "Failed to compact empties (check node logs for details)",
-                            )
-                            .await
+                            if let Err(e) = collapse_gaps(&mut stream, &mut conn, &mut bv).await {
+                                _ = send_error(&mut stream, e).await;
+                            }
                         }
                     }
+
+                    _ = send_success(&mut stream).await;
                 }
                 Command::Locks { top } => {
                     info_log(&mut stream, "gathering top locks").await;
@@ -388,7 +462,7 @@ async fn handle_conn(
                     send_success(&mut stream).await;
                 }
                 Command::Actor(ActorCommand::Version { actor_id, version }) => {
-                    let json = {
+                    let json: Result<serde_json::Value, rusqlite::Error> = {
                         let bookie = bookie.read("admin actor version").await;
                         let booked = match bookie.get(&actor_id) {
                             Some(booked) => booked,
@@ -399,17 +473,40 @@ async fn handle_conn(
                             }
                         };
                         let booked_read = booked.read("admin actor version booked").await;
-                        match booked_read.get(&version) {
-                            Some(known) => match known {
-                                KnownVersion::Cleared => {
-                                    Ok(serde_json::Value::String("cleared".into()))
+                        if booked_read.contains_version(&version) {
+                            match booked_read.get_partial(&version) {
+                                Some(partial) => {
+                                    Ok(serde_json::json!({"partial": partial}))
+                                    // serde_json::to_value(partial)
+                                    // .map(|v| serde_json::json!({"partial": v}))
+                                },
+                                None => {
+                                    match agent.pool().read().await {
+                                        Ok(conn) => match conn.prepare_cached("SELECT db_version, last_seq, ts FROM __corro_bookkeeping WHERE actor_id = :actor_id AND start_version = :version") {
+                                            Ok(mut prepped) => match prepped.query_row(named_params! {":actor_id": actor_id, ":version": version}, |row| Ok((row.get::<_, Option<CrsqlDbVersion>>(0)?, row.get::<_, Option<CrsqlSeq>>(1)?, row.get::<_, Option<Timestamp>>(2)?))).optional() {
+                                                Ok(Some((Some(db_version), Some(last_seq), Some(ts)))) => {
+                                                    Ok(serde_json::json!({"current": {"db_version": db_version, "last_seq": last_seq, "ts": ts}}))
+                                                },
+                                                Ok(_) => {
+                                                    Ok(serde_json::Value::String("cleared".into()))
+                                                }
+                                                Err(e) => {
+                                                    Err(e)
+                                                }
+                                            },
+                                            Err(e) => {
+                                                Err(e)
+                                            }
+                                        },
+                                        Err(e) => {
+                                            _ = send_error(&mut stream, e).await;
+                                            continue;
+                                        }
+                                    }
                                 }
-                                KnownVersion::Current(known) => serde_json::to_value(known)
-                                    .map(|v| serde_json::json!({"current": v})),
-                                KnownVersion::Partial(known) => serde_json::to_value(known)
-                                    .map(|v| serde_json::json!({"partial": v})),
-                            },
-                            None => Ok(serde_json::Value::Null),
+                            }
+                        } else {
+                            Ok(serde_json::Value::Null)
                         }
                     };
 

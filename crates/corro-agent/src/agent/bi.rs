@@ -46,7 +46,7 @@ pub fn spawn_bipayload_handler(
 
             counter!("corro.peer.stream.accept.total", "type" => "bi").increment(1);
 
-            debug!(
+            trace!(
                 "accepted a bidirectional stream from {}",
                 conn.remote_address()
             );

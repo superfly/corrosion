@@ -5,8 +5,10 @@ use corro_types::{
     agent::{Agent, Bookie},
     config::{Config, ConfigBuilder, ConfigBuilderError},
 };
-use tempfile::TempDir;
 use tripwire::Tripwire;
+
+mod tempdir;
+use tempdir::TempDir;
 
 pub const TEST_SCHEMA: &str = r#"
         CREATE TABLE IF NOT EXISTS tests (
@@ -19,6 +21,14 @@ pub const TEST_SCHEMA: &str = r#"
             text TEXT NOT NULL DEFAULT ""
         ) WITHOUT ROWID;
 
+        CREATE TABLE IF NOT EXISTS tests3 (
+            id INTEGER NOT NULL PRIMARY KEY,
+            text TEXT NOT NULL DEFAULT "",
+            text2 TEXT NOT NULL DEFAULT "",
+            num INTEGER NOT NULL DEFAULT 0,
+            num2 INTEGER NOT NULL DEFAULT 0
+        ) WITHOUT ROWID;
+
         CREATE TABLE IF NOT EXISTS testsblob (
             id BLOB NOT NULL PRIMARY KEY,
             text TEXT NOT NULL DEFAULT ""
@@ -27,6 +37,18 @@ pub const TEST_SCHEMA: &str = r#"
         CREATE TABLE IF NOT EXISTS testsbool (
             id INTEGER NOT NULL PRIMARY KEY,
             b boolean not null default false
+        );
+
+        CREATE TABLE IF NOT EXISTS wide (
+            id1 BLOB NOT NULL,
+            id2 TEXT NOT NULL,
+
+            int INTEGER NOT NULL DEFAULT 1,
+            float REAL NOT NULL DEFAULT 1.0,
+
+            blob BLOB,
+
+            PRIMARY KEY (id1, id2)
         );
     "#;
 
@@ -41,8 +63,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
     f: F,
     tripwire: Tripwire,
 ) -> eyre::Result<TestAgent> {
-    let tmpdir = tempfile::tempdir()?;
-
+    let tmpdir = TempDir::new(tempfile::tempdir()?);
     let schema_path = tmpdir.path().join("schema");
 
     let conf = f(Config::builder()

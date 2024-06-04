@@ -137,7 +137,7 @@ fn copy_check(src: &mut File, dst: &mut File, len: u64) -> Result<(), Error> {
     Ok(())
 }
 
-enum Locked {
+pub enum Locked {
     Wal(File),
     Other,
 }
@@ -148,7 +148,7 @@ impl Locked {
     }
 }
 
-fn lock_all<P: AsRef<Path>>(
+pub fn lock_all<P: AsRef<Path>>(
     db_file: &mut File,
     db_path: P,
     timeout: Duration,

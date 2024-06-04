@@ -1,14 +1,11 @@
 //! Start the root agent tasks
 
-use std::sync::Arc;
+use std::time::Instant;
 
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_cleanup},
         metrics, setup, util, AgentOptions,
-    },
-    api::public::pubsub::{
-        process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache,
     },
     broadcast::runtime_loop,
 };
@@ -18,12 +15,10 @@ use corro_types::{
     base::CrsqlSeq,
     channel::bounded,
     config::{Config, PerfConfig},
-    pubsub::{Matcher, SubsManager},
 };
 
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use spawn::spawn_counted;
-use tokio::{sync::RwLock as TokioRwLock, task::block_in_place};
 use tracing::{error, info};
 use tripwire::Tripwire;
 
@@ -43,24 +38,21 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     let AgentOptions {
         gossip_server_endpoint,
         transport,
-        api_listener,
+        api_listeners,
         tripwire,
         lock_registry,
         rx_bcast,
         rx_apply,
-        rx_empty,
         rx_clear_buf,
         rx_changes,
         rx_foca,
         subs_manager,
+        subs_bcast_cache,
         rtt_rx,
     } = opts;
 
     // Get our gossip address and make sure it's valid
     let gossip_addr = gossip_server_endpoint.local_addr()?;
-
-    // Setup subscription handlers
-    let subs_bcast_cache = setup_spawn_subscriptions(&agent, &subs_manager, &tripwire).await?;
 
     //// Start PG server to accept query requests from PG clients
     // TODO: pull this out into a separate function?
@@ -104,15 +96,15 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         &tripwire,
         subs_bcast_cache,
         &subs_manager,
-        api_listener,
+        api_listeners,
     )
     .await?;
 
-    spawn_counted(util::write_empties_loop(
-        agent.clone(),
-        rx_empty,
-        tripwire.clone(),
-    ));
+    // spawn_counted(util::write_empties_loop(
+    //     agent.clone(),
+    //     rx_empty,
+    //     tripwire.clone(),
+    // ));
 
     tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
 
@@ -133,12 +125,17 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         let mut w = bookie.write("init").await;
         w.insert(agent.actor_id(), agent.booked().clone());
     }
+
+    let start = Instant::now();
     {
         let conn = agent.pool().read().await?;
         let actor_ids: Vec<ActorId> = conn
-            .prepare("SELECT DISTINCT actor_id FROM __corro_bookkeeping")?
+            .prepare("SELECT site_id FROM crsql_site_id WHERE ordinal > 0")?
             .query_map([], |row| row.get(0))
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        // not strictly required, but we don't need to keep it open
+        drop(conn);
 
         let pool = agent.pool();
 
@@ -153,15 +150,17 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
                         tokio::spawn(async move {
                             let conn = pool.read().await?;
 
-                            block_in_place(|| BookedVersions::from_conn(&conn, actor_id))
-                                .map(|bv| (actor_id, bv))
-                                .map_err(eyre::Report::from)
+                            tokio::task::block_in_place(|| {
+                                BookedVersions::from_conn(&conn, actor_id)
+                                    .map(|bv| (actor_id, bv))
+                                    .map_err(eyre::Report::from)
+                            })
                         })
                         .await?
                     }
                 }),
         )
-        .buffer_unordered(8);
+        .buffer_unordered(4);
 
         while let Some((actor_id, bv)) = TryStreamExt::try_next(&mut buf).await? {
             for (version, partial) in bv.partials.iter() {
@@ -186,16 +185,24 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         }
     }
 
+    info!("Bookkeeping fully loaded in {:?}", start.elapsed());
+
     spawn_counted(
         util::sync_loop(
             agent.clone(),
             bookie.clone(),
             transport.clone(),
-            rx_apply,
             tripwire.clone(),
         )
         .inspect(|_| info!("corrosion agent sync loop is done")),
     );
+
+    spawn_counted(util::apply_fully_buffered_changes_loop(
+        agent.clone(),
+        bookie.clone(),
+        rx_apply,
+        tripwire.clone(),
+    ));
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
@@ -210,73 +217,5 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         tripwire.clone(),
     ));
 
-    if let Some(secs) = agent.config().db.clear_overwritten_secs {
-        tokio::spawn(util::clear_overwritten_versions_loop(
-            agent.clone(),
-            bookie.clone(),
-            secs,
-        ));
-    }
-
     Ok(bookie)
-}
-
-/// Initialise subscription state and tasks
-///
-/// 1. Get subscriptions state directory from config
-/// 2. Load existing subscriptions and restore them in SubsManager
-/// 3. Spawn subscription processor task
-async fn setup_spawn_subscriptions(
-    agent: &Agent,
-    subs_manager: &SubsManager,
-    tripwire: &Tripwire,
-) -> eyre::Result<SharedMatcherBroadcastCache> {
-    let mut subs_bcast_cache = MatcherBroadcastCache::default();
-    let mut to_cleanup = vec![];
-
-    let subs_path = agent.config().db.subscriptions_path();
-
-    if let Ok(mut dir) = tokio::fs::read_dir(&subs_path).await {
-        while let Ok(Some(entry)) = dir.next_entry().await {
-            let path_str = entry.path().display().to_string();
-            if let Some(sub_id_str) = path_str.strip_prefix(subs_path.as_str()) {
-                if let Ok(sub_id) = sub_id_str.trim_matches('/').parse() {
-                    let (_, created) = match subs_manager.restore(
-                        sub_id,
-                        &subs_path,
-                        &agent.schema().read(),
-                        agent.pool(),
-                        tripwire.clone(),
-                    ) {
-                        Ok(res) => res,
-                        Err(e) => {
-                            error!(%sub_id, "could not restore subscription: {e}");
-                            to_cleanup.push(sub_id);
-                            continue;
-                        }
-                    };
-
-                    info!(%sub_id, "Restored subscription");
-
-                    let (sub_tx, _) = tokio::sync::broadcast::channel(10240);
-
-                    tokio::spawn(process_sub_channel(
-                        subs_manager.clone(),
-                        sub_id,
-                        sub_tx.clone(),
-                        created.evt_rx,
-                    ));
-
-                    subs_bcast_cache.insert(sub_id, sub_tx);
-                }
-            }
-        }
-    }
-
-    for id in to_cleanup {
-        info!(sub_id = %id, "Cleaning up unclean subscription");
-        Matcher::cleanup(id, Matcher::sub_path(subs_path.as_path(), id))?;
-    }
-
-    Ok(Arc::new(TokioRwLock::new(subs_bcast_cache)))
 }

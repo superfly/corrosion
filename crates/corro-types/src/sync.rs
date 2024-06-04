@@ -300,14 +300,19 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             Some(v) => v,
         };
 
-        let need: Vec<_> = bookedr.sync_need().iter().cloned().collect();
+        let need: Vec<_> = bookedr.needed().iter().cloned().collect();
 
         if !need.is_empty() {
             state.need.insert(actor_id, need);
         }
 
         {
-            for (v, partial) in bookedr.partials.iter() {
+            for (v, partial) in bookedr
+                .partials
+                .iter()
+                // don't set partial if it is effectively complete
+                .filter(|(_, partial)| !partial.is_complete())
+            {
                 state.partial_need.entry(actor_id).or_default().insert(
                     *v,
                     partial

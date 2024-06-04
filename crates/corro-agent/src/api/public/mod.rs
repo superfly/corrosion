@@ -7,21 +7,18 @@ use axum::{response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
-    agent::{Agent, ChangeError, CurrentVersion, KnownDbVersion},
+    agent::{Agent, ChangeError},
     api::{
-        row_to_change, ColumnName, ExecResponse, ExecResult, QueryEvent, Statement,
-        TableStatRequest, TableStatResponse,
+        ColumnName, ExecResponse, ExecResult, QueryEvent, Statement, TableStatRequest,
+        TableStatResponse,
     },
-    base::{CrsqlDbVersion, CrsqlSeq},
-    broadcast::{ChangeV1, Changeset, Timestamp},
-    change::{ChunkedChanges, SqliteValue, MAX_CHANGES_BYTE_SIZE},
+    base::Version,
+    change::{insert_local_changes, InsertChangesInfo, SqliteValue},
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
-use itertools::Itertools;
-use metrics::counter;
-use rusqlite::{named_params, params_from_iter, ToSql, Transaction};
+use rusqlite::{params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
     sync::{
@@ -32,14 +29,14 @@ use tokio::{
 };
 use tracing::{debug, error, info, trace};
 
-use corro_types::broadcast::{BroadcastInput, BroadcastV1};
+use corro_types::broadcast::broadcast_changes;
 
 pub mod pubsub;
 
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     f: F,
-) -> Result<(T, Duration), ChangeError>
+) -> Result<(T, Option<Version>, Duration), ChangeError>
 where
     F: Fn(&Transaction) -> Result<T, ChangeError>,
 {
@@ -68,176 +65,38 @@ where
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
-        let ts = Timestamp::from(agent.clock().new_timestamp());
+        let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
 
-        let db_version: CrsqlDbVersion = tx
-            .prepare_cached("SELECT crsql_next_db_version()")
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: None,
-            })?
-            .query_row((), |row| row.get(0))
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: None,
-            })?;
+        tx.commit().map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: insert_info.as_ref().map(|info| info.version),
+        })?;
 
-        let has_changes: bool = tx
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM crsql_changes WHERE db_version = ?);")
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: None,
-            })?
-            .query_row([db_version], |row| row.get(0))
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: None,
-            })?;
+        let elapsed = start.elapsed();
 
-        if !has_changes {
-            tx.commit().map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: None,
-            })?;
-            return Ok((ret, start.elapsed()));
-        }
-
-        let last_version = book_writer.last().unwrap_or_default();
-        trace!("last_version: {last_version}");
-        let version = last_version + 1;
-        trace!("version: {version}");
-
-        let last_seq: CrsqlSeq = tx
-            .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?")
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: Some(version),
-            })?
-            .query_row([db_version], |row| row.get(0))
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: Some(version),
-            })?;
-
-        let elapsed = {
-            tx.prepare_cached(
-                r#"
-                INSERT INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
-                    VALUES (:actor_id, :start_version, :db_version, :last_seq, :ts);
-            "#,
-            )
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: Some(version),
-            })?
-            .execute(named_params! {
-                ":actor_id": actor_id,
-                ":start_version": version,
-                ":db_version": db_version,
-                ":last_seq": last_seq,
-                ":ts": ts
-            })
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: Some(version),
-            })?;
-
-            debug!(%actor_id, %version, %db_version, "inserted local bookkeeping row!");
-
-            tx.commit().map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: Some(version),
-            })?;
-            start.elapsed()
-        };
-
-        trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
-
-        book_writer.insert(
-            version,
-            KnownDbVersion::Current(CurrentVersion {
+        match insert_info {
+            None => Ok((ret, None, elapsed)),
+            Some(InsertChangesInfo {
+                version,
                 db_version,
                 last_seq,
                 ts,
-            }),
-        );
-        drop(book_writer);
+                snap,
+            }) => {
+                trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-        let agent = agent.clone();
+                book_writer.commit_snapshot(snap);
 
-        spawn_counted(async move {
-            let conn = agent.pool().read().await?;
+                let agent = agent.clone();
 
-            block_in_place(|| {
-                // TODO: make this more generic so both sync and local changes can use it.
-                let mut prepped = conn.prepare_cached(
-                    r#"
-                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                        FROM crsql_changes
-                        WHERE db_version = ?
-                        ORDER BY seq ASC
-                "#,
-                )?;
-                let rows = prepped.query_map([db_version], row_to_change)?;
-                let chunked =
-                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
-                for changes_seqs in chunked {
-                    match changes_seqs {
-                        Ok((changes, seqs)) => {
-                            for (table_name, count) in
-                                changes.iter().counts_by(|change| &change.table)
-                            {
-                                counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "local").increment(count as u64);
-                            }
+                spawn_counted(async move {
+                    broadcast_changes(agent, db_version, last_seq, version, ts).await
+                });
 
-                            trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
-
-                            agent.subs_manager().match_changes(&changes, db_version);
-
-                            let tx_bcast = agent.tx_bcast().clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = tx_bcast
-                                    .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
-                                        ChangeV1 {
-                                            actor_id,
-                                            changeset: Changeset::Full {
-                                                version,
-                                                changes,
-                                                seqs,
-                                                last_seq,
-                                                ts,
-                                            },
-                                        },
-                                    )))
-                                    .await
-                                {
-                                    error!("could not send change message for broadcast: {e}");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                            break;
-                        }
-                    }
-                }
-                Ok::<_, rusqlite::Error>(())
-            })?;
-
-            Ok::<_, eyre::Report>(())
-        });
-
-        Ok::<_, ChangeError>((ret, elapsed))
+                Ok::<_, ChangeError>((ret, Some(version), elapsed))
+            }
+        }
     })
 }
 
@@ -285,6 +144,7 @@ pub async fn api_v1_transactions(
                     error: "at least 1 statement is required".into(),
                 }],
                 time: 0.0,
+                version: None,
             }),
         );
     }
@@ -317,7 +177,7 @@ pub async fn api_v1_transactions(
     })
     .await;
 
-    let (results, elapsed) = match res {
+    let (results, version, elapsed) = match res {
         Ok(res) => res,
         Err(e) => {
             error!("could not execute statement(s): {e}");
@@ -328,6 +188,7 @@ pub async fn api_v1_transactions(
                         error: e.to_string(),
                     }],
                     time: 0.0,
+                    version: None,
                 }),
             );
         }
@@ -338,6 +199,7 @@ pub async fn api_v1_transactions(
         axum::Json(ExecResponse {
             results,
             time: elapsed.as_secs_f64(),
+            version,
         }),
     )
 }
@@ -634,6 +496,7 @@ pub async fn api_v1_db_schema(
                     error: "at least 1 statement is required".into(),
                 }],
                 time: 0.0,
+                version: None,
             }),
         );
     }
@@ -649,6 +512,7 @@ pub async fn api_v1_db_schema(
                     error: e.to_string(),
                 }],
                 time: 0.0,
+                version: None,
             }),
         );
     }
@@ -658,6 +522,7 @@ pub async fn api_v1_db_schema(
         axum::Json(ExecResponse {
             results: vec![],
             time: start.elapsed().as_secs_f64(),
+            version: None,
         }),
     )
 }
@@ -727,7 +592,13 @@ pub async fn api_v1_table_stats(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use corro_types::{api::RowId, base::Version, config::Config, schema::SqliteType};
+    use corro_types::{
+        api::RowId,
+        base::Version,
+        broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
+        config::Config,
+        schema::SqliteType,
+    };
     use futures::Stream;
     use http_body::{combinators::UnsyncBoxBody, Body};
     use tokio::sync::mpsc::error::TryRecvError;

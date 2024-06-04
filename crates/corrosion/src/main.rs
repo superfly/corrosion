@@ -1,7 +1,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use admin::AdminConn;
@@ -453,6 +453,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Sync(SyncCommand::ReconcileGaps) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::ReconcileGaps,
+            ))
+            .await?;
+        }
         Command::Locks { top } => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Locks { top: *top })
@@ -482,10 +489,38 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
-        Command::CompactEmpties => {
-            let mut conn = AdminConn::connect(cli.admin_path()).await?;
-            conn.send_command(corro_admin::Command::CompactEmpties)
-                .await?;
+        Command::Db(DbCommand::Lock { cmd }) => {
+            let config = match cli.config() {
+                Ok(config) => config,
+                Err(_e) => {
+                    eyre::bail!(
+                        "path to current database is required via the config file passed as --config"
+                    );
+                }
+            };
+
+            let db_path = &config.db.path;
+            info!("Opening DB file at {db_path}");
+            let mut db_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(db_path)?;
+
+            info!("Acquiring lock...");
+            let start = Instant::now();
+            let _lock = sqlite3_restore::lock_all(&mut db_file, db_path, Duration::from_secs(30))?;
+            info!("Lock acquired after {:?}", start.elapsed());
+
+            info!("Launching command {cmd}");
+            let mut splitted_cmd = shell_words::split(cmd.as_str())?;
+            let exit = std::process::Command::new(splitted_cmd.remove(0))
+                .args(splitted_cmd)
+                .spawn()?
+                .wait()?;
+
+            info!("Exited with code: {:?}", exit.code());
+            std::process::exit(exit.code().unwrap_or(1));
         }
     }
 
@@ -543,7 +578,7 @@ impl Cli {
         Ok(if let Some(api_addr) = self.api_addr {
             api_addr
         } else {
-            self.config()?.api.bind_addr
+            *self.config()?.api.bind_addr.first().unwrap()
         })
     }
 
@@ -648,8 +683,9 @@ enum Command {
     #[command(subcommand)]
     Tls(TlsCommand),
 
-    /// Clear overwritten versions
-    CompactEmpties,
+    /// DB-related commands
+    #[command(subcommand)]
+    Db(DbCommand),
 }
 
 #[derive(Subcommand)]
@@ -676,6 +712,8 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
+    /// Reconcile gaps between memory and DB
+    ReconcileGaps,
 }
 
 #[derive(Subcommand)]
@@ -724,4 +762,10 @@ enum TlsClientCommand {
         #[arg(long)]
         ca_cert: Utf8PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum DbCommand {
+    /// Acquires the lock on the DB
+    Lock { cmd: String },
 }

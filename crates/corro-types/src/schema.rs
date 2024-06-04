@@ -15,6 +15,8 @@ use sqlite3_parser::ast::{
 };
 use tracing::{debug, info, trace};
 
+use crate::agent::create_clock_change_trigger;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Column {
     pub name: String,
@@ -372,6 +374,9 @@ pub fn apply_schema(
                     .to_string(),
                 )?;
             }
+
+            // create the trigger for this table, in case it does not exist
+            create_clock_change_trigger(tx, name)?;
         }
     }
 
