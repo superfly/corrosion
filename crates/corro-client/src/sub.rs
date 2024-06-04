@@ -1,7 +1,6 @@
 use std::{
     error::Error,
     io,
-    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -57,7 +56,7 @@ type FramedBody = FramedRead<IoBodyStreamReader, LinesBytesCodec>;
 pub struct SubscriptionStream<T> {
     id: Uuid,
     client: hyper::Client<HttpConnector, Body>,
-    api_addr: SocketAddr,
+    api_addr: String,
     observed_eoq: bool,
     last_change_id: Option<ChangeId>,
     stream: Option<FramedBody>,
@@ -92,13 +91,13 @@ where
     pub fn new(
         id: Uuid,
         client: hyper::Client<HttpConnector, Body>,
-        api_addr: SocketAddr,
+        api_addr: &str,
         body: hyper::Body,
     ) -> Self {
         Self {
             id,
             client,
-            api_addr,
+            api_addr: api_addr.into(),
             observed_eoq: false,
             last_change_id: None,
             stream: Some(FramedRead::new(

@@ -1,6 +1,6 @@
 pub mod sub;
 
-use std::{net::SocketAddr, ops::Deref, path::Path};
+use std::{ops::Deref, path::Path};
 
 use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
 use http::uri::PathAndQuery;
@@ -12,14 +12,14 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct CorrosionApiClient {
-    api_addr: SocketAddr,
+    api_addr: String,
     api_client: hyper::Client<HttpConnector, Body>,
 }
 
 impl CorrosionApiClient {
-    pub fn new(api_addr: SocketAddr) -> Self {
+    pub fn new<T: ToString>(api_addr: T) -> Self {
         Self {
-            api_addr,
+            api_addr: api_addr.to_string(),
             api_client: hyper::Client::builder().http2_only(true).build_http(),
         }
     }
@@ -117,7 +117,7 @@ impl CorrosionApiClient {
         Ok(SubscriptionStream::new(
             id,
             self.api_client.clone(),
-            self.api_addr,
+            &self.api_addr,
             res.into_body(),
         ))
     }
@@ -167,7 +167,7 @@ impl CorrosionApiClient {
         Ok(SubscriptionStream::new(
             id,
             self.api_client.clone(),
-            self.api_addr,
+            &self.api_addr,
             res.into_body(),
         ))
     }
@@ -313,7 +313,7 @@ pub struct CorrosionClient {
 }
 
 impl CorrosionClient {
-    pub fn new<P: AsRef<Path>>(api_addr: SocketAddr, db_path: P) -> Self {
+    pub fn new<P: AsRef<Path>, T: ToString>(api_addr: T, db_path: P) -> Self {
         Self {
             api_client: CorrosionApiClient::new(api_addr),
             pool: sqlite_pool::Config::new(db_path.as_ref())
