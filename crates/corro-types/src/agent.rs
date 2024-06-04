@@ -538,7 +538,9 @@ pub fn create_clock_change_trigger(
     CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_updated
         AFTER UPDATE ON {name}__crsql_clock FOR EACH ROW
             WHEN (old.site_id != new.site_id OR old.db_version != new.db_version) AND NOT EXISTS
-            (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = old.site_id AND c.db_version = old.db_version)
+                (SELECT q 1 FROM crsql_changes AS c
+                    WHERE c.site_id = (select site_id FROM crsql_site_id WHERE ordinal = old.site_id)
+                    AND c.db_version = old.db_version)
         BEGIN
             INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
                 ON CONFLICT (site_id, db_version) DO NOTHING;
@@ -546,6 +548,9 @@ pub fn create_clock_change_trigger(
 
     CREATE TRIGGER IF NOT EXISTS {name}__corro_db_version_deleted
         AFTER DELETE ON {name}__crsql_clock FOR EACH ROW
+            WHEN NOT EXISTS (SELECT DISTINCT 1 FROM crsql_changes AS c
+                 WHERE c.site_id = (select site_id FROM crsql_site_id WHERE ordinal = old.site_id)
+                 AND c.db_version = old.db_version)
         BEGIN
             INSERT INTO __corro_versions_impacted (site_id, db_version) VALUES (old.site_id, old.db_version)
                 ON CONFLICT (site_id, db_version) DO NOTHING;
