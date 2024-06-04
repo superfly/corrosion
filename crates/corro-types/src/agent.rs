@@ -1609,7 +1609,7 @@ pub fn find_overwritten_versions(
 
     let limit = limit.unwrap_or(-1);
 
-    let query = "SELECT v.db_version, si.site_id, v.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
+    let query = "SELECT v.db_version, si.site_id, v.site_id, bk.start_version
             FROM __corro_versions_impacted AS v
             INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
             INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version LIMIT ?".to_string();
@@ -1638,30 +1638,30 @@ pub fn find_overwritten_versions(
         };
         trace!("actor_id: {actor_id}");
 
-        let exists: bool = row.get(3)?;
+        // let exists: bool = row.get(3)?;
 
-        debug!("exists? {exists}");
+        // debug!("exists? {exists}");
 
-        if !exists {
-            debug!("version is gone now");
-            let version = match row.get::<_, Option<Version>>(4)? {
-                Some(version) => version,
-                None => {
-                    warn!("missing start_version for an impacted version: actor_id = {actor_id}, db_version = {db_version}");
-                    continue;
-                }
-            };
+        // if !exists {
+        debug!("version is gone now");
+        let version = match row.get::<_, Option<Version>>(3)? {
+            Some(version) => version,
+            None => {
+                warn!("missing start_version for an impacted version: actor_id = {actor_id}, db_version = {db_version}");
+                continue;
+            }
+        };
 
-            all_versions
-                .entry(actor_id)
-                .or_default()
-                .insert(version..=version);
-        }
+        all_versions
+            .entry(actor_id)
+            .or_default()
+            .insert(version..=version);
+        // }
 
         if limit != -1 {
             let ordinal: CrsqlDbVersion = row.get(2)?;
             where_clause.push(format!(
-                "(site_id = {ordinal}) and db_version = {db_version}"
+                "(site_id = {ordinal} and db_version = {db_version})"
             ));
         }
     }

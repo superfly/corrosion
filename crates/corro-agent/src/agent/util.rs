@@ -1261,7 +1261,6 @@ pub async fn clear_empty_versions_loop(agent: Agent, tripwire: Tripwire) {
             };
 
             debug!(%self_actor_id, "got ranges to clear for {} actors in {:?}", overwritten.len(), start.elapsed());
-            let start = Instant::now();
             let mut count = 0;
             for (actor_id, versions) in overwritten {
                 for version in versions {
