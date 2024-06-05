@@ -5,6 +5,7 @@
 #![deny(clippy::await_holding_lock)]
 
 mod preempt;
+#[cfg(unix)]
 mod signalstream;
 mod tripwire;
 
