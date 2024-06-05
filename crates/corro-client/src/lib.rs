@@ -5,6 +5,7 @@ use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use serde::de::DeserializeOwned;
 use std::{
+    io,
     net::SocketAddr,
     ops::Deref,
     path::Path,
@@ -12,7 +13,10 @@ use std::{
     time::{self, Instant},
 };
 use sub::{QueryStream, SubscriptionStream};
-use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio::{
+    net::{lookup_host, ToSocketAddrs},
+    sync::{RwLock, RwLockReadGuard},
+};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -343,16 +347,15 @@ impl Deref for CorrosionClient {
 }
 
 #[derive(Clone)]
-pub struct CorrosionPooledClient {
-    inner: Arc<RwLock<PooledClientInner>>,
+pub struct CorrosionPooledClient<A> {
+    inner: Arc<RwLock<PooledClientInner<A>>>,
 }
 
-struct PooledClientInner {
-    addrs: Vec<SocketAddr>,
-    stickiness_timeout: time::Duration,
+struct PooledClientInner<A> {
+    picker: AddrPicker<A>,
 
-    // Next address to try if the client is None
-    next_addr: usize,
+    // For how long to stick with a chosen server
+    stickiness_timeout: time::Duration,
     // Currently chosen client
     client: Option<CorrosionApiClient>,
     // Whether or not the chosen client has made a successful request
@@ -363,19 +366,13 @@ struct PooledClientInner {
     generation: u64,
 }
 
-impl CorrosionPooledClient {
-    pub fn new(api_addrs: &[SocketAddr], stickiness_timeout: time::Duration) -> Self {
-        assert!(
-            !api_addrs.is_empty(),
-            "At least one API address is required"
-        );
-
+impl<A: ToSocketAddrs> CorrosionPooledClient<A> {
+    pub fn new(addrs: A, stickiness_timeout: time::Duration) -> Self {
         Self {
             inner: Arc::new(RwLock::new(PooledClientInner {
-                addrs: Vec::from(api_addrs),
-                stickiness_timeout,
+                picker: AddrPicker::new(addrs),
 
-                next_addr: 0,
+                stickiness_timeout,
                 client: None,
                 had_success: false,
                 first_fail_at: None,
@@ -389,7 +386,7 @@ impl CorrosionPooledClient {
         statement: &Statement,
     ) -> Result<QueryStream<T>, Error> {
         let (response, generation) = {
-            let (client, generation) = self.get_client().await;
+            let (client, generation) = self.get_client().await?;
             let response = client.query_typed(statement).await;
 
             (response, generation)
@@ -413,7 +410,7 @@ impl CorrosionPooledClient {
         from: Option<ChangeId>,
     ) -> Result<SubscriptionStream<T>, Error> {
         let (response, generation) = {
-            let (client, generation) = self.get_client().await;
+            let (client, generation) = self.get_client().await?;
             let response = client.subscribe_typed(statement, skip_rows, from).await;
 
             (response, generation)
@@ -437,7 +434,7 @@ impl CorrosionPooledClient {
         from: Option<ChangeId>,
     ) -> Result<SubscriptionStream<T>, Error> {
         let (response, generation) = {
-            let (client, generation) = self.get_client().await;
+            let (client, generation) = self.get_client().await?;
             let response = client.subscription_typed(id, skip_rows, from).await;
 
             (response, generation)
@@ -454,14 +451,12 @@ impl CorrosionPooledClient {
         response
     }
 
-    async fn get_client(&self) -> (RwLockReadGuard<'_, CorrosionApiClient>, u64) {
+    async fn get_client(&self) -> Result<(RwLockReadGuard<'_, CorrosionApiClient>, u64), Error> {
         let mut inner = self.inner.write().await;
         let generation = inner.generation;
 
-        assert!(inner.next_addr < inner.addrs.len());
         if inner.client.is_none() {
-            let addr = inner.addrs[inner.next_addr];
-
+            let addr = inner.picker.next().await?;
             info!(
                 "next Corrosion server to attempt: {}, generation: {}",
                 addr, generation
@@ -469,10 +464,10 @@ impl CorrosionPooledClient {
             inner.client = Some(CorrosionApiClient::new(addr))
         }
 
-        (
+        Ok((
             RwLockReadGuard::map(inner.downgrade(), |inner| inner.client.as_ref().unwrap()),
             generation,
-        )
+        ))
     }
 
     async fn handle_success(&self, generation: u64) {
@@ -512,10 +507,8 @@ impl CorrosionPooledClient {
                 // If we had a successful call before, try to fallback to the first server, so the first
                 // one is always preferred by all the clients.
                 // Otherwise, continue iterating over the rest of the servers.
-                if inner.had_success && inner.next_addr > 0 {
-                    inner.next_addr = 0
-                } else {
-                    inner.next_addr = (inner.next_addr + 1) % inner.addrs.len();
+                if inner.had_success {
+                    inner.picker.reset()
                 }
 
                 inner.client = None;
@@ -527,8 +520,64 @@ impl CorrosionPooledClient {
     }
 }
 
+struct AddrPicker<A> {
+    addrs: A,
+
+    last_addrs: Option<Vec<SocketAddr>>,
+    cur_addr: usize,
+}
+
+impl<A: ToSocketAddrs> AddrPicker<A> {
+    fn new(addrs: A) -> AddrPicker<A> {
+        Self {
+            addrs,
+            last_addrs: None,
+            cur_addr: 0,
+        }
+    }
+
+    async fn next(&mut self) -> Result<SocketAddr, Error> {
+        // Either we don't have any address or we tried them all, resolve again.
+        if self.cur_addr
+            >= self
+                .last_addrs
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or_default()
+        {
+            let mut addrs = lookup_host(&self.addrs).await?.collect::<Vec<_>>();
+            // Sort so all the nodes try the addresses in the same order
+            addrs.sort();
+
+            debug!("got the following Corrosion servers: {:?}", addrs);
+
+            self.last_addrs = Some(addrs);
+            self.cur_addr = 0;
+        }
+
+        if let Some(addr) = self
+            .last_addrs
+            .as_ref()
+            .and_then(|a| a.get(self.cur_addr).copied())
+        {
+            self.cur_addr += 1;
+
+            Ok(addr)
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "DNS didn't return any addresses").into())
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cur_addr = 0;
+        self.last_addrs = None;
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error(transparent)]
+    Dns(#[from] io::Error),
     #[error(transparent)]
     Hyper(#[from] hyper::Error),
     #[error(transparent)]
