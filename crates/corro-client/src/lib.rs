@@ -1,13 +1,23 @@
 pub mod sub;
 
-use std::{net::SocketAddr, ops::Deref, path::Path};
-
 use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
 use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use serde::de::DeserializeOwned;
+use std::{
+    io,
+    net::SocketAddr,
+    ops::Deref,
+    path::Path,
+    sync::Arc,
+    time::{self, Instant},
+};
 use sub::{QueryStream, SubscriptionStream};
-use tracing::{debug, warn};
+use tokio::{
+    net::{lookup_host, ToSocketAddrs},
+    sync::{RwLock, RwLockReadGuard},
+};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -336,8 +346,238 @@ impl Deref for CorrosionClient {
     }
 }
 
+#[derive(Clone)]
+pub struct CorrosionPooledClient<A> {
+    inner: Arc<RwLock<PooledClientInner<A>>>,
+}
+
+struct PooledClientInner<A> {
+    picker: AddrPicker<A>,
+
+    // For how long to stick with a chosen server
+    stickiness_timeout: time::Duration,
+    // Currently chosen client
+    client: Option<CorrosionApiClient>,
+    // Whether or not the chosen client has made a successful request
+    had_success: bool,
+    // Time when the first fail occured after at least one successful call
+    first_fail_at: Option<Instant>,
+    // Current client generation, incremented after each client change
+    generation: u64,
+}
+
+impl<A: ToSocketAddrs> CorrosionPooledClient<A> {
+    pub fn new(addrs: A, stickiness_timeout: time::Duration) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(PooledClientInner {
+                picker: AddrPicker::new(addrs),
+
+                stickiness_timeout,
+                client: None,
+                had_success: false,
+                first_fail_at: None,
+                generation: 0,
+            })),
+        }
+    }
+
+    pub async fn query_typed<T: DeserializeOwned + Unpin>(
+        &self,
+        statement: &Statement,
+    ) -> Result<QueryStream<T>, Error> {
+        let (response, generation) = {
+            let (client, generation) = self.get_client().await?;
+            let response = client.query_typed(statement).await;
+
+            (response, generation)
+        };
+
+        if matches!(response, Err(Error::Hyper(_))) {
+            // We only care about I/O related errors
+            self.handle_error(generation).await;
+        } else {
+            // The rest are considered a success
+            self.handle_success(generation).await;
+        }
+
+        response
+    }
+
+    pub async fn subscribe_typed<T: DeserializeOwned + Unpin>(
+        &self,
+        statement: &Statement,
+        skip_rows: bool,
+        from: Option<ChangeId>,
+    ) -> Result<SubscriptionStream<T>, Error> {
+        let (response, generation) = {
+            let (client, generation) = self.get_client().await?;
+            let response = client.subscribe_typed(statement, skip_rows, from).await;
+
+            (response, generation)
+        };
+
+        if matches!(response, Err(Error::Hyper(_))) {
+            // We only care about I/O related errors
+            self.handle_error(generation).await;
+        } else {
+            // The rest are considered a success
+            self.handle_success(generation).await;
+        }
+
+        response
+    }
+
+    pub async fn subscription_typed<T: DeserializeOwned + Unpin>(
+        &self,
+        id: Uuid,
+        skip_rows: bool,
+        from: Option<ChangeId>,
+    ) -> Result<SubscriptionStream<T>, Error> {
+        let (response, generation) = {
+            let (client, generation) = self.get_client().await?;
+            let response = client.subscription_typed(id, skip_rows, from).await;
+
+            (response, generation)
+        };
+
+        if matches!(response, Err(Error::Hyper(_))) {
+            // We only care about I/O related errors
+            self.handle_error(generation).await;
+        } else {
+            // The rest are considered a success
+            self.handle_success(generation).await;
+        }
+
+        response
+    }
+
+    async fn get_client(&self) -> Result<(RwLockReadGuard<'_, CorrosionApiClient>, u64), Error> {
+        let mut inner = self.inner.write().await;
+        let generation = inner.generation;
+
+        if inner.client.is_none() {
+            let addr = inner.picker.next().await?;
+            info!(
+                "next Corrosion server to attempt: {}, generation: {}",
+                addr, generation
+            );
+            inner.client = Some(CorrosionApiClient::new(addr))
+        }
+
+        Ok((
+            RwLockReadGuard::map(inner.downgrade(), |inner| inner.client.as_ref().unwrap()),
+            generation,
+        ))
+    }
+
+    async fn handle_success(&self, generation: u64) {
+        let mut inner = self.inner.write().await;
+
+        // Even though the call was successul, another failed call has advanced the client already.
+        if inner.generation != generation {
+            return;
+        }
+
+        // Mark that this client was able to perform a successful call to Corrosion
+        // and we should stick with it.
+        inner.had_success = true;
+        // And reset the time of the first fail.
+        inner.first_fail_at = None;
+    }
+
+    async fn handle_error(&self, generation: u64) {
+        let mut inner = self.inner.write().await;
+
+        // Somebody else has already handled an error with this client
+        if generation != inner.generation {
+            return;
+        }
+
+        match inner.first_fail_at {
+            // First fail after success
+            None if inner.had_success => {
+                inner.first_fail_at = Some(Instant::now());
+            }
+
+            // Still within stickiness timeout, try the same server again
+            Some(first) if Instant::now().duration_since(first) < inner.stickiness_timeout => {}
+
+            // Otherwise, pick a new server for the next attempt
+            _ => {
+                // If we had a successful call before, try to fallback to the first server, so the first
+                // one is always preferred by all the clients.
+                // Otherwise, continue iterating over the rest of the servers.
+                if inner.had_success {
+                    inner.picker.reset()
+                }
+
+                inner.client = None;
+                inner.first_fail_at = None;
+                inner.had_success = false;
+                inner.generation += 1;
+            }
+        }
+    }
+}
+
+struct AddrPicker<A> {
+    addrs: A,
+
+    last_addrs: Option<Vec<SocketAddr>>,
+    cur_addr: usize,
+}
+
+impl<A: ToSocketAddrs> AddrPicker<A> {
+    fn new(addrs: A) -> AddrPicker<A> {
+        Self {
+            addrs,
+            last_addrs: None,
+            cur_addr: 0,
+        }
+    }
+
+    async fn next(&mut self) -> Result<SocketAddr, Error> {
+        // Either we don't have any address or we tried them all, resolve again.
+        if self.cur_addr
+            >= self
+                .last_addrs
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or_default()
+        {
+            let mut addrs = lookup_host(&self.addrs).await?.collect::<Vec<_>>();
+            // Sort so all the nodes try the addresses in the same order
+            addrs.sort();
+
+            debug!("got the following Corrosion servers: {:?}", addrs);
+
+            self.last_addrs = Some(addrs);
+            self.cur_addr = 0;
+        }
+
+        if let Some(addr) = self
+            .last_addrs
+            .as_ref()
+            .and_then(|a| a.get(self.cur_addr).copied())
+        {
+            self.cur_addr += 1;
+
+            Ok(addr)
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "DNS didn't return any addresses").into())
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cur_addr = 0;
+        self.last_addrs = None;
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error(transparent)]
+    Dns(#[from] io::Error),
     #[error(transparent)]
     Hyper(#[from] hyper::Error),
     #[error(transparent)]
