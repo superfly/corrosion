@@ -367,7 +367,7 @@ struct PooledClientInner<A> {
 }
 
 impl<A: ToSocketAddrs> CorrosionPooledClient<A> {
-    pub fn new(addrs: A, stickiness_timeout: time::Duration) -> Self {
+    pub fn new(addrs: Vec<A>, stickiness_timeout: time::Duration) -> Self {
         Self {
             inner: Arc::new(RwLock::new(PooledClientInner {
                 picker: AddrPicker::new(addrs),
@@ -521,46 +521,59 @@ impl<A: ToSocketAddrs> CorrosionPooledClient<A> {
 }
 
 struct AddrPicker<A> {
-    addrs: A,
+    // List of addresses/hostname to try in order
+    addrs: Vec<A>,
+    // Next address/hostname to try
+    next_addr: usize,
 
-    last_addrs: Option<Vec<SocketAddr>>,
-    cur_addr: usize,
+    // List of addresses returned by the last resolve attempt
+    last_resolved_addrs: Option<Vec<SocketAddr>>,
+    // Next address to return
+    next_resolved_addr: usize,
 }
 
 impl<A: ToSocketAddrs> AddrPicker<A> {
-    fn new(addrs: A) -> AddrPicker<A> {
+    fn new(addrs: Vec<A>) -> AddrPicker<A> {
         Self {
             addrs,
-            last_addrs: None,
-            cur_addr: 0,
+            next_addr: 0,
+
+            last_resolved_addrs: None,
+            next_resolved_addr: 0,
         }
     }
 
     async fn next(&mut self) -> Result<SocketAddr, Error> {
         // Either we don't have any address or we tried them all, resolve again.
-        if self.cur_addr
+        if self.next_resolved_addr
             >= self
-                .last_addrs
+                .last_resolved_addrs
                 .as_ref()
                 .map(|v| v.len())
                 .unwrap_or_default()
         {
-            let mut addrs = lookup_host(&self.addrs).await?.collect::<Vec<_>>();
+            let addr_or_hostname = self.addrs.get(self.next_addr).ok_or(io::Error::new(
+                io::ErrorKind::Other,
+                "No addresses available",
+            ))?;
+            self.next_addr = (self.next_addr + 1) % self.addrs.len();
+
+            let mut addrs = lookup_host(addr_or_hostname).await?.collect::<Vec<_>>();
             // Sort so all the nodes try the addresses in the same order
             addrs.sort();
 
             debug!("got the following Corrosion servers: {:?}", addrs);
 
-            self.last_addrs = Some(addrs);
-            self.cur_addr = 0;
+            self.last_resolved_addrs = Some(addrs);
+            self.next_resolved_addr = 0;
         }
 
         if let Some(addr) = self
-            .last_addrs
+            .last_resolved_addrs
             .as_ref()
-            .and_then(|a| a.get(self.cur_addr).copied())
+            .and_then(|a| a.get(self.next_resolved_addr).copied())
         {
-            self.cur_addr += 1;
+            self.next_resolved_addr += 1;
 
             Ok(addr)
         } else {
@@ -569,8 +582,9 @@ impl<A: ToSocketAddrs> AddrPicker<A> {
     }
 
     fn reset(&mut self) {
-        self.cur_addr = 0;
-        self.last_addrs = None;
+        self.next_addr = 0;
+        self.last_resolved_addrs = None;
+        self.next_resolved_addr = 0;
     }
 }
 
@@ -598,4 +612,288 @@ pub enum Error {
 
     #[error("could not retrieve subscription id from headers")]
     ExpectedQueryId,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{CorrosionPooledClient, Error};
+    use corro_api_types::SqliteValue;
+    use hyper::{header::HeaderValue, service::service_fn, Body, Request, Response};
+    use std::{
+        convert::Infallible,
+        net::SocketAddr,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tokio::{net::TcpListener, pin, sync::broadcast};
+    use uuid::Uuid;
+
+    struct Server {
+        id: Uuid,
+        addr: SocketAddr,
+        refuse: Arc<AtomicBool>,
+        drop_conn_tx: broadcast::Sender<()>,
+    }
+
+    impl Server {
+        async fn new(id: Uuid) -> Self {
+            let refuse = Arc::new(AtomicBool::new(false));
+            let (drop_conn_tx, drop_conn_rx) = broadcast::channel::<()>(1);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn({
+                let refuse = refuse.clone();
+
+                async move {
+                    loop {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        if refuse.load(Ordering::Relaxed) {
+                            drop(stream);
+                            continue;
+                        }
+
+                        let mut drop_conn_rx = drop_conn_rx.resubscribe();
+                        tokio::spawn(async move {
+                            let http = hyper::server::conn::Http::new();
+                            let conn = http.serve_connection(
+                                stream,
+                                service_fn(move |_: Request<Body>| async move {
+                                    let mut res = Response::new(Body::empty());
+                                    res.headers_mut().insert(
+                                        "corro-query-id",
+                                        HeaderValue::from_str(&id.to_string()).unwrap(),
+                                    );
+                                    Ok::<_, Infallible>(res)
+                                }),
+                            );
+                            pin!(conn);
+
+                            tokio::select! {
+                                _ = conn.as_mut() => (),
+                                _ = drop_conn_rx.recv() => (),
+                            }
+                        });
+                    }
+                }
+            });
+
+            Server {
+                id,
+                addr,
+                refuse,
+                drop_conn_tx,
+            }
+        }
+
+        fn refuse_new_conns(&self, refuse: bool) {
+            self.refuse.store(refuse, Ordering::Relaxed)
+        }
+
+        fn kill_existing_conns(&self) {
+            _ = self.drop_conn_tx.send(())
+        }
+    }
+
+    async fn gen_servers(num: usize) -> (Vec<Server>, Vec<SocketAddr>) {
+        let mut servers = Vec::new();
+
+        for _ in 0..num {
+            servers.push(Server::new(Uuid::new_v4()).await);
+        }
+
+        // sort the way the client is supposed to try them
+        servers.sort_by(|a, b| a.addr.partial_cmp(&b.addr).unwrap());
+        let addrs = servers.iter().map(|s| s.addr).collect();
+
+        (servers, addrs)
+    }
+
+    #[tokio::test]
+    async fn test_single_address() {
+        let statement = "".into();
+        let (servers, addresses) = gen_servers(1).await;
+
+        let client =
+            CorrosionPooledClient::new(vec![addresses.as_slice()], Duration::from_nanos(1));
+        let sub = client
+            .subscribe_typed::<SqliteValue>(&statement, false, None)
+            .await
+            .unwrap();
+        assert_eq!(sub.id(), servers[0].id);
+
+        // Drop the connection, next attempt should error
+        servers[0].kill_existing_conns();
+
+        let res = client
+            .subscribe_typed::<SqliteValue>(&statement, false, None)
+            .await;
+        assert!(matches!(res, Result::Err(Error::Hyper(_))));
+
+        // But the new one should succeed
+        let client =
+            CorrosionPooledClient::new(vec![addresses.as_slice()], Duration::from_nanos(1));
+        let sub = client
+            .subscribe_typed::<SqliteValue>(&statement, false, None)
+            .await
+            .unwrap();
+        assert_eq!(sub.id(), servers[0].id);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_addresses() {
+        let statement = "".into();
+        let (servers, addresses) = gen_servers(3).await;
+
+        let client =
+            CorrosionPooledClient::new(vec![addresses.as_slice()], Duration::from_nanos(1));
+
+        // Refuse connections on the first server
+        servers[0].refuse_new_conns(true);
+
+        // First one should error
+        let res = client
+            .subscribe_typed::<SqliteValue>(&statement, false, None)
+            .await;
+        assert!(matches!(res, Result::Err(Error::Hyper(_))));
+
+        // Second one should succeed
+        let sub = client
+            .subscribe_typed::<SqliteValue>(&statement, false, None)
+            .await
+            .unwrap();
+        assert_eq!(sub.id(), servers[1].id);
+
+        // Abort the second server, the client should fallback back to the first one after the first two attempts
+        servers[1].kill_existing_conns();
+        servers[1].refuse_new_conns(true);
+        servers[0].refuse_new_conns(false);
+
+        // First and second one should error
+        for _ in 0..2 {
+            let res = client
+                .subscribe_typed::<SqliteValue>(&statement, false, None)
+                .await;
+            assert!(matches!(res, Result::Err(Error::Hyper(_))));
+        }
+
+        // The next one should succeed
+        let sub = client
+            .subscribe_typed::<SqliteValue>(&statement, false, None)
+            .await
+            .unwrap();
+        assert_eq!(sub.id(), servers[0].id);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_addresses_sticky() {
+        let statement = "".into();
+        let (servers, addresses) = gen_servers(3).await;
+
+        let client =
+            CorrosionPooledClient::new(vec![addresses.as_slice()], Duration::from_millis(50));
+
+        // Refuse connections on the first server
+        servers[0].refuse_new_conns(true);
+
+        // First one should error
+        let res = client
+            .subscribe_typed::<SqliteValue>(&statement, false, None)
+            .await;
+        assert!(matches!(res, Result::Err(Error::Hyper(_))));
+
+        // Second one should succeed
+        let sub = client
+            .subscribe_typed::<SqliteValue>(&statement, false, None)
+            .await
+            .unwrap();
+        assert_eq!(sub.id(), servers[1].id);
+
+        // Abort the second server, the client should continue trying it until the timeout expires
+        servers[1].kill_existing_conns();
+        servers[1].refuse_new_conns(true);
+        servers[0].refuse_new_conns(false);
+
+        let mut attempts = 0;
+        loop {
+            let res = client
+                .subscribe_typed::<SqliteValue>(&statement, false, None)
+                .await;
+
+            match res {
+                Ok(sub) => {
+                    assert_eq!(sub.id(), servers[0].id);
+                    break;
+                }
+                Err(_) => attempts += 1,
+            };
+        }
+        assert!(attempts > 2);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_pool() {
+        let statement = "".into();
+        let (pool1_servers, pool1_addresses) = gen_servers(2).await;
+        let (pool2_servers, pool2_addresses) = gen_servers(2).await;
+
+        let client = CorrosionPooledClient::new(
+            vec![pool1_addresses.as_slice(), pool2_addresses.as_slice()],
+            Duration::from_nanos(1),
+        );
+
+        // Refuse connections on all servers
+        for i in 0..2 {
+            pool1_servers[i].refuse_new_conns(true);
+            pool2_servers[i].refuse_new_conns(true);
+        }
+
+        // Try to connect multiple times, all should fail
+        for _ in 0..15 {
+            let res = client
+                .subscribe_typed::<SqliteValue>(&statement, false, None)
+                .await;
+            assert!(matches!(res, Result::Err(Error::Hyper(_))));
+        }
+
+        // Accept connections on first server in the backup pool
+        pool2_servers[0].refuse_new_conns(false);
+        for i in 0..4 {
+            let res = client
+                .subscribe_typed::<SqliteValue>(&statement, false, None)
+                .await;
+            match res {
+                Result::Err(_) => (),
+                Ok(sub) => {
+                    assert_eq!(sub.id(), pool2_servers[0].id);
+                    break;
+                }
+            }
+            assert!(i != 3);
+        }
+
+        // Kill the connection, it should fallback to the first pool
+        pool2_servers[0].kill_existing_conns();
+        pool2_servers[0].refuse_new_conns(true);
+        pool1_servers[0].refuse_new_conns(false);
+        pool1_servers[1].refuse_new_conns(false);
+
+        // First and second one should error
+        for _ in 0..2 {
+            let res = client
+                .subscribe_typed::<SqliteValue>(&statement, false, None)
+                .await;
+            assert!(matches!(res, Result::Err(Error::Hyper(_))));
+        }
+
+        // Thirst one should succeed
+        let sub = client
+            .subscribe_typed::<SqliteValue>(&statement, false, None)
+            .await
+            .unwrap();
+        assert_eq!(sub.id(), pool1_servers[0].id);
+    }
 }
