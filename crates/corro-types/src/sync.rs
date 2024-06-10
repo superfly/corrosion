@@ -82,6 +82,7 @@ pub struct SyncStateV1 {
     pub heads: HashMap<ActorId, Version>,
     pub need: HashMap<ActorId, Vec<RangeInclusive<Version>>>,
     pub partial_need: HashMap<ActorId, HashMap<Version, Vec<RangeInclusive<CrsqlSeq>>>>,
+    pub last_cleared_ts: Option<Timestamp>,
 }
 
 impl SyncStateV1 {
@@ -256,6 +257,9 @@ pub enum SyncNeedV1 {
         version: Version,
         seqs: Vec<RangeInclusive<CrsqlSeq>>,
     },
+    Empty {
+        ts: Option<Timestamp>,
+    },
 }
 
 impl SyncNeedV1 {
@@ -263,6 +267,7 @@ impl SyncNeedV1 {
         match self {
             SyncNeedV1::Full { versions } => (versions.end().0 - versions.start().0) as usize + 1,
             SyncNeedV1::Partial { .. } => 1,
+            SyncNeedV1::Empty { .. } => 1,
         }
     }
 }
@@ -271,6 +276,14 @@ impl From<SyncStateV1> for SyncMessage {
     fn from(value: SyncStateV1) -> Self {
         SyncMessage::V1(SyncMessageV1::State(value))
     }
+}
+
+pub async fn get_last_cleared_ts(bookie: &Bookie, actor_id: &ActorId) -> Option<Timestamp> {
+    if let Some(booked) = bookie.read("get_last_cleared_ts").await.get(actor_id) {
+        let booked_reader = booked.read("get_last_cleared_ts").await;
+        return booked_reader.last_cleared_ts();
+    }
+    return None;
 }
 
 // generates a `SyncMessage` to tell another node what versions we're missing
@@ -324,6 +337,7 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
         }
 
         state.heads.insert(actor_id, last_version);
+        state.last_cleared_ts = bookedr.last_cleared_ts();
     }
 
     state
