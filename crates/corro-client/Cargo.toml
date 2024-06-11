@@ -22,5 +22,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 sqlite-pool = { path = "../sqlite-pool" }
 serde = { workspace = true }
+trust-dns-resolver = { workspace = true }
 
 [features]
