@@ -443,8 +443,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 }
             }
         }
-        Command::Reload => {
-            command::reload::run(cli.api_addr()?, &cli.config()?.db.schema_paths).await?
+        Command::Reload { allow_destructive } => {
+            command::reload::run(
+                cli.api_addr()?,
+                &cli.config()?.db.schema_paths,
+                *allow_destructive,
+            )
+            .await?
         }
         Command::Sync(SyncCommand::Generate) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
@@ -659,7 +664,10 @@ enum Command {
     },
 
     /// Reload the config
-    Reload,
+    Reload {
+        #[arg(long, default_value = "false")]
+        allow_destructive: bool,
+    },
 
     /// Sync-related commands
     #[command(subcommand)]

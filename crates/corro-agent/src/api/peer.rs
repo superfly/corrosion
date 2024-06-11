@@ -1605,7 +1605,7 @@ pub async fn serve_sync(
 
 #[cfg(test)]
 mod tests {
-    use axum::{Extension, Json};
+    use axum::{extract::Query, Extension, Json};
     use camino::Utf8PathBuf;
     use corro_tests::TEST_SCHEMA;
     use corro_types::{
@@ -1645,8 +1645,12 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _res) =
-            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
+        let (status_code, _res) = api_v1_db_schema(
+            Extension(agent.clone()),
+            Query(None),
+            Json(vec![TEST_SCHEMA.to_owned()]),
+        )
+        .await;
 
         assert_eq!(status_code, StatusCode::OK);
 

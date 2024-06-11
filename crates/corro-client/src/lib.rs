@@ -210,10 +210,18 @@ impl CorrosionApiClient {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    pub async fn schema(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
+    pub async fn schema(
+        &self,
+        statements: &[Statement],
+        allow_destructive: bool,
+    ) -> Result<ExecResponse, Error> {
+        let mut url = format!("http://{}/v1/migrations", self.api_addr);
+        if allow_destructive {
+            url += "?allow_destructive=true";
+        }
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/v1/migrations", self.api_addr))
+            .uri(url)
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statements)?))?;
@@ -232,6 +240,7 @@ impl CorrosionApiClient {
     pub async fn schema_from_paths<P: AsRef<Path>>(
         &self,
         schema_paths: &[P],
+        allow_destructive: bool,
     ) -> Result<Option<ExecResponse>, Error> {
         let mut statements = vec![];
 
@@ -312,7 +321,7 @@ impl CorrosionApiClient {
             return Ok(None);
         }
 
-        Ok(Some(self.schema(&statements).await?))
+        Ok(Some(self.schema(&statements, allow_destructive).await?))
     }
 }
 

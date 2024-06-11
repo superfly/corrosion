@@ -3,10 +3,16 @@ use std::{net::SocketAddr, path::Path};
 use corro_client::CorrosionApiClient;
 use tracing::info;
 
-pub async fn run<P: AsRef<Path>>(api_addr: SocketAddr, schema_paths: &[P]) -> eyre::Result<()> {
+pub async fn run<P: AsRef<Path>>(
+    api_addr: SocketAddr,
+    schema_paths: &[P],
+    allow_destructive: bool,
+) -> eyre::Result<()> {
     let client = CorrosionApiClient::new(api_addr);
 
-    client.schema_from_paths(schema_paths).await?;
+    client
+        .schema_from_paths(schema_paths, allow_destructive)
+        .await?;
     info!("Successfully reloaded Corrosion's schema from paths!");
     Ok(())
 }
@@ -27,7 +33,7 @@ mod tests {
 
         let client = corro_client::CorrosionApiClient::new(ta.agent.api_addr());
         client
-            .schema_from_paths(&ta.agent.config().db.schema_paths)
+            .schema_from_paths(&ta.agent.config().db.schema_paths, false)
             .await?;
 
         let mut conf = ta.agent.config().as_ref().clone();
@@ -46,7 +52,7 @@ mod tests {
 
         println!("conf: {conf:?}");
 
-        run(ta.agent.api_addr(), &conf.db.schema_paths).await?;
+        run(ta.agent.api_addr(), &conf.db.schema_paths, false).await?;
 
         assert!(ta.agent.schema().read().tables.contains_key("blah"));
 
