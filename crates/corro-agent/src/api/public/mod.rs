@@ -489,7 +489,7 @@ async fn execute_schema(
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct SchemaQuery {
     #[serde(default)]
     allow_destructive: bool,
@@ -497,7 +497,7 @@ pub struct SchemaQuery {
 
 pub async fn api_v1_db_schema(
     Extension(agent): Extension<Agent>,
-    query: Query<Option<SchemaQuery>>,
+    query: Query<SchemaQuery>,
     axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
     if statements.is_empty() {
@@ -515,13 +515,7 @@ pub async fn api_v1_db_schema(
 
     let start = Instant::now();
 
-    if let Err(e) = execute_schema(
-        &agent,
-        statements,
-        query.0.map(|q| q.allow_destructive).unwrap_or(false),
-    )
-    .await
-    {
+    if let Err(e) = execute_schema(&agent, statements, query.0.allow_destructive).await {
         error!("could not merge schemas: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -662,7 +656,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
-            Query(None),
+            Query(Default::default()),
             axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
         )
         .await;
@@ -745,7 +739,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
-            Query(None),
+            Query(Default::default()),
             axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
         )
         .await;
@@ -855,7 +849,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
-            Query(None),
+            Query(Default::default()),
             axum::Json(vec![
                 "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
             ]),
@@ -887,7 +881,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
-            Query(None),
+            Query(Default::default()),
             axum::Json(vec![
                 "CREATE TABLE tests2 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
                 "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
@@ -961,7 +955,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
-            Query(None),
+            Query(Default::default()),
             axum::Json(vec![create_stmt.into()]),
         )
         .await;

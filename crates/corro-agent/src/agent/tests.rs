@@ -783,7 +783,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     // setup the schema, for both nodes
     let (status_code, _body) = api_v1_db_schema(
         Extension(ta1.agent.clone()),
-        Query(None),
+        Query(Default::default()),
         axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
     )
     .await;
@@ -792,7 +792,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
 
     let (status_code, _body) = api_v1_db_schema(
         Extension(ta2.agent.clone()),
-        Query(None),
+        Query(Default::default()),
         axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
     )
     .await;
@@ -1914,7 +1914,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
     // setup the schema, for both nodes
     let (status_code, _body) = api_v1_db_schema(
         Extension(ta1.agent.clone()),
-        Query(None),
+        Query(Default::default()),
         axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
     )
     .await;
@@ -1923,7 +1923,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let (status_code, _body) = api_v1_db_schema(
         Extension(ta2.agent.clone()),
-        Query(None),
+        Query(Default::default()),
         axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
     )
     .await;

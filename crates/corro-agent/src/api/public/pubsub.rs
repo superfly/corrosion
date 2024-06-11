@@ -902,7 +902,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
-            Query(None),
+            Query(Default::default()),
             axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
         )
         .await;

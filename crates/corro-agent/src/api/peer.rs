@@ -1647,7 +1647,7 @@ mod tests {
 
         let (status_code, _res) = api_v1_db_schema(
             Extension(agent.clone()),
-            Query(None),
+            Query(Default::default()),
             Json(vec![TEST_SCHEMA.to_owned()]),
         )
         .await;
