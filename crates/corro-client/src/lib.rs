@@ -569,19 +569,22 @@ impl AddrPicker {
                 .ok_or(ResolveError::from("No addresses available"))?;
             self.next_addr = (self.next_addr + 1) % self.addrs.len();
 
-            // split host port
-            let (host, port) = host_port
-                .rsplit_once(':')
-                .and_then(|(host, port)| Some((host, port.parse().ok()?)))
-                .ok_or(ResolveError::from("Invalid Corrosion server address"))?;
+            let mut addrs = if let Ok(addr) = host_port.parse() {
+                vec![addr]
+            } else {
+                // split host port
+                let (host, port) = host_port
+                    .rsplit_once(':')
+                    .and_then(|(host, port)| Some((host, port.parse().ok()?)))
+                    .ok_or(ResolveError::from("Invalid Corrosion server address"))?;
 
-            let mut addrs = self
-                .resolver
-                .lookup_ip(host)
-                .await?
-                .iter()
-                .map(|addr| (addr, port).into())
-                .collect::<Vec<_>>();
+                self.resolver
+                    .lookup_ip(host)
+                    .await?
+                    .iter()
+                    .map(|addr| (addr, port).into())
+                    .collect::<Vec<_>>()
+            };
             // Sort so all the nodes try the addresses in the same order
             addrs.sort();
 
