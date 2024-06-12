@@ -570,16 +570,10 @@ impl AddrPicker {
             self.next_addr = (self.next_addr + 1) % self.addrs.len();
 
             // split host port
-            let mut host_port = host_port.splitn(2, ':');
-            let host = host_port.next().ok_or(ResolveError::from(
-                "Invalid Corrosion server address (missing hostname)",
-            ))?;
-            let port = host_port
-                .next()
-                .and_then(|p| p.parse().ok())
-                .ok_or(ResolveError::from(
-                    "Invalid Corrosion server address (missing port)",
-                ))?;
+            let (host, port) = host_port
+                .rsplit_once(':')
+                .and_then(|(host, port)| Some((host, port.parse().ok()?)))
+                .ok_or(ResolveError::from("Invalid Corrosion server address"))?;
 
             let mut addrs = self
                 .resolver
