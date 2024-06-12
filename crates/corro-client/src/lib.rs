@@ -5,7 +5,6 @@ use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use serde::de::DeserializeOwned;
 use std::{
-    io,
     net::SocketAddr,
     ops::Deref,
     path::Path,
@@ -13,11 +12,13 @@ use std::{
     time::{self, Instant},
 };
 use sub::{QueryStream, SubscriptionStream};
-use tokio::{
-    net::{lookup_host, ToSocketAddrs},
-    sync::{RwLock, RwLockReadGuard},
-};
+use tokio::sync::{RwLock, RwLockReadGuard};
 use tracing::{debug, info, warn};
+use trust_dns_resolver::{
+    error::ResolveError,
+    name_server::{GenericConnection, GenericConnectionProvider, TokioRuntime},
+    AsyncResolver,
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -347,12 +348,12 @@ impl Deref for CorrosionClient {
 }
 
 #[derive(Clone)]
-pub struct CorrosionPooledClient<A> {
-    inner: Arc<RwLock<PooledClientInner<A>>>,
+pub struct CorrosionPooledClient {
+    inner: Arc<RwLock<PooledClientInner>>,
 }
 
-struct PooledClientInner<A> {
-    picker: AddrPicker<A>,
+struct PooledClientInner {
+    picker: AddrPicker,
 
     // For how long to stick with a chosen server
     stickiness_timeout: time::Duration,
@@ -366,11 +367,15 @@ struct PooledClientInner<A> {
     generation: u64,
 }
 
-impl<A: ToSocketAddrs> CorrosionPooledClient<A> {
-    pub fn new(addrs: Vec<A>, stickiness_timeout: time::Duration) -> Self {
+impl CorrosionPooledClient {
+    pub fn new(
+        addrs: Vec<String>,
+        stickiness_timeout: time::Duration,
+        resolver: AsyncResolver<GenericConnection, GenericConnectionProvider<TokioRuntime>>,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(PooledClientInner {
-                picker: AddrPicker::new(addrs),
+                picker: AddrPicker::new(addrs, resolver),
 
                 stickiness_timeout,
                 client: None,
@@ -520,9 +525,11 @@ impl<A: ToSocketAddrs> CorrosionPooledClient<A> {
     }
 }
 
-struct AddrPicker<A> {
+struct AddrPicker {
+    // Resolver used to resolve the addresses
+    resolver: AsyncResolver<GenericConnection, GenericConnectionProvider<TokioRuntime>>,
     // List of addresses/hostname to try in order
-    addrs: Vec<A>,
+    addrs: Vec<String>,
     // Next address/hostname to try
     next_addr: usize,
 
@@ -532,9 +539,13 @@ struct AddrPicker<A> {
     next_resolved_addr: usize,
 }
 
-impl<A: ToSocketAddrs> AddrPicker<A> {
-    fn new(addrs: Vec<A>) -> AddrPicker<A> {
+impl AddrPicker {
+    fn new(
+        addrs: Vec<String>,
+        resolver: AsyncResolver<GenericConnection, GenericConnectionProvider<TokioRuntime>>,
+    ) -> AddrPicker {
         Self {
+            resolver,
             addrs,
             next_addr: 0,
 
@@ -552,13 +563,28 @@ impl<A: ToSocketAddrs> AddrPicker<A> {
                 .map(|v| v.len())
                 .unwrap_or_default()
         {
-            let addr_or_hostname = self.addrs.get(self.next_addr).ok_or(io::Error::new(
-                io::ErrorKind::Other,
-                "No addresses available",
-            ))?;
+            let host_port = self
+                .addrs
+                .get(self.next_addr)
+                .ok_or(ResolveError::from("No addresses available"))?;
             self.next_addr = (self.next_addr + 1) % self.addrs.len();
 
-            let mut addrs = lookup_host(addr_or_hostname).await?.collect::<Vec<_>>();
+            let mut addrs = if let Ok(addr) = host_port.parse() {
+                vec![addr]
+            } else {
+                // split host port
+                let (host, port) = host_port
+                    .rsplit_once(':')
+                    .and_then(|(host, port)| Some((host, port.parse().ok()?)))
+                    .ok_or(ResolveError::from("Invalid Corrosion server address"))?;
+
+                self.resolver
+                    .lookup_ip(host)
+                    .await?
+                    .iter()
+                    .map(|addr| (addr, port).into())
+                    .collect::<Vec<_>>()
+            };
             // Sort so all the nodes try the addresses in the same order
             addrs.sort();
 
@@ -577,7 +603,7 @@ impl<A: ToSocketAddrs> AddrPicker<A> {
 
             Ok(addr)
         } else {
-            Err(io::Error::new(io::ErrorKind::Other, "DNS didn't return any addresses").into())
+            Err(ResolveError::from("DNS didn't return any addresses").into())
         }
     }
 
@@ -591,7 +617,7 @@ impl<A: ToSocketAddrs> AddrPicker<A> {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Dns(#[from] io::Error),
+    Dns(#[from] ResolveError),
     #[error(transparent)]
     Hyper(#[from] hyper::Error),
     #[error(transparent)]
@@ -629,6 +655,7 @@ mod tests {
         time::Duration,
     };
     use tokio::{net::TcpListener, pin, sync::broadcast};
+    use trust_dns_resolver::AsyncResolver;
     use uuid::Uuid;
 
     struct Server {
@@ -698,7 +725,7 @@ mod tests {
         }
     }
 
-    async fn gen_servers(num: usize) -> (Vec<Server>, Vec<SocketAddr>) {
+    async fn gen_servers(num: usize) -> (Vec<Server>, Vec<String>) {
         let mut servers = Vec::new();
 
         for _ in 0..num {
@@ -707,7 +734,7 @@ mod tests {
 
         // sort the way the client is supposed to try them
         servers.sort_by(|a, b| a.addr.partial_cmp(&b.addr).unwrap());
-        let addrs = servers.iter().map(|s| s.addr).collect();
+        let addrs = servers.iter().map(|s| s.addr.to_string()).collect();
 
         (servers, addrs)
     }
@@ -717,8 +744,8 @@ mod tests {
         let statement = "".into();
         let (servers, addresses) = gen_servers(1).await;
 
-        let client =
-            CorrosionPooledClient::new(vec![addresses.as_slice()], Duration::from_nanos(1));
+        let resolver = AsyncResolver::tokio_from_system_conf().unwrap();
+        let client = CorrosionPooledClient::new(addresses, Duration::from_nanos(1), resolver);
         let sub = client
             .subscribe_typed::<SqliteValue>(&statement, false, None)
             .await
@@ -734,8 +761,6 @@ mod tests {
         assert!(matches!(res, Result::Err(Error::Hyper(_))));
 
         // But the new one should succeed
-        let client =
-            CorrosionPooledClient::new(vec![addresses.as_slice()], Duration::from_nanos(1));
         let sub = client
             .subscribe_typed::<SqliteValue>(&statement, false, None)
             .await
@@ -748,8 +773,8 @@ mod tests {
         let statement = "".into();
         let (servers, addresses) = gen_servers(3).await;
 
-        let client =
-            CorrosionPooledClient::new(vec![addresses.as_slice()], Duration::from_nanos(1));
+        let resolver = AsyncResolver::tokio_from_system_conf().unwrap();
+        let client = CorrosionPooledClient::new(addresses, Duration::from_nanos(1), resolver);
 
         // Refuse connections on the first server
         servers[0].refuse_new_conns(true);
@@ -793,8 +818,8 @@ mod tests {
         let statement = "".into();
         let (servers, addresses) = gen_servers(3).await;
 
-        let client =
-            CorrosionPooledClient::new(vec![addresses.as_slice()], Duration::from_millis(50));
+        let resolver = AsyncResolver::tokio_from_system_conf().unwrap();
+        let client = CorrosionPooledClient::new(addresses, Duration::from_millis(50), resolver);
 
         // Refuse connections on the first server
         servers[0].refuse_new_conns(true);
@@ -835,15 +860,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fallback_pool() {
+    async fn test_more_servers() {
         let statement = "".into();
         let (pool1_servers, pool1_addresses) = gen_servers(2).await;
         let (pool2_servers, pool2_addresses) = gen_servers(2).await;
 
-        let client = CorrosionPooledClient::new(
-            vec![pool1_addresses.as_slice(), pool2_addresses.as_slice()],
-            Duration::from_nanos(1),
-        );
+        let mut addresses = pool1_addresses;
+        addresses.extend_from_slice(&pool2_addresses);
+
+        let resolver = AsyncResolver::tokio_from_system_conf().unwrap();
+        let client = CorrosionPooledClient::new(addresses, Duration::from_nanos(1), resolver);
 
         // Refuse connections on all servers
         for i in 0..2 {
