@@ -118,6 +118,7 @@ impl Deref for ChangeV1 {
 pub enum Changeset {
     Empty {
         versions: RangeInclusive<Version>,
+        #[speedy(default_on_eof)]
         ts: Option<Timestamp>,
     },
     Full {
