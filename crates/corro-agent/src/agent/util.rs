@@ -883,7 +883,8 @@ pub async fn process_multiple_changes(
                     }
                     KnownDbVersion::Cleared => {
                         debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
-                        store_empty_changeset(&tx, *actor_id, versions.clone(), *ts)?;
+                        let ts = ts.unwrap_or(Timestamp::from(agent.clock().new_timestamp()));
+                        store_empty_changeset(&tx, *actor_id, versions.clone(), ts)?;
                     }
                 }
 
@@ -966,8 +967,10 @@ pub async fn process_multiple_changes(
         booked_writer.commit_snapshot(snap);
 
         for (_, changeset, _, _) in changesets.iter() {
-            let dur = (agent.clock().new_timestamp().get_time() - changeset.ts().0).to_duration();
-            histogram!("corro.agent.changes.commit.lag.seconds").record(dur);
+            if let Some(ts) = changeset.ts() {
+                let dur = (agent.clock().new_timestamp().get_time() - ts.0).to_duration();
+                histogram!("corro.agent.changes.commit.lag.seconds").record(dur);
+            }
         }
 
         debug!("committed {count} changes in {:?}", start.elapsed());
@@ -1244,7 +1247,7 @@ pub fn process_complete_version(
             KnownDbVersion::Cleared,
             Changeset::Empty {
                 versions,
-                ts: Timestamp::from(agent.clock().new_timestamp()),
+                ts: Some(Timestamp::from(agent.clock().new_timestamp())),
             },
         )
     } else {

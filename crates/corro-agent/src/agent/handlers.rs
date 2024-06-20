@@ -659,7 +659,9 @@ pub async fn handle_changes(
             }
         }
 
-        let recv_lag = (agent.clock().new_timestamp().get_time() - change.ts().0).to_duration();
+        let recv_lag = change
+            .ts()
+            .map(|ts| (agent.clock().new_timestamp().get_time() - ts.0).to_duration());
 
         if matches!(src, ChangeSource::Broadcast) {
             counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
@@ -690,9 +692,11 @@ pub async fn handle_changes(
             }
         }
 
-        let src_str: &'static str = src.into();
-        histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str)
-            .record(recv_lag.as_secs_f64());
+        if let Some(recv_lag) = recv_lag {
+            let src_str: &'static str = src.into();
+            histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str)
+                .record(recv_lag.as_secs_f64());
+        }
 
         // this will only run once for a non-empty changeset
         for v in change.versions() {

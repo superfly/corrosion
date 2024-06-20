@@ -118,11 +118,7 @@ impl Deref for ChangeV1 {
 pub enum Changeset {
     Empty {
         versions: RangeInclusive<Version>,
-        ts: Timestamp,
-    },
-    EmptySet {
-        versions: Vec<RangeInclusive<Version>>,
-        ts: Timestamp,
+        ts: Option<Timestamp>,
     },
     Full {
         version: Version,
@@ -131,6 +127,10 @@ pub enum Changeset {
         seqs: RangeInclusive<CrsqlSeq>,
         // last cr-sqlite sequence for the complete changeset
         last_seq: CrsqlSeq,
+        ts: Timestamp,
+    },
+    EmptySet {
+        versions: Vec<RangeInclusive<Version>>,
         ts: Timestamp,
     },
 }
@@ -220,11 +220,11 @@ impl Changeset {
         }
     }
 
-    pub fn ts(&self) -> Timestamp {
+    pub fn ts(&self) -> Option<Timestamp> {
         match self {
             Changeset::Empty { ts, .. } => *ts,
-            Changeset::EmptySet { ts, .. } => *ts,
-            Changeset::Full { ts, .. } => *ts,
+            Changeset::EmptySet { ts, .. } => Some(*ts),
+            Changeset::Full { ts, .. } => Some(*ts),
         }
     }
 

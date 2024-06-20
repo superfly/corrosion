@@ -541,7 +541,10 @@ fn handle_need(
                 for (versions, ts) in empties {
                     sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                         actor_id,
-                        changeset: Changeset::Empty { versions, ts },
+                        changeset: Changeset::Empty {
+                            versions,
+                            ts: Some(ts),
+                        },
                     })))?;
                 }
             }
@@ -570,7 +573,7 @@ fn handle_need(
                                 actor_id,
                                 changeset: Changeset::Empty {
                                     versions: version..=version,
-                                    ts,
+                                    ts: Some(ts),
                                 },
                             },
                         )))?;
@@ -621,7 +624,7 @@ fn handle_need(
                                     actor_id,
                                     changeset: Changeset::Empty {
                                         versions: empty..=empty,
-                                        ts,
+                                        ts: Some(ts),
                                     },
                                 },
                             )))?;
@@ -1124,13 +1127,21 @@ pub async fn parallel_sync(
 
                     counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string()).increment(1);
 
-                    let needs = our_sync_state.compute_available_needs(&their_sync_state);
+                    let mut needs = our_sync_state.compute_available_needs(&their_sync_state);
 
                     trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
 
                     let cleared_ts = their_sync_state.last_cleared_ts;
+
                     println!("got last cleared ts {cleared_ts:?}");
-                    Ok::<_, SyncError>((needs, tx, read, cleared_ts))
+                    if let Some(ts) = cleared_ts {
+                        if let Some(last_seen) = our_empty_ts.get(&actor_id) {
+                            if last_seen.is_none() || last_seen.unwrap() < ts {
+                                needs.entry(actor_id).or_default().push( SyncNeedV1::Empty { ts: *last_seen });
+                            }
+                        }
+                    }
+                    Ok::<_, SyncError>((needs, tx, read))
                 }.await
             )
         }.instrument(info_span!("sync_client_handshake", %actor_id, %addr))
@@ -1144,9 +1155,9 @@ pub async fn parallel_sync(
     let syncers = results
         .into_iter()
         .fold(Ok(vec![]), |agg, (actor_id, addr, res)| match res {
-            Ok((needs, tx, read, ts)) => {
+            Ok((needs, tx, read)) => {
                 let mut v = agg.unwrap_or_default();
-                v.push((actor_id, addr, needs, tx, read, ts));
+                v.push((actor_id, addr, needs, tx, read));
                 Ok(v)
             }
             Err(e) => {
@@ -1170,7 +1181,7 @@ pub async fn parallel_sync(
         let mut rng = rand::thread_rng();
         syncers.into_iter().fold(
             (Vec::with_capacity(len), Vec::with_capacity(len)),
-            |(mut readers, mut servers), (actor_id, addr, needs, tx, read, ts)| {
+            |(mut readers, mut servers), (actor_id, addr, needs, tx, read)| {
                 if needs.is_empty() {
                     trace!(%actor_id, "no needs!");
                     return (readers, servers);
@@ -1185,7 +1196,7 @@ pub async fn parallel_sync(
                     SyncNeedV1::Empty {..} => 0,
                 }).sum::<usize>()).sum::<usize>());
 
-                let mut actor_needs = needs
+                let actor_needs = needs
                     .into_iter()
                     .flat_map(|(actor_id, needs)| {
                         let mut needs: Vec<_> = needs
@@ -1209,15 +1220,6 @@ pub async fn parallel_sync(
                             .collect::<Vec<_>>()
                     })
                     .collect::<VecDeque<_>>();
-
-                if let Some(ts) = ts {
-                    if let Some(last_seen) = our_empty_ts.get(&actor_id) {
-                        if last_seen.is_none() || last_seen.unwrap() < ts {
-                            println!("add empty need with timestamp: {last_seen:?}");
-                            actor_needs.push_back((actor_id, SyncNeedV1::Empty { ts: *last_seen }))
-                        }
-                    }
-                }
 
                 servers.push((
                     actor_id,

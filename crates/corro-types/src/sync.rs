@@ -82,6 +82,7 @@ pub struct SyncStateV1 {
     pub heads: HashMap<ActorId, Version>,
     pub need: HashMap<ActorId, Vec<RangeInclusive<Version>>>,
     pub partial_need: HashMap<ActorId, HashMap<Version, Vec<RangeInclusive<CrsqlSeq>>>>,
+    #[speedy(default_on_eof)]
     pub last_cleared_ts: Option<Timestamp>,
 }
 
