@@ -85,9 +85,16 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let pool = SplitPool::create(&conf.db.path, write_sema.clone()).await?;
 
+    let clock = Arc::new(
+        uhlc::HLCBuilder::default()
+            .with_id(actor_id.try_into().unwrap())
+            .with_max_delta(Duration::from_millis(300))
+            .build(),
+    );
+
     let schema = {
         let mut conn = pool.write_priority().await?;
-        migrate(&mut conn)?;
+        migrate(clock.clone(), &mut conn)?;
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
 
@@ -138,13 +145,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         api_listeners.push(TcpListener::bind(addr).await?);
     }
     let api_addr = api_listeners.first().unwrap().local_addr()?;
-
-    let clock = Arc::new(
-        uhlc::HLCBuilder::default()
-            .with_id(actor_id.try_into().unwrap())
-            .with_max_delta(Duration::from_millis(300))
-            .build(),
-    );
 
     let (tx_bcast, rx_bcast) = bounded(conf.perf.bcast_channel_len, "bcast");
     let (tx_changes, rx_changes) = bounded(conf.perf.changes_channel_len, "changes");
