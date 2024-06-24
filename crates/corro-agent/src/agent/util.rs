@@ -699,7 +699,6 @@ pub async fn process_fully_buffered_changes(
 }
 
 #[tracing::instrument(skip(agent, bookie, changes), err)]
-#[tracing::instrument(skip(agent, bookie, changes), err)]
 pub async fn process_multiple_changes(
     agent: Agent,
     bookie: Bookie,

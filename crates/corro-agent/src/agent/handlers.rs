@@ -506,12 +506,12 @@ pub async fn process_emptyset(
         store_empty_changeset(&tx, actor_id, version.clone(), *ts)?;
     }
 
-    snap.insert_db(&tx, RangeInclusiveSet::from_iter(versions.clone()))
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
-        })?;
+    // snap.insert_db(&tx, RangeInclusiveSet::from_iter(versions.clone()))
+    //     .map_err(|source| ChangeError::Rusqlite {
+    //         source,
+    //         actor_id: None,
+    //         version: None,
+    //     })?;
     snap.update_cleared_ts(&tx, *ts)
         .map_err(|source| ChangeError::Rusqlite {
             source,
