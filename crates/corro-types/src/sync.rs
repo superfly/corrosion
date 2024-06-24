@@ -338,8 +338,16 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
         }
 
         state.heads.insert(actor_id, last_version);
-        state.last_cleared_ts = bookedr.last_cleared_ts();
     }
+
+    let last_ts =  bookie
+        .write("generate_sync (cleared ts)")
+        .await
+        .ensure(actor_id)
+        .read("generate_sync (cleared ts)")
+        .await.last_cleared_ts();
+
+    state.last_cleared_ts = last_ts;
 
     state
 }

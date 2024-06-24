@@ -1133,7 +1133,7 @@ pub async fn parallel_sync(
 
                     let cleared_ts = their_sync_state.last_cleared_ts;
 
-                    println!("got last cleared ts {cleared_ts:?}");
+                    info!(%actor_id, "got last cleared ts {cleared_ts:?}");
                     if let Some(ts) = cleared_ts {
                         if let Some(last_seen) = our_empty_ts.get(&actor_id) {
                             if last_seen.is_none() || last_seen.unwrap() < ts {
