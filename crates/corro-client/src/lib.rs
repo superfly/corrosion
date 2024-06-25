@@ -9,7 +9,7 @@ use std::{
     ops::Deref,
     path::Path,
     sync::Arc,
-    time::{self, Instant},
+    time::{self, Duration, Instant},
 };
 use sub::{QueryStream, SubscriptionStream};
 use tokio::sync::{RwLock, RwLockReadGuard};
@@ -21,6 +21,8 @@ use trust_dns_resolver::{
 };
 use uuid::Uuid;
 
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct CorrosionApiClient {
     api_addr: SocketAddr,
@@ -31,7 +33,11 @@ impl CorrosionApiClient {
     pub fn new(api_addr: SocketAddr) -> Self {
         Self {
             api_addr,
-            api_client: hyper::Client::builder().http2_only(true).build_http(),
+            api_client: hyper::Client::builder()
+                .http2_only(true)
+                .http2_keep_alive_interval(Some(HTTP2_KEEP_ALIVE_INTERVAL))
+                .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_INTERVAL / 2)
+                .build_http(),
         }
     }
 
