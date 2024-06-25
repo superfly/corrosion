@@ -289,9 +289,9 @@ pub async fn get_last_cleared_ts(bookie: &Bookie, actor_id: &ActorId) -> Option<
 
 // generates a `SyncMessage` to tell another node what versions we're missing
 #[tracing::instrument(skip_all, level = "debug")]
-pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
+pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncStateV1 {
     let mut state = SyncStateV1 {
-        actor_id,
+        actor_id: self_actor_id,
         ..Default::default()
     };
 
@@ -303,6 +303,8 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             .map(|(k, v)| (*k, v.clone()))
             .collect()
     };
+
+    let mut last_ts = None;
 
     for (actor_id, booked) in actors {
         let bookedr = booked
@@ -337,15 +339,12 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             }
         }
 
+        if actor_id == self_actor_id {
+            last_ts = bookedr.last_cleared_ts();
+        }
+
         state.heads.insert(actor_id, last_version);
     }
-
-    let last_ts =  bookie
-        .write("generate_sync (cleared ts)")
-        .await
-        .ensure(actor_id)
-        .read("generate_sync (cleared ts)")
-        .await.last_cleared_ts();
 
     state.last_cleared_ts = last_ts;
 

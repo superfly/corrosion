@@ -2510,7 +2510,7 @@ mod tests {
         let clock = Arc::new(uhlc::HLC::default());
         {
             setup_conn(&conn).unwrap();
-            migrate(clock,&mut conn).unwrap();
+            migrate(clock, &mut conn).unwrap();
             let tx = conn.transaction().unwrap();
             apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
             tx.commit().unwrap();

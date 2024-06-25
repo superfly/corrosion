@@ -944,9 +944,11 @@ pub async fn process_multiple_changes(
             }
         }
 
-        let mut booked_writer = agent
-            .booked()
-            .blocking_write("process_multiple_changes(update_cleared_ts)");
+        let mut booked_writer = {
+            agent
+                .booked()
+                .blocking_write("process_multiple_changes(update_cleared_ts)")
+        };
         let mut snap = booked_writer.snapshot();
         if let Some(ts) = last_cleared {
             snap.update_cleared_ts(&tx, ts)

@@ -361,24 +361,32 @@ fn refactor_corro_members(tx: &Transaction) -> rusqlite::Result<()> {
 }
 
 fn create_ts_index_bookkeeping_table(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(r#"
+    tx.execute_batch(
+        r#"
         CREATE INDEX index__corro_bookkeeping_ts ON __corro_bookkeeping (actor_id, ts ASC);
         CREATE TABLE __corro_sync_state (
             actor_id BLOB PRIMARY KEY NOT NULL,
             last_cleared_ts TEXT
         );
-    "#)
+    "#,
+    )
 }
 fn create_sync_state(clock: Arc<uhlc::HLC>) -> impl Fn(&Transaction) -> rusqlite::Result<()> {
     let ts = Timestamp::from(clock.new_timestamp());
 
-     move |tx: &Transaction| -> rusqlite::Result<()> {
-        tx.execute(r#"
+    move |tx: &Transaction| -> rusqlite::Result<()> {
+        tx.execute(
+            r#"
         UPDATE __corro_bookkeeping SET ts = ?
                 WHERE ts IS NULL AND end_version is NOT NULL AND actor_id = crsql_site_id();
-    "#, [ts])?;
+    "#,
+            [ts],
+        )?;
 
-        tx.execute("INSERT INTO __corro_sync_state VALUES (crsql_site_id(), ?);", [ts])?;
+        tx.execute(
+            "INSERT INTO __corro_sync_state VALUES (crsql_site_id(), ?);",
+            [ts],
+        )?;
 
         Ok(())
     }
