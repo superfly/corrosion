@@ -13,6 +13,7 @@ hyper = { workspace = true }
 hyper-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }

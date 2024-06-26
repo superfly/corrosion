@@ -12,6 +12,8 @@ use rustls::{Certificate, PrivateKey, RootCertStore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_with::{serde_as, NoneAsEmptyString};
 
+use rusqlite::types::{FromSql, FromSqlError, ValueRef};
+
 pub mod config;
 pub use config::Config;
 
@@ -187,6 +189,22 @@ impl ConsulCheckStatus {
             ConsulCheckStatus::Passing => "passing",
             ConsulCheckStatus::Warning => "warning",
             ConsulCheckStatus::Critical => "critical",
+        }
+    }
+}
+
+impl FromSql for ConsulCheckStatus {
+    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value {
+            ValueRef::Text(s) => Ok(match String::from_utf8_lossy(s).as_ref() {
+                "passing" => Self::Passing,
+                "warning" => Self::Warning,
+                "critical" => Self::Critical,
+                _ => {
+                    return Err(FromSqlError::InvalidType);
+                }
+            }),
+            _ => Err(FromSqlError::InvalidType),
         }
     }
 }
