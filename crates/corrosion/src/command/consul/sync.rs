@@ -263,11 +263,7 @@ async fn update_hashes(
         if service_hashes.get(&svc.id).is_none() {
             let hash = hash_service(&svc);
             statements.push(Statement::WithParams(
-                "INSERT INTO __corro_consul_services ( id, hash )
-    VALUES (?, ?)
-    ON CONFLICT (id) DO UPDATE SET
-        hash = excluded.hash;"
-                    .into(),
+                "INSERT INTO __corro_consul_services ( id, hash ) VALUES (?, ?);".into(),
                 vec![svc.id.clone().into(), hash.to_be_bytes().to_vec().into()],
             ));
             svc_insert.push((svc.id, hash));
@@ -278,11 +274,7 @@ async fn update_hashes(
         if check_hashes.get(&check.id).is_none() {
             let hash = hash_check(&check);
             statements.push(Statement::WithParams(
-                "INSERT INTO __corro_consul_checks ( id, hash )
-    VALUES (?, ?)
-    ON CONFLICT (id) DO UPDATE SET
-        hash = excluded.hash;"
-                    .into(),
+                "INSERT OR REPLACE INTO __corro_consul_checks ( id, hash ) VALUES (?, ?)".into(),
                 vec![check.id.clone().into(), hash.to_be_bytes().to_vec().into()],
             ));
             checks_insert.push((check.id, hash));
