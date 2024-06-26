@@ -689,6 +689,7 @@ dependencies = [
  "camino",
  "hyper",
  "hyper-rustls",
+ "rusqlite",
  "rustls",
  "rustls-pemfile",
  "serde",
