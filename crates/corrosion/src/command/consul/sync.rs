@@ -3,7 +3,7 @@ use corro_api_types::ColumnType;
 use corro_client::CorrosionClient;
 use corro_types::{api::Statement, config::ConsulConfig};
 use futures::future::select;
-use metrics::{histogram, counter};
+use metrics::{counter, histogram};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -12,7 +12,10 @@ use std::{
     path::Path,
     time::{Duration, Instant, SystemTime},
 };
-use tokio::{signal::unix::{signal, SignalKind}, time::{interval, timeout}};
+use tokio::{
+    signal::unix::{signal, SignalKind},
+    time::{interval, timeout},
+};
 use tracing::{debug, error, info, trace};
 
 const CONSUL_PULL_INTERVAL: Duration = Duration::from_secs(1);
@@ -43,10 +46,7 @@ pub async fn run<P: AsRef<Path>>(
     let consul = consul_client::Client::new(config.client.clone())?;
 
     info!("Setting up corrosion for consul sync");
-    setup(
-        &corrosion
-    )
-        .await?;
+    setup(&corrosion).await?;
 
     let mut consul_services: HashMap<String, u64> = HashMap::new();
     let mut consul_checks: HashMap<String, u64> = HashMap::new();
@@ -105,29 +105,27 @@ pub async fn run<P: AsRef<Path>>(
         match res {
             Ok((svc_stats, check_stats)) => {
                 if !svc_stats.is_zero() {
-                    info!("updated consul services: {svc_stats:?}");    
+                    info!("updated consul services: {svc_stats:?}");
                 }
                 if !check_stats.is_zero() {
-                    info!("updated consul checks: {check_stats:?}");    
+                    info!("updated consul checks: {check_stats:?}");
                 }
             }
             Err(e) => match e {
                 UpdateError::Execute(ExecuteError::Sqlite(_)) => {
                     return Err(e.into());
-                },
+                }
                 e => {
                     error!("non-fatal update error, continuing. error: {e}");
                 }
-            }
+            },
         }
     }
 
     Ok(())
 }
 
-async fn setup(
-    corrosion: &CorrosionClient,
-) -> eyre::Result<()> {
+async fn setup(corrosion: &CorrosionClient) -> eyre::Result<()> {
     let mut conn = corrosion.pool().get().await?;
     {
         let tx = conn.transaction()?;
@@ -152,13 +150,22 @@ async fn setup(
 
     struct ColumnInfo {
         name: String,
-        kind: corro_api_types::ColumnType
+        kind: corro_api_types::ColumnType,
     }
 
-    let col_infos: Vec<ColumnInfo> = conn.prepare("PRAGMA table_info(consul_services)")?.query_map([], |row| Ok(ColumnInfo { name: row.get(1)?, kind: row.get(2)? })).map_err(|e| eyre::eyre!("could not query consul_services' table_info: {e}"))?.collect::<Result<Vec<_>, _>>()?;
-    
+    let col_infos: Vec<ColumnInfo> = conn
+        .prepare("PRAGMA table_info(consul_services)")?
+        .query_map([], |row| {
+            Ok(ColumnInfo {
+                name: row.get(1)?,
+                kind: row.get(2)?,
+            })
+        })
+        .map_err(|e| eyre::eyre!("could not query consul_services' table_info: {e}"))?
+        .collect::<Result<Vec<_>, _>>()?;
+
     let expected_cols = [
-        ("node", vec![ColumnType::Text]), 
+        ("node", vec![ColumnType::Text]),
         ("id", vec![ColumnType::Text]),
         ("name", vec![ColumnType::Text]),
         ("tags", vec![ColumnType::Text, ColumnType::Blob]),
@@ -169,15 +176,27 @@ async fn setup(
     ];
 
     for (name, kind) in expected_cols {
-        if !col_infos.iter().any(|info| info.name == name && kind.contains(&info.kind)) {
+        if !col_infos
+            .iter()
+            .any(|info| info.name == name && kind.contains(&info.kind))
+        {
             eyre::bail!("expected a column consul_services.{name} w/ type {kind:?}");
         }
     }
 
-    let col_infos: Vec<ColumnInfo> = conn.prepare("PRAGMA table_info(consul_checks)")?.query_map([], |row| Ok(ColumnInfo { name: row.get(1)?, kind: row.get(2)? })).map_err(|e| eyre::eyre!("could not query consul_checks' table_info: {e}"))?.collect::<Result<Vec<_>, _>>()?;
-    
+    let col_infos: Vec<ColumnInfo> = conn
+        .prepare("PRAGMA table_info(consul_checks)")?
+        .query_map([], |row| {
+            Ok(ColumnInfo {
+                name: row.get(1)?,
+                kind: row.get(2)?,
+            })
+        })
+        .map_err(|e| eyre::eyre!("could not query consul_checks' table_info: {e}"))?
+        .collect::<Result<Vec<_>, _>>()?;
+
     let expected_cols = [
-        ("node", vec![ColumnType::Text]), 
+        ("node", vec![ColumnType::Text]),
         ("id", vec![ColumnType::Text]),
         ("service_id", vec![ColumnType::Text]),
         ("service_name", vec![ColumnType::Text]),
@@ -188,7 +207,10 @@ async fn setup(
     ];
 
     for (name, kind) in expected_cols {
-        if !col_infos.iter().any(|info| info.name == name && kind.contains(&info.kind)) {
+        if !col_infos
+            .iter()
+            .any(|info| info.name == name && kind.contains(&info.kind))
+        {
             eyre::bail!("expected a column consul_checks.{name} w/ type {kind:?}");
         }
     }
@@ -371,18 +393,18 @@ fn append_upsert_service_statements(
     updated_at: i64,
 ) {
     // run this by corrosion so it's part of the same transaction
-    statements.push(Statement::WithParams("INSERT INTO __corro_consul_services ( id, hash )
+    statements.push(Statement::WithParams(
+        "INSERT INTO __corro_consul_services ( id, hash )
     VALUES (?, ?)
     ON CONFLICT (id) DO UPDATE SET
         hash = excluded.hash;"
-                                          .into(),vec![
-                                              
-                                              svc.id.clone().into(),
-                                              hash.to_be_bytes().to_vec().into(),
-                                          ]));
+            .into(),
+        vec![svc.id.clone().into(), hash.to_be_bytes().to_vec().into()],
+    ));
 
     // upsert!
-    statements.push(Statement::WithParams("INSERT INTO consul_services ( node, id, name, tags, meta, port, address, updated_at )
+    statements.push(Statement::WithParams(
+        "INSERT INTO consul_services ( node, id, name, tags, meta, port, address, updated_at )
     VALUES (?,?,?,?,?,?,?,?)
     ON CONFLICT(node, id) DO UPDATE SET
         name = excluded.name,
@@ -391,17 +413,22 @@ fn append_upsert_service_statements(
         port = excluded.port,
         address = excluded.address,
         updated_at = excluded.updated_at;"
-                                          .into(),vec![
-                                              
-                                              node.into(),
-                                              svc.id.into(),
-                                              svc.name.into(),
-                                              serde_json::to_string(&svc.tags).unwrap_or_else(|_| "[]".to_string()).into(),
-                                              serde_json::to_string(&svc.meta).unwrap_or_else(|_| "{}".to_string()).into(),
-                                              svc.port.into(),
-                                              svc.address.into(),
-                                              updated_at.into(),
-                                          ]));
+            .into(),
+        vec![
+            node.into(),
+            svc.id.into(),
+            svc.name.into(),
+            serde_json::to_string(&svc.tags)
+                .unwrap_or_else(|_| "[]".to_string())
+                .into(),
+            serde_json::to_string(&svc.meta)
+                .unwrap_or_else(|_| "{}".to_string())
+                .into(),
+            svc.port.into(),
+            svc.address.into(),
+            updated_at.into(),
+        ],
+    ));
 }
 
 fn append_upsert_check_statements(
@@ -412,15 +439,14 @@ fn append_upsert_check_statements(
     updated_at: i64,
 ) {
     // run this by corrosion so it's part of the same transaction
-    statements.push(Statement::WithParams("INSERT INTO __corro_consul_checks ( id, hash )
+    statements.push(Statement::WithParams(
+        "INSERT INTO __corro_consul_checks ( id, hash )
     VALUES (?, ?)
     ON CONFLICT (id) DO UPDATE SET
         hash = excluded.hash;"
-                                          .into(),vec![
-                                              
-                                              check.id.clone().into(),
-                                              hash.to_be_bytes().to_vec().into(),
-                                          ]));
+            .into(),
+        vec![check.id.clone().into(), hash.to_be_bytes().to_vec().into()],
+    ));
 
     // upsert!
     statements.push(Statement::WithParams("INSERT INTO consul_checks ( node, id, service_id, service_name, name, status, output, updated_at )
@@ -433,7 +459,6 @@ fn append_upsert_check_statements(
         output = excluded.output,
         updated_at = excluded.updated_at;"
                                           .into(),vec![
-                                              
                                               node.into(),
                                               check.id.into(),
                                               check.service_id.into(),
@@ -452,7 +477,7 @@ enum ConsulServiceOp {
 
 enum ConsulCheckOp {
     Upsert { check: AgentCheck, hash: u64 },
-    Delete { id: String }
+    Delete { id: String },
 }
 
 ///
@@ -519,7 +544,7 @@ fn update_checks(
         let hash = hash_check(&check);
         ops.push(ConsulCheckOp::Upsert { check, hash });
     }
-    
+
     ops
 }
 
@@ -530,7 +555,7 @@ enum UpdateError {
     #[error("timed out")]
     TimedOut,
     #[error(transparent)]
-    Execute(#[from] ExecuteError)
+    Execute(#[from] ExecuteError),
 }
 
 async fn update_consul(
@@ -545,7 +570,8 @@ async fn update_consul(
         let start = Instant::now();
         match timeout(Duration::from_secs(5), consul.agent_services()).await {
             Ok(Ok(services)) => {
-                histogram!("corro_consul.consul.response.time.seconds").record(start.elapsed().as_secs_f64());
+                histogram!("corro_consul.consul.response.time.seconds")
+                    .record(start.elapsed().as_secs_f64());
                 Ok(update_services(services, service_hashes, skip_hash_check))
             }
             Ok(Err(e)) => {
@@ -557,14 +583,14 @@ async fn update_consul(
                 Err(UpdateError::TimedOut)
             }
         }
-        
     };
 
     let fut_checks = async {
         let start = Instant::now();
         match timeout(Duration::from_secs(5), consul.agent_checks()).await {
             Ok(Ok(checks)) => {
-                histogram!("corro_consul.consul.response.time.seconds").record(start.elapsed().as_secs_f64());
+                histogram!("corro_consul.consul.response.time.seconds")
+                    .record(start.elapsed().as_secs_f64());
                 Ok(update_checks(checks, check_hashes, skip_hash_check))
             }
             Ok(Err(e)) => {
@@ -580,15 +606,17 @@ async fn update_consul(
 
     let (svcs, checks) = tokio::try_join!(fut_services, fut_checks)?;
 
-    execute(node, corrosion, svcs, service_hashes, checks, check_hashes).await.map_err(UpdateError::from)
+    execute(node, corrosion, svcs, service_hashes, checks, check_hashes)
+        .await
+        .map_err(UpdateError::from)
 }
 
 #[derive(Debug, thiserror::Error)]
 enum ExecuteError {
     #[error("client: {0}")]
-    Client(#[from]corro_client::Error),
+    Client(#[from] corro_client::Error),
     #[error("sqlite: {0}")]
-    Sqlite(String)
+    Sqlite(String),
 }
 
 async fn execute(
@@ -614,19 +642,25 @@ async fn execute(
             ConsulServiceOp::Upsert { svc, hash } => {
                 svc_to_upsert.push((svc.id.clone(), hash));
                 append_upsert_service_statements(&mut statements, node, svc, hash, updated_at);
-            },
+            }
             ConsulServiceOp::Delete { id } => {
                 svc_to_delete.push(id.clone());
 
-                statements.push(Statement::WithParams("DELETE FROM __corro_consul_services WHERE id = ?;".into(),vec![id.clone().into()]));
-                statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),vec![node.into(),id.into(),]));
-            },
+                statements.push(Statement::WithParams(
+                    "DELETE FROM __corro_consul_services WHERE id = ?;".into(),
+                    vec![id.clone().into()],
+                ));
+                statements.push(Statement::WithParams(
+                    "DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),
+                    vec![node.into(), id.into()],
+                ));
+            }
         }
     }
 
     // delete everything that's wrong in the DB! this is useful on restore from a backup...
     statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND id NOT IN (SELECT id FROM __corro_consul_services)".into(), vec![node.into()]));
-    
+
     let mut check_to_upsert = vec![];
     let mut check_to_delete = vec![];
 
@@ -635,28 +669,35 @@ async fn execute(
             ConsulCheckOp::Upsert { check, hash } => {
                 check_to_upsert.push((check.id.clone(), hash));
                 append_upsert_check_statements(&mut statements, node, check, hash, updated_at);
-            },
+            }
             ConsulCheckOp::Delete { id } => {
                 check_to_delete.push(id.clone());
-                statements.push(Statement::WithParams("DELETE FROM __corro_consul_checks WHERE id = ?;".into(),vec![id.clone().into(),]));
-                statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),vec![node.into(),id.into()]));
-            },
+                statements.push(Statement::WithParams(
+                    "DELETE FROM __corro_consul_checks WHERE id = ?;".into(),
+                    vec![id.clone().into()],
+                ));
+                statements.push(Statement::WithParams(
+                    "DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),
+                    vec![node.into(), id.into()],
+                ));
+            }
         }
     }
 
     // delete everything that's wrong in the DB! this is useful on restore from a backup...
     statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND id NOT IN (SELECT id FROM __corro_consul_checks)".into(), vec![node.into()]));
-    
 
     if !statements.is_empty() {
-        if let Some(e) = corrosion.execute(&statements).await?.results.into_iter().find_map(|res| {
-            match res {
+        if let Some(e) = corrosion
+            .execute(&statements)
+            .await?
+            .results
+            .into_iter()
+            .find_map(|res| match res {
                 corro_api_types::ExecResult::Execute { .. } => None,
-                corro_api_types::ExecResult::Error { error } => {
-                    Some(error)
-                },
-            }
-        }) {
+                corro_api_types::ExecResult::Error { error } => Some(error),
+            })
+        {
             return Err(ExecuteError::Sqlite(e));
         }
     }
@@ -665,7 +706,7 @@ async fn execute(
 
     for (id, hash) in svc_to_upsert {
         service_hashes.insert(id, hash);
-        svc_stats.upserted +=1 ;
+        svc_stats.upserted += 1;
     }
     for id in svc_to_delete {
         service_hashes.remove(&id);
@@ -676,7 +717,7 @@ async fn execute(
 
     for (id, hash) in check_to_upsert {
         check_hashes.insert(id, hash);
-        check_stats.upserted +=1 ;
+        check_stats.upserted += 1;
     }
     for id in check_to_delete {
         check_hashes.remove(&id);
@@ -702,7 +743,9 @@ mod tests {
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
         let tmpdir = tempfile::TempDir::new()?;
-        tokio::fs::write(tmpdir.path().join("consul.sql"), b"
+        tokio::fs::write(
+            tmpdir.path().join("consul.sql"),
+            b"
             CREATE TABLE consul_services (
                 node TEXT NOT NULL,
                 id TEXT NOT NULL,
@@ -728,24 +771,31 @@ mod tests {
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (node, id)
             );
-        ").await?;
+        ",
+        )
+        .await?;
 
-        let ta1 = launch_test_agent(|conf| conf.add_schema_path(tmpdir.path().display().to_string()).build(), tripwire.clone()).await?;
-        let ta2 = launch_test_agent(
+        let ta1 = launch_test_agent(
             |conf| {
-                conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()]).add_schema_path(tmpdir.path().display().to_string())
+                conf.add_schema_path(tmpdir.path().display().to_string())
                     .build()
             },
             tripwire.clone(),
         )
-            .await?;
+        .await?;
+        let ta2 = launch_test_agent(
+            |conf| {
+                conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+                    .add_schema_path(tmpdir.path().display().to_string())
+                    .build()
+            },
+            tripwire.clone(),
+        )
+        .await?;
 
         let ta1_client = CorrosionClient::new(ta1.agent.api_addr(), ta1.agent.db_path());
 
-        setup(
-            &ta1_client,
-        )
-            .await?;
+        setup(&ta1_client).await?;
 
         let mut svc_hashes = HashMap::new();
         let mut check_hashes = HashMap::new();
@@ -810,7 +860,15 @@ mod tests {
         services.insert("service-id".into(), svc.clone());
         services.insert("service-id0".into(), svc0.clone());
 
-        let (applied, check_applied) = execute("node-1", &ta1_client, update_services(services.clone(), &svc_hashes, false), &mut svc_hashes, Default::default(), &mut check_hashes).await?;
+        let (applied, check_applied) = execute(
+            "node-1",
+            &ta1_client,
+            update_services(services.clone(), &svc_hashes, false),
+            &mut svc_hashes,
+            Default::default(),
+            &mut check_hashes,
+        )
+        .await?;
 
         assert!(check_applied.is_zero());
 
@@ -833,7 +891,15 @@ mod tests {
             assert_eq!(svc_hash, hash);
         }
 
-        let (applied, _check_applied) = execute("node-1", &ta1_client, update_services(services, &svc_hashes, false), &mut svc_hashes, Default::default(), &mut check_hashes).await?;
+        let (applied, _check_applied) = execute(
+            "node-1",
+            &ta1_client,
+            update_services(services, &svc_hashes, false),
+            &mut svc_hashes,
+            Default::default(),
+            &mut check_hashes,
+        )
+        .await?;
 
         assert!(check_applied.is_zero());
 
@@ -844,10 +910,7 @@ mod tests {
 
         let ta2_client = CorrosionClient::new(ta2.agent.api_addr(), ta2.agent.db_path());
 
-        setup(
-            &ta2_client,
-        )
-            .await?;
+        setup(&ta2_client).await?;
 
         sleep(Duration::from_secs(2)).await;
 
@@ -861,7 +924,15 @@ mod tests {
             assert_eq!(app_id, 123);
         }
 
-        let (applied, _check_applied) = execute("node-1", &ta1_client, update_services(HashMap::new(), &svc_hashes, false), &mut svc_hashes, Default::default(), &mut check_hashes).await?;
+        let (applied, _check_applied) = execute(
+            "node-1",
+            &ta1_client,
+            update_services(HashMap::new(), &svc_hashes, false),
+            &mut svc_hashes,
+            Default::default(),
+            &mut check_hashes,
+        )
+        .await?;
 
         assert!(check_applied.is_zero());
 

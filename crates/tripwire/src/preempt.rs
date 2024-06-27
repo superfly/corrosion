@@ -98,7 +98,10 @@ where
     C: Future,
 {
     fn preemptible(self, preempt: P) -> PreemptibleFuture<P, Self> {
-        PreemptibleFuture { preempt, complete: self }
+        PreemptibleFuture {
+            preempt,
+            complete: self,
+        }
     }
 }
 

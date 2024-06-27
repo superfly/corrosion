@@ -118,6 +118,11 @@ impl Deref for ChangeV1 {
 pub enum Changeset {
     Empty {
         versions: RangeInclusive<Version>,
+        ts: Timestamp,
+    },
+    EmptySet {
+        versions: Vec<RangeInclusive<Version>>,
+        ts: Timestamp,
     },
     Full {
         version: Version,
@@ -153,7 +158,10 @@ pub struct ChangesetParts {
 impl Changeset {
     pub fn versions(&self) -> RangeInclusive<Version> {
         match self {
-            Changeset::Empty { versions } => versions.clone(),
+            Changeset::Empty { versions, .. } => versions.clone(),
+            // todo: this returns dummy version because empty set has an array of versions.
+            // probably shouldn't be doing this
+            Changeset::EmptySet { .. } => Version(0)..=Version(0),
             Changeset::Full { version, .. } => *version..=*version,
         }
     }
@@ -165,6 +173,7 @@ impl Changeset {
     pub fn seqs(&self) -> Option<&RangeInclusive<CrsqlSeq>> {
         match self {
             Changeset::Empty { .. } => None,
+            Changeset::EmptySet { .. } => None,
             Changeset::Full { seqs, .. } => Some(seqs),
         }
     }
@@ -172,6 +181,7 @@ impl Changeset {
     pub fn last_seq(&self) -> Option<CrsqlSeq> {
         match self {
             Changeset::Empty { .. } => None,
+            Changeset::EmptySet { .. } => None,
             Changeset::Full { last_seq, .. } => Some(*last_seq),
         }
     }
@@ -179,6 +189,7 @@ impl Changeset {
     pub fn is_complete(&self) -> bool {
         match self {
             Changeset::Empty { .. } => true,
+            Changeset::EmptySet { .. } => true,
             Changeset::Full { seqs, last_seq, .. } => {
                 *seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq
             }
@@ -188,6 +199,7 @@ impl Changeset {
     pub fn len(&self) -> usize {
         match self {
             Changeset::Empty { .. } => 0, //(versions.end().0 - versions.start().0 + 1) as usize,
+            Changeset::EmptySet { versions, .. } => versions.len(),
             Changeset::Full { changes, .. } => changes.len(),
         }
     }
@@ -195,20 +207,31 @@ impl Changeset {
     pub fn is_empty(&self) -> bool {
         match self {
             Changeset::Empty { .. } => true,
+            Changeset::EmptySet { .. } => true,
             Changeset::Full { changes, .. } => changes.is_empty(),
         }
     }
 
-    pub fn ts(&self) -> Option<Timestamp> {
+    pub fn is_empty_set(&self) -> bool {
         match self {
-            Changeset::Empty { .. } => None,
-            Changeset::Full { ts, .. } => Some(*ts),
+            Changeset::Empty { .. } => false,
+            Changeset::EmptySet { .. } => true,
+            Changeset::Full { .. } => false,
+        }
+    }
+
+    pub fn ts(&self) -> Timestamp {
+        match self {
+            Changeset::Empty { ts, .. } => *ts,
+            Changeset::EmptySet { ts, .. } => *ts,
+            Changeset::Full { ts, .. } => *ts,
         }
     }
 
     pub fn changes(&self) -> &[Change] {
         match self {
             Changeset::Empty { .. } => &[],
+            Changeset::EmptySet { .. } => &[],
             Changeset::Full { changes, .. } => changes,
         }
     }
@@ -216,6 +239,7 @@ impl Changeset {
     pub fn into_parts(self) -> Option<ChangesetParts> {
         match self {
             Changeset::Empty { .. } => None,
+            Changeset::EmptySet { .. } => None,
             Changeset::Full {
                 version,
                 changes,
@@ -239,7 +263,7 @@ pub enum TimestampParseError {
     Parse(ParseNTP64Error),
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Hash)]
 #[serde(transparent)]
 pub struct Timestamp(pub NTP64);
 
