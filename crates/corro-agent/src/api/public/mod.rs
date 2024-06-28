@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{response::IntoResponse, Extension};
+use axum::{extract::Query, response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
@@ -19,6 +19,7 @@ use corro_types::{
 };
 use hyper::StatusCode;
 use rusqlite::{params_from_iter, ToSql, Transaction};
+use serde::Deserialize;
 use spawn::spawn_counted;
 use tokio::{
     sync::{
@@ -440,7 +441,11 @@ pub async fn api_v1_queries(
     }
 }
 
-async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
+async fn execute_schema(
+    agent: &Agent,
+    statements: Vec<String>,
+    allow_destructive: bool,
+) -> eyre::Result<()> {
     let new_sql: String = statements.join(";");
 
     let partial_schema = parse_sql(&new_sql)?;
@@ -465,7 +470,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     block_in_place(|| {
         let tx = conn.immediate_transaction()?;
 
-        apply_schema(&tx, &schema_write, &mut new_schema)?;
+        apply_schema(&tx, &schema_write, &mut new_schema, allow_destructive)?;
 
         for tbl_name in partial_schema.tables.keys() {
             tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
@@ -484,8 +489,15 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     Ok(())
 }
 
+#[derive(Deserialize, Default)]
+pub struct SchemaQuery {
+    #[serde(default)]
+    allow_destructive: bool,
+}
+
 pub async fn api_v1_db_schema(
     Extension(agent): Extension<Agent>,
+    query: Query<SchemaQuery>,
     axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
     if statements.is_empty() {
@@ -503,7 +515,7 @@ pub async fn api_v1_db_schema(
 
     let start = Instant::now();
 
-    if let Err(e) = execute_schema(&agent, statements).await {
+    if let Err(e) = execute_schema(&agent, statements, query.0.allow_destructive).await {
         error!("could not merge schemas: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -644,6 +656,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
+            Query(Default::default()),
             axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
         )
         .await;
@@ -726,6 +739,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
+            Query(Default::default()),
             axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
         )
         .await;
@@ -835,6 +849,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
+            Query(Default::default()),
             axum::Json(vec![
                 "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
             ]),
@@ -866,6 +881,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
+            Query(Default::default()),
             axum::Json(vec![
                 "CREATE TABLE tests2 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
                 "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
@@ -939,6 +955,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
+            Query(Default::default()),
             axum::Json(vec![create_stmt.into()]),
         )
         .await;

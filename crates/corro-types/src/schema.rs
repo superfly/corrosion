@@ -269,6 +269,7 @@ pub fn apply_schema(
     tx: &Transaction,
     schema: &Schema,
     new_schema: &mut Schema,
+    allow_destructive: bool,
 ) -> Result<(), ApplySchemaError> {
     if let Some(name) = schema
         .tables
@@ -277,10 +278,11 @@ pub fn apply_schema(
         .difference(&new_schema.tables.keys().collect::<HashSet<_>>())
         .next()
     {
-        // TODO: add options and check flag
-        return Err(ApplySchemaError::DropTableWithoutDestructiveFlag(
-            (*name).clone(),
-        ));
+        if !allow_destructive {
+            return Err(ApplySchemaError::DropTableWithoutDestructiveFlag(
+                (*name).clone(),
+            ));
+        }
     }
 
     let mut schema_to_merge = Schema::default();
@@ -417,10 +419,12 @@ pub fn apply_schema(
         debug!("dropped cols: {dropped_cols:?}");
 
         if let Some(col_name) = dropped_cols.into_iter().next() {
-            return Err(ApplySchemaError::RemoveColumnWithoutDestructiveFlag(
-                name.clone(),
-                col_name.clone(),
-            ));
+            if !allow_destructive {
+                return Err(ApplySchemaError::RemoveColumnWithoutDestructiveFlag(
+                    name.clone(),
+                    col_name.clone(),
+                ));
+            }
         }
 
         // 2. check for changed columns
