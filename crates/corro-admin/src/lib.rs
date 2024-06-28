@@ -4,19 +4,11 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
-use corro_types::{
-    actor::{ActorId, ClusterId},
-    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{FocaCmd, FocaInput, Timestamp},
-    sqlite::SqlitePoolError,
-    sync::generate_sync,
-};
+use corro_agent::agent::util;
 use futures::{SinkExt, TryStreamExt};
 use rusqlite::{named_params, params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use spawn::spawn_counted;
 use time::OffsetDateTime;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -26,6 +18,16 @@ use tokio::{
 use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
+
+use corro_types::{
+    actor::{ActorId, ClusterId},
+    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    broadcast::{FocaCmd, FocaInput, Timestamp},
+    sqlite::SqlitePoolError,
+    sync::generate_sync,
+};
+use spawn::spawn_counted;
 use tripwire::Tripwire;
 
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +98,7 @@ pub enum Command {
     Locks { top: usize },
     Cluster(ClusterCommand),
     Actor(ActorCommand),
+    CompactEmpties,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,8 +306,12 @@ async fn handle_conn(
                 }
                 Command::Sync(SyncCommand::ReconcileGaps) => {
                     let actor_ids: Vec<_> = {
-                        let r = bookie.read("admin sync reconcile gaps").await;
-                        r.keys().copied().collect()
+                        bookie
+                            .read("admin sync reconcile gaps")
+                            .await
+                            .clone()
+                            .into_keys()
+                            .collect()
                     };
 
                     for actor_id in actor_ids {
@@ -519,6 +526,60 @@ async fn handle_conn(
                     }
 
                     send_success(&mut stream).await;
+                }
+                Command::CompactEmpties => {
+                    let actor_ids: Vec<_> = {
+                        let r = bookie.read("admin compact empties").await;
+                        r.keys().copied().collect()
+                    };
+
+                    let (tx, mut rx) = mpsc::channel(4);
+
+                    let agent = agent.clone();
+                    let started = std::time::Instant::now();
+                    let done = tokio::task::spawn_local(async move {
+                        for actor_id in actor_ids {
+                            if let Err(e) =
+                                util::clear_empty_versions(agent.clone(), actor_id, Some(&tx), None)
+                                    .await
+                            {
+                                return Some(format!("{e}"));
+                            }
+                        }
+
+                        None
+                    });
+
+                    while let Some(msg) = rx.recv().await {
+                        info_log(&mut stream, msg).await;
+                    }
+
+                    match done.await {
+                        Ok(None) => {
+                            let elapsed = started.elapsed().as_secs_f64();
+                            info_log(&mut stream, format!(
+                                    "Finished compacting empty versions!  Took {} seconds ({} minutes)",
+                                    elapsed,
+                                    elapsed / 60.0
+                                ),
+                            ).await;
+                            send_success(&mut stream).await
+                        }
+                        Ok(Some(err)) => {
+                            send_error(
+                                &mut stream,
+                                format!("An error occured while compacting empties: {err}"),
+                            )
+                            .await
+                        }
+                        _ => {
+                            send_error(
+                                &mut stream,
+                                "Failed to compact empties (check node logs for details)",
+                            )
+                            .await
+                        }
+                    }
                 }
             },
             Ok(None) => {
