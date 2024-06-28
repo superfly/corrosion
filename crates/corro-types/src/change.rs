@@ -232,10 +232,27 @@ pub fn insert_local_changes(
         version: Some(version),
     })?;
 
+    let mut cleared_ts: Option<Timestamp> = None;
     for (actor_id, versions_set) in overwritten {
-        for versions in versions_set {
-            store_empty_changeset(tx, actor_id, versions)?;
+        if actor_id != agent.actor_id() {
+            warn!("clearing and setting timestamp for empties from a different node");
         }
+        let ts = Timestamp::from(agent.clock().new_timestamp());
+        for versions in versions_set {
+            let inserted = store_empty_changeset(tx, actor_id, versions, ts)?;
+            if inserted > 0 {
+                cleared_ts = Some(ts)
+            }
+        }
+    }
+
+    if let Some(ts) = cleared_ts {
+        snap.update_cleared_ts(tx, ts)
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            })?;
     }
 
     Ok(Some(InsertChangesInfo {
@@ -251,6 +268,7 @@ pub fn store_empty_changeset(
     conn: &Connection,
     actor_id: ActorId,
     versions: RangeInclusive<Version>,
+    ts: Timestamp,
 ) -> Result<usize, ChangeError> {
     trace!(%actor_id, "attempting to delete versions range {versions:?}");
     let start = Instant::now();
@@ -351,14 +369,14 @@ pub fn store_empty_changeset(
         .prepare_cached(
             "
                 INSERT INTO __corro_bookkeeping (actor_id, start_version, end_version, db_version, last_seq, ts)
-                    VALUES (?, ?, ?, NULL, NULL, NULL);
+                    VALUES (?, ?, ?, NULL, NULL, ?);
             ",
         ).map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
             version: None,
         })?
-        .execute(params![actor_id, range.start(), range.end()]).map_err(|source| ChangeError::Rusqlite {
+        .execute(params![actor_id, range.start(), range.end(), ts]).map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
             version: None,
