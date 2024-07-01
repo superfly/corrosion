@@ -116,6 +116,10 @@ where
         self.id
     }
 
+    pub fn api_addr(&self) -> SocketAddr {
+        self.api_addr
+    }
+
     fn poll_stream(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
