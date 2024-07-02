@@ -21,6 +21,7 @@ use trust_dns_resolver::{
 };
 use uuid::Uuid;
 
+const HTTP2_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -31,13 +32,15 @@ pub struct CorrosionApiClient {
 
 impl CorrosionApiClient {
     pub fn new(api_addr: SocketAddr) -> Self {
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(HTTP2_CONNECT_TIMEOUT));
         Self {
             api_addr,
             api_client: hyper::Client::builder()
                 .http2_only(true)
                 .http2_keep_alive_interval(Some(HTTP2_KEEP_ALIVE_INTERVAL))
                 .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_INTERVAL / 2)
-                .build_http(),
+                .build(connector),
         }
     }
 
