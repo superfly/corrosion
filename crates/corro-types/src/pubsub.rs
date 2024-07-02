@@ -159,6 +159,90 @@ impl SubsManager {
         inner.remove(id)
     }
 
+    pub fn match_changes_from_db_version(
+        &self,
+        conn: &Connection,
+        db_version: CrsqlDbVersion,
+    ) -> rusqlite::Result<()> {
+        let handles = {
+            let inner = self.0.read();
+            if inner.handles.is_empty() {
+                return Ok(());
+            }
+            inner.handles.clone()
+        };
+
+        let mut candidates = handles
+            .iter()
+            .map(|(id, handle)| (id, (MatchCandidates::new(), handle)))
+            .collect::<BTreeMap<_, _>>();
+
+        {
+            let mut prepped = conn.prepare_cached(
+                r#"
+            SELECT "table", pk, cid
+                FROM crsql_changes
+                WHERE db_version = ?
+                ORDER BY seq ASC
+            "#,
+            )?;
+
+            let rows = prepped.query_map([db_version], |row| {
+                Ok((
+                    row.get::<_, TableName>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, ColumnName>(2)?,
+                ))
+            })?;
+
+            for change_res in rows {
+                let (table, pk, column) = change_res?;
+
+                for (_id, (candidates, handle)) in candidates.iter_mut() {
+                    let change = MatchableChange {
+                        table: &table,
+                        pk: &pk,
+                        column: &column,
+                    };
+                    handle.filter_matchable_change(candidates, change);
+                }
+            }
+        }
+
+        // metrics...
+        for (id, (candidates, handle)) in candidates {
+            let mut match_count = 0;
+
+            for (table, pks) in candidates.iter() {
+                let count = pks.len();
+                match_count += count;
+                counter!("corro.subs.changes.matched.count", "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string()).increment(count as u64);
+            }
+
+            trace!(sub_id = %id, %db_version, "found {match_count} candidates");
+
+            if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
+                error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
+                match e {
+                    mpsc::error::TrySendError::Full(item) => {
+                        warn!("channel is full, falling back to async send");
+                        let changes_tx = handle.inner.changes_tx.clone();
+                        tokio::spawn(async move {
+                            _ = changes_tx.send(item).await;
+                        });
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        if let Some(handle) = self.remove(id) {
+                            tokio::spawn(handle.cleanup());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn match_changes(&self, changes: &[Change], db_version: CrsqlDbVersion) {
         trace!(
             %db_version,
