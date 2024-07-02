@@ -2,6 +2,7 @@
 //!
 //! This module is _big_ and maybe should be split up further.
 
+use std::sync::Arc;
 use std::{
     cmp,
     collections::VecDeque,
@@ -31,6 +32,7 @@ use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
+use std::sync::Mutex;
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
     task::{block_in_place, JoinSet},
@@ -424,7 +426,8 @@ pub async fn handle_changes(
 
     const MAX_SEEN_CACHE_LEN: usize = 10000;
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
-    let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
+    let mut seen_mutex: Arc<Mutex<IndexMap<_, RangeInclusiveSet<CrsqlSeq>>>> =
+        Arc::new(Mutex::new(IndexMap::new()));
 
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
@@ -447,11 +450,20 @@ pub async fn handle_changes(
             }
 
             debug!(count = %tmp_cost, "spawning processing multiple changes from beginning of loop");
-            join_set.spawn(util::process_multiple_changes(
-                agent.clone(),
-                bookie.clone(),
-                std::mem::take(&mut buf),
-            ));
+            let changes = std::mem::take(&mut buf);
+            let agent = agent.clone();
+            let bookie = bookie.clone();
+            let seen_mutex = seen_mutex.clone();
+            join_set.spawn(async move {
+                if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await
+                {
+                    error!("could not process multiple changes: {e}");
+                    for change in changes {
+                        let v = *change.0.versions().start();
+                        seen_mutex.lock().unwrap().remove(&(change.0.actor_id, v));
+                    }
+                };
+            });
 
             buf_cost -= tmp_cost;
         }
@@ -461,11 +473,8 @@ pub async fn handle_changes(
 
             // process these first, we don't care about the result,
             // but we need to drain it to free up concurrency
-            res = join_set.join_next(), if !join_set.is_empty() => {
+            _ = join_set.join_next(), if !join_set.is_empty() => {
                 debug!("processed multiple changes concurrently");
-                if let Some(Ok(Err(e))) = res {
-                    error!("could not process multiple changes: {e}");
-                }
                 continue;
             },
 
@@ -484,17 +493,27 @@ pub async fn handle_changes(
                 if buf_cost < max_changes_chunk && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     // we can process this right away
                     debug!(%buf_cost, "spawning processing multiple changes from max wait interval");
-                    join_set.spawn(util::process_multiple_changes(
-                        agent.clone(),
-                        bookie.clone(),
-                        queue.drain(..).collect(),
-                    ));
+                    let changes: Vec<_> = queue.drain(..).collect();
+                    let agent = agent.clone();
+                    let bookie = bookie.clone();
+                    let seen_mutex = seen_mutex.clone();
+                    join_set.spawn(async move {
+                        if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await {
+                            error!("could not process multiple changes: {e}");
+                            for change in changes {
+                                let v = *change.0.versions().start();
+                                seen_mutex.lock().unwrap().remove(&(change.0.actor_id, v));
+                            }
+                        };
+                    });
                     buf_cost = 0;
                 }
 
-                if seen.len() > MAX_SEEN_CACHE_LEN {
+                let seen_len = { seen_mutex.lock().unwrap().len() };
+                if seen_len > MAX_SEEN_CACHE_LEN {
                     // we don't want to keep too many entries in here.
-                    seen = seen.split_off(seen.len() - KEEP_SEEN_CACHE_SIZE);
+                    let new_seen = { seen_mutex.lock().unwrap().split_off(seen_len - KEEP_SEEN_CACHE_SIZE) };
+                    seen_mutex = Arc::new(Mutex::new(new_seen));
                 }
                 continue
             },
@@ -511,20 +530,23 @@ pub async fn handle_changes(
             continue;
         }
 
-        if let Some(mut seqs) = change.seqs().cloned() {
-            let v = *change.versions().start();
-            if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
-                if seqs.all(|seq| seen_seqs.contains(&seq)) {
+        {
+            let seen = seen_mutex.lock().unwrap();
+            if let Some(mut seqs) = change.seqs().cloned() {
+                let v = *change.versions().start();
+                if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
+                    if seqs.all(|seq| seen_seqs.contains(&seq)) {
+                        continue;
+                    }
+                }
+            } else {
+                // empty versions
+                if change
+                    .versions()
+                    .all(|v| seen.contains_key(&(change.actor_id, v)))
+                {
                     continue;
                 }
-            }
-        } else {
-            // empty versions
-            if change
-                .versions()
-                .all(|v| seen.contains_key(&(change.actor_id, v)))
-            {
-                continue;
             }
         }
 
@@ -569,6 +591,7 @@ pub async fn handle_changes(
 
         // this will only run once for a non-empty changeset
         for v in change.versions() {
+            let mut seen = seen_mutex.lock().unwrap();
             let entry = seen.entry((change.actor_id, v)).or_default();
             if let Some(seqs) = change.seqs().cloned() {
                 entry.extend([seqs]);
