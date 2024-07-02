@@ -2,7 +2,7 @@
 //!
 //! This module is _big_ and maybe should be split up further.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::{
     cmp,
     collections::VecDeque,
@@ -26,10 +26,10 @@ use corro_types::{
 };
 
 use bytes::Bytes;
+use corro_types::base::Version;
 use foca::Notification;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
-use parking_lot::Mutex;
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
@@ -426,8 +426,7 @@ pub async fn handle_changes(
 
     const MAX_SEEN_CACHE_LEN: usize = 10000;
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
-    let mut seen_mutex: Arc<Mutex<IndexMap<_, RangeInclusiveSet<CrsqlSeq>>>> =
-        Arc::new(Mutex::new(IndexMap::new()));
+    let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
@@ -453,16 +452,22 @@ pub async fn handle_changes(
             let changes = std::mem::take(&mut buf);
             let agent = agent.clone();
             let bookie = bookie.clone();
-            let seen_mutex = seen_mutex.clone();
             join_set.spawn(async move {
                 if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await
                 {
                     error!("could not process multiple changes: {e}");
-                    for change in changes {
-                        let v = *change.0.versions().start();
-                        seen_mutex.lock().remove(&(change.0.actor_id, v));
-                    }
-                };
+                    changes.iter().fold(
+                        BTreeMap::new(),
+                        |mut acc: BTreeMap<ActorId, RangeInclusiveSet<Version>>, change| {
+                            acc.entry(change.0.actor_id)
+                                .or_default()
+                                .insert(change.0.versions());
+                            acc
+                        },
+                    )
+                } else {
+                    BTreeMap::new()
+                }
             });
 
             buf_cost -= tmp_cost;
@@ -473,8 +478,16 @@ pub async fn handle_changes(
 
             // process these first, we don't care about the result,
             // but we need to drain it to free up concurrency
-            _ = join_set.join_next(), if !join_set.is_empty() => {
+            res = join_set.join_next(), if !join_set.is_empty() => {
                 debug!("processed multiple changes concurrently");
+                if let Some(Ok(res)) = res {
+                    for (actor_id, versions) in res {
+                        let versions: Vec<_> = versions.into_iter().flatten().collect();
+                        for version in versions {
+                            seen.remove(&(actor_id, version));
+                        }
+                    }
+                }
                 continue;
             },
 
@@ -496,24 +509,24 @@ pub async fn handle_changes(
                     let changes: Vec<_> = queue.drain(..).collect();
                     let agent = agent.clone();
                     let bookie = bookie.clone();
-                    let seen_mutex = seen_mutex.clone();
                     join_set.spawn(async move {
-                        if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await {
+                        if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await
+                        {
                             error!("could not process multiple changes: {e}");
-                            for change in changes {
-                                let v = *change.0.versions().start();
-                                seen_mutex.lock().remove(&(change.0.actor_id, v));
-                            }
-                        };
+                            changes.iter().fold(BTreeMap::new(), |mut acc: BTreeMap<ActorId, RangeInclusiveSet<Version>> , change| {
+                                acc.entry(change.0.actor_id).or_default().insert(change.0.versions());
+                                acc
+                            })
+                        } else {
+                            BTreeMap::new()
+                        }
                     });
                     buf_cost = 0;
                 }
 
-                let seen_len = { seen_mutex.lock().len() };
-                if seen_len > MAX_SEEN_CACHE_LEN {
+                if seen.len() > MAX_SEEN_CACHE_LEN {
                     // we don't want to keep too many entries in here.
-                    let new_seen = { seen_mutex.lock().split_off(seen_len - KEEP_SEEN_CACHE_SIZE) };
-                    seen_mutex = Arc::new(Mutex::new(new_seen));
+                    seen = seen.split_off(seen.len() - KEEP_SEEN_CACHE_SIZE);
                 }
                 continue
             },
@@ -530,23 +543,20 @@ pub async fn handle_changes(
             continue;
         }
 
-        {
-            let seen = seen_mutex.lock();
-            if let Some(mut seqs) = change.seqs().cloned() {
-                let v = *change.versions().start();
-                if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
-                    if seqs.all(|seq| seen_seqs.contains(&seq)) {
-                        continue;
-                    }
-                }
-            } else {
-                // empty versions
-                if change
-                    .versions()
-                    .all(|v| seen.contains_key(&(change.actor_id, v)))
-                {
+        if let Some(mut seqs) = change.seqs().cloned() {
+            let v = *change.versions().start();
+            if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
+                if seqs.all(|seq| seen_seqs.contains(&seq)) {
                     continue;
                 }
+            }
+        } else {
+            // empty versions
+            if change
+                .versions()
+                .all(|v| seen.contains_key(&(change.actor_id, v)))
+            {
+                continue;
             }
         }
 
@@ -591,7 +601,6 @@ pub async fn handle_changes(
 
         // this will only run once for a non-empty changeset
         for v in change.versions() {
-            let mut seen = seen_mutex.lock();
             let entry = seen.entry((change.actor_id, v)).or_default();
             if let Some(seqs) = change.seqs().cloned() {
                 entry.extend([seqs]);
