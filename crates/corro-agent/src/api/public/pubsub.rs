@@ -370,8 +370,11 @@ async fn catch_up_sub_anew(
     });
 
     let last_change_id = {
-        let conn = matcher.pool().get().await?;
-        block_in_place(|| matcher.all_rows(&conn, q_tx))?
+        let mut conn = matcher.pool().get().await?;
+        block_in_place(|| {
+            let conn_tx = conn.transaction()?;
+            matcher.all_rows(&conn_tx, q_tx)
+        })?
     };
 
     task.await??;
