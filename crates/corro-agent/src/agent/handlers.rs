@@ -29,10 +29,10 @@ use bytes::Bytes;
 use foca::Notification;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
+use parking_lot::Mutex;
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
-use std::sync::Mutex;
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
     task::{block_in_place, JoinSet},
@@ -460,7 +460,7 @@ pub async fn handle_changes(
                     error!("could not process multiple changes: {e}");
                     for change in changes {
                         let v = *change.0.versions().start();
-                        seen_mutex.lock().unwrap().remove(&(change.0.actor_id, v));
+                        seen_mutex.lock().remove(&(change.0.actor_id, v));
                     }
                 };
             });
@@ -502,17 +502,17 @@ pub async fn handle_changes(
                             error!("could not process multiple changes: {e}");
                             for change in changes {
                                 let v = *change.0.versions().start();
-                                seen_mutex.lock().unwrap().remove(&(change.0.actor_id, v));
+                                seen_mutex.lock().remove(&(change.0.actor_id, v));
                             }
                         };
                     });
                     buf_cost = 0;
                 }
 
-                let seen_len = { seen_mutex.lock().unwrap().len() };
+                let seen_len = { seen_mutex.lock().len() };
                 if seen_len > MAX_SEEN_CACHE_LEN {
                     // we don't want to keep too many entries in here.
-                    let new_seen = { seen_mutex.lock().unwrap().split_off(seen_len - KEEP_SEEN_CACHE_SIZE) };
+                    let new_seen = { seen_mutex.lock().split_off(seen_len - KEEP_SEEN_CACHE_SIZE) };
                     seen_mutex = Arc::new(Mutex::new(new_seen));
                 }
                 continue
@@ -531,7 +531,7 @@ pub async fn handle_changes(
         }
 
         {
-            let seen = seen_mutex.lock().unwrap();
+            let seen = seen_mutex.lock();
             if let Some(mut seqs) = change.seqs().cloned() {
                 let v = *change.versions().start();
                 if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
@@ -591,7 +591,7 @@ pub async fn handle_changes(
 
         // this will only run once for a non-empty changeset
         for v in change.versions() {
-            let mut seen = seen_mutex.lock().unwrap();
+            let mut seen = seen_mutex.lock();
             let entry = seen.entry((change.actor_id, v)).or_default();
             if let Some(seqs) = change.seqs().cloned() {
                 entry.extend([seqs]);
