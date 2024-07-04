@@ -792,8 +792,15 @@ pub async fn handle_sync(
                     **id != agent.actor_id() && state.cluster_id == agent.cluster_id()
                 })
                 // Grab a ring-buffer index to the member RTT range
-                .map(|(id, state)| (*id, state.ring.unwrap_or(255), state.addr))
-                .collect::<Vec<(ActorId, u8, SocketAddr)>>()
+                .map(|(id, state)| {
+                    (
+                        *id,
+                        state.ring.unwrap_or(255),
+                        state.addr,
+                        state.last_sync_ts,
+                    )
+                })
+                .collect::<Vec<(ActorId, u8, SocketAddr, Option<Timestamp>)>>()
         };
 
         if candidates.is_empty() {
@@ -816,6 +823,8 @@ pub async fn handle_sync(
             sync_state
                 .need_len_for_actor(&b.0)
                 .cmp(&sync_state.need_len_for_actor(&a.0))
+                // if equal, look at last sync time
+                .then_with(|| a.3.cmp(&b.3))
                 // if equal, look at proximity (via `ring`)
                 .then_with(|| a.1.cmp(&b.1))
         });
@@ -823,7 +832,7 @@ pub async fn handle_sync(
         choices.truncate(desired_count);
         choices
             .into_iter()
-            .map(|(actor_id, _, addr)| (actor_id, addr))
+            .map(|(actor_id, _, addr, _)| (actor_id, addr))
             .collect()
     };
 
@@ -852,6 +861,7 @@ pub async fn handle_sync(
         info!(
             "synced {n} changes w/ {} in {}s @ {} changes/s",
             chosen
+                .clone()
                 .into_iter()
                 .map(|(actor_id, _)| actor_id.to_string())
                 .collect::<Vec<_>>()
@@ -859,6 +869,12 @@ pub async fn handle_sync(
             elapsed.as_secs_f64(),
             n as f64 / elapsed.as_secs_f64()
         );
+
+        let ts = Timestamp::from(agent.clock().new_timestamp());
+        for (actor_id, _) in chosen {
+            let mut members = agent.members().write();
+            members.update_sync_ts(actor_id, ts);
+        }
     }
     Ok(())
 }
