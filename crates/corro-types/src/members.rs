@@ -61,8 +61,8 @@ impl Members {
         self.states.get(id)
     }
 
-    pub fn update_sync_ts(&mut self, actor_id: ActorId, ts: Timestamp) {
-        if let Some(state) = self.states.get_mut(&actor_id) {
+    pub fn update_sync_ts(&mut self, actor_id: &ActorId, ts: Timestamp) {
+        if let Some(state) = self.states.get_mut(actor_id) {
             state.last_sync_ts = Some(ts);
         }
     }

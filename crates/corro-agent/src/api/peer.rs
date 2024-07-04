@@ -1436,20 +1436,23 @@ pub async fn parallel_sync(
 
             debug!(%actor_id, %count, "done reading sync messages");
 
-            Ok(count)
+            Ok((actor_id, count))
         }
         .instrument(info_span!("read_sync_requests_responses", %actor_id))
     }))
-    .collect::<Vec<Result<usize, SyncError>>>()
+    .collect::<Vec<Result<(ActorId, usize), SyncError>>>()
     .await;
 
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+    let mut members = agent.members().write();
     for res in counts.iter() {
-        if let Err(e) = res {
-            error!("could not properly recv from peer: {e}");
-        }
+        match res {
+            Err(e) => error!("could not properly recv from peer: {e}"),
+            Ok((actor_id, _)) => members.update_sync_ts(&actor_id, ts),
+        };
     }
 
-    Ok(counts.into_iter().flatten().sum::<usize>())
+    Ok(counts.into_iter().map(|res| res.map(|i| i.1)).flatten().sum::<usize>())
 }
 
 #[tracing::instrument(skip(agent, bookie, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]

@@ -869,12 +869,6 @@ pub async fn handle_sync(
             elapsed.as_secs_f64(),
             n as f64 / elapsed.as_secs_f64()
         );
-
-        let ts = Timestamp::from(agent.clock().new_timestamp());
-        for (actor_id, _) in chosen {
-            let mut members = agent.members().write();
-            members.update_sync_ts(actor_id, ts);
-        }
     }
     Ok(())
 }
