@@ -408,7 +408,8 @@ fn processing_cost(change: &Changeset) -> usize {
 }
 
 /// Handle incoming emptyset received during syncs
-///
+///_
+#[allow(dead_code)]
 pub async fn handle_emptyset(
     agent: Agent,
     bookie: Bookie,
@@ -472,6 +473,7 @@ pub async fn handle_emptyset(
     println!("shutting down handle empties loop");
 }
 
+#[allow(dead_code)]
 pub async fn process_emptyset(
     agent: Agent,
     bookie: Bookie,
