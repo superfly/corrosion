@@ -1374,7 +1374,7 @@ pub async fn parallel_sync(
 
     let counts = FuturesUnordered::from_iter(readers.into_iter().map(|(actor_id, mut read)| {
         let tx_changes = agent.tx_changes().clone();
-        let tx_emptyset = agent.tx_emptyset().clone();
+        // let tx_emptyset = agent.tx_emptyset().clone();
 
         async move {
             let mut count = 0;
@@ -1402,13 +1402,13 @@ pub async fn parallel_sync(
                                 change.seqs()
                             );
                             // only accept emptyset that's from the same node that's syncing
-                            if change.is_empty_set() {
-                                tx_emptyset
-                                    .send(change)
-                                    .await
-                                    .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
-                                continue;
-                            }
+                            // if change.is_empty_set() {
+                            //     tx_emptyset
+                            //         .send(change)
+                            //         .await
+                            //         .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
+                            //     continue;
+                            // }
 
                             tx_changes
                                 .send((change, ChangeSource::Sync))
