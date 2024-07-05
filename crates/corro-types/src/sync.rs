@@ -82,6 +82,8 @@ pub struct SyncStateV1 {
     pub heads: HashMap<ActorId, Version>,
     pub need: HashMap<ActorId, Vec<RangeInclusive<Version>>>,
     pub partial_need: HashMap<ActorId, HashMap<Version, Vec<RangeInclusive<CrsqlSeq>>>>,
+    #[speedy(default_on_eof)]
+    pub last_cleared_ts: Option<Timestamp>,
 }
 
 impl SyncStateV1 {
@@ -256,6 +258,9 @@ pub enum SyncNeedV1 {
         version: Version,
         seqs: Vec<RangeInclusive<CrsqlSeq>>,
     },
+    Empty {
+        ts: Option<Timestamp>,
+    },
 }
 
 impl SyncNeedV1 {
@@ -263,6 +268,7 @@ impl SyncNeedV1 {
         match self {
             SyncNeedV1::Full { versions } => (versions.end().0 - versions.start().0) as usize + 1,
             SyncNeedV1::Partial { .. } => 1,
+            SyncNeedV1::Empty { .. } => 1,
         }
     }
 }
@@ -273,11 +279,24 @@ impl From<SyncStateV1> for SyncMessage {
     }
 }
 
+pub async fn get_last_cleared_ts(bookie: &Bookie, actor_id: &ActorId) -> Option<Timestamp> {
+    let booked = bookie
+        .read("get_last_cleared_ts")
+        .await
+        .get(actor_id)
+        .cloned();
+    if let Some(booked) = booked {
+        let booked_reader = booked.read("get_last_cleared_ts").await;
+        return booked_reader.last_cleared_ts();
+    }
+    return None;
+}
+
 // generates a `SyncMessage` to tell another node what versions we're missing
 #[tracing::instrument(skip_all, level = "debug")]
-pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
+pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncStateV1 {
     let mut state = SyncStateV1 {
-        actor_id,
+        actor_id: self_actor_id,
         ..Default::default()
     };
 
@@ -289,6 +308,8 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             .map(|(k, v)| (*k, v.clone()))
             .collect()
     };
+
+    let mut last_ts = None;
 
     for (actor_id, booked) in actors {
         let bookedr = booked
@@ -323,8 +344,14 @@ pub async fn generate_sync(bookie: &Bookie, actor_id: ActorId) -> SyncStateV1 {
             }
         }
 
+        if actor_id == self_actor_id {
+            last_ts = bookedr.last_cleared_ts();
+        }
+
         state.heads.insert(actor_id, last_version);
     }
+
+    state.last_cleared_ts = last_ts;
 
     state
 }

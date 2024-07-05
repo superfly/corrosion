@@ -3,6 +3,9 @@
 //! This module is _big_ and maybe should be split up further.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::ops::RangeInclusive;
+
 use std::{
     cmp,
     collections::VecDeque,
@@ -26,7 +29,11 @@ use corro_types::{
 };
 
 use bytes::Bytes;
+use corro_types::agent::ChangeError;
 use corro_types::base::Version;
+use corro_types::broadcast::Timestamp;
+use corro_types::change::store_empty_changeset;
+use corro_types::sync::get_last_cleared_ts;
 use foca::Notification;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
@@ -392,12 +399,139 @@ pub fn spawn_handle_db_cleanup(pool: SplitPool) {
 
 // determine the estimated resource cost of processing a change
 fn processing_cost(change: &Changeset) -> usize {
-    if change.is_empty() {
+    if change.is_empty() && !change.is_empty_set() {
         let versions = change.versions();
         cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)
     } else {
         change.len()
     }
+}
+
+/// Handle incoming emptyset received during syncs
+///
+pub async fn handle_emptyset(
+    agent: Agent,
+    bookie: Bookie,
+    mut rx_emptysets: CorroReceiver<ChangeV1>,
+    mut tripwire: Tripwire,
+) {
+    // maybe bigger timeout?
+    let mut max_wait = tokio::time::interval(Duration::from_millis(
+        agent.config().perf.apply_queue_timeout as u64,
+    ));
+    let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
+
+    let mut buf = HashMap::new();
+    let mut cost = 0;
+
+    loop {
+        let mut process = false;
+        tokio::select! {
+            maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
+                Some(change) => {
+                    if let Changeset::EmptySet { versions, ts } = change.changeset {
+                        buf.entry(change.actor_id).or_insert(VecDeque::new()).push_back((versions.clone(), ts));
+                        cost += versions.len();
+                    } else {
+                        warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
+                    }
+
+                    if cost >= max_changes_chunk && !buf.is_empty() {
+                        process = true;
+                    }
+                },
+                None => break,
+            },
+            _ = max_wait.tick() => {
+                process = true
+            },
+            _ = &mut tripwire => {
+                break;
+            }
+        }
+
+        if process {
+            for (actor, changes) in &mut buf {
+                while !changes.is_empty() {
+                    let change = changes.pop_front().unwrap();
+                    match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await {
+                        Ok(()) => {
+                            cost -= change.0.len();
+                        }
+                        Err(e) => {
+                            warn!("encountered error when processing emptyset - {e}");
+                            changes.push_front(change);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("shutting down handle empties loop");
+}
+
+pub async fn process_emptyset(
+    agent: Agent,
+    bookie: Bookie,
+    actor_id: ActorId,
+    changes: &(Vec<RangeInclusive<corro_types::base::Version>>, Timestamp),
+) -> Result<(), ChangeError> {
+    let (versions, ts) = changes;
+    let mut conn = agent.pool().write_low().await?;
+
+    let booked = {
+        bookie
+            .write(format!(
+                "process_emptyset(booked writer, updates timestamp):{actor_id}",
+            ))
+            .await
+            .ensure(actor_id)
+    };
+    let mut booked_write = booked
+        .write(format!(
+            "process_emptyset(booked writer, updates timestamp):{actor_id}"
+        ))
+        .await;
+    let mut snap = booked_write.snapshot();
+
+    let tx = conn
+        .immediate_transaction()
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?;
+
+    counter!("corro.sync.empties.count", "actor" => format!("{}", actor_id.to_string()))
+        .increment(versions.len() as u64);
+    debug!(self_actor_id = %agent.actor_id(), "processing emptyset changes, len: {}", versions.len());
+    for version in versions {
+        store_empty_changeset(&tx, actor_id, version.clone(), *ts)?;
+    }
+
+    snap.insert_db(&tx, RangeInclusiveSet::from_iter(versions.clone()))
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?;
+    snap.update_cleared_ts(&tx, *ts)
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?;
+
+    tx.commit().map_err(|source| ChangeError::Rusqlite {
+        source,
+        actor_id: None,
+        version: None,
+    })?;
+    booked_write.commit_snapshot(snap);
+
+    Ok(())
 }
 
 /// Bundle incoming changes to optimise transaction sizes with SQLite
@@ -658,8 +792,15 @@ pub async fn handle_sync(
                     **id != agent.actor_id() && state.cluster_id == agent.cluster_id()
                 })
                 // Grab a ring-buffer index to the member RTT range
-                .map(|(id, state)| (*id, state.ring.unwrap_or(255), state.addr))
-                .collect::<Vec<(ActorId, u8, SocketAddr)>>()
+                .map(|(id, state)| {
+                    (
+                        *id,
+                        state.ring.unwrap_or(255),
+                        state.addr,
+                        state.last_sync_ts,
+                    )
+                })
+                .collect::<Vec<(ActorId, u8, SocketAddr, Option<Timestamp>)>>()
         };
 
         if candidates.is_empty() {
@@ -682,6 +823,8 @@ pub async fn handle_sync(
             sync_state
                 .need_len_for_actor(&b.0)
                 .cmp(&sync_state.need_len_for_actor(&a.0))
+                // if equal, look at last sync time
+                .then_with(|| a.3.cmp(&b.3))
                 // if equal, look at proximity (via `ring`)
                 .then_with(|| a.1.cmp(&b.1))
         });
@@ -689,7 +832,7 @@ pub async fn handle_sync(
         choices.truncate(desired_count);
         choices
             .into_iter()
-            .map(|(actor_id, _, addr)| (actor_id, addr))
+            .map(|(actor_id, _, addr, _)| (actor_id, addr))
             .collect()
     };
 
@@ -698,8 +841,14 @@ pub async fn handle_sync(
         return Ok(());
     }
 
+    let mut last_cleared: HashMap<ActorId, Option<Timestamp>> = HashMap::new();
+
+    for (actor_id, _) in chosen.clone() {
+        last_cleared.insert(actor_id, get_last_cleared_ts(&bookie, &actor_id).await);
+    }
+
     let start = Instant::now();
-    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state).await {
+    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state, last_cleared).await {
         Ok(n) => n,
         Err(e) => {
             error!("failed to execute parallel sync: {e:?}");
@@ -712,6 +861,7 @@ pub async fn handle_sync(
         info!(
             "synced {n} changes w/ {} in {}s @ {} changes/s",
             chosen
+                .clone()
                 .into_iter()
                 .map(|(actor_id, _)| actor_id.to_string())
                 .collect::<Vec<_>>()

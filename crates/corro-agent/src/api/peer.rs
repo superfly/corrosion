@@ -24,9 +24,10 @@ use itertools::Itertools;
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rand::seq::SliceRandom;
-use rangemap::RangeInclusiveSet;
+use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, Connection};
 use speedy::Writable;
+use std::string::String;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{self, unbounded_channel, Sender};
 use tokio::task::block_in_place;
@@ -349,13 +350,15 @@ const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
 #[allow(clippy::too_many_arguments)]
 fn handle_need(
     conn: &mut Connection,
+    agent: &Agent,
     actor_id: ActorId,
     need: SyncNeedV1,
     sender: &Sender<SyncMessage>,
+    last_cleared_ts: Option<Timestamp>,
 ) -> eyre::Result<()> {
     debug!(%actor_id, "handle known versions! need: {need:?}");
 
-    let mut empties = RangeInclusiveSet::new();
+    let mut empties: RangeInclusiveMap<Version, Timestamp> = RangeInclusiveMap::new();
 
     // this is a read transaction!
     let tx = conn.transaction()?;
@@ -426,6 +429,7 @@ fn handle_need(
 
                 let version: Version = row.get(0)?;
                 let end_version: Option<Version> = row.get(1)?;
+                let ts: Timestamp = row.get(3)?;
 
                 if let Some(end_version) = end_version {
                     // cleared versions!
@@ -436,7 +440,7 @@ fn handle_need(
                     // pick the smallest end between ours and the versions
                     let end_version = cmp::min(end_version, *versions.end());
 
-                    empties.insert(start_version..=end_version);
+                    empties.insert(start_version..=end_version, ts);
 
                     // we have now processed this range!
                     unprocessed.remove(start_version..=end_version);
@@ -448,7 +452,6 @@ fn handle_need(
 
                 // since this is not a cleared version, those aren't supposed to fail!
                 let last_seq: CrsqlSeq = row.get(2)?;
-                let ts: Timestamp = row.get(3)?;
 
                 let mut prepped = tx.prepare_cached(
                     r#"
@@ -477,7 +480,7 @@ fn handle_need(
                     last_seq,
                     ts,
                 )? {
-                    empties.insert(empty..=empty);
+                    empties.insert(empty..=empty, ts);
                 }
             }
 
@@ -535,10 +538,13 @@ fn handle_need(
             }
 
             if !empties.is_empty() {
-                for versions in empties {
+                for (versions, ts) in empties {
                     sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                         actor_id,
-                        changeset: Changeset::Empty { versions },
+                        changeset: Changeset::Empty {
+                            versions,
+                            ts: Some(ts),
+                        },
                     })))?;
                 }
             }
@@ -554,6 +560,10 @@ fn handle_need(
                 Some(row) => {
                     let version: Version = row.get(0)?;
                     let end_version: Option<Version> = row.get(1)?;
+                    // ts could be null, since we previously didn't store timestamp for empties
+                    let ts: Option<Timestamp> = row.get(3)?;
+                    let ts: Timestamp =
+                        ts.unwrap_or(Timestamp::from(agent.clock().new_timestamp()));
 
                     if end_version.is_some() {
                         // send this one right away
@@ -563,6 +573,7 @@ fn handle_need(
                                 actor_id,
                                 changeset: Changeset::Empty {
                                     versions: version..=version,
+                                    ts: Some(ts),
                                 },
                             },
                         )))?;
@@ -571,7 +582,6 @@ fn handle_need(
 
                     // since this is not a cleared version, those aren't supposed to fail!
                     let last_seq: CrsqlSeq = row.get(2)?;
-                    let ts: Timestamp = row.get(3)?;
 
                     for range_needed in seqs {
                         let mut prepped = tx.prepare_cached(
@@ -614,6 +624,7 @@ fn handle_need(
                                     actor_id,
                                     changeset: Changeset::Empty {
                                         versions: empty..=empty,
+                                        ts: Some(ts),
                                     },
                                 },
                             )))?;
@@ -702,6 +713,49 @@ fn handle_need(
                 }
             }
         }
+        SyncNeedV1::Empty { ts } => {
+            if last_cleared_ts.is_none() {
+                return Ok(());
+            }
+            let ts = ts.unwrap_or(Default::default());
+            debug!("processing empty versions to {actor_id}");
+            let mut stmt = tx.prepare_cached(
+                "
+                SELECT start_version, end_version, ts FROM __corro_bookkeeping
+                    WHERE actor_id = crsql_site_id() AND end_version IS NOT NULL AND ts > ?
+                    ORDER BY ts",
+            )?;
+            let rows = stmt
+                .query_map([ts], |row| {
+                    Ok((Version(row.get(0)?)..=Version(row.get(1)?), row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<(RangeInclusive<Version>, Timestamp)>>>()?
+                .iter()
+                .fold(HashMap::new(), |mut acc, item| {
+                    acc.entry(item.1)
+                        .and_modify(|arr: &mut Vec<RangeInclusive<Version>>| {
+                            arr.push(item.clone().0)
+                        })
+                        .or_insert(vec![item.clone().0]);
+                    acc
+                });
+
+            let mut rows = Vec::from_iter(rows.iter());
+            rows.sort_by(|a, b| a.0.cmp(b.0));
+            let mut count = 0;
+            for (ts, versions) in rows {
+                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id: agent.actor_id(),
+                    changeset: Changeset::EmptySet {
+                        versions: versions.clone(),
+                        ts: *ts,
+                    },
+                })))?;
+                count += versions.len();
+            }
+
+            debug!("sent {count} empty versions during sync!");
+        }
     }
 
     Ok(())
@@ -770,6 +824,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
 }
 
 async fn process_sync(
+    agent: Agent,
     pool: SplitPool,
     bookie: Bookie,
     sender: Sender<SyncMessage>,
@@ -788,6 +843,12 @@ async fn process_sync(
             6,
         );
 
+    let last_ts = agent
+        .clone()
+        .booked()
+        .read("process_sync(read_cleared_ts))")
+        .await
+        .last_cleared_ts();
     loop {
         enum Branch {
             Reqs(Vec<Vec<(ActorId, Vec<SyncNeedV1>)>>),
@@ -843,14 +904,21 @@ async fn process_sync(
                                     continue;
                                 }
                             }
+                            SyncNeedV1::Empty { ts } => {
+                                debug!("received empty need with ts: {ts:?}");
+                            }
                         }
 
                         let pool = pool.clone();
                         let sender = sender.clone();
+
+                        let agent = agent.clone();
                         let fut = Box::pin(async move {
                             let mut conn = pool.read().await?;
 
-                            block_in_place(|| handle_need(&mut conn, actor_id, need, &sender))?;
+                            block_in_place(|| {
+                                handle_need(&mut conn, &agent, actor_id, need, &sender, last_ts)
+                            })?;
 
                             Ok(())
                         });
@@ -971,6 +1039,7 @@ pub async fn parallel_sync(
     transport: &Transport,
     members: Vec<(ActorId, SocketAddr)>,
     our_sync_state: SyncStateV1,
+    our_empty_ts: HashMap<ActorId, Option<Timestamp>>,
 ) -> Result<usize, SyncError> {
     trace!(
         self_actor_id = %agent.actor_id(),
@@ -1058,10 +1127,20 @@ pub async fn parallel_sync(
 
                     counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string()).increment(1);
 
-                    let needs = our_sync_state.compute_available_needs(&their_sync_state);
+                    let mut needs = our_sync_state.compute_available_needs(&their_sync_state);
 
                     trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
 
+                    let cleared_ts = their_sync_state.last_cleared_ts;
+
+                    info!(%actor_id, "got last cleared ts {cleared_ts:?}");
+                    if let Some(ts) = cleared_ts {
+                        if let Some(last_seen) = our_empty_ts.get(&actor_id) {
+                            if last_seen.is_none() || last_seen.unwrap() < ts {
+                                needs.entry(actor_id).or_default().push( SyncNeedV1::Empty { ts: *last_seen });
+                            }
+                        }
+                    }
                     Ok::<_, SyncError>((needs, tx, read))
                 }.await
             )
@@ -1114,35 +1193,38 @@ pub async fn parallel_sync(
                 debug!(%actor_id, %addr, "needs len: {}", needs.values().map(|needs| needs.iter().map(|need| match need {
                     SyncNeedV1::Full {versions} => (versions.end().0 - versions.start().0) as usize + 1,
                     SyncNeedV1::Partial {..} => 0,
+                    SyncNeedV1::Empty {..} => 0,
                 }).sum::<usize>()).sum::<usize>());
+
+                let actor_needs = needs
+                    .into_iter()
+                    .flat_map(|(actor_id, needs)| {
+                        let mut needs: Vec<_> = needs
+                            .into_iter()
+                            .flat_map(|need| match need {
+                                // chunk the versions, sometimes it's 0..=1000000 and that's far too big for a chunk!
+                                SyncNeedV1::Full { versions } => chunk_range(versions, 10)
+                                    .map(|versions| SyncNeedV1::Full { versions })
+                                    .collect(),
+
+                                need => vec![need],
+                            })
+                            .collect();
+
+                        // NOTE: IMPORTANT! shuffle the vec so we don't keep looping over the same later on
+                        needs.shuffle(&mut rng);
+
+                        needs
+                            .into_iter()
+                            .map(|need| (actor_id, need))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<VecDeque<_>>();
 
                 servers.push((
                     actor_id,
                     addr,
-                    needs
-                        .into_iter()
-                        .flat_map(|(actor_id, needs)| {
-                            let mut needs: Vec<_> = needs
-                                .into_iter()
-                                .flat_map(|need| match need {
-                                    // chunk the versions, sometimes it's 0..=1000000 and that's far too big for a chunk!
-                                    SyncNeedV1::Full { versions } => chunk_range(versions, 10)
-                                        .map(|versions| SyncNeedV1::Full { versions })
-                                        .collect(),
-
-                                    need => vec![need],
-                                })
-                                .collect();
-
-                            // NOTE: IMPORTANT! shuffle the vec so we don't keep looping over the same later on
-                            needs.shuffle(&mut rng);
-
-                            needs
-                                .into_iter()
-                                .map(|need| (actor_id, need))
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<VecDeque<_>>(),
+                    actor_needs,
                     tx,
                 ));
 
@@ -1241,6 +1323,7 @@ pub async fn parallel_sync(
                                     .collect(),
                             }]
                         }
+                        need => {vec![need]},
                     };
 
                     if actual_needs.is_empty() {
@@ -1291,6 +1374,8 @@ pub async fn parallel_sync(
 
     let counts = FuturesUnordered::from_iter(readers.into_iter().map(|(actor_id, mut read)| {
         let tx_changes = agent.tx_changes().clone();
+        let tx_emptyset = agent.tx_emptyset().clone();
+
         async move {
             let mut count = 0;
 
@@ -1316,6 +1401,14 @@ pub async fn parallel_sync(
                                 change.versions(),
                                 change.seqs()
                             );
+                            // only accept emptyset that's from the same node that's syncing
+                            if change.is_empty_set() {
+                                tx_emptyset
+                                    .send(change)
+                                    .await
+                                    .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
+                                continue;
+                            }
 
                             tx_changes
                                 .send((change, ChangeSource::Sync))
@@ -1343,20 +1436,23 @@ pub async fn parallel_sync(
 
             debug!(%actor_id, %count, "done reading sync messages");
 
-            Ok(count)
+            Ok((actor_id, count))
         }
         .instrument(info_span!("read_sync_requests_responses", %actor_id))
     }))
-    .collect::<Vec<Result<usize, SyncError>>>()
+    .collect::<Vec<Result<(ActorId, usize), SyncError>>>()
     .await;
 
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+    let mut members = agent.members().write();
     for res in counts.iter() {
-        if let Err(e) = res {
-            error!("could not properly recv from peer: {e}");
-        }
+        match res {
+            Err(e) => error!("could not properly recv from peer: {e}"),
+            Ok((actor_id, _)) => members.update_sync_ts(&actor_id, ts),
+        };
     }
 
-    Ok(counts.into_iter().flatten().sum::<usize>())
+    Ok(counts.into_iter().map(|res| res.map(|i| i.1)).flatten().sum::<usize>())
 }
 
 #[tracing::instrument(skip(agent, bookie, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]
@@ -1473,9 +1569,15 @@ pub async fn serve_sync(
     let (tx, mut rx) = mpsc::channel::<SyncMessage>(256);
 
     tokio::spawn(
-        process_sync(agent.pool().clone(), bookie.clone(), tx, rx_need)
-            .instrument(info_span!("process_sync"))
-            .inspect_err(|e| error!("could not process sync request: {e}")),
+        process_sync(
+            agent.clone(),
+            agent.pool().clone(),
+            bookie.clone(),
+            tx,
+            rx_need,
+        )
+        .instrument(info_span!("process_sync"))
+        .inspect_err(|e| error!("could not process sync request: {e}")),
     );
 
     let (send_res, recv_res) = tokio::join!(
@@ -1746,11 +1848,13 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
+                    &agent,
                     actor_id,
                     SyncNeedV1::Full {
                         versions: Version(1)..=Version(1),
                     },
                     &tx,
+                    None,
                 )
             })?;
 
@@ -1772,12 +1876,14 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
+                    &agent,
                     actor_id,
                     SyncNeedV1::Partial {
                         version: Version(2),
                         seqs: vec![CrsqlSeq(0)..=CrsqlSeq(0)],
                     },
                     &tx,
+                    None,
                 )
             })?;
 
@@ -1850,25 +1956,30 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
+                    &agent,
                     actor_id,
                     SyncNeedV1::Partial {
                         version: Version(1),
                         seqs: vec![CrsqlSeq(0)..=CrsqlSeq(0)],
                     },
                     &tx,
+                    None,
                 )
             })?;
 
             let msg = rx.recv().await.unwrap();
-            assert_eq!(
-                msg,
-                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Empty {
-                        versions: Version(1)..=Version(1)
-                    }
-                }))
-            );
+            if let SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                actor_id: actor,
+                changeset,
+                ..
+            })) = msg
+            {
+                assert_eq!(actor_id, actor);
+                assert!(changeset.is_empty());
+                assert_eq!(changeset.versions(), Version(1)..=Version(1));
+            } else {
+                panic!("{msg:?} doesn't contain an empty changeset");
+            }
         }
 
         {
@@ -1878,11 +1989,13 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
+                    &agent,
                     actor_id,
                     SyncNeedV1::Full {
                         versions: Version(1)..=Version(6),
                     },
                     &tx,
+                    None,
                 )
             })?;
 
@@ -1917,15 +2030,18 @@ mod tests {
             );
 
             let msg = rx.recv().await.unwrap();
-            assert_eq!(
-                msg,
-                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Empty {
-                        versions: Version(1)..=Version(1)
-                    }
-                }))
-            );
+            if let SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                actor_id: actor,
+                changeset,
+                ..
+            })) = msg
+            {
+                assert_eq!(actor_id, actor);
+                assert!(changeset.is_empty());
+                assert_eq!(changeset.versions(), Version(1)..=Version(1));
+            } else {
+                panic!("{msg:?} doesn't contain an empty changeset");
+            }
         }
 
         // overwrite v2
@@ -2041,11 +2157,13 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
+                    &agent.clone(),
                     actor_id,
                     SyncNeedV1::Full {
                         versions: Version(1)..=Version(1000),
                     },
                     &tx,
+                    None,
                 )
             })?;
 
@@ -2095,15 +2213,18 @@ mod tests {
             );
 
             let msg = rx.recv().await.unwrap();
-            assert_eq!(
-                msg,
-                SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Empty {
-                        versions: Version(1)..=Version(2)
-                    }
-                }))
-            );
+            if let SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                actor_id: actor,
+                changeset,
+                ..
+            })) = msg
+            {
+                assert_eq!(actor_id, actor);
+                assert!(changeset.is_empty());
+                assert_eq!(changeset.versions(), Version(1)..=Version(2));
+            } else {
+                panic!("{msg:?} doesn't contain an empty changeset");
+            }
         }
 
         {
@@ -2113,12 +2234,14 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
+                    &agent.clone(),
                     actor_id,
                     SyncNeedV1::Partial {
                         version: Version(5),
                         seqs: vec![CrsqlSeq(4)..=CrsqlSeq(7)],
                     },
                     &tx,
+                    None,
                 )
             })?;
 
@@ -2149,12 +2272,14 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
+                    &agent,
                     actor_id,
                     SyncNeedV1::Partial {
                         version: Version(5),
                         seqs: vec![CrsqlSeq(2)..=CrsqlSeq(2), CrsqlSeq(15)..=CrsqlSeq(24)],
                     },
                     &tx,
+                    None,
                 )
             })?;
 
