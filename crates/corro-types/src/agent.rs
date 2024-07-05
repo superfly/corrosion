@@ -255,7 +255,6 @@ pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result
         Box::new(crsqlite_v0_16_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_bookkeeping_gaps as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
-        Box::new(create_ts_index_bookkeeping_table),
         Box::new(create_sync_state(clock)),
     ];
 
@@ -360,21 +359,20 @@ fn refactor_corro_members(tx: &Transaction) -> rusqlite::Result<()> {
     )
 }
 
-fn create_ts_index_bookkeeping_table(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        r#"
+fn create_sync_state(clock: Arc<uhlc::HLC>) -> impl Fn(&Transaction) -> rusqlite::Result<()> {
+    let ts = Timestamp::from(clock.new_timestamp());
+
+    move |tx: &Transaction| -> rusqlite::Result<()> {
+        tx.execute_batch(
+            r#"
         CREATE INDEX index__corro_bookkeeping_ts ON __corro_bookkeeping (actor_id, ts ASC);
         CREATE TABLE __corro_sync_state (
             actor_id BLOB PRIMARY KEY NOT NULL,
             last_cleared_ts TEXT
         );
     "#,
-    )
-}
-fn create_sync_state(clock: Arc<uhlc::HLC>) -> impl Fn(&Transaction) -> rusqlite::Result<()> {
-    let ts = Timestamp::from(clock.new_timestamp());
+        )?;
 
-    move |tx: &Transaction| -> rusqlite::Result<()> {
         tx.execute(
             r#"
         UPDATE __corro_bookkeeping SET ts = ?
