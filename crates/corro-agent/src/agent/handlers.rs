@@ -451,7 +451,6 @@ pub async fn handle_emptyset(
         }
 
         if process {
-
             for (actor, changes) in &mut buf {
                 while !changes.is_empty() {
                     let change = changes.pop_front().unwrap();
@@ -469,7 +468,6 @@ pub async fn handle_emptyset(
                 }
             }
         }
-
     }
 
     println!("shutting down handle empties loop");
