@@ -630,6 +630,8 @@ pub async fn process_fully_buffered_changes(
                 }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
 
                 debug!(%actor_id, %version, "inserted bookkeeping row after buffered insert");
+
+                Some(db_version)
             } else {
                 store_empty_changeset(
                     &tx,
@@ -638,6 +640,7 @@ pub async fn process_fully_buffered_changes(
                     Timestamp::from(agent.clock().new_timestamp()),
                 )?;
                 debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
+                None
             };
 
             let mut snap = bookedw.snapshot();
