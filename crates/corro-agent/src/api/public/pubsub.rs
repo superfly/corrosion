@@ -868,21 +868,32 @@ async fn forward_bytes_to_body_sender(
 
 #[cfg(test)]
 mod tests {
+    use corro_types::actor::ActorId;
+    use corro_types::api::{Change, ColumnName, TableName};
+    use corro_types::base::{CrsqlDbVersion, CrsqlSeq, Version};
+    use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
+    use corro_types::pubsub::pack_columns;
     use corro_types::{
         api::{ChangeId, RowId},
         config::Config,
         pubsub::ChangeType,
     };
     use http_body::Body;
+    use spawn::wait_for_all_pending_handles;
+    use std::ops::RangeInclusive;
+    use std::time::Instant;
+    use tokio::time::timeout;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
 
+    use super::*;
+    use crate::agent::process_multiple_changes;
     use crate::{
         agent::setup,
         api::public::{api_v1_db_schema, api_v1_transactions},
     };
-
-    use super::*;
+    use corro_tests::launch_test_agent;
+    use corro_types::api::SqliteValue::Integer;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_v1_subs() -> eyre::Result<()> {
@@ -1286,6 +1297,201 @@ mod tests {
                 ChangeId(4),
             )
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn match_buffered_changes() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+        let schema = "CREATE TABLE buftests (
+            pk int NOT NULL PRIMARY KEY,
+            col1 text,
+            col2 text
+         );";
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(ta1.agent.clone()),
+            axum::Json(vec![schema.into()]),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK);
+
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+
+        let change1 = Change {
+            table: TableName("buftests".into()),
+            pk: pack_columns(&vec![1i64.into()])?,
+            cid: ColumnName("col1".into()),
+            val: "one".into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(0),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        let change2 = Change {
+            table: TableName("buftests".into()),
+            pk: pack_columns(&vec![1i64.into()])?,
+            cid: ColumnName("col2".into()),
+            val: "one line".into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(1),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        let changes = ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: Version(1),
+                changes: vec![change1, change2],
+                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(1)),
+                last_seq: CrsqlSeq(1),
+                ts: Default::default(),
+            },
+        };
+
+        process_multiple_changes(
+            ta1.agent.clone(),
+            ta1.bookie.clone(),
+            vec![(changes, ChangeSource::Sync, Instant::now())],
+        )
+        .await?;
+
+        let bcast_cache: SharedMatcherBroadcastCache = Default::default();
+        let mut res = api_v1_subs(
+            Extension(ta1.agent.clone()),
+            Extension(bcast_cache.clone()),
+            Extension(tripwire.clone()),
+            axum::extract::Query(SubParams::default()),
+            axum::Json(Statement::Simple("select * from buftests".into())),
+        )
+        .await
+        .into_response();
+
+        if !res.status().is_success() {
+            let b = res.body_mut().data().await.unwrap().unwrap();
+            println!("body: {}", String::from_utf8_lossy(&b));
+        }
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut rows = RowsIter {
+            body: res.into_body(),
+            codec: LinesCodec::new(),
+            buf: BytesMut::new(),
+            done: false,
+        };
+
+        assert_eq!(
+            rows.recv().await.unwrap().unwrap(),
+            QueryEvent::Columns(vec!["pk".into(), "col1".into(), "col2".into()])
+        );
+
+        assert_eq!(
+            rows.recv().await.unwrap().unwrap(),
+            QueryEvent::Row(RowId(1), vec![Integer(1), "one".into(), "one line".into()])
+        );
+
+        assert!(matches!(
+            rows.recv().await.unwrap().unwrap(),
+            QueryEvent::EndOfQuery { .. }
+        ));
+
+        // send partial change so it is buffered
+        let change3 = Change {
+            table: TableName("buftests".into()),
+            pk: pack_columns(&vec![2i64.into()])?,
+            cid: ColumnName("col1".into()),
+            val: "two".into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(0),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        let changes = ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: Version(2),
+                changes: vec![change3],
+                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(0)),
+                last_seq: CrsqlSeq(1),
+                ts: Default::default(),
+            },
+        };
+
+        process_multiple_changes(
+            ta1.agent.clone(),
+            ta1.bookie.clone(),
+            vec![(changes, ChangeSource::Sync, Instant::now())],
+        )
+        .await?;
+
+        // confirm that change is buffered in db
+        {
+            let conn = ta1.agent.pool().read().await?;
+            let end = conn.query_row(
+                "SELECT end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
+                (actor_id, 2),
+                |row| row.get::<_, CrsqlSeq>(0),
+            )?;
+            assert_eq!(end, CrsqlSeq(0));
+        }
+
+        let change4 = Change {
+            table: TableName("buftests".into()),
+            pk: pack_columns(&vec![2i64.into()])?,
+            cid: ColumnName("col2".into()),
+            val: "two line".into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(1),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        };
+
+        let changes = ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: Version(2),
+                changes: vec![change4],
+                seqs: RangeInclusive::new(CrsqlSeq(1), CrsqlSeq(1)),
+                last_seq: CrsqlSeq(1),
+                ts: Default::default(),
+            },
+        };
+
+        process_multiple_changes(
+            ta1.agent.clone(),
+            ta1.bookie.clone(),
+            vec![(changes, ChangeSource::Sync, Instant::now())],
+        )
+        .await?;
+
+        let res = timeout(Duration::from_secs(5), rows.recv()).await?;
+
+        assert_eq!(
+            res.unwrap().unwrap(),
+            QueryEvent::Change(
+                ChangeType::Insert,
+                RowId(2),
+                vec![Integer(2), "two".into(), "two line".into()],
+                ChangeId(1)
+            )
+        );
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
 
         Ok(())
     }

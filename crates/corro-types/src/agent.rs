@@ -527,8 +527,10 @@ pub enum PoolError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChangeError {
-    #[error("could not acquire pooled connection: {0}")]
+    #[error("could not acquire pooled write connection: {0}")]
     Pool(#[from] PoolError),
+    #[error("could not acquire pooled read connection: {0}")]
+    SqlitePool(#[from] SqlitePoolError),
     #[error("rusqlite: {source} (actor_id: {actor_id:?}, version: {version:?})")]
     Rusqlite {
         source: rusqlite::Error,
@@ -1927,7 +1929,7 @@ mod tests {
         all_versions: &mut RangeInclusiveSet<Version>,
         versions: RangeInclusiveSet<Version>,
     ) -> rusqlite::Result<()> {
-        all_versions.extend(versions.clone().into_iter());
+        all_versions.extend(versions.clone());
         let mut snap = bv.snapshot();
         snap.insert_db(conn, versions)?;
         bv.commit_snapshot(snap);

@@ -264,7 +264,7 @@ pub enum TimestampParseError {
     Parse(ParseNTP64Error),
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord)]
 #[serde(transparent)]
 pub struct Timestamp(pub NTP64);
 
@@ -287,6 +287,13 @@ impl Timestamp {
 impl PartialEq for Timestamp {
     fn eq(&self, other: &Self) -> bool {
         self.0.as_secs() == other.0.as_secs() && self.0.subsec_nanos() == other.0.subsec_nanos()
+    }
+}
+
+impl std::hash::Hash for Timestamp {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_secs().hash(state);
+        self.0.subsec_nanos().hash(state);
     }
 }
 
@@ -480,11 +487,11 @@ pub async fn broadcast_changes(
         // TODO: make this more generic so both sync and local changes can use it.
         let mut prepped = conn.prepare_cached(
             r#"
-                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                        FROM crsql_changes
-                        WHERE db_version = ?
-                        ORDER BY seq ASC
-                "#,
+                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                    FROM crsql_changes
+                    WHERE db_version = ?
+                    ORDER BY seq ASC
+            "#,
         )?;
         let rows = prepped.query_map([db_version], row_to_change)?;
         let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);

@@ -508,7 +508,7 @@ pub async fn configurable_stress_test(
         }
         if v.len() == agents.len()
             && v.iter()
-                .all(|(n, needed)| *n == changes_count as i64 && *needed == 0)
+                .all(|(n, needed)| *n == changes_count && *needed == 0)
         {
             break;
         }
@@ -1164,7 +1164,7 @@ async fn get_rows(
             let changes: Vec<Change>;
             let seqs = if let Some(seq) = versions.1.clone() {
                 let seq_query = " and seq >= ? and seq <= ?";
-                query = query + seq_query;
+                query += seq_query;
                 let mut prepped = conn.prepare(&query)?;
                 changes = prepped
                     .query_map((version, seq.start(), seq.end()), row_to_change)?

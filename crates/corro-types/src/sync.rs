@@ -289,7 +289,7 @@ pub async fn get_last_cleared_ts(bookie: &Bookie, actor_id: &ActorId) -> Option<
         let booked_reader = booked.read("get_last_cleared_ts").await;
         return booked_reader.last_cleared_ts();
     }
-    return None;
+    None
 }
 
 // generates a `SyncMessage` to tell another node what versions we're missing

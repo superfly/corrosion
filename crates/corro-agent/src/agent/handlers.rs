@@ -452,14 +452,22 @@ pub async fn handle_emptyset(
         }
 
         if process {
-
             for (actor, changes) in &mut buf {
                 while !changes.is_empty() {
                     let change = changes.pop_front().unwrap();
                     match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await {
                         Ok(()) => {
                             // cost -= change.0.len();
-                            cost -= change.0.iter().map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)).sum::<usize>();
+                            cost -= change
+                                .0
+                                .iter()
+                                .map(|versions| {
+                                    cmp::min(
+                                        (versions.end().0 - versions.start().0) as usize + 1,
+                                        20,
+                                    )
+                                })
+                                .sum::<usize>();
                         }
                         Err(e) => {
                             warn!("encountered error when processing emptyset - {e}");
@@ -470,7 +478,6 @@ pub async fn handle_emptyset(
                 }
             }
         }
-
     }
 
     println!("shutting down handle empties loop");
@@ -849,7 +856,7 @@ pub async fn handle_sync(
     let mut last_cleared: HashMap<ActorId, Option<Timestamp>> = HashMap::new();
 
     for (actor_id, _) in chosen.clone() {
-        last_cleared.insert(actor_id, get_last_cleared_ts(&bookie, &actor_id).await);
+        last_cleared.insert(actor_id, get_last_cleared_ts(bookie, &actor_id).await);
     }
 
     let start = Instant::now();

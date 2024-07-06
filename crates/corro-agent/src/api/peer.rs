@@ -1448,11 +1448,14 @@ pub async fn parallel_sync(
     for res in counts.iter() {
         match res {
             Err(e) => error!("could not properly recv from peer: {e}"),
-            Ok((actor_id, _)) => members.update_sync_ts(&actor_id, ts),
+            Ok((actor_id, _)) => members.update_sync_ts(actor_id, ts),
         };
     }
 
-    Ok(counts.into_iter().map(|res| res.map(|i| i.1)).flatten().sum::<usize>())
+    Ok(counts
+        .into_iter()
+        .flat_map(|res| res.map(|i| i.1))
+        .sum::<usize>())
 }
 
 #[tracing::instrument(skip(agent, bookie, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]
