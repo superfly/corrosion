@@ -264,7 +264,7 @@ pub enum TimestampParseError {
     Parse(ParseNTP64Error),
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord)]
 #[serde(transparent)]
 pub struct Timestamp(pub NTP64);
 
@@ -287,6 +287,13 @@ impl Timestamp {
 impl PartialEq for Timestamp {
     fn eq(&self, other: &Self) -> bool {
         self.0.as_secs() == other.0.as_secs() && self.0.subsec_nanos() == other.0.subsec_nanos()
+    }
+}
+
+impl std::hash::Hash for Timestamp {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_secs().hash(state);
+        self.0.subsec_nanos().hash(state);
     }
 }
 
