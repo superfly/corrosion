@@ -868,6 +868,7 @@ async fn forward_bytes_to_body_sender(
 
 #[cfg(test)]
 mod tests {
+    use axum::extract::Query;
     use corro_types::{
         api::{ChangeId, RowId},
         config::Config,
@@ -904,6 +905,7 @@ mod tests {
 
         let (status_code, _body) = api_v1_db_schema(
             Extension(agent.clone()),
+            Query(Default::default()),
             axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
         )
         .await;

@@ -2391,7 +2391,7 @@ mod tests {
             setup_conn(&conn)?;
             migrate(clock, &mut conn)?;
             let tx = conn.transaction()?;
-            apply_schema(&tx, &Schema::default(), &mut schema)?;
+            apply_schema(&tx, &Schema::default(), &mut schema, false)?;
             tx.commit()?;
         }
 
@@ -2512,7 +2512,7 @@ mod tests {
             setup_conn(&conn).unwrap();
             migrate(clock, &mut conn).unwrap();
             let tx = conn.transaction().unwrap();
-            apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
+            apply_schema(&tx, &Schema::default(), &mut schema, false).unwrap();
             tx.commit().unwrap();
         }
 
@@ -2552,7 +2552,7 @@ mod tests {
 
             {
                 let tx = conn2.transaction().unwrap();
-                apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
+                apply_schema(&tx, &Schema::default(), &mut schema, false).unwrap();
                 tx.commit().unwrap();
             }
 
