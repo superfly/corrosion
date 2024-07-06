@@ -2468,10 +2468,12 @@ mod tests {
             tmpdir.path().join("subs").display().to_string().into();
 
         let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1))).await?;
+        let clock = Arc::new(uhlc::HLC::default());
+
         {
             let mut conn = pool.write_priority().await?;
             setup_conn(&conn)?;
-            migrate(&mut conn)?;
+            migrate(clock, &mut conn)?;
             let tx = conn.transaction()?;
             apply_schema(&tx, &Schema::default(), &mut schema)?;
             tx.commit()?;
@@ -2589,10 +2591,10 @@ mod tests {
             .await
             .unwrap();
         let mut conn = pool.write_priority().await.unwrap();
-
+        let clock = Arc::new(uhlc::HLC::default());
         {
             setup_conn(&conn).unwrap();
-            migrate(&mut conn).unwrap();
+            migrate(clock, &mut conn).unwrap();
             let tx = conn.transaction().unwrap();
             apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
             tx.commit().unwrap();
@@ -2629,7 +2631,8 @@ mod tests {
             .expect("could not init crsql");
 
             setup_conn(&conn2).unwrap();
-            migrate(&mut conn2).unwrap();
+            let clock = Arc::new(uhlc::HLC::default());
+            migrate(clock, &mut conn2).unwrap();
 
             {
                 let tx = conn2.transaction().unwrap();

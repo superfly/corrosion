@@ -19,7 +19,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, Connection, Transaction};
+use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
@@ -66,6 +66,7 @@ pub struct AgentConfig {
     pub tx_apply: CorroSender<(ActorId, Version)>,
     pub tx_clear_buf: CorroSender<(ActorId, RangeInclusive<Version>)>,
     pub tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    pub tx_emptyset: CorroSender<ChangeV1>,
     pub tx_foca: CorroSender<FocaInput>,
 
     pub write_sema: Arc<Semaphore>,
@@ -92,6 +93,7 @@ pub struct AgentInner {
     tx_apply: CorroSender<(ActorId, Version)>,
     tx_clear_buf: CorroSender<(ActorId, RangeInclusive<Version>)>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    tx_emptyset: CorroSender<ChangeV1>,
     tx_foca: CorroSender<FocaInput>,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
@@ -121,6 +123,7 @@ impl Agent {
             tx_apply: config.tx_apply,
             tx_clear_buf: config.tx_clear_buf,
             tx_changes: config.tx_changes,
+            tx_emptyset: config.tx_emptyset,
             tx_foca: config.tx_foca,
             write_sema: config.write_sema,
             schema: config.schema,
@@ -176,6 +179,10 @@ impl Agent {
 
     pub fn tx_changes(&self) -> &CorroSender<(ChangeV1, ChangeSource)> {
         &self.0.tx_changes
+    }
+
+    pub fn tx_emptyset(&self) -> &CorroSender<ChangeV1> {
+        &self.0.tx_emptyset
     }
 
     pub fn tx_clear_buf(&self) -> &CorroSender<(ActorId, RangeInclusive<Version>)> {
@@ -239,7 +246,7 @@ impl Agent {
     }
 }
 
-pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result<()> {
     let migrations: Vec<Box<dyn Migration>> = vec![
         Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(bookkeeping_db_version_index as fn(&Transaction) -> rusqlite::Result<()>),
@@ -248,6 +255,8 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         Box::new(crsqlite_v0_16_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_bookkeeping_gaps as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(create_ts_index_bookkeeping_table),
+        Box::new(create_sync_state(clock)),
     ];
 
     crate::sqlite::migrate(conn, migrations)
@@ -349,6 +358,38 @@ fn refactor_corro_members(tx: &Transaction) -> rusqlite::Result<()> {
         ALTER TABLE __corro_members ADD COLUMN updated_at DATETIME NOT NULL DEFAULT 0;
     "#,
     )
+}
+
+fn create_ts_index_bookkeeping_table(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+        CREATE INDEX index__corro_bookkeeping_ts ON __corro_bookkeeping (actor_id, ts ASC);
+        CREATE TABLE __corro_sync_state (
+            actor_id BLOB PRIMARY KEY NOT NULL,
+            last_cleared_ts TEXT
+        );
+    "#,
+    )
+}
+fn create_sync_state(clock: Arc<uhlc::HLC>) -> impl Fn(&Transaction) -> rusqlite::Result<()> {
+    let ts = Timestamp::from(clock.new_timestamp());
+
+    move |tx: &Transaction| -> rusqlite::Result<()> {
+        tx.execute(
+            r#"
+        UPDATE __corro_bookkeeping SET ts = ?
+                WHERE ts IS NULL AND end_version is NOT NULL AND actor_id = crsql_site_id();
+    "#,
+            [ts],
+        )?;
+
+        tx.execute(
+            "INSERT INTO __corro_sync_state VALUES (crsql_site_id(), ?);",
+            [ts],
+        )?;
+
+        Ok(())
+    }
 }
 
 fn create_corro_subs(tx: &Transaction) -> rusqlite::Result<()> {
@@ -1097,6 +1138,7 @@ pub struct VersionsSnapshot {
     needed: RangeInclusiveSet<Version>,
     partials: BTreeMap<Version, PartialVersion>,
     max: Option<Version>,
+    last_cleared_ts: Option<Timestamp>,
 }
 
 impl VersionsSnapshot {
@@ -1161,6 +1203,16 @@ impl VersionsSnapshot {
         }
 
         self.max = changes.max.take();
+
+        Ok(())
+    }
+
+    pub fn update_cleared_ts(&mut self, conn: &Connection, ts: Timestamp) -> rusqlite::Result<()> {
+        if self.last_cleared_ts.is_none() || self.last_cleared_ts.unwrap() < ts {
+            self.last_cleared_ts = Some(ts);
+            conn.prepare_cached("INSERT OR REPLACE INTO __corro_sync_state VALUES (?, ?)")?
+                .execute((self.actor_id, ts))?;
+        }
 
         Ok(())
     }
@@ -1261,6 +1313,7 @@ pub struct BookedVersions {
     pub partials: BTreeMap<Version, PartialVersion>,
     needed: RangeInclusiveSet<Version>,
     max: Option<Version>,
+    last_cleared_ts: Option<Timestamp>,
 }
 
 impl BookedVersions {
@@ -1270,6 +1323,7 @@ impl BookedVersions {
             partials: Default::default(),
             needed: Default::default(),
             max: Default::default(),
+            last_cleared_ts: Default::default(),
         }
     }
 
@@ -1315,6 +1369,11 @@ impl BookedVersions {
                 }
             }
         }
+
+        bv.last_cleared_ts = conn
+            .prepare_cached("SELECT last_cleared_ts FROM __corro_sync_state WHERE actor_id = ?")?
+            .query_row([actor_id], |row| row.get(0))
+            .optional()?;
 
         let mut snap = bv.snapshot();
 
@@ -1384,12 +1443,20 @@ impl BookedVersions {
     pub fn last(&self) -> Option<Version> {
         self.max
     }
+    pub fn last_cleared_ts(&self) -> Option<Timestamp> {
+        self.last_cleared_ts
+    }
 
     pub fn commit_snapshot(&mut self, mut snap: VersionsSnapshot) {
         debug!("comitting snapshot");
         self.needed = std::mem::take(&mut snap.needed);
         self.partials = std::mem::take(&mut snap.partials);
         self.max = snap.max.take();
+        if let Some(ts) = snap.last_cleared_ts {
+            if self.last_cleared_ts.is_none() || self.last_cleared_ts().unwrap() < ts {
+                self.last_cleared_ts = Some(ts)
+            }
+        }
     }
 
     pub fn snapshot(&self) -> VersionsSnapshot {
@@ -1399,6 +1466,7 @@ impl BookedVersions {
             needed: self.needed.clone(),
             partials: self.partials.clone(),
             max: self.max,
+            last_cleared_ts: self.last_cleared_ts,
         }
     }
 
@@ -1649,7 +1717,8 @@ mod tests {
 
         let mut conn = CrConn::init(Connection::open_in_memory()?)?;
         setup_conn(&conn)?;
-        migrate(&mut conn)?;
+        let clock = Arc::new(uhlc::HLC::default());
+        migrate(clock, &mut conn)?;
 
         let actor_id = ActorId::default();
         let mut bv = BookedVersions::new(actor_id);

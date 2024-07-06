@@ -127,7 +127,10 @@ pub trait Migration {
     fn migrate(&self, tx: &Transaction) -> rusqlite::Result<()>;
 }
 
-impl Migration for fn(&Transaction) -> rusqlite::Result<()> {
+impl<F> Migration for F
+where
+    F: Fn(&Transaction) -> rusqlite::Result<()>,
+{
     fn migrate(&self, tx: &Transaction) -> rusqlite::Result<()> {
         self(tx)
     }

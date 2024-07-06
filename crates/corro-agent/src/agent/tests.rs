@@ -32,7 +32,9 @@ use crate::{
 };
 use corro_tests::*;
 use corro_types::agent::Agent;
+use corro_types::broadcast::Timestamp;
 use corro_types::change::Change;
+use corro_types::sync::get_last_cleared_ts;
 use corro_types::{
     actor::ActorId,
     agent::migrate,
@@ -661,12 +663,14 @@ async fn large_tx_sync() -> eyre::Result<()> {
     let ta3_transport = Transport::new(&ta3.agent.config().gossip, rtt_tx.clone()).await?;
     let ta4_transport = Transport::new(&ta4.agent.config().gossip, rtt_tx.clone()).await?;
 
+    println!("starting sync!?");
     for _ in 0..6 {
         let res = parallel_sync(
             &ta2.agent,
             &ta2_transport,
             vec![(ta1.agent.actor_id(), ta1.agent.gossip_addr())],
             generate_sync(&ta2.bookie, ta2.agent.actor_id()).await,
+            HashMap::new(),
         )
         .await?;
 
@@ -680,6 +684,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
                 (ta2.agent.actor_id(), ta2.agent.gossip_addr()),
             ],
             generate_sync(&ta3.bookie, ta3.agent.actor_id()).await,
+            HashMap::new(),
         )
         .await?;
 
@@ -693,6 +698,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
                 (ta2.agent.actor_id(), ta2.agent.gossip_addr()),
             ],
             generate_sync(&ta4.bookie, ta4.agent.actor_id()).await,
+            HashMap::new(),
         )
         .await?;
 
@@ -770,6 +776,127 @@ async fn large_tx_sync() -> eyre::Result<()> {
 struct TestRecord {
     id: i64,
     text: String,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_clear_empty_versions() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
+    let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
+    // setup the schema, for both nodes
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta1.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+
+    assert_eq!(status_code, StatusCode::OK);
+
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta2.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    // make about 50 transactions to ta1
+    insert_rows(ta1.agent.clone(), 1, 50).await;
+    // send them all
+    let rows = get_rows(ta1.agent.clone(), vec![(Version(1)..=Version(50), None)]).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+
+    // overwrite different version ranges
+    insert_rows(ta1.agent.clone(), 1, 5).await;
+    insert_rows(ta1.agent.clone(), 10, 10).await;
+    insert_rows(ta1.agent.clone(), 23, 25).await;
+    insert_rows(ta1.agent.clone(), 30, 31).await;
+
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![
+            (Version(51)..=Version(55), None),
+            (Version(56)..=Version(56), None),
+            (Version(57)..=Version(59), None),
+            (Version(60)..=Version(60), None),
+        ],
+    )
+    .await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    check_bookie_versions(
+        ta2.clone(),
+        ta1.agent.actor_id(),
+        vec![Version(1)..=Version(50)],
+        vec![],
+        vec![],
+        vec![],
+    )
+    .await?;
+
+    let mut last_cleared: HashMap<ActorId, Option<Timestamp>> = HashMap::new();
+    last_cleared.insert(
+        ta1.agent.actor_id(),
+        get_last_cleared_ts(&ta2.bookie, &ta1.agent.actor_id()).await,
+    );
+
+    println!("got last cleared - {last_cleared:?}");
+
+    // // initiate sync with ta1 to get cleared
+    let _ = parallel_sync(
+        &ta2.agent,
+        &ta2_transport,
+        vec![(ta1.agent.actor_id(), ta1.agent.gossip_addr())],
+        generate_sync(&ta2.bookie, ta2.agent.actor_id()).await,
+        last_cleared,
+    )
+    .await?;
+    //
+    // println!("ta2 synced {res}");
+    //
+    // sleep(Duration::from_secs(2)).await;
+    //
+    // check_bookie_versions(
+    //     ta2.clone(),
+    //     ta1.agent.actor_id(),
+    //     vec![],
+    //     vec![],
+    //     vec![],
+    //     vec![
+    //         Version(1)..=Version(5),
+    //         Version(10)..=Version(10),
+    //         Version(23)..=Version(25),
+    //         Version(30)..=Version(31),
+    //     ],
+    // )
+    // .await?;
+    //
+    // // ta2 should have ta1's last cleared
+    // let ta1_cleared = ta1
+    //     .agent
+    //     .booked()
+    //     .read("test_clear_empty")
+    //     .await
+    //     .last_cleared_ts();
+    // let ta2_ta1_cleared = ta2
+    //     .bookie
+    //     .write("test")
+    //     .await
+    //     .ensure(ta1.agent.actor_id())
+    //     .read("test_clear_empty")
+    //     .await
+    //     .last_cleared_ts();
+    //
+    // assert_eq!(ta1_cleared, ta2_ta1_cleared);
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1005,7 +1132,7 @@ async fn check_bookie_versions(
     for versions in cleared {
         assert!(conn.prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping WHERE actor_id = ? and start_version = ? and end_version = ?)")?
-            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?);
+            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?, "Versions {versions:?} not cleared in corro bookkeeping table");
     }
 
     Ok(())
@@ -1020,6 +1147,16 @@ async fn get_rows(
     let conn = agent.pool().read().await?;
     for versions in v {
         for version in versions.0 {
+            let count: u64 = conn.query_row(
+                "SELECT COUNT(*) FROM crsql_changes where db_version = ?",
+                [version],
+                |row| row.get(0),
+            )?;
+            let mut last = 4;
+            // count will be zero for cleared versions
+            if count > 0 {
+                last = count - 1;
+            }
             let mut query =
                 r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
             FROM crsql_changes where db_version = ?"#
@@ -1038,7 +1175,7 @@ async fn get_rows(
                 changes = prepped
                     .query_map([version], row_to_change)?
                     .collect::<Result<Vec<_>, _>>()?;
-                CrsqlSeq(0)..=CrsqlSeq(3)
+                CrsqlSeq(0)..=CrsqlSeq(last)
             };
 
             result.push((
@@ -1048,7 +1185,7 @@ async fn get_rows(
                         version,
                         changes,
                         seqs,
-                        last_seq: CrsqlSeq(3),
+                        last_seq: CrsqlSeq(last),
                         ts: agent.clock().new_timestamp().into(),
                     },
                 },
@@ -1219,7 +1356,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     let mut conn = CrConn::init(rusqlite::Connection::open_in_memory()?)?;
 
     corro_types::sqlite::setup_conn(&conn)?;
-    migrate(&mut conn)?;
+    migrate(Default::default(), &mut conn)?;
 
     let actor_id = ActorId(uuid::Uuid::new_v4());
 
@@ -1239,7 +1376,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(1)..=Version(2))?,
+            store_empty_changeset(&tx, actor_id, Version(1)..=Version(2), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1276,7 +1413,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(5)..=Version(7))?,
+            store_empty_changeset(&tx, actor_id, Version(5)..=Version(7), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1324,7 +1461,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(3)..=Version(6))?,
+            store_empty_changeset(&tx, actor_id, Version(3)..=Version(6), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1363,7 +1500,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(1)..=Version(10))?,
+            store_empty_changeset(&tx, actor_id, Version(1)..=Version(10), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1407,7 +1544,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(1)..=Version(11))?,
+            store_empty_changeset(&tx, actor_id, Version(1)..=Version(11), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1456,7 +1593,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(14)..=Version(14))?,
+            store_empty_changeset(&tx, actor_id, Version(14)..=Version(14), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1516,7 +1653,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(12)..=Version(14))?,
+            store_empty_changeset(&tx, actor_id, Version(12)..=Version(14), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1559,7 +1696,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(15)..=Version(15))?,
+            store_empty_changeset(&tx, actor_id, Version(15)..=Version(15), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1593,7 +1730,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23))?,
+            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1633,7 +1770,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23))?,
+            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1687,7 +1824,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23))?,
+            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1745,7 +1882,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(1)..=Version(24))?,
+            store_empty_changeset(&tx, actor_id, Version(1)..=Version(24), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1767,7 +1904,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(26)..=Version(27))?,
+            store_empty_changeset(&tx, actor_id, Version(26)..=Version(27), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1820,7 +1957,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(1)..=Version(29))?,
+            store_empty_changeset(&tx, actor_id, Version(1)..=Version(29), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1829,7 +1966,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(40)..=Version(45))?,
+            store_empty_changeset(&tx, actor_id, Version(40)..=Version(45), Default::default())?,
             1
         );
         tx.commit()?;
@@ -1838,7 +1975,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(35)..=Version(37))?,
+            store_empty_changeset(&tx, actor_id, Version(35)..=Version(37), Default::default())?,
             1
         );
         tx.commit()?;
