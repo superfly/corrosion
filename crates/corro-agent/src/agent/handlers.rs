@@ -419,9 +419,11 @@ pub async fn handle_emptyset(
                 debug!("processed emptysets!");
                 if let Some(Ok(res)) = res {
                     for (actor_id, mut changes) in res {
-                        let curr = buf.entry(actor_id).or_default();
-                        changes.append(curr);
-                        *curr = changes;
+                        if !changes.is_empty() {
+                            let curr = buf.entry(actor_id).or_default();
+                            changes.append(curr);
+                            *curr = changes;
+                        }
                     }
                 }
             },
