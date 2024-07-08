@@ -1,9 +1,4 @@
-use std::{
-    fmt, io,
-    num::NonZeroU32,
-    ops::{Deref, RangeInclusive},
-    time::Duration,
-};
+use std::{cmp, fmt, io, num::NonZeroU32, ops::{Deref, RangeInclusive}, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use corro_api_types::{row_to_change, Change};
@@ -164,6 +159,15 @@ impl Changeset {
             // probably shouldn't be doing this
             Changeset::EmptySet { .. } => Version(0)..=Version(0),
             Changeset::Full { version, .. } => *version..=*version,
+        }
+    }
+
+    // determine the estimated resource cost of processing a change
+    pub fn processing_cost(&self) -> usize {
+        match self {
+            Changeset::Empty { versions, .. } => cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20),
+            Changeset::EmptySet { versions, .. } => versions.iter().map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)).sum::<usize>(),
+            Changeset::Full { changes, ..} => changes.len(),
         }
     }
 
