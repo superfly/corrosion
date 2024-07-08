@@ -354,7 +354,7 @@ fn handle_need(
     actor_id: ActorId,
     need: SyncNeedV1,
     sender: &Sender<SyncMessage>,
-    _last_cleared_ts: Option<Timestamp>,
+    last_cleared_ts: Option<Timestamp>,
 ) -> eyre::Result<()> {
     debug!(%actor_id, "handle known versions! need: {need:?}");
 
@@ -713,48 +713,48 @@ fn handle_need(
                 }
             }
         }
-        SyncNeedV1::Empty { .. } => {
-            // if last_cleared_ts.is_none() {
-            //     return Ok(());
-            // }
-            // let ts = ts.unwrap_or(Default::default());
-            // debug!("processing empty versions to {actor_id}");
-            // let mut stmt = tx.prepare_cached(
-            //     "
-            //     SELECT start_version, end_version, ts FROM __corro_bookkeeping
-            //         WHERE actor_id = crsql_site_id() AND end_version IS NOT NULL AND ts > ?
-            //         ORDER BY ts",
-            // )?;
-            // let rows = stmt
-            //     .query_map([ts], |row| {
-            //         Ok((Version(row.get(0)?)..=Version(row.get(1)?), row.get(2)?))
-            //     })?
-            //     .collect::<rusqlite::Result<Vec<(RangeInclusive<Version>, Timestamp)>>>()?
-            //     .iter()
-            //     .fold(HashMap::new(), |mut acc, item| {
-            //         acc.entry(item.1)
-            //             .and_modify(|arr: &mut Vec<RangeInclusive<Version>>| {
-            //                 arr.push(item.clone().0)
-            //             })
-            //             .or_insert(vec![item.clone().0]);
-            //         acc
-            //     });
-            //
-            // let mut rows = Vec::from_iter(rows.iter());
-            // rows.sort_by(|a, b| a.0.cmp(b.0));
-            // let mut count = 0;
-            // for (ts, versions) in rows {
-            //     sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-            //         actor_id: agent.actor_id(),
-            //         changeset: Changeset::EmptySet {
-            //             versions: versions.clone(),
-            //             ts: *ts,
-            //         },
-            //     })))?;
-            //     count += versions.len();
-            // }
-            //
-            // debug!("sent {count} empty versions during sync!");
+        SyncNeedV1::Empty { ts, .. } => {
+            if last_cleared_ts.is_none() {
+                return Ok(());
+            }
+            let ts = ts.unwrap_or(Default::default());
+            debug!("processing empty versions to {actor_id}");
+            let mut stmt = tx.prepare_cached(
+                "
+                SELECT start_version, end_version, ts FROM __corro_bookkeeping
+                    WHERE actor_id = crsql_site_id() AND end_version IS NOT NULL AND ts > ?
+                    ORDER BY ts",
+            )?;
+            let rows = stmt
+                .query_map([ts], |row| {
+                    Ok((Version(row.get(0)?)..=Version(row.get(1)?), row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<(RangeInclusive<Version>, Timestamp)>>>()?
+                .iter()
+                .fold(HashMap::new(), |mut acc, item| {
+                    acc.entry(item.1)
+                        .and_modify(|arr: &mut Vec<RangeInclusive<Version>>| {
+                            arr.push(item.clone().0)
+                        })
+                        .or_insert(vec![item.clone().0]);
+                    acc
+                });
+
+            let mut rows = Vec::from_iter(rows.iter());
+            rows.sort_by(|a, b| a.0.cmp(b.0));
+            let mut count = 0;
+            for (ts, versions) in rows {
+                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id: agent.actor_id(),
+                    changeset: Changeset::EmptySet {
+                        versions: versions.clone(),
+                        ts: *ts,
+                    },
+                })))?;
+                count += versions.len();
+            }
+
+            debug!("sent {count} empty versions during sync!");
         }
     }
 
@@ -1039,7 +1039,7 @@ pub async fn parallel_sync(
     transport: &Transport,
     members: Vec<(ActorId, SocketAddr)>,
     our_sync_state: SyncStateV1,
-    _our_empty_ts: HashMap<ActorId, Option<Timestamp>>,
+    our_empty_ts: HashMap<ActorId, Option<Timestamp>>,
 ) -> Result<usize, SyncError> {
     trace!(
         self_actor_id = %agent.actor_id(),
@@ -1127,20 +1127,20 @@ pub async fn parallel_sync(
 
                     counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string()).increment(1);
 
-                    let needs = our_sync_state.compute_available_needs(&their_sync_state);
+                    let mut needs = our_sync_state.compute_available_needs(&their_sync_state);
 
                     trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
 
-                    // let cleared_ts = their_sync_state.last_cleared_ts;
+                    let cleared_ts = their_sync_state.last_cleared_ts;
 
-                    // info!(%actor_id, "got last cleared ts {cleared_ts:?}");
-                    // if let Some(ts) = cleared_ts {
-                    //     if let Some(last_seen) = our_empty_ts.get(&actor_id) {
-                    //         if last_seen.is_none() || last_seen.unwrap() < ts {
-                    //             needs.entry(actor_id).or_default().push( SyncNeedV1::Empty { ts: *last_seen });
-                    //         }
-                    //     }
-                    // }
+                    info!(%actor_id, "got last cleared ts {cleared_ts:?}");
+                    if let Some(ts) = cleared_ts {
+                        if let Some(last_seen) = our_empty_ts.get(&actor_id) {
+                            if last_seen.is_none() || last_seen.unwrap() < ts {
+                                needs.entry(actor_id).or_default().push( SyncNeedV1::Empty { ts: *last_seen });
+                            }
+                        }
+                    }
                     Ok::<_, SyncError>((needs, tx, read))
                 }.await
             )
@@ -1374,7 +1374,7 @@ pub async fn parallel_sync(
 
     let counts = FuturesUnordered::from_iter(readers.into_iter().map(|(actor_id, mut read)| {
         let tx_changes = agent.tx_changes().clone();
-        // let tx_emptyset = agent.tx_emptyset().clone();
+        let tx_emptyset = agent.tx_emptyset().clone();
 
         async move {
             let mut count = 0;
@@ -1402,13 +1402,13 @@ pub async fn parallel_sync(
                                 change.seqs()
                             );
                             // only accept emptyset that's from the same node that's syncing
-                            // if change.is_empty_set() {
-                            //     tx_emptyset
-                            //         .send(change)
-                            //         .await
-                            //         .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
-                            //     continue;
-                            // }
+                            if change.is_empty_set() {
+                                tx_emptyset
+                                    .send(change)
+                                    .await
+                                    .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
+                                continue;
+                            }
 
                             tx_changes
                                 .send((change, ChangeSource::Sync))

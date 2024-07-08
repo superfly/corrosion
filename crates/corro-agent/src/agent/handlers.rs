@@ -397,16 +397,6 @@ pub fn spawn_handle_db_cleanup(pool: SplitPool) {
     });
 }
 
-// determine the estimated resource cost of processing a change
-fn processing_cost(change: &Changeset) -> usize {
-    if change.is_empty() && !change.is_empty_set() {
-        let versions = change.versions();
-        cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)
-    } else {
-        change.len()
-    }
-}
-
 /// Handle incoming emptyset received during syncs
 ///_
 #[allow(dead_code)]
@@ -422,17 +412,39 @@ pub async fn handle_emptyset(
     ));
     let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
 
-    let mut buf = HashMap::new();
+    let mut buf: HashMap<ActorId, VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>> =
+        HashMap::new();
     let mut cost = 0;
+
+    let mut join_set: JoinSet<
+        HashMap<ActorId, VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>>,
+    > = JoinSet::new();
 
     loop {
         let mut process = false;
         tokio::select! {
+            res = join_set.join_next(), if !join_set.is_empty() => {
+                debug!("processed emptysets!");
+                if let Some(Ok(res)) = res {
+                    for (actor_id, mut changes) in res {
+                        let processing_cost = changes.iter().map(|x| x.0.clone())
+                                    .flatten().map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)).sum::<usize>();
+                        let curr = buf.entry(actor_id).or_default();
+                        changes.append(curr);
+                        *curr = changes;
+                        cost += processing_cost;
+                    }
+                }
+                if cost >= max_changes_chunk && !buf.is_empty() {
+                    process = true;
+                }
+            },
             maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
                 Some(change) => {
+                    let change_cost = change.processing_cost();
                     if let Changeset::EmptySet { versions, ts } = change.changeset {
                         buf.entry(change.actor_id).or_insert(VecDeque::new()).push_back((versions.clone(), ts));
-                        cost += versions.iter().map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)).sum::<usize>();
+                        cost += change_cost;
                     } else {
                         warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
                     }
@@ -451,33 +463,36 @@ pub async fn handle_emptyset(
             }
         }
 
-        if process {
-            for (actor, changes) in &mut buf {
-                while !changes.is_empty() {
-                    let change = changes.pop_front().unwrap();
-                    match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await {
-                        Ok(()) => {
-                            // cost -= change.0.len();
-                            cost -= change
-                                .0
-                                .iter()
-                                .map(|versions| {
-                                    cmp::min(
-                                        (versions.end().0 - versions.start().0) as usize + 1,
-                                        20,
-                                    )
-                                })
-                                .sum::<usize>();
-                        }
-                        Err(e) => {
-                            warn!("encountered error when processing emptyset - {e}");
-                            changes.push_front(change);
-                            break;
+        if process && join_set.len() == 0 {
+            let mut to_process = std::mem::take(&mut buf);
+            // .iter().map(|x| x.iter().map(|x| x.0.clone()).collect::<Vec<_>>());
+            let changes_cost = to_process
+                .iter()
+                .flat_map(|x| x.1)
+                .flat_map(|x| x.0.clone())
+                .map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20))
+                .sum::<usize>();
+            cost -= changes_cost;
+            let agent = agent.clone();
+            let bookie = bookie.clone();
+            join_set.spawn(async move {
+                for (actor, changes) in &mut to_process {
+                    while !changes.is_empty() {
+                        let change = changes.pop_front().unwrap();
+                        match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                warn!("encountered error when processing emptyset - {e}");
+                                changes.push_front(change);
+                                break;
+                            }
                         }
                     }
                 }
-            }
-        }
+                to_process
+            });
+        };
     }
 
     println!("shutting down handle empties loop");
@@ -488,11 +503,11 @@ pub async fn process_emptyset(
     agent: Agent,
     bookie: Bookie,
     actor_id: ActorId,
-    changes: &(Vec<RangeInclusive<corro_types::base::Version>>, Timestamp),
+    changes: &(Vec<RangeInclusive<Version>>, Timestamp),
 ) -> Result<(), ChangeError> {
     let (versions, ts) = changes;
     let mut conn = agent.pool().write_low().await?;
-
+    debug!("processing emptyset from {:?}", actor_id);
     let booked = {
         bookie
             .write(format!(
@@ -583,7 +598,7 @@ pub async fn handle_changes(
             // concurrently bvased on MAX_CONCURRENCY
             let mut tmp_cost = 0;
             while let Some((change, src, queued_at)) = queue.pop_front() {
-                tmp_cost += processing_cost(&change);
+                tmp_cost += change.processing_cost();
                 buf.push((change, src, queued_at));
                 if tmp_cost >= max_changes_chunk {
                     break;
@@ -765,7 +780,7 @@ pub async fn handle_changes(
             }
         }
 
-        let cost = processing_cost(&change);
+        let cost = change.processing_cost();
         queue.push_back((change, src, Instant::now()));
 
         buf_cost += cost; // tracks the cost, not number of changes
