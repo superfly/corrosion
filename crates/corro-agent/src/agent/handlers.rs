@@ -406,73 +406,42 @@ pub async fn handle_emptyset(
     mut rx_emptysets: CorroReceiver<ChangeV1>,
     mut tripwire: Tripwire,
 ) {
-    // maybe bigger timeout?
-    let mut max_wait = tokio::time::interval(Duration::from_millis(
-        agent.config().perf.apply_queue_timeout as u64,
-    ));
-    let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
-
     let mut buf: HashMap<ActorId, VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>> =
         HashMap::new();
-    let mut cost = 0;
 
     let mut join_set: JoinSet<
         HashMap<ActorId, VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>>,
     > = JoinSet::new();
 
     loop {
-        let mut process = false;
         tokio::select! {
             res = join_set.join_next(), if !join_set.is_empty() => {
                 debug!("processed emptysets!");
                 if let Some(Ok(res)) = res {
                     for (actor_id, mut changes) in res {
-                        let processing_cost = changes.iter().map(|x| x.0.clone())
-                                    .flatten().map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)).sum::<usize>();
                         let curr = buf.entry(actor_id).or_default();
                         changes.append(curr);
                         *curr = changes;
-                        cost += processing_cost;
                     }
-                }
-                if cost >= max_changes_chunk && !buf.is_empty() {
-                    process = true;
                 }
             },
             maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
                 Some(change) => {
-                    let change_cost = change.processing_cost();
                     if let Changeset::EmptySet { versions, ts } = change.changeset {
                         buf.entry(change.actor_id).or_insert(VecDeque::new()).push_back((versions.clone(), ts));
-                        cost += change_cost;
                     } else {
                         warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
                     }
-
-                    if cost >= max_changes_chunk && !buf.is_empty() {
-                        process = true;
-                    }
                 },
                 None => break,
-            },
-            _ = max_wait.tick() => {
-                process = true
             },
             _ = &mut tripwire => {
                 break;
             }
         }
 
-        if process && join_set.len() == 0 {
+        if join_set.is_empty() && !buf.is_empty() {
             let mut to_process = std::mem::take(&mut buf);
-            // .iter().map(|x| x.iter().map(|x| x.0.clone()).collect::<Vec<_>>());
-            let changes_cost = to_process
-                .iter()
-                .flat_map(|x| x.1)
-                .flat_map(|x| x.0.clone())
-                .map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20))
-                .sum::<usize>();
-            cost -= changes_cost;
             let agent = agent.clone();
             let bookie = bookie.clone();
             join_set.spawn(async move {
