@@ -1459,6 +1459,12 @@ impl BookedVersions {
         }
     }
 
+    pub fn update_cleared_ts(&mut self, ts: Timestamp) {
+        if self.last_cleared_ts.is_none() || self.last_cleared_ts().unwrap() < ts {
+            self.last_cleared_ts = Some(ts)
+        }
+    }
+
     pub fn snapshot(&self) -> VersionsSnapshot {
         trace!("creating snapshot");
         VersionsSnapshot {

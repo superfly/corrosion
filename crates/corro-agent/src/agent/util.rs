@@ -961,13 +961,15 @@ pub async fn process_multiple_changes(
             }
         }
 
-        let mut booked_writer = {
-            agent
-                .booked()
-                .blocking_write("process_multiple_changes(update_cleared_ts)")
-        };
-        let mut snap = booked_writer.snapshot();
         if let Some(ts) = last_cleared {
+            let mut snap = {
+                agent
+                    .booked()
+                    .blocking_write("process_multiple_changes(update_cleared_ts snapshot)")
+                    .snapshot()
+            };
+
+
             snap.update_cleared_ts(&tx, ts)
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
@@ -982,7 +984,13 @@ pub async fn process_multiple_changes(
             version: None,
         })?;
 
-        booked_writer.commit_snapshot(snap);
+        if let Some(ts) = last_cleared {
+            let mut booked_writer = agent
+                    .booked()
+                    .blocking_write("process_multiple_changes(update_cleared_ts)");
+            booked_writer.update_cleared_ts(ts);
+        }
+
 
         for (_, changeset, _, _) in changesets.iter() {
             if let Some(ts) = changeset.ts() {
