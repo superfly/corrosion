@@ -450,6 +450,24 @@ pub async fn handle_emptyset(
                 for (actor, changes) in &mut to_process {
                     while !changes.is_empty() {
                         let change = changes.pop_front().unwrap();
+                        if let Some(booked) = bookie
+                            .read(format!("process_emptyset(check ts):{actor}"))
+                            .await
+                            .get(actor)
+                        {
+                            let booked_read = booked
+                                .read(format!(
+                                    "process_emptyset(booked writer, ts timestamp):{actor}"
+                                ))
+                                .await;
+
+                            if let Some(seen_ts) = booked_read.last_cleared_ts() {
+                                if seen_ts > change.1 {
+                                    continue;
+                                }
+                            }
+                        }
+
                         match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await
                         {
                             Ok(()) => {}
@@ -497,12 +515,6 @@ pub async fn process_emptyset(
                 "process_emptyset(booked writer, updates timestamp):{actor_id}"
             ))
             .await;
-
-        if let Some(seen_ts) = booked_write.last_cleared_ts() {
-            if seen_ts > *ts {
-                return Ok(());
-            }
-        }
 
         let mut snap = booked_write.snapshot();
 
