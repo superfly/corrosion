@@ -663,8 +663,8 @@ pub async fn process_fully_buffered_changes(
                 if actor_id != agent.actor_id() {
                     warn!("clearing empties for another actor: {actor_id}")
                 }
-                let ts = Timestamp::from(agent.clock().new_timestamp());
                 for versions in versions_set {
+                    let ts = Timestamp::from(agent.clock().new_timestamp());
                     let inserted = store_empty_changeset(&tx, actor_id, versions, ts)?;
                     if inserted > 0 {
                         last_cleared = Some(ts);
