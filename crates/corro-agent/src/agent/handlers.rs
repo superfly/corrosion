@@ -477,8 +477,71 @@ pub async fn process_emptyset(
     changes: &(Vec<RangeInclusive<Version>>, Timestamp),
 ) -> Result<(), ChangeError> {
     let (versions, ts) = changes;
+
+    let mut version_iter = versions.chunks(100);
+
+    while let Some(chunk) = version_iter.next() {
+        let mut conn = agent.pool().write_low().await?;
+        debug!("processing emptyset from {:?}", actor_id);
+        let booked = {
+            bookie
+                .write(format!(
+                    "process_emptyset(booked writer, updates timestamp):{actor_id}",
+                ))
+                .await
+                .ensure(actor_id)
+        };
+
+        let mut booked_write = booked
+            .write(format!(
+                "process_emptyset(booked writer, updates timestamp):{actor_id}"
+            ))
+            .await;
+
+        if let Some(seen_ts) = booked_write.last_cleared_ts() {
+            if seen_ts > *ts {
+                return Ok(());
+            }
+        }
+
+        let mut snap = booked_write.snapshot();
+
+        debug!(self_actor_id = %agent.actor_id(), "processing emptyset changes, len: {}", versions.len());
+        block_in_place(|| {
+            let tx = conn
+                .immediate_transaction()
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: None,
+                    version: None,
+                })?;
+
+            for version in chunk {
+                store_empty_changeset(&tx, actor_id, version.clone(), *ts)?;
+            }
+
+            snap.insert_db(&tx, RangeInclusiveSet::from_iter(chunk.iter().cloned()))
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: None,
+                    version: None,
+                })?;
+
+            tx.commit().map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
+
+            booked_write.commit_snapshot(snap);
+            counter!("corro.sync.empties.count", "actor" => format!("{}", actor_id.to_string()))
+                .increment(chunk.len() as u64);
+
+            Ok::<_, ChangeError>(())
+        })?;
+    }
+
     let mut conn = agent.pool().write_low().await?;
-    debug!("processing emptyset from {:?}", actor_id);
     let booked = {
         bookie
             .write(format!(
@@ -487,53 +550,30 @@ pub async fn process_emptyset(
             .await
             .ensure(actor_id)
     };
+
     let mut booked_write = booked
         .write(format!(
             "process_emptyset(booked writer, updates timestamp):{actor_id}"
         ))
         .await;
-    let mut snap = booked_write.snapshot();
 
-    debug!(self_actor_id = %agent.actor_id(), "processing emptyset changes, len: {}", versions.len());
-    block_in_place(|| {
-        let tx = conn
-            .immediate_transaction()
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: None,
-                version: None,
-            })?;
-
-        for version in versions {
-            store_empty_changeset(&tx, actor_id, version.clone(), *ts)?;
-        }
-
-        snap.insert_db(&tx, RangeInclusiveSet::from_iter(versions.clone()))
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: None,
-                version: None,
-            })?;
-        snap.update_cleared_ts(&tx, *ts)
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: None,
-                version: None,
-            })?;
-
-        tx.commit().map_err(|source| ChangeError::Rusqlite {
+    let tx = conn
+        .immediate_transaction()
+        .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: None,
             version: None,
         })?;
 
-        Ok::<_, ChangeError>(())
-    })?;
+    let mut snap = booked_write.snapshot();
+    snap.update_cleared_ts(&tx, *ts)
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?;
+
     booked_write.commit_snapshot(snap);
-
-    counter!("corro.sync.empties.count", "actor" => format!("{}", actor_id.to_string()))
-        .increment(versions.len() as u64);
-
     Ok(())
 }
 
