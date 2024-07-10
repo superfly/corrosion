@@ -115,6 +115,7 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA recursive_triggers = ON;
+            PRAGMA auto_vacuum = INCREMENTAL;
         "#,
     )?;
 
