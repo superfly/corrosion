@@ -414,7 +414,7 @@ async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
             let mut rows = prepped.query([])?;
 
             while let Ok(Some(_)) = rows.next() {}
-            histogram!("corro.db.wal.truncate.seconds").record(start.elapsed().as_secs_f64());
+            histogram!("corro.db.incremental.vacuum.seconds").record(start.elapsed().as_secs_f64());
 
             freelist = conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
             debug!("freelist count after incremental vacuum: {freelist:?}");
