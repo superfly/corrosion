@@ -376,34 +376,54 @@ fn db_cleanup(conn: &rusqlite::Connection) -> eyre::Result<()> {
     Ok::<_, eyre::Report>(())
 }
 
-/// Due to compacting empty versions in the __corro_bookkeping table,
-/// lots of database can get freed. This function runs an incremental_vacuum
-/// when the number of free database pages is over a certain limit.
+/// If the number of unused free pages is above the provided limit,
+/// This function continously runs an incremental_vacuum
+/// until it is below the limit
 ///
-fn vacuum_db(conn: &rusqlite::Connection, n: u64) -> eyre::Result<()> {
-    let freelist: u64 = conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
+    let mut freelist: u64 = {
+        let conn = pool.read().await?;
+
+        let vacuum: u64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        if vacuum != 2 {
+            warn!("auto_vacuum isn't set to INCREMENTAL");
+            return Err(rusqlite::Error::ModuleError(
+                "auto_vacuum has to be set to INCREMENTAL".to_string(),
+            )
+            .into());
+        }
+
+        conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?
+    };
+
     debug!("freelist count: {freelist:?}");
 
-    if freelist > n {
-        let start = Instant::now();
+    while freelist >= lim {
+        let conn = pool.write_low().await?;
 
-        let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
-        conn.pragma_update(None, "busy_timeout", 60000)?;
+        block_in_place(|| {
+            let start = Instant::now();
 
-        let cache_size: i64 = conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
-        conn.pragma_update(None, "cache_size", -50000)?;
+            let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+            conn.pragma_update(None, "busy_timeout", 60000)?;
 
-        let mut prepped = conn.prepare("pragma incremental_vacuum(10000)")?;
-        let mut rows = prepped.query([])?;
-        while let Ok(Some(_)) = rows.next() {}
+            let cache_size: i64 = conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
+            conn.pragma_update(None, "cache_size", -50000)?;
 
-        histogram!("corro.db.wal.truncate.seconds").record(start.elapsed().as_secs_f64());
+            let mut prepped = conn.prepare("pragma incremental_vacuum(10000)")?;
+            let mut rows = prepped.query([])?;
 
-        let freelist: u64 = conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
-        debug!("freelist count after incremental vacuum: {freelist:?}");
+            while let Ok(Some(_)) = rows.next() {}
+            histogram!("corro.db.wal.truncate.seconds").record(start.elapsed().as_secs_f64());
 
-        _ = conn.pragma_update(None, "busy_timeout", orig);
-        _ = conn.pragma_update(None, "cache_size", cache_size);
+            freelist = conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+            debug!("freelist count after incremental vacuum: {freelist:?}");
+
+            _ = conn.pragma_update(None, "busy_timeout", orig)?;
+            _ = conn.pragma_update(None, "cache_size", cache_size)?;
+
+            Ok::<(), eyre::Error>(())
+        })?;
     }
 
     Ok::<_, eyre::Report>(())
@@ -435,19 +455,12 @@ pub fn spawn_handle_vacuum_db(pool: SplitPool) {
     const MAX_DB_FREE_PAGES: u64 = 10000;
 
     tokio::spawn(async move {
-        let mut vacuum_db_interval = tokio::time::interval(Duration::from_secs(60 * 60 * 24));
+        let mut vacuum_db_interval = tokio::time::interval(Duration::from_secs(60 * 15));
         loop {
             vacuum_db_interval.tick().await;
 
-            match pool.write_low().await {
-                Ok(conn) => {
-                    if let Err(e) = block_in_place(|| vacuum_db(&conn, MAX_DB_FREE_PAGES)) {
-                        error!("could not check freelist and vacuum: {e}");
-                    }
-                }
-                Err(e) => {
-                    error!("could not acquire low priority conn to truncate wal: {e}")
-                }
+            if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await {
+                error!("could not check freelist and vacuum: {e}");
             }
         }
     });
@@ -987,6 +1000,10 @@ pub async fn handle_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+    use tokio::time::timeout;
 
     #[test]
     fn ensure_truncate_works() -> eyre::Result<()> {
@@ -1005,17 +1022,24 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn ensure_vacuum_works() -> eyre::Result<()> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn ensure_vacuum_works() -> eyre::Result<()> {
         let tmpdir = tempfile::tempdir()?;
+        let db_path = tmpdir.into_path().join("db.sqlite");
 
-        let mut conn = rusqlite::Connection::open(tmpdir.path().join("db.sqlite"))?;
-        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-        let pragma_value = 12345u64;
-        conn.pragma_update(None, "busy_timeout", pragma_value)?;
+        {
+            let db_conn = Connection::open(db_path.clone())?;
+            db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
+        }
 
-        conn.execute(
-            r#"
+        println!("temp db: {:?}", db_path);
+        let write_sema = Arc::new(Semaphore::new(1));
+        let pool = SplitPool::create(db_path, write_sema.clone()).await?;
+
+        {
+            let mut conn = pool.write_priority().await?;
+            conn.execute(
+                r#"
             CREATE TABLE test (
                 id BIGINT NOT NULL PRIMARY KEY,
                 col1 TEXT,
@@ -1024,31 +1048,31 @@ mod tests {
                 col4 TEXT
             )
         "#,
-            [],
-        )?;
-
-        let tx = conn.transaction()?;
-        // create 1m rows
-        for i in 1..100000 {
-            tx.execute(
-                r"INSERT INTO test VALUES (?, ?, ?, ?, ?)",
-                (i, "colunm 1", "column 2", "column 3", "column 4"),
+                [],
             )?;
+
+            let tx = conn.transaction()?;
+            // create 1m rows
+            for i in 1..100000 {
+                tx.execute(
+                    r"INSERT INTO test VALUES (?, ?, ?, ?, ?)",
+                    (i, "colunm 1", "column 2", "column 3", "column 4"),
+                )?;
+            }
+            tx.commit()?;
+
+            conn.execute("DELETE FROM test", [])?;
+            let freelist: u64 =
+                conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+            assert!(freelist > 1000);
         }
-        tx.commit()?;
 
-        conn.execute("DELETE FROM test", [])?;
-        let freelist: u64 = conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
-        assert!(freelist > 1000);
-        vacuum_db(&conn, 1000)?;
+        timeout(Duration::from_millis(10), vacuum_db(pool.clone(), 1000)).await??;
 
+        let conn = pool.read().await?;
         assert_eq!(
             conn.pragma_query_value(None, "freelist_count", |row| row.get::<_, u64>(0))?,
             0
-        );
-        assert_eq!(
-            conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))?,
-            pragma_value
         );
 
         Ok(())
