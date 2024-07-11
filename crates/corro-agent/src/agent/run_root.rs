@@ -17,6 +17,7 @@ use corro_types::{
     config::{Config, PerfConfig},
 };
 
+use crate::agent::handlers::spawn_handle_vacuum_db;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use spawn::spawn_counted;
 use tracing::{error, info};
@@ -120,6 +121,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     ));
 
     spawn_handle_db_cleanup(agent.pool().clone());
+    spawn_handle_vacuum_db(agent.pool().clone());
 
     let bookie = Bookie::new_with_registry(Default::default(), lock_registry);
     {
