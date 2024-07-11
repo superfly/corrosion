@@ -40,6 +40,7 @@ use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
+use tokio::time::sleep;
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
     task::{block_in_place, JoinSet},
@@ -410,7 +411,7 @@ async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
             let cache_size: i64 = conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
             conn.pragma_update(None, "cache_size", -50000)?;
 
-            let mut prepped = conn.prepare("pragma incremental_vacuum(10000)")?;
+            let mut prepped = conn.prepare("pragma incremental_vacuum(2000)")?;
             let mut rows = prepped.query([])?;
 
             while let Ok(Some(_)) = rows.next() {}
@@ -424,6 +425,9 @@ async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
 
             Ok::<(), eyre::Error>(())
         })?;
+
+        drop(conn);
+        sleep(Duration::from_secs(1)).await;
     }
 
     Ok::<_, eyre::Report>(())
@@ -432,6 +436,9 @@ async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
 /// See `db_cleanup`
 pub fn spawn_handle_db_cleanup(pool: SplitPool) {
     tokio::spawn(async move {
+        // large sleep right at the start to give node time to sync
+        sleep(Duration::from_secs(60 * 7)).await;
+
         let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
         loop {
             db_cleanup_interval.tick().await;
@@ -455,6 +462,9 @@ pub fn spawn_handle_vacuum_db(pool: SplitPool) {
     const MAX_DB_FREE_PAGES: u64 = 10000;
 
     tokio::spawn(async move {
+        // large sleep right at the start to give node time to sync before vacuuming
+        sleep(Duration::from_secs(60 * 7)).await;
+
         let mut vacuum_db_interval = tokio::time::interval(Duration::from_secs(60 * 15));
         loop {
             vacuum_db_interval.tick().await;
@@ -1067,7 +1077,7 @@ mod tests {
             assert!(freelist > 1000);
         }
 
-        timeout(Duration::from_millis(10), vacuum_db(pool.clone(), 1000)).await??;
+        timeout(Duration::from_secs(2), vacuum_db(pool.clone(), 1000)).await??;
 
         let conn = pool.read().await?;
         assert_eq!(
