@@ -416,7 +416,7 @@ async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
         block_in_place(|| {
             let start = Instant::now();
 
-            let mut prepped = conn.prepare("pragma incremental_vacuum(2000)")?;
+            let mut prepped = conn.prepare("pragma incremental_vacuum(1000)")?;
             let mut rows = prepped.query([])?;
 
             while let Ok(Some(_)) = rows.next() {}
@@ -451,8 +451,7 @@ pub fn spawn_handle_db_cleanup(pool: SplitPool) {
         loop {
             db_cleanup_interval.tick().await;
 
-            if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await
-            {
+            if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await {
                 error!("could not check freelist and vacuum: {e}");
             }
 
@@ -1074,9 +1073,8 @@ mod tests {
         timeout(Duration::from_secs(2), vacuum_db(pool.clone(), 1000)).await??;
 
         let conn = pool.read().await?;
-        assert_eq!(
-            conn.pragma_query_value(None, "freelist_count", |row| row.get::<_, u64>(0))?,
-            0
+        assert!(
+            conn.pragma_query_value(None, "freelist_count", |row| row.get::<_, u64>(0))? < 1000
         );
 
         Ok(())
