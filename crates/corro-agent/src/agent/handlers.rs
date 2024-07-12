@@ -433,15 +433,22 @@ async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
     Ok::<_, eyre::Report>(())
 }
 
-/// See `db_cleanup`
+/// See `db_cleanup` and `vacuum_db`
 pub fn spawn_handle_db_cleanup(pool: SplitPool) {
     tokio::spawn(async move {
         // large sleep right at the start to give node time to sync
+        const MAX_DB_FREE_PAGES: u64 = 10000;
+
         sleep(Duration::from_secs(60 * 7)).await;
 
         let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
         loop {
             db_cleanup_interval.tick().await;
+
+            if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await
+            {
+                error!("could not check freelist and vacuum: {e}");
+            }
 
             match pool.write_low().await {
                 Ok(conn) => {
@@ -452,25 +459,6 @@ pub fn spawn_handle_db_cleanup(pool: SplitPool) {
                 Err(e) => {
                     error!("could not acquire low priority conn to truncate wal: {e}")
                 }
-            }
-        }
-    });
-}
-
-/// See `vacuum_db`
-pub fn spawn_handle_vacuum_db(pool: SplitPool) {
-    const MAX_DB_FREE_PAGES: u64 = 10000;
-
-    tokio::spawn(async move {
-        // large sleep right at the start to give node time to sync before vacuuming
-        sleep(Duration::from_secs(60 * 7)).await;
-
-        let mut vacuum_db_interval = tokio::time::interval(Duration::from_secs(60 * 15));
-        loop {
-            vacuum_db_interval.tick().await;
-
-            if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await {
-                error!("could not check freelist and vacuum: {e}");
             }
         }
     });
