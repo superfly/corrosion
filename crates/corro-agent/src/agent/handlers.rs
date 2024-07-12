@@ -399,17 +399,22 @@ async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
 
     debug!("freelist count: {freelist:?}");
 
+    let (busy_timeout, cache_size) = {
+        // update settings in write conn
+        let conn = pool.write_low().await?;
+        let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+        conn.pragma_update(None, "busy_timeout", 60000)?;
+
+        let cache_size: i64 = conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
+        conn.pragma_update(None, "cache_size", 100000)?;
+        (orig, cache_size)
+    };
+
     while freelist >= lim {
         let conn = pool.write_low().await?;
 
         block_in_place(|| {
             let start = Instant::now();
-
-            let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
-            conn.pragma_update(None, "busy_timeout", 60000)?;
-
-            let cache_size: i64 = conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
-            conn.pragma_update(None, "cache_size", -50000)?;
 
             let mut prepped = conn.prepare("pragma incremental_vacuum(2000)")?;
             let mut rows = prepped.query([])?;
@@ -420,15 +425,16 @@ async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
             freelist = conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
             debug!("freelist count after incremental vacuum: {freelist:?}");
 
-            _ = conn.pragma_update(None, "busy_timeout", orig)?;
-            _ = conn.pragma_update(None, "cache_size", cache_size)?;
-
             Ok::<(), eyre::Error>(())
         })?;
 
         drop(conn);
         sleep(Duration::from_secs(1)).await;
     }
+
+    let conn = pool.write_low().await?;
+    _ = conn.pragma_update(None, "busy_timeout", busy_timeout)?;
+    _ = conn.pragma_update(None, "cache_size", cache_size)?;
 
     Ok::<_, eyre::Report>(())
 }
