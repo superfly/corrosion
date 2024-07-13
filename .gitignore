@@ -4,3 +4,4 @@
 /data
 /book
 .direnv/**
+*.log

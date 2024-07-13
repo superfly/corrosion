@@ -72,8 +72,11 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let members = Members::default();
 
     let actor_id = {
-        let conn = CrConn::init(Connection::open(&conf.db.path)?)?;
+        // we need to set auto_vacuum before any tables are created
+        let db_conn = Connection::open(&conf.db.path)?;
+        db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
 
+        let conn = CrConn::init(db_conn)?;
         conn.query_row("SELECT crsql_site_id();", [], |row| {
             row.get::<_, ActorId>(0)
         })
