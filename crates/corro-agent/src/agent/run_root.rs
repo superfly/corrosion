@@ -45,6 +45,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         rx_apply,
         rx_clear_buf,
         rx_changes,
+        rx_emptyset,
         rx_foca,
         subs_manager,
         subs_bcast_cache,
@@ -214,6 +215,13 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         agent.clone(),
         bookie.clone(),
         rx_changes,
+        tripwire.clone(),
+    ));
+
+    spawn_counted(handlers::handle_emptyset(
+        agent.clone(),
+        bookie.clone(),
+        rx_emptyset,
         tripwire.clone(),
     ));
 

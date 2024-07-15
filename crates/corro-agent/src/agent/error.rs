@@ -4,8 +4,8 @@ use corro_types::{
     sqlite::SqlitePoolError,
     sync::{SyncMessageDecodeError, SyncMessageEncodeError},
 };
-use tokio::time::error::Elapsed;
 use hyper::StatusCode;
+use tokio::time::error::Elapsed;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncClientError {

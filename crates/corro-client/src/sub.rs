@@ -116,6 +116,10 @@ where
         self.id
     }
 
+    pub fn api_addr(&self) -> SocketAddr {
+        self.api_addr
+    }
+
     fn poll_stream(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -225,18 +229,20 @@ where
         if let Some(backoff) = self.backoff.as_mut() {
             ready!(backoff.as_mut().poll(cx));
             self.backoff = None;
-            self.backoff_count = 0;
         }
 
         let io_err = match ready!(self.as_mut().poll_stream(cx)) {
             Some(Err(SubscriptionError::Io(io_err))) => io_err,
-            other => return Poll::Ready(other),
+            other => {
+                self.backoff_count = 0;
+                return Poll::Ready(other);
+            }
         };
 
         // reset the stream
         self.stream = None;
 
-        if self.backoff_count >= 30 {
+        if self.backoff_count >= 10 {
             return Poll::Ready(Some(Err(SubscriptionError::MaxRetryAttempts)));
         }
 

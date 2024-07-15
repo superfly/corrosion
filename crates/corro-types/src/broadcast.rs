@@ -1,9 +1,4 @@
-use std::{
-    fmt, io,
-    num::NonZeroU32,
-    ops::{Deref, RangeInclusive},
-    time::Duration,
-};
+use std::{cmp, fmt, io, num::NonZeroU32, ops::{Deref, RangeInclusive}, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use corro_api_types::{row_to_change, Change};
@@ -118,6 +113,8 @@ impl Deref for ChangeV1 {
 pub enum Changeset {
     Empty {
         versions: RangeInclusive<Version>,
+        #[speedy(default_on_eof)]
+        ts: Option<Timestamp>,
     },
     Full {
         version: Version,
@@ -126,6 +123,10 @@ pub enum Changeset {
         seqs: RangeInclusive<CrsqlSeq>,
         // last cr-sqlite sequence for the complete changeset
         last_seq: CrsqlSeq,
+        ts: Timestamp,
+    },
+    EmptySet {
+        versions: Vec<RangeInclusive<Version>>,
         ts: Timestamp,
     },
 }
@@ -153,8 +154,20 @@ pub struct ChangesetParts {
 impl Changeset {
     pub fn versions(&self) -> RangeInclusive<Version> {
         match self {
-            Changeset::Empty { versions } => versions.clone(),
+            Changeset::Empty { versions, .. } => versions.clone(),
+            // todo: this returns dummy version because empty set has an array of versions.
+            // probably shouldn't be doing this
+            Changeset::EmptySet { .. } => Version(0)..=Version(0),
             Changeset::Full { version, .. } => *version..=*version,
+        }
+    }
+
+    // determine the estimated resource cost of processing a change
+    pub fn processing_cost(&self) -> usize {
+        match self {
+            Changeset::Empty { versions, .. } => cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20),
+            Changeset::EmptySet { versions, .. } => versions.iter().map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)).sum::<usize>(),
+            Changeset::Full { changes, ..} => changes.len(),
         }
     }
 
@@ -165,6 +178,7 @@ impl Changeset {
     pub fn seqs(&self) -> Option<&RangeInclusive<CrsqlSeq>> {
         match self {
             Changeset::Empty { .. } => None,
+            Changeset::EmptySet { .. } => None,
             Changeset::Full { seqs, .. } => Some(seqs),
         }
     }
@@ -172,6 +186,7 @@ impl Changeset {
     pub fn last_seq(&self) -> Option<CrsqlSeq> {
         match self {
             Changeset::Empty { .. } => None,
+            Changeset::EmptySet { .. } => None,
             Changeset::Full { last_seq, .. } => Some(*last_seq),
         }
     }
@@ -179,6 +194,7 @@ impl Changeset {
     pub fn is_complete(&self) -> bool {
         match self {
             Changeset::Empty { .. } => true,
+            Changeset::EmptySet { .. } => true,
             Changeset::Full { seqs, last_seq, .. } => {
                 *seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq
             }
@@ -188,6 +204,7 @@ impl Changeset {
     pub fn len(&self) -> usize {
         match self {
             Changeset::Empty { .. } => 0, //(versions.end().0 - versions.start().0 + 1) as usize,
+            Changeset::EmptySet { versions, .. } => versions.len(),
             Changeset::Full { changes, .. } => changes.len(),
         }
     }
@@ -195,13 +212,23 @@ impl Changeset {
     pub fn is_empty(&self) -> bool {
         match self {
             Changeset::Empty { .. } => true,
+            Changeset::EmptySet { .. } => true,
             Changeset::Full { changes, .. } => changes.is_empty(),
+        }
+    }
+
+    pub fn is_empty_set(&self) -> bool {
+        match self {
+            Changeset::Empty { .. } => false,
+            Changeset::EmptySet { .. } => true,
+            Changeset::Full { .. } => false,
         }
     }
 
     pub fn ts(&self) -> Option<Timestamp> {
         match self {
-            Changeset::Empty { .. } => None,
+            Changeset::Empty { ts, .. } => *ts,
+            Changeset::EmptySet { ts, .. } => Some(*ts),
             Changeset::Full { ts, .. } => Some(*ts),
         }
     }
@@ -209,6 +236,7 @@ impl Changeset {
     pub fn changes(&self) -> &[Change] {
         match self {
             Changeset::Empty { .. } => &[],
+            Changeset::EmptySet { .. } => &[],
             Changeset::Full { changes, .. } => changes,
         }
     }
@@ -216,6 +244,7 @@ impl Changeset {
     pub fn into_parts(self) -> Option<ChangesetParts> {
         match self {
             Changeset::Empty { .. } => None,
+            Changeset::EmptySet { .. } => None,
             Changeset::Full {
                 version,
                 changes,
@@ -239,7 +268,7 @@ pub enum TimestampParseError {
     Parse(ParseNTP64Error),
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord)]
 #[serde(transparent)]
 pub struct Timestamp(pub NTP64);
 
@@ -262,6 +291,13 @@ impl Timestamp {
 impl PartialEq for Timestamp {
     fn eq(&self, other: &Self) -> bool {
         self.0.as_secs() == other.0.as_secs() && self.0.subsec_nanos() == other.0.subsec_nanos()
+    }
+}
+
+impl std::hash::Hash for Timestamp {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_secs().hash(state);
+        self.0.subsec_nanos().hash(state);
     }
 }
 
@@ -455,11 +491,11 @@ pub async fn broadcast_changes(
         // TODO: make this more generic so both sync and local changes can use it.
         let mut prepped = conn.prepare_cached(
             r#"
-                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                        FROM crsql_changes
-                        WHERE db_version = ?
-                        ORDER BY seq ASC
-                "#,
+                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                    FROM crsql_changes
+                    WHERE db_version = ?
+                    ORDER BY seq ASC
+            "#,
         )?;
         let rows = prepped.query_map([db_version], row_to_change)?;
         let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
