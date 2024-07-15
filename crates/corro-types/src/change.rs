@@ -237,8 +237,8 @@ pub fn insert_local_changes(
         if actor_id != agent.actor_id() {
             warn!("clearing and setting timestamp for empties from a different node");
         }
-        let ts = Timestamp::from(agent.clock().new_timestamp());
         for versions in versions_set {
+            let ts = Timestamp::from(agent.clock().new_timestamp());
             let inserted = store_empty_changeset(tx, actor_id, versions, ts)?;
             if inserted > 0 {
                 cleared_ts = Some(ts)

@@ -40,6 +40,7 @@ use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
+use tokio::time::sleep;
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
     task::{block_in_place, JoinSet},
@@ -376,12 +377,83 @@ fn db_cleanup(conn: &rusqlite::Connection) -> eyre::Result<()> {
     Ok::<_, eyre::Report>(())
 }
 
-/// See `db_cleanup`
+/// If the number of unused free pages is above the provided limit,
+/// This function continously runs an incremental_vacuum
+/// until it is below the limit
+///
+async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
+    let mut freelist: u64 = {
+        let conn = pool.read().await?;
+
+        let vacuum: u64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        if vacuum != 2 {
+            warn!("auto_vacuum isn't set to INCREMENTAL");
+            return Err(rusqlite::Error::ModuleError(
+                "auto_vacuum has to be set to INCREMENTAL".to_string(),
+            )
+            .into());
+        }
+
+        conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?
+    };
+
+    debug!("freelist count: {freelist:?}");
+
+    let (busy_timeout, cache_size) = {
+        // update settings in write conn
+        let conn = pool.write_low().await?;
+        let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+        conn.pragma_update(None, "busy_timeout", 60000)?;
+
+        let cache_size: i64 = conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
+        conn.pragma_update(None, "cache_size", 100000)?;
+        (orig, cache_size)
+    };
+
+    while freelist >= lim {
+        let conn = pool.write_low().await?;
+
+        block_in_place(|| {
+            let start = Instant::now();
+
+            let mut prepped = conn.prepare("pragma incremental_vacuum(1000)")?;
+            let mut rows = prepped.query([])?;
+
+            while let Ok(Some(_)) = rows.next() {}
+            histogram!("corro.db.incremental.vacuum.seconds").record(start.elapsed().as_secs_f64());
+
+            freelist = conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+            debug!("freelist count after incremental vacuum: {freelist:?}");
+
+            Ok::<(), eyre::Error>(())
+        })?;
+
+        drop(conn);
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    let conn = pool.write_low().await?;
+    _ = conn.pragma_update(None, "busy_timeout", busy_timeout)?;
+    _ = conn.pragma_update(None, "cache_size", cache_size)?;
+
+    Ok::<_, eyre::Report>(())
+}
+
+/// See `db_cleanup` and `vacuum_db`
 pub fn spawn_handle_db_cleanup(pool: SplitPool) {
     tokio::spawn(async move {
+        // large sleep right at the start to give node time to sync
+        const MAX_DB_FREE_PAGES: u64 = 10000;
+
+        sleep(Duration::from_secs(60 * 7)).await;
+
         let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
         loop {
             db_cleanup_interval.tick().await;
+
+            if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await {
+                error!("could not check freelist and vacuum: {e}");
+            }
 
             match pool.write_low().await {
                 Ok(conn) => {
@@ -397,16 +469,6 @@ pub fn spawn_handle_db_cleanup(pool: SplitPool) {
     });
 }
 
-// determine the estimated resource cost of processing a change
-fn processing_cost(change: &Changeset) -> usize {
-    if change.is_empty() && !change.is_empty_set() {
-        let versions = change.versions();
-        cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)
-    } else {
-        change.len()
-    }
-}
-
 /// Handle incoming emptyset received during syncs
 ///_
 #[allow(dead_code)]
@@ -416,71 +478,84 @@ pub async fn handle_emptyset(
     mut rx_emptysets: CorroReceiver<ChangeV1>,
     mut tripwire: Tripwire,
 ) {
-    // maybe bigger timeout?
-    let mut max_wait = tokio::time::interval(Duration::from_millis(
-        agent.config().perf.apply_queue_timeout as u64,
-    ));
-    let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
+    let mut buf: HashMap<ActorId, VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>> =
+        HashMap::new();
 
-    let mut buf = HashMap::new();
-    let mut cost = 0;
+    let mut join_set: JoinSet<
+        HashMap<ActorId, VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>>,
+    > = JoinSet::new();
 
     loop {
-        let mut process = false;
         tokio::select! {
+            res = join_set.join_next(), if !join_set.is_empty() => {
+                debug!("processed emptysets!");
+                if let Some(Ok(res)) = res {
+                    for (actor_id, mut changes) in res {
+                        if !changes.is_empty() {
+                            let curr = buf.entry(actor_id).or_default();
+                            changes.append(curr);
+                            *curr = changes;
+                        }
+                    }
+                }
+            },
             maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
                 Some(change) => {
                     if let Changeset::EmptySet { versions, ts } = change.changeset {
                         buf.entry(change.actor_id).or_insert(VecDeque::new()).push_back((versions.clone(), ts));
-                        cost += versions.iter().map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)).sum::<usize>();
                     } else {
                         warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
                     }
-
-                    if cost >= max_changes_chunk && !buf.is_empty() {
-                        process = true;
-                    }
                 },
                 None => break,
-            },
-            _ = max_wait.tick() => {
-                process = true
             },
             _ = &mut tripwire => {
                 break;
             }
         }
 
-        if process {
-            for (actor, changes) in &mut buf {
-                while !changes.is_empty() {
-                    let change = changes.pop_front().unwrap();
-                    match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await {
-                        Ok(()) => {
-                            // cost -= change.0.len();
-                            cost -= change
-                                .0
-                                .iter()
-                                .map(|versions| {
-                                    cmp::min(
-                                        (versions.end().0 - versions.start().0) as usize + 1,
-                                        20,
-                                    )
-                                })
-                                .sum::<usize>();
+        if join_set.is_empty() && !buf.is_empty() {
+            let mut to_process = std::mem::take(&mut buf);
+            let agent = agent.clone();
+            let bookie = bookie.clone();
+            join_set.spawn(async move {
+                for (actor, changes) in &mut to_process {
+                    while !changes.is_empty() {
+                        let change = changes.pop_front().unwrap();
+                        if let Some(booked) = bookie
+                            .read(format!("process_emptyset(check ts):{actor}"))
+                            .await
+                            .get(actor)
+                        {
+                            let booked_read = booked
+                                .read(format!(
+                                    "process_emptyset(booked writer, ts timestamp):{actor}"
+                                ))
+                                .await;
+
+                            if let Some(seen_ts) = booked_read.last_cleared_ts() {
+                                if seen_ts > change.1 {
+                                    continue;
+                                }
+                            }
                         }
-                        Err(e) => {
-                            warn!("encountered error when processing emptyset - {e}");
-                            changes.push_front(change);
-                            break;
+                        match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                warn!("encountered error when processing emptyset - {e}");
+                                changes.push_front(change);
+                                break;
+                            }
                         }
                     }
                 }
-            }
-        }
+                to_process
+            });
+        };
     }
 
-    println!("shutting down handle empties loop");
+    info!("shutting down handle empties loop");
 }
 
 #[allow(dead_code)]
@@ -488,11 +563,68 @@ pub async fn process_emptyset(
     agent: Agent,
     bookie: Bookie,
     actor_id: ActorId,
-    changes: &(Vec<RangeInclusive<corro_types::base::Version>>, Timestamp),
+    changes: &(Vec<RangeInclusive<Version>>, Timestamp),
 ) -> Result<(), ChangeError> {
     let (versions, ts) = changes;
-    let mut conn = agent.pool().write_low().await?;
 
+    let mut version_iter = versions.chunks(100);
+
+    while let Some(chunk) = version_iter.next() {
+        let mut conn = agent.pool().write_low().await?;
+        debug!("processing emptyset from {:?}", actor_id);
+        let booked = {
+            bookie
+                .write(format!(
+                    "process_emptyset(booked writer, updates timestamp):{actor_id}",
+                ))
+                .await
+                .ensure(actor_id)
+        };
+
+        let mut booked_write = booked
+            .write(format!(
+                "process_emptyset(booked writer, updates timestamp):{actor_id}"
+            ))
+            .await;
+
+        let mut snap = booked_write.snapshot();
+
+        debug!(self_actor_id = %agent.actor_id(), "processing emptyset changes, len: {}", versions.len());
+        block_in_place(|| {
+            let tx = conn
+                .immediate_transaction()
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: None,
+                    version: None,
+                })?;
+
+            for version in chunk {
+                store_empty_changeset(&tx, actor_id, version.clone(), *ts)?;
+            }
+
+            snap.insert_db(&tx, RangeInclusiveSet::from_iter(chunk.iter().cloned()))
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: None,
+                    version: None,
+                })?;
+
+            tx.commit().map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
+
+            booked_write.commit_snapshot(snap);
+            counter!("corro.sync.empties.count", "actor" => format!("{}", actor_id.to_string()))
+                .increment(chunk.len() as u64);
+
+            Ok::<_, ChangeError>(())
+        })?;
+    }
+
+    let mut conn = agent.pool().write_low().await?;
     let booked = {
         bookie
             .write(format!(
@@ -501,12 +633,12 @@ pub async fn process_emptyset(
             .await
             .ensure(actor_id)
     };
+
     let mut booked_write = booked
         .write(format!(
             "process_emptyset(booked writer, updates timestamp):{actor_id}"
         ))
         .await;
-    let mut snap = booked_write.snapshot();
 
     let tx = conn
         .immediate_transaction()
@@ -516,19 +648,7 @@ pub async fn process_emptyset(
             version: None,
         })?;
 
-    counter!("corro.sync.empties.count", "actor" => format!("{}", actor_id.to_string()))
-        .increment(versions.len() as u64);
-    debug!(self_actor_id = %agent.actor_id(), "processing emptyset changes, len: {}", versions.len());
-    for version in versions {
-        store_empty_changeset(&tx, actor_id, version.clone(), *ts)?;
-    }
-
-    snap.insert_db(&tx, RangeInclusiveSet::from_iter(versions.clone()))
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
-        })?;
+    let mut snap = booked_write.snapshot();
     snap.update_cleared_ts(&tx, *ts)
         .map_err(|source| ChangeError::Rusqlite {
             source,
@@ -536,13 +656,7 @@ pub async fn process_emptyset(
             version: None,
         })?;
 
-    tx.commit().map_err(|source| ChangeError::Rusqlite {
-        source,
-        actor_id: None,
-        version: None,
-    })?;
     booked_write.commit_snapshot(snap);
-
     Ok(())
 }
 
@@ -583,7 +697,7 @@ pub async fn handle_changes(
             // concurrently bvased on MAX_CONCURRENCY
             let mut tmp_cost = 0;
             while let Some((change, src, queued_at)) = queue.pop_front() {
-                tmp_cost += processing_cost(&change);
+                tmp_cost += change.processing_cost();
                 buf.push((change, src, queued_at));
                 if tmp_cost >= max_changes_chunk {
                     break;
@@ -765,7 +879,7 @@ pub async fn handle_changes(
             }
         }
 
-        let cost = processing_cost(&change);
+        let cost = change.processing_cost();
         queue.push_back((change, src, Instant::now()));
 
         buf_cost += cost; // tracks the cost, not number of changes
@@ -888,6 +1002,10 @@ pub async fn handle_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+    use tokio::time::timeout;
 
     #[test]
     fn ensure_truncate_works() -> eyre::Result<()> {
@@ -901,6 +1019,61 @@ mod tests {
         assert_eq!(
             conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))?,
             pragma_value
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn ensure_vacuum_works() -> eyre::Result<()> {
+        let tmpdir = tempfile::tempdir()?;
+        let db_path = tmpdir.into_path().join("db.sqlite");
+
+        {
+            let db_conn = Connection::open(db_path.clone())?;
+            db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
+        }
+
+        println!("temp db: {:?}", db_path);
+        let write_sema = Arc::new(Semaphore::new(1));
+        let pool = SplitPool::create(db_path, write_sema.clone()).await?;
+
+        {
+            let mut conn = pool.write_priority().await?;
+            conn.execute(
+                r#"
+            CREATE TABLE test (
+                id BIGINT NOT NULL PRIMARY KEY,
+                col1 TEXT,
+                col2 TEXT,
+                col3 TEXT,
+                col4 TEXT
+            )
+        "#,
+                [],
+            )?;
+
+            let tx = conn.transaction()?;
+            // create 1m rows
+            for i in 1..100000 {
+                tx.execute(
+                    r"INSERT INTO test VALUES (?, ?, ?, ?, ?)",
+                    (i, "colunm 1", "column 2", "column 3", "column 4"),
+                )?;
+            }
+            tx.commit()?;
+
+            conn.execute("DELETE FROM test", [])?;
+            let freelist: u64 =
+                conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+            assert!(freelist > 1000);
+        }
+
+        timeout(Duration::from_secs(2), vacuum_db(pool.clone(), 1000)).await??;
+
+        let conn = pool.read().await?;
+        assert!(
+            conn.pragma_query_value(None, "freelist_count", |row| row.get::<_, u64>(0))? < 1000
         );
 
         Ok(())
