@@ -114,6 +114,7 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
         r#"
             PRAGMA journal_mode = WAL;
             PRAGMA journal_size_limit = 1073741824;
+            PRAGMA wal_autocheckpoint = 524288;
             PRAGMA synchronous = NORMAL;
             PRAGMA recursive_triggers = ON;
         "#,
