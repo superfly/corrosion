@@ -352,30 +352,30 @@ pub async fn handle_notifications(
     }
 }
 
-/// We keep a write-ahead-log, which under write-pressure can grow to
-/// multiple gigabytes and needs periodic truncation.  We don't want
-/// to schedule this task too often since it locks the whole DB.
-// TODO: can we get around the lock somehow?
-fn wal_checkpoint(conn: &rusqlite::Connection) -> eyre::Result<()> {
-    debug!("handling db_cleanup (WAL truncation)");
-    let start = Instant::now();
+// /// We keep a write-ahead-log, which under write-pressure can grow to
+// /// multiple gigabytes and needs periodic truncation.  We don't want
+// /// to schedule this task too often since it locks the whole DB.
+// // TODO: can we get around the lock somehow?
+// fn wal_checkpoint(conn: &rusqlite::Connection) -> eyre::Result<()> {
+//     debug!("handling db_cleanup (WAL truncation)");
+//     let start = Instant::now();
 
-    let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
-    conn.pragma_update(None, "busy_timeout", 60000)?;
+//     let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+//     conn.pragma_update(None, "busy_timeout", 60000)?;
 
-    let busy: bool = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
-    if busy {
-        warn!("could not truncate sqlite WAL, database busy");
-        counter!("corro.db.wal.truncate.busy").increment(1);
-    } else {
-        debug!("successfully truncated sqlite WAL!");
-        histogram!("corro.db.wal.truncate.seconds").record(start.elapsed().as_secs_f64());
-    }
+//     let busy: bool = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
+//     if busy {
+//         warn!("could not truncate sqlite WAL, database busy");
+//         counter!("corro.db.wal.truncate.busy").increment(1);
+//     } else {
+//         debug!("successfully truncated sqlite WAL!");
+//         histogram!("corro.db.wal.truncate.seconds").record(start.elapsed().as_secs_f64());
+//     }
 
-    _ = conn.pragma_update(None, "busy_timeout", orig);
+//     _ = conn.pragma_update(None, "busy_timeout", orig);
 
-    Ok::<_, eyre::Report>(())
-}
+//     Ok::<_, eyre::Report>(())
+// }
 
 /// If the number of unused free pages is above the provided limit,
 /// This function continously runs an incremental_vacuum
@@ -440,38 +440,19 @@ async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
 }
 
 /// See `db_cleanup` and `vacuum_db`
-pub fn spawn_handle_db_cleanup(pool: SplitPool) {
+pub fn spawn_handle_vacuum(pool: SplitPool) {
     tokio::spawn(async move {
         // large sleep right at the start to give node time to sync
         const MAX_DB_FREE_PAGES: u64 = 10000;
 
-        sleep(Duration::from_secs(60 * 7)).await;
+        sleep(Duration::from_secs(60)).await;
 
         let mut vacuum_interval = tokio::time::interval(Duration::from_secs(60 * 15));
-        let mut wal_checkpoint_interval = tokio::time::interval(Duration::from_secs(60));
 
         loop {
-            tokio::select! {
-                biased;
-                _ = vacuum_interval.tick() => {
-                    if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await {
-                        error!("could not check freelist and vacuum: {e}");
-                    }
-                },
-                _ = wal_checkpoint_interval.tick() => {
-                    // fall-through
-                }
-            }
-
-            match pool.write_low().await {
-                Ok(conn) => {
-                    if let Err(e) = block_in_place(|| wal_checkpoint(&conn)) {
-                        error!("could not truncate wal: {e}");
-                    }
-                }
-                Err(e) => {
-                    error!("could not acquire low priority conn to truncate wal: {e}")
-                }
+            vacuum_interval.tick().await;
+            if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await {
+                error!("could not check freelist and vacuum: {e}");
             }
         }
     });
@@ -1015,22 +996,22 @@ mod tests {
     use tokio::sync::Semaphore;
     use tokio::time::timeout;
 
-    #[test]
-    fn ensure_truncate_works() -> eyre::Result<()> {
-        let tmpdir = tempfile::tempdir()?;
+    // #[test]
+    // fn ensure_truncate_works() -> eyre::Result<()> {
+    //     let tmpdir = tempfile::tempdir()?;
 
-        let conn = rusqlite::Connection::open(tmpdir.path().join("db.sqlite"))?;
-        let pragma_value = 12345u64;
-        conn.pragma_update(None, "busy_timeout", pragma_value)?;
+    //     let conn = rusqlite::Connection::open(tmpdir.path().join("db.sqlite"))?;
+    //     let pragma_value = 12345u64;
+    //     conn.pragma_update(None, "busy_timeout", pragma_value)?;
 
-        wal_checkpoint(&conn)?;
-        assert_eq!(
-            conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))?,
-            pragma_value
-        );
+    //     wal_checkpoint(&conn)?;
+    //     assert_eq!(
+    //         conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))?,
+    //         pragma_value
+    //     );
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn ensure_vacuum_works() -> eyre::Result<()> {

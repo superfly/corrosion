@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::{
     agent::{
-        handlers::{self, spawn_handle_db_cleanup},
+        handlers::{self, spawn_handle_vacuum},
         metrics, setup, util, AgentOptions,
     },
     broadcast::runtime_loop,
@@ -119,7 +119,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         notifications_rx,
     ));
 
-    spawn_handle_db_cleanup(agent.pool().clone());
+    spawn_handle_vacuum(agent.pool().clone());
 
     let bookie = Bookie::new_with_registry(Default::default(), lock_registry);
     {
