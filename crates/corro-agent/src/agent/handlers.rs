@@ -356,7 +356,7 @@ pub async fn handle_notifications(
 /// multiple gigabytes and needs periodic truncation.  We don't want
 /// to schedule this task too often since it locks the whole DB.
 // TODO: can we get around the lock somehow?
-fn db_cleanup(conn: &rusqlite::Connection) -> eyre::Result<()> {
+fn wal_checkpoint(conn: &rusqlite::Connection) -> eyre::Result<()> {
     debug!("handling db_cleanup (WAL truncation)");
     let start = Instant::now();
 
@@ -447,18 +447,26 @@ pub fn spawn_handle_db_cleanup(pool: SplitPool) {
 
         sleep(Duration::from_secs(60 * 7)).await;
 
-        let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
-        loop {
-            db_cleanup_interval.tick().await;
+        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(60 * 15));
+        let mut wal_checkpoint_interval = tokio::time::interval(Duration::from_secs(60));
 
-            if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await {
-                error!("could not check freelist and vacuum: {e}");
+        loop {
+            tokio::select! {
+                biased;
+                _ = vacuum_interval.tick() => {
+                    if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await {
+                        error!("could not check freelist and vacuum: {e}");
+                    }
+                },
+                _ = wal_checkpoint_interval.tick() => {
+                    // fall-through
+                }
             }
 
             match pool.write_low().await {
                 Ok(conn) => {
-                    if let Err(e) = block_in_place(|| db_cleanup(&conn)) {
-                        error!("could not truncate db: {e}");
+                    if let Err(e) = block_in_place(|| wal_checkpoint(&conn)) {
+                        error!("could not truncate wal: {e}");
                     }
                 }
                 Err(e) => {
@@ -1015,7 +1023,7 @@ mod tests {
         let pragma_value = 12345u64;
         conn.pragma_update(None, "busy_timeout", pragma_value)?;
 
-        db_cleanup(&conn)?;
+        wal_checkpoint(&conn)?;
         assert_eq!(
             conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))?,
             pragma_value
