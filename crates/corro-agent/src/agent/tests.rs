@@ -891,6 +891,14 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         .last_cleared_ts();
 
     assert_eq!(ta1_cleared, ta2_ta1_cleared);
+    // check db too
+    let conn = ta2.agent.pool().read().await?;
+    let db_ts: Timestamp = conn
+        .prepare_cached("SELECT last_cleared_ts FROM __corro_sync_state WHERE actor_id = ?")?
+        .query_row([&ta1.agent.actor_id()], |row| row.get(0))?;
+
+    println!("db_ts - {:?}", db_ts);
+    assert_eq!(db_ts, ta1_cleared.unwrap());
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;

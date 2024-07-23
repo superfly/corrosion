@@ -685,6 +685,12 @@ pub async fn process_emptyset(
             version: None,
         })?;
 
+    tx.commit().map_err(|source| ChangeError::Rusqlite {
+        source,
+        actor_id: None,
+        version: None,
+    })?;
+
     booked_write.commit_snapshot(snap);
     Ok(())
 }
