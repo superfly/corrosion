@@ -94,13 +94,14 @@ where
         client: hyper::Client<HttpConnector, Body>,
         api_addr: SocketAddr,
         body: hyper::Body,
+        change_id: Option<ChangeId>,
     ) -> Self {
         Self {
             id,
             client,
             api_addr,
-            observed_eoq: false,
-            last_change_id: None,
+            observed_eoq: change_id.is_some(),
+            last_change_id: change_id,
             stream: Some(FramedRead::new(
                 StreamReader::new(IoBodyStream { body }),
                 LinesBytesCodec::default(),
