@@ -12,10 +12,13 @@ use std::{
     time::{self, Duration, Instant},
 };
 use sub::{QueryStream, SubscriptionStream};
-use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio::{
+    sync::{RwLock, RwLockReadGuard},
+    time::timeout,
+};
 use tracing::{debug, info, warn};
 use trust_dns_resolver::{
-    error::ResolveError,
+    error::{ResolveError, ResolveErrorKind},
     name_server::{GenericConnection, GenericConnectionProvider, TokioRuntime},
     AsyncResolver,
 };
@@ -23,6 +26,7 @@ use uuid::Uuid;
 
 const HTTP2_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct CorrosionApiClient {
@@ -589,9 +593,9 @@ impl AddrPicker {
                     .and_then(|(host, port)| Some((host, port.parse().ok()?)))
                     .ok_or(ResolveError::from("Invalid Corrosion server address"))?;
 
-                self.resolver
-                    .lookup_ip(host)
-                    .await?
+                timeout(DNS_RESOLVE_TIMEOUT, self.resolver.lookup_ip(host))
+                    .await
+                    .map_err(|_| ResolveError::from(ResolveErrorKind::Timeout))??
                     .iter()
                     .map(|addr| (addr, port).into())
                     .collect::<Vec<_>>()
