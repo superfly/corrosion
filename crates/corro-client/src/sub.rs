@@ -75,8 +75,8 @@ pub enum SubscriptionError {
     Http(#[from] http::Error),
     #[error(transparent)]
     Deserialize(#[from] serde_json::Error),
-    #[error("missed a change, inconsistent state")]
-    MissedChange,
+    #[error("missed a change (expected: {expected}, got: {got}), inconsistent state")]
+    MissedChange { expected: ChangeId, got: ChangeId },
     #[error("max line length exceeded")]
     MaxLineLengthExceeded,
     #[error("initial query never finished")]
@@ -148,8 +148,14 @@ where
                         self.last_change_id = *change_id;
                     }
                     if let TypedQueryEvent::Change(_, _, _, change_id) = &evt {
-                        if matches!(self.last_change_id, Some(id) if id.0 + 1 != change_id.0) {
-                            return Poll::Ready(Some(Err(SubscriptionError::MissedChange)));
+                        match self.last_change_id {
+                            Some(id) if id + 1 != *change_id => {
+                                return Poll::Ready(Some(Err(SubscriptionError::MissedChange {
+                                    expected: id + 1,
+                                    got: *change_id,
+                                })))
+                            }
+                            _ => (),
                         }
                         self.last_change_id = Some(*change_id);
                     }
