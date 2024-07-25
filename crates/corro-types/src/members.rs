@@ -17,16 +17,23 @@ pub struct MemberState {
 
     pub ring: Option<u8>,
     pub last_sync_ts: Option<Timestamp>,
+    pub last_empty_ts: Option<Timestamp>,
 }
 
 impl MemberState {
-    pub fn new(addr: SocketAddr, ts: Timestamp, cluster_id: ClusterId) -> Self {
+    pub fn new(
+        addr: SocketAddr,
+        ts: Timestamp,
+        cluster_id: ClusterId,
+        last_empty_ts: Option<Timestamp>,
+    ) -> Self {
         Self {
             addr,
             ts,
             cluster_id,
             ring: None,
             last_sync_ts: None,
+            last_empty_ts: last_empty_ts,
         }
     }
 
@@ -67,15 +74,27 @@ impl Members {
         }
     }
 
+    pub fn update_last_empty(&mut self, actor_id: &ActorId, ts: Option<Timestamp>) {
+        if let Some(state) = self.states.get_mut(actor_id) {
+            if ts > state.last_empty_ts {
+                state.last_empty_ts = ts;
+            }
+        }
+    }
+
     // A result of `true` means that the effective list of
     // cluster member addresses has changed
-    pub fn add_member(&mut self, actor: &Actor) -> MemberAddedResult {
+    pub fn add_member(
+        &mut self,
+        actor: &Actor,
+        last_empty_ts: Option<Timestamp>,
+    ) -> MemberAddedResult {
         let actor_id = actor.id();
         let mut ret = MemberAddedResult::Ignored;
 
         let member = self.states.entry(actor_id).or_insert_with(|| {
             ret = MemberAddedResult::NewMember;
-            MemberState::new(actor.addr(), actor.ts(), actor.cluster_id())
+            MemberState::new(actor.addr(), actor.ts(), actor.cluster_id(), last_empty_ts)
         });
 
         trace!("member: {member:?}");
