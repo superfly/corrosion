@@ -717,8 +717,8 @@ fn handle_need(
             if last_cleared_ts.is_none() {
                 return Ok(());
             }
+            info!("processing empty versions to {actor_id} with ts: {:?}", ts );
             let ts = ts.unwrap_or(Default::default());
-            debug!("processing empty versions to {actor_id}");
             let mut stmt = tx.prepare_cached(
                 "
                 SELECT start_version, end_version, ts FROM __corro_bookkeeping
@@ -1134,13 +1134,9 @@ pub async fn parallel_sync(
                     let cleared_ts = their_sync_state.last_cleared_ts;
 
                     info!(%actor_id, "got last cleared ts {cleared_ts:?}");
-                    if let Some(ts) = cleared_ts {
-                        if let Some(last_seen) = our_empty_ts.get(&actor_id) {
-                            if last_seen.is_none() || last_seen.unwrap() < ts {
-                                needs.entry(actor_id).or_default().push( SyncNeedV1::Empty { ts: *last_seen });
-                            }
-                        }
-                    }
+                    let last_seen = our_empty_ts.get(&actor_id).unwrap_or(&None);
+                    needs.entry(actor_id).or_default().push( SyncNeedV1::Empty { ts: *last_seen });
+
                     Ok::<_, SyncError>((needs, tx, read))
                 }.await
             )

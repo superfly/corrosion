@@ -531,6 +531,7 @@ pub async fn handle_emptyset(
             },
             maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
                 Some(change) => {
+                    info!("received emptyset changes in emptyset channel from {}", change.actor_id);
                     if let Changeset::EmptySet { versions, ts } = change.changeset {
                         buf.entry(change.actor_id).or_insert(VecDeque::new()).push_back((versions.clone(), ts));
                     } else {
