@@ -272,24 +272,7 @@ pub async fn handle_notifications(
         trace!("handle notification");
         match notification {
             Notification::MemberUp(actor) => {
-                // check for last empty when adding a new member.
-                let last_cleared_ts = {
-                    match agent.pool().read().await {
-                        Ok(conn) => match get_last_cleared_ts(&conn, actor.id()) {
-                            Ok(ts) => ts,
-                            Err(e) => {
-                                error!("could not get last_empty_ts: {e}");
-                                None
-                            }
-                        },
-                        Err(e) => {
-                            error!("could not get read conn: {e}");
-                            None
-                        }
-                    }
-                };
-
-                let member_added_res = agent.members().write().add_member(&actor, last_cleared_ts);
+                let member_added_res = agent.members().write().add_member(&actor);
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 
                 match member_added_res {
@@ -297,9 +280,29 @@ pub async fn handle_notifications(
                         debug!("Member Added {actor:?}");
                         counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
 
+                        let last_cleared_ts = {
+                            match agent.pool().read().await {
+                                Ok(conn) => {
+                                    get_last_cleared_ts(&conn, actor.id()).unwrap_or_else(|e| {
+                                        error!("could not get last_empty_ts: {e}");
+                                        None
+                                    })
+                                }
+                                Err(e) => {
+                                    error!("could not get read conn: {e}");
+                                    None
+                                }
+                            }
+                        };
+
+                        let members_len = {
+                            let mut members = agent.members().write();
+                            members.update_last_empty(&actor.id(), last_cleared_ts);
+                            members.states.len() as u32
+                        };
+
                         // actually added a member
                         // notify of new cluster size
-                        let members_len = agent.members().read().states.len() as u32;
                         if let Ok(size) = members_len.try_into() {
                             if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await
                             {
