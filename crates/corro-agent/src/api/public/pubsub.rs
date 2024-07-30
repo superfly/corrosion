@@ -524,7 +524,7 @@ pub async fn catch_up_sub(
         for i in 0..5 {
             min_change_id = last_change_id + 1;
 
-            if change_id > min_change_id {
+            if change_id >= min_change_id {
                 // missed some updates!
                 info!(sub_id = %matcher.id(), "attempt #{} to catch up subcription from change id: {change_id:?} (last: {last_change_id:?})", i+1);
 
@@ -547,7 +547,7 @@ pub async fn catch_up_sub(
             // sleep 100 millis
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if change_id > min_change_id {
+        if change_id >= min_change_id {
             _ = evt_tx
                 .send(error_to_query_event_bytes_with_meta(
                     &mut buf,
