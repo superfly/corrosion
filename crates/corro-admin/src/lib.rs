@@ -394,6 +394,7 @@ async fn handle_conn(
                     for value in values {
                         send(&mut stream, Response::Json(value)).await;
                     }
+                    send_success(&mut stream).await;
                 }
                 Command::Cluster(ClusterCommand::MembershipStates) => {
                     info_log(&mut stream, "gathering membership state").await;
