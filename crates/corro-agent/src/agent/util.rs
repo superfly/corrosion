@@ -976,6 +976,8 @@ pub async fn process_multiple_changes(
                     actor_id: None,
                     version: None,
                 })?;
+
+            std::mem::forget(snap);
         }
 
         tx.commit().map_err(|source| ChangeError::Rusqlite {
