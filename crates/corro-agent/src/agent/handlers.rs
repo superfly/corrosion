@@ -443,15 +443,16 @@ async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
 /// See `db_cleanup` and `vacuum_db`
 pub fn spawn_handle_db_maintenance(agent: &Agent) {
     let mut wal_path = agent.config().db.path.clone();
+    let wal_threshold = agent.config().perf.wal_threshold_gb as u64;
     wal_path.set_extension(format!("{}-wal", wal_path.extension().unwrap_or_default()));
 
     let pool = agent.pool().clone();
 
     tokio::spawn(async move {
-        const TRUNCATE_WAL_THRESHOLD: u64 = 5 * 1024 * 1024 * 1024;
+        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024 * 1024;
 
         // try to initially truncate the WAL
-        match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, TRUNCATE_WAL_THRESHOLD).await
+        match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold).await
         {
             Ok(truncated) if truncated => {
                 info!("initially truncated WAL");
@@ -476,7 +477,7 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
             }
 
             if let Err(e) =
-                wal_checkpoint_over_threshold(wal_path.as_path(), &pool, TRUNCATE_WAL_THRESHOLD)
+                wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold)
                     .await
             {
                 error!("could not wal_checkpoint truncate: {e}");
@@ -530,6 +531,7 @@ pub async fn handle_emptyset(
             },
             maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
                 Some(change) => {
+                    info!("received emptyset changes in emptyset channel from {}", change.actor_id);
                     if let Changeset::EmptySet { versions, ts } = change.changeset {
                         buf.entry(change.actor_id).or_insert(VecDeque::new()).push_back((versions.clone(), ts));
                     } else {

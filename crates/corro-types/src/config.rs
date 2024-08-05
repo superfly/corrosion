@@ -11,6 +11,10 @@ const fn default_apply_queue() -> usize {
     100
 }
 
+const fn default_wal_threshold() -> usize {
+    10
+}
+
 /// Used for the apply channel
 const fn default_huge_channel() -> usize {
     2048
@@ -181,6 +185,8 @@ pub struct PerfConfig {
     pub apply_queue_timeout: usize,
     #[serde(default = "default_apply_queue")]
     pub apply_queue_len: usize,
+    #[serde(default = "default_wal_threshold")]
+    pub wal_threshold_gb: usize,
 }
 
 impl Default for PerfConfig {
@@ -197,6 +203,7 @@ impl Default for PerfConfig {
             foca_channel_len: default_small_channel(),
             apply_queue_timeout: default_apply_timeout(),
             apply_queue_len: default_apply_queue(),
+            wal_threshold_gb: default_wal_threshold(),
         }
     }
 }
