@@ -34,7 +34,6 @@ use corro_tests::*;
 use corro_types::agent::Agent;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::Change;
-use corro_types::sync::get_last_cleared_ts;
 use corro_types::{
     actor::ActorId,
     agent::migrate,
@@ -838,10 +837,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     .await?;
 
     let mut last_cleared: HashMap<ActorId, Option<Timestamp>> = HashMap::new();
-    last_cleared.insert(
-        ta1.agent.actor_id(),
-        get_last_cleared_ts(&ta2.bookie, &ta1.agent.actor_id()).await,
-    );
+    last_cleared.insert(ta1.agent.actor_id(), None);
 
     println!("got last cleared - {last_cleared:?}");
 

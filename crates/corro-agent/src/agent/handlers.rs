@@ -21,7 +21,7 @@ use crate::{
 use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, Bookie, SplitPool},
+    agent::{get_last_cleared_ts, Agent, Bookie, SplitPool},
     base::CrsqlSeq,
     broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, FocaInput},
     channel::CorroReceiver,
@@ -34,7 +34,6 @@ use corro_types::agent::ChangeError;
 use corro_types::base::Version;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::store_empty_changeset;
-use corro_types::sync::get_last_cleared_ts;
 use foca::Notification;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
@@ -281,9 +280,29 @@ pub async fn handle_notifications(
                         debug!("Member Added {actor:?}");
                         counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
 
+                        let last_cleared_ts = {
+                            match agent.pool().read().await {
+                                Ok(conn) => {
+                                    get_last_cleared_ts(&conn, actor.id()).unwrap_or_else(|e| {
+                                        error!("could not get last_empty_ts: {e}");
+                                        None
+                                    })
+                                }
+                                Err(e) => {
+                                    error!("could not get read conn: {e}");
+                                    None
+                                }
+                            }
+                        };
+
+                        let members_len = {
+                            let mut members = agent.members().write();
+                            members.update_last_empty(&actor.id(), last_cleared_ts);
+                            members.states.len() as u32
+                        };
+
                         // actually added a member
                         // notify of new cluster size
-                        let members_len = agent.members().read().states.len() as u32;
                         if let Ok(size) = members_len.try_into() {
                             if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await
                             {
@@ -564,6 +583,8 @@ pub async fn handle_emptyset(
 
                             if let Some(seen_ts) = booked_read.last_cleared_ts() {
                                 if seen_ts > change.1 {
+                                    warn!("skipping change because last cleared ts '{:?}' is greater than empty ts: {:?}",
+                                        seen_ts, change.1);
                                     continue;
                                 }
                             }
@@ -692,6 +713,7 @@ pub async fn process_emptyset(
     })?;
 
     booked_write.commit_snapshot(snap);
+
     Ok(())
 }
 
@@ -1005,7 +1027,12 @@ pub async fn handle_sync(
     let mut last_cleared: HashMap<ActorId, Option<Timestamp>> = HashMap::new();
 
     for (actor_id, _) in chosen.clone() {
-        last_cleared.insert(actor_id, get_last_cleared_ts(bookie, &actor_id).await);
+        let last_ts = match agent.members().read().states.get(&actor_id) {
+            Some(state) => state.last_empty_ts,
+            None => None,
+        };
+
+        last_cleared.insert(actor_id, last_ts);
     }
 
     let start = Instant::now();

@@ -1370,10 +1370,7 @@ impl BookedVersions {
             }
         }
 
-        bv.last_cleared_ts = conn
-            .prepare_cached("SELECT last_cleared_ts FROM __corro_sync_state WHERE actor_id = ?")?
-            .query_row([actor_id], |row| row.get(0))
-            .optional()?;
+        bv.last_cleared_ts = get_last_cleared_ts(conn, actor_id)?;
 
         let mut snap = bv.snapshot();
 
@@ -1496,6 +1493,17 @@ impl BookedVersions {
     pub fn needed(&self) -> &RangeInclusiveSet<Version> {
         &self.needed
     }
+}
+
+pub fn get_last_cleared_ts(
+    conn: &Connection,
+    actor_id: ActorId,
+) -> rusqlite::Result<Option<Timestamp>> {
+    let ts = conn
+        .prepare_cached("SELECT last_cleared_ts FROM __corro_sync_state WHERE actor_id = ?")?
+        .query_row([actor_id], |row| row.get(0))
+        .optional()?;
+    Ok(ts)
 }
 
 #[derive(Debug)]
