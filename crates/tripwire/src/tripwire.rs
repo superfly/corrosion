@@ -5,13 +5,17 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::{
-    signal::unix::{signal, SignalKind},
-    sync::{mpsc, watch},
-};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
+#[cfg(windows)]
+use tokio::signal::windows::ctrl_c;
+use tokio::sync::{mpsc, watch};
+#[cfg(windows)]
+use tokio_stream::wrappers::CtrlCStream;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, warn};
 
+#[cfg(unix)]
 use crate::signalstream::SignalStream;
 
 /// A `Future` that completes once the program is requested to shutdown. This
@@ -51,10 +55,20 @@ impl Tripwire {
     }
 
     /// Listen for SIGTERM and SIGINT
+    #[cfg(unix)]
     pub fn new_signals() -> (Self, TripwireWorker<Select<SignalStream, SignalStream>>) {
+        // For non-Windows platforms, create signal streams for SIGTERM and SIGINT
         let sigterms = SignalStream::new(signal(SignalKind::terminate()).unwrap());
         let sigints = SignalStream::new(signal(SignalKind::interrupt()).unwrap());
         Self::new(select(sigterms, sigints))
+    }
+
+    #[cfg(windows)]
+    pub fn new_signals() -> (Self, TripwireWorker<Select<CtrlCStream, CtrlCStream>>) {
+        // For Windows platforms, create two Ctrl-C signal streams to meet the requirement of `select`
+        let ctrl_c1 = CtrlCStream::new(ctrl_c().unwrap());
+        let ctrl_c2 = CtrlCStream::new(ctrl_c().unwrap());
+        Self::new(select(ctrl_c1, ctrl_c2))
     }
 
     /// Returns an Arc of the current [TripwireState]
