@@ -731,6 +731,7 @@ pub async fn handle_changes(
     mut tripwire: Tripwire,
 ) {
     let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
+    let max_queue_len: usize = agent.config().perf.processing_queue_len;
     let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
     let mut buf_cost = 0;
@@ -742,7 +743,6 @@ pub async fn handle_changes(
         agent.config().perf.apply_queue_timeout as u64,
     ));
 
-    const MAX_QUEUE_LEN: usize = 10000;
     const MAX_SEEN_CACHE_LEN: usize = 10000;
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
@@ -863,7 +863,7 @@ pub async fn handle_changes(
         }
 
         // drop items when the queue is full.
-        if queue.len() > MAX_QUEUE_LEN {
+        if queue.len() > max_queue_len {
             warn!(
                 "dropping changes from {} because changes queue is full",
                 change.actor_id
