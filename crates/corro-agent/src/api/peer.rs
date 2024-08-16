@@ -1136,7 +1136,7 @@ pub async fn parallel_sync(
                     if let Some(ts) = cleared_ts {
                         if let Some(last_seen) = our_empty_ts.get(&actor_id) {
                             if last_seen.is_none() || last_seen.unwrap() < ts {
-                                debug!(%actor_id, "got last cleared ts {cleared_ts:?} - out last_seen {last_seen:?}");
+                                info!(%actor_id, "got last cleared ts {cleared_ts:?} - out last_seen {last_seen:?}");
                                 needs.entry(actor_id).or_default().push( SyncNeedV1::Empty { ts: *last_seen });
                             }
                         }
