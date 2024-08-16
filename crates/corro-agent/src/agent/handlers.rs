@@ -742,6 +742,7 @@ pub async fn handle_changes(
         agent.config().perf.apply_queue_timeout as u64,
     ));
 
+    const MAX_QUEUE_LEN: usize = 10000;
     const MAX_SEEN_CACHE_LEN: usize = 10000;
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
@@ -858,6 +859,15 @@ pub async fn handle_changes(
         counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
 
         if change.actor_id == agent.actor_id() {
+            continue;
+        }
+
+        // drop items when the queue is full.
+        if queue.len() > MAX_QUEUE_LEN {
+            warn!(
+                "dropping changes from {} because changes queue is full",
+                change.actor_id
+            );
             continue;
         }
 
