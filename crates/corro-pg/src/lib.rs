@@ -48,7 +48,7 @@ use rusqlite::{
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
     As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Name,
-    OneSelect, ResultColumn, Select, SelectTable, Stmt, With,
+    OneSelect, ResultColumn, Select, SelectBody, SelectTable, Stmt, With,
 };
 use sqlparser::ast::Statement as PgStatement;
 use tokio::{
@@ -848,21 +848,144 @@ pub async fn start(
                                                 .collect();
                                         }
 
+                                        let mut field_type_overrides = HashMap::new();
+
+                                        match &parsed_cmd {
+                                            ParsedCmd::Sqlite(Cmd::Stmt(stmt)) => match stmt {
+                                                Stmt::Select(Select {
+                                                    body:
+                                                        SelectBody {
+                                                            select:
+                                                                OneSelect::Select {
+                                                                    columns: cols, ..
+                                                                },
+                                                            ..
+                                                        },
+                                                    ..
+                                                })
+                                                | Stmt::Delete {
+                                                    returning: Some(cols),
+                                                    ..
+                                                }
+                                                | Stmt::Insert {
+                                                    returning: Some(cols),
+                                                    ..
+                                                }
+                                                | Stmt::Update {
+                                                    returning: Some(cols),
+                                                    ..
+                                                } => {
+                                                    for (i, col) in cols.iter().enumerate() {
+                                                        if let ResultColumn::Expr(expr, _as) = col {
+                                                            let type_override = match expr {
+                                                                Expr::Cast {
+                                                                    type_name, ..
+                                                                } => {
+                                                                    match name_to_type(
+                                                                        &type_name.name,
+                                                                    ) {
+                                                                        Ok(t) => Some(t),
+                                                                        Err(e) => {
+                                                                            back_tx.blocking_send(
+                                                                                (e.into(), true)
+                                                                                    .into(),
+                                                                            )?;
+                                                                            discard_until_sync =
+                                                                                true;
+                                                                            continue 'outer;
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Expr::FunctionCall {
+                                                                    name, ..
+                                                                }
+                                                                | Expr::FunctionCallStar {
+                                                                    name,
+                                                                    ..
+                                                                } => match name
+                                                                    .0
+                                                                    .as_str()
+                                                                    .to_uppercase()
+                                                                    .as_ref()
+                                                                {
+                                                                    "COUNT" => Some(Type::INT8),
+                                                                    _ => None,
+                                                                },
+                                                                _ => None,
+                                                            };
+                                                            if let Some(type_override) =
+                                                                type_override
+                                                            {
+                                                                match prepped.column_name(i) {
+                                                                    Ok(col_name) => {
+                                                                        field_type_overrides
+                                                                            .insert(
+                                                                                col_name,
+                                                                                type_override,
+                                                                            );
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!("col index didn't exist at {i}, attempted to override type as: {type_override}: {e}");
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            },
+                                            ParsedCmd::Postgres(_stmt) => {
+                                                // TODO: handle type overrides here too
+                                                // let cols = match stmt {
+                                                //     PgStatement::Insert { returning, .. }
+                                                //     | PgStatement::Update { returning, .. }
+                                                //     | PgStatement::Delete { returning, .. } => {
+                                                //         returning
+                                                //     }
+                                                //     PgStatement::Query(query) => {
+                                                //         match *query.body {
+                                                //             sqlparser::ast::SetExpr::Select(
+                                                //                 select,
+                                                //             ) => Some(select.projection),
+                                                //             _ => None,
+                                                //         }
+                                                //     }
+                                                //     _ => None,
+                                                // };
+
+                                                // if let Some(cols) = cols {
+
+                                                // }
+                                            }
+                                            _ => {}
+                                        }
+
                                         let mut fields = vec![];
                                         for col in prepped.columns() {
-                                            let col_type = match name_to_type(
-                                                col.decl_type().unwrap_or("text"),
-                                            ) {
-                                                Ok(t) => t,
-                                                Err(e) => {
-                                                    back_tx
-                                                        .blocking_send((e.into(), true).into())?;
-                                                    discard_until_sync = true;
-                                                    continue 'outer;
-                                                }
-                                            };
+                                            let col_name = col.name();
+                                            let col_type =
+                                                match field_type_overrides.remove(col_name) {
+                                                    Some(t) => t,
+                                                    None => match col.decl_type() {
+                                                        None => Type::TEXT,
+                                                        Some(decl_type) => {
+                                                            match name_to_type(decl_type) {
+                                                                Ok(t) => t,
+                                                                Err(e) => {
+                                                                    back_tx.blocking_send(
+                                                                        (e.into(), true).into(),
+                                                                    )?;
+                                                                    discard_until_sync = true;
+                                                                    continue 'outer;
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                };
                                             fields.push(FieldInfo::new(
-                                                col.name().to_string(),
+                                                col_name.to_string(),
                                                 None,
                                                 None,
                                                 col_type,
@@ -3253,6 +3376,11 @@ mod tests {
             println!("updated_at: {updated_at:?}");
 
             assert_eq!(future, updated_at);
+
+            let row = client
+                .query_one("SELECT COUNT(*) FROM kitchensink", &[])
+                .await?;
+            println!("COUNT ROW: {row:?}");
         }
 
         tripwire_tx.send(()).await.ok();
