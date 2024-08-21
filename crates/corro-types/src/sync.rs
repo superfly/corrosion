@@ -279,18 +279,6 @@ impl From<SyncStateV1> for SyncMessage {
     }
 }
 
-pub async fn get_last_cleared_ts(bookie: &Bookie, actor_id: &ActorId) -> Option<Timestamp> {
-    let booked = bookie
-        .read("get_last_cleared_ts")
-        .await
-        .get(actor_id)
-        .cloned();
-    if let Some(booked) = booked {
-        let booked_reader = booked.read("get_last_cleared_ts").await;
-        return booked_reader.last_cleared_ts();
-    }
-    None
-}
 
 // generates a `SyncMessage` to tell another node what versions we're missing
 #[tracing::instrument(skip_all, level = "debug")]
