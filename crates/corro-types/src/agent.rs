@@ -1213,7 +1213,6 @@ impl VersionsSnapshot {
             conn.prepare_cached("INSERT OR REPLACE INTO __corro_sync_state VALUES (?, ?)")?
                 .execute((self.actor_id, ts))?;
         }
-
         Ok(())
     }
 

@@ -988,11 +988,10 @@ pub async fn process_multiple_changes(
 
         if let Some(ts) = last_cleared {
             let mut booked_writer = agent
-                    .booked()
-                    .blocking_write("process_multiple_changes(update_cleared_ts)");
+                .booked()
+                .blocking_write("process_multiple_changes(update_cleared_ts)");
             booked_writer.update_cleared_ts(ts);
         }
-
 
         for (_, changeset, _, _) in changesets.iter() {
             if let Some(ts) = changeset.ts() {
