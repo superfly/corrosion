@@ -731,6 +731,7 @@ pub async fn handle_changes(
     mut tripwire: Tripwire,
 ) {
     let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
+    let max_queue_len: usize = agent.config().perf.processing_queue_len;
     let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
     let mut buf_cost = 0;
@@ -746,6 +747,7 @@ pub async fn handle_changes(
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
+    let mut drop_log_count: u64 = 0;
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
@@ -858,6 +860,26 @@ pub async fn handle_changes(
         counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
 
         if change.actor_id == agent.actor_id() {
+            continue;
+        }
+
+        // drop items when the queue is full.
+        if queue.len() > max_queue_len {
+            drop_log_count += 1;
+            if is_pow_10(drop_log_count) {
+                if drop_log_count == 1 {
+                    warn!("dropping a change because changes queue is full");
+                } else {
+                    warn!(
+                        "dropping {} changes because changes queue is full",
+                        drop_log_count
+                    );
+                }
+            }
+            // reset count
+            if drop_log_count == 100000000 {
+                drop_log_count = 0;
+            }
             continue;
         }
 
@@ -1141,4 +1163,12 @@ mod tests {
 
         Ok(())
     }
+}
+
+#[inline]
+fn is_pow_10(i: u64) -> bool {
+    matches!(
+        i,
+        1 | 10 | 100 | 1000 | 10000 | 1000000 | 10000000 | 100000000
+    )
 }
