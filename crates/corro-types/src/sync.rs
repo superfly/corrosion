@@ -113,7 +113,7 @@ impl SyncStateV1 {
                                 for seq in seqs {
                                     seqs_set.remove(seq.clone())
                                 }
-                                *need_seqs = Vec::from_iter(seqs_set.clone().into_iter());
+                                *need_seqs = Vec::from_iter(seqs_set.into_iter());
                                 if need_seqs.is_empty() {
                                     delete = true
                                 }

@@ -1742,52 +1742,6 @@ mod tests {
         api::public::api_v1_db_schema,
     };
 
-    use super::*;
-    #[test]
-    fn test_get_needs() -> eyre::Result<()> {
-        let original_state: SyncStateV1 = SyncStateV1::default();
-
-        let actor1 = ActorId(Uuid::new_v4());
-        let actor2 = ActorId(Uuid::new_v4());
-        let mut actor1_state = SyncStateV1::default();
-        actor1_state.heads.insert(actor1, Version(60));
-        actor1_state.heads.insert(actor2, Version(20));
-
-        let mut actor2_state = SyncStateV1::default();
-        actor2_state.heads.insert(actor1, Version(60));
-        actor2_state.heads.insert(actor2, Version(20));
-
-        let needs_map = distribute_available_needs(
-            original_state.clone(),
-            vec![
-                (actor1, actor1_state.clone()),
-                (actor2, actor2_state.clone()),
-            ],
-        );
-        println!("{:#?}", needs_map);
-
-        let actor3 = ActorId(Uuid::new_v4());
-        let mut actor3_state = SyncStateV1::default();
-        actor3_state.heads.insert(actor3, Version(40));
-        // actor 2 has seen only till Version(20)
-        actor2_state.heads.insert(actor3, Version(10));
-        // actor 1 has seen up to 40 but has some needs
-        actor1_state.heads.insert(actor3, Version(40));
-        actor1_state
-            .need
-            .insert(actor3, vec![(Version(3)..=Version(20))]);
-
-        let needs_map = distribute_available_needs(
-            original_state,
-            vec![
-                (actor1, actor1_state),
-                (actor2, actor2_state),
-                (actor3, actor3_state),
-            ],
-        );
-        println!("{:#?}", needs_map);
-        Ok(())
-    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_need() -> eyre::Result<()> {
