@@ -1735,12 +1735,14 @@ mod tests {
     use rand::{Rng, RngCore};
     use tempfile::TempDir;
     use tripwire::Tripwire;
-    use uuid::Uuid;
 
     use crate::{
         agent::{process_multiple_changes, setup},
         api::public::api_v1_db_schema,
     };
+
+    use super::*;
+
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_need() -> eyre::Result<()> {
