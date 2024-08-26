@@ -1742,7 +1742,6 @@ mod tests {
         api::public::api_v1_db_schema,
     };
 
-
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_need() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
