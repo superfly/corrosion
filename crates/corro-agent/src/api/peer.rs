@@ -1538,7 +1538,6 @@ pub fn distribute_available_needs2(
                                     versions: chunks[i].clone(),
                                 },
                             ));
-                            println!("actor {least:?} - adding need {:?}", chunks[i]);
                             actors.retain(|x| !remove_actor.contains(x));
                         }
                     }
