@@ -1153,7 +1153,9 @@ pub async fn parallel_sync(
 
     let len = syncers.len();
     let actor_state: Vec<_> = syncers.iter().map(|x| (x.0, x.2.clone())).collect();
+    let compute_start = Instant::now();
     let actor_needs = distribute_available_needs(our_sync_state, actor_state);
+    info!("took {:?} to compute needs from other actors", compute_start.elapsed());
 
     let (readers, mut servers) = {
         let mut rng = rand::thread_rng();
