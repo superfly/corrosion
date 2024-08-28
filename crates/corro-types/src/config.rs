@@ -15,7 +15,7 @@ const fn default_wal_threshold() -> usize {
     10
 }
 const fn default_processing_queue() -> usize {
-    100000
+    500000
 }
 
 /// Used for the apply channel
