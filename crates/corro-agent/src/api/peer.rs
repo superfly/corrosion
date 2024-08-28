@@ -1293,7 +1293,7 @@ pub async fn parallel_sync(
                             new_versions
                                 .into_iter()
                                 .map(|versions| {
-                                    range.remove(versions.clone());
+                                    range.insert(versions.clone());
                                     SyncNeedV1::Full { versions }
                                 })
                                 .collect()
@@ -1318,7 +1318,7 @@ pub async fn parallel_sync(
                                 seqs: new_seqs
                                     .into_iter()
                                     .map(|seqs| {
-                                        range.remove(seqs.clone());
+                                        range.insert(seqs.clone());
                                         seqs
                                     })
                                     .collect(),
