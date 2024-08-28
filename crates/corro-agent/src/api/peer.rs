@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap};
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -23,7 +23,6 @@ use futures::{Future, Stream, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
-use rand::seq::SliceRandom;
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, Connection};
 use speedy::Writable;
@@ -942,16 +941,6 @@ async fn process_sync(
     Ok(())
 }
 
-fn chunk_range<T: std::iter::Step + std::ops::Add<u64, Output = T> + std::cmp::Ord + Copy>(
-    range: RangeInclusive<T>,
-    chunk_size: usize,
-) -> impl Iterator<Item = RangeInclusive<T>> {
-    range.clone().step_by(chunk_size).map(move |block_start| {
-        let block_end = (block_start + chunk_size as u64).min(*range.end());
-        block_start..=block_end
-    })
-}
-
 fn encode_sync_msg(
     codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
@@ -1038,7 +1027,7 @@ pub async fn parallel_sync(
     agent: &Agent,
     transport: &Transport,
     members: Vec<(ActorId, SocketAddr)>,
-    our_sync_state: SyncStateV1,
+    mut our_sync_state: SyncStateV1,
     our_empty_ts: HashMap<ActorId, Option<Timestamp>>,
 ) -> Result<usize, SyncError> {
     trace!(
@@ -1162,51 +1151,17 @@ pub async fn parallel_sync(
         })?;
 
     let len = syncers.len();
-    let actor_state: Vec<_> = syncers.iter().map(|x| (x.0, x.2.clone())).collect();
-    let compute_start = Instant::now();
-    let actor_needs = distribute_available_needs2(our_sync_state, actor_state);
-    info!("took {:?} to compute needs from other actors", compute_start.elapsed());
 
     let (readers, mut servers) = {
-        let mut rng = rand::thread_rng();
         syncers.into_iter().fold(
             (Vec::with_capacity(len), Vec::with_capacity(len)),
             |(mut readers, mut servers), (actor_id, addr, state, tx, read)| {
-                let mut needs = actor_needs.get(&actor_id).cloned().unwrap_or_default();
-
-                let cleared_ts = state.last_cleared_ts;
-                if let Some(ts) = cleared_ts {
-                    if let Some(last_seen) = our_empty_ts.get(&actor_id) {
-                        if last_seen.is_none() || last_seen.unwrap() < ts {
-                            debug!(%actor_id, "got last cleared ts {cleared_ts:?} - out last_seen {last_seen:?}");
-                            needs.push((actor_id, SyncNeedV1::Empty { ts: *last_seen }));
-                        }
-                    }
-                }
-
-                if needs.is_empty() {
-                    trace!(%actor_id, "no needs!");
-                    return (readers, servers);
-                }
                 readers.push((actor_id, read));
-
-                trace!(%actor_id, "needs: {needs:?}");
-
-                debug!(%actor_id, %addr, "needs len: {}", needs.iter().map(|(_, need)| match need {
-                    SyncNeedV1::Full {versions} => (versions.end().0 - versions.start().0) as usize + 1,
-                    SyncNeedV1::Partial {..} => 0,
-                    SyncNeedV1::Empty {..} => 0,
-                }).sum::<usize>());
-
-                needs.shuffle(&mut rng);
-
-
-                let actor_needs = needs.into_iter().collect::<VecDeque<_>>();
 
                 servers.push((
                     actor_id,
                     addr,
-                    actor_needs,
+                    state,
                     tx,
                 ));
 
@@ -1225,12 +1180,6 @@ pub async fn parallel_sync(
         let mut send_buf = BytesMut::new();
         let mut encode_buf = BytesMut::new();
 
-        // already requested full versions
-        let mut req_full: HashMap<ActorId, RangeInclusiveSet<Version>> = HashMap::new();
-
-        // already requested partial version sequences
-        let mut req_partials: HashMap<(ActorId, Version), RangeInclusiveSet<CrsqlSeq>> = HashMap::new();
-
         let start = Instant::now();
 
         loop {
@@ -1238,90 +1187,27 @@ pub async fn parallel_sync(
                 break;
             }
             let mut next_servers = Vec::with_capacity(servers.len());
-            'servers: for (server_actor_id, addr, mut needs, mut tx) in servers {
-                if needs.is_empty() {
-                    continue;
-                }
-
-                let mut drained = 0;
-
-                while drained < 10 {
-                    let (actor_id, need) = match needs.pop_front() {
-                        Some(popped) => popped,
-                        None => {
-                            break;
-                        }
-                    };
-
-                    drained += 1;
-
-                    let actual_needs = match need {
-                        SyncNeedV1::Full { versions } => {
-                            let range = req_full.entry(actor_id).or_default();
-
-                            let mut new_versions =
-                                RangeInclusiveSet::from_iter([versions.clone()].into_iter());
-
-                            // check if we've already requested
-                            for overlap in range.overlapping(&versions) {
-                                new_versions.remove(overlap.clone());
-                            }
-
-                            if new_versions.is_empty() {
-                                continue;
-                            }
-
-                            new_versions
-                                .into_iter()
-                                .map(|versions| {
-                                    range.remove(versions.clone());
-                                    SyncNeedV1::Full { versions }
-                                })
-                                .collect()
-                        }
-                        SyncNeedV1::Partial { version, seqs } => {
-                            let range = req_partials.entry((actor_id, version)).or_default();
-                            let mut new_seqs =
-                                RangeInclusiveSet::from_iter(seqs.clone().into_iter());
-
-                            for seqs in seqs {
-                                for overlap in range.overlapping(&seqs) {
-                                    new_seqs.remove(overlap.clone());
-                                }
-                            }
-
-                            if new_seqs.is_empty() {
-                                continue;
-                            }
-
-                            vec![SyncNeedV1::Partial {
-                                version,
-                                seqs: new_seqs
-                                    .into_iter()
-                                    .map(|seqs| {
-                                        range.remove(seqs.clone());
-                                        seqs
-                                    })
-                                    .collect(),
-                            }]
-                        }
-                        need => {vec![need]},
-                    };
-
-                    if actual_needs.is_empty() {
-                        warn!(%server_actor_id, %actor_id, %addr, "nothing to send!");
-                        continue;
+            'servers: for (server_actor_id, addr, state, mut tx) in servers {
+                let mut last_need: HashMap<ActorId, Vec<SyncNeedV1>> = HashMap::new();
+                for _ in 0..10 {
+                    let needs = our_sync_state.get_n_needs(&state, 10);
+                    last_need = needs.clone();
+                    if needs.is_empty() {
+                        break;
                     }
 
-                    let req_len = actual_needs.len();
+                    our_sync_state.merge_needs(&needs);
+
+                    let needs = Vec::from_iter(needs.into_iter());
+                    let req_len = needs.len();
 
                     if let Err(e) = encode_sync_msg(
                         &mut codec,
                         &mut encode_buf,
                         &mut send_buf,
-                        SyncMessage::V1(SyncMessageV1::Request(vec![(actor_id, actual_needs)])),
+                        SyncMessage::V1(SyncMessageV1::Request(needs)),
                     ) {
-                        error!(%server_actor_id, %actor_id, %addr, "could not encode sync request: {e} (elapsed: {:?})", start.elapsed());
+                        error!(%server_actor_id, %server_actor_id, %addr, "could not encode sync request: {e} (elapsed: {:?})", start.elapsed());
                         continue 'servers;
                     }
 
@@ -1338,7 +1224,26 @@ pub async fn parallel_sync(
                     tokio::task::yield_now().await;
                 }
 
-                if needs.is_empty() {
+                if last_need.is_empty() {
+                    if let Some(ts) = state.last_cleared_ts {
+                        if let Some(last_seen) = our_empty_ts.get(&server_actor_id) {
+                            if last_seen.is_none() || last_seen.unwrap() < ts {
+                                if let Err(e) = encode_sync_msg(
+                                    &mut codec,
+                                    &mut encode_buf,
+                                    &mut send_buf,
+                                    SyncMessage::V1(SyncMessageV1::Request(vec![(server_actor_id, vec![SyncNeedV1::Empty { ts: *last_seen }])])),
+                                ) {
+                                    error!(%server_actor_id, %server_actor_id, %addr, "could not encode sync request: {e} (elapsed: {:?})", start.elapsed());
+                                } else {
+                                    if let Err(e) = write_buf(&mut send_buf, &mut tx).await {
+                                        error!(%server_actor_id, %addr, "could not write sync requests: {e} (elapsed: {:?})", start.elapsed());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if let Err(e) = tx.finish().instrument(info_span!("quic_finish")).await {
                         warn!("could not finish stream while sending sync requests: {e}");
                     }
@@ -1346,7 +1251,7 @@ pub async fn parallel_sync(
                     continue;
                 }
 
-                next_servers.push((server_actor_id, addr, needs, tx));
+                next_servers.push((server_actor_id, addr, state, tx));
             }
             servers = next_servers;
         }
@@ -1480,93 +1385,6 @@ pub fn distribute_available_needs(
 
     final_needs
 }
-
-pub fn distribute_available_needs2(
-    our_state: SyncStateV1,
-    states: Vec<(ActorId, SyncStateV1)>,
-) -> HashMap<ActorId, Vec<(ActorId, SyncNeedV1)>> {
-    let mut final_needs: HashMap<ActorId, Vec<(ActorId, SyncNeedV1)>> = HashMap::new();
-    let states_map: HashMap<_, _> = states.clone().into_iter().collect();
-    let actors: Vec<_> = states.iter().map(|(id, _)| *id).collect();
-    let mut our_state = our_state;
-    for (actor_id, state) in states {
-        let actor_needs = our_state.compute_available_needs(&state);
-        for (needs_actor, needs) in actor_needs.clone() {
-            for need in needs {
-                match need {
-                    SyncNeedV1::Full { versions } => {
-                        let chunks: Vec<_> = crate::api::peer::chunk_range(versions, 10).collect();
-                        let mut actors: Vec<_> = actors.clone();
-
-                        for i in 0..chunks.len() {
-                            let rest: Vec<(_, _)> = chunks[i..].iter().map(|c| (
-                                needs_actor,
-                                SyncNeedV1::Full {
-                                    versions: c.clone(),
-                                })
-                            ).collect();
-                            if actors.len() <= 1 {
-                                final_needs.entry(actor_id).or_default().extend_from_slice(&rest);
-                                break
-                            }
-
-                            let mut remove_actor = vec![];
-                            let version_actors: Vec<_> = actors
-                                .clone()
-                                .into_iter()
-                                .filter(|x| {
-                                    let state = states_map
-                                        .get(x)
-                                        .cloned()
-                                        .unwrap_or_default();
-
-                                    if state.heads.get(&needs_actor).unwrap_or(&Default::default())
-                                        < chunks[i].start() {
-                                        remove_actor.push(*x);
-                                    }
-
-                                    state.contains(&needs_actor, &chunks[i])
-                                })
-                                .collect();
-
-                            let least = get_actor_min(&version_actors, &final_needs);
-                            let least = least.unwrap_or(actor_id);
-
-                            final_needs.entry(least).or_default().push((
-                                needs_actor,
-                                SyncNeedV1::Full {
-                                    versions: chunks[i].clone(),
-                                },
-                            ));
-                            actors.retain(|x| !remove_actor.contains(x));
-                        }
-                    }
-                    _ => {
-                        final_needs
-                            .entry(actor_id)
-                            .or_default()
-                            .push((needs_actor, need));
-                    }
-                }
-            }
-        }
-        our_state.merge_needs(&actor_needs);
-    }
-
-    final_needs
-}
-
-pub fn get_actor_min(
-    actors: &Vec<ActorId>,
-    cur_needs: &HashMap<ActorId, Vec<(ActorId, SyncNeedV1)>>,
-) -> Option<ActorId> {
-    let min = actors
-        .iter()
-        .min_by_key(|x| cur_needs.get(x).unwrap_or(&vec![]).len());
-
-    min.cloned()
-}
-
 
 #[tracing::instrument(skip(agent, bookie, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]
 pub async fn serve_sync(
