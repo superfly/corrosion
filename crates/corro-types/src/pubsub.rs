@@ -43,7 +43,7 @@ use crate::{
     agent::SplitPool,
     api::QueryEvent,
     base::CrsqlDbVersion,
-    schema::{Schema, Table},
+    schema::{Generated, Schema, Table},
     sqlite::CrConn,
 };
 
@@ -1925,12 +1925,14 @@ fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSele
 }
 
 fn insert_col(set: &mut HashSet<String>, schema: &Schema, tbl_name: &str, name: &str) {
-    if let Some(generated) = schema
-        .tables
-        .get(tbl_name)
-        .and_then(|tbl| tbl.columns.get(name).and_then(|col| col.generated.as_ref()))
+    let table = schema.tables.get(tbl_name);
+    if let Some(generated) =
+        table.and_then(|tbl| tbl.columns.get(name).and_then(|col| col.generated.as_ref()))
     {
-        set.extend(generated.from.clone());
+        // recursively check for generated columns
+        for name in generated.from.iter() {
+            insert_col(set, schema, tbl_name, name);
+        }
     } else {
         set.insert(name.to_owned());
     }
