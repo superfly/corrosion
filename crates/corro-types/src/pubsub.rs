@@ -373,6 +373,10 @@ impl MatcherHandle {
         self.inner.id
     }
 
+    pub fn hash(&self) -> &str {
+        &self.inner.hash
+    }
+
     pub fn parsed_columns(&self) -> &[ResultColumn] {
         &self.inner.parsed.columns
     }

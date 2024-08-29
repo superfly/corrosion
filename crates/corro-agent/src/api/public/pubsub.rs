@@ -93,6 +93,7 @@ async fn sub_by_id(
 
     let (evt_tx, evt_rx) = mpsc::channel(512);
 
+    let query_hash = matcher.hash().to_owned();
     tokio::spawn(catch_up_sub(matcher, params, rx, evt_tx));
 
     let (tx, body) = hyper::Body::channel();
@@ -102,6 +103,7 @@ async fn sub_by_id(
     hyper::Response::builder()
         .status(StatusCode::OK)
         .header("corro-query-id", id.to_string())
+        .header("corro-query-hash", query_hash)
         .body(body)
         .expect("could not build query response body")
 }
@@ -701,6 +703,7 @@ pub async fn api_v1_subs(
         tripwire,
     ));
 
+    let query_hash = handle.hash().to_owned();
     let matcher_id = match upsert_sub(
         handle,
         maybe_created,
@@ -718,6 +721,7 @@ pub async fn api_v1_subs(
     hyper::Response::builder()
         .status(StatusCode::OK)
         .header("corro-query-id", matcher_id.to_string())
+        .header("corro-query-hash", query_hash)
         .body(body)
         .expect("could not generate ok http response for query request")
 }
