@@ -23,9 +23,15 @@ pub struct Column {
     pub sql_type: (SqliteType, Option<String>),
     pub nullable: bool,
     pub default_value: Option<String>,
-    pub generated: Option<String>,
+    pub generated: Option<Generated>,
     pub primary_key: bool,
     pub raw: ColumnDefinition,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct Generated {
+    pub raw: String,
+    pub from: Vec<String>,
 }
 
 impl Column {
@@ -830,8 +836,16 @@ fn prepare_table(
                         nullable,
                         default_value,
                         generated: def.constraints.iter().find_map(|named| {
-                            if let ColumnConstraint::Generated { ref expr, .. } = named.constraint {
-                                Some(expr.to_string())
+                            if let ColumnConstraint::Generated { ref expr, ref typ } =
+                                named.constraint
+                            {
+                                trace!("generated typ: {typ:?}, expr: {expr:?}");
+                                let mut from = vec![];
+                                extract_expr_columns(expr, &mut from);
+                                Some(Generated {
+                                    raw: expr.to_string(),
+                                    from,
+                                })
                             } else {
                                 None
                             }
@@ -847,5 +861,21 @@ fn prepare_table(
             constraints: constraints.cloned(),
             options: *options,
         },
+    }
+}
+
+fn extract_expr_columns(expr: &Expr, cols: &mut Vec<String>) {
+    match expr {
+        Expr::FunctionCall {
+            args: Some(args), ..
+        } => {
+            for expr in args.iter() {
+                extract_expr_columns(expr, cols);
+            }
+        }
+        Expr::Id(colname) => {
+            cols.push(unquote(&colname.0).ok().unwrap_or(colname.0.clone()));
+        }
+        _ => {}
     }
 }
