@@ -14,7 +14,7 @@ use corro_api_types::{
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
-use metrics::counter;
+use metrics::{counter, histogram};
 use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::{
     params_from_iter,
@@ -43,7 +43,7 @@ use crate::{
     agent::SplitPool,
     api::QueryEvent,
     base::CrsqlDbVersion,
-    schema::{Generated, Schema, Table},
+    schema::{Schema, Table},
     sqlite::CrConn,
 };
 
@@ -282,10 +282,12 @@ impl SubsManager {
                 match e {
                     mpsc::error::TrySendError::Full(item) => {
                         warn!("channel is full, falling back to async send");
+
                         let changes_tx = handle.inner.changes_tx.clone();
                         tokio::spawn(async move {
                             _ = changes_tx.send(item).await;
                         });
+                        counter!("corro.subs.changes.channel.async_fallbacks_count", "sql_hash" => handle.inner.hash.clone()).increment(1);
                     }
                     mpsc::error::TrySendError::Closed(_) => {
                         if let Some(handle) = self.remove(id) {
@@ -1197,7 +1199,9 @@ impl Matcher {
                         }
                         break;
                     }
-                    debug!(sub_id = %self.id, "processed {buf_count} changes for subscription in {:?}", start.elapsed());
+                    let elapsed = start.elapsed();
+                    debug!(sub_id = %self.id, "processed {buf_count} changes for subscription in {elapsed:?}");
+                    histogram!("corro.subs.changes.processing.duration.seconds", "sql_hash" => self.hash.clone()).record(elapsed);
                     buf_count = 0;
                 }
                 Branch::PurgeOldChanges => {
