@@ -610,8 +610,9 @@ impl Matcher {
         sql: &str,
     ) -> Result<(Matcher, MatcherHandle), MatcherError> {
         let sub_path = Self::sub_path(subs_path.as_path(), id);
+        let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
 
-        info!("Initializing subscription at {sub_path}");
+        info!(%sql_hash, sub_id = %id, "Initializing subscription at {sub_path}");
 
         std::fs::create_dir_all(&sub_path)?;
 
@@ -783,7 +784,7 @@ impl Matcher {
                     .join(","),
             );
 
-            info!(sub_id = %id, "modified query for table '{tbl_name}': {new_query}");
+            info!(%sql_hash, sub_id = %id, "modified query for table '{tbl_name}': {new_query}");
 
             statements.insert(
                 tbl_name.clone(),
@@ -802,10 +803,6 @@ impl Matcher {
 
         // big channel to not miss anything
         let (changes_tx, changes_rx) = mpsc::channel(20480);
-
-        let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
-
-        trace!("PARSED: {parsed:?}");
 
         let handle = MatcherHandle {
             inner: Arc::new(InnerMatcherHandle {
@@ -1109,7 +1106,7 @@ impl Matcher {
                 tbl_name,
                 pks,
             ) {
-                info!(sub_id = %self.id, "query plan for table '{tbl_name}':\n{plan}");
+                info!(sub_id = %self.id, sql_hash = %self.hash, "query plan for table '{tbl_name}':\n{plan}");
             }
         }
 
