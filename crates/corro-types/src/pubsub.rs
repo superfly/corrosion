@@ -1174,6 +1174,9 @@ impl Matcher {
                     }
                 },
                 _ = process_changes_deadline.as_mut() => {
+                    process_changes_deadline
+                        .as_mut()
+                        .reset((Instant::now() + PROCESS_BUFFER_DEADLINE).into());
                     if buf_count == 0 {
                         continue;
                     }
