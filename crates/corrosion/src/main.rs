@@ -543,10 +543,10 @@ fn main() {
 }
 
 #[derive(Parser)]
-#[clap(version = VERSION)]
+#[command(version = VERSION)]
 struct Cli {
     /// Set the config file path
-    #[clap(
+    #[arg(
         long = "config",
         short,
         global = true,
@@ -554,13 +554,13 @@ struct Cli {
     )]
     config_path: Utf8PathBuf,
 
-    #[clap(long, global = true)]
+    #[arg(long, global = true)]
     api_addr: Option<SocketAddr>,
 
-    #[clap(long, global = true)]
+    #[arg(long, global = true)]
     db_path: Option<Utf8PathBuf>,
 
-    #[clap(long, global = true)]
+    #[arg(long, global = true)]
     admin_path: Option<Utf8PathBuf>,
 
     #[command(subcommand)]
