@@ -56,6 +56,7 @@ type FramedBody = FramedRead<IoBodyStreamReader, LinesBytesCodec>;
 
 pub struct SubscriptionStream<T> {
     id: Uuid,
+    hash: Option<String>,
     client: hyper::Client<HttpConnector, Body>,
     api_addr: SocketAddr,
     observed_eoq: bool,
@@ -91,6 +92,7 @@ where
 {
     pub fn new(
         id: Uuid,
+        hash: Option<String>,
         client: hyper::Client<HttpConnector, Body>,
         api_addr: SocketAddr,
         body: hyper::Body,
@@ -98,6 +100,7 @@ where
     ) -> Self {
         Self {
             id,
+            hash,
             client,
             api_addr,
             observed_eoq: change_id.is_some(),
@@ -115,6 +118,10 @@ where
 
     pub fn id(&self) -> Uuid {
         self.id
+    }
+
+    pub fn hash(&self) -> Option<&str> {
+        self.hash.as_deref()
     }
 
     pub fn api_addr(&self) -> SocketAddr {
