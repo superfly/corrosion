@@ -137,9 +137,14 @@ impl CorrosionApiClient {
             .get(HeaderName::from_static("corro-query-id"))
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
             .ok_or(Error::ExpectedQueryId)?;
+        let hash = res
+            .headers()
+            .get(HeaderName::from_static("corro-query-hash"))
+            .and_then(|v| v.to_str().map(ToOwned::to_owned).ok());
 
         Ok(SubscriptionStream::new(
             id,
+            hash,
             self.api_client.clone(),
             self.api_addr,
             res.into_body(),
@@ -189,8 +194,14 @@ impl CorrosionApiClient {
             return Err(Error::UnexpectedStatusCode(res.status()));
         }
 
+        let hash = res
+            .headers()
+            .get(HeaderName::from_static("corro-query-hash"))
+            .and_then(|v| v.to_str().map(ToOwned::to_owned).ok());
+
         Ok(SubscriptionStream::new(
             id,
+            hash,
             self.api_client.clone(),
             self.api_addr,
             res.into_body(),
