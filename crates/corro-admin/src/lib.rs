@@ -27,6 +27,7 @@ use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
+use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
@@ -96,12 +97,22 @@ pub enum Command {
     Locks { top: usize },
     Cluster(ClusterCommand),
     Actor(ActorCommand),
+    Subs(SubsCommand),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncCommand {
     Generate,
     ReconcileGaps,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SubsCommand {
+    Info {
+        hash: Option<String>,
+        id: Option<Uuid>,
+    },
+    List,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,6 +531,62 @@ async fn handle_conn(
                     }
 
                     send_success(&mut stream).await;
+                }
+                Command::Subs(SubsCommand::List) => {
+                    let handles = agent.subs_manager().get_handles();
+                    let uuid_to_hash = handles
+                        .iter()
+                        .map(|(k, v)| {
+                            json!({
+                               "id": k,
+                               "hash": v.hash(),
+                                "sql": v.sql().lines().map(|c| c.trim()).collect::<Vec<_>>().join(" "),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+
+                    send(&mut stream, Response::Json(serde_json::json!(uuid_to_hash))).await;
+                    send_success(&mut stream).await;
+                }
+                Command::Subs(SubsCommand::Info { hash, id }) => {
+                    let matcher_handle = match (hash, id) {
+                        (Some(hash), _) => agent.subs_manager().get_by_hash(&hash),
+                        (None, Some(id)) => agent.subs_manager().get(&id),
+                        (None, None) => {
+                            send_error(&mut stream, "specify hash or id for subscription").await;
+                            continue;
+                        }
+                    };
+                    match matcher_handle {
+                        Some(matcher) => {
+                            let statements = matcher
+                                .cached_stmts()
+                                .iter()
+                                .map(|(table, stmts)| {
+                                    json!({
+                                        table: stmts.new_query(),
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            send(
+                                &mut stream,
+                                Response::Json(serde_json::json!({
+                                    "id": matcher.id(),
+                                    "hash": matcher.hash(),
+                                    "path": matcher.subs_path(),
+                                    "last_change_id": matcher.last_change_id_sent(),
+                                    "original_query": matcher.sql().lines().map(|c| c.trim()).collect::<Vec<_>>().join(" "),
+                                    "statements": statements,
+                                })),
+                            )
+                            .await;
+                            send_success(&mut stream).await;
+                        }
+                        None => {
+                            send_error(&mut stream, "unknown subscription hash or id").await;
+                            continue;
+                        }
+                    };
                 }
             },
             Ok(None) => {

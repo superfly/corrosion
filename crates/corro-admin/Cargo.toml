@@ -20,3 +20,4 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 tripwire = { path = "../tripwire" }
 rangemap = { workspace = true }
+uuid = { workspace = true }
