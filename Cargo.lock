@@ -741,6 +741,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tripwire",
+ "uuid",
 ]
 
 [[package]]

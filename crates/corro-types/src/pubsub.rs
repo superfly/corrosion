@@ -74,6 +74,14 @@ impl SubsManager {
         self.0.read().get_by_query(sql)
     }
 
+    pub fn get_by_hash(&self, hash: &str) -> Option<MatcherHandle> {
+        self.0.read().get_by_hash(hash)
+    }
+
+    pub fn get_handles(&self) -> BTreeMap<Uuid, MatcherHandle> {
+        self.0.read().handles.clone()
+    }
+
     pub fn get_or_insert(
         &self,
         sql: &str,
@@ -328,6 +336,13 @@ impl InnerSubsManager {
             .and_then(|id| self.handles.get(id).cloned())
     }
 
+    pub fn get_by_hash(&self, hash: &str) -> Option<MatcherHandle> {
+        self.handles
+            .values()
+            .find(|x| x.inner.hash == hash)
+            .cloned()
+    }
+
     fn remove(&mut self, id: &Uuid) -> Option<MatcherHandle> {
         let handle = self.handles.remove(id)?;
         self.queries.remove(&handle.inner.sql);
@@ -364,6 +379,9 @@ struct InnerMatcherHandle {
     cancel: CancellationToken,
     changes_tx: mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>,
     last_change_rx: watch::Receiver<ChangeId>,
+    // some state from the matcher so we can take a look later
+    subs_path: String,
+    cached_statements: HashMap<String, MatcherStmt>,
 }
 
 type MatchCandidates = IndexMap<TableName, IndexSet<Vec<u8>>>;
@@ -371,6 +389,10 @@ type MatchCandidates = IndexMap<TableName, IndexSet<Vec<u8>>>;
 impl MatcherHandle {
     pub fn id(&self) -> Uuid {
         self.inner.id
+    }
+
+    pub fn sql(&self) -> &String {
+        &self.inner.sql
     }
 
     pub fn hash(&self) -> &str {
@@ -383,6 +405,14 @@ impl MatcherHandle {
 
     pub fn col_names(&self) -> &[ColumnName] {
         &self.inner.col_names
+    }
+
+    pub fn subs_path(&self) -> &String {
+        &self.inner.subs_path
+    }
+
+    pub fn cached_stmts(&self) -> &HashMap<String, MatcherStmt> {
+        &self.inner.cached_statements
     }
 
     pub async fn cleanup(self) {
@@ -591,6 +621,12 @@ pub struct Matcher {
 pub struct MatcherStmt {
     new_query: String,
     temp_query: String,
+}
+
+impl MatcherStmt {
+    pub fn new_query(self: &Self) -> &String {
+        return &self.new_query;
+    }
 }
 
 const CHANGE_ID_COL: &str = "id";
@@ -819,6 +855,8 @@ impl Matcher {
                 cancel: cancel.clone(),
                 last_change_rx,
                 changes_tx,
+                cached_statements: statements.clone(),
+                subs_path: sub_path.to_string(),
             }),
             state: state.clone(),
         };
