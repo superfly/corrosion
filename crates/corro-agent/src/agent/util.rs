@@ -56,6 +56,7 @@ use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+use crate::api::public::pubsub::api_v1_updates;
 
 use super::BcastCache;
 
@@ -205,6 +206,20 @@ pub async fn setup_http_api_handler(
         .route(
             "/v1/subscriptions",
             post(api_v1_subs).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(128)),
+            ),
+        )
+        .route(
+            "/v1/notifications/:table",
+            post(api_v1_updates).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -712,6 +727,15 @@ pub async fn process_fully_buffered_changes(
                 error!(%db_version, "could not match changes from db version: {e}");
             }
         });
+
+        block_in_place(|| {
+            if let Err(e) = agent
+                .updates_manager()
+                .match_changes_from_db_version(&conn, db_version)
+            {
+                error!(%db_version, "could not match changes from db version: {e}");
+            }
+        });
     }
 
     Ok(db_version.is_some())
@@ -1053,6 +1077,8 @@ pub async fn process_multiple_changes(
         agent
             .subs_manager()
             .match_changes(changeset.changes(), db_version);
+
+        agent.updates_manager().match_changes(changeset.changes(), db_version);
     }
 
     histogram!("corro.agent.changes.processing.time.seconds").record(start.elapsed());

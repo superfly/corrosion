@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
+use corro_types::updates::{Handle, Manager, UpdateHandle, UpdatesManager};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct SubParams {
@@ -74,7 +75,9 @@ async fn sub_by_id(
                 bcast_cache_write.remove(&id);
                 if let Some(handle) = subs.remove(&id) {
                     info!(sub_id = %id, "Removed subscription from sub_by_id");
-                    tokio::spawn(handle.cleanup());
+                    tokio::spawn(async move {
+                        handle.cleanup().await;
+                    });
                 }
 
                 return hyper::Response::builder()
@@ -130,7 +133,7 @@ const MAX_UNSUB_TIME: Duration = Duration::from_secs(120);
 const RECEIVERS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 pub async fn process_sub_channel(
-    subs: SubsManager,
+    subs: impl Manager,
     id: Uuid,
     tx: broadcast::Sender<(Bytes, QueryEventMeta)>,
     mut evt_rx: mpsc::Receiver<QueryEvent>,
@@ -662,6 +665,98 @@ pub async fn upsert_sub(
     }
 }
 
+pub async fn upsert_update(
+    handle: UpdateHandle,
+    maybe_created: Option<MatcherCreated>,
+    updates: &UpdatesManager,
+    bcast_write: &mut MatcherBroadcastCache,
+    tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
+) -> Result<Uuid, MatcherUpsertError> {
+    let sub_rx = if let Some(created) = maybe_created {
+        let (sub_tx, sub_rx) = broadcast::channel(10240);
+        bcast_write.insert(handle.id(), sub_tx.clone());
+        tokio::spawn(process_sub_channel(
+            updates.clone(),
+            handle.id(),
+            sub_tx,
+            created.evt_rx,
+        ));
+
+        sub_rx
+    } else {
+        let id = handle.id();
+        let sub_tx = bcast_write
+            .get(&id)
+            .cloned()
+            .ok_or(MatcherUpsertError::MissingBroadcaster)?;
+        debug!("found matcher handle");
+
+        sub_tx.subscribe()
+    };
+
+    tokio::spawn(forward_sub_to_sender(
+        handle.clone(),
+        sub_rx,
+        tx,
+        false
+    ));
+
+    Ok(handle.id())
+}
+
+pub async fn api_v1_updates(
+    Extension(agent): Extension<Agent>,
+    Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
+    Extension(tripwire): Extension<Tripwire>,
+    axum::extract::Path(table): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    info!("Received update request for table: {table}");
+
+    let mut bcast_write = bcast_cache.write().await;
+    let updates = agent.updates_manager();
+
+    let upsert_res = updates.get_or_insert(
+        &table,
+        &agent.schema().read(),
+        agent.pool(),
+        tripwire.clone(),
+    );
+
+    let (handle, maybe_created) = match upsert_res {
+        Ok(res) => res,
+        Err(e) => return hyper::Response::<hyper::Body>::from(MatcherUpsertError::from(e)),
+    };
+
+    let (tx, body) = hyper::Body::channel();
+    let (forward_tx, forward_rx) = mpsc::channel(10240);
+
+    tokio::spawn(forward_bytes_to_body_sender(
+        handle.id(),
+        forward_rx,
+        tx,
+        tripwire,
+    ));
+
+    let update_id = match upsert_update(
+        handle,
+        maybe_created,
+        updates,
+        &mut bcast_write,
+        forward_tx,
+    )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => return hyper::Response::<hyper::Body>::from(e),
+    };
+
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header("corro-query-id", update_id.to_string())
+        .body(body)
+        .expect("could not generate ok http response for update request")
+}
+
 pub async fn api_v1_subs(
     Extension(agent): Extension<Agent>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
@@ -729,7 +824,7 @@ pub async fn api_v1_subs(
 const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 
 async fn forward_sub_to_sender(
-    handle: MatcherHandle,
+    handle: impl Handle,
     mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
     tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
     skip_rows: bool,
@@ -970,6 +1065,23 @@ mod tests {
 
             assert_eq!(res.status(), StatusCode::OK);
 
+            // only want notifications
+            let mut notify_res = api_v1_updates(
+                Extension(agent.clone()),
+                Extension(bcast_cache.clone()),
+                Extension(tripwire.clone()),
+                axum::extract::Path("tests".to_string()),
+            )
+                .await
+                .into_response();
+
+            if !notify_res.status().is_success() {
+                let b = notify_res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(notify_res.status(), StatusCode::OK);
+
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
                 axum::Json(vec![Statement::WithParams(
@@ -983,6 +1095,13 @@ mod tests {
 
             let mut rows = RowsIter {
                 body: res.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
+            let mut notify_rows = RowsIter {
+                body: notify_res.into_body(),
                 codec: LinesCodec::new(),
                 buf: BytesMut::new(),
                 done: false,
@@ -1042,6 +1161,16 @@ mod tests {
                 )
             );
 
+            assert_eq!(notify_rows.recv().await.unwrap().unwrap(), QueryEvent::Notify(
+                TableName("tests".into()),
+                vec!["service-id-3".into()],
+            ));
+
+            assert_eq!(notify_rows.recv().await.unwrap().unwrap(), QueryEvent::Notify(
+                TableName("tests".into()),
+                vec!["service-id-4".into()],
+            ));
+
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
                 Extension(bcast_cache.clone()),
@@ -1079,6 +1208,30 @@ mod tests {
                 )
             );
 
+            // new subscriber for notifications
+            let mut notify_res2 = api_v1_updates(
+                Extension(agent.clone()),
+                Extension(bcast_cache.clone()),
+                Extension(tripwire.clone()),
+                axum::extract::Path("tests".to_string()),
+            )
+                .await
+                .into_response();
+
+            if !notify_res2.status().is_success() {
+                let b = notify_res2.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(notify_res2.status(), StatusCode::OK);
+
+            let mut notify_rows2 = RowsIter {
+                body: notify_res2.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
                 axum::Json(vec![Statement::WithParams(
@@ -1100,6 +1253,15 @@ mod tests {
             assert_eq!(rows.recv().await.unwrap().unwrap(), query_evt);
 
             assert_eq!(rows_from.recv().await.unwrap().unwrap(), query_evt);
+
+            let notify_evt = QueryEvent::Notify(
+                TableName("tests".into()),
+                vec!["service-id-5".into()],
+            );
+
+            assert_eq!(notify_rows.recv().await.unwrap().unwrap(), notify_evt);
+
+            assert_eq!(notify_rows2.recv().await.unwrap().unwrap(), notify_evt);
 
             // subscriber who arrives later!
 
@@ -1314,6 +1476,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn match_buffered_changes() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
+        let start = Instant::now();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
         let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
@@ -1392,6 +1555,32 @@ mod tests {
         }
 
         assert_eq!(res.status(), StatusCode::OK);
+
+        // only notifications
+        let mut notify_res = api_v1_updates(
+            Extension(ta1.agent.clone()),
+            Extension(bcast_cache.clone()),
+            Extension(tripwire.clone()),
+            axum::extract::Path("tests".to_string()),
+        )
+            .await
+            .into_response();
+
+        if !notify_res.status().is_success() {
+            let b = notify_res.body_mut().data().await.unwrap().unwrap();
+            println!("body: {}", String::from_utf8_lossy(&b));
+        }
+
+        assert_eq!(notify_res.status(), StatusCode::OK);
+
+        let mut notify_rows = RowsIter {
+            body: notify_res.into_body(),
+            codec: LinesCodec::new(),
+            buf: BytesMut::new(),
+            done: false,
+        };
+
+        println!("done with update call in {:?}", start.elapsed());
 
         let mut rows = RowsIter {
             body: res.into_body(),
@@ -1496,6 +1685,15 @@ mod tests {
                 RowId(2),
                 vec![Integer(2), "two".into(), "two line".into()],
                 ChangeId(1)
+            )
+        );
+
+        let notify_res = timeout(Duration::from_secs(5), notify_rows.recv()).await?;
+        assert_eq!(
+            notify_res.unwrap().unwrap(),
+            QueryEvent::Notify(
+                TableName("buftests".into()),
+                vec![Integer(2)],
             )
         );
 

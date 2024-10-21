@@ -11,6 +11,7 @@ use corro_types::{
     broadcast::{FocaCmd, FocaInput, Timestamp},
     sqlite::SqlitePoolError,
     sync::generate_sync,
+    updates::Handle,
 };
 use futures::{SinkExt, TryStreamExt};
 use rusqlite::{named_params, params, OptionalExtension};

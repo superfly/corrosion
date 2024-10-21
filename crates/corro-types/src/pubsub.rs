@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
 use compact_str::{format_compact, ToCompactString};
@@ -47,6 +48,7 @@ use crate::{
     sqlite::CrConn,
 };
 
+use crate::updates::{Handle, Manager};
 pub use corro_api_types::sqlite::ChangeType;
 
 #[derive(Debug, Default, Clone)]
@@ -64,6 +66,22 @@ pub struct MatcherCreated {
 }
 
 const SUB_EVENT_CHANNEL_CAP: usize = 512;
+
+impl Manager for SubsManager {
+    fn get(&self, id: &Uuid) -> Option<Box<dyn Handle>> {
+        self.0
+            .read()
+            .get(id)
+            .map(|h| Box::new(h) as Box<dyn Handle>)
+    }
+
+    fn remove(&self, id: &Uuid) -> Option<Box<dyn Handle + Send>> {
+        let mut inner = self.0.write();
+        inner
+            .remove(id)
+            .map(|h| Box::new(h) as Box<dyn Handle + Send>)
+    }
+}
 
 impl SubsManager {
     pub fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
@@ -241,7 +259,9 @@ impl SubsManager {
                     }
                     mpsc::error::TrySendError::Closed(_) => {
                         if let Some(handle) = self.remove(id) {
-                            tokio::spawn(handle.cleanup());
+                            tokio::spawn(async move {
+                                handle.cleanup().await;
+                            });
                         }
                     }
                 }
@@ -299,7 +319,7 @@ impl SubsManager {
                     }
                     mpsc::error::TrySendError::Closed(_) => {
                         if let Some(handle) = self.remove(id) {
-                            tokio::spawn(handle.cleanup());
+                            tokio::spawn(async move { handle.cleanup().await });
                         }
                     }
                 }
@@ -309,7 +329,7 @@ impl SubsManager {
 }
 
 #[derive(Debug)]
-struct MatchableChange<'a> {
+pub struct MatchableChange<'a> {
     table: &'a TableName,
     pk: &'a [u8],
     column: &'a ColumnName,
@@ -384,13 +404,25 @@ struct InnerMatcherHandle {
     cached_statements: HashMap<String, MatcherStmt>,
 }
 
-type MatchCandidates = IndexMap<TableName, IndexSet<Vec<u8>>>;
+pub type MatchCandidates = IndexMap<TableName, IndexSet<Vec<u8>>>;
 
-impl MatcherHandle {
-    pub fn id(&self) -> Uuid {
+#[async_trait]
+impl Handle for MatcherHandle {
+    fn id(&self) -> Uuid {
         self.inner.id
     }
 
+    fn cancelled(&self) -> WaitForCancellationFuture {
+        self.inner.cancel.cancelled()
+    }
+
+    async fn cleanup(&self) {
+        self.inner.cancel.cancel();
+        info!(sub_id = %self.inner.id, "Canceled subscription");
+    }
+}
+
+impl MatcherHandle {
     pub fn sql(&self) -> &String {
         &self.inner.sql
     }
@@ -415,11 +447,6 @@ impl MatcherHandle {
         &self.inner.cached_statements
     }
 
-    pub async fn cleanup(self) {
-        self.inner.cancel.cancel();
-        info!(sub_id = %self.inner.id, "Canceled subscription");
-    }
-
     pub fn pool(&self) -> &RusqlitePool {
         &self.inner.pool
     }
@@ -430,10 +457,6 @@ impl MatcherHandle {
         while !state.is_running() {
             cvar.wait(&mut state);
         }
-    }
-
-    pub fn cancelled(&self) -> WaitForCancellationFuture {
-        self.inner.cancel.cancelled()
     }
 
     pub fn max_change_id(&self, conn: &Connection) -> rusqlite::Result<ChangeId> {
@@ -951,7 +974,8 @@ impl Matcher {
         sql: &str,
         tripwire: Tripwire,
     ) -> Result<MatcherHandle, MatcherError> {
-        let (mut matcher, handle) = Self::new(id, subs_path, schema, &state_conn, evt_tx, sql)?;
+        let (mut matcher, handle) =
+            Self::new(id, subs_path, schema, &state_conn, evt_tx, sql)?;
 
         let pk_cols = matcher
             .pks

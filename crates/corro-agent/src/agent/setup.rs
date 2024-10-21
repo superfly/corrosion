@@ -41,6 +41,7 @@ use corro_types::{
     schema::{init_schema, Schema},
     sqlite::CrConn,
 };
+use corro_types::updates::UpdatesManager;
 
 /// Runtime state for the Corrosion agent
 pub struct AgentOptions {
@@ -106,6 +107,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let subs_manager = SubsManager::default();
 
+    let updates_manager = UpdatesManager::default();
     // Setup subscription handlers
     let subs_bcast_cache = setup_spawn_subscriptions(
         &subs_manager,
@@ -210,6 +212,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         schema: RwLock::new(schema),
         cluster_id,
         subs_manager,
+        updates_manager,
         tripwire,
     });
 
