@@ -56,6 +56,7 @@ pub enum QueryEventMeta {
     EndOfQuery(Option<ChangeId>),
     Change(ChangeId),
     Error,
+    Notify,
 }
 
 /// RowId newtype to differentiate from ChangeId

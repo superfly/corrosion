@@ -25,6 +25,7 @@ use corro_types::{
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
+    updates::{match_changes, match_changes_from_db_version},
 };
 use std::{
     cmp,
@@ -36,6 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::api::public::update::api_v1_updates;
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
@@ -205,6 +207,20 @@ pub async fn setup_http_api_handler(
         .route(
             "/v1/subscriptions",
             post(api_v1_subs).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(128)),
+            ),
+        )
+        .route(
+            "/v1/updates/:table",
+            post(api_v1_updates).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -705,11 +721,16 @@ pub async fn process_fully_buffered_changes(
     if let Some(db_version) = db_version {
         let conn = agent.pool().read().await?;
         block_in_place(|| {
-            if let Err(e) = agent
-                .subs_manager()
-                .match_changes_from_db_version(&conn, db_version)
+            if let Err(e) = match_changes_from_db_version(agent.subs_manager(), &conn, db_version) {
+                error!(%db_version, "could not match changes for subs from db version: {e}");
+            }
+        });
+
+        block_in_place(|| {
+            if let Err(e) =
+                match_changes_from_db_version(agent.updates_manager(), &conn, db_version)
             {
-                error!(%db_version, "could not match changes from db version: {e}");
+                error!(%db_version, "could not match changes for updates from db version: {e}");
             }
         });
     }
@@ -969,7 +990,6 @@ pub async fn process_multiple_changes(
                     .snapshot()
             };
 
-
             snap.update_cleared_ts(&tx, ts)
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
@@ -988,11 +1008,10 @@ pub async fn process_multiple_changes(
 
         if let Some(ts) = last_cleared {
             let mut booked_writer = agent
-                    .booked()
-                    .blocking_write("process_multiple_changes(update_cleared_ts)");
+                .booked()
+                .blocking_write("process_multiple_changes(update_cleared_ts)");
             booked_writer.update_cleared_ts(ts);
         }
-
 
         for (_, changeset, _, _) in changesets.iter() {
             if let Some(ts) = changeset.ts() {
@@ -1050,9 +1069,8 @@ pub async fn process_multiple_changes(
 
     for (_actor_id, changeset, db_version, _src) in changesets {
         change_chunk_size += changeset.changes().len();
-        agent
-            .subs_manager()
-            .match_changes(changeset.changes(), db_version);
+        match_changes(agent.subs_manager(), changeset.changes(), db_version);
+        match_changes(agent.updates_manager(), changeset.changes(), db_version);
     }
 
     histogram!("corro.agent.changes.processing.time.seconds").record(start.elapsed());

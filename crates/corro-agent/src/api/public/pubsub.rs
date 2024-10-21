@@ -3,6 +3,7 @@ use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::{format_compact, ToCompactString};
+use corro_types::updates::Handle;
 use corro_types::{
     agent::Agent,
     api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
@@ -74,7 +75,9 @@ async fn sub_by_id(
                 bcast_cache_write.remove(&id);
                 if let Some(handle) = subs.remove(&id) {
                     info!(sub_id = %id, "Removed subscription from sub_by_id");
-                    tokio::spawn(handle.cleanup());
+                    tokio::spawn(async move {
+                        handle.cleanup().await;
+                    });
                 }
 
                 return hyper::Response::builder()
@@ -883,12 +886,14 @@ mod tests {
     use corro_types::base::{CrsqlDbVersion, CrsqlSeq, Version};
     use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
     use corro_types::pubsub::pack_columns;
+    use corro_types::updates::NotifyEvent;
     use corro_types::{
         api::{ChangeId, RowId},
         config::Config,
         pubsub::ChangeType,
     };
     use http_body::Body;
+    use serde::de::DeserializeOwned;
     use spawn::wait_for_all_pending_handles;
     use std::ops::RangeInclusive;
     use std::time::Instant;
@@ -898,6 +903,7 @@ mod tests {
 
     use super::*;
     use crate::agent::process_multiple_changes;
+    use crate::api::public::update::{api_v1_updates, SharedUpdateBroadcastCache};
     use crate::{
         agent::setup,
         api::public::{api_v1_db_schema, api_v1_transactions},
@@ -951,6 +957,7 @@ mod tests {
         assert!(body.0.results.len() == 2);
 
         let bcast_cache: SharedMatcherBroadcastCache = Default::default();
+        let update_bcast_cache: SharedUpdateBroadcastCache = Default::default();
 
         {
             let mut res = api_v1_subs(
@@ -970,6 +977,23 @@ mod tests {
 
             assert_eq!(res.status(), StatusCode::OK);
 
+            // only want notifications
+            let mut notify_res = api_v1_updates(
+                Extension(agent.clone()),
+                Extension(update_bcast_cache.clone()),
+                Extension(tripwire.clone()),
+                axum::extract::Path("tests".to_string()),
+            )
+            .await
+            .into_response();
+
+            if !notify_res.status().is_success() {
+                let b = notify_res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(notify_res.status(), StatusCode::OK);
+
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
                 axum::Json(vec![Statement::WithParams(
@@ -988,18 +1012,25 @@ mod tests {
                 done: false,
             };
 
+            let mut notify_rows = RowsIter {
+                body: notify_res.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Columns(vec!["id".into(), "text".into()])
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(
                     RowId(2),
                     vec!["service-id-2".into(), "service-name-2".into()]
@@ -1007,12 +1038,12 @@ mod tests {
             );
 
             assert!(matches!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::EndOfQuery { .. }
             ));
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Change(
                     ChangeType::Insert,
                     RowId(3),
@@ -1033,13 +1064,23 @@ mod tests {
             assert_eq!(status_code, StatusCode::OK);
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Change(
                     ChangeType::Insert,
                     RowId(4),
                     vec!["service-id-4".into(), "service-name-4".into()],
                     ChangeId(2)
                 )
+            );
+
+            assert_eq!(
+                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-3".into()],)
+            );
+
+            assert_eq!(
+                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-4".into()],)
             );
 
             let mut res = api_v1_subs(
@@ -1070,7 +1111,7 @@ mod tests {
             };
 
             assert_eq!(
-                rows_from.recv().await.unwrap().unwrap(),
+                rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Change(
                     ChangeType::Insert,
                     RowId(4),
@@ -1078,6 +1119,30 @@ mod tests {
                     ChangeId(2)
                 )
             );
+
+            // new subscriber for updates
+            let mut notify_res2 = api_v1_updates(
+                Extension(agent.clone()),
+                Extension(update_bcast_cache.clone()),
+                Extension(tripwire.clone()),
+                axum::extract::Path("tests".to_string()),
+            )
+            .await
+            .into_response();
+
+            if !notify_res2.status().is_success() {
+                let b = notify_res2.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(notify_res2.status(), StatusCode::OK);
+
+            let mut notify_rows2 = RowsIter {
+                body: notify_res2.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
@@ -1097,9 +1162,24 @@ mod tests {
                 ChangeId(3),
             );
 
-            assert_eq!(rows.recv().await.unwrap().unwrap(), query_evt);
+            assert_eq!(rows.recv::<QueryEvent>().await.unwrap().unwrap(), query_evt);
 
-            assert_eq!(rows_from.recv().await.unwrap().unwrap(), query_evt);
+            assert_eq!(
+                rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
+                query_evt
+            );
+
+            let notify_evt = NotifyEvent::Notify(ChangeType::Update, vec!["service-id-5".into()]);
+
+            assert_eq!(
+                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                notify_evt
+            );
+
+            assert_eq!(
+                notify_rows2.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                notify_evt
+            );
 
             // subscriber who arrives later!
 
@@ -1128,17 +1208,17 @@ mod tests {
             };
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Columns(vec!["id".into(), "text".into()])
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(
                     RowId(2),
                     vec!["service-id-2".into(), "service-name-2".into()]
@@ -1146,7 +1226,7 @@ mod tests {
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(
                     RowId(3),
                     vec!["service-id-3".into(), "service-name-3".into()],
@@ -1154,7 +1234,7 @@ mod tests {
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(
                     RowId(4),
                     vec!["service-id-4".into(), "service-name-4".into()],
@@ -1162,11 +1242,43 @@ mod tests {
             );
 
             assert_eq!(
-                rows.recv().await.unwrap().unwrap(),
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Row(
                     RowId(5),
                     vec!["service-id-5".into(), "service-name-5".into()]
                 )
+            );
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-6".into(), "service-name-6".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "delete from  tests where id = ?".into(),
+                    vec!["service-id-6".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            assert_eq!(
+                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-6".into()],)
+            );
+
+            assert_eq!(
+                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                NotifyEvent::Notify(ChangeType::Delete, vec!["service-id-6".into()],)
             );
         }
 
@@ -1200,7 +1312,7 @@ mod tests {
         };
 
         assert_eq!(
-            rows_from.recv().await.unwrap().unwrap(),
+            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(4),
@@ -1210,7 +1322,7 @@ mod tests {
         );
 
         assert_eq!(
-            rows_from.recv().await.unwrap().unwrap(),
+            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(5),
@@ -1260,7 +1372,7 @@ mod tests {
         assert_eq!(status_code, StatusCode::OK);
 
         assert_eq!(
-            rows_from.recv().await.unwrap().unwrap(),
+            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(6),
@@ -1299,7 +1411,7 @@ mod tests {
         };
 
         assert_eq!(
-            rows_from.recv().await.unwrap().unwrap(),
+            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(6),
@@ -1314,6 +1426,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn match_buffered_changes() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
+
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
         let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
@@ -1376,6 +1489,7 @@ mod tests {
         .await?;
 
         let bcast_cache: SharedMatcherBroadcastCache = Default::default();
+        let update_bcast_cache: SharedUpdateBroadcastCache = Default::default();
         let mut res = api_v1_subs(
             Extension(ta1.agent.clone()),
             Extension(bcast_cache.clone()),
@@ -1393,6 +1507,30 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
 
+        // only notifications
+        let mut notify_res = api_v1_updates(
+            Extension(ta1.agent.clone()),
+            Extension(update_bcast_cache.clone()),
+            Extension(tripwire.clone()),
+            axum::extract::Path("buftests".to_string()),
+        )
+        .await
+        .into_response();
+
+        if !notify_res.status().is_success() {
+            let b = notify_res.body_mut().data().await.unwrap().unwrap();
+            println!("body: {}", String::from_utf8_lossy(&b));
+        }
+
+        assert_eq!(notify_res.status(), StatusCode::OK);
+
+        let mut notify_rows = RowsIter {
+            body: notify_res.into_body(),
+            codec: LinesCodec::new(),
+            buf: BytesMut::new(),
+            done: false,
+        };
+
         let mut rows = RowsIter {
             body: res.into_body(),
             codec: LinesCodec::new(),
@@ -1401,17 +1539,17 @@ mod tests {
         };
 
         assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
+            rows.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::Columns(vec!["pk".into(), "col1".into(), "col2".into()])
         );
 
         assert_eq!(
-            rows.recv().await.unwrap().unwrap(),
+            rows.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::Row(RowId(1), vec![Integer(1), "one".into(), "one line".into()])
         );
 
         assert!(matches!(
-            rows.recv().await.unwrap().unwrap(),
+            rows.recv::<QueryEvent>().await.unwrap().unwrap(),
             QueryEvent::EndOfQuery { .. }
         ));
 
@@ -1487,7 +1625,7 @@ mod tests {
         )
         .await?;
 
-        let res = timeout(Duration::from_secs(5), rows.recv()).await?;
+        let res = timeout(Duration::from_secs(5), rows.recv::<QueryEvent>()).await?;
 
         assert_eq!(
             res.unwrap().unwrap(),
@@ -1497,6 +1635,12 @@ mod tests {
                 vec![Integer(2), "two".into(), "two line".into()],
                 ChangeId(1)
             )
+        );
+
+        let notify_res = timeout(Duration::from_secs(5), notify_rows.recv::<NotifyEvent>()).await?;
+        assert_eq!(
+            notify_res.unwrap().unwrap(),
+            NotifyEvent::Notify(ChangeType::Update, vec![Integer(2)],)
         );
 
         tripwire_tx.send(()).await.ok();
@@ -1514,7 +1658,7 @@ mod tests {
     }
 
     impl RowsIter {
-        async fn recv(&mut self) -> Option<eyre::Result<QueryEvent>> {
+        async fn recv<T: DeserializeOwned>(&mut self) -> Option<eyre::Result<T>> {
             if self.done {
                 return None;
             }
