@@ -15,7 +15,7 @@ use corro_api_types::{
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
-use metrics::{counter, histogram};
+use metrics::histogram;
 use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::{
     params_from_iter,

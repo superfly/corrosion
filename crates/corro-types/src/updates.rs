@@ -463,9 +463,12 @@ pub fn match_changes_from_db_version(
     db_version: CrsqlDbVersion,
 ) -> rusqlite::Result<()> {
     let handles = manager.get_handles();
+    if handles.is_empty() {
+        return Ok(())
+    }
 
     let mut candidates = handles
-        .iter()
+        .into_iter()
         .map(|(id, handle)| (id, (MatchCandidates::new(), handle)))
         .collect::<BTreeMap<_, _>>();
 
@@ -508,7 +511,7 @@ pub fn match_changes_from_db_version(
         for (table, pks) in candidates.iter() {
             let count = pks.len();
             match_count += count;
-            counter!("corro.subs.changes.matched.count", "sql_hash" => handle.hash().clone(), "table" => table.to_string()).increment(count as u64);
+            counter!("corro.subs.changes.matched.count", "sql_hash" => handle.hash().to_string(), "table" => table.to_string()).increment(count as u64);
         }
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
@@ -524,7 +527,7 @@ pub fn match_changes_from_db_version(
                     });
                 }
                 mpsc::error::TrySendError::Closed(_) => {
-                    if let Some(handle) = manager.remove(id) {
+                    if let Some(handle) = manager.remove(&id) {
                         tokio::spawn(async move {
                             handle.cleanup().await;
                         });
