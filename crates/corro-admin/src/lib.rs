@@ -295,7 +295,12 @@ async fn handle_conn(
 ) -> Result<(), AdminError> {
     // wrap in stream in line delimited json decoder
     let mut stream: FramedStream = tokio_serde::Framed::new(
-        tokio_util::codec::Framed::new(stream, LengthDelimitedCodec::new()),
+        tokio_util::codec::Framed::new(
+            stream,
+            LengthDelimitedCodec::builder()
+                .max_frame_length(100 * 1_024 * 1_024)
+                .new_codec(),
+        ),
         Json::<Command, Response>::default(),
     );
 
