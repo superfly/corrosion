@@ -1063,13 +1063,13 @@ pub async fn parallel_sync(
                 *actor_id,
                 *addr,
                 async {
-                    let mut codec = LengthDelimitedCodec::new();
+                    let mut codec = LengthDelimitedCodec::builder().max_frame_length(100 * 1_024 * 1_024).new_codec();
                     let mut send_buf = BytesMut::new();
                     let mut encode_buf = BytesMut::new();
 
                     let actor_id = *actor_id;
                     let (mut tx, rx) = transport.open_bi(*addr).await?;
-                    let mut read = FramedRead::new(rx, LengthDelimitedCodec::new());
+                    let mut read = FramedRead::new(rx, LengthDelimitedCodec::builder().max_frame_length(100 * 1_024 * 1_024).new_codec());
 
                     encode_write_bipayload_msg(
                         &mut codec,
@@ -1240,7 +1240,7 @@ pub async fn parallel_sync(
 
     tokio::spawn(async move {
         // reusable buffers and constructs
-        let mut codec = LengthDelimitedCodec::new();
+        let mut codec = LengthDelimitedCodec::builder().max_frame_length(100 * 1_024 * 1_024).new_codec();
         let mut send_buf = BytesMut::new();
         let mut encode_buf = BytesMut::new();
 
@@ -1481,7 +1481,9 @@ pub async fn serve_sync(
     tracing::Span::current().set_parent(context);
 
     debug!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "received sync request");
-    let mut codec = LengthDelimitedCodec::new();
+    let mut codec = LengthDelimitedCodec::builder()
+        .max_frame_length(100 * 1_024 * 1_024)
+        .new_codec();
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
 
