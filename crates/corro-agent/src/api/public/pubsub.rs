@@ -3,6 +3,7 @@ use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::{format_compact, ToCompactString};
+use corro_types::updates::{Handle, Manager, UpdateHandle, UpdatesManager};
 use corro_types::{
     agent::Agent,
     api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
@@ -24,7 +25,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
-use corro_types::updates::{Handle, Manager, UpdateHandle, UpdatesManager};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct SubParams {
@@ -694,12 +694,7 @@ pub async fn upsert_update(
         sub_tx.subscribe()
     };
 
-    tokio::spawn(forward_sub_to_sender(
-        handle.clone(),
-        sub_rx,
-        tx,
-        false
-    ));
+    tokio::spawn(forward_sub_to_sender(handle.clone(), sub_rx, tx, false));
 
     Ok(handle.id())
 }
@@ -737,18 +732,11 @@ pub async fn api_v1_updates(
         tripwire,
     ));
 
-    let update_id = match upsert_update(
-        handle,
-        maybe_created,
-        updates,
-        &mut bcast_write,
-        forward_tx,
-    )
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => return hyper::Response::<hyper::Body>::from(e),
-    };
+    let update_id =
+        match upsert_update(handle, maybe_created, updates, &mut bcast_write, forward_tx).await {
+            Ok(id) => id,
+            Err(e) => return hyper::Response::<hyper::Body>::from(e),
+        };
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -1072,8 +1060,8 @@ mod tests {
                 Extension(tripwire.clone()),
                 axum::extract::Path("tests".to_string()),
             )
-                .await
-                .into_response();
+            .await
+            .into_response();
 
             if !notify_res.status().is_success() {
                 let b = notify_res.body_mut().data().await.unwrap().unwrap();
@@ -1161,15 +1149,15 @@ mod tests {
                 )
             );
 
-            assert_eq!(notify_rows.recv().await.unwrap().unwrap(), QueryEvent::Notify(
-                TableName("tests".into()),
-                vec!["service-id-3".into()],
-            ));
+            assert_eq!(
+                notify_rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Notify(TableName("tests".into()), vec!["service-id-3".into()],)
+            );
 
-            assert_eq!(notify_rows.recv().await.unwrap().unwrap(), QueryEvent::Notify(
-                TableName("tests".into()),
-                vec!["service-id-4".into()],
-            ));
+            assert_eq!(
+                notify_rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Notify(TableName("tests".into()), vec!["service-id-4".into()],)
+            );
 
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
@@ -1215,8 +1203,8 @@ mod tests {
                 Extension(tripwire.clone()),
                 axum::extract::Path("tests".to_string()),
             )
-                .await
-                .into_response();
+            .await
+            .into_response();
 
             if !notify_res2.status().is_success() {
                 let b = notify_res2.body_mut().data().await.unwrap().unwrap();
@@ -1254,10 +1242,8 @@ mod tests {
 
             assert_eq!(rows_from.recv().await.unwrap().unwrap(), query_evt);
 
-            let notify_evt = QueryEvent::Notify(
-                TableName("tests".into()),
-                vec!["service-id-5".into()],
-            );
+            let notify_evt =
+                QueryEvent::Notify(TableName("tests".into()), vec!["service-id-5".into()]);
 
             assert_eq!(notify_rows.recv().await.unwrap().unwrap(), notify_evt);
 
@@ -1561,10 +1547,10 @@ mod tests {
             Extension(ta1.agent.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
-            axum::extract::Path("tests".to_string()),
+            axum::extract::Path("buftests".to_string()),
         )
-            .await
-            .into_response();
+        .await
+        .into_response();
 
         if !notify_res.status().is_success() {
             let b = notify_res.body_mut().data().await.unwrap().unwrap();
@@ -1691,10 +1677,7 @@ mod tests {
         let notify_res = timeout(Duration::from_secs(5), notify_rows.recv()).await?;
         assert_eq!(
             notify_res.unwrap().unwrap(),
-            QueryEvent::Notify(
-                TableName("buftests".into()),
-                vec![Integer(2)],
-            )
+            QueryEvent::Notify(TableName("buftests".into()), vec![Integer(2)],)
         );
 
         tripwire_tx.send(()).await.ok();

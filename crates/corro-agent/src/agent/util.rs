@@ -25,6 +25,7 @@ use corro_types::{
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
+    updates::{match_changes, match_changes_from_db_version},
 };
 use std::{
     cmp,
@@ -36,6 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::api::public::pubsub::api_v1_updates;
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
@@ -56,7 +58,6 @@ use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
-use crate::api::public::pubsub::api_v1_updates;
 
 use super::BcastCache;
 
@@ -720,18 +721,14 @@ pub async fn process_fully_buffered_changes(
     if let Some(db_version) = db_version {
         let conn = agent.pool().read().await?;
         block_in_place(|| {
-            if let Err(e) = agent
-                .subs_manager()
-                .match_changes_from_db_version(&conn, db_version)
-            {
+            if let Err(e) = match_changes_from_db_version(agent.subs_manager(), &conn, db_version) {
                 error!(%db_version, "could not match changes from db version: {e}");
             }
         });
 
         block_in_place(|| {
-            if let Err(e) = agent
-                .updates_manager()
-                .match_changes_from_db_version(&conn, db_version)
+            if let Err(e) =
+                match_changes_from_db_version(agent.updates_manager(), &conn, db_version)
             {
                 error!(%db_version, "could not match changes from db version: {e}");
             }
@@ -993,7 +990,6 @@ pub async fn process_multiple_changes(
                     .snapshot()
             };
 
-
             snap.update_cleared_ts(&tx, ts)
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
@@ -1012,11 +1008,10 @@ pub async fn process_multiple_changes(
 
         if let Some(ts) = last_cleared {
             let mut booked_writer = agent
-                    .booked()
-                    .blocking_write("process_multiple_changes(update_cleared_ts)");
+                .booked()
+                .blocking_write("process_multiple_changes(update_cleared_ts)");
             booked_writer.update_cleared_ts(ts);
         }
-
 
         for (_, changeset, _, _) in changesets.iter() {
             if let Some(ts) = changeset.ts() {
@@ -1074,11 +1069,8 @@ pub async fn process_multiple_changes(
 
     for (_actor_id, changeset, db_version, _src) in changesets {
         change_chunk_size += changeset.changes().len();
-        agent
-            .subs_manager()
-            .match_changes(changeset.changes(), db_version);
-
-        agent.updates_manager().match_changes(changeset.changes(), db_version);
+        match_changes(agent.subs_manager(), changeset.changes(), db_version);
+        match_changes(agent.updates_manager(), changeset.changes(), db_version);
     }
 
     histogram!("corro.agent.changes.processing.time.seconds").record(start.elapsed());

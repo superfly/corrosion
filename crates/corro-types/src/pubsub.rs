@@ -60,7 +60,7 @@ struct InnerSubsManager {
     queries: HashMap<String, Uuid>,
 }
 
-// tools to bootstrap a new subscriber
+// tools to bootstrap a new subscriber or notifier
 pub struct MatcherCreated {
     pub evt_rx: mpsc::Receiver<QueryEvent>,
 }
@@ -68,6 +68,10 @@ pub struct MatcherCreated {
 const SUB_EVENT_CHANNEL_CAP: usize = 512;
 
 impl Manager for SubsManager {
+    fn trait_type(&self) -> String {
+        "subs".to_string()
+    }
+
     fn get(&self, id: &Uuid) -> Option<Box<dyn Handle>> {
         self.0
             .read()
@@ -80,6 +84,14 @@ impl Manager for SubsManager {
         inner
             .remove(id)
             .map(|h| Box::new(h) as Box<dyn Handle + Send>)
+    }
+
+    fn get_handles(&self) -> BTreeMap<Uuid, Box<dyn Handle>> {
+        let handles = { self.0.read().handles.clone() };
+        handles
+            .into_iter()
+            .map(|(id, x)| (id, Box::new(x) as Box<dyn Handle>))
+            .collect()
     }
 }
 
@@ -184,155 +196,13 @@ impl SubsManager {
         let mut inner = self.0.write();
         inner.remove(id)
     }
-
-    pub fn match_changes_from_db_version(
-        &self,
-        conn: &Connection,
-        db_version: CrsqlDbVersion,
-    ) -> rusqlite::Result<()> {
-        let handles = {
-            let inner = self.0.read();
-            if inner.handles.is_empty() {
-                return Ok(());
-            }
-            inner.handles.clone()
-        };
-
-        let mut candidates = handles
-            .iter()
-            .map(|(id, handle)| (id, (MatchCandidates::new(), handle)))
-            .collect::<BTreeMap<_, _>>();
-
-        {
-            let mut prepped = conn.prepare_cached(
-                r#"
-            SELECT "table", pk, cid
-                FROM crsql_changes
-                WHERE db_version = ?
-                ORDER BY seq ASC
-            "#,
-            )?;
-
-            let rows = prepped.query_map([db_version], |row| {
-                Ok((
-                    row.get::<_, TableName>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, ColumnName>(2)?,
-                ))
-            })?;
-
-            for change_res in rows {
-                let (table, pk, column) = change_res?;
-
-                for (_id, (candidates, handle)) in candidates.iter_mut() {
-                    let change = MatchableChange {
-                        table: &table,
-                        pk: &pk,
-                        column: &column,
-                    };
-                    handle.filter_matchable_change(candidates, change);
-                }
-            }
-        }
-
-        // metrics...
-        for (id, (candidates, handle)) in candidates {
-            let mut match_count = 0;
-
-            for (table, pks) in candidates.iter() {
-                let count = pks.len();
-                match_count += count;
-                counter!("corro.subs.changes.matched.count", "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string()).increment(count as u64);
-            }
-
-            trace!(sub_id = %id, %db_version, "found {match_count} candidates");
-
-            if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
-                error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
-                match e {
-                    mpsc::error::TrySendError::Full(item) => {
-                        warn!("channel is full, falling back to async send");
-                        let changes_tx = handle.inner.changes_tx.clone();
-                        tokio::spawn(async move {
-                            _ = changes_tx.send(item).await;
-                        });
-                    }
-                    mpsc::error::TrySendError::Closed(_) => {
-                        if let Some(handle) = self.remove(id) {
-                            tokio::spawn(async move {
-                                handle.cleanup().await;
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn match_changes(&self, changes: &[Change], db_version: CrsqlDbVersion) {
-        trace!(
-            %db_version,
-            "trying to match changes to subscribers, len: {}",
-            changes.len()
-        );
-        if changes.is_empty() {
-            return;
-        }
-        let handles = {
-            let inner = self.0.read();
-            if inner.handles.is_empty() {
-                return;
-            }
-            inner.handles.clone()
-        };
-
-        for (id, handle) in handles.iter() {
-            trace!(sub_id = %id, %db_version, "attempting to match changes to a subscription");
-            let mut candidates = MatchCandidates::new();
-            let mut match_count = 0;
-            for change in changes.iter().map(MatchableChange::from) {
-                if handle.filter_matchable_change(&mut candidates, change) {
-                    match_count += 1;
-                }
-            }
-
-            // metrics...
-            for (table, pks) in candidates.iter() {
-                counter!("corro.subs.changes.matched.count", "sql_hash" => handle.inner.hash.clone(), "table" => table.to_string()).increment(pks.len() as u64);
-            }
-
-            trace!(sub_id = %id, %db_version, "found {match_count} candidates");
-
-            if let Err(e) = handle.inner.changes_tx.try_send((candidates, db_version)) {
-                error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
-                match e {
-                    mpsc::error::TrySendError::Full(item) => {
-                        warn!("channel is full, falling back to async send");
-
-                        let changes_tx = handle.inner.changes_tx.clone();
-                        tokio::spawn(async move {
-                            _ = changes_tx.send(item).await;
-                        });
-                        counter!("corro.subs.changes.channel.async_fallbacks_count", "sql_hash" => handle.inner.hash.clone()).increment(1);
-                    }
-                    mpsc::error::TrySendError::Closed(_) => {
-                        if let Some(handle) = self.remove(id) {
-                            tokio::spawn(async move { handle.cleanup().await });
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
 pub struct MatchableChange<'a> {
-    table: &'a TableName,
-    pk: &'a [u8],
-    column: &'a ColumnName,
+    pub table: &'a TableName,
+    pub pk: &'a [u8],
+    pub column: &'a ColumnName,
 }
 
 impl<'a> From<&'a Change> for MatchableChange<'a> {
@@ -412,23 +282,64 @@ impl Handle for MatcherHandle {
         self.inner.id
     }
 
+    fn hash(&self) -> &str {
+        &self.inner.hash
+    }
+
     fn cancelled(&self) -> WaitForCancellationFuture {
         self.inner.cancel.cancelled()
+    }
+
+    fn changes_tx(&self) -> mpsc::Sender<(MatchCandidates, CrsqlDbVersion)> {
+        self.inner.changes_tx.clone()
     }
 
     async fn cleanup(&self) {
         self.inner.cancel.cancel();
         info!(sub_id = %self.inner.id, "Canceled subscription");
     }
+
+    fn filter_matchable_change(
+        &self,
+        candidates: &mut MatchCandidates,
+        change: MatchableChange,
+    ) -> bool {
+        trace!("filtering change {change:?}");
+        // don't double process the same pk
+        if candidates
+            .get(change.table)
+            .map(|pks| pks.contains(change.pk))
+            .unwrap_or_default()
+        {
+            trace!("already contained key");
+            return false;
+        }
+
+        // don't consider changes that don't have both the table + col in the matcher query
+        if !self
+            .inner
+            .parsed
+            .table_columns
+            .get(change.table.as_str())
+            .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
+            .unwrap_or_default()
+        {
+            trace!("could not match against parsed query table and columns");
+            return false;
+        }
+
+        if let Some(v) = candidates.get_mut(change.table) {
+            v.insert(change.pk.to_vec())
+        } else {
+            candidates.insert(change.table.clone(), [change.pk.to_vec()].into());
+            true
+        }
+    }
 }
 
 impl MatcherHandle {
     pub fn sql(&self) -> &String {
         &self.inner.sql
-    }
-
-    pub fn hash(&self) -> &str {
-        &self.inner.hash
     }
 
     pub fn parsed_columns(&self) -> &[ResultColumn] {
@@ -580,43 +491,6 @@ impl MatcherHandle {
         .map_err(|_| MatcherError::EventReceiverClosed)?;
 
         Ok(max_change_id)
-    }
-
-    fn filter_matchable_change(
-        &self,
-        candidates: &mut MatchCandidates,
-        change: MatchableChange,
-    ) -> bool {
-        trace!("filtering change {change:?}");
-        // don't double process the same pk
-        if candidates
-            .get(change.table)
-            .map(|pks| pks.contains(change.pk))
-            .unwrap_or_default()
-        {
-            trace!("already contained key");
-            return false;
-        }
-
-        // don't consider changes that don't have both the table + col in the matcher query
-        if !self
-            .inner
-            .parsed
-            .table_columns
-            .get(change.table.as_str())
-            .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
-            .unwrap_or_default()
-        {
-            trace!("could not match against parsed query table and columns");
-            return false;
-        }
-
-        if let Some(v) = candidates.get_mut(change.table) {
-            v.insert(change.pk.to_vec())
-        } else {
-            candidates.insert(change.table.clone(), [change.pk.to_vec()].into());
-            true
-        }
     }
 }
 
@@ -974,8 +848,7 @@ impl Matcher {
         sql: &str,
         tripwire: Tripwire,
     ) -> Result<MatcherHandle, MatcherError> {
-        let (mut matcher, handle) =
-            Self::new(id, subs_path, schema, &state_conn, evt_tx, sql)?;
+        let (mut matcher, handle) = Self::new(id, subs_path, schema, &state_conn, evt_tx, sql)?;
 
         let pk_cols = matcher
             .pks
