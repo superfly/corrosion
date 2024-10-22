@@ -144,16 +144,6 @@ impl InnerUpdatesManager {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum UpdateError {
-    #[error(transparent)]
-    Lexer(#[from] sqlite3_parser::lexer::sql::Error),
-    #[error("one statement is required for matching")]
-    StatementRequired,
-    #[error("unsupported statement")]
-    UnsupportedStatement,
-}
-
 impl UpdatesManager {
     pub fn get(&self, table: &str) -> Option<UpdateHandle> {
         let id = self.0.read().tables.get(table).cloned();
@@ -250,7 +240,7 @@ impl UpdateHandle {
 
     pub async fn cleanup(self) {
         self.inner.cancel.cancel();
-        info!(sub_id = %self.inner.name, "Canceled subscription");
+        info!(update_id = %self.inner.id, "Canceled update");
     }
 }
 
@@ -263,7 +253,7 @@ fn handle_candidates(
     }
 
     trace!(
-        "got some candidates! {:?}",
+        "got some candidates for updates! {:?}",
         candidates.keys().collect::<Vec<_>>()
     );
 
@@ -287,33 +277,6 @@ fn handle_candidates(
     return Ok(());
 }
 
-// async fn cmd_loop(
-//     id: Uuid,
-//     evt_rx: mpsc::Sender<QueryEvent>,
-//     mut changes_rx: mpsc::Receiver<(MatchCandidates, CrsqlDbVersion)>,
-//     mut tripwire: Tripwire,
-// ) {
-//     loop {
-//         tokio::select! {
-//             Some((candidates, _)) = changes_rx.recv() => {
-//                 // todo(s): handle error properly
-//                 if let Err(e) = block_in_place(|| handle_candidates(evt_rx.clone(), candidates)) {
-//                     if !matches!(e, MatcherError::EventReceiverClosed) {
-//                         error!(id = %id, "could not handle change: {e}");
-//                     }
-//                     break;
-//                 }
-//             }
-//             _ = &mut tripwire => {
-//                 trace!(sub_id = %id, "tripped cmd_loop, returning");
-//                 // just return!
-//                 return;
-//             }
-//         }
-//     }
-//     info!("changes channel closed! exiting.");
-// }
-
 async fn cmd_loop(
     id: Uuid,
     cancel: CancellationToken,
@@ -325,7 +288,6 @@ async fn cmd_loop(
     const PROCESS_BUFFER_DEADLINE: Duration = Duration::from_millis(600);
 
     info!(sub_id = %id, "Starting loop to run the subscription");
-    // todo(somtochiama): do we need to have some state like MatcherRunning?
 
     let mut buf = MatchCandidates::new();
     let mut buf_count = 0;
@@ -339,7 +301,7 @@ async fn cmd_loop(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                info!(sub_id = %id, "Acknowledged subscription cancellation, breaking loop.");
+                info!(sub_id = %id, "Acknowledged updates cancellation, breaking loop.");
                 break;
             }
             Some((candidates, _)) = changes_rx.recv() => {
@@ -366,7 +328,6 @@ async fn cmd_loop(
             },
             _ = &mut tripwire => {
                 trace!(sub_id = %id, "tripped cmd_loop, returning");
-                // just return!
                 return;
             }
             else => {
@@ -397,7 +358,7 @@ async fn cmd_loop(
         }
     }
 
-    debug!(id = %id, "matcher loop is done");
+    debug!(id = %id, "update loop is done");
 }
 
 pub fn match_changes(manager: &impl Manager, changes: &[Change], db_version: CrsqlDbVersion) {
@@ -428,14 +389,14 @@ pub fn match_changes(manager: &impl Manager, changes: &[Change], db_version: Crs
 
         // metrics...
         for (table, pks) in candidates.iter() {
-            counter!("corro.subs.changes.updates.count", "table" => table.to_string())
+            counter!(format!("corro.{trait_type}.changes.matched.count"), "table" => table.to_string())
                 .increment(pks.len() as u64);
         }
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
         if let Err(e) = handle.changes_tx().try_send((candidates, db_version)) {
-            error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
+            error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
             match e {
                 mpsc::error::TrySendError::Full(item) => {
                     warn!("channel is full, falling back to async send");
@@ -467,6 +428,7 @@ pub fn match_changes_from_db_version(
         return Ok(())
     }
 
+    let trait_type = manager.trait_type();
     let mut candidates = handles
         .into_iter()
         .map(|(id, handle)| (id, (MatchCandidates::new(), handle)))
@@ -511,13 +473,13 @@ pub fn match_changes_from_db_version(
         for (table, pks) in candidates.iter() {
             let count = pks.len();
             match_count += count;
-            counter!("corro.subs.changes.matched.count", "sql_hash" => handle.hash().to_string(), "table" => table.to_string()).increment(count as u64);
+            counter!(format!("corro.{trait_type}.changes.matched.count"), "sql_hash" => handle.hash().to_string(), "table" => table.to_string()).increment(count as u64);
         }
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
         if let Err(e) = handle.changes_tx().try_send((candidates, db_version)) {
-            error!(sub_id = %id, "could not send change candidates to subscription handler: {e}");
+            error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
             match e {
                 mpsc::error::TrySendError::Full(item) => {
                     warn!("channel is full, falling back to async send");

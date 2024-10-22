@@ -219,7 +219,7 @@ pub async fn setup_http_api_handler(
             ),
         )
         .route(
-            "/v1/notifications/:table",
+            "/v1/updates/:table",
             post(api_v1_updates).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {

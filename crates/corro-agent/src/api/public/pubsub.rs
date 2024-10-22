@@ -689,7 +689,7 @@ pub async fn upsert_update(
             .get(&id)
             .cloned()
             .ok_or(MatcherUpsertError::MissingBroadcaster)?;
-        debug!("found matcher handle");
+        debug!("found update handle");
 
         sub_tx.subscribe()
     };
@@ -1196,7 +1196,7 @@ mod tests {
                 )
             );
 
-            // new subscriber for notifications
+            // new subscriber for updates
             let mut notify_res2 = api_v1_updates(
                 Extension(agent.clone()),
                 Extension(bcast_cache.clone()),
