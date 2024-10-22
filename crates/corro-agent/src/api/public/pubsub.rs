@@ -132,8 +132,8 @@ const MAX_UNSUB_TIME: Duration = Duration::from_secs(120);
 // this should be a fraction of the MAX_UNSUB_TIME
 const RECEIVERS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
-pub async fn process_sub_channel(
-    subs: impl Manager,
+pub async fn process_sub_channel<H: Handle>(
+    subs: impl Manager<H>,
     id: Uuid,
     tx: broadcast::Sender<(Bytes, QueryEventMeta)>,
     mut evt_rx: mpsc::Receiver<QueryEvent>,

@@ -67,31 +67,23 @@ pub struct MatcherCreated {
 
 const SUB_EVENT_CHANNEL_CAP: usize = 512;
 
-impl Manager for SubsManager {
+impl Manager<MatcherHandle> for SubsManager {
     fn trait_type(&self) -> String {
         "subs".to_string()
     }
 
-    fn get(&self, id: &Uuid) -> Option<Box<dyn Handle>> {
-        self.0
-            .read()
-            .get(id)
-            .map(|h| Box::new(h) as Box<dyn Handle>)
+    fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
+        self.0.read().get(id)
     }
 
-    fn remove(&self, id: &Uuid) -> Option<Box<dyn Handle + Send>> {
+    fn remove(&self, id: &Uuid) -> Option<MatcherHandle> {
         let mut inner = self.0.write();
-        inner
-            .remove(id)
-            .map(|h| Box::new(h) as Box<dyn Handle + Send>)
+        inner.remove(id)
     }
 
-    fn get_handles(&self) -> BTreeMap<Uuid, Box<dyn Handle>> {
+    fn get_handles(&self) -> BTreeMap<Uuid, MatcherHandle> {
         let handles = { self.0.read().handles.clone() };
-        handles
-            .into_iter()
-            .map(|(id, x)| (id, Box::new(x) as Box<dyn Handle>))
-            .collect()
+        handles.clone()
     }
 }
 

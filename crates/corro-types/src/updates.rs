@@ -24,11 +24,11 @@ use uuid::Uuid;
 #[derive(Debug, Default, Clone)]
 pub struct UpdatesManager(Arc<RwLock<InnerUpdatesManager>>);
 
-pub trait Manager {
+pub trait Manager<H: Handle> {
     fn trait_type(&self) -> String;
-    fn get(&self, id: &Uuid) -> Option<Box<dyn Handle>>;
-    fn remove(&self, id: &Uuid) -> Option<Box<dyn Handle + Send>>;
-    fn get_handles(&self) -> BTreeMap<Uuid, Box<dyn Handle>>;
+    fn get(&self, id: &Uuid) -> Option<H>;
+    fn remove(&self, id: &Uuid) -> Option<H>;
+    fn get_handles(&self) -> BTreeMap<Uuid, H>;
 }
 
 #[async_trait]
@@ -45,31 +45,23 @@ pub trait Handle {
     async fn cleanup(&self);
 }
 
-impl Manager for UpdatesManager {
+impl Manager<UpdateHandle> for UpdatesManager {
     fn trait_type(&self) -> String {
         "updates".to_string()
     }
 
-    fn get(&self, id: &Uuid) -> Option<Box<dyn Handle>> {
-        self.0
-            .read()
-            .get(id)
-            .map(|h| Box::new(h) as Box<dyn Handle>)
+    fn get(&self, id: &Uuid) -> Option<UpdateHandle> {
+        self.0.read().get(id)
     }
 
-    fn remove(&self, id: &Uuid) -> Option<Box<dyn Handle + Send>> {
+    fn remove(&self, id: &Uuid) -> Option<UpdateHandle> {
         let mut inner = self.0.write();
-        inner
-            .remove(id)
-            .map(|h| Box::new(h) as Box<dyn Handle + Send>)
+        inner.remove(id)
     }
 
-    fn get_handles(&self) -> BTreeMap<Uuid, Box<dyn Handle>> {
+    fn get_handles(&self) -> BTreeMap<Uuid, UpdateHandle> {
         let handles = { self.0.read().handles.clone() };
-        handles
-            .into_iter()
-            .map(|(id, x)| (id, Box::new(x) as Box<dyn Handle>))
-            .collect()
+        handles.clone()
     }
 }
 
@@ -361,7 +353,7 @@ async fn cmd_loop(
     debug!(id = %id, "update loop is done");
 }
 
-pub fn match_changes(manager: &impl Manager, changes: &[Change], db_version: CrsqlDbVersion) {
+pub fn match_changes<H: Handle + Send + 'static>(manager: &impl Manager<H>, changes: &[Change], db_version: CrsqlDbVersion) {
     let trait_type = manager.trait_type();
     trace!(
         %db_version,
@@ -418,8 +410,8 @@ pub fn match_changes(manager: &impl Manager, changes: &[Change], db_version: Crs
     }
 }
 
-pub fn match_changes_from_db_version(
-    manager: &impl Manager,
+pub fn match_changes_from_db_version<H: Handle + Send + 'static>(
+    manager: &impl Manager<H>,
     conn: &Connection,
     db_version: CrsqlDbVersion,
 ) -> rusqlite::Result<()> {
