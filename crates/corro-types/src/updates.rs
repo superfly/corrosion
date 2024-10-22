@@ -430,7 +430,7 @@ pub fn match_changes_from_db_version(
 
     let trait_type = manager.trait_type();
     let mut candidates = handles
-        .into_iter()
+        .iter()
         .map(|(id, handle)| (id, (MatchCandidates::new(), handle)))
         .collect::<BTreeMap<_, _>>();
 
