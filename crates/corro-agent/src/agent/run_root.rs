@@ -53,7 +53,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     } = opts;
 
     // Get our gossip address and make sure it's valid
-    let gossip_addr = gossip_server_endpoint.local_addr()?;
+    let gossip_addr = agent.external_addr().unwrap_or_else(|| agent.gossip_addr());
 
     //// Start PG server to accept query requests from PG clients
     // TODO: pull this out into a separate function?
