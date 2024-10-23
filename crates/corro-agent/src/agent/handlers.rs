@@ -18,9 +18,10 @@ use crate::{
     api::peer::parallel_sync,
     transport::Transport,
 };
+use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, Bookie, SplitPool},
+    agent::{get_last_cleared_ts, Agent, Bookie, SplitPool},
     base::CrsqlSeq,
     broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, FocaInput},
     channel::CorroReceiver,
@@ -33,7 +34,6 @@ use corro_types::agent::ChangeError;
 use corro_types::base::Version;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::store_empty_changeset;
-use corro_types::sync::get_last_cleared_ts;
 use foca::Notification;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
@@ -280,9 +280,29 @@ pub async fn handle_notifications(
                         debug!("Member Added {actor:?}");
                         counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
 
+                        let last_cleared_ts = {
+                            match agent.pool().read().await {
+                                Ok(conn) => {
+                                    get_last_cleared_ts(&conn, actor.id()).unwrap_or_else(|e| {
+                                        error!("could not get last_empty_ts: {e}");
+                                        None
+                                    })
+                                }
+                                Err(e) => {
+                                    error!("could not get read conn: {e}");
+                                    None
+                                }
+                            }
+                        };
+
+                        let members_len = {
+                            let mut members = agent.members().write();
+                            members.update_last_empty(&actor.id(), last_cleared_ts);
+                            members.states.len() as u32
+                        };
+
                         // actually added a member
                         // notify of new cluster size
-                        let members_len = agent.members().read().states.len() as u32;
                         if let Ok(size) = members_len.try_into() {
                             if let Err(e) = agent.tx_foca().send(FocaInput::ClusterSize(size)).await
                             {
@@ -356,7 +376,7 @@ pub async fn handle_notifications(
 /// multiple gigabytes and needs periodic truncation.  We don't want
 /// to schedule this task too often since it locks the whole DB.
 // TODO: can we get around the lock somehow?
-fn db_cleanup(conn: &rusqlite::Connection) -> eyre::Result<()> {
+fn wal_checkpoint(conn: &rusqlite::Connection) -> eyre::Result<()> {
     debug!("handling db_cleanup (WAL truncation)");
     let start = Instant::now();
 
@@ -381,7 +401,7 @@ fn db_cleanup(conn: &rusqlite::Connection) -> eyre::Result<()> {
 /// This function continously runs an incremental_vacuum
 /// until it is below the limit
 ///
-async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
+async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
     let mut freelist: u64 = {
         let conn = pool.read().await?;
 
@@ -433,40 +453,69 @@ async fn vacuum_db(pool: SplitPool, lim: u64) -> eyre::Result<()> {
     }
 
     let conn = pool.write_low().await?;
-    _ = conn.pragma_update(None, "busy_timeout", busy_timeout)?;
-    _ = conn.pragma_update(None, "cache_size", cache_size)?;
+    conn.pragma_update(None, "busy_timeout", busy_timeout)?;
+    conn.pragma_update(None, "cache_size", cache_size)?;
 
     Ok::<_, eyre::Report>(())
 }
 
 /// See `db_cleanup` and `vacuum_db`
-pub fn spawn_handle_db_cleanup(pool: SplitPool) {
+pub fn spawn_handle_db_maintenance(agent: &Agent) {
+    let mut wal_path = agent.config().db.path.clone();
+    let wal_threshold = agent.config().perf.wal_threshold_gb as u64;
+    wal_path.set_extension(format!("{}-wal", wal_path.extension().unwrap_or_default()));
+
+    let pool = agent.pool().clone();
+
     tokio::spawn(async move {
+        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024 * 1024;
+
+        // try to initially truncate the WAL
+        match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold).await
+        {
+            Ok(truncated) if truncated => {
+                info!("initially truncated WAL");
+            }
+            Err(e) => {
+                error!("could not initially truncate WAL: {e}");
+            }
+            _ => {}
+        }
+
         // large sleep right at the start to give node time to sync
+        sleep(Duration::from_secs(60)).await;
+
+        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(60 * 5));
+
         const MAX_DB_FREE_PAGES: u64 = 10000;
 
-        sleep(Duration::from_secs(60 * 7)).await;
-
-        let mut db_cleanup_interval = tokio::time::interval(Duration::from_secs(60 * 15));
         loop {
-            db_cleanup_interval.tick().await;
-
-            if let Err(e) = vacuum_db(pool.clone(), MAX_DB_FREE_PAGES).await {
+            vacuum_interval.tick().await;
+            if let Err(e) = vacuum_db(&pool, MAX_DB_FREE_PAGES).await {
                 error!("could not check freelist and vacuum: {e}");
             }
 
-            match pool.write_low().await {
-                Ok(conn) => {
-                    if let Err(e) = block_in_place(|| db_cleanup(&conn)) {
-                        error!("could not truncate db: {e}");
-                    }
-                }
-                Err(e) => {
-                    error!("could not acquire low priority conn to truncate wal: {e}")
-                }
+            if let Err(e) =
+                wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold)
+                    .await
+            {
+                error!("could not wal_checkpoint truncate: {e}");
             }
         }
     });
+}
+
+async fn wal_checkpoint_over_threshold(
+    wal_path: &Utf8Path,
+    pool: &SplitPool,
+    threshold: u64,
+) -> eyre::Result<bool> {
+    let should_truncate = wal_path.metadata()?.len() > threshold;
+    if should_truncate {
+        let conn = pool.write_low().await?;
+        block_in_place(|| wal_checkpoint(&conn))?;
+    }
+    Ok(should_truncate)
 }
 
 /// Handle incoming emptyset received during syncs
@@ -535,6 +584,8 @@ pub async fn handle_emptyset(
 
                             if let Some(seen_ts) = booked_read.last_cleared_ts() {
                                 if seen_ts > change.1 {
+                                    warn!("skipping change because last cleared ts '{:?}' is greater than empty ts: {:?}",
+                                        seen_ts, change.1);
                                     continue;
                                 }
                             }
@@ -656,7 +707,14 @@ pub async fn process_emptyset(
             version: None,
         })?;
 
+    tx.commit().map_err(|source| ChangeError::Rusqlite {
+        source,
+        actor_id: None,
+        version: None,
+    })?;
+
     booked_write.commit_snapshot(snap);
+
     Ok(())
 }
 
@@ -673,6 +731,7 @@ pub async fn handle_changes(
     mut tripwire: Tripwire,
 ) {
     let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
+    let max_queue_len: usize = agent.config().perf.processing_queue_len;
     let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
     let mut buf_cost = 0;
@@ -688,6 +747,7 @@ pub async fn handle_changes(
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
+    let mut drop_log_count: u64 = 0;
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
@@ -800,6 +860,26 @@ pub async fn handle_changes(
         counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
 
         if change.actor_id == agent.actor_id() {
+            continue;
+        }
+
+        // drop items when the queue is full.
+        if queue.len() > max_queue_len {
+            drop_log_count += 1;
+            if is_pow_10(drop_log_count) {
+                if drop_log_count == 1 {
+                    warn!("dropping a change because changes queue is full");
+                } else {
+                    warn!(
+                        "dropping {} changes because changes queue is full",
+                        drop_log_count
+                    );
+                }
+            }
+            // reset count
+            if drop_log_count == 100000000 {
+                drop_log_count = 0;
+            }
             continue;
         }
 
@@ -970,7 +1050,12 @@ pub async fn handle_sync(
     let mut last_cleared: HashMap<ActorId, Option<Timestamp>> = HashMap::new();
 
     for (actor_id, _) in chosen.clone() {
-        last_cleared.insert(actor_id, get_last_cleared_ts(bookie, &actor_id).await);
+        let last_ts = match agent.members().read().states.get(&actor_id) {
+            Some(state) => state.last_empty_ts,
+            None => None,
+        };
+
+        last_cleared.insert(actor_id, last_ts);
     }
 
     let start = Instant::now();
@@ -1015,7 +1100,7 @@ mod tests {
         let pragma_value = 12345u64;
         conn.pragma_update(None, "busy_timeout", pragma_value)?;
 
-        db_cleanup(&conn)?;
+        wal_checkpoint(&conn)?;
         assert_eq!(
             conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))?,
             pragma_value
@@ -1069,7 +1154,7 @@ mod tests {
             assert!(freelist > 1000);
         }
 
-        timeout(Duration::from_secs(2), vacuum_db(pool.clone(), 1000)).await??;
+        timeout(Duration::from_secs(2), vacuum_db(&pool, 1000)).await??;
 
         let conn = pool.read().await?;
         assert!(
@@ -1078,4 +1163,12 @@ mod tests {
 
         Ok(())
     }
+}
+
+#[inline]
+fn is_pow_10(i: u64) -> bool {
+    matches!(
+        i,
+        1 | 10 | 100 | 1000 | 10000 | 1000000 | 10000000 | 100000000
+    )
 }

@@ -41,7 +41,12 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                 tokio::spawn({
                     let agent = agent.clone();
                     async move {
-                        let mut framed = FramedRead::new(rx, LengthDelimitedCodec::new());
+                        let mut framed = FramedRead::new(
+                            rx,
+                            LengthDelimitedCodec::builder()
+                                .max_frame_length(100 * 1_024 * 1_024)
+                                .new_codec(),
+                        );
 
                         loop {
                             match StreamExt::next(&mut framed).await {

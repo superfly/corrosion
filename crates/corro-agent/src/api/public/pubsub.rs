@@ -93,6 +93,7 @@ async fn sub_by_id(
 
     let (evt_tx, evt_rx) = mpsc::channel(512);
 
+    let query_hash = matcher.hash().to_owned();
     tokio::spawn(catch_up_sub(matcher, params, rx, evt_tx));
 
     let (tx, body) = hyper::Body::channel();
@@ -102,6 +103,7 @@ async fn sub_by_id(
     hyper::Response::builder()
         .status(StatusCode::OK)
         .header("corro-query-id", id.to_string())
+        .header("corro-query-hash", query_hash)
         .body(body)
         .expect("could not build query response body")
 }
@@ -485,7 +487,7 @@ pub async fn catch_up_sub(
         }
     };
 
-    let min_change_id = last_change_id + 1;
+    let mut min_change_id = last_change_id + 1;
     info!(sub_id = %matcher.id(), "minimum expected change id: {min_change_id:?}");
 
     let mut pending_event = None;
@@ -522,7 +524,9 @@ pub async fn catch_up_sub(
     if let Some(change_id) = last_sub_change_id {
         debug!(sub_id = %matcher.id(), "got a change to check: {change_id:?}");
         for i in 0..5 {
-            if change_id > min_change_id {
+            min_change_id = last_change_id + 1;
+
+            if change_id >= min_change_id {
                 // missed some updates!
                 info!(sub_id = %matcher.id(), "attempt #{} to catch up subcription from change id: {change_id:?} (last: {last_change_id:?})", i+1);
 
@@ -545,7 +549,7 @@ pub async fn catch_up_sub(
             // sleep 100 millis
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if change_id > min_change_id {
+        if change_id >= min_change_id {
             _ = evt_tx
                 .send(error_to_query_event_bytes_with_meta(
                     &mut buf,
@@ -569,6 +573,8 @@ pub async fn catch_up_sub(
                 warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
                 return;
             }
+
+            last_change_id = change_id;
         }
     }
 
@@ -586,6 +592,8 @@ pub async fn catch_up_sub(
                 warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
                 return;
             }
+
+            last_change_id = change_id;
         }
     }
 
@@ -695,6 +703,7 @@ pub async fn api_v1_subs(
         tripwire,
     ));
 
+    let query_hash = handle.hash().to_owned();
     let matcher_id = match upsert_sub(
         handle,
         maybe_created,
@@ -712,6 +721,7 @@ pub async fn api_v1_subs(
     hyper::Response::builder()
         .status(StatusCode::OK)
         .header("corro-query-id", matcher_id.to_string())
+        .header("corro-query-hash", query_hash)
         .body(body)
         .expect("could not generate ok http response for query request")
 }

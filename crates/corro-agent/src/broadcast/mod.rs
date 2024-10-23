@@ -377,7 +377,9 @@ pub fn runtime_loop(
     tokio::spawn(async move {
         const BROADCAST_CUTOFF: usize = 64 * 1024;
 
-        let mut bcast_codec = LengthDelimitedCodec::new();
+        let mut bcast_codec = LengthDelimitedCodec::builder()
+            .max_frame_length(100 * 1_024 * 1_024)
+            .new_codec();
 
         let mut bcast_buf = BytesMut::new();
         let mut local_bcast_buf = BytesMut::new();

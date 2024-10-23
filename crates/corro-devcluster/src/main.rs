@@ -16,21 +16,21 @@ use std::{
 use crate::topology::Simple;
 
 #[derive(Parser)]
-#[clap(version = env!("CARGO_PKG_VERSION"))]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     /// Set the state directory path.  If not set the environment
     /// variable CORRO_DEVCLUSTER_STATE_DIR will be used
-    #[clap(long = "statedir", short = 'd', global = true)]
+    #[arg(long = "statedir", short = 'd', global = true)]
     state_directory: Option<PathBuf>,
 
     /// Set the state directory path.  If not set the environment
     /// variable CORRO_DEVCLUSTER_SCHEMA_DIR will be used
-    #[clap(long = "schemadir", short = 's', global = true)]
+    #[arg(long = "schemadir", short = 's', global = true)]
     schema_directory: Option<PathBuf>,
 
     /// Provide the binary path for corrosion.  If none is provided,
     /// corrosion will be built with nix (which may take a minute)
-    #[clap(long = "binpath", short = 'b', global = true)]
+    #[arg(long = "binpath", short = 'b', global = true)]
     binary_path: Option<String>,
 
     #[command(subcommand)]

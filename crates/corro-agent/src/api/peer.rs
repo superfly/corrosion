@@ -717,8 +717,8 @@ fn handle_need(
             if last_cleared_ts.is_none() {
                 return Ok(());
             }
+            debug!("processing empty versions to {actor_id} with ts: {:?}", ts);
             let ts = ts.unwrap_or(Default::default());
-            debug!("processing empty versions to {actor_id}");
             let mut stmt = tx.prepare_cached(
                 "
                 SELECT start_version, end_version, ts FROM __corro_bookkeeping
@@ -1063,13 +1063,13 @@ pub async fn parallel_sync(
                 *actor_id,
                 *addr,
                 async {
-                    let mut codec = LengthDelimitedCodec::new();
+                    let mut codec = LengthDelimitedCodec::builder().max_frame_length(100 * 1_024 * 1_024).new_codec();
                     let mut send_buf = BytesMut::new();
                     let mut encode_buf = BytesMut::new();
 
                     let actor_id = *actor_id;
                     let (mut tx, rx) = transport.open_bi(*addr).await?;
-                    let mut read = FramedRead::new(rx, LengthDelimitedCodec::new());
+                    let mut read = FramedRead::new(rx, LengthDelimitedCodec::builder().max_frame_length(100 * 1_024 * 1_024).new_codec());
 
                     encode_write_bipayload_msg(
                         &mut codec,
@@ -1133,14 +1133,15 @@ pub async fn parallel_sync(
 
                     let cleared_ts = their_sync_state.last_cleared_ts;
 
-                    info!(%actor_id, "got last cleared ts {cleared_ts:?}");
                     if let Some(ts) = cleared_ts {
                         if let Some(last_seen) = our_empty_ts.get(&actor_id) {
                             if last_seen.is_none() || last_seen.unwrap() < ts {
+                                debug!(%actor_id, "got last cleared ts {cleared_ts:?} - out last_seen {last_seen:?}");
                                 needs.entry(actor_id).or_default().push( SyncNeedV1::Empty { ts: *last_seen });
                             }
                         }
                     }
+
                     Ok::<_, SyncError>((needs, tx, read))
                 }.await
             )
@@ -1239,7 +1240,7 @@ pub async fn parallel_sync(
 
     tokio::spawn(async move {
         // reusable buffers and constructs
-        let mut codec = LengthDelimitedCodec::new();
+        let mut codec = LengthDelimitedCodec::builder().max_frame_length(100 * 1_024 * 1_024).new_codec();
         let mut send_buf = BytesMut::new();
         let mut encode_buf = BytesMut::new();
 
@@ -1292,7 +1293,7 @@ pub async fn parallel_sync(
                             new_versions
                                 .into_iter()
                                 .map(|versions| {
-                                    range.remove(versions.clone());
+                                    range.insert(versions.clone());
                                     SyncNeedV1::Full { versions }
                                 })
                                 .collect()
@@ -1317,7 +1318,7 @@ pub async fn parallel_sync(
                                 seqs: new_seqs
                                     .into_iter()
                                     .map(|seqs| {
-                                        range.remove(seqs.clone());
+                                        range.insert(seqs.clone());
                                         seqs
                                     })
                                     .collect(),
@@ -1371,14 +1372,13 @@ pub async fn parallel_sync(
     }.instrument(info_span!("send_sync_requests")));
 
     // now handle receiving changesets!
-
     let counts = FuturesUnordered::from_iter(readers.into_iter().map(|(actor_id, mut read)| {
         let tx_changes = agent.tx_changes().clone();
         let tx_emptyset = agent.tx_emptyset().clone();
 
         async move {
             let mut count = 0;
-
+            let mut last_empty_ts = None;
             loop {
                 match read_sync_msg(&mut read).await {
                     Ok(None) => {
@@ -1403,10 +1403,15 @@ pub async fn parallel_sync(
                             );
                             // only accept emptyset that's from the same node that's syncing
                             if change.is_empty_set() {
+                                let change_ts = change.ts();
                                 tx_emptyset
                                     .send(change)
                                     .await
                                     .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
+
+                                if change_ts > last_empty_ts {
+                                    last_empty_ts = change_ts;
+                                }
                                 continue;
                             }
 
@@ -1436,19 +1441,22 @@ pub async fn parallel_sync(
 
             debug!(%actor_id, %count, "done reading sync messages");
 
-            Ok((actor_id, count))
+            Ok((actor_id, count, last_empty_ts))
         }
         .instrument(info_span!("read_sync_requests_responses", %actor_id))
     }))
-    .collect::<Vec<Result<(ActorId, usize), SyncError>>>()
+    .collect::<Vec<Result<(ActorId, usize, Option<Timestamp>), SyncError>>>()
     .await;
 
-    let ts = Timestamp::from(agent.clock().new_timestamp());
     let mut members = agent.members().write();
+    let ts = Timestamp::from(agent.clock().new_timestamp());
     for res in counts.iter() {
         match res {
             Err(e) => error!("could not properly recv from peer: {e}"),
-            Ok((actor_id, _)) => members.update_sync_ts(actor_id, ts),
+            Ok((actor_id, _, last_empty_ts)) => {
+                members.update_sync_ts(actor_id, ts);
+                members.update_last_empty(actor_id, *last_empty_ts);
+            }
         };
     }
 
@@ -1473,7 +1481,9 @@ pub async fn serve_sync(
     tracing::Span::current().set_parent(context);
 
     debug!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "received sync request");
-    let mut codec = LengthDelimitedCodec::new();
+    let mut codec = LengthDelimitedCodec::builder()
+        .max_frame_length(100 * 1_024 * 1_024)
+        .new_codec();
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
 

@@ -85,6 +85,15 @@ pub fn collect_metrics(agent: &Agent, transport: &Transport) {
         }
     }
 
+    match conn.pragma_query_value(None, "freelist_count", |row| row.get::<_, u64>(0)) {
+        Ok(n) => {
+            gauge!("corro.db.freelist.count").set(n as f64);
+        }
+        Err(e) => {
+            error!("could not query freelist_count in db: {e}");
+        }
+    }
+
     let mut db_path = agent.config().db.path.clone();
 
     if let Ok(meta) = db_path.metadata() {
