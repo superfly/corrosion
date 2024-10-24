@@ -82,8 +82,7 @@ impl Manager<MatcherHandle> for SubsManager {
     }
 
     fn get_handles(&self) -> BTreeMap<Uuid, MatcherHandle> {
-        let handles = { self.0.read().handles.clone() };
-        handles.clone()
+        self.0.read().handles.clone()
     }
 }
 
@@ -195,6 +194,7 @@ pub struct MatchableChange<'a> {
     pub table: &'a TableName,
     pub pk: &'a [u8],
     pub column: &'a ColumnName,
+    pub cl: &'a i64,
 }
 
 impl<'a> From<&'a Change> for MatchableChange<'a> {
@@ -203,6 +203,7 @@ impl<'a> From<&'a Change> for MatchableChange<'a> {
             table: &value.table,
             pk: &value.pk,
             column: &value.cid,
+            cl: &value.cl,
         }
     }
 }
@@ -266,7 +267,7 @@ struct InnerMatcherHandle {
     cached_statements: HashMap<String, MatcherStmt>,
 }
 
-pub type MatchCandidates = IndexMap<TableName, IndexSet<Vec<u8>>>;
+pub type MatchCandidates = IndexMap<TableName, IndexSet<(Vec<u8>, i64)>>;
 
 #[async_trait]
 impl Handle for MatcherHandle {
@@ -300,7 +301,7 @@ impl Handle for MatcherHandle {
         // don't double process the same pk
         if candidates
             .get(change.table)
-            .map(|pks| pks.contains(change.pk))
+            .map(|pks| pks.contains(&(change.pk.to_vec(), change.cl.clone())))
             .unwrap_or_default()
         {
             trace!("already contained key");
@@ -321,9 +322,9 @@ impl Handle for MatcherHandle {
         }
 
         if let Some(v) = candidates.get_mut(change.table) {
-            v.insert(change.pk.to_vec())
+            v.insert((change.pk.to_vec(), change.cl.clone()))
         } else {
-            candidates.insert(change.table.clone(), [change.pk.to_vec()].into());
+            candidates.insert(change.table.clone(), [(change.pk.to_vec(), change.cl.clone())].into());
             true
         }
     }
@@ -1426,7 +1427,7 @@ impl Matcher {
         for (table, pks) in candidates {
             let pks = pks
                 .iter()
-                .map(|pk| unpack_columns(pk))
+                .map(|(pk, _)| unpack_columns(pk))
                 .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
 
             let tmp_table_name = format!("temp_{table}");
@@ -1693,7 +1694,7 @@ impl Matcher {
         {
             let mut changes_prepped = state_conn.prepare_cached(
                 r#"
-            SELECT DISTINCT "table", pk
+            SELECT DISTINCT "table", pk, cl
                 FROM crsql_changes
                     WHERE db_version > ?
                       AND db_version <= ? -- TODO: allow going over?
@@ -1707,7 +1708,7 @@ impl Matcher {
                 candidates
                     .entry(row.get(0)?)
                     .or_default()
-                    .insert(row.get(1)?);
+                    .insert((row.get(1)?, row.get(2)?));
             }
         }
 

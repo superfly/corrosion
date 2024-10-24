@@ -311,7 +311,7 @@ impl QueryResponseIter {
                         return Some(Err(Box::new(EvalAltResult::from(e))));
                     }
                     // TODO(somtochiama):
-                    QueryEvent::Notify(_, _) => {
+                    QueryEvent::Notify(..) => {
                         self.done = true;
                         return None;
                     }

@@ -4,6 +4,7 @@ use crate::pubsub::{
 };
 use crate::schema::Schema;
 use async_trait::async_trait;
+use corro_api_types::sqlite::ChangeType;
 use corro_api_types::{Change, ColumnName, QueryEvent, SqliteValueRef, TableName};
 use corro_base_types::CrsqlDbVersion;
 use metrics::{counter, histogram};
@@ -60,8 +61,7 @@ impl Manager<UpdateHandle> for UpdatesManager {
     }
 
     fn get_handles(&self) -> BTreeMap<Uuid, UpdateHandle> {
-        let handles = { self.0.read().handles.clone() };
-        handles.clone()
+        self.0.read().handles.clone()
     }
 }
 
@@ -92,7 +92,7 @@ impl Handle for UpdateHandle {
         // don't double process the same pk
         if candidates
             .get(change.table)
-            .map(|pks| pks.contains(change.pk))
+            .map(|pks| pks.contains(&(change.pk.to_vec(), change.cl.clone())))
             .unwrap_or_default()
         {
             trace!("already contained key");
@@ -100,9 +100,9 @@ impl Handle for UpdateHandle {
         }
 
         if let Some(v) = candidates.get_mut(change.table) {
-            v.insert(change.pk.to_vec())
+            v.insert((change.pk.to_vec(), change.cl.clone()))
         } else {
-            candidates.insert(change.table.clone(), [change.pk.to_vec()].into());
+            candidates.insert(change.table.clone(), [(change.pk.to_vec(), change.cl.clone())].into());
             true
         }
     }
@@ -252,12 +252,17 @@ fn handle_candidates(
     for (table, pks) in candidates {
         let pks = pks
             .iter()
-            .map(|pk| unpack_columns(pk))
-            .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
+            .map(|(pk, cl)| unpack_columns(pk).and_then(|x| Ok((x, cl.clone()))))
+            .collect::<Result<Vec<(Vec<SqliteValueRef>, i64)>, _>>()?;
 
-        for pk in pks {
+        for (pk, cl) in pks {
+            let mut change_type = ChangeType::Update;
+            if cl % 2 == 0 {
+                change_type = ChangeType::Delete
+            }
             if let Err(e) = evt_tx.blocking_send(QueryEvent::Notify(
                 table.clone(),
+                change_type,
                 pk.iter().map(|x| x.to_owned()).collect::<Vec<_>>(),
             )) {
                 debug!("could not send back row to matcher sub sender: {e}");
@@ -429,7 +434,7 @@ pub fn match_changes_from_db_version<H: Handle + Send + 'static>(
     {
         let mut prepped = conn.prepare_cached(
             r#"
-        SELECT "table", pk, cid
+        SELECT "table", pk, cid, cl
             FROM crsql_changes
             WHERE db_version = ?
             ORDER BY seq ASC
@@ -441,17 +446,19 @@ pub fn match_changes_from_db_version<H: Handle + Send + 'static>(
                 row.get::<_, TableName>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
                 row.get::<_, ColumnName>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?;
 
         for change_res in rows {
-            let (table, pk, column) = change_res?;
+            let (table, pk, column, cl) = change_res?;
 
             for (_id, (candidates, handle)) in candidates.iter_mut() {
                 let change = MatchableChange {
                     table: &table,
                     pk: &pk,
                     column: &column,
+                    cl: &cl,
                 };
                 handle.filter_matchable_change(candidates, change);
             }

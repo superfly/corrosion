@@ -722,7 +722,7 @@ pub async fn process_fully_buffered_changes(
         let conn = agent.pool().read().await?;
         block_in_place(|| {
             if let Err(e) = match_changes_from_db_version(agent.subs_manager(), &conn, db_version) {
-                error!(%db_version, "could not match changes from db version: {e}");
+                error!(%db_version, "could not match changes for subs from db version: {e}");
             }
         });
 
@@ -730,7 +730,7 @@ pub async fn process_fully_buffered_changes(
             if let Err(e) =
                 match_changes_from_db_version(agent.updates_manager(), &conn, db_version)
             {
-                error!(%db_version, "could not match changes from db version: {e}");
+                error!(%db_version, "could not match changes for updates from db version: {e}");
             }
         });
     }

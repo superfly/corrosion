@@ -1151,12 +1151,12 @@ mod tests {
 
             assert_eq!(
                 notify_rows.recv().await.unwrap().unwrap(),
-                QueryEvent::Notify(TableName("tests".into()), vec!["service-id-3".into()],)
+                QueryEvent::Notify(TableName("tests".into()), ChangeType::Update, vec!["service-id-3".into()],)
             );
 
             assert_eq!(
                 notify_rows.recv().await.unwrap().unwrap(),
-                QueryEvent::Notify(TableName("tests".into()), vec!["service-id-4".into()],)
+                QueryEvent::Notify(TableName("tests".into()), ChangeType::Update, vec!["service-id-4".into()],)
             );
 
             let mut res = api_v1_subs(
@@ -1243,7 +1243,7 @@ mod tests {
             assert_eq!(rows_from.recv().await.unwrap().unwrap(), query_evt);
 
             let notify_evt =
-                QueryEvent::Notify(TableName("tests".into()), vec!["service-id-5".into()]);
+                QueryEvent::Notify(TableName("tests".into()), ChangeType::Update, vec!["service-id-5".into()]);
 
             assert_eq!(notify_rows.recv().await.unwrap().unwrap(), notify_evt);
 
@@ -1316,6 +1316,39 @@ mod tests {
                     vec!["service-id-5".into(), "service-name-5".into()]
                 )
             );
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-6".into(), "service-name-6".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "delete from  tests where id = ?".into(),
+                    vec!["service-id-6".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            assert_eq!(
+                notify_rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Notify(TableName("tests".into()), ChangeType::Update, vec!["service-id-6".into()],)
+            );
+
+            assert_eq!(
+                notify_rows.recv().await.unwrap().unwrap(),
+                QueryEvent::Notify(TableName("tests".into()), ChangeType::Delete, vec!["service-id-6".into()],)
+            );
+
         }
 
         // previous subs have been dropped.
@@ -1455,6 +1488,8 @@ mod tests {
                 ChangeId(4),
             )
         );
+
+        
 
         Ok(())
     }
@@ -1677,7 +1712,7 @@ mod tests {
         let notify_res = timeout(Duration::from_secs(5), notify_rows.recv()).await?;
         assert_eq!(
             notify_res.unwrap().unwrap(),
-            QueryEvent::Notify(TableName("buftests".into()), vec![Integer(2)],)
+            QueryEvent::Notify(TableName("buftests".into()), ChangeType::Update, vec![Integer(2)],)
         );
 
         tripwire_tx.send(()).await.ok();
