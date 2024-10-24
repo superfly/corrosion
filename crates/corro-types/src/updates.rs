@@ -249,7 +249,7 @@ fn handle_candidates(
         candidates.keys().collect::<Vec<_>>()
     );
 
-    for (table, pks) in candidates {
+    for (_, pks) in candidates {
         let pks = pks
             .iter()
             .map(|(pk, cl)| unpack_columns(pk).and_then(|x| Ok((x, cl.clone()))))
@@ -261,7 +261,6 @@ fn handle_candidates(
                 change_type = ChangeType::Delete
             }
             if let Err(e) = evt_tx.blocking_send(QueryEvent::Notify(
-                table.clone(),
                 change_type,
                 pk.iter().map(|x| x.to_owned()).collect::<Vec<_>>(),
             )) {

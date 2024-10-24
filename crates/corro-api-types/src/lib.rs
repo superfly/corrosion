@@ -35,7 +35,7 @@ pub enum TypedQueryEvent<T> {
     },
     Change(ChangeType, RowId, T, ChangeId),
     Error(CompactString),
-    Notify(TableName, ChangeType, T)
+    Notify(ChangeType, T)
 }
 
 impl<T> TypedQueryEvent<T> {
@@ -46,7 +46,7 @@ impl<T> TypedQueryEvent<T> {
             TypedQueryEvent::EndOfQuery { change_id, .. } => QueryEventMeta::EndOfQuery(*change_id),
             TypedQueryEvent::Change(_, _, _, id) => QueryEventMeta::Change(*id),
             TypedQueryEvent::Error(_) => QueryEventMeta::Error,
-            TypedQueryEvent::Notify(_, _, _) => QueryEventMeta::Notify,
+            TypedQueryEvent::Notify(_, _) => QueryEventMeta::Notify,
         }
     }
 }
