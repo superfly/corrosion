@@ -43,7 +43,7 @@ impl<T> HasLen for IndexSet<T> {
     }
 }
 
-pub trait Manager<H: Handle<T>, T: HasLen> {
+pub trait Manager<H> {
     fn trait_type(&self) -> String;
     fn get(&self, id: &Uuid) -> Option<H>;
     fn remove(&self, id: &Uuid) -> Option<H>;
@@ -57,8 +57,8 @@ impl<T> HasLen for Vec<T> {
 }
 
 #[async_trait]
-pub trait Handle<T: HasLen> {
-    type CandidateMatcher: IntoIterator<Item = (TableName, T)> + Clone + Send;
+pub trait Handle {
+    type CandidateMatcher;
 
     fn id(&self) -> Uuid;
     fn hash(&self) -> &str;
@@ -73,7 +73,7 @@ pub trait Handle<T: HasLen> {
     async fn cleanup(&self);
 }
 
-impl Manager<UpdateHandle, IndexMap<Vec<u8>, i64>> for UpdatesManager {
+impl Manager<UpdateHandle> for UpdatesManager {
     fn trait_type(&self) -> String {
         "updates".to_string()
     }
@@ -109,7 +109,7 @@ pub enum TypedNotifyEvent<T> {
 }
 
 #[async_trait]
-impl Handle<IndexMap<Vec<u8>, i64>> for UpdateHandle {
+impl Handle for UpdateHandle {
     type CandidateMatcher = MatchClCandidates;
 
     fn id(&self) -> Uuid {
@@ -415,13 +415,13 @@ async fn cmd_loop(
     debug!(id = %id, "update loop is done");
 }
 
-pub fn match_changes<H, T>(
-    manager: &impl Manager<H, T>,
+pub fn match_changes<H, T: HasLen>(
+    manager: &impl Manager<H>,
     changes: &[Change],
     db_version: CrsqlDbVersion,
 ) where
-    H: Handle<T> + Send + 'static,
-    T: HasLen + Clone + 'static,
+    H: Handle + Send + 'static,
+    H::CandidateMatcher: IntoIterator<Item = (TableName, T)> + Clone + Send,
 {
     let trait_type = manager.trait_type();
     trace!(
@@ -482,14 +482,14 @@ pub fn match_changes<H, T>(
     }
 }
 
-pub fn match_changes_from_db_version<H, T>(
-    manager: &impl Manager<H, T>,
+pub fn match_changes_from_db_version<H, T: HasLen>(
+    manager: &impl Manager<H>,
     conn: &Connection,
     db_version: CrsqlDbVersion,
 ) -> rusqlite::Result<()>
 where
-    H: Handle<T> + Send + 'static,
-    T: HasLen + 'static,
+    H: Handle + Send + 'static,
+    H::CandidateMatcher: IntoIterator<Item = (TableName, T)> + Clone + Send,
 {
     let handles = manager.get_handles();
     if handles.is_empty() {

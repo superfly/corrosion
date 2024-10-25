@@ -67,7 +67,7 @@ pub struct MatcherCreated {
 
 const SUB_EVENT_CHANNEL_CAP: usize = 512;
 
-impl Manager<MatcherHandle, IndexSet<Vec<u8>>> for SubsManager {
+impl Manager<MatcherHandle> for SubsManager {
     fn trait_type(&self) -> String {
         "subs".to_string()
     }
@@ -270,7 +270,7 @@ struct InnerMatcherHandle {
 type MatchCandidates = IndexMap<TableName, IndexSet<Vec<u8>>>;
 
 #[async_trait]
-impl Handle<IndexSet<Vec<u8>>> for MatcherHandle {
+impl Handle for MatcherHandle {
     type CandidateMatcher = MatchCandidates;
 
     fn id(&self) -> Uuid {
