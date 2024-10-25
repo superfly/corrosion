@@ -1,15 +1,16 @@
 use crate::agent::SplitPool;
-use crate::pubsub::{
-    unpack_columns, MatchCandidates, MatchableChange, MatcherCreated, MatcherError,
-};
+use crate::pubsub::{unpack_columns, MatchableChange, MatcherError};
 use crate::schema::Schema;
 use async_trait::async_trait;
+use compact_str::CompactString;
 use corro_api_types::sqlite::ChangeType;
-use corro_api_types::{Change, ColumnName, QueryEvent, SqliteValueRef, TableName};
+use corro_api_types::{Change, ColumnName, SqliteValue, SqliteValueRef, TableName};
 use corro_base_types::CrsqlDbVersion;
+use indexmap::IndexMap;
 use metrics::{counter, histogram};
 use parking_lot::RwLock;
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,15 +35,18 @@ pub trait Manager<H: Handle> {
 
 #[async_trait]
 pub trait Handle {
+    type CandidateMatcher: Send;
+
     fn id(&self) -> Uuid;
     fn hash(&self) -> &str;
     fn cancelled(&self) -> WaitForCancellationFuture;
     fn filter_matchable_change(
         &self,
-        candidates: &mut MatchCandidates,
+        candidates: &mut Self::CandidateMatcher,
         change: MatchableChange,
     ) -> bool;
-    fn changes_tx(&self) -> mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>;
+    fn changes_tx(&self) -> mpsc::Sender<(Self::CandidateMatcher, CrsqlDbVersion)>;
+    fn get_candidates(&self) -> Self::CandidateMatcher;
     async fn cleanup(&self);
 }
 
@@ -65,8 +69,26 @@ impl Manager<UpdateHandle> for UpdatesManager {
     }
 }
 
+type MatchClCandidates = IndexMap<TableName, IndexMap<Vec<u8>, i64>>;
+
+pub type NotifyEvent = TypedNotifyEvent<Vec<SqliteValue>>;
+
+pub enum NotifyType {
+    Upsert = 0,
+    Delete = 2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedNotifyEvent<T> {
+    Notify(ChangeType, T),
+    Error(CompactString),
+}
+
 #[async_trait]
 impl Handle for UpdateHandle {
+    type CandidateMatcher = MatchClCandidates;
+
     fn id(&self) -> Uuid {
         self.inner.id
     }
@@ -81,7 +103,7 @@ impl Handle for UpdateHandle {
 
     fn filter_matchable_change(
         &self,
-        candidates: &mut MatchCandidates,
+        candidates: &mut MatchClCandidates,
         change: MatchableChange,
     ) -> bool {
         if change.table.to_string() != self.inner.name {
@@ -92,7 +114,7 @@ impl Handle for UpdateHandle {
         // don't double process the same pk
         if candidates
             .get(change.table)
-            .map(|pks| pks.contains(&(change.pk.to_vec(), change.cl.clone())))
+            .map(|pks| pks.contains_key(change.pk))
             .unwrap_or_default()
         {
             trace!("already contained key");
@@ -100,24 +122,36 @@ impl Handle for UpdateHandle {
         }
 
         if let Some(v) = candidates.get_mut(change.table) {
-            v.insert((change.pk.to_vec(), change.cl.clone()))
+            v.insert(change.pk.into(), change.cl).is_none()
         } else {
-            candidates.insert(change.table.clone(), [(change.pk.to_vec(), change.cl.clone())].into());
+            candidates.insert(
+                change.table.clone(),
+                [(change.pk.to_vec(), change.cl)].into(),
+            );
             true
         }
     }
 
-    fn changes_tx(&self) -> mpsc::Sender<(MatchCandidates, CrsqlDbVersion)> {
-        return self.inner.changes_tx.clone();
+    fn changes_tx(&self) -> mpsc::Sender<(MatchClCandidates, CrsqlDbVersion)> {
+        self.inner.changes_tx.clone()
+    }
+
+    fn get_candidates(&self) -> MatchClCandidates {
+        MatchClCandidates::new()
     }
 
     async fn cleanup(&self) {
-        // self.inner.cancel.cancel();
+        self.inner.cancel.cancel();
         info!(sub_id = %self.inner.id, "Canceled subscription");
     }
 }
 
 const UPDATE_EVENT_CHANNEL_CAP: usize = 512;
+
+// tools to bootstrap a new notifier
+pub struct UpdateCreated {
+    pub evt_rx: mpsc::Receiver<NotifyEvent>,
+}
 
 #[derive(Debug, Default)]
 struct InnerUpdatesManager {
@@ -151,7 +185,7 @@ impl UpdatesManager {
         schema: &Schema,
         _pool: &SplitPool,
         tripwire: Tripwire,
-    ) -> Result<(UpdateHandle, Option<MatcherCreated>), MatcherError> {
+    ) -> Result<(UpdateHandle, Option<UpdateCreated>), MatcherError> {
         if let Some(handle) = self.get(tbl_name) {
             return Ok((handle, None));
         }
@@ -172,7 +206,7 @@ impl UpdatesManager {
         inner.handles.insert(id, handle.clone());
         inner.tables.insert(tbl_name.to_string(), id);
 
-        Ok((handle, Some(MatcherCreated { evt_rx })))
+        Ok((handle, Some(UpdateCreated { evt_rx })))
     }
 
     pub fn remove(&self, id: &Uuid) -> Option<UpdateHandle> {
@@ -192,7 +226,7 @@ pub struct InnerUpdateHandle {
     id: Uuid,
     name: String,
     cancel: CancellationToken,
-    changes_tx: mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>,
+    changes_tx: mpsc::Sender<(MatchClCandidates, CrsqlDbVersion)>,
 }
 
 impl UpdateHandle {
@@ -203,7 +237,7 @@ impl UpdateHandle {
         id: Uuid,
         tbl_name: &str,
         schema: &Schema,
-        evt_tx: mpsc::Sender<QueryEvent>,
+        evt_tx: mpsc::Sender<NotifyEvent>,
         tripwire: Tripwire,
     ) -> Result<UpdateHandle, MatcherError> {
         // check for existing handles
@@ -237,8 +271,8 @@ impl UpdateHandle {
 }
 
 fn handle_candidates(
-    evt_tx: mpsc::Sender<QueryEvent>,
-    candidates: MatchCandidates,
+    evt_tx: mpsc::Sender<NotifyEvent>,
+    candidates: MatchClCandidates,
 ) -> Result<(), MatcherError> {
     if candidates.is_empty() {
         return Ok(());
@@ -260,7 +294,7 @@ fn handle_candidates(
             if cl % 2 == 0 {
                 change_type = ChangeType::Delete
             }
-            if let Err(e) = evt_tx.blocking_send(QueryEvent::Notify(
+            if let Err(e) = evt_tx.blocking_send(NotifyEvent::Notify(
                 change_type,
                 pk.iter().map(|x| x.to_owned()).collect::<Vec<_>>(),
             )) {
@@ -270,14 +304,14 @@ fn handle_candidates(
         }
     }
 
-    return Ok(());
+    Ok(())
 }
 
 async fn cmd_loop(
     id: Uuid,
     cancel: CancellationToken,
-    evt_rx: mpsc::Sender<QueryEvent>,
-    mut changes_rx: mpsc::Receiver<(MatchCandidates, CrsqlDbVersion)>,
+    evt_tx: mpsc::Sender<NotifyEvent>,
+    mut changes_rx: mpsc::Receiver<(MatchClCandidates, CrsqlDbVersion)>,
     mut tripwire: Tripwire,
 ) {
     const PROCESS_CHANGES_THRESHOLD: usize = 1000;
@@ -285,7 +319,7 @@ async fn cmd_loop(
 
     info!(sub_id = %id, "Starting loop to run the subscription");
 
-    let mut buf = MatchCandidates::new();
+    let mut buf = MatchClCandidates::new();
     let mut buf_count = 0;
 
     // max duration of aggregating candidates
@@ -301,10 +335,10 @@ async fn cmd_loop(
                 break;
             }
             Some((candidates, _)) = changes_rx.recv() => {
-                for (table, pks) in  candidates {
+                for (table, pk_map) in  candidates {
                     let buffed = buf.entry(table).or_default();
-                    for pk in pks {
-                        if buffed.insert(pk) {
+                    for (pk, cl) in pk_map {
+                        if buffed.insert(pk, cl).is_none() {
                             buf_count += 1;
                         }
                     }
@@ -334,7 +368,7 @@ async fn cmd_loop(
         if process {
             let start = Instant::now();
             if let Err(e) =
-                block_in_place(|| handle_candidates(evt_rx.clone(), std::mem::take(&mut buf)))
+                block_in_place(|| handle_candidates(evt_tx.clone(), std::mem::take(&mut buf)))
             {
                 if !matches!(e, MatcherError::EventReceiverClosed) {
                     error!(sub_id = %id, "could not handle change: {e}");
@@ -357,7 +391,11 @@ async fn cmd_loop(
     debug!(id = %id, "update loop is done");
 }
 
-pub fn match_changes<H: Handle + Send + 'static>(manager: &impl Manager<H>, changes: &[Change], db_version: CrsqlDbVersion) {
+pub fn match_changes<H: Handle + Send + 'static>(
+    manager: &impl Manager<H>,
+    changes: &[Change],
+    db_version: CrsqlDbVersion,
+) {
     let trait_type = manager.trait_type();
     trace!(
         %db_version,
@@ -375,7 +413,7 @@ pub fn match_changes<H: Handle + Send + 'static>(manager: &impl Manager<H>, chan
 
     for (id, handle) in handles.iter() {
         trace!(sub_id = %id, %db_version, "attempting to match changes to a subscription");
-        let mut candidates = MatchCandidates::new();
+        let mut candidates = handle.get_candidates();
         let mut match_count = 0;
         for change in changes.iter().map(MatchableChange::from) {
             if handle.filter_matchable_change(&mut candidates, change) {
@@ -384,10 +422,10 @@ pub fn match_changes<H: Handle + Send + 'static>(manager: &impl Manager<H>, chan
         }
 
         // metrics...
-        for (table, pks) in candidates.iter() {
-            counter!(format!("corro.{trait_type}.changes.matched.count"), "table" => table.to_string())
-                .increment(pks.len() as u64);
-        }
+        // for (table, pks) in candidates.iter() {
+        //     counter!(format!("corro.{trait_type}.changes.matched.count"), "table" => table.to_string())
+        //         .increment(pks.len() as u64);
+        // }
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
@@ -421,13 +459,13 @@ pub fn match_changes_from_db_version<H: Handle + Send + 'static>(
 ) -> rusqlite::Result<()> {
     let handles = manager.get_handles();
     if handles.is_empty() {
-        return Ok(())
+        return Ok(());
     }
 
     let trait_type = manager.trait_type();
     let mut candidates = handles
         .iter()
-        .map(|(id, handle)| (id, (MatchCandidates::new(), handle)))
+        .map(|(id, handle)| (id, (handle.get_candidates(), handle)))
         .collect::<BTreeMap<_, _>>();
 
     {
@@ -457,7 +495,7 @@ pub fn match_changes_from_db_version<H: Handle + Send + 'static>(
                     table: &table,
                     pk: &pk,
                     column: &column,
-                    cl: &cl,
+                    cl,
                 };
                 handle.filter_matchable_change(candidates, change);
             }
@@ -468,11 +506,11 @@ pub fn match_changes_from_db_version<H: Handle + Send + 'static>(
     for (id, (candidates, handle)) in candidates {
         let mut match_count = 0;
 
-        for (table, pks) in candidates.iter() {
-            let count = pks.len();
-            match_count += count;
-            counter!(format!("corro.{trait_type}.changes.matched.count"), "sql_hash" => handle.hash().to_string(), "table" => table.to_string()).increment(count as u64);
-        }
+        // for (table, pks) in candidates.iter() {
+        //     let count = pks.len();
+        //     match_count += count;
+        //     counter!(format!("corro.{trait_type}.changes.matched.count"), "sql_hash" => handle.hash().to_string(), "table" => table.to_string()).increment(count as u64);
+        // }
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 

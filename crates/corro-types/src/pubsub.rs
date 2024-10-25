@@ -194,7 +194,7 @@ pub struct MatchableChange<'a> {
     pub table: &'a TableName,
     pub pk: &'a [u8],
     pub column: &'a ColumnName,
-    pub cl: &'a i64,
+    pub cl: i64,
 }
 
 impl<'a> From<&'a Change> for MatchableChange<'a> {
@@ -203,7 +203,7 @@ impl<'a> From<&'a Change> for MatchableChange<'a> {
             table: &value.table,
             pk: &value.pk,
             column: &value.cid,
-            cl: &value.cl,
+            cl: value.cl,
         }
     }
 }
@@ -267,10 +267,12 @@ struct InnerMatcherHandle {
     cached_statements: HashMap<String, MatcherStmt>,
 }
 
-pub type MatchCandidates = IndexMap<TableName, IndexSet<(Vec<u8>, i64)>>;
+type MatchCandidates = IndexMap<TableName, IndexSet<Vec<u8>>>;
 
 #[async_trait]
 impl Handle for MatcherHandle {
+    type CandidateMatcher = MatchCandidates;
+
     fn id(&self) -> Uuid {
         self.inner.id
     }
@@ -287,6 +289,10 @@ impl Handle for MatcherHandle {
         self.inner.changes_tx.clone()
     }
 
+    fn get_candidates(&self) -> MatchCandidates {
+        MatchCandidates::new()
+    }
+
     async fn cleanup(&self) {
         self.inner.cancel.cancel();
         info!(sub_id = %self.inner.id, "Canceled subscription");
@@ -301,7 +307,7 @@ impl Handle for MatcherHandle {
         // don't double process the same pk
         if candidates
             .get(change.table)
-            .map(|pks| pks.contains(&(change.pk.to_vec(), change.cl.clone())))
+            .map(|pks| pks.contains(change.pk))
             .unwrap_or_default()
         {
             trace!("already contained key");
@@ -322,9 +328,9 @@ impl Handle for MatcherHandle {
         }
 
         if let Some(v) = candidates.get_mut(change.table) {
-            v.insert((change.pk.to_vec(), change.cl.clone()))
+            v.insert(change.pk.to_vec())
         } else {
-            candidates.insert(change.table.clone(), [(change.pk.to_vec(), change.cl.clone())].into());
+            candidates.insert(change.table.clone(), [change.pk.to_vec()].into());
             true
         }
     }
@@ -1427,7 +1433,7 @@ impl Matcher {
         for (table, pks) in candidates {
             let pks = pks
                 .iter()
-                .map(|(pk, _)| unpack_columns(pk))
+                .map(|pk,| unpack_columns(pk))
                 .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
 
             let tmp_table_name = format!("temp_{table}");
@@ -1708,7 +1714,7 @@ impl Matcher {
                 candidates
                     .entry(row.get(0)?)
                     .or_default()
-                    .insert((row.get(1)?, row.get(2)?));
+                    .insert(row.get(1)?);
             }
         }
 

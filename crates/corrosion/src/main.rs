@@ -401,9 +401,6 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                     Ok(QueryEvent::Change(_, _, _, _)) => {
                         break;
                     }
-                    Ok(QueryEvent::Notify(..)) => {
-                        break;
-                    }
                     Ok(QueryEvent::Error(e)) => {
                         eyre::bail!("{e}");
                     }

@@ -37,7 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::api::public::pubsub::api_v1_updates;
+use crate::api::public::update::api_v1_updates;
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
