@@ -58,7 +58,8 @@ impl<T> HasLen for Vec<T> {
 
 #[async_trait]
 pub trait Handle {
-    type CandidateMatcher;
+    type Candidate: HasLen;
+    type CandidateMatcher: IntoIterator<Item = (TableName, Self::Candidate)>;
 
     fn id(&self) -> Uuid;
     fn hash(&self) -> &str;
@@ -110,6 +111,7 @@ pub enum TypedNotifyEvent<T> {
 
 #[async_trait]
 impl Handle for UpdateHandle {
+    type Candidate = IndexMap<Vec<u8>, i64>;
     type CandidateMatcher = MatchClCandidates;
 
     fn id(&self) -> Uuid {
@@ -415,13 +417,10 @@ async fn cmd_loop(
     debug!(id = %id, "update loop is done");
 }
 
-pub fn match_changes<H, T: HasLen>(
-    manager: &impl Manager<H>,
-    changes: &[Change],
-    db_version: CrsqlDbVersion,
-) where
+pub fn match_changes<H>(manager: &impl Manager<H>, changes: &[Change], db_version: CrsqlDbVersion)
+where
     H: Handle + Send + 'static,
-    H::CandidateMatcher: IntoIterator<Item = (TableName, T)> + Clone + Send,
+    H::CandidateMatcher: Clone + Send,
 {
     let trait_type = manager.trait_type();
     trace!(
@@ -482,14 +481,14 @@ pub fn match_changes<H, T: HasLen>(
     }
 }
 
-pub fn match_changes_from_db_version<H, T: HasLen>(
+pub fn match_changes_from_db_version<H>(
     manager: &impl Manager<H>,
     conn: &Connection,
     db_version: CrsqlDbVersion,
 ) -> rusqlite::Result<()>
 where
     H: Handle + Send + 'static,
-    H::CandidateMatcher: IntoIterator<Item = (TableName, T)> + Clone + Send,
+    H::CandidateMatcher: Clone + Send,
 {
     let handles = manager.get_handles();
     if handles.is_empty() {

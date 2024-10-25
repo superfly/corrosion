@@ -271,6 +271,7 @@ type MatchCandidates = IndexMap<TableName, IndexSet<Vec<u8>>>;
 
 #[async_trait]
 impl Handle for MatcherHandle {
+    type Candidate = IndexSet<Vec<u8>>;
     type CandidateMatcher = MatchCandidates;
 
     fn id(&self) -> Uuid {
