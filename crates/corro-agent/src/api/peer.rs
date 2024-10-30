@@ -23,7 +23,6 @@ use futures::{Future, Stream, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
-use rand::seq::SliceRandom;
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, Connection};
 use speedy::Writable;
@@ -405,6 +404,7 @@ fn handle_need(
                     -- [:start]---[end_version]---[:end]
                     ( end_version BETWEEN :start AND :end )
                 )
+            ORDER BY start_version DESC
             ",
     )?;
 
@@ -1179,7 +1179,6 @@ pub async fn parallel_sync(
     let len = syncers.len();
 
     let (readers, mut servers) = {
-        let mut rng = rand::thread_rng();
         syncers.into_iter().fold(
             (Vec::with_capacity(len), Vec::with_capacity(len)),
             |(mut readers, mut servers), (actor_id, addr, needs, tx, read)| {
@@ -1191,6 +1190,7 @@ pub async fn parallel_sync(
 
                 trace!(%actor_id, "needs: {needs:?}");
 
+
                 debug!(%actor_id, %addr, "needs len: {}", needs.values().map(|needs| needs.iter().map(|need| match need {
                     SyncNeedV1::Full {versions} => (versions.end().0 - versions.start().0) as usize + 1,
                     SyncNeedV1::Partial {..} => 0,
@@ -1200,7 +1200,7 @@ pub async fn parallel_sync(
                 let actor_needs = needs
                     .into_iter()
                     .flat_map(|(actor_id, needs)| {
-                        let mut needs: Vec<_> = needs
+                        let needs: Vec<_> = needs
                             .into_iter()
                             .flat_map(|need| match need {
                                 // chunk the versions, sometimes it's 0..=1000000 and that's far too big for a chunk!
@@ -1213,7 +1213,6 @@ pub async fn parallel_sync(
                             .collect();
 
                         // NOTE: IMPORTANT! shuffle the vec so we don't keep looping over the same later on
-                        needs.shuffle(&mut rng);
 
                         needs
                             .into_iter()
@@ -1265,7 +1264,7 @@ pub async fn parallel_sync(
                 let mut drained = 0;
 
                 while drained < 10 {
-                    let (actor_id, need) = match needs.pop_front() {
+                    let (actor_id, need) = match needs.pop_back() {
                         Some(popped) => popped,
                         None => {
                             break;
@@ -2018,8 +2017,8 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(2),
-                        changes: vec![change2],
+                        version: Version(3),
+                        changes: vec![change3.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
                         ts,
@@ -2033,8 +2032,8 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(3),
-                        changes: vec![change3.clone()],
+                        version: Version(2),
+                        changes: vec![change2.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
                         ts,
@@ -2186,8 +2185,8 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(3),
-                        changes: vec![change3],
+                        version: Version(4),
+                        changes: vec![change4],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
                         ts,
@@ -2201,8 +2200,8 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(4),
-                        changes: vec![change4],
+                        version: Version(3),
+                        changes: vec![change3],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
                         ts,

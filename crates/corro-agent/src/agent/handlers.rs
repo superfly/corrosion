@@ -863,15 +863,22 @@ pub async fn handle_changes(
             continue;
         }
 
-        // drop items when the queue is full.
+        // drop old items when the queue is full.
         if queue.len() > max_queue_len {
+            let change = queue.pop_front();
+            if let Some(change) = change {
+                for v in change.0.versions() {
+                    let _ = seen.remove(&(change.0.actor_id, v));
+                }
+            }
+
             drop_log_count += 1;
             if is_pow_10(drop_log_count) {
                 if drop_log_count == 1 {
-                    warn!("dropping a change because changes queue is full");
+                    warn!("dropped an old change because changes queue is full");
                 } else {
                     warn!(
-                        "dropping {} changes because changes queue is full",
+                        "droppped {} old changes because changes queue is full",
                         drop_log_count
                     );
                 }

@@ -531,7 +531,7 @@ pub fn runtime_loop(
                 }
             }
 
-            for mut pending in to_broadcast.drain(..) {
+            for mut pending in to_broadcast.drain(..).rev() {
                 trace!("{} to broadcast: {pending:?}", actor_id);
 
                 let (member_count, max_transmissions) = {
