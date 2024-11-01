@@ -1212,8 +1212,6 @@ pub async fn parallel_sync(
                             })
                             .collect();
 
-                        // NOTE: IMPORTANT! shuffle the vec so we don't keep looping over the same later on
-
                         needs
                             .into_iter()
                             .map(|need| (actor_id, need))

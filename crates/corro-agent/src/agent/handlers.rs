@@ -865,7 +865,7 @@ pub async fn handle_changes(
 
         // drop old items when the queue is full.
         if queue.len() > max_queue_len {
-            let change = queue.pop_front();
+            let change = queue.pop_back();
             if let Some(change) = change {
                 for v in change.0.versions() {
                     let _ = seen.remove(&(change.0.actor_id, v));
