@@ -887,7 +887,6 @@ pub async fn handle_changes(
             if drop_log_count == 100000000 {
                 drop_log_count = 0;
             }
-            continue;
         }
 
         if let Some(mut seqs) = change.seqs().cloned() {
