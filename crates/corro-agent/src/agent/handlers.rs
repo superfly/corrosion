@@ -745,7 +745,7 @@ pub async fn handle_changes(
         agent.config().perf.apply_queue_timeout as u64,
     ));
 
-    const MAX_SEEN_CACHE_LEN: usize = 1000;
+    const MAX_SEEN_CACHE_LEN: usize = 10000;
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 

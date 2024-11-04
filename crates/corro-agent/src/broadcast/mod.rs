@@ -374,10 +374,6 @@ pub fn runtime_loop(
         }
     });
 
-    let mut join_set = JoinSet::new();
-    let max_queue_len = agent.config().perf.processing_queue_len;
-    const MAX_INFLIGHT_BROADCAST: usize = 10000;
-
     tokio::spawn(async move {
         const BROADCAST_CUTOFF: usize = 64 * 1024;
 
@@ -410,6 +406,9 @@ pub fn runtime_loop(
         let mut tripped = false;
         let mut ser_buf = BytesMut::new();
 
+        let mut join_set = JoinSet::new();
+        let max_queue_len = agent.config().perf.processing_queue_len;
+        const MAX_INFLIGHT_BROADCAST: usize = 10000;
         let mut to_broadcast = VecDeque::new();
         let mut log_count = 0;
 
