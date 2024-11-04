@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     num::NonZeroU32,
     pin::Pin,
@@ -26,7 +26,7 @@ use speedy::Writable;
 use strum::EnumDiscriminants;
 use tokio::{
     sync::mpsc,
-    task::{block_in_place, LocalSet},
+    task::{block_in_place, JoinSet, LocalSet},
     time::interval,
 };
 use tokio_stream::StreamExt;
@@ -41,7 +41,7 @@ use corro_types::{
     channel::{bounded, CorroReceiver, CorroSender},
 };
 
-use crate::transport::Transport;
+use crate::{agent::util::log_at_pow_10, transport::Transport};
 
 #[derive(Clone)]
 struct TimerSpawner {
@@ -374,6 +374,10 @@ pub fn runtime_loop(
         }
     });
 
+    let mut join_set = JoinSet::new();
+    let max_queue_len = agent.config().perf.processing_queue_len;
+    const MAX_INFLIGHT_BROADCAST: usize = 10000;
+
     tokio::spawn(async move {
         const BROADCAST_CUTOFF: usize = 64 * 1024;
 
@@ -406,7 +410,8 @@ pub fn runtime_loop(
         let mut tripped = false;
         let mut ser_buf = BytesMut::new();
 
-        let mut to_broadcast = vec![];
+        let mut to_broadcast = VecDeque::new();
+        let mut log_count = 0;
 
         loop {
             let branch = tokio::select! {
@@ -447,10 +452,10 @@ pub fn runtime_loop(
                 }
                 Branch::BroadcastTick => {
                     if !bcast_buf.is_empty() {
-                        to_broadcast.push(PendingBroadcast::new(bcast_buf.split().freeze()));
+                        to_broadcast.push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
                     }
                     if !local_bcast_buf.is_empty() {
-                        to_broadcast.push(PendingBroadcast::new_local(
+                        to_broadcast.push_front(PendingBroadcast::new_local(
                             local_bcast_buf.split().freeze(),
                         ));
                     }
@@ -501,7 +506,7 @@ pub fn runtime_loop(
                         }
 
                         if local_bcast_buf.len() >= BROADCAST_CUTOFF {
-                            to_broadcast.push(PendingBroadcast::new_local(
+                            to_broadcast.push_front(PendingBroadcast::new_local(
                                 local_bcast_buf.split().freeze(),
                             ));
                         }
@@ -514,13 +519,14 @@ pub fn runtime_loop(
                         }
 
                         if bcast_buf.len() >= BROADCAST_CUTOFF {
-                            to_broadcast.push(PendingBroadcast::new(bcast_buf.split().freeze()));
+                            to_broadcast
+                                .push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
                         }
                     }
                 }
                 Branch::WokePendingBroadcast(pending) => {
                     trace!("handling Branch::WokePendingBroadcast");
-                    to_broadcast.push(pending);
+                    to_broadcast.push_front(pending);
                 }
                 Branch::Metrics => {
                     trace!("handling Branch::Metrics");
@@ -531,7 +537,10 @@ pub fn runtime_loop(
                 }
             }
 
-            for mut pending in to_broadcast.drain(..).rev() {
+            while join_set.try_join_next().is_some() {}
+
+            while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
+                let mut pending = to_broadcast.pop_front().unwrap();
                 trace!("{} to broadcast: {pending:?}", actor_id);
 
                 let (member_count, max_transmissions) = {
@@ -574,7 +583,7 @@ pub fn runtime_loop(
                 for addr in broadcast_to {
                     debug!(actor = %actor_id, "broadcasting {} bytes to: {addr}", pending.payload.len());
 
-                    tokio::spawn(transmit_broadcast(
+                    join_set.spawn(transmit_broadcast(
                         pending.payload.clone(),
                         transport.clone(),
                         addr,
@@ -596,6 +605,18 @@ pub fn runtime_loop(
                         }));
                     }
                 }
+            }
+
+            // if broadcast queue is over the max, drop the oldest, most sent item
+            if to_broadcast.len() > max_queue_len {
+                let max_sent = to_broadcast
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, val)| val.send_count);
+                if let Some((i, _)) = max_sent {
+                    to_broadcast.remove(i);
+                    log_at_pow_10("dropped broadcast from queue", &mut log_count);
+                };
             }
         }
         info!("broadcasts are done");

@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::agent::util::log_at_pow_10;
 use crate::{
     agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL},
     api::peer::parallel_sync,
@@ -527,11 +528,12 @@ pub async fn handle_emptyset(
     mut rx_emptysets: CorroReceiver<ChangeV1>,
     mut tripwire: Tripwire,
 ) {
-    let mut buf: HashMap<ActorId, VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>> =
+    type EmptyQueue = VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>;
+    let mut buf: HashMap<ActorId, EmptyQueue> =
         HashMap::new();
 
     let mut join_set: JoinSet<
-        HashMap<ActorId, VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>>,
+        HashMap<ActorId, EmptyQueue>,
     > = JoinSet::new();
 
     loop {
@@ -551,7 +553,7 @@ pub async fn handle_emptyset(
             maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
                 Some(change) => {
                     if let Changeset::EmptySet { versions, ts } = change.changeset {
-                        buf.entry(change.actor_id).or_insert(VecDeque::new()).push_back((versions.clone(), ts));
+                        buf.entry(change.actor_id).or_default().push_back((versions.clone(), ts));
                     } else {
                         warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
                     }
@@ -618,9 +620,9 @@ pub async fn process_emptyset(
 ) -> Result<(), ChangeError> {
     let (versions, ts) = changes;
 
-    let mut version_iter = versions.chunks(100);
+    let version_iter = versions.chunks(100);
 
-    while let Some(chunk) = version_iter.next() {
+    for chunk in version_iter {
         let mut conn = agent.pool().write_low().await?;
         debug!("processing emptyset from {:?}", actor_id);
         let booked = {
@@ -743,7 +745,7 @@ pub async fn handle_changes(
         agent.config().perf.apply_queue_timeout as u64,
     ));
 
-    const MAX_SEEN_CACHE_LEN: usize = 10000;
+    const MAX_SEEN_CACHE_LEN: usize = 1000;
     const KEEP_SEEN_CACHE_SIZE: usize = 1000;
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
@@ -872,21 +874,7 @@ pub async fn handle_changes(
                 }
             }
 
-            drop_log_count += 1;
-            if is_pow_10(drop_log_count) {
-                if drop_log_count == 1 {
-                    warn!("dropped an old change because changes queue is full");
-                } else {
-                    warn!(
-                        "droppped {} old changes because changes queue is full",
-                        drop_log_count
-                    );
-                }
-            }
-            // reset count
-            if drop_log_count == 100000000 {
-                drop_log_count = 0;
-            }
+            log_at_pow_10("dropped old change from queue", &mut drop_log_count);
         }
 
         if let Some(mut seqs) = change.seqs().cloned() {
@@ -1169,12 +1157,4 @@ mod tests {
 
         Ok(())
     }
-}
-
-#[inline]
-fn is_pow_10(i: u64) -> bool {
-    matches!(
-        i,
-        1 | 10 | 100 | 1000 | 10000 | 1000000 | 10000000 | 100000000
-    )
 }
