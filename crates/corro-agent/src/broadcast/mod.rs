@@ -614,20 +614,30 @@ async fn handle_broadcasts(
             }
         }
 
-        // if broadcast queue is over the max, drop the oldest, most sent item
-        if to_broadcast.len() > max_queue_len {
-            let max_sent = to_broadcast
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, val)| val.send_count);
-            if let Some((i, _)) = max_sent {
-                to_broadcast.remove(i);
-                log_at_pow_10("dropped broadcast from queue", &mut log_count);
-            };
+        if drop_oldest_broadcast(&mut to_broadcast, max_queue_len).is_some() {
+            log_at_pow_10("dropped old change from queue", &mut log_count);
         }
     }
 
     info!("broadcasts are done");
+}
+
+// Drop the oldest, most sent item
+fn drop_oldest_broadcast(
+    queue: &mut VecDeque<PendingBroadcast>,
+    max: usize,
+) -> Option<PendingBroadcast> {
+    if queue.len() > max {
+        let max_sent: Option<(_, _)> = queue
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, val)| val.send_count);
+        if let Some((i, _)) = max_sent {
+            return queue.remove(i);
+        }
+    }
+
+    None
 }
 
 fn diff_member_states(
@@ -831,6 +841,55 @@ mod tests {
         broadcast::{BroadcastV1, ChangeV1, Changeset},
     };
     use uuid::Uuid;
+
+    #[test]
+    fn test_behaviour_when_queue_is_full() -> eyre::Result<()> {
+        let max = 4;
+        let mut queue = VecDeque::new();
+
+        assert!(drop_oldest_broadcast(&mut queue, max).is_none());
+
+
+        queue.push_front(build_broadcast(1, 0));
+        queue.push_front(build_broadcast(2, 3));
+        queue.push_front(build_broadcast(3, 1));
+        queue.push_front(build_broadcast(4, 1));
+        queue.push_front(build_broadcast(5, 2));
+        queue.push_front(build_broadcast(6, 1));
+        queue.push_front(build_broadcast(7, 3));
+        queue.push_front(build_broadcast(8, 0));
+
+        // drop oldest item with highest send count
+        let dropped = drop_oldest_broadcast(&mut queue, max).unwrap();
+        assert_eq!(dropped.send_count, 3);
+        assert_eq!(2_i64.to_be_bytes(), dropped.payload.as_ref());
+
+        let dropped = drop_oldest_broadcast(&mut queue, max).unwrap();
+        assert_eq!(dropped.send_count, 3);
+        assert_eq!(7_i64.to_be_bytes(), dropped.payload.as_ref());
+
+        let dropped = drop_oldest_broadcast(&mut queue, max).unwrap();
+        assert_eq!(dropped.send_count, 2);
+        assert_eq!(5_i64.to_be_bytes(), dropped.payload.as_ref());
+
+        let dropped = drop_oldest_broadcast(&mut queue, max).unwrap();
+        assert_eq!(dropped.send_count, 1);
+        assert_eq!(3_i64.to_be_bytes(), dropped.payload.as_ref());
+
+        // queue is still at max now, no item gets dropped
+        assert!(drop_oldest_broadcast(&mut queue, max).is_none());
+
+        Ok(())
+    }
+
+    fn build_broadcast(id: u64, send_count: u8) -> PendingBroadcast {
+        PendingBroadcast {
+            payload: Bytes::copy_from_slice(&id.to_be_bytes()),
+            is_local: false,
+            send_count,
+            sent_to: HashSet::new(),
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_broadcast_order() -> eyre::Result<()> {

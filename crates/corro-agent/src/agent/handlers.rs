@@ -119,7 +119,12 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(&tripwire, &conn, agent.cluster_id(), agent.tx_changes().clone());
+        uni::spawn_unipayload_handler(
+            &tripwire,
+            &conn,
+            agent.cluster_id(),
+            agent.tx_changes().clone(),
+        );
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }
@@ -529,12 +534,9 @@ pub async fn handle_emptyset(
     mut tripwire: Tripwire,
 ) {
     type EmptyQueue = VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>;
-    let mut buf: HashMap<ActorId, EmptyQueue> =
-        HashMap::new();
+    let mut buf: HashMap<ActorId, EmptyQueue> = HashMap::new();
 
-    let mut join_set: JoinSet<
-        HashMap<ActorId, EmptyQueue>,
-    > = JoinSet::new();
+    let mut join_set: JoinSet<HashMap<ActorId, EmptyQueue>> = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -865,18 +867,6 @@ pub async fn handle_changes(
             continue;
         }
 
-        // drop old items when the queue is full.
-        if queue.len() > max_queue_len {
-            let change = queue.pop_back();
-            if let Some(change) = change {
-                for v in change.0.versions() {
-                    let _ = seen.remove(&(change.0.actor_id, v));
-                }
-            }
-
-            log_at_pow_10("dropped old change from queue", &mut drop_log_count);
-        }
-
         if let Some(mut seqs) = change.seqs().cloned() {
             let v = *change.versions().start();
             if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
@@ -925,6 +915,18 @@ pub async fn handle_changes(
                 trace!("already seen, stop disseminating");
                 continue;
             }
+        }
+
+        // drop old items when the queue is full.
+        if queue.len() > max_queue_len {
+            let change = queue.pop_back();
+            if let Some(change) = change {
+                for v in change.0.versions() {
+                    let _ = seen.remove(&(change.0.actor_id, v));
+                }
+            }
+
+            log_at_pow_10("dropped old change from queue", &mut drop_log_count);
         }
 
         if let Some(recv_lag) = recv_lag {
