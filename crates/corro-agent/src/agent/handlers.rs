@@ -119,7 +119,7 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(&tripwire, &conn, agent.clone());
+        uni::spawn_unipayload_handler(&tripwire, &conn, agent.cluster_id(), agent.tx_changes().clone());
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }

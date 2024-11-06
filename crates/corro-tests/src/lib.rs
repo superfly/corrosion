@@ -57,6 +57,7 @@ pub struct TestAgent {
     pub agent: Agent,
     pub bookie: Bookie,
     pub tmpdir: Arc<TempDir>,
+    pub config: Config,
 }
 
 pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError>>(
@@ -78,7 +79,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 
     let schema_paths = conf.db.schema_paths.clone();
 
-    let (agent, bookie) = start_with_config(conf, tripwire).await?;
+    let (agent, bookie) = start_with_config(conf.clone(), tripwire).await?;
 
     {
         let client = corro_client::CorrosionApiClient::new(agent.api_addr());
@@ -89,5 +90,6 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
         agent,
         bookie,
         tmpdir: Arc::new(tmpdir),
+        config: conf,
     })
 }

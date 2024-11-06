@@ -624,9 +624,7 @@ pub struct MatcherStmt {
 }
 
 impl MatcherStmt {
-    pub fn new_query(self: &Self) -> &String {
-        return &self.new_query;
-    }
+    pub fn new_query(&self) -> &String { &self.new_query }
 }
 
 const CHANGE_ID_COL: &str = "id";

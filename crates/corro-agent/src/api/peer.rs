@@ -1717,9 +1717,12 @@ pub async fn serve_sync(
 
 #[cfg(test)]
 mod tests {
+    use crate::api::public::api_v1_transactions;
     use axum::{Extension, Json};
     use camino::Utf8PathBuf;
+    use corro_tests::launch_test_agent;
     use corro_tests::TEST_SCHEMA;
+    use corro_types::api::Statement;
     use corro_types::{
         api::{ColumnName, TableName},
         base::CrsqlDbVersion,
@@ -1738,6 +1741,63 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sync_changes_order() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
+        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+        // create versions on the first node
+        let versions_range = 1..=100;
+        for i in versions_range.clone() {
+            let (status_code, body) = api_v1_transactions(
+                Extension(ta1.agent.clone()),
+                axum::Json(vec![Statement::WithParams(
+                    "INSERT OR REPLACE INTO testsblob (id,text) VALUES (?,?)".into(),
+                    vec![format!("service-id-{i}").into(), "service-name".into()],
+                )]),
+            )
+            .await;
+            assert_eq!(status_code, StatusCode::OK);
+
+            let version = body.0.version.unwrap();
+            assert_eq!(version, Version(i));
+        }
+
+        let dir = tempfile::tempdir()?;
+
+        let (ta2_agent, mut ta2_opts) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire,
+        )
+        .await?;
+
+        let members = vec![(ta1.agent.actor_id(), ta1.agent.gossip_addr())];
+        let _ = parallel_sync(
+            &ta2_agent,
+            &ta2_opts.transport,
+            members,
+            Default::default(),
+            HashMap::new(),
+        )
+        .await?;
+
+        for i in versions_range.rev() {
+            let changes = tokio::time::timeout(Duration::from_secs(5), ta2_opts.rx_changes.recv())
+                .await?
+                .unwrap();
+            assert_eq!(changes.0.versions(), Version(i)..=Version(i));
+        }
+
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_handle_need() -> eyre::Result<()> {

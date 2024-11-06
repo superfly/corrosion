@@ -1,6 +1,5 @@
 use corro_types::{
-    agent::Agent,
-    broadcast::{BroadcastV1, ChangeSource, UniPayload, UniPayloadV1},
+    actor::ClusterId, broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1}, channel::CorroSender
 };
 use metrics::counter;
 use speedy::Readable;
@@ -11,7 +10,7 @@ use tripwire::Tripwire;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
-pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, agent: Agent) {
+pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, cluster_id: ClusterId, tx_changes: CorroSender<(ChangeV1, ChangeSource)>) {
     tokio::spawn({
         let conn = conn.clone();
         let mut tripwire = tripwire.clone();
@@ -39,7 +38,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                 );
 
                 tokio::spawn({
-                    let agent = agent.clone();
+                    let tx_changes = tx_changes.clone();
                     async move {
                         let mut framed = FramedRead::new(
                             rx,
@@ -48,6 +47,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                 .new_codec(),
                         );
 
+                        let mut changes = vec![];
                         loop {
                             match StreamExt::next(&mut framed).await {
                                 Some(Ok(b)) => {
@@ -57,27 +57,19 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                         Ok(payload) => {
                                             trace!("parsed a payload: {payload:?}");
 
+       
                                             match payload {
                                                 UniPayload::V1 {
                                                     data:
                                                         UniPayloadV1::Broadcast(BroadcastV1::Change(
                                                             change,
                                                         )),
-                                                    cluster_id,
+                                                    cluster_id: payload_cluster_id,
                                                 } => {
-                                                    if cluster_id != agent.cluster_id() {
+                                                    if cluster_id != payload_cluster_id {
                                                         continue;
                                                     }
-                                                    if let Err(e) = agent
-                                                        .tx_changes()
-                                                        .send((change, ChangeSource::Broadcast))
-                                                        .await
-                                                    {
-                                                        error!(
-                                                            "could not send change for processing: {e}"
-                                                        );
-                                                        return;
-                                                    }
+                                                    changes.push((change, ChangeSource::Broadcast));
                                                 }
                                             }
                                         }
@@ -92,6 +84,18 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                 }
                                 None => break,
                             }
+                        }
+
+                        for change in changes.into_iter().rev() {
+                            if let Err(e) = tx_changes
+                                    .send(change)
+                                    .await
+                                {
+                                    error!(
+                                        "could not send change for processing: {e}"
+                                    );
+                                    return;
+                                }
                         }
                     }
                 });

@@ -122,14 +122,13 @@ pub fn runtime_loop(
     agent: Agent,
     transport: Transport,
     mut rx_foca: CorroReceiver<FocaInput>,
-    mut rx_bcast: CorroReceiver<BroadcastInput>,
+    rx_bcast: CorroReceiver<BroadcastInput>,
     to_send_tx: CorroSender<(Actor, Bytes)>,
     notifications_tx: CorroSender<Notification<Actor>>,
-    mut tripwire: Tripwire,
+    tripwire: Tripwire,
 ) {
     debug!("starting runtime loop for actor: {actor:?}");
     let rng = StdRng::from_entropy();
-    let actor_id = actor.id();
 
     let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
 
@@ -374,252 +373,261 @@ pub fn runtime_loop(
         }
     });
 
-    tokio::spawn(async move {
-        const BROADCAST_CUTOFF: usize = 64 * 1024;
+    tokio::spawn(handle_broadcasts(
+        agent, rx_bcast, transport, config, tripwire,
+    ));
+}
 
-        let mut bcast_codec = LengthDelimitedCodec::builder()
-            .max_frame_length(100 * 1_024 * 1_024)
-            .new_codec();
+async fn handle_broadcasts(
+    agent: Agent,
+    mut rx_bcast: CorroReceiver<BroadcastInput>,
+    transport: Transport,
+    config: Arc<RwLock<foca::Config>>,
+    mut tripwire: Tripwire,
+) {
+    let actor_id = agent.actor_id();
+    const BROADCAST_CUTOFF: usize = 64 * 1024;
 
-        let mut bcast_buf = BytesMut::new();
-        let mut local_bcast_buf = BytesMut::new();
-        let mut single_bcast_buf = BytesMut::new();
+    let mut bcast_codec = LengthDelimitedCodec::builder()
+        .max_frame_length(100 * 1_024 * 1_024)
+        .new_codec();
 
-        let mut metrics_interval = interval(Duration::from_secs(10));
+    let mut bcast_buf = BytesMut::new();
+    let mut local_bcast_buf = BytesMut::new();
+    let mut single_bcast_buf = BytesMut::new();
 
-        let mut rng = StdRng::from_entropy();
+    let mut metrics_interval = interval(Duration::from_secs(10));
 
-        let mut idle_pendings = FuturesUnordered::<
-            Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>,
-        >::new();
+    let mut rng = StdRng::from_entropy();
 
-        let mut bcast_interval = interval(Duration::from_millis(500));
+    let mut idle_pendings =
+        FuturesUnordered::<Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>>::new();
 
-        enum Branch {
-            Broadcast(BroadcastInput),
-            BroadcastTick,
-            WokePendingBroadcast(PendingBroadcast),
-            Tripped,
-            Metrics,
-        }
+    let mut bcast_interval = interval(Duration::from_millis(500));
 
-        let mut tripped = false;
-        let mut ser_buf = BytesMut::new();
+    enum Branch {
+        Broadcast(BroadcastInput),
+        BroadcastTick,
+        WokePendingBroadcast(PendingBroadcast),
+        Tripped,
+        Metrics,
+    }
 
-        let mut join_set = JoinSet::new();
-        let max_queue_len = agent.config().perf.processing_queue_len;
-        const MAX_INFLIGHT_BROADCAST: usize = 10000;
-        let mut to_broadcast = VecDeque::new();
-        let mut log_count = 0;
+    let mut tripped = false;
+    let mut ser_buf = BytesMut::new();
 
-        loop {
-            let branch = tokio::select! {
-                biased;
-                input = rx_bcast.recv() => match input {
-                    Some(input) => {
-                        Branch::Broadcast(input)
-                    },
-                    None => {
-                        warn!("no more swim inputs");
-                        break;
-                    }
+    let mut join_set = JoinSet::new();
+    let max_queue_len = agent.config().perf.processing_queue_len;
+    const MAX_INFLIGHT_BROADCAST: usize = 10000;
+    let mut to_broadcast = VecDeque::new();
+    let mut log_count = 0;
+
+    loop {
+        let branch = tokio::select! {
+            biased;
+            input = rx_bcast.recv() => match input {
+                Some(input) => {
+                    Branch::Broadcast(input)
                 },
-                _ = bcast_interval.tick() => {
-                    Branch::BroadcastTick
-                },
-                maybe_woke = idle_pendings.next(), if !idle_pendings.is_terminated() => match maybe_woke {
-                    Some(woke) => Branch::WokePendingBroadcast(woke),
-                    None => {
-                        trace!("idle pendings returned None");
-                        // I guess?
+                None => {
+                    warn!("no more swim inputs");
+                    break;
+                }
+            },
+            _ = bcast_interval.tick() => {
+                Branch::BroadcastTick
+            },
+            maybe_woke = idle_pendings.next(), if !idle_pendings.is_terminated() => match maybe_woke {
+                Some(woke) => Branch::WokePendingBroadcast(woke),
+                None => {
+                    trace!("idle pendings returned None");
+                    // I guess?
+                    continue;
+                }
+            },
+
+            _ = &mut tripwire, if !tripped => {
+                tripped = true;
+                Branch::Tripped
+            },
+            _ = metrics_interval.tick() => {
+                Branch::Metrics
+            }
+        };
+
+        match branch {
+            Branch::Tripped => {
+                // nothing to do here, yet!
+            }
+            Branch::BroadcastTick => {
+                if !bcast_buf.is_empty() {
+                    to_broadcast.push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
+                }
+                if !local_bcast_buf.is_empty() {
+                    to_broadcast.push_front(PendingBroadcast::new_local(
+                        local_bcast_buf.split().freeze(),
+                    ));
+                }
+            }
+            Branch::Broadcast(input) => {
+                trace!("handling Branch::Broadcast");
+                let (bcast, is_local) = match input {
+                    BroadcastInput::Rebroadcast(bcast) => (bcast, false),
+                    BroadcastInput::AddBroadcast(bcast) => (bcast, true),
+                };
+                trace!("adding broadcast: {bcast:?}, local? {is_local}");
+
+                if let Err(e) = (UniPayload::V1 {
+                    data: UniPayloadV1::Broadcast(bcast.clone()),
+                    cluster_id: agent.cluster_id(),
+                })
+                .write_to_stream((&mut ser_buf).writer())
+                {
+                    error!("could not encode UniPayload::V1 Broadcast: {e}");
+                    ser_buf.clear();
+                    continue;
+                }
+                trace!("ser buf len: {}", ser_buf.len());
+
+                if is_local {
+                    if let Err(e) =
+                        bcast_codec.encode(ser_buf.split().freeze(), &mut single_bcast_buf)
+                    {
+                        error!("could not encode local broadcast: {e}");
+                        single_bcast_buf.clear();
                         continue;
                     }
-                },
 
-                _ = &mut tripwire, if !tripped => {
-                    tripped = true;
-                    Branch::Tripped
-                },
-                _ = metrics_interval.tick() => {
-                    Branch::Metrics
-                }
-            };
+                    let payload = single_bcast_buf.split().freeze();
 
-            match branch {
-                Branch::Tripped => {
-                    // nothing to do here, yet!
-                }
-                Branch::BroadcastTick => {
-                    if !bcast_buf.is_empty() {
-                        to_broadcast.push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
+                    local_bcast_buf.extend_from_slice(&payload);
+
+                    {
+                        let members = agent.members().read();
+                        for addr in members.ring0(agent.cluster_id()) {
+                            // this spawns, so we won't be holding onto the read lock for long
+                            tokio::spawn(transmit_broadcast(
+                                payload.clone(),
+                                transport.clone(),
+                                addr,
+                            ));
+                        }
                     }
-                    if !local_bcast_buf.is_empty() {
+
+                    if local_bcast_buf.len() >= BROADCAST_CUTOFF {
                         to_broadcast.push_front(PendingBroadcast::new_local(
                             local_bcast_buf.split().freeze(),
                         ));
                     }
-                }
-                Branch::Broadcast(input) => {
-                    trace!("handling Branch::Broadcast");
-                    let (bcast, is_local) = match input {
-                        BroadcastInput::Rebroadcast(bcast) => (bcast, false),
-                        BroadcastInput::AddBroadcast(bcast) => (bcast, true),
-                    };
-                    trace!("adding broadcast: {bcast:?}, local? {is_local}");
-
-                    if let Err(e) = (UniPayload::V1 {
-                        data: UniPayloadV1::Broadcast(bcast.clone()),
-                        cluster_id: agent.cluster_id(),
-                    })
-                    .write_to_stream((&mut ser_buf).writer())
-                    {
-                        error!("could not encode UniPayload::V1 Broadcast: {e}");
-                        ser_buf.clear();
+                } else {
+                    if let Err(e) = bcast_codec.encode(ser_buf.split().freeze(), &mut bcast_buf) {
+                        error!("could not encode broadcast: {e}");
+                        bcast_buf.clear();
                         continue;
                     }
-                    trace!("ser buf len: {}", ser_buf.len());
 
-                    if is_local {
-                        if let Err(e) =
-                            bcast_codec.encode(ser_buf.split().freeze(), &mut single_bcast_buf)
-                        {
-                            error!("could not encode local broadcast: {e}");
-                            single_bcast_buf.clear();
-                            continue;
-                        }
-
-                        let payload = single_bcast_buf.split().freeze();
-
-                        local_bcast_buf.extend_from_slice(&payload);
-
-                        {
-                            let members = agent.members().read();
-                            for addr in members.ring0(agent.cluster_id()) {
-                                // this spawns, so we won't be holding onto the read lock for long
-                                tokio::spawn(transmit_broadcast(
-                                    payload.clone(),
-                                    transport.clone(),
-                                    addr,
-                                ));
-                            }
-                        }
-
-                        if local_bcast_buf.len() >= BROADCAST_CUTOFF {
-                            to_broadcast.push_front(PendingBroadcast::new_local(
-                                local_bcast_buf.split().freeze(),
-                            ));
-                        }
-                    } else {
-                        if let Err(e) = bcast_codec.encode(ser_buf.split().freeze(), &mut bcast_buf)
-                        {
-                            error!("could not encode broadcast: {e}");
-                            bcast_buf.clear();
-                            continue;
-                        }
-
-                        if bcast_buf.len() >= BROADCAST_CUTOFF {
-                            to_broadcast
-                                .push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
-                        }
-                    }
-                }
-                Branch::WokePendingBroadcast(pending) => {
-                    trace!("handling Branch::WokePendingBroadcast");
-                    to_broadcast.push_front(pending);
-                }
-                Branch::Metrics => {
-                    trace!("handling Branch::Metrics");
-                    gauge!("corro.broadcast.pending.count").set(idle_pendings.len() as f64);
-                    gauge!("corro.broadcast.buffer.capacity").set(bcast_buf.capacity() as f64);
-                    gauge!("corro.broadcast.serialization.buffer.capacity")
-                        .set(ser_buf.capacity() as f64);
-                }
-            }
-
-            while join_set.try_join_next().is_some() {}
-
-            while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
-                let mut pending = to_broadcast.pop_front().unwrap();
-                trace!("{} to broadcast: {pending:?}", actor_id);
-
-                let (member_count, max_transmissions) = {
-                    let config = config.read();
-                    let members = agent.members().read();
-                    let count = members.states.len();
-                    let ring0_count = members.ring0(agent.cluster_id()).count();
-                    let max_transmissions = config.max_transmissions.get();
-                    (
-                        std::cmp::max(
-                            config.num_indirect_probes.get(),
-                            (count - ring0_count) / (max_transmissions as usize * 10),
-                        ),
-                        max_transmissions,
-                    )
-                };
-
-                let broadcast_to = {
-                    agent
-                        .members()
-                        .read()
-                        .states
-                        .iter()
-                        .filter_map(|(member_id, state)| {
-                            // don't broadcast to ourselves... or ring0 if local broadcast
-                            if *member_id == actor_id
-                                || state.cluster_id != agent.cluster_id()
-                                || (pending.is_local && state.is_ring0())
-                                || pending.sent_to.contains(&state.addr)
-                            // don't broadcast to this peer
-                            {
-                                None
-                            } else {
-                                Some(state.addr)
-                            }
-                        })
-                        .choose_multiple(&mut rng, member_count)
-                };
-
-                for addr in broadcast_to {
-                    debug!(actor = %actor_id, "broadcasting {} bytes to: {addr}", pending.payload.len());
-
-                    join_set.spawn(transmit_broadcast(
-                        pending.payload.clone(),
-                        transport.clone(),
-                        addr,
-                    ));
-
-                    pending.sent_to.insert(addr);
-                }
-
-                if let Some(send_count) = pending.send_count.checked_add(1) {
-                    trace!("send_count: {send_count}, max_transmissions: {max_transmissions}");
-                    pending.send_count = send_count;
-
-                    if send_count < max_transmissions {
-                        debug!("queueing for re-send");
-                        idle_pendings.push(Box::pin(async move {
-                            // FIXME: calculate sleep duration based on send count
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            pending
-                        }));
+                    if bcast_buf.len() >= BROADCAST_CUTOFF {
+                        to_broadcast.push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
                     }
                 }
             }
-
-            // if broadcast queue is over the max, drop the oldest, most sent item
-            if to_broadcast.len() > max_queue_len {
-                let max_sent = to_broadcast
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, val)| val.send_count);
-                if let Some((i, _)) = max_sent {
-                    to_broadcast.remove(i);
-                    log_at_pow_10("dropped broadcast from queue", &mut log_count);
-                };
+            Branch::WokePendingBroadcast(pending) => {
+                trace!("handling Branch::WokePendingBroadcast");
+                to_broadcast.push_front(pending);
+            }
+            Branch::Metrics => {
+                trace!("handling Branch::Metrics");
+                gauge!("corro.broadcast.pending.count").set(idle_pendings.len() as f64);
+                gauge!("corro.broadcast.buffer.capacity").set(bcast_buf.capacity() as f64);
+                gauge!("corro.broadcast.serialization.buffer.capacity")
+                    .set(ser_buf.capacity() as f64);
             }
         }
-        info!("broadcasts are done");
-    });
+
+        while join_set.try_join_next().is_some() {}
+
+        while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
+            let mut pending = to_broadcast.pop_front().unwrap();
+            trace!("{} to broadcast: {pending:?}", actor_id);
+
+            let (member_count, max_transmissions) = {
+                let config = config.read();
+                let members = agent.members().read();
+                let count = members.states.len();
+                let ring0_count = members.ring0(agent.cluster_id()).count();
+                let max_transmissions = config.max_transmissions.get();
+                (
+                    std::cmp::max(
+                        config.num_indirect_probes.get(),
+                        (count - ring0_count) / (max_transmissions as usize * 10),
+                    ),
+                    max_transmissions,
+                )
+            };
+
+            let broadcast_to = {
+                agent
+                    .members()
+                    .read()
+                    .states
+                    .iter()
+                    .filter_map(|(member_id, state)| {
+                        // don't broadcast to ourselves... or ring0 if local broadcast
+                        if *member_id == actor_id
+                            || state.cluster_id != agent.cluster_id()
+                            || (pending.is_local && state.is_ring0())
+                            || pending.sent_to.contains(&state.addr)
+                        // don't broadcast to this peer
+                        {
+                            None
+                        } else {
+                            Some(state.addr)
+                        }
+                    })
+                    .choose_multiple(&mut rng, member_count)
+            };
+
+            for addr in broadcast_to {
+                debug!(actor = %actor_id, "broadcasting {} bytes to: {addr}", pending.payload.len());
+
+                join_set.spawn(transmit_broadcast(
+                    pending.payload.clone(),
+                    transport.clone(),
+                    addr,
+                ));
+
+                pending.sent_to.insert(addr);
+            }
+
+            if let Some(send_count) = pending.send_count.checked_add(1) {
+                trace!("send_count: {send_count}, max_transmissions: {max_transmissions}");
+                pending.send_count = send_count;
+
+                if send_count < max_transmissions {
+                    debug!("queueing for re-send");
+                    idle_pendings.push(Box::pin(async move {
+                        // FIXME: calculate sleep duration based on send count
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        pending
+                    }));
+                }
+            }
+        }
+
+        // if broadcast queue is over the max, drop the oldest, most sent item
+        if to_broadcast.len() > max_queue_len {
+            let max_sent = to_broadcast
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, val)| val.send_count);
+            if let Some((i, _)) = max_sent {
+                to_broadcast.remove(i);
+                log_at_pow_10("dropped broadcast from queue", &mut log_count);
+            };
+        }
+    }
+
+    info!("broadcasts are done");
 }
 
 fn diff_member_states(
@@ -810,5 +818,92 @@ async fn transmit_broadcast(payload: Bytes, transport: Transport, addr: SocketAd
         Ok(Ok(_)) => {
             counter!("corro.peer.stream.bytes.sent.total", "type" => "uni").increment(len as u64);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::spawn_unipayload_handler;
+    use corro_tests::launch_test_agent;
+    use corro_types::{
+        base::{CrsqlSeq, Version},
+        broadcast::{BroadcastV1, ChangeV1, Changeset},
+    };
+    use uuid::Uuid;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_broadcast_order() -> eyre::Result<()> {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+        let (tx_bcast, rx_bcast) = bounded(100, "bcast");
+        let (tx_rtt, _) = mpsc::channel(100);
+
+        let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
+        let transport = Transport::new(&ta1.config.gossip, tx_rtt).await?;
+
+        let server_config = quinn_plaintext::server_config();
+        let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())?;
+        let ta2_gossip_addr = endpoint.local_addr()?;
+        println!("listening on {ta2_gossip_addr}");
+
+        let ta2_actor = Actor::new(
+            ActorId(Uuid::new_v4()),
+            ta2_gossip_addr,
+            Default::default(),
+            ta1.agent.cluster_id(),
+        );
+        ta1.agent.members().write().add_member(&ta2_actor);
+
+        tokio::spawn(handle_broadcasts(
+            ta1.agent.clone(),
+            rx_bcast,
+            transport,
+            config,
+            tripwire.clone(),
+        ));
+
+        let actor_id = ta1.agent.actor_id();
+        for i in 0..5 {
+            tx_bcast
+                .send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(i),
+                        changes: vec![],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts: Default::default(),
+                    },
+                })))
+                .await?;
+        }
+
+        if let Some(conn) = endpoint.accept().await {
+            info!("accepting connection");
+            let conn = conn.await.unwrap();
+
+            let (tx_changes, mut rx_changes) = bounded(100, "changes");
+            spawn_unipayload_handler(&tripwire, &conn, ta1.agent.cluster_id(), tx_changes);
+
+            // we should receive five items starting from the biggest version
+            for i in (0..5).rev() {
+                let changes = tokio::time::timeout(Duration::from_secs(5), rx_changes.recv())
+                    .await?
+                    .unwrap();
+                assert_eq!(changes.0.versions(), Version(i)..=Version(i));
+            }
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        spawn::wait_for_all_pending_handles().await;
+
+        Ok(())
     }
 }
