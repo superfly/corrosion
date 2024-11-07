@@ -982,7 +982,7 @@ pub async fn start(
                                             let fields = match field_types(
                                                 stmt,
                                                 cmd,
-                                                FieldFormats::Each(&result_formats),
+                                                FieldFormats::Each(result_formats),
                                             ) {
                                                 Ok(fields) => fields,
                                                 Err(e) => {

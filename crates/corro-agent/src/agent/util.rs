@@ -969,7 +969,6 @@ pub async fn process_multiple_changes(
                     .snapshot()
             };
 
-
             snap.update_cleared_ts(&tx, ts)
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
@@ -988,11 +987,10 @@ pub async fn process_multiple_changes(
 
         if let Some(ts) = last_cleared {
             let mut booked_writer = agent
-                    .booked()
-                    .blocking_write("process_multiple_changes(update_cleared_ts)");
+                .booked()
+                .blocking_write("process_multiple_changes(update_cleared_ts)");
             booked_writer.update_cleared_ts(ts);
         }
-
 
         for (_, changeset, _, _) in changesets.iter() {
             if let Some(ts) = changeset.ts() {
@@ -1317,4 +1315,22 @@ pub fn check_buffered_meta_to_clear(
     }
 
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+}
+
+pub fn log_at_pow_10(msg: &str, count: &mut u64) {
+    if is_pow_10(*count + 1) {
+        warn!("{} (log count: {})", msg, count)
+    }
+    // reset count
+    if *count == 100000000 {
+        *count = 0;
+    }
+}
+
+#[inline]
+fn is_pow_10(i: u64) -> bool {
+    matches!(
+        i,
+        1 | 10 | 100 | 1000 | 10000 | 1000000 | 10000000 | 100000000
+    )
 }

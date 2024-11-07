@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::agent::util::log_at_pow_10;
 use crate::{
     agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL},
     api::peer::parallel_sync,
@@ -118,7 +119,12 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(&tripwire, &conn, agent.clone());
+        uni::spawn_unipayload_handler(
+            &tripwire,
+            &conn,
+            agent.cluster_id(),
+            agent.tx_changes().clone(),
+        );
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }
@@ -527,12 +533,10 @@ pub async fn handle_emptyset(
     mut rx_emptysets: CorroReceiver<ChangeV1>,
     mut tripwire: Tripwire,
 ) {
-    let mut buf: HashMap<ActorId, VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>> =
-        HashMap::new();
+    type EmptyQueue = VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>;
+    let mut buf: HashMap<ActorId, EmptyQueue> = HashMap::new();
 
-    let mut join_set: JoinSet<
-        HashMap<ActorId, VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>>,
-    > = JoinSet::new();
+    let mut join_set: JoinSet<HashMap<ActorId, EmptyQueue>> = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -551,7 +555,7 @@ pub async fn handle_emptyset(
             maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
                 Some(change) => {
                     if let Changeset::EmptySet { versions, ts } = change.changeset {
-                        buf.entry(change.actor_id).or_insert(VecDeque::new()).push_back((versions.clone(), ts));
+                        buf.entry(change.actor_id).or_default().push_back((versions.clone(), ts));
                     } else {
                         warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
                     }
@@ -618,9 +622,9 @@ pub async fn process_emptyset(
 ) -> Result<(), ChangeError> {
     let (versions, ts) = changes;
 
-    let mut version_iter = versions.chunks(100);
+    let version_iter = versions.chunks(100);
 
-    while let Some(chunk) = version_iter.next() {
+    for chunk in version_iter {
         let mut conn = agent.pool().write_low().await?;
         debug!("processing emptyset from {:?}", actor_id);
         let booked = {
@@ -863,26 +867,6 @@ pub async fn handle_changes(
             continue;
         }
 
-        // drop items when the queue is full.
-        if queue.len() > max_queue_len {
-            drop_log_count += 1;
-            if is_pow_10(drop_log_count) {
-                if drop_log_count == 1 {
-                    warn!("dropping a change because changes queue is full");
-                } else {
-                    warn!(
-                        "dropping {} changes because changes queue is full",
-                        drop_log_count
-                    );
-                }
-            }
-            // reset count
-            if drop_log_count == 100000000 {
-                drop_log_count = 0;
-            }
-            continue;
-        }
-
         if let Some(mut seqs) = change.seqs().cloned() {
             let v = *change.versions().start();
             if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
@@ -931,6 +915,18 @@ pub async fn handle_changes(
                 trace!("already seen, stop disseminating");
                 continue;
             }
+        }
+
+        // drop old items when the queue is full.
+        if queue.len() > max_queue_len {
+            let change = queue.pop_back();
+            if let Some(change) = change {
+                for v in change.0.versions() {
+                    let _ = seen.remove(&(change.0.actor_id, v));
+                }
+            }
+
+            log_at_pow_10("dropped old change from queue", &mut drop_log_count);
         }
 
         if let Some(recv_lag) = recv_lag {
@@ -1163,12 +1159,4 @@ mod tests {
 
         Ok(())
     }
-}
-
-#[inline]
-fn is_pow_10(i: u64) -> bool {
-    matches!(
-        i,
-        1 | 10 | 100 | 1000 | 10000 | 1000000 | 10000000 | 100000000
-    )
 }
