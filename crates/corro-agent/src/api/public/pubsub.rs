@@ -882,11 +882,11 @@ async fn forward_bytes_to_body_sender(
 #[cfg(test)]
 mod tests {
     use corro_types::actor::ActorId;
+    use corro_types::api::NotifyEvent;
     use corro_types::api::{Change, ColumnName, TableName};
     use corro_types::base::{CrsqlDbVersion, CrsqlSeq, Version};
     use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
     use corro_types::pubsub::pack_columns;
-    use corro_types::updates::NotifyEvent;
     use corro_types::{
         api::{ChangeId, RowId},
         config::Config,

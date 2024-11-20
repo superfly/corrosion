@@ -2,14 +2,12 @@ use crate::agent::SplitPool;
 use crate::pubsub::{unpack_columns, MatchCandidates, MatchableChange, MatcherError};
 use crate::schema::Schema;
 use async_trait::async_trait;
-use compact_str::CompactString;
 use corro_api_types::sqlite::ChangeType;
-use corro_api_types::{Change, ColumnName, SqliteValue, SqliteValueRef, TableName};
+use corro_api_types::{Change, ColumnName, NotifyEvent, SqliteValueRef, TableName};
 use corro_base_types::CrsqlDbVersion;
 use metrics::{counter, histogram, Counter};
 use parking_lot::RwLock;
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
 use spawn::spawn_counted;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
@@ -42,20 +40,6 @@ pub trait Handle {
     fn changes_tx(&self) -> mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>;
     async fn cleanup(&self);
     fn get_counter(&self, table: &str) -> &HandleMetrics;
-}
-
-pub type NotifyEvent = TypedNotifyEvent<Vec<SqliteValue>>;
-
-pub enum NotifyType {
-    Upsert = 0,
-    Delete = 2,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum TypedNotifyEvent<T> {
-    Notify(ChangeType, T),
-    Error(CompactString),
 }
 
 #[derive(Clone)]
@@ -439,10 +423,7 @@ where
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
-        if let Err(e) = handle
-            .changes_tx()
-            .try_send((candidates, db_version))
-        {
+        if let Err(e) = handle.changes_tx().try_send((candidates, db_version)) {
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
             match e {
                 mpsc::error::TrySendError::Full(item) => {
@@ -532,10 +513,7 @@ where
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
-        if let Err(e) = handle
-            .changes_tx()
-            .try_send((candidates, db_version))
-        {
+        if let Err(e) = handle.changes_tx().try_send((candidates, db_version)) {
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
             match e {
                 mpsc::error::TrySendError::Full(item) => {

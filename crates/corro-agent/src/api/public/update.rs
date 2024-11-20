@@ -5,7 +5,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::Agent,
-    updates::{Handle, NotifyEvent, UpdateCreated, UpdateHandle, UpdatesManager},
+    api::NotifyEvent,
+    updates::{Handle, UpdateCreated, UpdateHandle, UpdatesManager},
 };
 use futures::future::poll_fn;
 use tokio::sync::{
