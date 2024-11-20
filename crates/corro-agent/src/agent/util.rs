@@ -10,6 +10,7 @@ use crate::{
     api::public::{
         api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
         pubsub::{api_v1_sub_by_id, api_v1_subs},
+        update::SharedUpdateBroadcastCache,
     },
     transport::Transport,
 };
@@ -170,6 +171,7 @@ pub async fn setup_http_api_handler(
     agent: &Agent,
     tripwire: &Tripwire,
     subs_bcast_cache: BcastCache,
+    updates_bcast_cache: SharedUpdateBroadcastCache,
     subs_manager: &SubsManager,
     api_listeners: Vec<TcpListener>,
 ) -> eyre::Result<()> {
@@ -280,6 +282,7 @@ pub async fn setup_http_api_handler(
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
                 .layer(Extension(agent.clone()))
                 .layer(Extension(subs_bcast_cache))
+                .layer(Extension(updates_bcast_cache))
                 .layer(Extension(subs_manager.clone()))
                 .layer(Extension(tripwire.clone())),
         )
