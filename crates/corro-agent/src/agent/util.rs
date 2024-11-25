@@ -1318,7 +1318,8 @@ pub fn check_buffered_meta_to_clear(
 }
 
 pub fn log_at_pow_10(msg: &str, count: &mut u64) {
-    if is_pow_10(*count + 1) {
+    *count += 1;
+    if is_pow_10(*count) {
         warn!("{} (log count: {})", msg, count)
     }
     // reset count
