@@ -615,7 +615,7 @@ async fn handle_broadcasts(
         }
 
         if drop_oldest_broadcast(&mut to_broadcast, max_queue_len).is_some() {
-            log_at_pow_10("dropped old change from queue", &mut log_count);
+            log_at_pow_10("dropped old change from broadcast queue", &mut log_count);
         }
     }
 
