@@ -28,6 +28,7 @@ pub use error::{SyncClientError, SyncRecvError};
 pub use run_root::start_with_config;
 pub use setup::{setup, AgentOptions};
 pub use util::process_multiple_changes;
+pub use uni::spawn_unipayload_handler;
 
 pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
 #[cfg(test)]
