@@ -497,7 +497,7 @@ pub fn apply_schema(
                 }
 
                 if require_migration {
-                    tx.execute_batch(&format!("SELECT crsql_commit_alter('{name}');"))?;
+                    tx.execute_batch(&format!("SELECT crsql_commit_alter('main', '{name}', 1);"))?;
                 }
                 info!(
                     "Altering crsql for table {} took {:?}",
