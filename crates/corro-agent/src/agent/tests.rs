@@ -21,6 +21,7 @@ use tokio::{
 };
 use tracing::{debug, info_span};
 use tripwire::Tripwire;
+use uuid::Uuid;
 
 use crate::{
     agent::process_multiple_changes,
@@ -31,7 +32,7 @@ use crate::{
     transport::Transport,
 };
 use corro_tests::*;
-use corro_types::agent::Agent;
+use corro_types::{agent::Agent, api::{ColumnName, TableName}, pubsub::pack_columns};
 use corro_types::broadcast::Timestamp;
 use corro_types::change::Change;
 use corro_types::{
@@ -895,6 +896,112 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
 
     println!("db_ts - {:?}", db_ts);
     assert_eq!(db_ts, ta1_cleared.unwrap());
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_process_failed_changes() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let actor_id = ActorId(Uuid::new_v4());
+    // setup the schema, for both nodes
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta1.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+
+
+    let change1 = Change {
+        table: TableName("tests".into()),
+        pk: pack_columns(&vec![1i64.into()])?,
+        cid: ColumnName("text".into()),
+        val: "one".into(),
+        col_version: 1,
+        db_version: CrsqlDbVersion(1),
+        seq: CrsqlSeq(0),
+        site_id: actor_id.to_bytes(),
+        cl: 1,
+    };
+
+    let change2 = Change {
+        table: TableName("tests".into()),
+        pk: pack_columns(&vec![2i64.into()])?,
+        cid: ColumnName("text".into()),
+        val: "two".into(),
+        col_version: 1,
+        db_version: CrsqlDbVersion(2),
+        seq: CrsqlSeq(0),
+        site_id: actor_id.to_bytes(),
+        cl: 1,
+    };
+
+
+    let bad_change = Change {
+        table: TableName("tests".into()),
+        pk: pack_columns(&vec![2i64.into()])?,
+        cid: ColumnName("nonexistent".into()),
+        val: "x".into(),
+        col_version: 1,
+        db_version: CrsqlDbVersion(2),
+        seq: CrsqlSeq(1),
+        site_id: actor_id.to_bytes(),
+        cl: 1,
+    };
+
+    let res = process_multiple_changes(
+        ta1.agent.clone(),
+        ta1.bookie.clone(),
+        vec![
+            (
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(1),
+                        changes: vec![change1.clone()],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts: Default::default(),
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            ),
+            (
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(2),
+                        changes: vec![change2.clone(), bad_change],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(1),
+                        last_seq: CrsqlSeq(1),
+                        ts: Default::default(),
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            ),
+        ],
+    )
+    .await;
+
+    assert!(res.is_ok());
+    
+    let conn = ta1.agent.pool().read().await?;
+    conn.prepare_cached("SELECT text from tests where id = 1")?.query_row([], |row| { row.get::<_, String>(0)})?;
+
+    let res = conn.prepare_cached("SELECT text from tests where id = 2")?.query_row([], |row| { row.get::<_, String>(0)});
+    assert!(res.is_err());
+    assert_eq!(res, Err(rusqlite::Error::QueryReturnedNoRows));
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;

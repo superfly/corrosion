@@ -2,7 +2,6 @@
 //!
 //! This module is _big_ and maybe should be split up further.
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
@@ -777,21 +776,7 @@ pub async fn handle_changes(
             let agent = agent.clone();
             let bookie = bookie.clone();
             join_set.spawn(async move {
-                if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await
-                {
-                    error!("could not process multiple changes: {e}");
-                    changes.iter().fold(
-                        BTreeMap::new(),
-                        |mut acc: BTreeMap<ActorId, RangeInclusiveSet<Version>>, change| {
-                            acc.entry(change.0.actor_id)
-                                .or_default()
-                                .insert(change.0.versions());
-                            acc
-                        },
-                    )
-                } else {
-                    BTreeMap::new()
-                }
+                util::process_multiple_changes(agent, bookie, changes.clone()).await
             });
 
             buf_cost -= tmp_cost;
@@ -804,13 +789,14 @@ pub async fn handle_changes(
             // but we need to drain it to free up concurrency
             res = join_set.join_next(), if !join_set.is_empty() => {
                 debug!("processed multiple changes concurrently");
-                if let Some(Ok(res)) = res {
-                    for (actor_id, versions) in res {
-                        let versions: Vec<_> = versions.into_iter().flatten().collect();
-                        for version in versions {
-                            seen.remove(&(actor_id, version));
-                        }
-                    }
+                if let Some(Ok(Err(e))) = res {
+                    error!("could not process multiple changes: {e}");
+                    // for (actor_id, versions) in res {
+                    //     let versions: Vec<_> = versions.into_iter().flatten().collect();
+                    //     for version in versions {
+                    //         seen.remove(&(actor_id, version));
+                    //     }
+                    // }
                 }
                 continue;
             },
@@ -834,16 +820,7 @@ pub async fn handle_changes(
                     let agent = agent.clone();
                     let bookie = bookie.clone();
                     join_set.spawn(async move {
-                        if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await
-                        {
-                            error!("could not process multiple changes: {e}");
-                            changes.iter().fold(BTreeMap::new(), |mut acc: BTreeMap<ActorId, RangeInclusiveSet<Version>> , change| {
-                                acc.entry(change.0.actor_id).or_default().insert(change.0.versions());
-                                acc
-                            })
-                        } else {
-                            BTreeMap::new()
-                        }
+                        util::process_multiple_changes(agent, bookie, changes.clone()).await
                     });
                     buf_cost = 0;
                 }
