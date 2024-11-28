@@ -909,12 +909,13 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test_process_failed_changes() -> eyre::Result<()> {
+async fn process_failed_changes() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
 
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
-    let actor_id = ActorId(Uuid::new_v4());
+    let uuid = Uuid::parse_str("00000000-0000-0000-a716-446655440000")?;
+    let actor_id = ActorId(uuid);
     // setup the schema, for both nodes
     let (status_code, _body) = api_v1_db_schema(
         Extension(ta1.agent.clone()),
@@ -923,25 +924,34 @@ async fn test_process_failed_changes() -> eyre::Result<()> {
     .await;
     assert_eq!(status_code, StatusCode::OK);
 
-    let change1 = Change {
-        table: TableName("tests".into()),
-        pk: pack_columns(&vec![1i64.into()])?,
-        cid: ColumnName("text".into()),
-        val: "one".into(),
-        col_version: 1,
-        db_version: CrsqlDbVersion(1),
-        seq: CrsqlSeq(0),
-        site_id: actor_id.to_bytes(),
-        cl: 1,
-    };
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta2.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
 
-    let change2 = Change {
+    for i in 1..=5_i64 {
+        let (status_code, _) = api_v1_transactions(
+            Extension(ta2.agent.clone()),
+            axum::Json(vec![Statement::WithParams(
+                "INSERT OR REPLACE INTO tests (id,text) VALUES (?,?)".into(),
+                vec![i.into(), "service-text".into()],
+            )]),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK);
+    }
+    let mut good_changes = get_rows(ta2.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
+
+    let change6 = Change {
         table: TableName("tests".into()),
-        pk: pack_columns(&vec![2i64.into()])?,
+        pk: pack_columns(&vec![6i64.into()])?,
         cid: ColumnName("text".into()),
-        val: "two".into(),
+        val: "six".into(),
         col_version: 1,
-        db_version: CrsqlDbVersion(2),
+        db_version: CrsqlDbVersion(6),
         seq: CrsqlSeq(0),
         site_id: actor_id.to_bytes(),
         cl: 1,
@@ -949,90 +959,59 @@ async fn test_process_failed_changes() -> eyre::Result<()> {
 
     let bad_change = Change {
         table: TableName("tests".into()),
-        pk: pack_columns(&vec![2i64.into()])?,
+        pk: pack_columns(&vec![6i64.into()])?,
         cid: ColumnName("nonexistent".into()),
-        val: "x".into(),
+        val: "six".into(),
         col_version: 1,
-        db_version: CrsqlDbVersion(2),
+        db_version: CrsqlDbVersion(6),
         seq: CrsqlSeq(1),
         site_id: actor_id.to_bytes(),
         cl: 1,
     };
 
-    let change3 = Change {
-        table: TableName("tests".into()),
-        pk: pack_columns(&vec![3i64.into()])?,
-        cid: ColumnName("text".into()),
-        val: "three".into(),
-        col_version: 1,
-        db_version: CrsqlDbVersion(2),
-        seq: CrsqlSeq(0),
-        site_id: actor_id.to_bytes(),
-        cl: 1,
-    };
+    let mut rows = vec![
+        (
+            ChangeV1 {
+                actor_id,
+                changeset: Changeset::Full {
+                    version: Version(1),
+                    changes: vec![change6.clone(), bad_change],
+                    seqs: CrsqlSeq(0)..=CrsqlSeq(1),
+                    last_seq: CrsqlSeq(1),
+                    ts: Default::default(),
+                },
+            },
+            ChangeSource::Sync,
+            Instant::now(),
+        )
+    ];
 
-    let res = process_multiple_changes(
-        ta1.agent.clone(),
-        ta1.bookie.clone(),
-        vec![
-            (
-                ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Full {
-                        version: Version(1),
-                        changes: vec![change1.clone()],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
-                        ts: Default::default(),
-                    },
-                },
-                ChangeSource::Sync,
-                Instant::now(),
-            ),
-            (
-                ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Full {
-                        version: Version(2),
-                        changes: vec![change2.clone(), bad_change],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(1),
-                        last_seq: CrsqlSeq(1),
-                        ts: Default::default(),
-                    },
-                },
-                ChangeSource::Sync,
-                Instant::now(),
-            ),
-            (
-                ChangeV1 {
-                    actor_id,
-                    changeset: Changeset::Full {
-                        version: Version(3),
-                        changes: vec![change3.clone()],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
-                        ts: Default::default(),
-                    },
-                },
-                ChangeSource::Sync,
-                Instant::now(),
-            ),
-        ],
-    )
-    .await;
+    rows.append(&mut good_changes);
+
+    let res = process_multiple_changes(ta1.agent.clone(), ta1.bookie.clone(), rows).await;
 
     assert!(res.is_ok());
 
+    // verify that correct versions were inserted
     let conn = ta1.agent.pool().read().await?;
-    conn.prepare_cached("SELECT text from tests where id = 1")?
-        .query_row([], |row| row.get::<_, String>(0))?;
 
-    let conn = ta1.agent.pool().read().await?;
-    conn.prepare_cached("SELECT text from tests where id = 3")?
-        .query_row([], |row| row.get::<_, String>(0))?;
+    for i in 1..=5_i64 {
+        let pk = pack_columns(&[i.into()])?;
+        let crsql_dbv = conn.prepare_cached(r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ?"#)?
+            .query_row([pk], |row| row.get::<_, CrsqlDbVersion>(0))?;
+
+        let booked_dbv = conn.prepare_cached("SELECT db_version from __corro_bookkeeping where start_version = ? and actor_id = ?")?
+            .query_row((i, ta2.agent.actor_id()), |row| row.get::<_, CrsqlDbVersion>(0))?;
+
+        assert_eq!(crsql_dbv, booked_dbv);
+
+        let conn = ta1.agent.pool().read().await?;
+        conn.prepare_cached("SELECT text from tests where id = ?")?
+            .query_row([i], |row| row.get::<_, String>(0))?;
+    }
 
     let res = conn
-        .prepare_cached("SELECT text from tests where id = 2")?
+        .prepare_cached("SELECT text from tests where id = 6")?
         .query_row([], |row| row.get::<_, String>(0));
     assert!(res.is_err());
     assert_eq!(res, Err(rusqlite::Error::QueryReturnedNoRows));
@@ -1298,7 +1277,7 @@ async fn get_rows(
                 |row| row.get(0),
             )?;
             let mut last = 4;
-            // count will be zero for cleared vertest_processions
+            // count will be zero for cleared versions
             if count > 0 {
                 last = count - 1;
             }

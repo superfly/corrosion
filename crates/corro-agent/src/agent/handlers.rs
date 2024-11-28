@@ -750,8 +750,8 @@ pub async fn handle_changes(
         agent.config().perf.apply_queue_timeout as u64,
     ));
 
-    const MAX_SEEN_CACHE_LEN: usize = 10000;
-    const KEEP_SEEN_CACHE_SIZE: usize = 1000;
+    let max_seen_cache_len: usize = max_queue_len;
+    let keep_seen_cache_size: usize = cmp::max(10, max_seen_cache_len / 10);
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
     let mut drop_log_count: u64 = 0;
@@ -819,9 +819,9 @@ pub async fn handle_changes(
                     buf_cost = 0;
                 }
 
-                if seen.len() > MAX_SEEN_CACHE_LEN {
+                if seen.len() > max_seen_cache_len {
                     // we don't want to keep too many entries in here.
-                    seen = seen.split_off(seen.len() - KEEP_SEEN_CACHE_SIZE);
+                    seen = seen.split_off(seen.len() - keep_seen_cache_size);
                 }
                 continue
             },
