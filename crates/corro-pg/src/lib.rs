@@ -2089,7 +2089,7 @@ impl Session {
         let mut book_writer = self
             .agent
             .booked()
-            .blocking_write("handle_write_tx(book_writer)");
+            .blocking_write::<&str, _>("handle_write_tx(book_writer)", None);
 
         let actor_id = self.agent.actor_id();
 

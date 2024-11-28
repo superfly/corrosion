@@ -492,10 +492,10 @@ pub async fn configurable_stress_test(
             debug!(
                 "last version: {:?}",
                 ta.bookie
-                    .write("test")
+                    .write::<&str, _>("test", None)
                     .await
                     .ensure(ta.agent.actor_id())
-                    .read("test")
+                    .read::<&str, _>("test", None)
                     .await
                     .last()
             );
@@ -731,11 +731,11 @@ async fn large_tx_sync() -> eyre::Result<()> {
         println!(
             "{name}: bookie: {:?}",
             ta.bookie
-                .read("test")
+                .read::<&str, _>("test", None)
                 .await
                 .get(&ta1.agent.actor_id())
                 .unwrap()
-                .read("test")
+                .read::<&str, _>("test", None)
                 .await
                 .deref()
         );
@@ -879,15 +879,15 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     let ta1_cleared = ta1
         .agent
         .booked()
-        .read("test_clear_empty")
+        .read::<&str, _>("test_clear_empty", None)
         .await
         .last_cleared_ts();
     let ta2_ta1_cleared = ta2
         .bookie
-        .write("test")
+        .write::<&str, _>("test", None)
         .await
         .ensure(ta1.agent.actor_id())
-        .read("test_clear_empty")
+        .read::<&str, _>("test_clear_empty", None)
         .await
         .last_cleared_ts();
 
@@ -1188,8 +1188,12 @@ async fn check_bookie_versions(
     cleared: Vec<RangeInclusive<Version>>,
 ) -> eyre::Result<()> {
     let conn = ta.agent.pool().read().await?;
-    let booked = ta.bookie.write("test").await.ensure(actor_id);
-    let bookedv = booked.read("test").await;
+    let booked = ta
+        .bookie
+        .write::<&str, _>("test", None)
+        .await
+        .ensure(actor_id);
+    let bookedv = booked.read::<&str, _>("test", None).await;
 
     for versions in complete {
         for version in versions.clone() {

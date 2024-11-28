@@ -4,6 +4,7 @@
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use indexmap::IndexMap;
+use metrics::counter;
 use parking_lot::RwLock;
 use rusqlite::{Connection, OptionalExtension};
 use std::{
@@ -164,7 +165,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     tokio::spawn({
         let pool = pool.clone();
         // acquiring the lock here means everything will have to wait for it to be ready
-        let mut booked = booked.write_owned("init").await;
+        let mut booked = booked.write_owned::<&str, _>("init", None).await;
         async move {
             let conn = pool.read().await?;
             *booked.deref_mut().deref_mut() =
@@ -196,7 +197,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
                 if top
                     .values()
-                    .any(|meta| meta.started_at.elapsed() > WARNING_THRESHOLD)
+                    .any(|meta| meta.started_at.elapsed() >= WARNING_THRESHOLD)
                 {
                     warn!(
                         "lock registry shows locks held for a long time! top {} locks:",
@@ -209,6 +210,11 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                             "{} (id: {id}, type: {:?}, state: {:?}) locked for: {duration:?}",
                             lock.label, lock.kind, lock.state
                         );
+
+                        if duration >= WARNING_THRESHOLD {
+                            counter!("corro.agent.lock.slow.count", "name" => lock.label)
+                                .increment(1);
+                        }
                     }
                 }
             }

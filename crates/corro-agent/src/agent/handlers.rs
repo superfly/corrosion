@@ -579,14 +579,12 @@ pub async fn handle_emptyset(
                     while !changes.is_empty() {
                         let change = changes.pop_front().unwrap();
                         if let Some(booked) = bookie
-                            .read(format!("process_emptyset(check ts):{actor}"))
+                            .read("process_emptyset(check ts)",actor.as_simple())
                             .await
                             .get(actor)
                         {
                             let booked_read = booked
-                                .read(format!(
-                                    "process_emptyset(booked writer, ts timestamp):{actor}"
-                                ))
+                                .read("process_emptyset(booked writer, ts timestamp)", actor.as_simple())
                                 .await;
 
                             if let Some(seen_ts) = booked_read.last_cleared_ts() {
@@ -632,17 +630,19 @@ pub async fn process_emptyset(
         debug!("processing emptyset from {:?}", actor_id);
         let booked = {
             bookie
-                .write(format!(
-                    "process_emptyset(booked writer, updates timestamp):{actor_id}",
-                ))
+                .write(
+                    "process_emptyset(booked writer, updates timestamp)",
+                    actor_id.as_simple(),
+                )
                 .await
                 .ensure(actor_id)
         };
 
         let mut booked_write = booked
-            .write(format!(
-                "process_emptyset(booked writer, updates timestamp):{actor_id}"
-            ))
+            .write(
+                "process_emptyset(booked writer, updates timestamp)",
+                actor_id.as_simple(),
+            )
             .await;
 
         let mut snap = booked_write.snapshot();
@@ -685,17 +685,19 @@ pub async fn process_emptyset(
     let mut conn = agent.pool().write_low().await?;
     let booked = {
         bookie
-            .write(format!(
-                "process_emptyset(booked writer, updates timestamp):{actor_id}",
-            ))
+            .write(
+                "process_emptyset(booked writer, updates timestamp)",
+                actor_id.as_simple(),
+            )
             .await
             .ensure(actor_id)
     };
 
     let mut booked_write = booked
-        .write(format!(
-            "process_emptyset(booked writer, updates timestamp):{actor_id}"
-        ))
+        .write(
+            "process_emptyset(booked writer, updates timestamp)",
+            actor_id.as_simple(),
+        )
         .await;
 
     let tx = conn
@@ -865,10 +867,7 @@ pub async fn handle_changes(
 
         let booked = {
             bookie
-                .read(format!(
-                    "handle_change(get):{}",
-                    change.actor_id.as_simple()
-                ))
+                .read("handle_change(get)", change.actor_id.as_simple())
                 .await
                 .get(&change.actor_id)
                 .cloned()
@@ -876,10 +875,7 @@ pub async fn handle_changes(
 
         if let Some(booked) = booked {
             if booked
-                .read(format!(
-                    "handle_change(contains?):{}",
-                    change.actor_id.as_simple()
-                ))
+                .read("handle_change(contains?)", change.actor_id.as_simple())
                 .await
                 .contains_all(change.versions(), change.seqs())
             {
@@ -1161,8 +1157,12 @@ mod tests {
 
         sleep(Duration::from_secs(2)).await;
 
-        let bookie = bookie.read("read booked").await;
-        let booked = bookie.get(&other_actor).unwrap().read("test").await;
+        let bookie = bookie.read::<&str, _>("read booked", None).await;
+        let booked = bookie
+            .get(&other_actor)
+            .unwrap()
+            .read::<&str, _>("test", None)
+            .await;
         assert!(booked.contains_all(Version(6)..=Version(10), None));
         assert!(booked.contains_all(Version(1)..=Version(3), None));
         assert!(!booked.contains_version(&Version(5)));
