@@ -32,7 +32,6 @@ use crate::{
     transport::Transport,
 };
 use corro_tests::*;
-use corro_types::{agent::Agent, api::{ColumnName, TableName}, pubsub::pack_columns};
 use corro_types::broadcast::Timestamp;
 use corro_types::change::Change;
 use corro_types::{
@@ -44,6 +43,11 @@ use corro_types::{
     change::store_empty_changeset,
     sqlite::CrConn,
     sync::generate_sync,
+};
+use corro_types::{
+    agent::Agent,
+    api::{ColumnName, TableName},
+    pubsub::pack_columns,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -904,7 +908,6 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     Ok(())
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_process_failed_changes() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
@@ -919,7 +922,6 @@ async fn test_process_failed_changes() -> eyre::Result<()> {
     )
     .await;
     assert_eq!(status_code, StatusCode::OK);
-
 
     let change1 = Change {
         table: TableName("tests".into()),
@@ -945,7 +947,6 @@ async fn test_process_failed_changes() -> eyre::Result<()> {
         cl: 1,
     };
 
-
     let bad_change = Change {
         table: TableName("tests".into()),
         pk: pack_columns(&vec![2i64.into()])?,
@@ -954,6 +955,18 @@ async fn test_process_failed_changes() -> eyre::Result<()> {
         col_version: 1,
         db_version: CrsqlDbVersion(2),
         seq: CrsqlSeq(1),
+        site_id: actor_id.to_bytes(),
+        cl: 1,
+    };
+
+    let change3 = Change {
+        table: TableName("tests".into()),
+        pk: pack_columns(&vec![3i64.into()])?,
+        cid: ColumnName("text".into()),
+        val: "three".into(),
+        col_version: 1,
+        db_version: CrsqlDbVersion(2),
+        seq: CrsqlSeq(0),
         site_id: actor_id.to_bytes(),
         cl: 1,
     };
@@ -990,16 +1003,37 @@ async fn test_process_failed_changes() -> eyre::Result<()> {
                 ChangeSource::Sync,
                 Instant::now(),
             ),
+            (
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: Version(3),
+                        changes: vec![change3.clone()],
+                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        last_seq: CrsqlSeq(0),
+                        ts: Default::default(),
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            ),
         ],
     )
     .await;
 
     assert!(res.is_ok());
-    
-    let conn = ta1.agent.pool().read().await?;
-    conn.prepare_cached("SELECT text from tests where id = 1")?.query_row([], |row| { row.get::<_, String>(0)})?;
 
-    let res = conn.prepare_cached("SELECT text from tests where id = 2")?.query_row([], |row| { row.get::<_, String>(0)});
+    let conn = ta1.agent.pool().read().await?;
+    conn.prepare_cached("SELECT text from tests where id = 1")?
+        .query_row([], |row| row.get::<_, String>(0))?;
+
+    let conn = ta1.agent.pool().read().await?;
+    conn.prepare_cached("SELECT text from tests where id = 3")?
+        .query_row([], |row| row.get::<_, String>(0))?;
+
+    let res = conn
+        .prepare_cached("SELECT text from tests where id = 2")?
+        .query_row([], |row| row.get::<_, String>(0));
     assert!(res.is_err());
     assert_eq!(res, Err(rusqlite::Error::QueryReturnedNoRows));
 
@@ -1264,7 +1298,7 @@ async fn get_rows(
                 |row| row.get(0),
             )?;
             let mut last = 4;
-            // count will be zero for cleared versions
+            // count will be zero for cleared vertest_processions
             if count > 0 {
                 last = count - 1;
             }

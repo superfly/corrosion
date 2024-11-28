@@ -12,9 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::agent::util::log_at_pow_10;
 use crate::{
-    agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL},
+    agent::{
+        bi, bootstrap, uni,
+        util::{log_at_pow_10, process_multiple_changes},
+        SyncClientError, ANNOUNCE_INTERVAL,
+    },
     api::peer::parallel_sync,
     transport::Transport,
 };
@@ -35,6 +38,7 @@ use corro_types::base::Version;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::store_empty_changeset;
 use foca::Notification;
+use indexmap::map::Entry;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
@@ -775,9 +779,7 @@ pub async fn handle_changes(
             let changes = std::mem::take(&mut buf);
             let agent = agent.clone();
             let bookie = bookie.clone();
-            join_set.spawn(async move {
-                util::process_multiple_changes(agent, bookie, changes.clone()).await
-            });
+            join_set.spawn(process_multiple_changes(agent, bookie, changes.clone()));
 
             buf_cost -= tmp_cost;
         }
@@ -791,12 +793,6 @@ pub async fn handle_changes(
                 debug!("processed multiple changes concurrently");
                 if let Some(Ok(Err(e))) = res {
                     error!("could not process multiple changes: {e}");
-                    // for (actor_id, versions) in res {
-                    //     let versions: Vec<_> = versions.into_iter().flatten().collect();
-                    //     for version in versions {
-                    //         seen.remove(&(actor_id, version));
-                    //     }
-                    // }
                 }
                 continue;
             },
@@ -819,9 +815,7 @@ pub async fn handle_changes(
                     let changes: Vec<_> = queue.drain(..).collect();
                     let agent = agent.clone();
                     let bookie = bookie.clone();
-                    join_set.spawn(async move {
-                        util::process_multiple_changes(agent, bookie, changes.clone()).await
-                    });
+                    join_set.spawn(process_multiple_changes(agent, bookie, changes.clone()));
                     buf_cost = 0;
                 }
 
@@ -896,10 +890,16 @@ pub async fn handle_changes(
 
         // drop old items when the queue is full.
         if queue.len() >= max_queue_len {
-            let dropped = queue.pop_front();
-            if let Some(dropped) = dropped {
-                for v in dropped.0.versions() {
-                    let _ = seen.remove(&(dropped.0.actor_id, v));
+            if let Some((dropped_change, _, _)) = queue.pop_front() {
+                for v in dropped_change.versions() {
+                    if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
+                        if let Some(seqs) = dropped_change.seqs().cloned() {
+                            entry.get_mut().remove(seqs);
+                        } else {
+                            entry.remove_entry();
+                        }
+                    };
+                    buf_cost -= dropped_change.processing_cost();
                 }
             }
 
