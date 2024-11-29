@@ -899,8 +899,9 @@ pub async fn handle_changes(
                             entry.remove_entry();
                         }
                     };
-                    buf_cost -= dropped_change.processing_cost();
                 }
+
+                buf_cost -= dropped_change.processing_cost();
             }
 
             log_at_pow_10("dropped old change from queue", &mut drop_log_count);
