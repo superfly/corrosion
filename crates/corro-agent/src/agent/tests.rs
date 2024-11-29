@@ -21,6 +21,7 @@ use tokio::{
 };
 use tracing::{debug, info_span};
 use tripwire::Tripwire;
+use uuid::Uuid;
 
 use crate::{
     agent::process_multiple_changes,
@@ -31,7 +32,6 @@ use crate::{
     transport::Transport,
 };
 use corro_tests::*;
-use corro_types::agent::Agent;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::Change;
 use corro_types::{
@@ -43,6 +43,11 @@ use corro_types::{
     change::store_empty_changeset,
     sqlite::CrConn,
     sync::generate_sync,
+};
+use corro_types::{
+    agent::Agent,
+    api::{ColumnName, TableName},
+    pubsub::pack_columns,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -895,6 +900,121 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
 
     println!("db_ts - {:?}", db_ts);
     assert_eq!(db_ts, ta1_cleared.unwrap());
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn process_failed_changes() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let uuid = Uuid::parse_str("00000000-0000-0000-a716-446655440000")?;
+    let actor_id = ActorId(uuid);
+    // setup the schema, for both nodes
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta1.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(ta2.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    for i in 1..=5_i64 {
+        let (status_code, _) = api_v1_transactions(
+            Extension(ta2.agent.clone()),
+            axum::Json(vec![Statement::WithParams(
+                "INSERT OR REPLACE INTO tests (id,text) VALUES (?,?)".into(),
+                vec![i.into(), "service-text".into()],
+            )]),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK);
+    }
+    let mut good_changes = get_rows(ta2.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
+
+    let change6 = Change {
+        table: TableName("tests".into()),
+        pk: pack_columns(&vec![6i64.into()])?,
+        cid: ColumnName("text".into()),
+        val: "six".into(),
+        col_version: 1,
+        db_version: CrsqlDbVersion(6),
+        seq: CrsqlSeq(0),
+        site_id: actor_id.to_bytes(),
+        cl: 1,
+    };
+
+    let bad_change = Change {
+        table: TableName("tests".into()),
+        pk: pack_columns(&vec![6i64.into()])?,
+        cid: ColumnName("nonexistent".into()),
+        val: "six".into(),
+        col_version: 1,
+        db_version: CrsqlDbVersion(6),
+        seq: CrsqlSeq(1),
+        site_id: actor_id.to_bytes(),
+        cl: 1,
+    };
+
+    let mut rows = vec![
+        (
+            ChangeV1 {
+                actor_id,
+                changeset: Changeset::Full {
+                    version: Version(1),
+                    changes: vec![change6.clone(), bad_change],
+                    seqs: CrsqlSeq(0)..=CrsqlSeq(1),
+                    last_seq: CrsqlSeq(1),
+                    ts: Default::default(),
+                },
+            },
+            ChangeSource::Sync,
+            Instant::now(),
+        )
+    ];
+
+    rows.append(&mut good_changes);
+
+    let res = process_multiple_changes(ta1.agent.clone(), ta1.bookie.clone(), rows).await;
+
+    assert!(res.is_ok());
+
+    // verify that correct versions were inserted
+    let conn = ta1.agent.pool().read().await?;
+
+    for i in 1..=5_i64 {
+        let pk = pack_columns(&[i.into()])?;
+        let crsql_dbv = conn.prepare_cached(r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ?"#)?
+            .query_row([pk], |row| row.get::<_, CrsqlDbVersion>(0))?;
+
+        let booked_dbv = conn.prepare_cached("SELECT db_version from __corro_bookkeeping where start_version = ? and actor_id = ?")?
+            .query_row((i, ta2.agent.actor_id()), |row| row.get::<_, CrsqlDbVersion>(0))?;
+
+        assert_eq!(crsql_dbv, booked_dbv);
+
+        let conn = ta1.agent.pool().read().await?;
+        conn.prepare_cached("SELECT text from tests where id = ?")?
+            .query_row([i], |row| row.get::<_, String>(0))?;
+    }
+
+    let res = conn
+        .prepare_cached("SELECT text from tests where id = 6")?
+        .query_row([], |row| row.get::<_, String>(0));
+    assert!(res.is_err());
+    assert_eq!(res, Err(rusqlite::Error::QueryReturnedNoRows));
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;

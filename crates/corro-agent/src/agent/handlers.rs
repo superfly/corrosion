@@ -2,7 +2,6 @@
 //!
 //! This module is _big_ and maybe should be split up further.
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
@@ -13,9 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::agent::util::log_at_pow_10;
 use crate::{
-    agent::{bi, bootstrap, uni, util, SyncClientError, ANNOUNCE_INTERVAL},
+    agent::{
+        bi, bootstrap, uni,
+        util::{log_at_pow_10, process_multiple_changes},
+        SyncClientError, ANNOUNCE_INTERVAL,
+    },
     api::peer::parallel_sync,
     transport::Transport,
 };
@@ -36,6 +38,7 @@ use corro_types::base::Version;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::store_empty_changeset;
 use foca::Notification;
+use indexmap::map::Entry;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
@@ -747,8 +750,8 @@ pub async fn handle_changes(
         agent.config().perf.apply_queue_timeout as u64,
     ));
 
-    const MAX_SEEN_CACHE_LEN: usize = 10000;
-    const KEEP_SEEN_CACHE_SIZE: usize = 1000;
+    let max_seen_cache_len: usize = max_queue_len;
+    let keep_seen_cache_size: usize = cmp::max(10, max_seen_cache_len / 10);
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
     let mut drop_log_count: u64 = 0;
@@ -776,23 +779,7 @@ pub async fn handle_changes(
             let changes = std::mem::take(&mut buf);
             let agent = agent.clone();
             let bookie = bookie.clone();
-            join_set.spawn(async move {
-                if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await
-                {
-                    error!("could not process multiple changes: {e}");
-                    changes.iter().fold(
-                        BTreeMap::new(),
-                        |mut acc: BTreeMap<ActorId, RangeInclusiveSet<Version>>, change| {
-                            acc.entry(change.0.actor_id)
-                                .or_default()
-                                .insert(change.0.versions());
-                            acc
-                        },
-                    )
-                } else {
-                    BTreeMap::new()
-                }
-            });
+            join_set.spawn(process_multiple_changes(agent, bookie, changes.clone()));
 
             buf_cost -= tmp_cost;
         }
@@ -804,13 +791,8 @@ pub async fn handle_changes(
             // but we need to drain it to free up concurrency
             res = join_set.join_next(), if !join_set.is_empty() => {
                 debug!("processed multiple changes concurrently");
-                if let Some(Ok(res)) = res {
-                    for (actor_id, versions) in res {
-                        let versions: Vec<_> = versions.into_iter().flatten().collect();
-                        for version in versions {
-                            seen.remove(&(actor_id, version));
-                        }
-                    }
+                if let Some(Ok(Err(e))) = res {
+                    error!("could not process multiple changes: {e}");
                 }
                 continue;
             },
@@ -833,24 +815,13 @@ pub async fn handle_changes(
                     let changes: Vec<_> = queue.drain(..).collect();
                     let agent = agent.clone();
                     let bookie = bookie.clone();
-                    join_set.spawn(async move {
-                        if let Err(e) = util::process_multiple_changes(agent, bookie, changes.clone()).await
-                        {
-                            error!("could not process multiple changes: {e}");
-                            changes.iter().fold(BTreeMap::new(), |mut acc: BTreeMap<ActorId, RangeInclusiveSet<Version>> , change| {
-                                acc.entry(change.0.actor_id).or_default().insert(change.0.versions());
-                                acc
-                            })
-                        } else {
-                            BTreeMap::new()
-                        }
-                    });
+                    join_set.spawn(process_multiple_changes(agent, bookie, changes.clone()));
                     buf_cost = 0;
                 }
 
-                if seen.len() > MAX_SEEN_CACHE_LEN {
+                if seen.len() > max_seen_cache_len {
                     // we don't want to keep too many entries in here.
-                    seen = seen.split_off(seen.len() - KEEP_SEEN_CACHE_SIZE);
+                    seen = seen.split_off(seen.len() - keep_seen_cache_size);
                 }
                 continue
             },
@@ -919,10 +890,16 @@ pub async fn handle_changes(
 
         // drop old items when the queue is full.
         if queue.len() >= max_queue_len {
-            let dropped = queue.pop_front();
-            if let Some(dropped) = dropped {
-                for v in dropped.0.versions() {
-                    let _ = seen.remove(&(dropped.0.actor_id, v));
+            if let Some((dropped_change, _, _)) = queue.pop_front() {
+                for v in dropped_change.versions() {
+                    if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
+                        if let Some(seqs) = dropped_change.seqs().cloned() {
+                            entry.get_mut().remove(seqs);
+                        } else {
+                            entry.remove_entry();
+                        }
+                    };
+                    buf_cost -= dropped_change.processing_cost();
                 }
             }
 

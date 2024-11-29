@@ -849,7 +849,6 @@ mod tests {
 
         assert!(drop_oldest_broadcast(&mut queue, max).is_none());
 
-
         queue.push_front(build_broadcast(1, 0));
         queue.push_front(build_broadcast(2, 3));
         queue.push_front(build_broadcast(3, 1));
