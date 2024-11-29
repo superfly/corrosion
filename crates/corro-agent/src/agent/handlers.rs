@@ -782,6 +782,7 @@ pub async fn handle_changes(
             let agent = agent.clone();
             let bookie = bookie.clone();
             join_set.spawn(process_multiple_changes(agent, bookie, changes.clone()));
+            counter!("corro.agent.changes.batch.spawned").increment(1);
 
             buf_cost -= tmp_cost;
         }
@@ -818,6 +819,7 @@ pub async fn handle_changes(
                     let agent = agent.clone();
                     let bookie = bookie.clone();
                     join_set.spawn(process_multiple_changes(agent, bookie, changes.clone()));
+                    counter!("corro.agent.changes.batch.spawned").increment(1);
                     buf_cost = 0;
                 }
 
