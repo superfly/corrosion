@@ -523,19 +523,16 @@ pub async fn process_fully_buffered_changes(
 
         let booked = {
             bookie
-                .write(format!(
-                    "process_fully_buffered(ensure):{}",
-                    actor_id.as_simple()
-                ))
+                .write("process_fully_buffered(ensure)", actor_id.as_simple())
                 .await
                 .ensure(actor_id)
         };
 
         let mut bookedw = booked
-            .write(format!(
-                "process_fully_buffered(booked writer):{}",
-                actor_id.as_simple()
-            ))
+            .write(
+                "process_fully_buffered(booked writer)",
+                actor_id.as_simple(),
+            )
             .await;
         debug!(%actor_id, %version, "acquired Booked write lock to process fully buffered changes");
 
@@ -685,7 +682,7 @@ pub async fn process_fully_buffered_changes(
             let mut agent_booked = {
                 agent
                     .booked()
-                    .blocking_write("process_fully_buffered_changes(get snapshot)")
+                    .blocking_write::<&str, _>("process_fully_buffered_changes(get snapshot)", None)
             };
 
             let mut agent_snap = agent_booked.snapshot();
@@ -750,18 +747,18 @@ pub async fn process_multiple_changes(
 
         let booked_writer = {
             bookie
-                .write(format!(
-                    "process_multiple_changes(ensure):{}",
-                    change.actor_id.as_simple()
-                ))
+                .write(
+                    "process_multiple_changes(ensure)",
+                    change.actor_id.as_simple(),
+                )
                 .await
                 .ensure(change.actor_id)
         };
         if booked_writer
-            .read(format!(
-                "process_multiple_changes(contains?):{}",
-                change.actor_id.as_simple()
-            ))
+            .read(
+                "process_multiple_changes(contains_all?)",
+                change.actor_id.as_simple(),
+            )
             .await
             .contains_all(change.versions(), change.seqs())
         {
@@ -796,16 +793,16 @@ pub async fn process_multiple_changes(
         for (actor_id, changes) in unknown_changes {
             let booked = {
                 bookie
-                    .blocking_write(format!(
-                        "process_multiple_changes(for_actor_blocking):{}",
-                        actor_id.as_simple()
-                    ))
+                    .blocking_write(
+                        "process_multiple_changes(for_actor_blocking)",
+                        actor_id.as_simple(),
+                    )
                     .ensure(actor_id)
             };
-            let booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer, unknown changes):{}",
-                actor_id.as_simple()
-            ));
+            let booked_write = booked.blocking_write(
+                "process_multiple_changes(booked writer, unknown changes)",
+                actor_id.as_simple(),
+            );
 
             let mut seen = RangeInclusiveMap::new();
 
@@ -922,9 +919,10 @@ pub async fn process_multiple_changes(
 
             let booked = {
                 bookie
-                    .blocking_write(format!(
-                        "process_multiple_changes(for_actor_blocking):{actor_id}",
-                    ))
+                    .blocking_write(
+                        "process_multiple_changes(for_actor_blocking)",
+                        actor_id.as_simple(),
+                    )
                     .ensure(*actor_id)
             };
 
@@ -932,9 +930,10 @@ pub async fn process_multiple_changes(
             let mut snap = match snapshots.remove(actor_id) {
                 Some(snap) => snap,
                 None => {
-                    let booked_write = booked.blocking_write(format!(
-                        "process_multiple_changes(booked writer, during knowns):{actor_id}",
-                    ));
+                    let booked_write = booked.blocking_write(
+                        "process_multiple_changes(booked writer, during knowns)",
+                        actor_id.as_simple(),
+                    );
                     booked_write.snapshot()
                 }
             };
@@ -976,7 +975,10 @@ pub async fn process_multiple_changes(
             let mut snap = {
                 agent
                     .booked()
-                    .blocking_write("process_multiple_changes(update_cleared_ts snapshot)")
+                    .blocking_write::<&str, _>(
+                        "process_multiple_changes(update_cleared_ts snapshot)",
+                        None,
+                    )
                     .snapshot()
             };
 
@@ -999,7 +1001,7 @@ pub async fn process_multiple_changes(
         if let Some(ts) = last_cleared {
             let mut booked_writer = agent
                 .booked()
-                .blocking_write("process_multiple_changes(update_cleared_ts)");
+                .blocking_write::<&str, _>("process_multiple_changes(update_cleared_ts)", None);
             booked_writer.update_cleared_ts(ts);
         }
 
@@ -1015,14 +1017,16 @@ pub async fn process_multiple_changes(
         for (actor_id, knowns) in knowns {
             let booked = {
                 bookie
-                    .blocking_write(format!(
-                        "process_multiple_changes(for_actor_blocking):{actor_id}",
-                    ))
+                    .blocking_write(
+                        "process_multiple_changes(for_actor_blocking)",
+                        actor_id.as_simple(),
+                    )
                     .ensure(actor_id)
             };
-            let mut booked_write = booked.blocking_write(format!(
-                "process_multiple_changes(booked writer, before apply needed):{actor_id}",
-            ));
+            let mut booked_write = booked.blocking_write(
+                "process_multiple_changes(booked writer, before apply needed)",
+                actor_id.as_simple(),
+            );
 
             if let Some(snap) = snapshots.remove(&actor_id) {
                 booked_write.commit_snapshot(snap);

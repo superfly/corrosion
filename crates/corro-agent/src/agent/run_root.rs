@@ -123,7 +123,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
 
     let bookie = Bookie::new_with_registry(Default::default(), lock_registry);
     {
-        let mut w = bookie.write("init").await;
+        let mut w = bookie.write::<&str, _>("init", None).await;
         w.insert(agent.actor_id(), agent.booked().clone());
     }
 
@@ -180,7 +180,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
             }
 
             bookie
-                .write("replace_actor")
+                .write::<&str, _>("replace_actor", None)
                 .await
                 .replace_actor(actor_id, bv);
         }

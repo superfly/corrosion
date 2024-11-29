@@ -49,7 +49,7 @@ where
     // so it probably doesn't matter too much, except for reads of internal state
     let mut book_writer = agent
         .booked()
-        .write("make_broadcastable_changes(booked writer)")
+        .write::<&str, _>("make_broadcastable_changes(booked writer)", None)
         .await;
 
     let start = Instant::now();
@@ -681,7 +681,10 @@ mod tests {
             }))
         ));
 
-        assert_eq!(agent.booked().read("test").await.last(), Some(Version(1)));
+        assert_eq!(
+            agent.booked().read::<&str, _>("test", None).await.last(),
+            Some(Version(1))
+        );
 
         println!("second req...");
 

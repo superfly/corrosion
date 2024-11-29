@@ -289,7 +289,7 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
 
     let actors: Vec<(ActorId, Booked)> = {
         bookie
-            .read("generate_sync")
+            .read::<&str, _>("generate_sync", None)
             .await
             .iter()
             .map(|(k, v)| (*k, v.clone()))
@@ -299,9 +299,7 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
     let mut last_ts = None;
 
     for (actor_id, booked) in actors {
-        let bookedr = booked
-            .read(format!("generate_sync:{}", actor_id.as_simple()))
-            .await;
+        let bookedr = booked.read("generate_sync", actor_id.as_simple()).await;
 
         let last_version = match { bookedr.last() } {
             None => continue,
