@@ -407,7 +407,7 @@ async fn handle_broadcasts(
 
     enum Branch {
         Broadcast(BroadcastInput),
-        BroadcastTick,
+        BroadcastDeadline,
         WokePendingBroadcast(PendingBroadcast),
         Tripped,
         Metrics,
@@ -418,7 +418,7 @@ async fn handle_broadcasts(
 
     let mut join_set = JoinSet::new();
     let max_queue_len = agent.config().perf.processing_queue_len;
-    const MAX_INFLIGHT_BROADCAST: usize = 10000;
+    const MAX_INFLIGHT_BROADCAST: usize = 1000;
     let mut to_broadcast = VecDeque::new();
     let mut log_count = 0;
 
@@ -435,7 +435,7 @@ async fn handle_broadcasts(
                 }
             },
             _ = bcast_interval.tick() => {
-                Branch::BroadcastTick
+                Branch::BroadcastDeadline
             },
             maybe_woke = idle_pendings.next(), if !idle_pendings.is_terminated() => match maybe_woke {
                 Some(woke) => Branch::WokePendingBroadcast(woke),
@@ -459,7 +459,7 @@ async fn handle_broadcasts(
             Branch::Tripped => {
                 // nothing to do here, yet!
             }
-            Branch::BroadcastTick => {
+            Branch::BroadcastDeadline => {
                 if !bcast_buf.is_empty() {
                     to_broadcast.push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
                 }
