@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     num::NonZeroU32,
@@ -17,6 +18,8 @@ use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future,
 };
+use governor::{Quota, RateLimiter};
+use itertools::Itertools;
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
@@ -386,6 +389,8 @@ async fn handle_broadcasts(
     mut tripwire: Tripwire,
 ) {
     let actor_id = agent.actor_id();
+
+    // max broadcast size
     const BROADCAST_CUTOFF: usize = 64 * 1024;
 
     let mut bcast_codec = LengthDelimitedCodec::builder()
@@ -418,9 +423,13 @@ async fn handle_broadcasts(
 
     let mut join_set = JoinSet::new();
     let max_queue_len = agent.config().perf.processing_queue_len;
-    const MAX_INFLIGHT_BROADCAST: usize = 1000;
+    const MAX_INFLIGHT_BROADCAST: usize = 500;
     let mut to_broadcast = VecDeque::new();
     let mut log_count = 0;
+
+    let mut limited_log_count = 0;
+
+    let limiter = RateLimiter::direct(Quota::per_second(unsafe { NonZeroU32::new_unchecked(10) }));
 
     loop {
         let branch = tokio::select! {
@@ -471,6 +480,7 @@ async fn handle_broadcasts(
             }
             Branch::Broadcast(input) => {
                 trace!("handling Branch::Broadcast");
+
                 let (bcast, is_local) = match input {
                     BroadcastInput::Rebroadcast(bcast) => (bcast, false),
                     BroadcastInput::AddBroadcast(bcast) => (bcast, true),
@@ -504,14 +514,18 @@ async fn handle_broadcasts(
 
                     {
                         let members = agent.members().read();
+                        let mut spawn_count = 0;
                         for addr in members.ring0(agent.cluster_id()) {
                             // this spawns, so we won't be holding onto the read lock for long
-                            tokio::spawn(transmit_broadcast(
+                            // don't check for max concurrency here, local broadcast should happen!
+                            join_set.spawn(transmit_broadcast(
                                 payload.clone(),
                                 transport.clone(),
                                 addr,
                             ));
+                            spawn_count += 1;
                         }
+                        counter!("corro.broadcast.spawn", "type" => "local").increment(spawn_count);
                     }
 
                     if local_bcast_buf.len() >= BROADCAST_CUTOFF {
@@ -538,84 +552,108 @@ async fn handle_broadcasts(
             Branch::Metrics => {
                 trace!("handling Branch::Metrics");
                 gauge!("corro.broadcast.pending.count").set(idle_pendings.len() as f64);
+                gauge!("corro.broadcast.processing.jobs").set(join_set.len() as f64);
                 gauge!("corro.broadcast.buffer.capacity").set(bcast_buf.capacity() as f64);
                 gauge!("corro.broadcast.serialization.buffer.capacity")
                     .set(ser_buf.capacity() as f64);
             }
         }
 
-        while join_set.try_join_next().is_some() {}
+        while join_set.try_join_next().is_some() {
+            // we're draining the join_set, even though it's not strictly necessary
+        }
 
-        while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
-            let mut pending = to_broadcast.pop_front().unwrap();
-            trace!("{} to broadcast: {pending:?}", actor_id);
-
-            let (member_count, max_transmissions) = {
-                let config = config.read();
-                let members = agent.members().read();
-                let count = members.states.len();
-                let ring0_count = members.ring0(agent.cluster_id()).count();
-                let max_transmissions = config.max_transmissions.get();
-                (
-                    std::cmp::max(
-                        config.num_indirect_probes.get(),
-                        (count - ring0_count) / (max_transmissions as usize * 10),
-                    ),
-                    max_transmissions,
-                )
-            };
-
-            let broadcast_to = {
-                agent
-                    .members()
-                    .read()
-                    .states
-                    .iter()
-                    .filter_map(|(member_id, state)| {
-                        // don't broadcast to ourselves... or ring0 if local broadcast
-                        if *member_id == actor_id
-                            || state.cluster_id != agent.cluster_id()
-                            || (pending.is_local && state.is_ring0())
-                            || pending.sent_to.contains(&state.addr)
-                        // don't broadcast to this peer
-                        {
-                            None
-                        } else {
-                            Some(state.addr)
-                        }
-                    })
-                    .choose_multiple(&mut rng, member_count)
-            };
-
-            for addr in broadcast_to {
-                debug!(actor = %actor_id, "broadcasting {} bytes to: {addr}", pending.payload.len());
-
-                join_set.spawn(transmit_broadcast(
-                    pending.payload.clone(),
-                    transport.clone(),
-                    addr,
-                ));
-
-                pending.sent_to.insert(addr);
+        match limiter.check() {
+            Err(e) => {
+                trace!("{e}");
+                counter!("corro.broadcast.rate_limited").increment(1);
+                log_at_pow_10("broadcasts rate limited", &mut limited_log_count);
             }
+            Ok(_) => {
+                while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
+                    let mut pending = to_broadcast.pop_front().unwrap();
+                    trace!("{} to broadcast: {pending:?}", actor_id);
 
-            if let Some(send_count) = pending.send_count.checked_add(1) {
-                trace!("send_count: {send_count}, max_transmissions: {max_transmissions}");
-                pending.send_count = send_count;
+                    let (choose_count, max_transmissions) = {
+                        let config = config.read();
+                        let members = agent.members().read();
+                        let count = members.states.len();
+                        let ring0_count = members.ring0(agent.cluster_id()).count();
+                        let max_transmissions = config.max_transmissions.get();
+                        (
+                            // send to, at most:
+                            // SWIM num_indirect_probes
+                            // or
+                            // total of members > ring 0 / SWIM max_transmissions
+                            cmp::max(
+                                config.num_indirect_probes.get(),
+                                (count - ring0_count) / (max_transmissions as usize * 10),
+                            ),
+                            max_transmissions,
+                        )
+                    };
 
-                if send_count < max_transmissions {
-                    debug!("queueing for re-send");
-                    idle_pendings.push(Box::pin(async move {
-                        // FIXME: calculate sleep duration based on send count
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        pending
-                    }));
+                    let broadcast_to = {
+                        agent
+                            .members()
+                            .read()
+                            .states
+                            .iter()
+                            .filter_map(|(member_id, state)| {
+                                // don't broadcast to ourselves... or ring0 if local broadcast
+                                if *member_id == actor_id
+                                    || state.cluster_id != agent.cluster_id()
+                                    || (pending.is_local && state.is_ring0())
+                                    || pending.sent_to.contains(&state.addr)
+                                // don't broadcast to this peer
+                                {
+                                    None
+                                } else {
+                                    Some(state.addr)
+                                }
+                            })
+                            .choose_multiple(
+                                &mut rng,
+                                // prevent going over max count
+                                cmp::min(choose_count, MAX_INFLIGHT_BROADCAST - join_set.len()),
+                            )
+                    };
+
+                    let mut spawn_count = 0;
+                    for addr in broadcast_to {
+                        debug!(actor = %actor_id, "broadcasting {} bytes to: {addr}", pending.payload.len());
+
+                        join_set.spawn(transmit_broadcast(
+                            pending.payload.clone(),
+                            transport.clone(),
+                            addr,
+                        ));
+                        spawn_count += 1;
+
+                        pending.sent_to.insert(addr);
+                    }
+                    counter!("corro.broadcast.spawn", "type" => "local").increment(spawn_count);
+
+                    if let Some(send_count) = pending.send_count.checked_add(1) {
+                        trace!("send_count: {send_count}, max_transmissions: {max_transmissions}");
+                        pending.send_count = send_count;
+
+                        if send_count < max_transmissions {
+                            debug!("queueing for re-send");
+                            idle_pendings.push(Box::pin(async move {
+                                // FIXME: calculate sleep duration based on send count
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                pending
+                            }));
+                        }
+                    }
                 }
             }
         }
 
         if drop_oldest_broadcast(&mut to_broadcast, max_queue_len).is_some() {
             log_at_pow_10("dropped old change from broadcast queue", &mut log_count);
+            counter!("corro.broadcast.dropped").increment(1);
         }
     }
 
