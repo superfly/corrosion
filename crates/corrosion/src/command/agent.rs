@@ -60,9 +60,10 @@ pub async fn run(
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
-    let (agent, bookie) = corro_agent::agent::start_with_config(config.clone(), tripwire.clone())
-        .await
-        .expect("could not start agent");
+    let (agent, bookie, _) =
+        corro_agent::agent::start_with_config(config.clone(), tripwire.clone())
+            .await
+            .expect("could not start agent");
 
     corro_admin::start_server(
         agent.clone(),

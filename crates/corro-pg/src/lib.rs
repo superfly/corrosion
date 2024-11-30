@@ -2312,7 +2312,6 @@ impl<'conn> Session<'conn> {
             })?;
 
         if let Some(InsertChangesInfo {
-            version,
             db_version,
             last_seq,
             ts,
@@ -2325,9 +2324,7 @@ impl<'conn> Session<'conn> {
 
             let agent = self.agent.clone();
 
-            spawn_counted(async move {
-                broadcast_changes(agent, db_version, last_seq, version, ts).await
-            });
+            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
         }
 
         Ok(())
@@ -3509,11 +3506,6 @@ mod tests {
 
             let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
             println!("CHANGE ROW: {row:?}");
-
-            let row = client
-                .query_one("SELECT * FROM __corro_bookkeeping", &[])
-                .await?;
-            println!("BK ROW: {row:?}");
 
             client
                 .batch_execute("SELECT 1; SELECT 2; SELECT 3;")

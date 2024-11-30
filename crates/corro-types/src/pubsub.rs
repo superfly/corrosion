@@ -10,7 +10,7 @@ use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
 use compact_str::{format_compact, ToCompactString};
 use corro_api_types::{
-    ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
+    Change, ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
@@ -44,7 +44,6 @@ use crate::{
     agent::SplitPool,
     api::QueryEvent,
     base::CrsqlDbVersion,
-    change::Change,
     schema::{Schema, Table},
     sqlite::CrConn,
     updates::HandleMetrics,
@@ -2484,12 +2483,11 @@ mod tests {
             tmpdir.path().join("subs").display().to_string().into();
 
         let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1))).await?;
-        let clock = Arc::new(uhlc::HLC::default());
 
         {
             let mut conn = pool.write_priority().await?;
             setup_conn(&conn)?;
-            migrate(clock, &mut conn)?;
+            migrate(&mut conn)?;
             let tx = conn.transaction()?;
             apply_schema(&tx, &Schema::default(), &mut schema)?;
             tx.commit()?;
@@ -2607,10 +2605,9 @@ mod tests {
             .await
             .unwrap();
         let mut conn = pool.write_priority().await.unwrap();
-        let clock = Arc::new(uhlc::HLC::default());
         {
             setup_conn(&conn).unwrap();
-            migrate(clock, &mut conn).unwrap();
+            migrate(&mut conn).unwrap();
             let tx = conn.transaction().unwrap();
             apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
             tx.commit().unwrap();
@@ -2647,8 +2644,7 @@ mod tests {
             .expect("could not init crsql");
 
             setup_conn(&conn2).unwrap();
-            let clock = Arc::new(uhlc::HLC::default());
-            migrate(clock, &mut conn2).unwrap();
+            migrate(&mut conn2).unwrap();
 
             {
                 let tx = conn2.transaction().unwrap();
@@ -2690,7 +2686,7 @@ mod tests {
                     change.db_version,
                     &change.site_id,
                     change.cl,
-                    change.seq,
+                    change.seq
                 ])
                 .unwrap();
             }
@@ -2989,7 +2985,7 @@ mod tests {
     ) -> rusqlite::Result<()> {
         let mut candidates = MatchCandidates::new();
 
-        let mut prepped = state_conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE site_id = COALESCE(?, crsql_site_id()) AND db_version = ? ORDER BY seq ASC"#)?;
+        let mut prepped = state_conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl  FROM crsql_changes WHERE site_id = COALESCE(?, crsql_site_id()) AND db_version = ? ORDER BY seq ASC"#)?;
         let rows = prepped
             .query_map(params![actor_id, db_version], row_to_change)
             .unwrap();

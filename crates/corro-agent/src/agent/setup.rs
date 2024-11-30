@@ -39,10 +39,8 @@ use crate::{
 use corro_types::updates::UpdatesManager;
 use corro_types::{
     actor::ActorId,
-    agent::{
-        migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool,
-    },
-    base::Version,
+    agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
+    base::CrsqlDbVersion,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
     config::Config,
@@ -59,10 +57,9 @@ pub struct AgentOptions {
     pub transport: Transport,
     pub api_listeners: Vec<TcpListener>,
     pub rx_bcast: CorroReceiver<BroadcastInput>,
-    pub rx_apply: CorroReceiver<(ActorId, Version)>,
-    pub rx_clear_buf: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
+    pub rx_apply: CorroReceiver<(ActorId, CrsqlDbVersion)>,
+    pub rx_clear_buf: CorroReceiver<(ActorId, RangeInclusive<CrsqlDbVersion>)>,
     pub rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
-    pub rx_emptyset: CorroReceiver<ChangeV1>,
     pub rx_foca: CorroReceiver<FocaInput>,
     pub rtt_rx: TokioReceiver<(SocketAddr, Duration)>,
     pub subs_manager: SubsManager,
@@ -108,7 +105,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let schema = {
         let mut conn = pool.write_priority().await?;
-        migrate(clock.clone(), &mut conn)?;
+        migrate(&mut conn)?;
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
 
@@ -165,7 +162,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let (tx_bcast, rx_bcast) = bounded(conf.perf.bcast_channel_len, "bcast");
     let (tx_changes, rx_changes) = bounded(conf.perf.changes_channel_len, "changes");
-    let (tx_emptyset, rx_emptyset) = bounded(conf.perf.changes_channel_len, "emptyset");
     let (tx_foca, rx_foca) = bounded(conf.perf.foca_channel_len, "foca");
 
     let lock_registry = LockRegistry::default();
@@ -248,14 +244,13 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let opts = AgentOptions {
         gossip_server_endpoint,
-        transport,
+        transport: transport.clone(),
         api_listeners,
         lock_registry,
         rx_bcast,
         rx_apply,
         rx_clear_buf,
         rx_changes,
-        rx_emptyset,
         rx_foca,
         rtt_rx,
         subs_manager: subs_manager.clone(),
@@ -278,7 +273,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_apply,
         tx_clear_buf,
         tx_changes,
-        tx_emptyset,
         tx_foca,
         write_sema,
         schema: RwLock::new(schema),

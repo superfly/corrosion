@@ -1044,7 +1044,7 @@ mod tests {
     use crate::agent::spawn_unipayload_handler;
     use corro_tests::launch_test_agent;
     use corro_types::{
-        base::{CrsqlSeq, Version},
+        base::{CrsqlDbVersion, CrsqlSeq},
         broadcast::{BroadcastV1, ChangeV1, Changeset},
     };
     use uuid::Uuid;
@@ -1129,7 +1129,7 @@ mod tests {
         let bcast = BroadcastV1::Change(ChangeV1 {
             actor_id: ta1.agent.actor_id(),
             changeset: Changeset::Full {
-                version: Version(0),
+                version: CrsqlDbVersion(0),
                 changes: vec![],
                 seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                 last_seq: CrsqlSeq(0),
@@ -1162,7 +1162,7 @@ mod tests {
                 .send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(i),
+                        version: CrsqlDbVersion(i),
                         changes: vec![],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
@@ -1184,7 +1184,7 @@ mod tests {
                 let changes = tokio::time::timeout(Duration::from_secs(5), rx_changes.recv())
                     .await?
                     .unwrap();
-                assert_eq!(changes.0.versions(), Version(i)..=Version(i));
+                assert_eq!(changes.0.versions(), CrsqlDbVersion(i)..=CrsqlDbVersion(i));
             }
         }
 

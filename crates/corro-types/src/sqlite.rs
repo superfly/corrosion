@@ -21,8 +21,6 @@ pub const CRSQL_EXT_FILENAME: &str = "crsqlite.so";
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-aarch64.dylib");
-#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-x86_64.dylib");
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-x86_64.so");
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -42,6 +40,7 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
     init_cr_conn(&mut conn)?;
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
+    conn.trace(Some(|sql| trace!("{sql}")));
     Ok(CrConn(conn))
 }
 
@@ -180,6 +179,11 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
     // determine how many migrations to skip (skip as many as we are at)
     let skip_n = migration_version(&tx).unwrap_or_default();
 
+    if skip_n > migrations.len() {
+        warn!("Skipping migrations, database is at migration version {skip_n} which is greater than {}", migrations.len());
+        return Ok(());
+    }
+
     for (i, migration) in migrations.into_iter().skip(skip_n).enumerate() {
         let new_version = skip_n + i;
         info!("Applying migration to v{new_version}");
@@ -284,18 +288,6 @@ mod tests {
             let timeout = Some(tokio::time::Duration::from_millis(5));
             let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
             let res = itx.execute("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;", &[]);
-
-            assert!(res.is_err_and(
-                |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
-            ));
-        }
-
-        {
-            let tx = conn.transaction()?;
-            let timeout = Some(tokio::time::Duration::from_millis(5));
-            let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
-            let res = itx.prepare_cached("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;")?
-                        .execute(());
 
             assert!(res.is_err_and(
                 |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
