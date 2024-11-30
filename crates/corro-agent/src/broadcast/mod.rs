@@ -440,6 +440,8 @@ async fn handle_broadcasts(
         NonZeroU32::new_unchecked(10 * 1024 * 1024)
     }));
 
+    let mut rate_limited = false;
+
     loop {
         let branch = tokio::select! {
             biased;
@@ -558,7 +560,7 @@ async fn handle_broadcasts(
             // we're draining the join_set, even though it's not strictly necessary
         }
 
-        let mut exceeded_quota = false;
+        let prev_rate_limited = rate_limited;
 
         // start with local broadcasts, they're higher priority
         while !to_local_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
@@ -586,7 +588,7 @@ async fn handle_broadcasts(
                             }
                             TransmitError::QuotaExceeded(_) => {
                                 // exceeded our quota, stop trying to send this through
-                                exceeded_quota = true;
+                                rate_limited = true;
                                 counter!("corro.broadcast.rate_limited").increment(1);
                                 log_at_pow_10("broadcasts rate limited", &mut limited_log_count);
                                 break;
@@ -609,30 +611,33 @@ async fn handle_broadcasts(
             counter!("corro.broadcast.spawn", "type" => "local").increment(spawn_count);
         }
 
-        if !exceeded_quota {
+        if !rate_limited {
+            let (members_count, ring0_count) = {
+                let members = agent.members().read();
+                let members_count = members.states.len();
+                let ring0_count = members.ring0(agent.cluster_id()).count();
+                (members_count, ring0_count)
+            };
+
+            let (choose_count, max_transmissions) = {
+                let config = config.read();
+                let max_transmissions = config.max_transmissions.get();
+                let dynamic_count =
+                    (members_count - ring0_count) / (max_transmissions as usize * 10);
+                let count = cmp::max(config.num_indirect_probes.get(), dynamic_count);
+
+                if prev_rate_limited {
+                    // we've been rate limited on the last loop, try sending to less nodes...
+                    (cmp::min(count, dynamic_count / 2), max_transmissions / 2)
+                } else {
+                    (count, max_transmissions)
+                }
+            };
+
             while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
                 let mut pending = to_broadcast.pop_front().unwrap();
 
                 trace!("{} to broadcast: {pending:?}", actor_id);
-
-                let (choose_count, max_transmissions) = {
-                    let config = config.read();
-                    let members = agent.members().read();
-                    let count = members.states.len();
-                    let ring0_count = members.ring0(agent.cluster_id()).count();
-                    let max_transmissions = config.max_transmissions.get();
-                    (
-                        // send to, at most:
-                        // SWIM num_indirect_probes
-                        // or
-                        // total of members > ring 0 / SWIM max_transmissions
-                        cmp::max(
-                            config.num_indirect_probes.get(),
-                            (count - ring0_count) / (max_transmissions as usize * 10),
-                        ),
-                        max_transmissions,
-                    )
-                };
 
                 let broadcast_to = {
                     agent
@@ -710,9 +715,13 @@ async fn handle_broadcasts(
                         if send_count < max_transmissions {
                             debug!("queueing for re-send");
                             idle_pendings.push(Box::pin(async move {
+                                // slow our send pace if we've been previously rate limited
+                                let sleep_ms_base = if prev_rate_limited { 1000 } else { 250 };
                                 // send with increasing latency as we've already sent the updates out
-                                tokio::time::sleep(Duration::from_millis(250 * send_count as u64))
-                                    .await;
+                                tokio::time::sleep(Duration::from_millis(
+                                    sleep_ms_base * send_count as u64,
+                                ))
+                                .await;
                                 pending
                             }));
                         }
