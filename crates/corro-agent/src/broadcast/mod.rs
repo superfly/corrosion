@@ -380,11 +380,11 @@ pub fn runtime_loop(
     ));
 }
 
-type DirectRateLimiter = RateLimiter<
+type BroadcastRateLimiter = RateLimiter<
     governor::state::NotKeyed,
     governor::state::InMemoryState,
     governor::clock::QuantaClock,
-    governor::middleware::NoOpMiddleware<governor::clock::QuantaInstant>,
+    governor::middleware::StateInformationMiddleware,
 >;
 
 async fn handle_broadcasts(
@@ -436,9 +436,10 @@ async fn handle_broadcasts(
 
     let mut limited_log_count = 0;
 
-    let bytes_per_sec: DirectRateLimiter = RateLimiter::direct(Quota::per_second(unsafe {
+    let bytes_per_sec: BroadcastRateLimiter = RateLimiter::direct(Quota::per_second(unsafe {
         NonZeroU32::new_unchecked(10 * 1024 * 1024)
-    }));
+    }))
+    .with_middleware();
 
     let mut rate_limited = false;
 
@@ -948,7 +949,7 @@ enum TransmitError {
 
 #[tracing::instrument(skip(payload, transport), fields(buf_size = payload.len()), level = "debug")]
 fn try_transmit_broadcast(
-    bytes_per_sec: &DirectRateLimiter,
+    bytes_per_sec: &BroadcastRateLimiter,
     payload: Bytes,
     transport: Transport,
     addr: SocketAddr,
@@ -965,7 +966,10 @@ fn try_transmit_broadcast(
     };
 
     match bytes_per_sec.check_n(len_u32) {
-        Ok(Ok(_)) => {}
+        Ok(Ok(state)) => {
+            gauge!("corro.broadcast.limiter.remaining_burst")
+                .set(state.remaining_burst_capacity() as f64);
+        }
         Ok(Err(e)) => return Err(TransmitError::QuotaExceeded(e)),
         Err(e) => return Err(e.into()),
     }
