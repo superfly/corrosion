@@ -16,7 +16,7 @@ use corro_client::CorrosionApiClient;
 use corro_types::{
     actor::{ActorId, ClusterId},
     api::{ExecResult, QueryEvent, Statement},
-    base::Version,
+    base::CrsqlSiteVersion,
     config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
 };
 use futures::StreamExt;
@@ -484,7 +484,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             conn.send_command(corro_admin::Command::Actor(
                 corro_admin::ActorCommand::Version {
                     actor_id: ActorId(*actor_id),
-                    version: Version(*version),
+                    version: CrsqlSiteVersion(*version),
                 },
             ))
             .await?;

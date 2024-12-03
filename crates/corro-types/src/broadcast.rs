@@ -1,8 +1,14 @@
-use std::{cmp, fmt, io, num::NonZeroU32, ops::{Deref, RangeInclusive}, time::Duration};
+use std::{
+    cmp, fmt, io,
+    num::NonZeroU32,
+    ops::{Deref, RangeInclusive},
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
-use corro_api_types::{row_to_change, Change};
+use corro_api_types::{row_to_change, Change, ColumnName, SqliteValue, TableName};
 use foca::{Identity, Member, Notification, Runtime, Timer};
+use indexmap::IndexMap;
 use itertools::Itertools;
 use metrics::counter;
 use rusqlite::{
@@ -22,7 +28,7 @@ use uhlc::{ParseNTP64Error, NTP64};
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     agent::Agent,
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
     change::{ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
     sqlite::SqlitePoolError,
@@ -36,12 +42,22 @@ pub enum UniPayload {
         #[speedy(default_on_eof)]
         cluster_id: ClusterId,
     },
+    // V2 {
+    //     data: UniPayloadV2,
+    //     #[speedy(default_on_eof)]
+    //     cluster_id: ClusterId,
+    // }
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
     Broadcast(BroadcastV1),
 }
+
+// #[derive(Debug, Clone, Readable, Writable)]
+// pub enum UniPayloadV2 {
+//     Broadcast(BroadcastV2),
+// }
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum BiPayload {
@@ -87,6 +103,45 @@ pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
+// #[derive(Clone, Debug, Readable, Writable)]
+// pub enum BroadcastV2 {
+//     Change(ChangeV2),
+// }
+
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub struct ChangeV2 {
+    pub actor_id: ActorId,
+    pub changeset: MappedChangeset,
+}
+
+#[derive(Debug, Clone, PartialEq, Readable, Writable, Hash, Eq)]
+pub struct VersionKey {
+    pub actor_id: ActorId,
+    pub site_version: CrsqlSiteVersion,
+    pub db_version: CrsqlDbVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub struct MappedChangeset(pub IndexMap<VersionKey, ChangesetPerTablePk>);
+
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub struct ColumnChange {
+    pub cid: ColumnName,
+    pub val: SqliteValue,
+    pub col_version: i64,
+    pub seq: CrsqlSeq,
+    pub cl: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Readable, Writable, Hash, Eq)]
+pub struct ChangeRowKey {
+    pub table: TableName,
+    pub pk: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub struct ChangesetPerTablePk(IndexMap<ChangeRowKey, Vec<ColumnChange>>);
+
 #[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum ChangeSource {
@@ -94,7 +149,6 @@ pub enum ChangeSource {
     Sync,
 }
 
-// TODO: shrink this by mapping primary keys to integers instead of repeating them
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
@@ -112,12 +166,12 @@ impl Deref for ChangeV1 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum Changeset {
     Empty {
-        versions: RangeInclusive<Version>,
+        versions: RangeInclusive<CrsqlSiteVersion>,
         #[speedy(default_on_eof)]
         ts: Option<Timestamp>,
     },
     Full {
-        version: Version,
+        version: CrsqlSiteVersion,
         changes: Vec<Change>,
         // cr-sqlite sequences contained in this changeset
         seqs: RangeInclusive<CrsqlSeq>,
@@ -126,7 +180,7 @@ pub enum Changeset {
         ts: Timestamp,
     },
     EmptySet {
-        versions: Vec<RangeInclusive<Version>>,
+        versions: Vec<RangeInclusive<CrsqlSiteVersion>>,
         ts: Timestamp,
     },
 }
@@ -144,7 +198,7 @@ impl From<ChangesetParts> for Changeset {
 }
 
 pub struct ChangesetParts {
-    pub version: Version,
+    pub version: CrsqlSiteVersion,
     pub changes: Vec<Change>,
     pub seqs: RangeInclusive<CrsqlSeq>,
     pub last_seq: CrsqlSeq,
@@ -152,12 +206,12 @@ pub struct ChangesetParts {
 }
 
 impl Changeset {
-    pub fn versions(&self) -> RangeInclusive<Version> {
+    pub fn versions(&self) -> RangeInclusive<CrsqlSiteVersion> {
         match self {
             Changeset::Empty { versions, .. } => versions.clone(),
             // todo: this returns dummy version because empty set has an array of versions.
             // probably shouldn't be doing this
-            Changeset::EmptySet { .. } => Version(0)..=Version(0),
+            Changeset::EmptySet { .. } => CrsqlSiteVersion(0)..=CrsqlSiteVersion(0),
             Changeset::Full { version, .. } => *version..=*version,
         }
     }
@@ -165,9 +219,14 @@ impl Changeset {
     // determine the estimated resource cost of processing a change
     pub fn processing_cost(&self) -> usize {
         match self {
-            Changeset::Empty { versions, .. } => cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20),
-            Changeset::EmptySet { versions, .. } => versions.iter().map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)).sum::<usize>(),
-            Changeset::Full { changes, ..} => changes.len(),
+            Changeset::Empty { versions, .. } => {
+                cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)
+            }
+            Changeset::EmptySet { versions, .. } => versions
+                .iter()
+                .map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20))
+                .sum::<usize>(),
+            Changeset::Full { changes, .. } => changes.len(),
         }
     }
 
@@ -327,6 +386,12 @@ impl From<NTP64> for Timestamp {
     }
 }
 
+impl From<u64> for Timestamp {
+    fn from(value: u64) -> Self {
+        Self(NTP64(value))
+    }
+}
+
 impl FromSql for Timestamp {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         match value {
@@ -481,7 +546,7 @@ pub async fn broadcast_changes(
     agent: Agent,
     db_version: CrsqlDbVersion,
     last_seq: CrsqlSeq,
-    version: Version,
+    version: CrsqlSiteVersion,
     ts: Timestamp,
 ) -> Result<(), BroadcastError> {
     let actor_id = agent.actor_id();

@@ -7,7 +7,7 @@ use camino::Utf8PathBuf;
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
     broadcast::{FocaCmd, FocaInput, Timestamp},
     sqlite::SqlitePoolError,
     sync::generate_sync,
@@ -125,7 +125,10 @@ pub enum ClusterCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ActorCommand {
-    Version { actor_id: ActorId, version: Version },
+    Version {
+        actor_id: ActorId,
+        version: CrsqlSiteVersion,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -252,7 +255,7 @@ async fn collapse_gaps(
                     rusqlite::params![actor_id],
                     |row| Ok(row.get(0)?..=row.get(1)?),
                 )?
-                .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<Version>>>()?;
+                .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<CrsqlSiteVersion>>>()?;
 
         let deleted = tx.execute(
             "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",

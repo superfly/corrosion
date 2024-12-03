@@ -32,13 +32,13 @@ use crate::{
     transport::Transport,
 };
 use corro_tests::*;
-use corro_types::broadcast::Timestamp;
 use corro_types::change::Change;
 use corro_types::{
     actor::ActorId,
     agent::migrate,
     api::{row_to_change, ExecResponse, ExecResult, Statement},
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
+    broadcast::Timestamp,
     broadcast::{ChangeSource, ChangeV1, Changeset},
     change::store_empty_changeset,
     sqlite::CrConn,
@@ -150,7 +150,7 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
     println!("body: {body:?}");
 
     #[allow(clippy::type_complexity)]
-        let bk: Vec<(ActorId, Version, Option<Version>, CrsqlDbVersion, Option<CrsqlSeq>)> = ta1
+        let bk: Vec<(ActorId, CrsqlSiteVersion, Option<CrsqlSiteVersion>, CrsqlDbVersion, Option<CrsqlSeq>)> = ta1
             .agent
             .pool()
             .read()
@@ -159,8 +159,8 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
             .query_map((), |row| {
                 Ok((
                     row.get::<_, ActorId>(0)?,
-                    row.get::<_, Version>(1)?,
-                    row.get::<_, Option<Version>>(2)?,
+                    row.get::<_, CrsqlSiteVersion>(1)?,
+                    row.get::<_, Option<CrsqlSiteVersion>>(2)?,
                     row.get::<_, CrsqlDbVersion>(3)?,
                     row.get::<_, Option<CrsqlSeq>>(4)?,
                 ))
@@ -172,14 +172,14 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
         vec![
             (
                 ta1.agent.actor_id(),
-                Version(1),
+                CrsqlSiteVersion(1),
                 None,
                 CrsqlDbVersion(1),
                 Some(CrsqlSeq(0))
             ),
             (
                 ta1.agent.actor_id(),
-                Version(2),
+                CrsqlSiteVersion(2),
                 None,
                 CrsqlDbVersion(2),
                 Some(CrsqlSeq(0))
@@ -522,7 +522,8 @@ pub async fn configurable_stress_test(
         if start.elapsed() > Duration::from_secs(30) {
             for ta in agents.iter() {
                 let conn = ta.agent.pool().read().await?;
-                let mut per_actor: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
+                let mut per_actor: BTreeMap<ActorId, RangeInclusiveSet<CrsqlSiteVersion>> =
+                    BTreeMap::new();
                 let mut prepped = conn.prepare("SELECT actor_id, start_version, coalesce(end_version, start_version) FROM __corro_bookkeeping;")?;
                 let mut rows = prepped.query(())?;
 
@@ -546,7 +547,8 @@ pub async fn configurable_stress_test(
 
                 for (actor_id, versions) in per_actor {
                     if let Some(versions_len) = actor_versions.get(&actor_id) {
-                        let full_range = Version(1)..=Version(*versions_len as u64);
+                        let full_range =
+                            CrsqlSiteVersion(1)..=CrsqlSiteVersion(*versions_len as u64);
                         let gaps = versions.gaps(&full_range);
                         for gap in gaps {
                             println!("{} db gap! {actor_id} => {gap:?}", ta.agent.actor_id());
@@ -565,7 +567,7 @@ pub async fn configurable_stress_test(
                 let recorded_gaps = conn
                     .prepare("SELECT actor_id, start, end FROM __corro_bookkeeping_gaps")?
                     .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                    .collect::<Result<Vec<(ActorId, Version, Version)>, _>>()?;
+                    .collect::<Result<Vec<(ActorId, CrsqlSiteVersion, CrsqlSiteVersion)>, _>>()?;
 
                 for (actor_id, start, end) in recorded_gaps {
                     println!(
@@ -741,7 +743,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
         );
 
         if count as usize != expected_count {
-            let buf_count: Vec<(Version, u64)> = conn
+            let buf_count: Vec<(CrsqlSiteVersion, u64)> = conn
                 .prepare("select version,count(*) from __corro_buffered_changes group by version")?
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -811,7 +813,11 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     // make about 50 transactions to ta1
     insert_rows(ta1.agent.clone(), 1, 50).await;
     // send them all
-    let rows = get_rows(ta1.agent.clone(), vec![(Version(1)..=Version(50), None)]).await?;
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![(CrsqlSiteVersion(1)..=CrsqlSiteVersion(50), None)],
+    )
+    .await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
 
     // overwrite different version ranges
@@ -823,10 +829,10 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     let rows = get_rows(
         ta1.agent.clone(),
         vec![
-            (Version(51)..=Version(55), None),
-            (Version(56)..=Version(56), None),
-            (Version(57)..=Version(59), None),
-            (Version(60)..=Version(60), None),
+            (CrsqlSiteVersion(51)..=CrsqlSiteVersion(55), None),
+            (CrsqlSiteVersion(56)..=CrsqlSiteVersion(56), None),
+            (CrsqlSiteVersion(57)..=CrsqlSiteVersion(59), None),
+            (CrsqlSiteVersion(60)..=CrsqlSiteVersion(60), None),
         ],
     )
     .await?;
@@ -834,7 +840,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        vec![Version(1)..=Version(50)],
+        vec![CrsqlSiteVersion(1)..=CrsqlSiteVersion(50)],
         vec![],
         vec![],
         vec![],
@@ -867,10 +873,10 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         vec![],
         vec![],
         vec![
-            Version(1)..=Version(5),
-            Version(10)..=Version(10),
-            Version(23)..=Version(25),
-            Version(30)..=Version(31),
+            CrsqlSiteVersion(1)..=CrsqlSiteVersion(5),
+            CrsqlSiteVersion(10)..=CrsqlSiteVersion(10),
+            CrsqlSiteVersion(23)..=CrsqlSiteVersion(25),
+            CrsqlSiteVersion(30)..=CrsqlSiteVersion(31),
         ],
     )
     .await?;
@@ -943,7 +949,11 @@ async fn process_failed_changes() -> eyre::Result<()> {
         .await;
         assert_eq!(status_code, StatusCode::OK);
     }
-    let mut good_changes = get_rows(ta2.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
+    let mut good_changes = get_rows(
+        ta2.agent.clone(),
+        vec![(CrsqlSiteVersion(1)..=CrsqlSiteVersion(5), None)],
+    )
+    .await?;
 
     let change6 = Change {
         table: TableName("tests".into()),
@@ -955,6 +965,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
         seq: CrsqlSeq(0),
         site_id: actor_id.to_bytes(),
         cl: 1,
+        site_version: CrsqlSiteVersion(1),
     };
 
     let bad_change = Change {
@@ -967,24 +978,23 @@ async fn process_failed_changes() -> eyre::Result<()> {
         seq: CrsqlSeq(1),
         site_id: actor_id.to_bytes(),
         cl: 1,
+        site_version: CrsqlSiteVersion(1),
     };
 
-    let mut rows = vec![
-        (
-            ChangeV1 {
-                actor_id,
-                changeset: Changeset::Full {
-                    version: Version(1),
-                    changes: vec![change6.clone(), bad_change],
-                    seqs: CrsqlSeq(0)..=CrsqlSeq(1),
-                    last_seq: CrsqlSeq(1),
-                    ts: Default::default(),
-                },
+    let mut rows = vec![(
+        ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: CrsqlSiteVersion(1),
+                changes: vec![change6.clone(), bad_change],
+                seqs: CrsqlSeq(0)..=CrsqlSeq(1),
+                last_seq: CrsqlSeq(1),
+                ts: Default::default(),
             },
-            ChangeSource::Sync,
-            Instant::now(),
-        )
-    ];
+        },
+        ChangeSource::Sync,
+        Instant::now(),
+    )];
 
     rows.append(&mut good_changes);
 
@@ -997,7 +1007,10 @@ async fn process_failed_changes() -> eyre::Result<()> {
 
     for i in 1..=5_i64 {
         let pk = pack_columns(&[i.into()])?;
-        let crsql_dbv = conn.prepare_cached(r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ?"#)?
+        let crsql_dbv = conn
+            .prepare_cached(
+                r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ?"#,
+            )?
             .query_row([pk], |row| row.get::<_, CrsqlDbVersion>(0))?;
 
         let booked_dbv = conn.prepare_cached("SELECT db_version from __corro_bookkeeping where start_version = ? and actor_id = ?")?
@@ -1051,13 +1064,17 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     insert_rows(ta1.agent.clone(), 1, 50).await;
 
     // sent 1-5
-    let rows = get_rows(ta1.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![(CrsqlSiteVersion(1)..=CrsqlSiteVersion(5), None)],
+    )
+    .await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
     // check ta2 bookie
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        vec![Version(1)..=Version(5)],
+        vec![CrsqlSiteVersion(1)..=CrsqlSiteVersion(5)],
         vec![],
         vec![],
         vec![],
@@ -1065,14 +1082,18 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     .await?;
 
     // sent: 1-5, 9-10
-    let rows = get_rows(ta1.agent.clone(), vec![(Version(9)..=Version(10), None)]).await?;
+    let rows = get_rows(
+        ta1.agent.clone(),
+        vec![(CrsqlSiteVersion(9)..=CrsqlSiteVersion(10), None)],
+    )
+    .await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
     // check for gap 6-8
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
         vec![],
-        vec![Version(6)..=Version(8)],
+        vec![CrsqlSiteVersion(6)..=CrsqlSiteVersion(8)],
         vec![],
         vec![],
     )
@@ -1084,8 +1105,11 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     let rows = get_rows(
         ta1.agent.clone(),
         vec![
-            (Version(20)..=Version(20), None),
-            (Version(15)..=Version(16), Some(CrsqlSeq(0)..=CrsqlSeq(0))),
+            (CrsqlSiteVersion(20)..=CrsqlSiteVersion(20), None),
+            (
+                CrsqlSiteVersion(15)..=CrsqlSiteVersion(16),
+                Some(CrsqlSeq(0)..=CrsqlSeq(0)),
+            ),
         ],
     )
     .await?;
@@ -1095,8 +1119,14 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ta2.clone(),
         ta1.agent.actor_id(),
         vec![],
-        vec![Version(11)..=Version(14), Version(17)..=Version(19)],
-        vec![(Version(15)..=Version(16), CrsqlSeq(0)..=CrsqlSeq(0))],
+        vec![
+            CrsqlSiteVersion(11)..=CrsqlSiteVersion(14),
+            CrsqlSiteVersion(17)..=CrsqlSiteVersion(19),
+        ],
+        vec![(
+            CrsqlSiteVersion(15)..=CrsqlSiteVersion(16),
+            CrsqlSeq(0)..=CrsqlSeq(0),
+        )],
         vec![],
     )
     .await?;
@@ -1108,8 +1138,8 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     let rows = get_rows(
         ta1.agent.clone(),
         vec![
-            (Version(21)..=Version(21), None),
-            (Version(25)..=Version(25), None),
+            (CrsqlSiteVersion(21)..=CrsqlSiteVersion(21), None),
+            (CrsqlSiteVersion(25)..=CrsqlSiteVersion(25), None),
         ],
     )
     .await?;
@@ -1121,7 +1151,10 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         vec![],
         vec![],
         vec![],
-        vec![Version(21)..=Version(21), Version(25)..=Version(25)],
+        vec![
+            CrsqlSiteVersion(21)..=CrsqlSiteVersion(21),
+            CrsqlSiteVersion(25)..=CrsqlSiteVersion(25),
+        ],
     )
     .await?;
 
@@ -1130,9 +1163,12 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     let rows = get_rows(
         ta1.agent.clone(),
         vec![
-            (Version(14)..=Version(18), None),
-            (Version(15)..=Version(16), Some(CrsqlSeq(1)..=CrsqlSeq(3))),
-            (Version(23)..=Version(24), None),
+            (CrsqlSiteVersion(14)..=CrsqlSiteVersion(18), None),
+            (
+                CrsqlSiteVersion(15)..=CrsqlSiteVersion(16),
+                Some(CrsqlSeq(1)..=CrsqlSeq(3)),
+            ),
+            (CrsqlSiteVersion(23)..=CrsqlSiteVersion(24), None),
         ],
     )
     .await?;
@@ -1140,14 +1176,17 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        vec![Version(14)..=Version(18), Version(15)..=Version(16)],
         vec![
-            Version(11)..=Version(13),
-            Version(19)..=Version(19),
-            Version(22)..=Version(22),
+            CrsqlSiteVersion(14)..=CrsqlSiteVersion(18),
+            CrsqlSiteVersion(15)..=CrsqlSiteVersion(16),
+        ],
+        vec![
+            CrsqlSiteVersion(11)..=CrsqlSiteVersion(13),
+            CrsqlSiteVersion(19)..=CrsqlSiteVersion(19),
+            CrsqlSiteVersion(22)..=CrsqlSiteVersion(22),
         ],
         vec![],
-        vec![Version(23)..=Version(25)],
+        vec![CrsqlSiteVersion(23)..=CrsqlSiteVersion(25)],
     )
     .await?;
 
@@ -1155,9 +1194,9 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     let rows = get_rows(
         ta1.agent.clone(),
         vec![
-            (Version(6)..=Version(8), None),
-            (Version(11)..=Version(19), None),
-            (Version(22)..=Version(22), None),
+            (CrsqlSiteVersion(6)..=CrsqlSiteVersion(8), None),
+            (CrsqlSiteVersion(11)..=CrsqlSiteVersion(19), None),
+            (CrsqlSiteVersion(22)..=CrsqlSiteVersion(22), None),
         ],
     )
     .await?;
@@ -1165,10 +1204,10 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        vec![Version(1)..=Version(20)],
+        vec![CrsqlSiteVersion(1)..=CrsqlSiteVersion(20)],
         vec![],
         vec![],
-        vec![Version(21)..=Version(25)],
+        vec![CrsqlSiteVersion(21)..=CrsqlSiteVersion(25)],
     )
     .await?;
 
@@ -1182,10 +1221,10 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
 async fn check_bookie_versions(
     ta: TestAgent,
     actor_id: ActorId,
-    complete: Vec<RangeInclusive<Version>>,
-    gap: Vec<RangeInclusive<Version>>,
-    partials: Vec<(RangeInclusive<Version>, RangeInclusive<CrsqlSeq>)>,
-    cleared: Vec<RangeInclusive<Version>>,
+    complete: Vec<RangeInclusive<CrsqlSiteVersion>>,
+    gap: Vec<RangeInclusive<CrsqlSiteVersion>>,
+    partials: Vec<(RangeInclusive<CrsqlSiteVersion>, RangeInclusive<CrsqlSeq>)>,
+    cleared: Vec<RangeInclusive<CrsqlSiteVersion>>,
 ) -> eyre::Result<()> {
     let conn = ta.agent.pool().read().await?;
     let booked = ta
@@ -1197,7 +1236,7 @@ async fn check_bookie_versions(
 
     for versions in complete {
         for version in versions.clone() {
-            let bk: Vec<(ActorId, Version, Option<Version>)> = conn
+            let bk: Vec<(ActorId, CrsqlSiteVersion, Option<CrsqlSiteVersion>)> = conn
                 .prepare(
                     "SELECT actor_id, start_version, end_version FROM __corro_bookkeeping where start_version = ?",
                 )?
@@ -1216,7 +1255,7 @@ async fn check_bookie_versions(
 
     for versions in partials {
         for version in versions.0.clone() {
-            let bk: Vec<(ActorId, Version, CrsqlSeq, CrsqlSeq)> = conn
+            let bk: Vec<(ActorId, CrsqlSiteVersion, CrsqlSeq, CrsqlSeq)> = conn
                 .prepare(
                     "SELECT site_id, version, start_seq, end_seq FROM __corro_seq_bookkeeping where version = ?",
                 )?
@@ -1268,7 +1307,10 @@ async fn check_bookie_versions(
 
 async fn get_rows(
     agent: Agent,
-    v: Vec<(RangeInclusive<Version>, Option<RangeInclusive<CrsqlSeq>>)>,
+    v: Vec<(
+        RangeInclusive<CrsqlSiteVersion>,
+        Option<RangeInclusive<CrsqlSeq>>,
+    )>,
 ) -> eyre::Result<Vec<(ChangeV1, ChangeSource, Instant)>> {
     let mut result = vec![];
 
@@ -1346,7 +1388,7 @@ async fn insert_rows(agent: Agent, start: i64, n: i64) {
         assert_eq!(status_code, StatusCode::OK);
 
         // let version = body.0.version.unwrap();
-        // assert_eq!(version, Version(i as u64));
+        // assert_eq!(version, CrsqlSiteVersion(i as u64));
     }
 }
 
@@ -1491,8 +1533,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     #[derive(Debug, Eq, PartialEq)]
     struct CorroBook {
         actor_id: ActorId,
-        start_version: Version,
-        end_version: Option<Version>,
+        start_version: CrsqlSiteVersion,
+        end_version: Option<CrsqlSiteVersion>,
     }
 
     conn.execute(
@@ -1504,7 +1546,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(1)..=Version(2), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(1)..=CrsqlSiteVersion(2),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1527,8 +1574,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(2))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(2))
         }
     );
 
@@ -1541,7 +1588,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(5)..=Version(7), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(5)..=CrsqlSiteVersion(7),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1564,15 +1616,15 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(2))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(2))
         }
     );
     assert_eq!(
         rows[1],
         CorroBook {
             actor_id,
-            start_version: Version(3),
+            start_version: CrsqlSiteVersion(3),
             end_version: None
         }
     );
@@ -1580,8 +1632,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[2],
         CorroBook {
             actor_id,
-            start_version: Version(5),
-            end_version: Some(Version(7))
+            start_version: CrsqlSiteVersion(5),
+            end_version: Some(CrsqlSiteVersion(7))
         }
     );
 
@@ -1589,7 +1641,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(3)..=Version(6), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(3)..=CrsqlSiteVersion(6),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1614,8 +1671,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(7))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(7))
         }
     );
 
@@ -1628,7 +1685,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(1)..=Version(10), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(1)..=CrsqlSiteVersion(10),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1653,8 +1715,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(10))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(10))
         }
     );
 
@@ -1662,7 +1724,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[1],
         CorroBook {
             actor_id,
-            start_version: Version(12),
+            start_version: CrsqlSiteVersion(12),
             end_version: None
         }
     );
@@ -1672,7 +1734,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(1)..=Version(11), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(1)..=CrsqlSiteVersion(11),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1697,8 +1764,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(11))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(11))
         }
     );
 
@@ -1706,7 +1773,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[1],
         CorroBook {
             actor_id,
-            start_version: Version(12),
+            start_version: CrsqlSiteVersion(12),
             end_version: None
         }
     );
@@ -1721,7 +1788,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(14)..=Version(14), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(14)..=CrsqlSiteVersion(14),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1746,8 +1818,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(11))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(11))
         }
     );
 
@@ -1755,7 +1827,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[1],
         CorroBook {
             actor_id,
-            start_version: Version(12),
+            start_version: CrsqlSiteVersion(12),
             end_version: None
         }
     );
@@ -1763,7 +1835,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[2],
         CorroBook {
             actor_id,
-            start_version: Version(13),
+            start_version: CrsqlSiteVersion(13),
             end_version: None
         }
     );
@@ -1772,8 +1844,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[3],
         CorroBook {
             actor_id,
-            start_version: Version(14),
-            end_version: Some(Version(14))
+            start_version: CrsqlSiteVersion(14),
+            end_version: Some(CrsqlSiteVersion(14))
         }
     );
 
@@ -1781,7 +1853,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(12)..=Version(14), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(12)..=CrsqlSiteVersion(14),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1806,8 +1883,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(14))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(14))
         }
     );
 
@@ -1824,7 +1901,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(15)..=Version(15), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(15)..=CrsqlSiteVersion(15),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1849,8 +1931,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(18))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(18))
         }
     );
 
@@ -1858,7 +1940,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(15)..=CrsqlSiteVersion(23),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1883,8 +1970,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(23))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(23))
         }
     );
 
@@ -1898,7 +1985,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(15)..=CrsqlSiteVersion(23),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1923,8 +2015,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(23))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(23))
         }
     );
 
@@ -1932,7 +2024,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[1],
         CorroBook {
             actor_id,
-            start_version: Version(24),
+            start_version: CrsqlSiteVersion(24),
             end_version: None
         }
     );
@@ -1952,7 +2044,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(15)..=Version(23), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(15)..=CrsqlSiteVersion(23),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -1977,7 +2074,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
+            start_version: CrsqlSiteVersion(1),
             end_version: None
         }
     );
@@ -1986,8 +2083,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[1],
         CorroBook {
             actor_id,
-            start_version: Version(2),
-            end_version: Some(Version(23))
+            start_version: CrsqlSiteVersion(2),
+            end_version: Some(CrsqlSiteVersion(23))
         }
     );
 
@@ -1995,7 +2092,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[2],
         CorroBook {
             actor_id,
-            start_version: Version(24),
+            start_version: CrsqlSiteVersion(24),
             end_version: None
         }
     );
@@ -2010,7 +2107,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(1)..=Version(24), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(1)..=CrsqlSiteVersion(24),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -2032,7 +2134,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(26)..=Version(27), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(26)..=CrsqlSiteVersion(27),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -2057,8 +2164,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(24))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(24))
         }
     );
 
@@ -2066,8 +2173,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[1],
         CorroBook {
             actor_id,
-            start_version: Version(26),
-            end_version: Some(Version(27))
+            start_version: CrsqlSiteVersion(26),
+            end_version: Some(CrsqlSiteVersion(27))
         }
     );
 
@@ -2075,7 +2182,7 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[2],
         CorroBook {
             actor_id,
-            start_version: Version(29),
+            start_version: CrsqlSiteVersion(29),
             end_version: None
         }
     );
@@ -2085,7 +2192,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(1)..=Version(29), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(1)..=CrsqlSiteVersion(29),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -2094,7 +2206,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(40)..=Version(45), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(40)..=CrsqlSiteVersion(45),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -2103,7 +2220,12 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
     {
         let tx = conn.transaction()?;
         assert_eq!(
-            store_empty_changeset(&tx, actor_id, Version(35)..=Version(37), Default::default())?,
+            store_empty_changeset(
+                &tx,
+                actor_id,
+                CrsqlSiteVersion(35)..=CrsqlSiteVersion(37),
+                Default::default()
+            )?,
             1
         );
         tx.commit()?;
@@ -2141,8 +2263,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[0],
         CorroBook {
             actor_id,
-            start_version: Version(1),
-            end_version: Some(Version(29))
+            start_version: CrsqlSiteVersion(1),
+            end_version: Some(CrsqlSiteVersion(29))
         }
     );
 
@@ -2150,8 +2272,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[1],
         CorroBook {
             actor_id,
-            start_version: Version(35),
-            end_version: Some(Version(37))
+            start_version: CrsqlSiteVersion(35),
+            end_version: Some(CrsqlSiteVersion(37))
         }
     );
 
@@ -2159,8 +2281,8 @@ fn test_store_empty_changeset() -> eyre::Result<()> {
         rows[2],
         CorroBook {
             actor_id,
-            start_version: Version(40),
-            end_version: Some(Version(45))
+            start_version: CrsqlSiteVersion(40),
+            end_version: Some(CrsqlSiteVersion(45))
         }
     );
 
@@ -2204,13 +2326,18 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let version = body.0.version.unwrap();
 
-    assert_eq!(version, Version(1));
+    assert_eq!(version, CrsqlSiteVersion(1));
 
     let conn = ta1.agent.pool().read().await?;
 
     // check locally that everything is in order
 
-    let bk: Vec<(ActorId, Version, Option<Version>, CrsqlDbVersion)> = conn
+    let bk: Vec<(
+        ActorId,
+        CrsqlSiteVersion,
+        Option<CrsqlSiteVersion>,
+        CrsqlDbVersion,
+    )> = conn
         .prepare(
             "SELECT actor_id, start_version, end_version, db_version FROM __corro_bookkeeping",
         )?
@@ -2269,9 +2396,14 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let version = body.0.version.unwrap();
 
-    assert_eq!(version, Version(2));
+    assert_eq!(version, CrsqlSiteVersion(2));
 
-    let bk: Vec<(ActorId, Version, Option<Version>, Option<CrsqlDbVersion>)> = conn
+    let bk: Vec<(
+        ActorId,
+        CrsqlSiteVersion,
+        Option<CrsqlSiteVersion>,
+        Option<CrsqlDbVersion>,
+    )> = conn
         .prepare(
             "SELECT actor_id, start_version, end_version, db_version FROM __corro_bookkeeping",
         )?
@@ -2283,7 +2415,12 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
     assert_eq!(
         bk,
         vec![
-            (ta1.agent.actor_id(), Version(1), Some(Version(1)), None),
+            (
+                ta1.agent.actor_id(),
+                CrsqlSiteVersion(1),
+                Some(CrsqlSiteVersion(1)),
+                None
+            ),
             (ta1.agent.actor_id(), version, None, Some(CrsqlDbVersion(2)))
         ]
     );
@@ -2320,7 +2457,12 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let conn = ta2.agent.pool().read().await?;
 
-    let bk: Vec<(ActorId, Version, Option<Version>, Option<CrsqlDbVersion>)> = conn
+    let bk: Vec<(
+        ActorId,
+        CrsqlSiteVersion,
+        Option<CrsqlSiteVersion>,
+        Option<CrsqlDbVersion>,
+    )> = conn
         .prepare(
             "SELECT actor_id, start_version, end_version, db_version FROM __corro_bookkeeping",
         )?
@@ -2334,7 +2476,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
         vec![
             (
                 ta1.agent.actor_id(),
-                Version(1),
+                CrsqlSiteVersion(1),
                 None,
                 Some(CrsqlDbVersion(1))
             ),

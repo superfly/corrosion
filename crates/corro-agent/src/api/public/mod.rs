@@ -12,7 +12,7 @@ use corro_types::{
         ColumnName, ExecResponse, ExecResult, QueryEvent, Statement, TableStatRequest,
         TableStatResponse,
     },
-    base::Version,
+    base::CrsqlSiteVersion,
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
@@ -36,7 +36,7 @@ pub mod pubsub;
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     f: F,
-) -> Result<(T, Option<Version>, Duration), ChangeError>
+) -> Result<(T, Option<CrsqlSiteVersion>, Duration), ChangeError>
 where
     F: Fn(&Transaction) -> Result<T, ChangeError>,
 {
@@ -594,7 +594,7 @@ mod tests {
     use bytes::Bytes;
     use corro_types::{
         api::RowId,
-        base::Version,
+        base::CrsqlSiteVersion,
         broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
         config::Config,
         schema::SqliteType,
@@ -674,7 +674,7 @@ mod tests {
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
                 changeset: Changeset::Full {
-                    version: Version(1),
+                    version: CrsqlSiteVersion(1),
                     ..
                 },
                 ..
@@ -683,7 +683,7 @@ mod tests {
 
         assert_eq!(
             agent.booked().read::<&str, _>("test", None).await.last(),
-            Some(Version(1))
+            Some(CrsqlSiteVersion(1))
         );
 
         println!("second req...");

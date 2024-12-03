@@ -1,7 +1,7 @@
 use std::{iter::Peekable, ops::RangeInclusive, time::Instant};
 
 pub use corro_api_types::{row_to_change, Change, SqliteValue};
-use corro_base_types::{CrsqlDbVersion, Version};
+use corro_base_types::{CrsqlDbVersion, CrsqlSiteVersion};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, params, Connection};
 use tracing::{debug, trace, warn};
@@ -124,7 +124,7 @@ where
 pub const MAX_CHANGES_BYTE_SIZE: usize = 8 * 1024;
 
 pub struct InsertChangesInfo {
-    pub version: Version,
+    pub version: CrsqlSiteVersion,
     pub db_version: CrsqlDbVersion,
     pub last_seq: CrsqlSeq,
     pub ts: Timestamp,
@@ -267,13 +267,13 @@ pub fn insert_local_changes(
 pub fn store_empty_changeset(
     conn: &Connection,
     actor_id: ActorId,
-    versions: RangeInclusive<Version>,
+    versions: RangeInclusive<CrsqlSiteVersion>,
     ts: Timestamp,
 ) -> Result<usize, ChangeError> {
     trace!(%actor_id, "attempting to delete versions range {versions:?}");
     let start = Instant::now();
     // first, delete "current" versions, they're now gone!
-    let deleted: Vec<RangeInclusive<Version>> = conn
+    let deleted: Vec<RangeInclusive<CrsqlSiteVersion>> = conn
         .prepare_cached(
             "
         DELETE FROM __corro_bookkeeping
@@ -335,7 +335,7 @@ pub fn store_empty_changeset(
             ],
             |row| {
                 let start = row.get(0)?;
-                Ok(start..=row.get::<_, Option<Version>>(1)?.unwrap_or(start))
+                Ok(start..=row.get::<_, Option<CrsqlSiteVersion>>(1)?.unwrap_or(start))
             },
         )
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())

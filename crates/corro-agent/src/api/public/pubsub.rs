@@ -880,7 +880,7 @@ async fn forward_bytes_to_body_sender(
 mod tests {
     use corro_types::actor::ActorId;
     use corro_types::api::{Change, ColumnName, TableName};
-    use corro_types::base::{CrsqlDbVersion, CrsqlSeq, Version};
+    use corro_types::base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion};
     use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
     use corro_types::pubsub::pack_columns;
     use corro_types::{
@@ -1343,6 +1343,7 @@ mod tests {
             seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
+            site_version: CrsqlSiteVersion(1),
         };
 
         let change2 = Change {
@@ -1355,12 +1356,13 @@ mod tests {
             seq: CrsqlSeq(1),
             site_id: actor_id.to_bytes(),
             cl: 1,
+            site_version: CrsqlSiteVersion(1),
         };
 
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: Version(1),
+                version: CrsqlSiteVersion(1),
                 changes: vec![change1, change2],
                 seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(1)),
                 last_seq: CrsqlSeq(1),
@@ -1426,12 +1428,13 @@ mod tests {
             seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
+            site_version: CrsqlSiteVersion(1),
         };
 
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: Version(2),
+                version: CrsqlSiteVersion(2),
                 changes: vec![change3],
                 seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(0)),
                 last_seq: CrsqlSeq(1),
@@ -1467,12 +1470,13 @@ mod tests {
             seq: CrsqlSeq(1),
             site_id: actor_id.to_bytes(),
             cl: 1,
+            site_version: CrsqlSiteVersion(1),
         };
 
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: Version(2),
+                version: CrsqlSiteVersion(2),
                 changes: vec![change4],
                 seqs: RangeInclusive::new(CrsqlSeq(1), CrsqlSeq(1)),
                 last_seq: CrsqlSeq(1),

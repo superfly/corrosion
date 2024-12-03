@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::{BufMut, BytesMut};
 use corro_types::actor::ClusterId;
 use corro_types::agent::{Agent, SplitPool};
-use corro_types::base::{CrsqlSeq, Version};
+use corro_types::base::{CrsqlSeq, CrsqlSiteVersion};
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
@@ -357,56 +357,67 @@ fn handle_need(
 ) -> eyre::Result<()> {
     debug!(%actor_id, "handle known versions! need: {need:?}");
 
-    let mut empties: RangeInclusiveMap<Version, Timestamp> = RangeInclusiveMap::new();
+    let mut empties: RangeInclusiveSet<CrsqlSiteVersion> = RangeInclusiveSet::new();
 
     // this is a read transaction!
     let tx = conn.transaction()?;
 
     let mut prepped = tx.prepare_cached(
         "
-        SELECT start_version, end_version, last_seq, ts
-            FROM __corro_bookkeeping
-            WHERE
-                actor_id = :actor_id
-                AND
-                start_version >= COALESCE((
-                    -- try to find the previous range
-                    SELECT start_version
-                        FROM __corro_bookkeeping
-                        WHERE
-                            actor_id = :actor_id AND
-                            start_version < :start -- AND end_version IS NOT NULL
-                        ORDER BY start_version DESC
-                        LIMIT 1
-                ), 1)
-                AND
-                start_version <= COALESCE((
-                    -- try to find the next range
-                    SELECT start_version
-                        FROM __corro_bookkeeping
-                        WHERE
-                            actor_id = :actor_id AND
-                            start_version > :end -- AND end_version IS NOT NULL
-                        ORDER BY start_version ASC
-                        LIMIT 1
-                ), :end + 1)
-                AND
-                (
-                    -- [:start]---[start_version]---[:end]
-                    ( start_version BETWEEN :start AND :end ) OR
-
-                    -- [start_version]---[:start]---[:end]---[end_version]
-                    ( start_version <= :start AND end_version >= :end ) OR
-
-                    -- [:start]---[start_version]---[:end]---[end_version]
-                    ( start_version <= :end AND end_version >= :end ) OR
-
-                    -- [:start]---[end_version]---[:end]
-                    ( end_version BETWEEN :start AND :end )
-                )
-            ORDER BY start_version DESC
-            ",
+        SELECT site_version, MAX(seq) AS last_seq
+            FROM crsql_changes
+            WHERE site_id = :actor_id
+              AND site_version BETWEEN :start AND :end
+            GROUP BY site_version
+            ORDER BY site_version DESC, seq ASC
+    ",
     )?;
+
+    // let mut prepped = tx.prepare_cached(
+    //     "
+    //     SELECT start_version, end_version, last_seq, ts
+    //         FROM __corro_bookkeeping
+    //         WHERE
+    //             actor_id = :actor_id
+    //             AND
+    //             start_version >= COALESCE((
+    //                 -- try to find the previous range
+    //                 SELECT start_version
+    //                     FROM __corro_bookkeeping
+    //                     WHERE
+    //                         actor_id = :actor_id AND
+    //                         start_version < :start -- AND end_version IS NOT NULL
+    //                     ORDER BY start_version DESC
+    //                     LIMIT 1
+    //             ), 1)
+    //             AND
+    //             start_version <= COALESCE((
+    //                 -- try to find the next range
+    //                 SELECT start_version
+    //                     FROM __corro_bookkeeping
+    //                     WHERE
+    //                         actor_id = :actor_id AND
+    //                         start_version > :end -- AND end_version IS NOT NULL
+    //                     ORDER BY start_version ASC
+    //                     LIMIT 1
+    //             ), :end + 1)
+    //             AND
+    //             (
+    //                 -- [:start]---[start_version]---[:end]
+    //                 ( start_version BETWEEN :start AND :end ) OR
+
+    //                 -- [start_version]---[:start]---[:end]---[end_version]
+    //                 ( start_version <= :start AND end_version >= :end ) OR
+
+    //                 -- [:start]---[start_version]---[:end]---[end_version]
+    //                 ( start_version <= :end AND end_version >= :end ) OR
+
+    //                 -- [:start]---[end_version]---[:end]
+    //                 ( end_version BETWEEN :start AND :end )
+    //             )
+    //         ORDER BY start_version DESC
+    //         ",
+    // )?;
 
     match need {
         SyncNeedV1::Full { versions } => {
@@ -427,39 +438,15 @@ fn handle_need(
                     }
                 };
 
-                let version: Version = row.get(0)?;
-                let end_version: Option<Version> = row.get(1)?;
-                let ts: Timestamp = row.get(3)?;
-
-                if let Some(end_version) = end_version {
-                    // cleared versions!
-
-                    // pick the biggest start between ours and the versions
-                    let start_version = cmp::max(version, *versions.start());
-
-                    // pick the smallest end between ours and the versions
-                    let end_version = cmp::min(end_version, *versions.end());
-
-                    empties.insert(start_version..=end_version, ts);
-
-                    // we have now processed this range!
-                    unprocessed.remove(start_version..=end_version);
-
-                    continue;
-                }
+                let version: CrsqlSiteVersion = row.get(0)?;
+                let last_seq: CrsqlSeq = row.get(1)?;
 
                 debug!(%actor_id, ?version, "not empty");
 
-                // since this is not a cleared version, those aren't supposed to fail!
-                let last_seq: CrsqlSeq = row.get(2)?;
-
                 let mut prepped = tx.prepare_cached(
                     r#"
-                        SELECT c."table", c.pk, c.cid, c.val, c.col_version, c.db_version, c.seq, c.site_id, c.cl
-                            FROM __corro_bookkeeping AS bk
-                        INNER JOIN crsql_changes AS c ON c.site_id = bk.actor_id AND c.db_version = bk.db_version
-                            WHERE bk.actor_id = :actor_id
-                            AND bk.start_version = :version
+                        SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version
+                            FROM crsql_changes WHERE site_id = :actor_id AND site_version = :version
                             ORDER BY c.seq ASC
                     "#,
                 )?;
@@ -478,9 +465,8 @@ fn handle_need(
                     actor_id,
                     version,
                     last_seq,
-                    ts,
                 )? {
-                    empties.insert(empty..=empty, ts);
+                    empties.insert(empty..=empty);
                 }
             }
 
@@ -520,7 +506,7 @@ fn handle_need(
                             row_to_change,
                         )?;
 
-                        send_change_chunks(
+                        if let Some(empty) = send_change_chunks(
                             sender,
                             ChunkedChanges::new(
                                 rows,
@@ -531,20 +517,18 @@ fn handle_need(
                             actor_id,
                             version,
                             last_seq,
-                            ts,
-                        )?;
+                        )? {
+                            empties.insert(empty..=empty);
+                        }
                     }
                 }
             }
 
             if !empties.is_empty() {
-                for (versions, ts) in empties {
+                for versions in empties {
                     sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                         actor_id,
-                        changeset: Changeset::Empty {
-                            versions,
-                            ts: Some(ts),
-                        },
+                        changeset: Changeset::Empty { versions, ts: None },
                     })))?;
                 }
             }
@@ -558,8 +542,8 @@ fn handle_need(
 
             match rows.next()? {
                 Some(row) => {
-                    let version: Version = row.get(0)?;
-                    let end_version: Option<Version> = row.get(1)?;
+                    let version: CrsqlSiteVersion = row.get(0)?;
+                    let end_version: Option<CrsqlSiteVersion> = row.get(1)?;
                     // ts could be null, since we previously didn't store timestamp for empties
                     let ts: Option<Timestamp> = row.get(3)?;
                     let ts: Timestamp =
@@ -617,7 +601,6 @@ fn handle_need(
                             actor_id,
                             version,
                             last_seq,
-                            ts,
                         )? {
                             sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(
                                 ChangeV1 {
@@ -706,55 +689,59 @@ fn handle_need(
                                 actor_id,
                                 version,
                                 last_seq,
-                                ts,
                             )?;
                         }
                     }
                 }
             }
         }
-        SyncNeedV1::Empty { ts, .. } => {
-            if last_cleared_ts.is_none() {
-                return Ok(());
-            }
-            debug!("processing empty versions to {actor_id} with ts: {:?}", ts);
-            let ts = ts.unwrap_or(Default::default());
-            let mut stmt = tx.prepare_cached(
-                "
-                SELECT start_version, end_version, ts FROM __corro_bookkeeping
-                    WHERE actor_id = crsql_site_id() AND end_version IS NOT NULL AND ts > ?
-                    ORDER BY ts",
-            )?;
-            let rows = stmt
-                .query_map([ts], |row| {
-                    Ok((Version(row.get(0)?)..=Version(row.get(1)?), row.get(2)?))
-                })?
-                .collect::<rusqlite::Result<Vec<(RangeInclusive<Version>, Timestamp)>>>()?
-                .iter()
-                .fold(HashMap::new(), |mut acc, item| {
-                    acc.entry(item.1)
-                        .and_modify(|arr: &mut Vec<RangeInclusive<Version>>| {
-                            arr.push(item.clone().0)
-                        })
-                        .or_insert(vec![item.clone().0]);
-                    acc
-                });
+        SyncNeedV1::Empty { .. } => {
+            // NOTE: no more empties in the new reality
 
-            let mut rows = Vec::from_iter(rows.iter());
-            rows.sort_by(|a, b| a.0.cmp(b.0));
-            let mut count = 0;
-            for (ts, versions) in rows {
-                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                    actor_id: agent.actor_id(),
-                    changeset: Changeset::EmptySet {
-                        versions: versions.clone(),
-                        ts: *ts,
-                    },
-                })))?;
-                count += versions.len();
-            }
+            // if last_cleared_ts.is_none() {
+            //     return Ok(());
+            // }
+            // debug!("processing empty versions to {actor_id} with ts: {:?}", ts);
+            // let ts = ts.unwrap_or(Default::default());
+            // let mut stmt = tx.prepare_cached(
+            //     "
+            //     SELECT start_version, end_version, ts FROM __corro_bookkeeping
+            //         WHERE actor_id = crsql_site_id() AND end_version IS NOT NULL AND ts > ?
+            //         ORDER BY ts",
+            // )?;
+            // let rows = stmt
+            //     .query_map([ts], |row| {
+            //         Ok((
+            //             CrsqlSiteVersion(row.get(0)?)..=CrsqlSiteVersion(row.get(1)?),
+            //             row.get(2)?,
+            //         ))
+            //     })?
+            //     .collect::<rusqlite::Result<Vec<(RangeInclusive<CrsqlSiteVersion>, Timestamp)>>>()?
+            //     .iter()
+            //     .fold(HashMap::new(), |mut acc, item| {
+            //         acc.entry(item.1)
+            //             .and_modify(|arr: &mut Vec<RangeInclusive<CrsqlSiteVersion>>| {
+            //                 arr.push(item.clone().0)
+            //             })
+            //             .or_insert(vec![item.clone().0]);
+            //         acc
+            //     });
 
-            debug!("sent {count} empty versions during sync!");
+            // let mut rows = Vec::from_iter(rows.iter());
+            // rows.sort_by(|a, b| a.0.cmp(b.0));
+            // let mut count = 0;
+            // for (ts, versions) in rows {
+            //     sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+            //         actor_id: agent.actor_id(),
+            //         changeset: Changeset::EmptySet {
+            //             versions: versions.clone(),
+            //             ts: *ts,
+            //         },
+            //     })))?;
+            //     count += versions.len();
+            // }
+
+            // debug!("sent {count} empty versions during sync!");
         }
     }
 
@@ -765,10 +752,9 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     sender: &Sender<SyncMessage>,
     mut chunked: ChunkedChanges<I>,
     actor_id: ActorId,
-    version: Version,
+    version: CrsqlSiteVersion,
     last_seq: CrsqlSeq,
-    ts: Timestamp,
-) -> eyre::Result<Option<Version>> {
+) -> eyre::Result<Option<CrsqlSiteVersion>> {
     let mut max_buf_size = chunked.max_buf_size();
     loop {
         if sender.is_closed() {
@@ -788,7 +774,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
                             changes,
                             seqs,
                             last_seq,
-                            ts,
+                            ts: 0u64.into(),
                         },
                     })))?;
                 }
@@ -1244,10 +1230,10 @@ pub async fn parallel_sync(
         let mut encode_buf = BytesMut::new();
 
         // already requested full versions
-        let mut req_full: HashMap<ActorId, RangeInclusiveSet<Version>> = HashMap::new();
+        let mut req_full: HashMap<ActorId, RangeInclusiveSet<CrsqlSiteVersion>> = HashMap::new();
 
         // already requested partial version sequences
-        let mut req_partials: HashMap<(ActorId, Version), RangeInclusiveSet<CrsqlSeq>> = HashMap::new();
+        let mut req_partials: HashMap<(ActorId, CrsqlSiteVersion), RangeInclusiveSet<CrsqlSeq>> = HashMap::new();
 
         let start = Instant::now();
 
@@ -1725,6 +1711,7 @@ mod tests {
     use corro_tests::launch_test_agent;
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::Statement;
+    use corro_types::base::CrsqlSiteVersion;
     use corro_types::{
         api::{ColumnName, TableName},
         base::CrsqlDbVersion,
@@ -1766,7 +1753,7 @@ mod tests {
             assert_eq!(status_code, StatusCode::OK);
 
             let version = body.0.version.unwrap();
-            assert_eq!(version, Version(i));
+            assert_eq!(version, CrsqlSiteVersion(i));
         }
 
         let dir = tempfile::tempdir()?;
@@ -1795,7 +1782,10 @@ mod tests {
             let changes = tokio::time::timeout(Duration::from_secs(5), ta2_opts.rx_changes.recv())
                 .await?
                 .unwrap();
-            assert_eq!(changes.0.versions(), Version(i)..=Version(i));
+            assert_eq!(
+                changes.0.versions(),
+                CrsqlSiteVersion(i)..=CrsqlSiteVersion(i)
+            );
         }
 
         Ok(())
@@ -1838,6 +1828,7 @@ mod tests {
             seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
+            site_version: CrsqlSiteVersion(1),
         };
 
         let change2 = Change {
@@ -1850,6 +1841,7 @@ mod tests {
             seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
+            site_version: CrsqlSiteVersion(1),
         };
 
         let bookie = Bookie::new(Default::default());
@@ -1862,7 +1854,7 @@ mod tests {
                     ChangeV1 {
                         actor_id,
                         changeset: Changeset::Full {
-                            version: Version(1),
+                            version: CrsqlSiteVersion(1),
                             changes: vec![change1.clone()],
                             seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                             last_seq: CrsqlSeq(0),
@@ -1876,7 +1868,7 @@ mod tests {
                     ChangeV1 {
                         actor_id,
                         changeset: Changeset::Full {
-                            version: Version(2),
+                            version: CrsqlSiteVersion(2),
                             changes: vec![change2.clone()],
                             seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                             last_seq: CrsqlSeq(0),
@@ -1900,8 +1892,8 @@ mod tests {
         {
             let read = booked.read::<&str, _>("test", None).await;
 
-            assert!(read.contains_version(&Version(1)));
-            assert!(read.contains_version(&Version(2)));
+            assert!(read.contains_version(&CrsqlSiteVersion(1)));
+            assert!(read.contains_version(&CrsqlSiteVersion(2)));
         }
 
         {
@@ -1928,7 +1920,7 @@ mod tests {
                     &agent,
                     actor_id,
                     SyncNeedV1::Full {
-                        versions: Version(1)..=Version(1),
+                        versions: CrsqlSiteVersion(1)..=CrsqlSiteVersion(1),
                     },
                     &tx,
                     None,
@@ -1941,7 +1933,7 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(1),
+                        version: CrsqlSiteVersion(1),
                         changes: vec![change1],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
@@ -1956,7 +1948,7 @@ mod tests {
                     &agent,
                     actor_id,
                     SyncNeedV1::Partial {
-                        version: Version(2),
+                        version: CrsqlSiteVersion(2),
                         seqs: vec![CrsqlSeq(0)..=CrsqlSeq(0)],
                     },
                     &tx,
@@ -1970,7 +1962,7 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(2),
+                        version: CrsqlSiteVersion(2),
                         changes: vec![change2.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
@@ -1990,6 +1982,7 @@ mod tests {
             seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
+            site_version: CrsqlSiteVersion(1),
         };
 
         process_multiple_changes(
@@ -1999,7 +1992,7 @@ mod tests {
                 ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(3),
+                        version: CrsqlSiteVersion(3),
                         changes: vec![change3.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
@@ -2036,7 +2029,7 @@ mod tests {
                     &agent,
                     actor_id,
                     SyncNeedV1::Partial {
-                        version: Version(1),
+                        version: CrsqlSiteVersion(1),
                         seqs: vec![CrsqlSeq(0)..=CrsqlSeq(0)],
                     },
                     &tx,
@@ -2053,7 +2046,10 @@ mod tests {
             {
                 assert_eq!(actor_id, actor);
                 assert!(changeset.is_empty());
-                assert_eq!(changeset.versions(), Version(1)..=Version(1));
+                assert_eq!(
+                    changeset.versions(),
+                    CrsqlSiteVersion(1)..=CrsqlSiteVersion(1)
+                );
             } else {
                 panic!("{msg:?} doesn't contain an empty changeset");
             }
@@ -2069,7 +2065,7 @@ mod tests {
                     &agent,
                     actor_id,
                     SyncNeedV1::Full {
-                        versions: Version(1)..=Version(6),
+                        versions: CrsqlSiteVersion(1)..=CrsqlSiteVersion(6),
                     },
                     &tx,
                     None,
@@ -2082,7 +2078,7 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(3),
+                        version: CrsqlSiteVersion(3),
                         changes: vec![change3.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
@@ -2097,7 +2093,7 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(2),
+                        version: CrsqlSiteVersion(2),
                         changes: vec![change2.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
@@ -2115,7 +2111,10 @@ mod tests {
             {
                 assert_eq!(actor_id, actor);
                 assert!(changeset.is_empty());
-                assert_eq!(changeset.versions(), Version(1)..=Version(1));
+                assert_eq!(
+                    changeset.versions(),
+                    CrsqlSiteVersion(1)..=CrsqlSiteVersion(1)
+                );
             } else {
                 panic!("{msg:?} doesn't contain an empty changeset");
             }
@@ -2132,6 +2131,7 @@ mod tests {
             seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
+            site_version: CrsqlSiteVersion(1),
         };
 
         process_multiple_changes(
@@ -2141,7 +2141,7 @@ mod tests {
                 ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(4),
+                        version: CrsqlSiteVersion(4),
                         changes: vec![change4.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
@@ -2189,6 +2189,7 @@ mod tests {
                         seq: CrsqlSeq(last_seq),
                         site_id: actor_id.to_bytes(),
                         cl: 1,
+                        site_version: CrsqlSiteVersion(1),
                     };
                     last_seq += 1;
                     c
@@ -2207,7 +2208,7 @@ mod tests {
                 ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(5),
+                        version: CrsqlSiteVersion(5),
                         changes: changes.clone(),
                         seqs,
                         last_seq,
@@ -2237,7 +2238,7 @@ mod tests {
                     &agent.clone(),
                     actor_id,
                     SyncNeedV1::Full {
-                        versions: Version(1)..=Version(1000),
+                        versions: CrsqlSiteVersion(1)..=CrsqlSiteVersion(1000),
                     },
                     &tx,
                     None,
@@ -2250,7 +2251,7 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(4),
+                        version: CrsqlSiteVersion(4),
                         changes: vec![change4],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
@@ -2265,7 +2266,7 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(3),
+                        version: CrsqlSiteVersion(3),
                         changes: vec![change3],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
@@ -2280,7 +2281,7 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(5),
+                        version: CrsqlSiteVersion(5),
                         changes: changes.iter().flatten().cloned().collect(),
                         seqs: CrsqlSeq(0)..=last_seq,
                         last_seq,
@@ -2298,7 +2299,10 @@ mod tests {
             {
                 assert_eq!(actor_id, actor);
                 assert!(changeset.is_empty());
-                assert_eq!(changeset.versions(), Version(1)..=Version(2));
+                assert_eq!(
+                    changeset.versions(),
+                    CrsqlSiteVersion(1)..=CrsqlSiteVersion(2)
+                );
             } else {
                 panic!("{msg:?} doesn't contain an empty changeset");
             }
@@ -2314,7 +2318,7 @@ mod tests {
                     &agent.clone(),
                     actor_id,
                     SyncNeedV1::Partial {
-                        version: Version(5),
+                        version: CrsqlSiteVersion(5),
                         seqs: vec![CrsqlSeq(4)..=CrsqlSeq(7)],
                     },
                     &tx,
@@ -2328,7 +2332,7 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(5),
+                        version: CrsqlSiteVersion(5),
                         changes: changes
                             .iter()
                             .flatten()
@@ -2352,7 +2356,7 @@ mod tests {
                     &agent,
                     actor_id,
                     SyncNeedV1::Partial {
-                        version: Version(5),
+                        version: CrsqlSiteVersion(5),
                         seqs: vec![CrsqlSeq(2)..=CrsqlSeq(2), CrsqlSeq(15)..=CrsqlSeq(24)],
                     },
                     &tx,
@@ -2366,7 +2370,7 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(5),
+                        version: CrsqlSiteVersion(5),
                         changes: changes
                             .iter()
                             .flatten()
@@ -2386,7 +2390,7 @@ mod tests {
                 SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(5),
+                        version: CrsqlSiteVersion(5),
                         changes: changes
                             .iter()
                             .flatten()

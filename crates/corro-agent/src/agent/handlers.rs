@@ -34,7 +34,7 @@ use corro_types::{
 
 use bytes::Bytes;
 use corro_types::agent::ChangeError;
-use corro_types::base::Version;
+use corro_types::base::CrsqlSiteVersion;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::store_empty_changeset;
 use foca::Notification;
@@ -536,7 +536,7 @@ pub async fn handle_emptyset(
     mut rx_emptysets: CorroReceiver<ChangeV1>,
     mut tripwire: Tripwire,
 ) {
-    type EmptyQueue = VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>;
+    type EmptyQueue = VecDeque<(Vec<RangeInclusive<CrsqlSiteVersion>>, Timestamp)>;
     let mut buf: HashMap<ActorId, EmptyQueue> = HashMap::new();
 
     let mut join_set: JoinSet<HashMap<ActorId, EmptyQueue>> = JoinSet::new();
@@ -619,7 +619,7 @@ pub async fn process_emptyset(
     agent: Agent,
     bookie: Bookie,
     actor_id: ActorId,
-    changes: &(Vec<RangeInclusive<Version>>, Timestamp),
+    changes: &(Vec<RangeInclusive<CrsqlSiteVersion>>, Timestamp),
 ) -> Result<(), ChangeError> {
     let (versions, ts) = changes;
 
@@ -1068,7 +1068,8 @@ mod tests {
     use axum::{http::StatusCode, Extension, Json};
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{Change, ColumnName, TableName};
-    use corro_types::{base::CrsqlDbVersion, base::Version, config::Config, pubsub::pack_columns};
+    use corro_types::base::CrsqlSiteVersion;
+    use corro_types::{base::CrsqlDbVersion, config::Config, pubsub::pack_columns};
     use rusqlite::Connection;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
@@ -1140,13 +1141,14 @@ mod tests {
                     seq: CrsqlSeq(0),
                     site_id: agent.actor_id().to_bytes(),
                     cl: 1,
+                    site_version: CrsqlSiteVersion(1),
                 };
 
                 let change = (
                     ChangeV1 {
                         actor_id: other_actor,
                         changeset: Changeset::Full {
-                            version: Version(i as u64),
+                            version: CrsqlSiteVersion(i as u64),
                             changes: vec![crsql_row.clone()],
                             seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                             last_seq: CrsqlSeq(0),
@@ -1168,10 +1170,10 @@ mod tests {
             .unwrap()
             .read::<&str, _>("test", None)
             .await;
-        assert!(booked.contains_all(Version(6)..=Version(10), None));
-        assert!(booked.contains_all(Version(1)..=Version(3), None));
-        assert!(!booked.contains_version(&Version(5)));
-        assert!(!booked.contains_version(&Version(4)));
+        assert!(booked.contains_all(CrsqlSiteVersion(6)..=CrsqlSiteVersion(10), None));
+        assert!(booked.contains_all(CrsqlSiteVersion(1)..=CrsqlSiteVersion(3), None));
+        assert!(!booked.contains_version(&CrsqlSiteVersion(5)));
+        assert!(!booked.contains_version(&CrsqlSiteVersion(4)));
 
         Ok(())
     }
