@@ -455,6 +455,10 @@ async fn handle_broadcasts(
                     break;
                 }
             },
+            _ = join_set.next() => {
+                // drains the joinset
+                continue;
+            },
             _ = bcast_interval.tick() => {
                 Branch::BroadcastDeadline
             },
@@ -557,10 +561,6 @@ async fn handle_broadcasts(
             }
         }
 
-        while join_set.try_join_next().is_some() {
-            // we're draining the join_set, even though it's not strictly necessary
-        }
-
         let prev_rate_limited = rate_limited;
 
         // start with local broadcasts, they're higher priority
@@ -572,6 +572,9 @@ async fn handle_broadcasts(
             let mut spawn_count = 0;
             let mut ring0_count = 0;
             for addr in members.ring0(agent.cluster_id()) {
+                if join_set.len() >= MAX_INFLIGHT_BROADCAST {
+                    break;
+                }
                 ring0_count += 1;
 
                 match try_transmit_broadcast(
@@ -617,7 +620,7 @@ async fn handle_broadcasts(
             counter!("corro.broadcast.spawn", "type" => "local").increment(spawn_count);
         }
 
-        if !rate_limited {
+        if !rate_limited && !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
             let (members_count, ring0_count) = {
                 let members = agent.members().read();
                 let members_count = members.states.len();
@@ -667,7 +670,10 @@ async fn handle_broadcasts(
                         .choose_multiple(
                             &mut rng,
                             // prevent going over max count
-                            cmp::min(choose_count, MAX_INFLIGHT_BROADCAST - join_set.len()),
+                            cmp::min(
+                                choose_count,
+                                MAX_INFLIGHT_BROADCAST.saturating_sub(join_set.len()),
+                            ),
                         )
                 };
 
