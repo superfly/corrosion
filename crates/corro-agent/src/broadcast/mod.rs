@@ -455,7 +455,7 @@ async fn handle_broadcasts(
                     break;
                 }
             },
-            _ = join_set.next() => {
+            _ = join_set.join_next(), if !join_set.is_empty() => {
                 // drains the joinset
                 continue;
             },
