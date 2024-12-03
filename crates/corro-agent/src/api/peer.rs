@@ -446,7 +446,9 @@ fn handle_need(
                 let mut prepped = tx.prepare_cached(
                     r#"
                         SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version
-                            FROM crsql_changes WHERE site_id = :actor_id AND site_version = :version
+                            FROM crsql_changes
+                            WHERE site_id = :actor_id
+                              AND site_version = :version
                             ORDER BY c.seq ASC
                     "#,
                 )?;
@@ -484,7 +486,7 @@ fn handle_need(
                     for (range_needed, last_seq, ts) in seqs {
                         let mut prepped = tx.prepare_cached(
                             r#"
-                                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version
                                     FROM __corro_buffered_changes
                                     WHERE site_id = :actor_id
                                         AND version = :version
@@ -543,39 +545,16 @@ fn handle_need(
             match rows.next()? {
                 Some(row) => {
                     let version: CrsqlSiteVersion = row.get(0)?;
-                    let end_version: Option<CrsqlSiteVersion> = row.get(1)?;
-                    // ts could be null, since we previously didn't store timestamp for empties
-                    let ts: Option<Timestamp> = row.get(3)?;
-                    let ts: Timestamp =
-                        ts.unwrap_or(Timestamp::from(agent.clock().new_timestamp()));
-
-                    if end_version.is_some() {
-                        // send this one right away
-
-                        sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(
-                            ChangeV1 {
-                                actor_id,
-                                changeset: Changeset::Empty {
-                                    versions: version..=version,
-                                    ts: Some(ts),
-                                },
-                            },
-                        )))?;
-                        return Ok(());
-                    }
-
-                    // since this is not a cleared version, those aren't supposed to fail!
-                    let last_seq: CrsqlSeq = row.get(2)?;
+                    let last_seq: CrsqlSeq = row.get(1)?;
 
                     for range_needed in seqs {
                         let mut prepped = tx.prepare_cached(
                             r#"
-                                SELECT c."table", c.pk, c.cid, c.val, c.col_version, c.db_version, c.seq, c.site_id, c.cl
-                                    FROM __corro_bookkeeping AS bk
-                                INNER JOIN crsql_changes AS c ON c.site_id = bk.actor_id AND c.db_version = bk.db_version
-                                    WHERE bk.actor_id = :actor_id
-                                    AND bk.start_version = :version
-                                    AND c.seq BETWEEN :start AND :end
+                                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version
+                                    FROM crsql_changes
+                                    WHERE site_id = :actor_id
+                                      AND site_version = :version
+                                      AND seq BETWEEN :start AND :end
                                     ORDER BY c.seq ASC
                             "#,
                         )?;
@@ -607,7 +586,7 @@ fn handle_need(
                                     actor_id,
                                     changeset: Changeset::Empty {
                                         versions: empty..=empty,
-                                        ts: Some(ts),
+                                        ts: None,
                                     },
                                 },
                             )))?;
@@ -619,7 +598,7 @@ fn handle_need(
                         let seqs = tx
                             .prepare_cached(
                                 "
-                                SELECT start_seq, end_seq, last_seq, ts
+                                SELECT start_seq, end_seq, last_seq
                                     FROM __corro_seq_bookkeeping
                                     WHERE
                                         site_id = :actor_id AND
@@ -646,23 +625,22 @@ fn handle_need(
                                     ":start": seqs_range.start(),
                                     ":end": seqs_range.end(),
                                 },
-                                |row| Ok((row.get(0)?..=row.get(1)?, row.get(2)?, row.get(3)?)),
+                                |row| Ok((row.get(0)?..=row.get(1)?, row.get(2)?)),
                             )?
-                            .collect::<rusqlite::Result<
-                                Vec<(RangeInclusive<CrsqlSeq>, CrsqlSeq, Timestamp)>,
-                            >>()?;
+                            .collect::<rusqlite::Result<Vec<(RangeInclusive<CrsqlSeq>, CrsqlSeq)>>>(
+                            )?;
 
-                        for (range_needed, last_seq, ts) in seqs {
+                        for (range_needed, last_seq) in seqs {
                             let mut prepped = tx.prepare_cached(
-                                        r#"
-                                            SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                                                FROM __corro_buffered_changes
-                                                WHERE site_id = :actor_id
-                                                    AND version = :version
-                                                    AND seq BETWEEN :start_seq AND :end_seq
-                                                ORDER BY seq ASC
-                                        "#,
-                                    )?;
+                                r#"
+                                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version
+                                        FROM __corro_buffered_changes
+                                        WHERE site_id = :actor_id
+                                            AND version = :version
+                                            AND seq BETWEEN :start_seq AND :end_seq
+                                        ORDER BY seq ASC
+                                "#,
+                            )?;
 
                             // scope query to only the sequences we have
                             let start_seq = cmp::max(range_needed.start(), seqs_range.start());
