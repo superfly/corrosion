@@ -728,7 +728,7 @@ async fn handle_broadcasts(
                             debug!("queueing for re-send");
                             idle_pendings.push(Box::pin(async move {
                                 // slow our send pace if we've been previously rate limited
-                                let sleep_ms_base = if prev_rate_limited { 1000 } else { 250 };
+                                let sleep_ms_base = if prev_rate_limited { 500 } else { 100 };
                                 // send with increasing latency as we've already sent the updates out
                                 tokio::time::sleep(Duration::from_millis(
                                     sleep_ms_base * send_count as u64,
