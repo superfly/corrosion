@@ -581,7 +581,10 @@ async fn handle_broadcasts(
                     addr,
                 ) {
                     Err(e) => {
-                        log_at_pow_10("could not spawn broadcast transmission: {e}",  &mut limited_log_count);
+                        log_at_pow_10(
+                            "could not spawn broadcast transmission: {e}",
+                            &mut limited_log_count,
+                        );
                         match e {
                             TransmitError::TooBig(_) | TransmitError::InsufficientCapacity(_) => {
                                 // not sure this would ever happen
@@ -604,9 +607,10 @@ async fn handle_broadcasts(
             }
 
             // couldn't send it anywhere!
-            if spawn_count == 0 && ring0_count > 0 {
-                // push it back in front since this got nowhere
-                to_local_broadcast.push_back(payload);
+            if rate_limited && spawn_count == 0 && ring0_count > 0 {
+                // push it back in front since this got nowhere and it's still the
+                // freshest item we have in the queue
+                to_local_broadcast.push_front(payload);
                 break;
             }
 
