@@ -713,12 +713,12 @@ pub async fn process_multiple_changes(
                 version: None,
             })?;
 
-        let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
+        let mut processed: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
 
         let mut last_db_version = None;
 
-        // let mut writers: BTreeMap<ActorId, _> = Default::default();
+        let mut count = 0;
 
         for (actor_id, changes) in unknown_changes {
             let booked = {
@@ -739,7 +739,6 @@ pub async fn process_multiple_changes(
             for (change, src) in changes {
                 trace!("handling a single changeset: {change:?}");
                 let seqs = change.seqs();
-                let ts = change.ts();
                 if booked_write.contains_all(change.versions(), change.seqs()) {
                     trace!("previously unknown versions are now deemed known, aborting inserts");
                     continue;
@@ -750,11 +749,12 @@ pub async fn process_multiple_changes(
                 // check if we've seen this version here...
                 if versions.clone().all(|version| match seqs {
                     Some(check_seqs) => match seen.get(&version) {
-                        Some(known) => match known {
-                            KnownDbVersion::Partial(PartialVersion { seqs, .. }) => {
+                        Some(maybe_partial) => match maybe_partial {
+                            Some(PartialVersion { seqs, .. }) => {
                                 check_seqs.clone().all(|seq| seqs.contains(&seq))
                             }
-                            KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
+                            // other kind of known version
+                            None => true,
                         },
                         None => false,
                     },
@@ -776,7 +776,10 @@ pub async fn process_multiple_changes(
 
                     let (known, changeset) = {
                         match process_single_version(&agent, &mut tx, last_db_version, change) {
-                            Ok(res) => res,
+                            Ok(res) => {
+                                count += 1;
+                                res
+                            }
                             Err(e) => {
                                 error!("error processing single version: {e}");
                                 continue;
@@ -794,26 +797,23 @@ pub async fn process_multiple_changes(
                     known
                 };
 
-                seen.insert(versions.clone(), known.clone());
-                knowns
+                let partial = match known {
+                    KnownDbVersion::Partial(partial) => Some(partial),
+                    _ => None,
+                };
+
+                seen.insert(versions.clone(), partial.clone());
+                processed
                     .entry(actor_id)
                     .or_default()
-                    .push((versions, ts, known));
+                    .push((versions, partial));
             }
         }
 
-        let mut count = 0;
         let mut snapshots = BTreeMap::new();
 
-        for (actor_id, knowns) in knowns.iter_mut() {
-            debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} knowns", knowns.len());
-
-            let mut all_versions = RangeInclusiveSet::new();
-
-            for (versions, _, _) in knowns.iter() {
-                all_versions.insert(versions.clone());
-                count += 1;
-            }
+        for (actor_id, processed) in processed.iter() {
+            debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} changesets", processed.len());
 
             let booked = {
                 bookie
@@ -829,19 +829,25 @@ pub async fn process_multiple_changes(
                 Some(snap) => snap,
                 None => {
                     let booked_write = booked.blocking_write(
-                        "process_multiple_changes(booked writer, during knowns)",
+                        "process_multiple_changes(booked writer, during processed)",
                         actor_id.as_simple(),
                     );
                     booked_write.snapshot()
                 }
             };
 
-            snap.insert_db(&tx, all_versions)
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(*actor_id),
-                    version: None,
-                })?;
+            snap.insert_db(
+                &tx,
+                processed
+                    .iter()
+                    .map(|(versions, _)| versions.clone())
+                    .collect(),
+            )
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(*actor_id),
+                version: None,
+            })?;
 
             snapshots.insert(*actor_id, snap);
         }
@@ -863,7 +869,7 @@ pub async fn process_multiple_changes(
 
         debug!("committed {count} changes in {:?}", start.elapsed());
 
-        for (actor_id, knowns) in knowns {
+        for (actor_id, processed) in processed {
             let booked = {
                 bookie
                     .blocking_write(
@@ -881,9 +887,9 @@ pub async fn process_multiple_changes(
                 booked_write.commit_snapshot(snap);
             }
 
-            for (versions, _, known) in knowns {
+            for (versions, partial) in processed {
                 let version = *versions.start();
-                if let KnownDbVersion::Partial(partial) = known {
+                if let Some(partial) = partial {
                     let PartialVersion { seqs, last_seq, .. } =
                         booked_write.insert_partial(version, partial);
 
