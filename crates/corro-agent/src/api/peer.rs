@@ -442,7 +442,7 @@ fn handle_need(
                                 SELECT 1
                                 FROM __corro_buffered_changes
                                     WHERE site_id = :actor_id
-                                      AND version = :version
+                                      AND site_version = :version
                             ) AS buffered",
                         )?
                         .query_row(
@@ -463,7 +463,7 @@ fn handle_need(
 
                     let seqs = tx
                         .prepare_cached("
-                        SELECT start_seq, end_seq, last_seq FROM __corro_seq_bookkeeping WHERE site_id = :actor_id AND version = :version
+                        SELECT start_seq, end_seq, last_seq FROM __corro_seq_bookkeeping WHERE site_id = :actor_id AND site_version = :version
                         ")?.query_map(named_params!{
                             ":actor_id": actor_id,
                             ":version": version
@@ -472,10 +472,10 @@ fn handle_need(
                     for (range_needed, last_seq) in seqs {
                         let mut prepped = tx.prepare_cached(
                             r#"
-                                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, version
+                                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version
                                     FROM __corro_buffered_changes
                                     WHERE site_id = :actor_id
-                                        AND version = :version
+                                        AND site_version = :version
                                         AND seq BETWEEN :start_seq AND :end_seq
                                     ORDER BY seq ASC
                             "#,
@@ -578,7 +578,7 @@ fn handle_need(
                                 SELECT 1
                                 FROM __corro_buffered_changes
                                     WHERE site_id = :actor_id
-                                      AND version = :version
+                                      AND site_version = :version
                             ) AS buffered",
                         )?
                         .query_row(
@@ -603,7 +603,7 @@ fn handle_need(
                                     FROM __corro_seq_bookkeeping
                                     WHERE
                                         site_id = :actor_id AND
-                                        version = :version AND
+                                        site_version = :version AND
                                         (
                                             -- [:start]---[start_seq]---[:end]
                                             ( start_seq BETWEEN :start AND :end ) OR
@@ -636,10 +636,10 @@ fn handle_need(
                             for (range_needed, last_seq) in seqs {
                                 let mut prepped = tx.prepare_cached(
                                 r#"
-                                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, version
+                                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version
                                         FROM __corro_buffered_changes
                                         WHERE site_id = :actor_id
-                                            AND version = :version
+                                            AND site_version = :version
                                             AND seq BETWEEN :start_seq AND :end_seq
                                         ORDER BY seq ASC
                                 "#,

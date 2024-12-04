@@ -415,12 +415,12 @@ pub async fn clear_buffered_meta_loop(
 
                         // sub query required due to DELETE and LIMIT interaction
                         let seq_count = tx
-                            .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+                            .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, site_version, start_seq) IN (SELECT site_id, site_version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND site_version >= ? AND site_version <= ? LIMIT ?)")?
                             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
                         // sub query required due to DELETE and LIMIT interaction
                         let buf_count = tx
-                            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+                            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, site_version, seq) IN (SELECT site_id, db_version, site_version, seq FROM __corro_buffered_changes WHERE site_id = ? AND site_version >= ? AND site_version <= ? LIMIT ?)")?
                             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
                         tx.commit()?;
@@ -560,7 +560,7 @@ pub async fn process_fully_buffered_changes(
 
             info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
-            let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional().map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
+            let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND site_version = ?").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional().map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
 
             let start = Instant::now();
 
@@ -570,10 +570,10 @@ pub async fn process_fully_buffered_changes(
             .prepare_cached(
                 r#"
                 INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
-                    SELECT                 "table", pk, cid, val, col_version, ? as db_version, site_id, cl, seq, version
+                    SELECT                 "table", pk, cid, val, col_version, ? as db_version, site_id, cl, seq, site_version
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
-                              AND version = ?
+                              AND site_version = ?
                             ORDER BY db_version ASC, seq ASC
                             "#,
             ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
@@ -948,10 +948,10 @@ pub fn process_incomplete_version(
         let new_insertion = sp.prepare_cached(
             r#"
                 INSERT INTO __corro_buffered_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, version)
+                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
                 VALUES
                     (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq, :version)
-                ON CONFLICT (site_id, db_version, version, seq)
+                ON CONFLICT (site_id, db_version, site_version, seq)
                     DO NOTHING
             "#,
         )?
@@ -983,7 +983,7 @@ pub fn process_incomplete_version(
         .prepare_cached(
             "
             DELETE FROM __corro_seq_bookkeeping
-                WHERE site_id = :actor_id AND version = :version AND
+                WHERE site_id = :actor_id AND site_version = :version AND
                 (
                     -- [:start]---[start_seq]---[:end]
                     ( start_seq BETWEEN :start AND :end ) OR
@@ -1033,7 +1033,7 @@ pub fn process_incomplete_version(
         sp
         .prepare_cached(
             "
-                INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
+                INSERT INTO __corro_seq_bookkeeping (site_id, site_version, start_seq, end_seq, last_seq, ts)
                     VALUES (?, ?, ?, ?, ?, ?);
             ",
         )?
@@ -1170,12 +1170,12 @@ pub fn check_buffered_meta_to_clear(
     actor_id: ActorId,
     versions: RangeInclusive<CrsqlSiteVersion>,
 ) -> rusqlite::Result<bool> {
-    let should_clear: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))?;
+    let should_clear: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND site_version >= ? AND site_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))?;
     if should_clear {
         return Ok(true);
     }
 
-    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND site_version >= ? AND site_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
 }
 
 pub fn log_at_pow_10(msg: &str, count: &mut u64) {

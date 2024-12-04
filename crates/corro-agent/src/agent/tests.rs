@@ -1214,7 +1214,7 @@ async fn check_bookie_versions(
         for version in versions.0.clone() {
             let bk: Vec<(ActorId, CrsqlSiteVersion, CrsqlSeq, CrsqlSeq)> = conn
                 .prepare(
-                    "SELECT site_id, version, start_seq, end_seq FROM __corro_seq_bookkeeping where version = ?",
+                    "SELECT site_id, site_version, start_seq, end_seq FROM __corro_seq_bookkeeping where site_version = ?",
                 )?
                 .query_map([version], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))

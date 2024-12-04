@@ -258,9 +258,19 @@ pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result
         Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_ts_index_bookkeeping_table),
         Box::new(create_sync_state(clock)),
+        Box::new(use_site_version),
     ];
 
     crate::sqlite::migrate(conn, migrations)
+}
+
+fn use_site_version(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "
+        ALTER TABLE __corro_buffered_changes RENAME COLUMN version TO site_version;
+        ALTER TABLE __corro_seq_bookkeeping RENAME COLUMN version TO site_version;
+    ",
+    )
 }
 
 fn create_impacted_versions(tx: &Transaction) -> rusqlite::Result<()> {
@@ -1360,7 +1370,7 @@ impl BookedVersions {
         {
             // fetch known partial sequences
             let mut prepped = conn.prepare_cached(
-            "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
+            "SELECT site_version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
             )?;
             let mut rows = prepped.query([actor_id])?;
 

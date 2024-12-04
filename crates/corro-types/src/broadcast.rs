@@ -558,12 +558,6 @@ pub async fn broadcast_changes(
     trace!("got conn for broadcast");
 
     block_in_place(|| {
-        let count: i64 = conn
-            .prepare("SELECT COUNT(*) FROM crsql_changes;")?
-            .query_row([], |row| row.get(0))?;
-
-        trace!("broadcast: CRSQL CHANGES COUNT: {count}");
-
         // TODO: make this more generic so both sync and local changes can use it.
         let mut prepped = conn.prepare_cached(
             r#"
