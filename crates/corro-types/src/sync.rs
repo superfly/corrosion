@@ -297,8 +297,6 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
             .collect()
     };
 
-    let mut last_ts = None;
-
     for (actor_id, booked) in actors {
         let bookedr = booked.read("generate_sync", actor_id.as_simple()).await;
 
@@ -329,15 +327,11 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
                 );
             }
         }
-
-        if actor_id == self_actor_id {
-            last_ts = bookedr.last_cleared_ts();
-        }
-
         state.heads.insert(actor_id, last_version);
     }
 
-    state.last_cleared_ts = last_ts;
+    // TODO: remove this
+    state.last_cleared_ts = None;
 
     state
 }

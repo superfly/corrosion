@@ -193,103 +193,6 @@ impl From<LockMeta> for LockMetaElapsed {
     }
 }
 
-async fn collapse_gaps(
-    stream: &mut FramedStream,
-    conn: &mut rusqlite::Connection,
-    bv: &mut BookedVersions,
-) -> rusqlite::Result<()> {
-    let actor_id = bv.actor_id();
-    let mut snap = bv.snapshot();
-    _ = info_log(stream, format!("collapsing ranges for {actor_id}")).await;
-    let start = Instant::now();
-    let (deleted, inserted) = block_in_place(|| {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let versions = tx
-                .prepare_cached(
-                    "
-                    SELECT distinct bk.start_version, coalesce(bk.end_version, bk.start_version)
-                        FROM __corro_bookkeeping_gaps AS g
-                        INNER JOIN __corro_bookkeeping AS bk ON bk.actor_id = g.actor_id AND start_version >= COALESCE((
-                            -- try to find the previous range
-                            SELECT start_version
-                                FROM __corro_bookkeeping
-                                WHERE
-                                    actor_id = g.actor_id AND
-                                    start_version < g.start -- AND end_version IS NOT NULL
-                                ORDER BY start_version DESC
-                                LIMIT 1
-                        ), 1)
-                        AND
-                        start_version <= COALESCE((
-                            -- try to find the next range
-                            SELECT start_version
-                                FROM __corro_bookkeeping
-                                WHERE
-                                    actor_id = g.actor_id AND
-                                    start_version > g.end-- AND end_version IS NOT NULL
-                                ORDER BY start_version ASC
-                                LIMIT 1
-                        ), g.end+ 1) AND (
-                            -- [g.start]---[start_version]---[g.end]
-                            ( start_version BETWEEN g.start AND g.end ) OR
-
-                            -- [start_version]---[g.start]---[g.end]---[end_version]
-                            ( start_version <= g.start AND end_version >= g.end ) OR
-
-                            -- [g.start]---[start_version]---[g.end]---[end_version]
-                            ( start_version <= g.end AND end_version >= g.end ) OR
-
-                            -- [g.start]---[end_version]---[g.end]
-                            ( end_version BETWEEN g.start AND g.end ) OR
-
-                            -- ---[g.end][start_version]---[end_version]
-                            ( start_version = g.end + 1 AND end_version IS NOT NULL ) OR
-
-                            -- [end_version][g.start]---
-                            ( end_version = g.start - 1 )
-                        )
-                        where g.actor_id = ?
-                ",
-                )?
-                .query_map(
-                    rusqlite::params![actor_id],
-                    |row| Ok(row.get(0)?..=row.get(1)?),
-                )?
-                .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<CrsqlSiteVersion>>>()?;
-
-        let deleted = tx.execute(
-            "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
-            [actor_id],
-        )?;
-
-        let mut inserted = 0;
-        for range in snap.needed().iter() {
-            tx.prepare_cached(
-                "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?,?,?);",
-            )?
-            .execute(params![actor_id, range.start(), range.end()])?;
-            inserted += 1;
-        }
-
-        snap.insert_db(&tx, versions)?;
-
-        tx.commit()?;
-
-        Ok::<_, rusqlite::Error>((deleted, inserted))
-    })?;
-    _ = info_log(
-        stream,
-        format!(
-            "collapsed ranges in {:?} (deleted: {deleted}, inserted: {inserted})",
-            start.elapsed()
-        ),
-    )
-    .await;
-
-    bv.commit_snapshot(snap);
-    Ok(())
-}
-
 async fn handle_conn(
     agent: Agent,
     bookie: &Bookie,
@@ -321,33 +224,8 @@ async fn handle_conn(
                     send_success(&mut stream).await;
                 }
                 Command::Sync(SyncCommand::ReconcileGaps) => {
-                    let actor_ids: Vec<_> = {
-                        let r = bookie
-                            .read::<&str, _>("admin sync reconcile gaps", None)
-                            .await;
-                        r.keys().copied().collect()
-                    };
-
-                    for actor_id in actor_ids {
-                        {
-                            let booked = bookie
-                                .read("admin sync reconcile gaps get actor", actor_id.as_simple())
-                                .await
-                                .get(&actor_id)
-                                .unwrap()
-                                .clone();
-
-                            let mut conn = agent.pool().write_low().await.unwrap();
-                            let mut bv = booked
-                                .write::<&str, _>("admin sync reconcile gaps booked versions", None)
-                                .await;
-
-                            if let Err(e) = collapse_gaps(&mut stream, &mut conn, &mut bv).await {
-                                _ = send_error(&mut stream, e).await;
-                            }
-                        }
-                    }
-
+                    // TODO: remove
+                    // Now a noop
                     _ = send_success(&mut stream).await;
                 }
                 Command::Locks { top } => {

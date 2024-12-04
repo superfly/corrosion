@@ -1172,7 +1172,6 @@ pub struct VersionsSnapshot {
     needed: RangeInclusiveSet<CrsqlSiteVersion>,
     partials: BTreeMap<CrsqlSiteVersion, PartialVersion>,
     max: Option<CrsqlSiteVersion>,
-    last_cleared_ts: Option<Timestamp>,
 }
 
 impl VersionsSnapshot {
@@ -1237,16 +1236,6 @@ impl VersionsSnapshot {
         }
 
         self.max = changes.max.take();
-
-        Ok(())
-    }
-
-    pub fn update_cleared_ts(&mut self, conn: &Connection, ts: Timestamp) -> rusqlite::Result<()> {
-        if self.last_cleared_ts.is_none() || self.last_cleared_ts.unwrap() < ts {
-            self.last_cleared_ts = Some(ts);
-            conn.prepare_cached("INSERT OR REPLACE INTO __corro_sync_state VALUES (?, ?)")?
-                .execute((self.actor_id, ts))?;
-        }
 
         Ok(())
     }
@@ -1347,7 +1336,6 @@ pub struct BookedVersions {
     pub partials: BTreeMap<CrsqlSiteVersion, PartialVersion>,
     needed: RangeInclusiveSet<CrsqlSiteVersion>,
     max: Option<CrsqlSiteVersion>,
-    last_cleared_ts: Option<Timestamp>,
 }
 
 impl BookedVersions {
@@ -1357,7 +1345,6 @@ impl BookedVersions {
             partials: Default::default(),
             needed: Default::default(),
             max: Default::default(),
-            last_cleared_ts: Default::default(),
         }
     }
 
@@ -1372,9 +1359,7 @@ impl BookedVersions {
         // fetch the biggest version we know, a partial version might override
         // this below
         bv.max = conn
-            .prepare_cached(
-                "SELECT MAX(start_version) FROM __corro_bookkeeping WHERE actor_id = ?",
-            )?
+            .prepare_cached("SELECT MAX(site_version) FROM crsql_changes WHERE site_id = ?")?
             .query_row([actor_id], |row| row.get(0))?;
 
         {
@@ -1403,8 +1388,6 @@ impl BookedVersions {
                 }
             }
         }
-
-        bv.last_cleared_ts = get_last_cleared_ts(conn, actor_id)?;
 
         let mut snap = bv.snapshot();
 
@@ -1478,26 +1461,12 @@ impl BookedVersions {
     pub fn last(&self) -> Option<CrsqlSiteVersion> {
         self.max
     }
-    pub fn last_cleared_ts(&self) -> Option<Timestamp> {
-        self.last_cleared_ts
-    }
 
     pub fn commit_snapshot(&mut self, mut snap: VersionsSnapshot) {
         debug!("comitting snapshot");
         self.needed = std::mem::take(&mut snap.needed);
         self.partials = std::mem::take(&mut snap.partials);
         self.max = snap.max.take();
-        if let Some(ts) = snap.last_cleared_ts {
-            if self.last_cleared_ts.is_none() || self.last_cleared_ts().unwrap() < ts {
-                self.last_cleared_ts = Some(ts)
-            }
-        }
-    }
-
-    pub fn update_cleared_ts(&mut self, ts: Timestamp) {
-        if self.last_cleared_ts.is_none() || self.last_cleared_ts().unwrap() < ts {
-            self.last_cleared_ts = Some(ts)
-        }
     }
 
     pub fn snapshot(&self) -> VersionsSnapshot {
@@ -1507,7 +1476,6 @@ impl BookedVersions {
             needed: self.needed.clone(),
             partials: self.partials.clone(),
             max: self.max,
-            last_cleared_ts: self.last_cleared_ts,
         }
     }
 
@@ -1535,17 +1503,6 @@ impl BookedVersions {
     pub fn needed(&self) -> &RangeInclusiveSet<CrsqlSiteVersion> {
         &self.needed
     }
-}
-
-pub fn get_last_cleared_ts(
-    conn: &Connection,
-    actor_id: ActorId,
-) -> rusqlite::Result<Option<Timestamp>> {
-    let ts = conn
-        .prepare_cached("SELECT last_cleared_ts FROM __corro_sync_state WHERE actor_id = ?")?
-        .query_row([actor_id], |row| row.get(0))
-        .optional()?;
-    Ok(ts)
 }
 
 #[derive(Debug)]
@@ -1707,68 +1664,6 @@ impl Bookie {
     pub fn registry(&self) -> &LockRegistry {
         self.0.registry()
     }
-}
-
-/// Prune the database
-pub fn find_overwritten_versions(
-    conn: &Connection,
-) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<CrsqlSiteVersion>>> {
-    debug!("find_overwritten_versions");
-
-    let mut prepped = conn.prepare_cached("
-        SELECT v.db_version, si.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
-            FROM __corro_versions_impacted AS v
-            INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
-            INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
-        ")?;
-
-    let mut rows = prepped.query([])?;
-
-    let mut all_versions: BTreeMap<ActorId, RangeInclusiveSet<CrsqlSiteVersion>> = BTreeMap::new();
-
-    loop {
-        let row = match rows.next()? {
-            Some(row) => row,
-            None => break,
-        };
-
-        let db_version: CrsqlDbVersion = row.get(0)?;
-        trace!("db version: {db_version}");
-
-        let actor_id = match row.get::<_, Option<ActorId>>(1)? {
-            Some(actor_id) => actor_id,
-            None => {
-                warn!("missing actor_id for an impacted version with db_version = {db_version}");
-                continue;
-            }
-        };
-        trace!("actor_id: {actor_id}");
-
-        let exists: bool = row.get(2)?;
-
-        debug!("exists? {exists}");
-
-        if !exists {
-            debug!("version is gone now");
-            let version = match row.get::<_, Option<CrsqlSiteVersion>>(3)? {
-                Some(version) => version,
-                None => {
-                    warn!("missing start_version for an impacted version: actor_id = {actor_id}, db_version = {db_version}");
-                    continue;
-                }
-            };
-
-            all_versions
-                .entry(actor_id)
-                .or_default()
-                .insert(version..=version);
-        }
-    }
-
-    conn.prepare_cached("DELETE FROM __corro_versions_impacted")?
-        .execute([])?;
-
-    Ok(all_versions)
 }
 
 #[cfg(test)]

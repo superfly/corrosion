@@ -84,7 +84,7 @@ where
                 ts,
                 snap,
             }) => {
-                trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
+                trace!("committed tx, version: {version}, db_version: {db_version}, last_seq: {last_seq:?}");
 
                 book_writer.commit_snapshot(snap);
 

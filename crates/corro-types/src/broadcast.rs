@@ -556,7 +556,7 @@ pub async fn broadcast_changes(
         // TODO: make this more generic so both sync and local changes can use it.
         let mut prepped = conn.prepare_cached(
             r#"
-                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version
                     FROM crsql_changes
                     WHERE db_version = ?
                     ORDER BY seq ASC

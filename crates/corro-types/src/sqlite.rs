@@ -42,6 +42,7 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
     init_cr_conn(&mut conn)?;
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
+    conn.trace(Some(|sql| trace!("{sql}")));
     Ok(CrConn(conn))
 }
 

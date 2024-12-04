@@ -24,7 +24,7 @@ use crate::{
 use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{get_last_cleared_ts, Agent, Bookie, SplitPool},
+    agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
     broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, FocaInput},
     channel::CorroReceiver,
@@ -36,7 +36,6 @@ use bytes::Bytes;
 use corro_types::agent::ChangeError;
 use corro_types::base::CrsqlSiteVersion;
 use corro_types::broadcast::Timestamp;
-use corro_types::change::store_empty_changeset;
 use foca::Notification;
 use indexmap::map::Entry;
 use indexmap::IndexMap;
@@ -289,26 +288,7 @@ pub async fn handle_notifications(
                         debug!("Member Added {actor:?}");
                         counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
 
-                        let last_cleared_ts = {
-                            match agent.pool().read().await {
-                                Ok(conn) => {
-                                    get_last_cleared_ts(&conn, actor.id()).unwrap_or_else(|e| {
-                                        error!("could not get last_empty_ts: {e}");
-                                        None
-                                    })
-                                }
-                                Err(e) => {
-                                    error!("could not get read conn: {e}");
-                                    None
-                                }
-                            }
-                        };
-
-                        let members_len = {
-                            let mut members = agent.members().write();
-                            members.update_last_empty(&actor.id(), last_cleared_ts);
-                            members.states.len() as u32
-                        };
+                        let members_len = { agent.members().read().states.len() as u32 };
 
                         // actually added a member
                         // notify of new cluster size
@@ -578,23 +558,7 @@ pub async fn handle_emptyset(
                 for (actor, changes) in &mut to_process {
                     while !changes.is_empty() {
                         let change = changes.pop_front().unwrap();
-                        if let Some(booked) = bookie
-                            .read("process_emptyset(check ts)",actor.as_simple())
-                            .await
-                            .get(actor)
-                        {
-                            let booked_read = booked
-                                .read("process_emptyset(booked writer, ts timestamp)", actor.as_simple())
-                                .await;
 
-                            if let Some(seen_ts) = booked_read.last_cleared_ts() {
-                                if seen_ts > change.1 {
-                                    warn!("skipping change because last cleared ts '{:?}' is greater than empty ts: {:?}",
-                                        seen_ts, change.1);
-                                    continue;
-                                }
-                            }
-                        }
                         match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await
                         {
                             Ok(()) => {}
@@ -657,10 +621,6 @@ pub async fn process_emptyset(
                     version: None,
                 })?;
 
-            for version in chunk {
-                store_empty_changeset(&tx, actor_id, version.clone(), *ts)?;
-            }
-
             snap.insert_db(&tx, RangeInclusiveSet::from_iter(chunk.iter().cloned()))
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
@@ -681,48 +641,6 @@ pub async fn process_emptyset(
             Ok::<_, ChangeError>(())
         })?;
     }
-
-    let mut conn = agent.pool().write_low().await?;
-    let booked = {
-        bookie
-            .write(
-                "process_emptyset(booked writer, updates timestamp)",
-                actor_id.as_simple(),
-            )
-            .await
-            .ensure(actor_id)
-    };
-
-    let mut booked_write = booked
-        .write(
-            "process_emptyset(booked writer, updates timestamp)",
-            actor_id.as_simple(),
-        )
-        .await;
-
-    let tx = conn
-        .immediate_transaction()
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
-        })?;
-
-    let mut snap = booked_write.snapshot();
-    snap.update_cleared_ts(&tx, *ts)
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
-        })?;
-
-    tx.commit().map_err(|source| ChangeError::Rusqlite {
-        source,
-        actor_id: None,
-        version: None,
-    })?;
-
-    booked_write.commit_snapshot(snap);
 
     Ok(())
 }
@@ -1022,19 +940,8 @@ pub async fn handle_sync(
         return Ok(());
     }
 
-    let mut last_cleared: HashMap<ActorId, Option<Timestamp>> = HashMap::new();
-
-    for (actor_id, _) in chosen.clone() {
-        let last_ts = match agent.members().read().states.get(&actor_id) {
-            Some(state) => state.last_empty_ts,
-            None => None,
-        };
-
-        last_cleared.insert(actor_id, last_ts);
-    }
-
     let start = Instant::now();
-    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state, last_cleared).await {
+    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state).await {
         Ok(n) => n,
         Err(e) => {
             error!("failed to execute parallel sync: {e:?}");

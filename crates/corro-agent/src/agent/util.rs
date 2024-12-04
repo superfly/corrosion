@@ -15,14 +15,10 @@ use crate::{
 };
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{
-        find_overwritten_versions, Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion,
-        PartialVersion,
-    },
+    agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
     api::TableName,
     base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
-    change::store_empty_changeset,
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
@@ -617,36 +613,8 @@ pub async fn process_fully_buffered_changes(
                     })?;
                 debug!("db version: {db_version}");
 
-                // tx.prepare_cached(
-                // "
-                // INSERT OR IGNORE INTO __corro_bookkeeping (actor_id, start_version, db_version, last_seq, ts)
-                //     VALUES (
-                //         :actor_id,
-                //         :version,
-                //         :db_version,
-                //         :last_seq,
-                //         :ts
-                //     );",
-                // ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
-                // .execute(named_params! {
-                //     ":actor_id": actor_id,
-                //     ":version": version,
-                //     ":db_version": db_version,
-                //     ":last_seq": last_seq,
-                //     ":ts": ts
-                // }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
-
-                // debug!(%actor_id, %version, "inserted bookkeeping row after buffered insert");
-
                 Some(db_version)
             } else {
-                store_empty_changeset(
-                    &tx,
-                    actor_id,
-                    version..=version,
-                    Timestamp::from(agent.clock().new_timestamp()),
-                )?;
-                debug!(%actor_id, %version, "inserted CLEARED bookkeeping row after buffered insert");
                 None
             };
 
@@ -658,44 +626,6 @@ pub async fn process_fully_buffered_changes(
                     version: Some(version),
                 })?;
 
-            let overwritten =
-                find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(actor_id),
-                    version: Some(version),
-                })?;
-
-            let mut last_cleared: Option<Timestamp> = None;
-            for (actor_id, versions_set) in overwritten {
-                if actor_id != agent.actor_id() {
-                    warn!("clearing empties for another actor: {actor_id}")
-                }
-                for versions in versions_set {
-                    let ts = Timestamp::from(agent.clock().new_timestamp());
-                    let inserted = store_empty_changeset(&tx, actor_id, versions, ts)?;
-                    if inserted > 0 {
-                        last_cleared = Some(ts);
-                    }
-                }
-            }
-
-            let mut agent_booked = {
-                agent
-                    .booked()
-                    .blocking_write::<&str, _>("process_fully_buffered_changes(get snapshot)", None)
-            };
-
-            let mut agent_snap = agent_booked.snapshot();
-            if let Some(ts) = last_cleared {
-                agent_snap
-                    .update_cleared_ts(&tx, ts)
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: Some(actor_id),
-                        version: Some(version),
-                    })?;
-            }
-
             tx.commit().map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),
@@ -703,7 +633,6 @@ pub async fn process_fully_buffered_changes(
             })?;
 
             bookedw.commit_snapshot(snap);
-            agent_booked.commit_snapshot(agent_snap);
 
             Ok::<_, ChangeError>(db_version)
         })
@@ -733,6 +662,7 @@ pub async fn process_multiple_changes(
     let start = Instant::now();
     counter!("corro.agent.changes.processing.started").increment(changes.len() as u64);
     debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _, _)| cmp::max(change.len(), 1)).sum::<usize>());
+    trace!(self_actor_id = %agent.actor_id(), "changes: {changes:?}");
 
     let mut seen = HashSet::new();
     let mut unknown_changes: BTreeMap<_, Vec<_>> = BTreeMap::new();
@@ -884,37 +814,7 @@ pub async fn process_multiple_changes(
             let mut all_versions = RangeInclusiveSet::new();
 
             for (versions, ts, known) in knowns.iter() {
-                match known {
-                    KnownDbVersion::Partial { .. } => {}
-                    KnownDbVersion::Current(CurrentVersion {
-                        db_version,
-                        last_seq,
-                        ts,
-                    }) => {
-                        count += 1;
-                        // let version = versions.start();
-                        // debug!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
-                        // tx.prepare_cached("
-                        //     INSERT OR IGNORE INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  last_seq,  ts)
-                        //                             VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?
-                        //     .execute(named_params!{
-                        //         ":actor_id": actor_id,
-                        //         ":start_version": *version,
-                        //         ":db_version": *db_version,
-                        //         ":last_seq": *last_seq,
-                        //         ":ts": *ts
-                        //     }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?;
-                    }
-                    KnownDbVersion::Cleared => {
-                        debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
-                        let ts = ts.unwrap_or(Timestamp::from(agent.clock().new_timestamp()));
-                        store_empty_changeset(&tx, *actor_id, versions.clone(), ts)?;
-                    }
-                }
-
                 all_versions.insert(versions.clone());
-
-                debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserted bookkeeping row");
             }
 
             let booked = {
@@ -950,60 +850,11 @@ pub async fn process_multiple_changes(
 
         debug!("inserted {count} new changesets");
 
-        let overwritten =
-            find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: None,
-                version: None,
-            })?;
-
-        let mut last_cleared: Option<Timestamp> = None;
-        for (actor_id, versions_set) in overwritten {
-            if actor_id != agent.actor_id() {
-                warn!("clearing and setting timestamp for empties from a different node");
-            }
-            for versions in versions_set {
-                let ts = Timestamp::from(agent.clock().new_timestamp());
-                let inserted = store_empty_changeset(&tx, actor_id, versions, ts)?;
-                if inserted > 0 {
-                    last_cleared = Some(ts);
-                }
-            }
-        }
-
-        if let Some(ts) = last_cleared {
-            let mut snap = {
-                agent
-                    .booked()
-                    .blocking_write::<&str, _>(
-                        "process_multiple_changes(update_cleared_ts snapshot)",
-                        None,
-                    )
-                    .snapshot()
-            };
-
-            snap.update_cleared_ts(&tx, ts)
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: None,
-                    version: None,
-                })?;
-
-            std::mem::forget(snap);
-        }
-
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: None,
             version: None,
         })?;
-
-        if let Some(ts) = last_cleared {
-            let mut booked_writer = agent
-                .booked()
-                .blocking_write::<&str, _>("process_multiple_changes(update_cleared_ts)", None);
-            booked_writer.update_cleared_ts(ts);
-        }
 
         for (_, changeset, _, _) in changesets.iter() {
             if let Some(ts) = changeset.ts() {
