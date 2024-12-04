@@ -973,7 +973,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
         let pk = pack_columns(&[i.into()])?;
         let crsql_dbv = conn
             .prepare_cached(
-                r#"SELECT site_version, db_version from crsql_changes where "table" = "tests" and pk = ?"#,
+                r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ?"#,
             )?
             .query_row([pk], |row| row.get::<_, CrsqlDbVersion>(0))?;
 

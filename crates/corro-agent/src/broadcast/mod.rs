@@ -892,10 +892,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_broadcast_order() -> eyre::Result<()> {
-        tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .init();
+        _ = tracing_subscriber::fmt().try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
         let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
