@@ -20,7 +20,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, Connection, Transaction};
+use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
@@ -1364,8 +1364,9 @@ impl BookedVersions {
         // fetch the biggest version we know, a partial version might override
         // this below
         bv.max = conn
-            .prepare_cached("SELECT MAX(site_version) FROM crsql_changes WHERE site_id = ?")?
-            .query_row([actor_id], |row| row.get(0))?;
+            .prepare_cached("SELECT version FROM crsql_site_versions WHERE site_id = ?")?
+            .query_row([actor_id], |row| row.get(0))
+            .optional()?;
 
         {
             // fetch known partial sequences
