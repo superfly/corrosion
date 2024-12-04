@@ -258,18 +258,9 @@ pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result
         Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_ts_index_bookkeeping_table),
         Box::new(create_sync_state(clock)),
-        Box::new(include_site_version),
     ];
 
     crate::sqlite::migrate(conn, migrations)
-}
-
-fn include_site_version(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        "
-        ALTER TABLE __corro_buffered_changes ADD COLUMN site_version INTEGER NOT NULL DEFAULT 0;
-    ",
-    )
 }
 
 fn create_impacted_versions(tx: &Transaction) -> rusqlite::Result<()> {

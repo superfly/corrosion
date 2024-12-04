@@ -570,7 +570,7 @@ pub async fn process_fully_buffered_changes(
             .prepare_cached(
                 r#"
                 INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
-                    SELECT                 "table", pk, cid, val, col_version, ? as db_version, site_id, cl, seq, site_version
+                    SELECT                 "table", pk, cid, val, col_version, ? as db_version, site_id, cl, seq, version
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
                               AND version = ?

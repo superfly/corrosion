@@ -342,7 +342,11 @@ impl Timestamp {
     }
 
     pub fn zero() -> Self {
-        Timestamp(NTP64(0))
+        Timestamp::from(0u64)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0 .0 == 0
     }
 }
 
