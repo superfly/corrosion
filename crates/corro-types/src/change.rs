@@ -1,13 +1,11 @@
-use std::{iter::Peekable, ops::RangeInclusive, time::Instant};
+use std::{iter::Peekable, ops::RangeInclusive};
 
 pub use corro_api_types::{row_to_change, Change, SqliteValue};
 use corro_base_types::{CrsqlDbVersion, CrsqlSiteVersion};
-use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, params, Connection, OptionalExtension};
-use tracing::{debug, trace, warn};
+use rusqlite::{Connection, OptionalExtension};
+use tracing::trace;
 
 use crate::{
-    actor::ActorId,
     agent::{Agent, BookedVersions, ChangeError, VersionsSnapshot},
     base::CrsqlSeq,
     broadcast::Timestamp,

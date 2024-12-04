@@ -1,19 +1,16 @@
-use std::{
-    fmt::Display,
-    time::{Duration, Instant},
-};
+use std::{fmt::Display, time::Duration};
 
 use camino::Utf8PathBuf;
 use corro_types::{
     actor::{ActorId, ClusterId},
-    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
+    agent::{Agent, Bookie, LockKind, LockMeta, LockState},
     base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
-    broadcast::{FocaCmd, FocaInput, Timestamp},
+    broadcast::{FocaCmd, FocaInput},
     sqlite::SqlitePoolError,
     sync::generate_sync,
 };
 use futures::{SinkExt, TryStreamExt};
-use rusqlite::{named_params, params, OptionalExtension};
+use rusqlite::{named_params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spawn::spawn_counted;
@@ -384,13 +381,13 @@ async fn handle_conn(
                                 },
                                 None => {
                                     match agent.pool().read().await {
-                                        Ok(conn) => match conn.prepare_cached("SELECT db_version, last_seq, ts FROM __corro_bookkeeping WHERE actor_id = :actor_id AND start_version = :version") {
-                                            Ok(mut prepped) => match prepped.query_row(named_params! {":actor_id": actor_id, ":version": version}, |row| Ok((row.get::<_, Option<CrsqlDbVersion>>(0)?, row.get::<_, Option<CrsqlSeq>>(1)?, row.get::<_, Option<Timestamp>>(2)?))).optional() {
-                                                Ok(Some((Some(db_version), Some(last_seq), Some(ts)))) => {
-                                                    Ok(serde_json::json!({"current": {"db_version": db_version, "last_seq": last_seq, "ts": ts}}))
+                                        Ok(conn) => match conn.prepare_cached("SELECT db_version, MAX(seq) AS last_seq FROM crsql_changes WHERE site_id = :actor_id AND site_version = :version GROUP BY db_version") {
+                                            Ok(mut prepped) => match prepped.query_row(named_params! {":actor_id": actor_id, ":version": version}, |row| Ok((row.get::<_, Option<CrsqlDbVersion>>(0)?, row.get::<_, Option<CrsqlSeq>>(1)?))).optional() {
+                                                Ok(Some((Some(db_version), Some(last_seq)))) => {
+                                                    Ok(serde_json::json!({"current": {"db_version": db_version, "last_seq": last_seq}}))
                                                 },
                                                 Ok(_) => {
-                                                    Ok(serde_json::Value::String("cleared".into()))
+                                                    Ok(serde_json::Value::String("cleared or unkown".into()))
                                                 }
                                                 Err(e) => {
                                                     Err(e)

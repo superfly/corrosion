@@ -533,15 +533,15 @@ pub async fn process_fully_buffered_changes(
         debug!(%actor_id, %version, "acquired Booked write lock to process fully buffered changes");
 
         block_in_place(|| {
-            let (last_seq, ts) = {
+            let last_seq = {
                 match bookedw.partials.get(&version) {
-                    Some(PartialVersion { seqs, last_seq, ts }) => {
+                    Some(PartialVersion { seqs, last_seq, .. }) => {
                         if seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).count() != 0 {
                             error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
                             // TODO: return an error here
                             return Ok(None);
                         }
-                        (*last_seq, *ts)
+                        *last_seq
                     }
                     None => {
                         warn!(%actor_id, %version, "version not found in cache, returning");
@@ -800,9 +800,6 @@ pub async fn process_multiple_changes(
                     .or_default()
                     .push((versions, ts, known));
             }
-            // if knowns.contains_key(&actor_id) {
-            //     writers.insert(actor_id, booked_write);
-            // }
         }
 
         let mut count = 0;
@@ -813,8 +810,9 @@ pub async fn process_multiple_changes(
 
             let mut all_versions = RangeInclusiveSet::new();
 
-            for (versions, ts, known) in knowns.iter() {
+            for (versions, _, _) in knowns.iter() {
                 all_versions.insert(versions.clone());
+                count += 1;
             }
 
             let booked = {

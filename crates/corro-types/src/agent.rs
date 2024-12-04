@@ -20,7 +20,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
+use rusqlite::{named_params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,

@@ -516,7 +516,7 @@ pub async fn handle_emptyset(
     mut rx_emptysets: CorroReceiver<ChangeV1>,
     mut tripwire: Tripwire,
 ) {
-    type EmptyQueue = VecDeque<(Vec<RangeInclusive<CrsqlSiteVersion>>, Timestamp)>;
+    type EmptyQueue = VecDeque<Vec<RangeInclusive<CrsqlSiteVersion>>>;
     let mut buf: HashMap<ActorId, EmptyQueue> = HashMap::new();
 
     let mut join_set: JoinSet<HashMap<ActorId, EmptyQueue>> = JoinSet::new();
@@ -537,8 +537,8 @@ pub async fn handle_emptyset(
             },
             maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
                 Some(change) => {
-                    if let Changeset::EmptySet { versions, ts } = change.changeset {
-                        buf.entry(change.actor_id).or_default().push_back((versions.clone(), ts));
+                    if let Changeset::EmptySet { versions, .. } = change.changeset {
+                        buf.entry(change.actor_id).or_default().push_back(versions);
                     } else {
                         warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
                     }
@@ -583,10 +583,8 @@ pub async fn process_emptyset(
     agent: Agent,
     bookie: Bookie,
     actor_id: ActorId,
-    changes: &(Vec<RangeInclusive<CrsqlSiteVersion>>, Timestamp),
+    versions: &[RangeInclusive<CrsqlSiteVersion>],
 ) -> Result<(), ChangeError> {
-    let (versions, ts) = changes;
-
     let version_iter = versions.chunks(100);
 
     for chunk in version_iter {

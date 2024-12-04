@@ -23,7 +23,7 @@ use futures::{Future, Stream, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
-use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
+use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection};
 use speedy::Writable;
 use std::string::String;
@@ -349,7 +349,6 @@ const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
 #[allow(clippy::too_many_arguments)]
 fn handle_need(
     conn: &mut Connection,
-    agent: &Agent,
     actor_id: ActorId,
     need: SyncNeedV1,
     sender: &Sender<SyncMessage>,
@@ -371,52 +370,6 @@ fn handle_need(
             ORDER BY site_version DESC, seq ASC
     ",
     )?;
-
-    // let mut prepped = tx.prepare_cached(
-    //     "
-    //     SELECT start_version, end_version, last_seq, ts
-    //         FROM __corro_bookkeeping
-    //         WHERE
-    //             actor_id = :actor_id
-    //             AND
-    //             start_version >= COALESCE((
-    //                 -- try to find the previous range
-    //                 SELECT start_version
-    //                     FROM __corro_bookkeeping
-    //                     WHERE
-    //                         actor_id = :actor_id AND
-    //                         start_version < :start -- AND end_version IS NOT NULL
-    //                     ORDER BY start_version DESC
-    //                     LIMIT 1
-    //             ), 1)
-    //             AND
-    //             start_version <= COALESCE((
-    //                 -- try to find the next range
-    //                 SELECT start_version
-    //                     FROM __corro_bookkeeping
-    //                     WHERE
-    //                         actor_id = :actor_id AND
-    //                         start_version > :end -- AND end_version IS NOT NULL
-    //                     ORDER BY start_version ASC
-    //                     LIMIT 1
-    //             ), :end + 1)
-    //             AND
-    //             (
-    //                 -- [:start]---[start_version]---[:end]
-    //                 ( start_version BETWEEN :start AND :end ) OR
-
-    //                 -- [start_version]---[:start]---[:end]---[end_version]
-    //                 ( start_version <= :start AND end_version >= :end ) OR
-
-    //                 -- [:start]---[start_version]---[:end]---[end_version]
-    //                 ( start_version <= :end AND end_version >= :end ) OR
-
-    //                 -- [:start]---[end_version]---[:end]
-    //                 ( end_version BETWEEN :start AND :end )
-    //             )
-    //         ORDER BY start_version DESC
-    //         ",
-    // )?;
 
     match need {
         SyncNeedV1::Full { versions } => {
@@ -728,51 +681,6 @@ fn handle_need(
         }
         SyncNeedV1::Empty { .. } => {
             // NOTE: no more empties in the new reality
-
-            // if last_cleared_ts.is_none() {
-            //     return Ok(());
-            // }
-            // debug!("processing empty versions to {actor_id} with ts: {:?}", ts);
-            // let ts = ts.unwrap_or(Default::default());
-            // let mut stmt = tx.prepare_cached(
-            //     "
-            //     SELECT start_version, end_version, ts FROM __corro_bookkeeping
-            //         WHERE actor_id = crsql_site_id() AND end_version IS NOT NULL AND ts > ?
-            //         ORDER BY ts",
-            // )?;
-            // let rows = stmt
-            //     .query_map([ts], |row| {
-            //         Ok((
-            //             CrsqlSiteVersion(row.get(0)?)..=CrsqlSiteVersion(row.get(1)?),
-            //             row.get(2)?,
-            //         ))
-            //     })?
-            //     .collect::<rusqlite::Result<Vec<(RangeInclusive<CrsqlSiteVersion>, Timestamp)>>>()?
-            //     .iter()
-            //     .fold(HashMap::new(), |mut acc, item| {
-            //         acc.entry(item.1)
-            //             .and_modify(|arr: &mut Vec<RangeInclusive<CrsqlSiteVersion>>| {
-            //                 arr.push(item.clone().0)
-            //             })
-            //             .or_insert(vec![item.clone().0]);
-            //         acc
-            //     });
-
-            // let mut rows = Vec::from_iter(rows.iter());
-            // rows.sort_by(|a, b| a.0.cmp(b.0));
-            // let mut count = 0;
-            // for (ts, versions) in rows {
-            //     sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-            //         actor_id: agent.actor_id(),
-            //         changeset: Changeset::EmptySet {
-            //             versions: versions.clone(),
-            //             ts: *ts,
-            //         },
-            //     })))?;
-            //     count += versions.len();
-            // }
-
-            // debug!("sent {count} empty versions during sync!");
         }
     }
 
@@ -851,7 +759,6 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
 }
 
 async fn process_sync(
-    agent: Agent,
     pool: SplitPool,
     bookie: Bookie,
     sender: Sender<SyncMessage>,
@@ -934,13 +841,10 @@ async fn process_sync(
                         let pool = pool.clone();
                         let sender = sender.clone();
 
-                        let agent = agent.clone();
                         let fut = Box::pin(async move {
                             let mut conn = pool.read().await?;
 
-                            block_in_place(|| {
-                                handle_need(&mut conn, &agent, actor_id, need, &sender)
-                            })?;
+                            block_in_place(|| handle_need(&mut conn, actor_id, need, &sender))?;
 
                             Ok(())
                         });
@@ -1148,7 +1052,7 @@ pub async fn parallel_sync(
 
                     counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string()).increment(1);
 
-                    let mut needs = our_sync_state.compute_available_needs(&their_sync_state);
+                    let needs = our_sync_state.compute_available_needs(&their_sync_state);
 
                     trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
 
@@ -1460,7 +1364,7 @@ pub async fn parallel_sync(
     for res in counts.iter() {
         match res {
             Err(e) => error!("could not properly recv from peer: {e}"),
-            Ok((actor_id, _, last_empty_ts)) => {
+            Ok((actor_id, _, _)) => {
                 members.update_sync_ts(actor_id, ts);
             }
         };
@@ -1588,15 +1492,9 @@ pub async fn serve_sync(
     let (tx, mut rx) = mpsc::channel::<SyncMessage>(256);
 
     tokio::spawn(
-        process_sync(
-            agent.clone(),
-            agent.pool().clone(),
-            bookie.clone(),
-            tx,
-            rx_need,
-        )
-        .instrument(info_span!("process_sync"))
-        .inspect_err(|e| error!("could not process sync request: {e}")),
+        process_sync(agent.pool().clone(), bookie.clone(), tx, rx_need)
+            .instrument(info_span!("process_sync"))
+            .inspect_err(|e| error!("could not process sync request: {e}")),
     );
 
     let (send_res, recv_res) = tokio::join!(
@@ -1931,7 +1829,6 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
-                    &agent,
                     actor_id,
                     SyncNeedV1::Full {
                         versions: CrsqlSiteVersion(1)..=CrsqlSiteVersion(1),
@@ -1959,7 +1856,6 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
-                    &agent,
                     actor_id,
                     SyncNeedV1::Partial {
                         version: CrsqlSiteVersion(2),
@@ -2039,7 +1935,6 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
-                    &agent,
                     actor_id,
                     SyncNeedV1::Partial {
                         version: CrsqlSiteVersion(1),
@@ -2074,7 +1969,6 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
-                    &agent,
                     actor_id,
                     SyncNeedV1::Full {
                         versions: CrsqlSiteVersion(1)..=CrsqlSiteVersion(6),
@@ -2244,7 +2138,6 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
-                    &agent.clone(),
                     actor_id,
                     SyncNeedV1::Full {
                         versions: CrsqlSiteVersion(1)..=CrsqlSiteVersion(1000),
@@ -2323,7 +2216,6 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
-                    &agent.clone(),
                     actor_id,
                     SyncNeedV1::Partial {
                         version: CrsqlSiteVersion(5),
@@ -2360,7 +2252,6 @@ mod tests {
             block_in_place(|| {
                 handle_need(
                     &mut conn,
-                    &agent,
                     actor_id,
                     SyncNeedV1::Partial {
                         version: CrsqlSiteVersion(5),
