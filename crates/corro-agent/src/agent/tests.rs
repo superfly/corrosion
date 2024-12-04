@@ -522,7 +522,8 @@ pub async fn configurable_stress_test(
                 let conn = ta.agent.pool().read().await?;
                 let mut per_actor: BTreeMap<ActorId, RangeInclusiveSet<CrsqlSiteVersion>> =
                     BTreeMap::new();
-                let mut prepped = conn.prepare("SELECT actor_id, start_version, coalesce(end_version, start_version) FROM __corro_bookkeeping;")?;
+                let mut prepped =
+                    conn.prepare("SELECT DISTINCT site_id, site_version FROM crsql_changes;")?;
                 let mut rows = prepped.query(())?;
 
                 while let Ok(Some(row)) = rows.next() {
@@ -972,12 +973,17 @@ async fn process_failed_changes() -> eyre::Result<()> {
         let pk = pack_columns(&[i.into()])?;
         let crsql_dbv = conn
             .prepare_cached(
-                r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ?"#,
+                r#"SELECT site_version, db_version from crsql_changes where "table" = "tests" and pk = ?"#,
             )?
             .query_row([pk], |row| row.get::<_, CrsqlDbVersion>(0))?;
 
-        let booked_dbv = conn.prepare_cached("SELECT db_version from __corro_bookkeeping where start_version = ? and actor_id = ?")?
-            .query_row((i, ta2.agent.actor_id()), |row| row.get::<_, CrsqlDbVersion>(0))?;
+        let booked_dbv = conn
+            .prepare_cached(
+                "SELECT db_version from crsql_changes where site_version = ? and site_id = ?",
+            )?
+            .query_row((i, ta2.agent.actor_id()), |row| {
+                row.get::<_, CrsqlDbVersion>(0)
+            })?;
 
         assert_eq!(crsql_dbv, booked_dbv);
 
@@ -1199,15 +1205,6 @@ async fn check_bookie_versions(
 
     for versions in complete {
         for version in versions.clone() {
-            let bk: Vec<(ActorId, CrsqlSiteVersion, Option<CrsqlSiteVersion>)> = conn
-                .prepare(
-                    "SELECT actor_id, start_version, end_version FROM __corro_bookkeeping where start_version = ?",
-                )?
-                .query_map([version], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?.collect::<rusqlite::Result<Vec<_>>>()?;
-            assert_eq!(bk, vec![(actor_id, version, None)]);
-
             // should not be in gaps
             assert!(!conn.prepare_cached(
                 "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping_gaps WHERE actor_id = ? and ? between start and end)")?
@@ -1260,9 +1257,11 @@ async fn check_bookie_versions(
     }
 
     for versions in cleared {
-        assert!(conn.prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping WHERE actor_id = ? and start_version = ? and end_version = ?)")?
-            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?, "Versions {versions:?} not cleared in corro bookkeeping table");
+        for version in versions {
+            assert!(!conn.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM crsql_changes WHERE site_id = ? and site_version = ?)")?
+            .query_row((actor_id, version), |row| row.get(0))?, "Version {version} not cleared in crsql_changes table");
+        }
     }
 
     Ok(())

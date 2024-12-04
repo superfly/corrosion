@@ -683,6 +683,10 @@ impl SplitPool {
         Handle::current().block_on(self.0.read.get())
     }
 
+    pub fn drain_read(&self) {
+        self.0.read.retain(|_, _| false);
+    }
+
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn dedicated(&self) -> rusqlite::Result<Connection> {
         let conn = rusqlite::Connection::open(&self.0.path)?;

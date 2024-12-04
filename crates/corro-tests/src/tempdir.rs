@@ -20,6 +20,9 @@ impl Deref for TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         if env::var_os("NO_TEMPDIR_CLEANUP").is_some() {
+            if let Some(dir) = &self.0 {
+                println!("Not cleaning up temp dir {}", dir.path().display());
+            }
             mem::forget(self.0.take())
         }
     }

@@ -569,8 +569,8 @@ pub async fn process_fully_buffered_changes(
                 let count = tx
             .prepare_cached(
                 r#"
-                INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
-                    SELECT                 "table", pk, cid, val, col_version, ? as db_version, site_id, cl, seq
+                INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
+                    SELECT                 "table", pk, cid, val, col_version, ? as db_version, site_id, cl, seq, site_version
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
                               AND version = ?
@@ -1099,9 +1099,9 @@ pub fn process_complete_version(
         sp.prepare_cached(
             r#"
                 INSERT INTO crsql_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
                 VALUES
-                    (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?)
+                    (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?,   ?)
             "#,
         )?
         .execute(params![
@@ -1115,6 +1115,7 @@ pub fn process_complete_version(
             change.cl,
             // increment the seq by the start_seq or else we'll have multiple change rows with the same seq
             change.seq,
+            change.site_version,
         ])?;
         let rows_impacted: i64 = sp
             .prepare_cached("SELECT crsql_rows_impacted()")?

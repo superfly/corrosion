@@ -93,3 +93,11 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
         config: conf,
     })
 }
+
+impl Drop for TestAgent {
+    fn drop(&mut self) {
+        if std::env::var_os("NO_TEMPDIR_CLEANUP").is_some() {
+            println!("Dropping test agent {}", self.agent.actor_id());
+        }
+    }
+}

@@ -73,6 +73,22 @@ where
             version: insert_info.as_ref().map(|info| info.version),
         })?;
 
+        let count: i64 = conn
+            .prepare("SELECT COUNT(*) FROM crsql_changes;")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: insert_info.as_ref().map(|info| info.version),
+            })?
+            .query_row([], |row| row.get(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: insert_info.as_ref().map(|info| info.version),
+            })?;
+
+        println!("local: CRSQL CHANGES COUNT: {count}");
+
         let elapsed = start.elapsed();
 
         match insert_info {
@@ -475,6 +491,9 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
         }
 
         tx.commit()?;
+
+        // drain the pool of RO connections because they might not get the new tables in cr-sqlite!
+        agent.pool().drain_read();
 
         Ok::<_, eyre::Report>(())
     })?;
