@@ -3562,7 +3562,10 @@ mod tests {
             let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
             println!("updated_at: {updated_at:?}");
 
-            assert_eq!(now, updated_at.and_utc());
+            assert_eq!(
+                now.timestamp_micros(),
+                updated_at.and_utc().timestamp_micros()
+            );
 
             let future: DateTime<Utc> = Utc::now() + Duration::from_secs(1);
             println!("NOW: {future:?}");
@@ -3578,7 +3581,10 @@ mod tests {
             let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
             println!("updated_at: {updated_at:?}");
 
-            assert_eq!(future, updated_at.and_utc());
+            assert_eq!(
+                future.timestamp_micros(),
+                updated_at.and_utc().timestamp_micros()
+            );
 
             let row = client
                 .query_one(
