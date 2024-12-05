@@ -361,7 +361,9 @@ pub fn apply_schema(
                 schema_to_merge.tables.insert(name.clone(), parsed_table);
             }
 
+            debug!("selecting crsql_as_crr");
             tx.execute_batch(&format!("SELECT crsql_as_crr('{name}'); CREATE INDEX IF NOT EXISTS corro_{name}__crsql_clock_site_id_dbv ON {name}__crsql_clock (site_id, db_version);"))?;
+            debug!("done selecting as crr");
 
             if schema_to_merge.tables.contains_key(name) {
                 // just merged!

@@ -906,7 +906,7 @@ pub async fn handle_sync(
 
         debug!("found {} candidates to synchronize with", candidates.len());
 
-        let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
+        let desired_count = (candidates.len() / 100).clamp(3, 10);
         debug!("Selected {desired_count} nodes to sync with");
 
         let mut rng = StdRng::from_entropy();

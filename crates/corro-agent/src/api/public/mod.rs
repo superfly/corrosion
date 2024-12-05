@@ -462,7 +462,9 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
     new_schema.constrain()?;
 
-    block_in_place(|| {
+    // conn.trace(Some(|sql| debug!(sql)));
+
+    let apply_res = block_in_place(|| {
         let tx = conn.immediate_transaction()?;
 
         apply_schema(&tx, &schema_write, &mut new_schema)?;
@@ -480,7 +482,11 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
         agent.pool().drain_read();
 
         Ok::<_, eyre::Report>(())
-    })?;
+    });
+
+    // conn.trace(None);
+
+    apply_res?;
 
     *schema_write = new_schema;
 

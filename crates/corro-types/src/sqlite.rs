@@ -1,13 +1,13 @@
 use std::{
     ops::{Deref, DerefMut},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use once_cell::sync::Lazy;
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, trace::TraceEventCodes, Connection, Transaction};
 use sqlite_pool::SqliteConn;
 use tempfile::TempDir;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 pub type SqlitePool = sqlite_pool::Pool<CrConn>;
 pub type SqlitePoolError = sqlite_pool::PoolError;
@@ -42,7 +42,19 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
     init_cr_conn(&mut conn)?;
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
-    conn.trace(Some(|sql| trace!("{sql}")));
+
+    const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(|event| {
+            if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = event {
+                if duration >= SLOW_THRESHOLD {
+                    warn!("SLOW query {duration:?} => {}", stmt_ref.sql());
+                }
+            }
+        }),
+    );
+
     Ok(CrConn(conn))
 }
 
