@@ -1316,18 +1316,6 @@ pub async fn start(
                                                             prepped.raw_bind_parameter(idx, dt)?;
                                                         }
 
-                                                        // t @ &Type::TIMESTAMP => {
-                                                        //     let value: time::OffsetDateTime =
-                                                        //         from_type_and_format(
-                                                        //             t,
-                                                        //             b,
-                                                        //             format_code,
-                                                        //         )?;
-
-                                                        //     trace!("binding idx {idx} w/ value: {value}");
-                                                        //     prepped
-                                                        //         .raw_bind_parameter(idx, value)?;
-                                                        // }
                                                         t => {
                                                             warn!("unsupported type: {t:?}");
                                                             back_tx.blocking_send(
@@ -3310,38 +3298,36 @@ mod tests {
             println!("t2text: {:?}", row.try_get::<_, String>(2));
 
             let now: DateTime<Utc> = Utc::now();
-            let now = DateTime::<Utc>::from_timestamp_micros(now.timestamp_micros()).unwrap();
             println!("NOW: {now:?}");
 
             let row = client
                 .query_one(
                     "INSERT INTO kitchensink (other_ts, id, updated_at) VALUES (?1, ?2, ?1) RETURNING updated_at",
-                    &[&now, &1i64],
+                    &[&now.naive_utc(), &1i64],
                 )
                 .await?;
 
             println!("ROW: {row:?}");
-            let updated_at = row.try_get::<_, DateTime<Utc>>(0)?;
+            let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
             println!("updated_at: {updated_at:?}");
 
-            assert_eq!(now, updated_at);
+            assert_eq!(now, updated_at.and_utc());
 
             let future: DateTime<Utc> = Utc::now() + Duration::from_secs(1);
-            let future = DateTime::<Utc>::from_timestamp_micros(future.timestamp_micros()).unwrap();
             println!("NOW: {future:?}");
 
             let row = client
                 .query_one(
                     "UPDATE kitchensink SET other_ts = $ts, updated_at = $ts WHERE id = $id AND updated_at > ? RETURNING updated_at",
-                    &[&future, &1i64, &(now - Duration::from_secs(1))],
+                    &[&future.naive_utc(), &1i64, &(now - Duration::from_secs(1)).naive_utc()],
                 )
                 .await?;
 
             println!("ROW: {row:?}");
-            let updated_at = row.try_get::<_, DateTime<Utc>>(0)?;
+            let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
             println!("updated_at: {updated_at:?}");
 
-            assert_eq!(future, updated_at);
+            assert_eq!(future, updated_at.and_utc());
 
             let row = client
                 .query_one(
