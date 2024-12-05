@@ -320,14 +320,16 @@ async fn handle_conn(
                 }
                 Command::Sync(SyncCommand::ReconcileGaps) => {
                     let actor_ids: Vec<_> = {
-                        let r = bookie.read("admin sync reconcile gaps").await;
+                        let r = bookie
+                            .read::<&str, _>("admin sync reconcile gaps", None)
+                            .await;
                         r.keys().copied().collect()
                     };
 
                     for actor_id in actor_ids {
                         {
                             let booked = bookie
-                                .read(format!("admin sync reconcile gaps get actor {actor_id}"))
+                                .read("admin sync reconcile gaps get actor", actor_id.as_simple())
                                 .await
                                 .get(&actor_id)
                                 .unwrap()
@@ -335,7 +337,7 @@ async fn handle_conn(
 
                             let mut conn = agent.pool().write_low().await.unwrap();
                             let mut bv = booked
-                                .write("admin sync reconcile gaps booked versions")
+                                .write::<&str, _>("admin sync reconcile gaps booked versions", None)
                                 .await;
 
                             if let Err(e) = collapse_gaps(&mut stream, &mut conn, &mut bv).await {
@@ -481,7 +483,7 @@ async fn handle_conn(
                 }
                 Command::Actor(ActorCommand::Version { actor_id, version }) => {
                     let json: Result<serde_json::Value, rusqlite::Error> = {
-                        let bookie = bookie.read("admin actor version").await;
+                        let bookie = bookie.read::<&str, _>("admin actor version", None).await;
                         let booked = match bookie.get(&actor_id) {
                             Some(booked) => booked,
                             None => {
@@ -490,7 +492,9 @@ async fn handle_conn(
                                 continue;
                             }
                         };
-                        let booked_read = booked.read("admin actor version booked").await;
+                        let booked_read = booked
+                            .read::<&str, _>("admin actor version booked", None)
+                            .await;
                         if booked_read.contains_version(&version) {
                             match booked_read.get_partial(&version) {
                                 Some(partial) => {

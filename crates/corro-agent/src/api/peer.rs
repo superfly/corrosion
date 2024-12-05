@@ -846,7 +846,7 @@ async fn process_sync(
     let last_ts = agent
         .clone()
         .booked()
-        .read("process_sync(read_cleared_ts))")
+        .read::<&str, _>("process_sync(read_cleared_ts))", None)
         .await
         .last_cleared_ts();
     loop {
@@ -882,7 +882,7 @@ async fn process_sync(
 
                 for (actor_id, needs) in agg {
                     let booked = bookie
-                        .read("process_sync get actor")
+                        .read::<&str, _>("process_sync get actor", None)
                         .await
                         .get(&actor_id)
                         .cloned();
@@ -890,7 +890,9 @@ async fn process_sync(
                         Some(b) => b,
                         None => continue,
                     };
-                    let booked_read = booked.read("process_sync check needs").await;
+                    let booked_read = booked
+                        .read::<&str, _>("process_sync check needs", None)
+                        .await;
 
                     for need in needs {
                         match &need {
@@ -1888,10 +1890,15 @@ mod tests {
         )
         .await?;
 
-        let booked = bookie.read("test").await.get(&actor_id).cloned().unwrap();
+        let booked = bookie
+            .read::<&str, _>("test", None)
+            .await
+            .get(&actor_id)
+            .cloned()
+            .unwrap();
 
         {
-            let read = booked.read("test").await;
+            let read = booked.read::<&str, _>("test", None).await;
 
             assert!(read.contains_version(&Version(1)));
             assert!(read.contains_version(&Version(2)));

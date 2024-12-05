@@ -247,7 +247,9 @@ pub enum ApplySchemaError {
     DropTableWithoutDestructiveFlag(String),
     #[error("won't remove column without the destructive flag set (table: '{0}', column: '{1}')")]
     RemoveColumnWithoutDestructiveFlag(String, String),
-    #[error("can't add a primary key (table: '{0}', column: '{1}')")]
+    #[error("won't change column without the destructive flag set (table: '{0}', column: '{1}')")]
+    ChangeColumnWithoutDestructiveFlag(String, String),
+    #[error("can't add a primary key (table: '{0}', columns: '{1}')")]
     AddPrimaryKey(String, String),
     #[error("can't modify primary keys (table: '{0}')")]
     ModifyPrimaryKeys(String),
@@ -447,6 +449,14 @@ pub fn apply_schema(
             changed_cols.keys().collect::<Vec<_>>()
         );
 
+        if !changed_cols.is_empty() {
+            // TODO: add destructive flag
+            return Err(ApplySchemaError::ChangeColumnWithoutDestructiveFlag(
+                table.name.clone(),
+                changed_cols.keys().cloned().collect::<Vec<_>>().join(","),
+            ));
+        }
+
         let new_col_names = new_table
             .columns
             .keys()
@@ -497,7 +507,7 @@ pub fn apply_schema(
                 }
 
                 if require_migration {
-                    tx.execute_batch(&format!("SELECT crsql_commit_alter('{name}');"))?;
+                    tx.execute_batch(&format!("SELECT crsql_commit_alter('main', '{name}', 1);"))?;
                 }
                 info!(
                     "Altering crsql for table {} took {:?}",
