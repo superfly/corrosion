@@ -100,27 +100,23 @@ impl<T> CorroSender<T> {
         self.inner
             .send(value)
             .await
-            .map(|r| {
+            .inspect(|_r| {
                 self.send_time.record(before.elapsed().as_secs_f64());
                 self.send_count.increment(1);
-                r
             })
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.failed_sends.increment(1);
-                e
             })
     }
 
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         self.inner
             .try_send(value)
-            .map(|r| {
+            .inspect(|_r| {
                 self.send_count.increment(1);
-                r
             })
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.failed_sends.increment(1);
-                e
             })
     }
 
@@ -128,14 +124,12 @@ impl<T> CorroSender<T> {
         let before = Instant::now();
         self.inner
             .blocking_send(value)
-            .map(|r| {
+            .inspect(|_r| {
                 self.send_time.record(before.elapsed().as_secs_f64());
                 self.send_count.increment(1);
-                r
             })
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.failed_sends.increment(1);
-                e
             })
     }
 
@@ -148,37 +142,32 @@ impl<T> CorroSender<T> {
         self.inner
             .send_timeout(value, timeout)
             .await
-            .map(|r| {
+            .inspect(|_r| {
                 self.send_time.record(before.elapsed().as_secs_f64());
                 self.send_count.increment(1);
-                r
             })
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.failed_sends.increment(1);
-                e
             })
     }
 }
 
 impl<T> CorroReceiver<T> {
     pub async fn recv(&mut self) -> Option<T> {
-        self.inner.recv().await.map(|r| {
+        self.inner.recv().await.inspect(|_r| {
             self.recv_count.increment(1);
-            r
         })
     }
 
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        self.inner.try_recv().map(|r| {
+        self.inner.try_recv().inspect(|_r| {
             self.recv_count.increment(1);
-            r
         })
     }
 
     pub fn blocking_recv(&mut self) -> Option<T> {
-        self.inner.blocking_recv().map(|r| {
+        self.inner.blocking_recv().inspect(|_r| {
             self.recv_count.increment(1);
-            r
         })
     }
 }

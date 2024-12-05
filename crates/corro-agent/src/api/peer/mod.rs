@@ -885,7 +885,7 @@ async fn process_sync(
 
     drop(job_tx);
 
-    buf.try_collect().await?;
+    let _: () = buf.try_collect().await?;
 
     debug!("done processing sync state");
 
@@ -1257,9 +1257,8 @@ pub async fn parallel_sync(
                                 version,
                                 seqs: new_seqs
                                     .into_iter()
-                                    .map(|seqs| {
+                                    .inspect(|seqs| {
                                         range.insert(seqs.clone());
-                                        seqs
                                     })
                                     .collect(),
                             }]

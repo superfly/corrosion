@@ -742,6 +742,7 @@ mod tests {
         let f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&filepath)
             .unwrap();
 
@@ -794,6 +795,7 @@ mod tests {
         let f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&filepath)
             .unwrap();
 
