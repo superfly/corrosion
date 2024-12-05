@@ -229,7 +229,7 @@ async fn update_hashes(
 
         let services = conn
             .prepare(
-                "SELECT id, name, tags, meta, port, address FROM consul_services WHERE node = ?",
+                "SELECT id, name, tags, meta, port, address FROM consul_services WHERE node = ? AND source IS NULL",
             )?
             .query_map([nodename], |row| {
                 let tag_json: String = row.get(2)?;
@@ -258,7 +258,7 @@ async fn update_hashes(
             .map_err(|e| eyre::eyre!("could not query consul_checks' table_info: {e}"))?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let checks = conn.prepare("SELECT id, name, status, output, service_id, service_name FROM consul_checks WHERE node = ?")?
+        let checks = conn.prepare("SELECT id, name, status, output, service_id, service_name FROM consul_checks WHERE node = ? AND source IS NULL")?
             .query_map([nodename], |row| {
                 Ok(AgentCheck{
                     id: row.get(0)?,
@@ -659,7 +659,7 @@ async fn execute(
     }
 
     // delete everything that's wrong in the DB! this is useful on restore from a backup...
-    statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND id NOT IN (SELECT id FROM __corro_consul_services)".into(), vec![node.into()]));
+    statements.push(Statement::WithParams("DELETE FROM consul_services WHERE node = ? AND source IS NULL AND id NOT IN (SELECT id FROM __corro_consul_services)".into(), vec![node.into()]));
 
     let mut check_to_upsert = vec![];
     let mut check_to_delete = vec![];
@@ -685,7 +685,7 @@ async fn execute(
     }
 
     // delete everything that's wrong in the DB! this is useful on restore from a backup...
-    statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND id NOT IN (SELECT id FROM __corro_consul_checks)".into(), vec![node.into()]));
+    statements.push(Statement::WithParams("DELETE FROM consul_checks WHERE node = ? AND source IS NULL AND id NOT IN (SELECT id FROM __corro_consul_checks)".into(), vec![node.into()]));
 
     if !statements.is_empty() {
         if let Some(e) = corrosion
@@ -756,6 +756,7 @@ mod tests {
                 address TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 app_id INTEGER AS (CAST(JSON_EXTRACT(meta, '$.app_id') AS INTEGER)),        
+                source TEXT,
 
                 PRIMARY KEY (node, id)
             );
@@ -769,6 +770,7 @@ mod tests {
                 status TEXT NOT NULL DEFAULT '',
                 output TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER NOT NULL DEFAULT 0,
+                source TEXT,
                 PRIMARY KEY (node, id)
             );
         ",
