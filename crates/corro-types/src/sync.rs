@@ -300,7 +300,7 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
     for (actor_id, booked) in actors {
         let bookedr = booked.read("generate_sync", actor_id.as_simple()).await;
 
-        let last_version = match { bookedr.last() } {
+        let last_version = match bookedr.last() {
             None => continue,
             Some(v) => v,
         };

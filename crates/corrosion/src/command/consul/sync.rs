@@ -480,7 +480,6 @@ enum ConsulCheckOp {
     Delete { id: String },
 }
 
-///
 fn update_services(
     mut services: HashMap<String, AgentService>,
     hashes: &HashMap<String, u64>,

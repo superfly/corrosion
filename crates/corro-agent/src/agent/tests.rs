@@ -1395,7 +1395,7 @@ async fn many_small_changes() -> eyre::Result<()> {
 
     let mut start_id = 0;
 
-    FuturesUnordered::from_iter(agents.iter().map(|ta| {
+    let _: () = FuturesUnordered::from_iter(agents.iter().map(|ta| {
         let ta = ta.clone();
         start_id += 100000;
         async move {
@@ -1413,7 +1413,7 @@ async fn many_small_changes() -> eyre::Result<()> {
                 let api_addr = ta.agent.api_addr();
                 let actor_id = ta.agent.actor_id();
 
-                FuturesUnordered::from_iter(durs.into_iter().map(|dur| {
+                let _: () = FuturesUnordered::from_iter(durs.into_iter().map(|dur| {
                     let client = client.clone();
                     start_id += 1;
                     async move {

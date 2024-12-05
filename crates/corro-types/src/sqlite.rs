@@ -227,7 +227,7 @@ mod tests {
             let pool = pool.clone();
             async move {
                 tokio::spawn(async move {
-                    FuturesUnordered::from_iter((0..per_worker).map(|_| {
+                    let _: () = FuturesUnordered::from_iter((0..per_worker).map(|_| {
                         let pool = pool.clone();
                         async move {
                             let conn = pool.get().await?;
@@ -250,7 +250,7 @@ mod tests {
             }
         }));
 
-        futs.try_collect().await?;
+        let _: () = futs.try_collect().await?;
 
         let conn = pool.get().await?;
 

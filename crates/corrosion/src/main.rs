@@ -505,6 +505,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(db_path)?;
 
             info!("Acquiring lock...");
