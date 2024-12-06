@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes, BytesMut};
-use corro_api_types::{ChangeId, QueryEvent, TypedQueryEvent};
+use corro_api_types::{ChangeId, QueryEvent, TypedNotifyEvent, TypedQueryEvent};
 use futures::{ready, Future, Stream};
 use hyper::{client::HttpConnector, Body};
 use pin_project_lite::pin_project;
@@ -304,6 +304,66 @@ where
         self.backoff_count += 1;
 
         Poll::Pending
+    }
+}
+
+pub struct UpdatesStream<T> {
+    id: Uuid,
+    stream: FramedBody,
+    _deser: std::marker::PhantomData<T>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UpdatesError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Deserialize(#[from] serde_json::Error),
+    #[error("max line length exceeded")]
+    MaxLineLengthExceeded,
+}
+
+impl<T> UpdatesStream<T>
+where
+    T: DeserializeOwned + Unpin,
+{
+    pub fn new(id: Uuid, body: hyper::Body) -> Self {
+        Self {
+            id,
+            stream: FramedRead::new(
+                StreamReader::new(IoBodyStream { body }),
+                LinesBytesCodec::default(),
+            ),
+            _deser: Default::default(),
+        }
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+}
+
+impl<T> Stream for UpdatesStream<T>
+where
+    T: DeserializeOwned + Unpin,
+{
+    type Item = Result<TypedNotifyEvent<T>, UpdatesError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let res = ready!(Pin::new(&mut self.stream).poll_next(cx));
+        match res {
+            Some(Ok(b)) => match serde_json::from_slice(&b) {
+                Ok(evt) => Poll::Ready(Some(Ok(evt))),
+                Err(e) => Poll::Ready(Some(Err(e.into()))),
+            },
+            Some(Err(e)) => match e {
+                LinesCodecError::MaxLineLengthExceeded => {
+                    Poll::Ready(Some(Err(UpdatesError::MaxLineLengthExceeded)))
+                }
+                LinesCodecError::Io(io_err) => Poll::Ready(Some(Err(io_err.into()))),
+            },
+            None => Poll::Ready(None),
+        }
     }
 }
 

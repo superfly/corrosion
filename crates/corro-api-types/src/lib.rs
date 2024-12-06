@@ -56,6 +56,16 @@ pub enum QueryEventMeta {
     EndOfQuery(Option<ChangeId>),
     Change(ChangeId),
     Error,
+    Notify,
+}
+
+pub type NotifyEvent = TypedNotifyEvent<Vec<SqliteValue>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedNotifyEvent<T> {
+    Notify(ChangeType, T),
+    Error(CompactString),
 }
 
 /// RowId newtype to differentiate from ChangeId

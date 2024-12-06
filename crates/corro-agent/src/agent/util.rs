@@ -10,6 +10,7 @@ use crate::{
     api::public::{
         api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
         pubsub::{api_v1_sub_by_id, api_v1_subs},
+        update::SharedUpdateBroadcastCache,
     },
     transport::Transport,
 };
@@ -26,6 +27,7 @@ use corro_types::{
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
+    updates::{match_changes, match_changes_from_db_version},
 };
 use std::{
     cmp,
@@ -37,6 +39,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::api::public::update::api_v1_updates;
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
@@ -169,6 +172,7 @@ pub async fn setup_http_api_handler(
     agent: &Agent,
     tripwire: &Tripwire,
     subs_bcast_cache: BcastCache,
+    updates_bcast_cache: SharedUpdateBroadcastCache,
     subs_manager: &SubsManager,
     api_listeners: Vec<TcpListener>,
 ) -> eyre::Result<()> {
@@ -206,6 +210,20 @@ pub async fn setup_http_api_handler(
         .route(
             "/v1/subscriptions",
             post(api_v1_subs).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(128)),
+            ),
+        )
+        .route(
+            "/v1/updates/:table",
+            post(api_v1_updates).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -265,6 +283,7 @@ pub async fn setup_http_api_handler(
                 .layer(Extension(Arc::new(AtomicI64::new(0))))
                 .layer(Extension(agent.clone()))
                 .layer(Extension(subs_bcast_cache))
+                .layer(Extension(updates_bcast_cache))
                 .layer(Extension(subs_manager.clone()))
                 .layer(Extension(tripwire.clone())),
         )
@@ -712,11 +731,16 @@ pub async fn process_fully_buffered_changes(
     if let Some(db_version) = db_version {
         let conn = agent.pool().read().await?;
         block_in_place(|| {
-            if let Err(e) = agent
-                .subs_manager()
-                .match_changes_from_db_version(&conn, db_version)
+            if let Err(e) = match_changes_from_db_version(agent.subs_manager(), &conn, db_version) {
+                error!(%db_version, "could not match changes for subs from db version: {e}");
+            }
+        });
+
+        block_in_place(|| {
+            if let Err(e) =
+                match_changes_from_db_version(agent.updates_manager(), &conn, db_version)
             {
-                error!(%db_version, "could not match changes from db version: {e}");
+                error!(%db_version, "could not match changes for updates from db version: {e}");
             }
         });
     }
@@ -1063,9 +1087,8 @@ pub async fn process_multiple_changes(
 
     for (_actor_id, changeset, db_version, _src) in changesets {
         change_chunk_size += changeset.changes().len();
-        agent
-            .subs_manager()
-            .match_changes(changeset.changes(), db_version);
+        match_changes(agent.subs_manager(), changeset.changes(), db_version);
+        match_changes(agent.updates_manager(), changeset.changes(), db_version);
     }
 
     histogram!("corro.agent.changes.processing.time.seconds").record(start.elapsed());

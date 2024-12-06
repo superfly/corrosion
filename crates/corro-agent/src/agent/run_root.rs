@@ -49,6 +49,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         rx_foca,
         subs_manager,
         subs_bcast_cache,
+        updates_bcast_cache,
         rtt_rx,
     } = opts;
 
@@ -96,6 +97,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         &agent,
         &tripwire,
         subs_bcast_cache,
+        updates_bcast_cache,
         &subs_manager,
         api_listeners,
     )

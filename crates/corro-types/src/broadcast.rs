@@ -1,4 +1,9 @@
-use std::{cmp, fmt, io, num::NonZeroU32, ops::{Deref, RangeInclusive}, time::Duration};
+use std::{
+    cmp, fmt, io,
+    num::NonZeroU32,
+    ops::{Deref, RangeInclusive},
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
 use corro_api_types::{row_to_change, Change};
@@ -27,6 +32,7 @@ use crate::{
     channel::CorroSender,
     sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
+    updates::match_changes,
 };
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -165,9 +171,14 @@ impl Changeset {
     // determine the estimated resource cost of processing a change
     pub fn processing_cost(&self) -> usize {
         match self {
-            Changeset::Empty { versions, .. } => cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20),
-            Changeset::EmptySet { versions, .. } => versions.iter().map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)).sum::<usize>(),
-            Changeset::Full { changes, ..} => changes.len(),
+            Changeset::Empty { versions, .. } => {
+                cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)
+            }
+            Changeset::EmptySet { versions, .. } => versions
+                .iter()
+                .map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20))
+                .sum::<usize>(),
+            Changeset::Full { changes, .. } => changes.len(),
         }
     }
 
@@ -508,7 +519,8 @@ pub async fn broadcast_changes(
 
                     trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
-                    agent.subs_manager().match_changes(&changes, db_version);
+                    match_changes(agent.subs_manager(), &changes, db_version);
+                    match_changes(agent.updates_manager(), &changes, db_version);
 
                     let tx_bcast = agent.tx_bcast().clone();
                     tokio::spawn(async move {
