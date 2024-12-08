@@ -36,6 +36,13 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
     dir
 });
 
+pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+    let conn = rusqlite_to_crsqlite(conn)?;
+    conn.execute_batch("PRAGMA cache_size = -32000;")?;
+
+    Ok(conn)
+}
+
 pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     init_cr_conn(&mut conn)?;
     setup_conn(&conn)?;
@@ -139,6 +146,7 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRAGMA journal_size_limit = 1073741824;
             PRAGMA synchronous = NORMAL;
             PRAGMA recursive_triggers = ON;
+            PRAGMA mmap_size = 8589934592; -- 8GB
         "#,
     )?;
 

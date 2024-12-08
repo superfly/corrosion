@@ -844,7 +844,10 @@ fn diff_member_states(
             match last_states.entry(*id) {
                 Entry::Occupied(mut entry) => {
                     let (prev_member, prev_rtt) = entry.get();
-                    if prev_member != member || *prev_rtt != rtt {
+                    let member_differed = prev_member != member;
+                    let rtt_differed = *prev_rtt != rtt;
+                    if member_differed || rtt_differed {
+                        debug!("member differed? {member_differed}, rtt differed? {rtt_differed} (prev: {prev_rtt:?}, new: {rtt:?})");
                         entry.insert((member.clone(), rtt));
                         Some((member.clone(), rtt))
                     } else {
