@@ -624,7 +624,9 @@ pub struct MatcherStmt {
 }
 
 impl MatcherStmt {
-    pub fn new_query(&self) -> &String { &self.new_query }
+    pub fn new_query(&self) -> &String {
+        &self.new_query
+    }
 }
 
 const CHANGE_ID_COL: &str = "id";
@@ -667,6 +669,8 @@ impl Matcher {
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
                 PRAGMA temp_store = memory;
+                PRAGMA cache_size = -32000; -- 32MB
+                PRAGMA mmap_size = 536870912; -- 512MB
             "#,
         )?;
 
@@ -2741,7 +2745,7 @@ mod tests {
             }
 
             let changes = {
-                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = ? ORDER BY seq ASC"#).unwrap();
+                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version FROM crsql_changes WHERE db_version = ? ORDER BY seq ASC"#).unwrap();
                 let rows = prepped.query_map([1], row_to_change).unwrap();
 
                 let mut changes = vec![];
@@ -2759,9 +2763,9 @@ mod tests {
                 tx.prepare_cached(
                     r#"
                     INSERT INTO crsql_changes
-                        ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                        ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
                     VALUES
-                        (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?)
+                        (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?,   ?)
                 "#,
                 )
                 .unwrap()
@@ -2775,6 +2779,7 @@ mod tests {
                     &change.site_id,
                     change.cl,
                     change.seq,
+                    change.site_version,
                 ])
                 .unwrap();
             }
@@ -3073,7 +3078,7 @@ mod tests {
     ) -> rusqlite::Result<()> {
         let mut candidates = MatchCandidates::new();
 
-        let mut prepped = state_conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE site_id = COALESCE(?, crsql_site_id()) AND db_version = ? ORDER BY seq ASC"#)?;
+        let mut prepped = state_conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version FROM crsql_changes WHERE site_id = COALESCE(?, crsql_site_id()) AND db_version = ? ORDER BY seq ASC"#)?;
         let rows = prepped
             .query_map(params![actor_id, db_version], row_to_change)
             .unwrap();

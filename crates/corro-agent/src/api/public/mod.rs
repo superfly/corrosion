@@ -12,7 +12,7 @@ use corro_types::{
         ColumnName, ExecResponse, ExecResult, QueryEvent, Statement, TableStatRequest,
         TableStatResponse,
     },
-    base::Version,
+    base::CrsqlSiteVersion,
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
@@ -36,7 +36,7 @@ pub mod pubsub;
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     f: F,
-) -> Result<(T, Option<Version>, Duration), ChangeError>
+) -> Result<(T, Option<CrsqlSiteVersion>, Duration), ChangeError>
 where
     F: Fn(&Transaction) -> Result<T, ChangeError>,
 {
@@ -84,7 +84,7 @@ where
                 ts,
                 snap,
             }) => {
-                trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
+                trace!("committed tx, version: {version}, db_version: {db_version}, last_seq: {last_seq:?}");
 
                 book_writer.commit_snapshot(snap);
 
@@ -462,7 +462,9 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
     new_schema.constrain()?;
 
-    block_in_place(|| {
+    // conn.trace(Some(|sql| debug!(sql)));
+
+    let apply_res = block_in_place(|| {
         let tx = conn.immediate_transaction()?;
 
         apply_schema(&tx, &schema_write, &mut new_schema)?;
@@ -476,8 +478,15 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
         tx.commit()?;
 
+        // drain the pool of RO connections because they might not get the new tables in cr-sqlite!
+        agent.pool().drain_read();
+
         Ok::<_, eyre::Report>(())
-    })?;
+    });
+
+    // conn.trace(None);
+
+    apply_res?;
 
     *schema_write = new_schema;
 
@@ -594,7 +603,7 @@ mod tests {
     use bytes::Bytes;
     use corro_types::{
         api::RowId,
-        base::Version,
+        base::CrsqlSiteVersion,
         broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
         config::Config,
         schema::SqliteType,
@@ -674,7 +683,7 @@ mod tests {
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
                 changeset: Changeset::Full {
-                    version: Version(1),
+                    version: CrsqlSiteVersion(1),
                     ..
                 },
                 ..
@@ -683,7 +692,7 @@ mod tests {
 
         assert_eq!(
             agent.booked().read::<&str, _>("test", None).await.last(),
-            Some(Version(1))
+            Some(CrsqlSiteVersion(1))
         );
 
         println!("second req...");
