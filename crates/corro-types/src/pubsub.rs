@@ -669,6 +669,8 @@ impl Matcher {
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
                 PRAGMA temp_store = memory;
+                PRAGMA cache_size = -32000; -- 32MB
+                PRAGMA mmap_size = 536870912; -- 512MB
             "#,
         )?;
 

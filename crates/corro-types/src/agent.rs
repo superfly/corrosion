@@ -43,7 +43,10 @@ use crate::{
     config::Config,
     pubsub::SubsManager,
     schema::Schema,
-    sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn, Migration, SqlitePool, SqlitePoolError},
+    sqlite::{
+        rusqlite_to_crsqlite, rusqlite_to_crsqlite_write, setup_conn, CrConn, Migration,
+        SqlitePool, SqlitePoolError,
+    },
 };
 
 use super::members::Members;
@@ -613,7 +616,7 @@ impl SplitPool {
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
             .max_size(1)
-            .create_pool_transform(rusqlite_to_crsqlite)?;
+            .create_pool_transform(rusqlite_to_crsqlite_write)?;
 
         debug!("built RW pool");
 
@@ -698,7 +701,7 @@ impl SplitPool {
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
-        rusqlite_to_crsqlite(conn)
+        rusqlite_to_crsqlite_write(conn)
     }
 
     // get a high priority write connection (e.g. client input)
