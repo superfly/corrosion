@@ -27,10 +27,14 @@ use tripwire::Tripwire;
 use crate::{
     api::{
         peer::gossip_server_endpoint,
-        public::pubsub::{process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache},
+        public::{
+            pubsub::{process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache},
+            update::SharedUpdateBroadcastCache,
+        },
     },
     transport::Transport,
 };
+use corro_types::updates::UpdatesManager;
 use corro_types::{
     actor::ActorId,
     agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
@@ -59,6 +63,7 @@ pub struct AgentOptions {
     pub rtt_rx: TokioReceiver<(SocketAddr, Duration)>,
     pub subs_manager: SubsManager,
     pub subs_bcast_cache: SharedMatcherBroadcastCache,
+    pub updates_bcast_cache: SharedUpdateBroadcastCache,
     pub tripwire: Tripwire,
 }
 
@@ -108,6 +113,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let subs_manager = SubsManager::default();
 
+    let updates_manager = UpdatesManager::default();
     // Setup subscription handlers
     let subs_bcast_cache = setup_spawn_subscriptions(
         &subs_manager,
@@ -117,6 +123,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         &tripwire,
     )
     .await?;
+
+    let updates_bcast_cache = SharedUpdateBroadcastCache::default();
 
     let cluster_id = {
         let conn = pool.read().await?;
@@ -235,6 +243,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         rtt_rx,
         subs_manager: subs_manager.clone(),
         subs_bcast_cache,
+        updates_bcast_cache,
         tripwire: tripwire.clone(),
     };
 
@@ -258,6 +267,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         schema: RwLock::new(schema),
         cluster_id,
         subs_manager,
+        updates_manager,
         tripwire,
     });
 

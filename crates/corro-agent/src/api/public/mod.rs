@@ -33,6 +33,8 @@ use corro_types::broadcast::broadcast_changes;
 
 pub mod pubsub;
 
+pub mod update;
+
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     f: F,

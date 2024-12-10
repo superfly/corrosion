@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
     time::{self, Duration, Instant},
 };
-use sub::{QueryStream, SubscriptionStream};
+use sub::{QueryStream, SubscriptionStream, UpdatesStream};
 use tokio::{
     sync::{RwLock, RwLockReadGuard},
     time::timeout,
@@ -216,6 +216,45 @@ impl CorrosionApiClient {
         from: Option<ChangeId>,
     ) -> Result<SubscriptionStream<Vec<SqliteValue>>, Error> {
         self.subscription_typed(id, skip_rows, from).await
+    }
+
+    pub async fn updates_typed<T: DeserializeOwned + Unpin>(
+        &self,
+        table: &str,
+    ) -> Result<UpdatesStream<T>, Error> {
+        let p_and_q: PathAndQuery = format!("/v1/updates/{}", table).try_into()?;
+
+        let url = hyper::Uri::builder()
+            .scheme("http")
+            .authority(self.api_addr.to_string())
+            .path_and_query(p_and_q)
+            .build()?;
+
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(url)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::ACCEPT, "application/json")
+            .body(hyper::Body::empty())?;
+
+        let res = self.api_client.request(req).await?;
+
+        if !res.status().is_success() {
+            return Err(Error::UnexpectedStatusCode(res.status()));
+        }
+
+        // TODO: make that header name a const in corro-types
+        let id = res
+            .headers()
+            .get(HeaderName::from_static("corro-query-id"))
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
+            .ok_or(Error::ExpectedQueryId)?;
+
+        Ok(UpdatesStream::new(id, res.into_body()))
+    }
+
+    pub async fn updates(&self, table: &str) -> Result<UpdatesStream<Vec<SqliteValue>>, Error> {
+        self.updates_typed(table).await
     }
 
     pub async fn execute(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
