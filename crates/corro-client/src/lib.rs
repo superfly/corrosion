@@ -1,6 +1,11 @@
 pub mod sub;
 
 use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
+use hickory_resolver::{
+    error::{ResolveError, ResolveErrorKind},
+    name_server::TokioConnectionProvider,
+    AsyncResolver,
+};
 use http::uri::PathAndQuery;
 use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use serde::de::DeserializeOwned;
@@ -17,11 +22,6 @@ use tokio::{
     time::timeout,
 };
 use tracing::{debug, info, warn};
-use trust_dns_resolver::{
-    error::{ResolveError, ResolveErrorKind},
-    name_server::{GenericConnection, GenericConnectionProvider, TokioRuntime},
-    AsyncResolver,
-};
 use uuid::Uuid;
 
 const HTTP2_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -436,7 +436,7 @@ impl CorrosionPooledClient {
     pub fn new(
         addrs: Vec<String>,
         stickiness_timeout: time::Duration,
-        resolver: AsyncResolver<GenericConnection, GenericConnectionProvider<TokioRuntime>>,
+        resolver: AsyncResolver<TokioConnectionProvider>,
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(PooledClientInner {
@@ -592,7 +592,7 @@ impl CorrosionPooledClient {
 
 struct AddrPicker {
     // Resolver used to resolve the addresses
-    resolver: AsyncResolver<GenericConnection, GenericConnectionProvider<TokioRuntime>>,
+    resolver: AsyncResolver<TokioConnectionProvider>,
     // List of addresses/hostname to try in order
     addrs: Vec<String>,
     // Next address/hostname to try
@@ -605,10 +605,7 @@ struct AddrPicker {
 }
 
 impl AddrPicker {
-    fn new(
-        addrs: Vec<String>,
-        resolver: AsyncResolver<GenericConnection, GenericConnectionProvider<TokioRuntime>>,
-    ) -> AddrPicker {
+    fn new(addrs: Vec<String>, resolver: AsyncResolver<TokioConnectionProvider>) -> AddrPicker {
         Self {
             resolver,
             addrs,
@@ -709,6 +706,7 @@ pub enum Error {
 mod tests {
     use crate::{CorrosionPooledClient, Error};
     use corro_api_types::SqliteValue;
+    use hickory_resolver::AsyncResolver;
     use hyper::{header::HeaderValue, service::service_fn, Body, Request, Response};
     use std::{
         convert::Infallible,
@@ -720,7 +718,6 @@ mod tests {
         time::Duration,
     };
     use tokio::{net::TcpListener, pin, sync::broadcast};
-    use trust_dns_resolver::AsyncResolver;
     use uuid::Uuid;
 
     struct Server {
