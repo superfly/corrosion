@@ -7,7 +7,7 @@ use std::{
 };
 
 use compact_str::CompactString;
-use corro_base_types::{CrsqlDbVersion, CrsqlSeq, Version};
+use corro_base_types::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion};
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
     Row, ToSql,
@@ -220,7 +220,7 @@ impl From<&str> for Statement {
 pub struct ExecResponse {
     pub results: Vec<ExecResult>,
     pub time: f64,
-    pub version: Option<Version>,
+    pub version: Option<CrsqlSiteVersion>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -252,6 +252,7 @@ pub struct Change {
     pub seq: CrsqlSeq,
     pub site_id: [u8; 16],
     pub cl: i64,
+    pub site_version: CrsqlSiteVersion,
 }
 
 impl Change {
@@ -268,6 +269,8 @@ impl Change {
         // site_id
         16 +
         // cl
+        8 +
+        // site_version
         8
     }
 }
@@ -283,6 +286,7 @@ pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
         seq: row.get(6)?,
         site_id: row.get(7)?,
         cl: row.get(8)?,
+        site_version: row.get(9)?,
     })
 }
 
