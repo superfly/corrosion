@@ -412,7 +412,8 @@ fn append_upsert_service_statements(
         meta = excluded.meta,
         port = excluded.port,
         address = excluded.address,
-        updated_at = excluded.updated_at;"
+        updated_at = excluded.updated_at
+    WHERE source IS NULL;"
             .into(),
         vec![
             node.into(),
@@ -457,7 +458,8 @@ fn append_upsert_check_statements(
         name = excluded.name,
         status = excluded.status,
         output = excluded.output,
-        updated_at = excluded.updated_at;"
+        updated_at = excluded.updated_at
+    WHERE source IS NULL;"
                                           .into(),vec![
                                               node.into(),
                                               check.id.into(),
@@ -651,7 +653,7 @@ async fn execute(
                     vec![id.clone().into()],
                 ));
                 statements.push(Statement::WithParams(
-                    "DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),
+                    "DELETE FROM consul_services WHERE node = ? AND id = ? AND source IS NULL;".into(),
                     vec![node.into(), id.into()],
                 ));
             }
@@ -677,7 +679,7 @@ async fn execute(
                     vec![id.clone().into()],
                 ));
                 statements.push(Statement::WithParams(
-                    "DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),
+                    "DELETE FROM consul_checks WHERE node = ? AND id = ? AND source IS NULL;".into(),
                     vec![node.into(), id.into()],
                 ));
             }
