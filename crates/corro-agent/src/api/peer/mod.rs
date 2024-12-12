@@ -43,6 +43,8 @@ use crate::transport::{Transport, TransportError};
 
 use corro_types::{actor::ActorId, agent::Bookie};
 
+pub mod follow;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
     #[error(transparent)]
@@ -969,7 +971,7 @@ fn encode_sync_msg(
     Ok(())
 }
 
-async fn encode_write_bipayload_msg(
+pub async fn encode_write_bipayload_msg(
     codec: &mut LengthDelimitedCodec,
     encode_buf: &mut BytesMut,
     send_buf: &mut BytesMut,
