@@ -304,7 +304,16 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
                 match transport.open_bi(addr).await {
                     Ok((tx, rx)) => {
-                        match api::peer::follow::follow(&agent, tx, rx, Some(from), false).await {
+                        match api::peer::follow::follow(
+                            &agent,
+                            tx,
+                            rx,
+                            Some(from),
+                            false,
+                            follow.broadcast.as_ref(),
+                        )
+                        .await
+                        {
                             Ok(dbv) => {
                                 info!("following terminated, last db version: {dbv:?}");
                                 last_from = dbv;

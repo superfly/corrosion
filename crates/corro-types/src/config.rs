@@ -1,9 +1,14 @@
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::{
+    collections::HashSet,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+};
 
 use camino::Utf8PathBuf;
 use corro_base_types::CrsqlDbVersion;
 use serde::{Deserialize, Serialize};
 use serde_with::{formats::PreferOne, serde_as, OneOrMany};
+
+use crate::actor::ActorId;
 
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
@@ -38,6 +43,15 @@ pub struct FollowConfig {
     pub addr: SocketAddr,
     #[serde(default)]
     pub from: FollowFrom,
+    #[serde(default)]
+    pub broadcast: Option<FollowBroadcast>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FollowBroadcast {
+    ActorIds(HashSet<ActorId>),
+    Percent(u8),
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -385,8 +399,17 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn follow(mut self, addr: SocketAddr, from: FollowFrom) -> Self {
-        self.follow = Some(FollowConfig { addr, from });
+    pub fn follow(
+        mut self,
+        addr: SocketAddr,
+        from: FollowFrom,
+        broadcast: Option<FollowBroadcast>,
+    ) -> Self {
+        self.follow = Some(FollowConfig {
+            addr,
+            from,
+            broadcast,
+        });
         self
     }
 

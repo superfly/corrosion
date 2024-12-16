@@ -8,11 +8,13 @@ use corro_types::{
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{BiPayload, ChangeSource, ChangeV1, Changeset, Timestamp},
     change::ChunkedChanges,
+    config::FollowBroadcast,
     sqlite::SqlitePoolError,
 };
 use futures::{Stream, StreamExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
+use rand::{rngs::OsRng, Rng};
 use rusqlite::{params_from_iter, Row, ToSql};
 use speedy::{Readable, Writable};
 use tokio::{sync::mpsc, task::block_in_place};
@@ -238,6 +240,8 @@ pub async fn read_follow_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin
 pub async fn recv_follow(
     agent: &Agent,
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
+    local_only: bool,
+    broadcast: Option<&FollowBroadcast>,
 ) -> Result<Option<CrsqlDbVersion>, FollowError> {
     let mut last_db_version = None;
     let tx_changes = agent.tx_changes();
@@ -255,8 +259,17 @@ pub async fn recv_follow(
                         "received changeset for version(s) {:?} and db_version {db_version:?}",
                         changeset.versions()
                     );
+                    let change_src = if local_only
+                        || broadcast
+                            .map(|bcast| should_broadcast(&changeset.actor_id, bcast))
+                            .unwrap_or(false)
+                    {
+                        ChangeSource::Broadcast
+                    } else {
+                        ChangeSource::Follow
+                    };
                     tx_changes
-                        .send((changeset, ChangeSource::Follow))
+                        .send((changeset, change_src))
                         .await
                         .map_err(|_| FollowError::ChannelClosed)?;
                     if let Some(db_version) = db_version {
@@ -270,12 +283,20 @@ pub async fn recv_follow(
     Ok(last_db_version)
 }
 
+fn should_broadcast(actor_id: &ActorId, broadcast: &FollowBroadcast) -> bool {
+    match broadcast {
+        FollowBroadcast::ActorIds(set) => set.contains(actor_id),
+        FollowBroadcast::Percent(percent) => OsRng.gen_range(0..100) < *percent,
+    }
+}
+
 pub async fn follow(
     agent: &Agent,
     mut tx: SendStream,
     recv: RecvStream,
     from: Option<CrsqlDbVersion>,
     local_only: bool,
+    broadcast: Option<&FollowBroadcast>,
 ) -> Result<Option<CrsqlDbVersion>, FollowError> {
     let mut codec = LengthDelimitedCodec::builder()
         .max_frame_length(100 * 1_024 * 1_024)
@@ -302,7 +323,7 @@ pub async fn follow(
             .new_codec(),
     );
 
-    recv_follow(agent, framed).await
+    recv_follow(agent, framed, local_only, broadcast).await
 }
 
 #[cfg(test)]
