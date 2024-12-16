@@ -2779,7 +2779,6 @@ mod tests {
                     &change.site_id,
                     change.cl,
                     change.seq,
-                    change.site_version,
                 ])
                 .unwrap();
             }

@@ -926,7 +926,6 @@ async fn process_failed_changes() -> eyre::Result<()> {
         seq: CrsqlSeq(0),
         site_id: actor_id.to_bytes(),
         cl: 1,
-        site_version: CrsqlSiteVersion(1),
     };
 
     let bad_change = Change {
@@ -939,7 +938,6 @@ async fn process_failed_changes() -> eyre::Result<()> {
         seq: CrsqlSeq(1),
         site_id: actor_id.to_bytes(),
         cl: 1,
-        site_version: CrsqlSiteVersion(1),
     };
 
     let mut rows = vec![(

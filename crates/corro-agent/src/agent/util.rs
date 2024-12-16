@@ -1119,7 +1119,7 @@ pub fn process_complete_version(
             change.cl,
             // increment the seq by the start_seq or else we'll have multiple change rows with the same seq
             change.seq,
-            change.site_version,
+            version,
         ])?;
         let rows_impacted: i64 = sp
             .prepare_cached("SELECT crsql_rows_impacted()")?

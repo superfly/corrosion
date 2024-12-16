@@ -1343,7 +1343,6 @@ mod tests {
             seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
-            site_version: CrsqlSiteVersion(1),
         };
 
         let change2 = Change {
@@ -1356,7 +1355,6 @@ mod tests {
             seq: CrsqlSeq(1),
             site_id: actor_id.to_bytes(),
             cl: 1,
-            site_version: CrsqlSiteVersion(1),
         };
 
         let changes = ChangeV1 {
@@ -1428,7 +1426,6 @@ mod tests {
             seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
-            site_version: CrsqlSiteVersion(1),
         };
 
         let changes = ChangeV1 {
@@ -1470,7 +1467,6 @@ mod tests {
             seq: CrsqlSeq(1),
             site_id: actor_id.to_bytes(),
             cl: 1,
-            site_version: CrsqlSiteVersion(1),
         };
 
         let changes = ChangeV1 {

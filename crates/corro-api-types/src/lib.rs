@@ -242,7 +242,6 @@ pub struct Change {
     pub seq: CrsqlSeq,
     pub site_id: [u8; 16],
     pub cl: i64,
-    pub site_version: CrsqlSiteVersion,
 }
 
 impl Change {
@@ -276,7 +275,6 @@ pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
         seq: row.get(6)?,
         site_id: row.get(7)?,
         cl: row.get(8)?,
-        site_version: row.get(9)?,
     })
 }
 

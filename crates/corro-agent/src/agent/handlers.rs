@@ -1046,7 +1046,6 @@ mod tests {
                     seq: CrsqlSeq(0),
                     site_id: agent.actor_id().to_bytes(),
                     cl: 1,
-                    site_version: CrsqlSiteVersion(1),
                 };
 
                 let change = (
