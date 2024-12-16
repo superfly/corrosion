@@ -65,6 +65,10 @@ pub enum BiPayloadV1 {
         #[speedy(default_on_eof)]
         trace_ctx: SyncTraceContextV1,
     },
+    Follow {
+        from: Option<CrsqlDbVersion>,
+        local_only: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -98,6 +102,7 @@ pub enum BroadcastV1 {
 pub enum ChangeSource {
     Broadcast,
     Sync,
+    Follow,
 }
 
 // TODO: shrink this by mapping primary keys to integers instead of repeating them
