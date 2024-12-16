@@ -2,6 +2,7 @@
 
 // External crates
 use arc_swap::ArcSwap;
+use backoff::Backoff;
 use camino::Utf8PathBuf;
 use indexmap::IndexMap;
 use metrics::counter;
@@ -26,6 +27,7 @@ use tripwire::Tripwire;
 // Internals
 use crate::{
     api::{
+        self,
         peer::gossip_server_endpoint,
         public::{
             pubsub::{process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache},
@@ -34,7 +36,6 @@ use crate::{
     },
     transport::Transport,
 };
-use corro_types::updates::UpdatesManager;
 use corro_types::{
     actor::ActorId,
     agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
@@ -47,6 +48,7 @@ use corro_types::{
     schema::{init_schema, Schema},
     sqlite::CrConn,
 };
+use corro_types::{config::FollowFrom, updates::UpdatesManager};
 
 /// Runtime state for the Corrosion agent
 pub struct AgentOptions {
@@ -231,7 +233,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let opts = AgentOptions {
         gossip_server_endpoint,
-        transport,
+        transport: transport.clone(),
         api_listeners,
         lock_registry,
         rx_bcast,
@@ -246,6 +248,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         updates_bcast_cache,
         tripwire: tripwire.clone(),
     };
+
+    let follow = conf.follow.clone();
 
     let agent = Agent::new(AgentConfig {
         actor_id,
@@ -270,6 +274,62 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         updates_manager,
         tripwire,
     });
+
+    if let Some(follow) = follow {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            let boff = Backoff::new(0)
+                .timeout_range(Duration::from_millis(100), Duration::from_secs(2))
+                .iter();
+
+            let addr = follow.addr;
+            let (mut last_from, specific_from) = if let FollowFrom::DbVersion(from) = follow.from {
+                (Some(from), true)
+            } else {
+                (None, false)
+            };
+
+            for dur in boff {
+                let from = {
+                    if let Some(from) = last_from.take() {
+                        from
+                    } else {
+                        let conn = agent.pool().read().await.unwrap();
+                        conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))
+                            .unwrap()
+                    }
+                };
+
+                info!("following from db_version = {from}");
+
+                match transport.open_bi(addr).await {
+                    Ok((tx, rx)) => {
+                        match api::peer::follow::follow(&agent, tx, rx, Some(from), false).await {
+                            Ok(dbv) => {
+                                info!("following terminated, last db version: {dbv:?}");
+                                last_from = dbv;
+                            }
+                            Err(e) => {
+                                error!("could not follow to the end: {e}");
+                                if specific_from {
+                                    last_from = Some(from);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("could not open bidirectional stream to {addr}: {e}");
+                    }
+                }
+
+                warn!("follow broken, retrying in {dur:?}");
+
+                tokio::time::sleep(dur).await
+            }
+
+            info!("follow loop done");
+        });
+    }
 
     Ok((agent, opts))
 }

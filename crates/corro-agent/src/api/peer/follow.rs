@@ -5,8 +5,8 @@ use corro_types::{
     actor::ActorId,
     agent::Agent,
     api::row_to_change,
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{ChangeSource, ChangeV1, Changeset, Timestamp},
+    base::{CrsqlDbVersion, CrsqlSeq},
+    broadcast::{BiPayload, ChangeSource, ChangeV1, Changeset, Timestamp},
     change::ChunkedChanges,
     sqlite::SqlitePoolError,
 };
@@ -16,8 +16,10 @@ use quinn::{RecvStream, SendStream};
 use rusqlite::{params_from_iter, Row, ToSql};
 use speedy::{Readable, Writable};
 use tokio::{sync::mpsc, task::block_in_place};
-use tokio_util::codec::{Decoder, Encoder, FramedRead, LengthDelimitedCodec};
+use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, trace};
+
+use super::{encode_write_bipayload_msg, BiPayloadSendError};
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum FollowMessage {
@@ -31,16 +33,6 @@ impl FollowMessage {
 
     pub fn from_buf(buf: &mut BytesMut) -> Result<Self, FollowMessageDecodeError> {
         Ok(Self::from_slice(buf)?)
-    }
-
-    pub fn decode(
-        codec: &mut LengthDelimitedCodec,
-        buf: &mut BytesMut,
-    ) -> Result<Option<Self>, FollowMessageDecodeError> {
-        Ok(match codec.decode(buf)? {
-            Some(mut buf) => Some(Self::from_buf(&mut buf)?),
-            None => None,
-        })
     }
 }
 
@@ -65,6 +57,8 @@ pub enum FollowError {
     Rusqlite(#[from] rusqlite::Error),
     #[error("follow send channel is closed")]
     ChannelClosed,
+    #[error(transparent)]
+    BiPayloadSend(#[from] BiPayloadSendError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -79,8 +73,6 @@ pub enum FollowMessageEncodeError {
 pub enum FollowMessageDecodeError {
     #[error(transparent)]
     Decode(#[from] speedy::Error),
-    #[error("corrupted message, crc mismatch (got: {0}, expected {1})")]
-    Corrupted(u32, u32),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -223,8 +215,6 @@ pub async fn serve_follow(
         // prevents hot-looping
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-
-    Ok(())
 }
 
 pub async fn read_follow_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(
@@ -248,7 +238,8 @@ pub async fn read_follow_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin
 pub async fn recv_follow(
     agent: &Agent,
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
-) -> Result<(), FollowError> {
+) -> Result<Option<CrsqlDbVersion>, FollowError> {
+    let mut last_db_version = None;
     let tx_changes = agent.tx_changes();
     loop {
         match read_follow_msg(&mut read).await {
@@ -259,16 +250,59 @@ pub async fn recv_follow(
             }
             Ok(Some(msg)) => match msg {
                 FollowMessage::V1(FollowMessageV1::Change(changeset)) => {
+                    let db_version = changeset.changes().first().map(|change| change.db_version);
+                    debug!(
+                        "received changeset for version(s) {:?} and db_version {db_version:?}",
+                        changeset.versions()
+                    );
                     tx_changes
                         .send((changeset, ChangeSource::Follow))
                         .await
                         .map_err(|_| FollowError::ChannelClosed)?;
+                    if let Some(db_version) = db_version {
+                        last_db_version = Some(db_version);
+                    }
                 }
             },
         }
     }
 
-    Ok(())
+    Ok(last_db_version)
+}
+
+pub async fn follow(
+    agent: &Agent,
+    mut tx: SendStream,
+    recv: RecvStream,
+    from: Option<CrsqlDbVersion>,
+    local_only: bool,
+) -> Result<Option<CrsqlDbVersion>, FollowError> {
+    let mut codec = LengthDelimitedCodec::builder()
+        .max_frame_length(100 * 1_024 * 1_024)
+        .new_codec();
+    let mut encoding_buf = BytesMut::new();
+    let mut buf = BytesMut::new();
+
+    encode_write_bipayload_msg(
+        &mut codec,
+        &mut encoding_buf,
+        &mut buf,
+        BiPayload::V1 {
+            data: corro_types::broadcast::BiPayloadV1::Follow { from, local_only },
+            cluster_id: agent.cluster_id(),
+        },
+        &mut tx,
+    )
+    .await?;
+
+    let framed = FramedRead::new(
+        recv,
+        LengthDelimitedCodec::builder()
+            .max_frame_length(100 * 1_024 * 1_024)
+            .new_codec(),
+    );
+
+    recv_follow(agent, framed).await
 }
 
 #[cfg(test)]
