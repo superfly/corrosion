@@ -22,7 +22,7 @@ use futures::stream::FuturesUnordered;
 use futures::{Future, Stream, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use metrics::counter;
-use quinn::{RecvStream, SendStream};
+use quinn::{RecvStream, SendStream, WriteError};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, Connection};
 use speedy::Writable;
@@ -49,6 +49,8 @@ pub mod follow;
 pub enum SyncError {
     #[error(transparent)]
     Send(#[from] SyncSendError),
+    #[error(transparent)]
+    BiPayloadSend(#[from] BiPayloadSendError),
     #[error(transparent)]
     Recv(#[from] SyncRecvError),
     #[error(transparent)]
@@ -94,6 +96,24 @@ pub enum SyncSendError {
 
     #[error("sync send channel is closed")]
     ChannelClosed,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BiPayloadSendError {
+    #[error("could not encode payload: {0}")]
+    Encode(#[from] BiPayloadEncodeError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Write(#[from] quinn::WriteError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BiPayloadEncodeError {
+    #[error(transparent)]
+    Encode(#[from] speedy::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 fn build_quinn_transport_config(config: &GossipConfig) -> quinn::TransportConfig {
@@ -977,10 +997,12 @@ pub async fn encode_write_bipayload_msg(
     send_buf: &mut BytesMut,
     msg: BiPayload,
     write: &mut SendStream,
-) -> Result<(), SyncSendError> {
+) -> Result<(), BiPayloadSendError> {
     encode_bipayload_msg(codec, encode_buf, send_buf, msg)?;
 
-    write_buf(send_buf, write).await
+    write_buf(send_buf, write)
+        .await
+        .map_err(BiPayloadSendError::from)
 }
 
 fn encode_bipayload_msg(
@@ -988,9 +1010,9 @@ fn encode_bipayload_msg(
     encode_buf: &mut BytesMut,
     send_buf: &mut BytesMut,
     msg: BiPayload,
-) -> Result<(), SyncSendError> {
+) -> Result<(), BiPayloadEncodeError> {
     msg.write_to_stream(encode_buf.writer())
-        .map_err(SyncMessageEncodeError::from)?;
+        .map_err(BiPayloadEncodeError::from)?;
 
     codec.encode(encode_buf.split().freeze(), send_buf)?;
     Ok(())
@@ -1005,11 +1027,13 @@ async fn encode_write_sync_msg(
 ) -> Result<(), SyncSendError> {
     encode_sync_msg(codec, encode_buf, send_buf, msg)?;
 
-    write_buf(send_buf, write).await
+    write_buf(send_buf, write)
+        .await
+        .map_err(SyncSendError::from)
 }
 
 #[tracing::instrument(skip_all, fields(buf_size = send_buf.len()), err)]
-async fn write_buf(send_buf: &mut BytesMut, write: &mut SendStream) -> Result<(), SyncSendError> {
+async fn write_buf(send_buf: &mut BytesMut, write: &mut SendStream) -> Result<(), WriteError> {
     let len = send_buf.len();
     write.write_chunk(send_buf.split().freeze()).await?;
     counter!("corro.sync.chunk.sent.bytes").increment(len as u64);
@@ -1627,7 +1651,7 @@ pub async fn serve_sync(
                             encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
 
                             if send_buf.len() >= 16 * 1024 {
-                                write_buf(&mut send_buf, &mut write).await?;
+                                write_buf(&mut send_buf, &mut write).await.map_err(SyncSendError::from)?;
                             }
                         },
                         None => {
@@ -1637,7 +1661,7 @@ pub async fn serve_sync(
 
                     _ = check_buf.tick() => {
                         if !send_buf.is_empty() {
-                            write_buf(&mut send_buf, &mut write).await?;
+                            write_buf(&mut send_buf, &mut write).await.map_err(SyncSendError::from)?;
                         }
                     }
                 }
@@ -1645,7 +1669,7 @@ pub async fn serve_sync(
 
             if !stopped {
                 if !send_buf.is_empty() {
-                    write_buf(&mut send_buf, &mut write).await?;
+                    write_buf(&mut send_buf, &mut write).await.map_err(SyncSendError::from)?;
                 }
 
                 if let Err(e) = write.finish().await {

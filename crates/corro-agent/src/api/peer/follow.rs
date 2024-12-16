@@ -5,7 +5,7 @@ use corro_types::{
     actor::ActorId,
     agent::Agent,
     api::row_to_change,
-    base::{CrsqlDbVersion, CrsqlSeq},
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{BiPayload, ChangeSource, ChangeV1, Changeset, Timestamp},
     change::ChunkedChanges,
     sqlite::SqlitePoolError,
