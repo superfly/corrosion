@@ -1,51 +1,26 @@
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::{
+    collections::HashSet,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+};
 
 use camino::Utf8PathBuf;
+use corro_base_types::CrsqlDbVersion;
 use serde::{Deserialize, Serialize};
 use serde_with::{formats::PreferOne, serde_as, OneOrMany};
 
+use crate::actor::ActorId;
+
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
-
-const fn default_apply_queue() -> usize {
-    100
-}
-
-const fn default_wal_threshold() -> usize {
-    10
-}
-
-const fn default_processing_queue() -> usize {
-    20000
-}
-
-/// Used for the apply channel
-const fn default_huge_channel() -> usize {
-    2048
-}
-
-//
-const fn default_big_channel() -> usize {
-    1024
-}
-
-const fn default_mid_channel() -> usize {
-    512
-}
-
-const fn default_small_channel() -> usize {
-    256
-}
-
-const fn default_apply_timeout() -> usize {
-    50
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub db: DbConfig,
     pub api: ApiConfig,
     pub gossip: GossipConfig,
+
+    #[serde(default)]
+    pub follow: Option<FollowConfig>,
 
     #[serde(default)]
     pub perf: PerfConfig,
@@ -60,6 +35,31 @@ pub struct Config {
     pub log: LogConfig,
     #[serde(default)]
     pub consul: Option<ConsulConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FollowConfig {
+    pub addr: SocketAddr,
+    #[serde(default)]
+    pub from: FollowFrom,
+    #[serde(default)]
+    pub broadcast: Option<FollowBroadcast>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FollowBroadcast {
+    ActorIds(HashSet<ActorId>),
+    Percent(u8),
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(untagged, rename_all = "kebab-case")]
+pub enum FollowFrom {
+    #[default]
+    Latest,
+    DbVersion(CrsqlDbVersion),
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -291,6 +291,40 @@ impl Config {
     }
 }
 
+const fn default_apply_queue() -> usize {
+    100
+}
+
+const fn default_wal_threshold() -> usize {
+    10
+}
+
+const fn default_processing_queue() -> usize {
+    20000
+}
+
+/// Used for the apply channel
+const fn default_huge_channel() -> usize {
+    2048
+}
+
+//
+const fn default_big_channel() -> usize {
+    1024
+}
+
+const fn default_mid_channel() -> usize {
+    512
+}
+
+const fn default_small_channel() -> usize {
+    256
+}
+
+const fn default_apply_timeout() -> usize {
+    50
+}
+
 #[derive(Debug, Default)]
 pub struct ConfigBuilder {
     pub db_path: Option<Utf8PathBuf>,
@@ -306,6 +340,7 @@ pub struct ConfigBuilder {
     consul: Option<ConsulConfig>,
     tls: Option<TlsConfig>,
     perf: Option<PerfConfig>,
+    follow: Option<FollowConfig>,
 }
 
 impl ConfigBuilder {
@@ -364,6 +399,20 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn follow(
+        mut self,
+        addr: SocketAddr,
+        from: FollowFrom,
+        broadcast: Option<FollowBroadcast>,
+    ) -> Self {
+        self.follow = Some(FollowConfig {
+            addr,
+            from,
+            broadcast,
+        });
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -402,6 +451,7 @@ impl ConfigBuilder {
                 max_mtu: None, // TODO: add a builder function for it
                 disable_gso: false,
             },
+            follow: self.follow,
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {
                 uds_path: self.admin_path.unwrap_or_else(default_admin_path),

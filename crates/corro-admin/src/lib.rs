@@ -1,20 +1,27 @@
-use std::{
-    fmt::Display,
-    time::{Duration, Instant},
-};
+use std::{fmt::Display, net::SocketAddr, time::Duration};
 
+use bytes::BytesMut;
 use camino::Utf8PathBuf;
+use corro_agent::{
+    api::peer::{
+        encode_write_bipayload_msg,
+        follow::{read_follow_msg, FollowMessage, FollowMessageV1},
+    },
+    transport::Transport,
+};
 use corro_types::{
     actor::{ActorId, ClusterId},
-    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
-    broadcast::{FocaCmd, FocaInput, Timestamp},
+    agent::{Agent, Bookie, LockKind, LockMeta, LockState},
+    api::SqliteValueRef,
+    base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
+    broadcast::{BiPayload, Changeset, FocaCmd, FocaInput},
+    pubsub::unpack_columns,
     sqlite::SqlitePoolError,
     sync::generate_sync,
     updates::Handle,
 };
 use futures::{SinkExt, TryStreamExt};
-use rusqlite::{named_params, params, OptionalExtension};
+use rusqlite::{named_params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spawn::spawn_counted;
@@ -25,7 +32,7 @@ use tokio::{
     task::block_in_place,
 };
 use tokio_serde::{formats::Json, Framed};
-use tokio_util::codec::LengthDelimitedCodec;
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
@@ -45,6 +52,7 @@ pub struct AdminConfig {
 pub fn start_server(
     agent: Agent,
     bookie: Bookie,
+    transport: Transport,
     config: AdminConfig,
     mut tripwire: Tripwire,
 ) -> Result<(), AdminError> {
@@ -78,8 +86,9 @@ pub fn start_server(
                 let agent = agent.clone();
                 let bookie = bookie.clone();
                 let config = config.clone();
+                let transport = transport.clone();
                 async move {
-                    if let Err(e) = handle_conn(agent, &bookie, config, stream).await {
+                    if let Err(e) = handle_conn(agent, &bookie, &transport, config, stream).await {
                         error!("could not handle admin connection: {e}");
                     }
                 }
@@ -99,6 +108,16 @@ pub enum Command {
     Cluster(ClusterCommand),
     Actor(ActorCommand),
     Subs(SubsCommand),
+    Debug(DebugCommand),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DebugCommand {
+    Follow {
+        peer_addr: SocketAddr,
+        from: Option<u64>,
+        local_only: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,7 +145,10 @@ pub enum ClusterCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ActorCommand {
-    Version { actor_id: ActorId, version: Version },
+    Version {
+        actor_id: ActorId,
+        version: CrsqlSiteVersion,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -191,106 +213,10 @@ impl From<LockMeta> for LockMetaElapsed {
     }
 }
 
-async fn collapse_gaps(
-    stream: &mut FramedStream,
-    conn: &mut rusqlite::Connection,
-    bv: &mut BookedVersions,
-) -> rusqlite::Result<()> {
-    let actor_id = bv.actor_id();
-    let mut snap = bv.snapshot();
-    _ = info_log(stream, format!("collapsing ranges for {actor_id}")).await;
-    let start = Instant::now();
-    let (deleted, inserted) = block_in_place(|| {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let versions = tx
-                .prepare_cached(
-                    "
-                    SELECT distinct bk.start_version, coalesce(bk.end_version, bk.start_version)
-                        FROM __corro_bookkeeping_gaps AS g
-                        INNER JOIN __corro_bookkeeping AS bk ON bk.actor_id = g.actor_id AND start_version >= COALESCE((
-                            -- try to find the previous range
-                            SELECT start_version
-                                FROM __corro_bookkeeping
-                                WHERE
-                                    actor_id = g.actor_id AND
-                                    start_version < g.start -- AND end_version IS NOT NULL
-                                ORDER BY start_version DESC
-                                LIMIT 1
-                        ), 1)
-                        AND
-                        start_version <= COALESCE((
-                            -- try to find the next range
-                            SELECT start_version
-                                FROM __corro_bookkeeping
-                                WHERE
-                                    actor_id = g.actor_id AND
-                                    start_version > g.end-- AND end_version IS NOT NULL
-                                ORDER BY start_version ASC
-                                LIMIT 1
-                        ), g.end+ 1) AND (
-                            -- [g.start]---[start_version]---[g.end]
-                            ( start_version BETWEEN g.start AND g.end ) OR
-
-                            -- [start_version]---[g.start]---[g.end]---[end_version]
-                            ( start_version <= g.start AND end_version >= g.end ) OR
-
-                            -- [g.start]---[start_version]---[g.end]---[end_version]
-                            ( start_version <= g.end AND end_version >= g.end ) OR
-
-                            -- [g.start]---[end_version]---[g.end]
-                            ( end_version BETWEEN g.start AND g.end ) OR
-
-                            -- ---[g.end][start_version]---[end_version]
-                            ( start_version = g.end + 1 AND end_version IS NOT NULL ) OR
-
-                            -- [end_version][g.start]---
-                            ( end_version = g.start - 1 )
-                        )
-                        where g.actor_id = ?
-                ",
-                )?
-                .query_map(
-                    rusqlite::params![actor_id],
-                    |row| Ok(row.get(0)?..=row.get(1)?),
-                )?
-                .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<Version>>>()?;
-
-        let deleted = tx.execute(
-            "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
-            [actor_id],
-        )?;
-
-        let mut inserted = 0;
-        for range in snap.needed().iter() {
-            tx.prepare_cached(
-                "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?,?,?);",
-            )?
-            .execute(params![actor_id, range.start(), range.end()])?;
-            inserted += 1;
-        }
-
-        snap.insert_db(&tx, versions)?;
-
-        tx.commit()?;
-
-        Ok::<_, rusqlite::Error>((deleted, inserted))
-    })?;
-    _ = info_log(
-        stream,
-        format!(
-            "collapsed ranges in {:?} (deleted: {deleted}, inserted: {inserted})",
-            start.elapsed()
-        ),
-    )
-    .await;
-
-    bv.commit_snapshot(snap);
-    Ok(())
-}
-
 async fn handle_conn(
     agent: Agent,
     bookie: &Bookie,
+    transport: &Transport,
     _config: AdminConfig,
     stream: UnixStream,
 ) -> Result<(), AdminError> {
@@ -319,33 +245,8 @@ async fn handle_conn(
                     send_success(&mut stream).await;
                 }
                 Command::Sync(SyncCommand::ReconcileGaps) => {
-                    let actor_ids: Vec<_> = {
-                        let r = bookie
-                            .read::<&str, _>("admin sync reconcile gaps", None)
-                            .await;
-                        r.keys().copied().collect()
-                    };
-
-                    for actor_id in actor_ids {
-                        {
-                            let booked = bookie
-                                .read("admin sync reconcile gaps get actor", actor_id.as_simple())
-                                .await
-                                .get(&actor_id)
-                                .unwrap()
-                                .clone();
-
-                            let mut conn = agent.pool().write_low().await.unwrap();
-                            let mut bv = booked
-                                .write::<&str, _>("admin sync reconcile gaps booked versions", None)
-                                .await;
-
-                            if let Err(e) = collapse_gaps(&mut stream, &mut conn, &mut bv).await {
-                                _ = send_error(&mut stream, e).await;
-                            }
-                        }
-                    }
-
+                    // TODO: remove
+                    // Now a noop
                     _ = send_success(&mut stream).await;
                 }
                 Command::Locks { top } => {
@@ -504,13 +405,13 @@ async fn handle_conn(
                                 },
                                 None => {
                                     match agent.pool().read().await {
-                                        Ok(conn) => match conn.prepare_cached("SELECT db_version, last_seq, ts FROM __corro_bookkeeping WHERE actor_id = :actor_id AND start_version = :version") {
-                                            Ok(mut prepped) => match prepped.query_row(named_params! {":actor_id": actor_id, ":version": version}, |row| Ok((row.get::<_, Option<CrsqlDbVersion>>(0)?, row.get::<_, Option<CrsqlSeq>>(1)?, row.get::<_, Option<Timestamp>>(2)?))).optional() {
-                                                Ok(Some((Some(db_version), Some(last_seq), Some(ts)))) => {
-                                                    Ok(serde_json::json!({"current": {"db_version": db_version, "last_seq": last_seq, "ts": ts}}))
+                                        Ok(conn) => match conn.prepare_cached("SELECT db_version, MAX(seq) AS last_seq FROM crsql_changes WHERE site_id = :actor_id AND site_version = :version GROUP BY db_version") {
+                                            Ok(mut prepped) => match prepped.query_row(named_params! {":actor_id": actor_id, ":version": version}, |row| Ok((row.get::<_, Option<CrsqlDbVersion>>(0)?, row.get::<_, Option<CrsqlSeq>>(1)?))).optional() {
+                                                Ok(Some((Some(db_version), Some(last_seq)))) => {
+                                                    Ok(serde_json::json!({"current": {"db_version": db_version, "last_seq": last_seq}}))
                                                 },
                                                 Ok(_) => {
-                                                    Ok(serde_json::Value::String("cleared".into()))
+                                                    Ok(serde_json::Value::String("cleared or unkown".into()))
                                                 }
                                                 Err(e) => {
                                                     Err(e)
@@ -598,6 +499,132 @@ async fn handle_conn(
                         }
                     };
                 }
+                Command::Debug(DebugCommand::Follow {
+                    peer_addr,
+                    from,
+                    local_only,
+                }) => match transport.open_bi(peer_addr).await {
+                    Ok((mut tx, recv)) => {
+                        let mut codec = LengthDelimitedCodec::builder()
+                            .max_frame_length(100 * 1_024 * 1_024)
+                            .new_codec();
+                        let mut encoding_buf = BytesMut::new();
+                        let mut buf = BytesMut::new();
+
+                        if let Err(e) = encode_write_bipayload_msg(
+                            &mut codec,
+                            &mut encoding_buf,
+                            &mut buf,
+                            BiPayload::V1 {
+                                data: corro_types::broadcast::BiPayloadV1::Follow {
+                                    from: from.map(CrsqlDbVersion),
+                                    local_only,
+                                },
+                                cluster_id: agent.cluster_id(),
+                            },
+                            &mut tx,
+                        )
+                        .await
+                        {
+                            send_error(
+                                &mut stream,
+                                format!("could not send follow payload to {peer_addr}: {e}"),
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        let mut framed = FramedRead::new(
+                            recv,
+                            LengthDelimitedCodec::builder()
+                                .max_frame_length(100 * 1_024 * 1_024)
+                                .new_codec(),
+                        );
+
+                        'msg: loop {
+                            match read_follow_msg(&mut framed).await {
+                                Ok(None) => {
+                                    send_success(&mut stream).await;
+                                    break;
+                                }
+                                Err(e) => {
+                                    send_error(
+                                        &mut stream,
+                                        format!("error receiving follow message: {e}"),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                Ok(Some(msg)) => {
+                                    match msg {
+                                        FollowMessage::V1(FollowMessageV1::Change(change)) => {
+                                            let actor_id = change.actor_id;
+                                            match change.changeset {
+                                                Changeset::Full {
+                                                    version,
+                                                    changes,
+                                                    ts,
+                                                    ..
+                                                } => {
+                                                    if let Err(e) = stream
+                                                        .send(Response::Json(serde_json::json!({
+                                                            "actor_id": actor_id,
+                                                            "type": "full",
+                                                            "version": version,
+                                                            "ts": ts.to_string(),
+                                                        })))
+                                                        .await
+                                                    {
+                                                        warn!("could not send to steam, breaking ({e})");
+                                                        break;
+                                                    }
+
+                                                    for change in changes {
+                                                        if let Err(e) = stream.send(
+                                                            Response::Json(
+                                                                serde_json::json!({
+                                                                    "table": change.table,
+                                                                    "pk": unpack_columns(&change.pk).unwrap().iter().map(SqliteValueRef::to_owned).collect::<Vec<_>>(),
+                                                                    "cid": change.cid,
+                                                                    "val": change.val,
+                                                                    "col_version": change.col_version,
+                                                                    "db_version": change.db_version,
+                                                                    "seq": change.seq,
+                                                                    "site_id": ActorId::from_bytes(change.site_id),
+                                                                    "cl": change.cl,
+                                                                }),
+                                                            ),
+                                                        )
+                                                        .await {
+                                                            warn!("could not send to steam, breaking ({e})");
+                                                            break 'msg;
+                                                        }
+                                                    }
+                                                }
+                                                changeset => {
+                                                    send_log(
+                                                        &mut stream,
+                                                        LogLevel::Warn,
+                                                        format!("unknown change type received: {changeset:?}"),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        send_error(
+                            &mut stream,
+                            format!("could not open bi-directional stream with {peer_addr}: {e}"),
+                        )
+                        .await;
+                        continue;
+                    }
+                },
             },
             Ok(None) => {
                 debug!("done with admin conn");

@@ -808,7 +808,10 @@ fn diff_member_states(
             match last_states.entry(*id) {
                 Entry::Occupied(mut entry) => {
                     let (prev_member, prev_rtt) = entry.get();
-                    if prev_member != member || *prev_rtt != rtt {
+                    let member_differed = prev_member != member;
+                    let rtt_differed = *prev_rtt != rtt;
+                    if member_differed || rtt_differed {
+                        debug!("member differed? {member_differed}, rtt differed? {rtt_differed} (prev: {prev_rtt:?}, new: {rtt:?})");
                         entry.insert((member.clone(), rtt));
                         Some((member.clone(), rtt))
                     } else {
@@ -1008,7 +1011,7 @@ mod tests {
     use crate::agent::spawn_unipayload_handler;
     use corro_tests::launch_test_agent;
     use corro_types::{
-        base::{CrsqlSeq, Version},
+        base::{CrsqlSeq, CrsqlSiteVersion},
         broadcast::{BroadcastV1, ChangeV1, Changeset},
     };
     use uuid::Uuid;
@@ -1064,10 +1067,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_broadcast_order() -> eyre::Result<()> {
-        tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .init();
+        _ = tracing_subscriber::fmt().try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
         let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
@@ -1104,7 +1104,7 @@ mod tests {
                 .send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: Version(i),
+                        version: CrsqlSiteVersion(i),
                         changes: vec![],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
@@ -1126,7 +1126,10 @@ mod tests {
                 let changes = tokio::time::timeout(Duration::from_secs(5), rx_changes.recv())
                     .await?
                     .unwrap();
-                assert_eq!(changes.0.versions(), Version(i)..=Version(i));
+                assert_eq!(
+                    changes.0.versions(),
+                    CrsqlSiteVersion(i)..=CrsqlSiteVersion(i)
+                );
             }
         }
 

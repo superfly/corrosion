@@ -15,6 +15,7 @@ use std::{
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
+use corro_base_types::CrsqlSiteVersion;
 use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
@@ -37,13 +38,16 @@ use tripwire::Tripwire;
 use crate::updates::UpdatesManager;
 use crate::{
     actor::{Actor, ActorId, ClusterId},
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     channel::{bounded, CorroSender},
     config::Config,
     pubsub::SubsManager,
     schema::Schema,
-    sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn, Migration, SqlitePool, SqlitePoolError},
+    sqlite::{
+        rusqlite_to_crsqlite, rusqlite_to_crsqlite_write, setup_conn, CrConn, Migration,
+        SqlitePool, SqlitePoolError,
+    },
 };
 
 use super::members::Members;
@@ -64,8 +68,8 @@ pub struct AgentConfig {
     pub booked: Booked,
 
     pub tx_bcast: CorroSender<BroadcastInput>,
-    pub tx_apply: CorroSender<(ActorId, Version)>,
-    pub tx_clear_buf: CorroSender<(ActorId, RangeInclusive<Version>)>,
+    pub tx_apply: CorroSender<(ActorId, CrsqlSiteVersion)>,
+    pub tx_clear_buf: CorroSender<(ActorId, RangeInclusive<CrsqlSiteVersion>)>,
     pub tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
     pub tx_emptyset: CorroSender<ChangeV1>,
     pub tx_foca: CorroSender<FocaInput>,
@@ -93,8 +97,8 @@ pub struct AgentInner {
     clock: Arc<uhlc::HLC>,
     booked: Booked,
     tx_bcast: CorroSender<BroadcastInput>,
-    tx_apply: CorroSender<(ActorId, Version)>,
-    tx_clear_buf: CorroSender<(ActorId, RangeInclusive<Version>)>,
+    tx_apply: CorroSender<(ActorId, CrsqlSiteVersion)>,
+    tx_clear_buf: CorroSender<(ActorId, RangeInclusive<CrsqlSiteVersion>)>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
     tx_emptyset: CorroSender<ChangeV1>,
     tx_foca: CorroSender<FocaInput>,
@@ -178,7 +182,7 @@ impl Agent {
         &self.0.tx_bcast
     }
 
-    pub fn tx_apply(&self) -> &CorroSender<(ActorId, Version)> {
+    pub fn tx_apply(&self) -> &CorroSender<(ActorId, CrsqlSiteVersion)> {
         &self.0.tx_apply
     }
 
@@ -190,7 +194,7 @@ impl Agent {
         &self.0.tx_emptyset
     }
 
-    pub fn tx_clear_buf(&self) -> &CorroSender<(ActorId, RangeInclusive<Version>)> {
+    pub fn tx_clear_buf(&self) -> &CorroSender<(ActorId, RangeInclusive<CrsqlSiteVersion>)> {
         &self.0.tx_clear_buf
     }
 
@@ -266,9 +270,19 @@ pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result
         Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_ts_index_bookkeeping_table),
         Box::new(create_sync_state(clock)),
+        Box::new(use_site_version),
     ];
 
     crate::sqlite::migrate(conn, migrations)
+}
+
+fn use_site_version(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "
+        ALTER TABLE __corro_buffered_changes RENAME COLUMN version TO site_version;
+        ALTER TABLE __corro_seq_bookkeeping RENAME COLUMN version TO site_version;
+    ",
+    )
 }
 
 fn create_impacted_versions(tx: &Transaction) -> rusqlite::Result<()> {
@@ -544,7 +558,7 @@ pub enum ChangeError {
     Rusqlite {
         source: rusqlite::Error,
         actor_id: Option<ActorId>,
-        version: Option<Version>,
+        version: Option<CrsqlSiteVersion>,
     },
     #[error("non-contiguous empties range delete")]
     NonContiguousDelete,
@@ -611,7 +625,7 @@ impl SplitPool {
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
             .max_size(1)
-            .create_pool_transform(rusqlite_to_crsqlite)?;
+            .create_pool_transform(rusqlite_to_crsqlite_write)?;
 
         debug!("built RW pool");
 
@@ -682,6 +696,10 @@ impl SplitPool {
         Handle::current().block_on(self.0.read.get())
     }
 
+    pub fn drain_read(&self) {
+        self.0.read.retain(|_, _| false);
+    }
+
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn dedicated(&self) -> rusqlite::Result<Connection> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
@@ -692,7 +710,7 @@ impl SplitPool {
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
-        rusqlite_to_crsqlite(conn)
+        rusqlite_to_crsqlite_write(conn)
     }
 
     // get a high priority write connection (e.g. client input)
@@ -1168,21 +1186,20 @@ pub enum KnownDbVersion {
 #[derive(Debug)]
 pub struct VersionsSnapshot {
     actor_id: ActorId,
-    needed: RangeInclusiveSet<Version>,
-    partials: BTreeMap<Version, PartialVersion>,
-    max: Option<Version>,
-    last_cleared_ts: Option<Timestamp>,
+    needed: RangeInclusiveSet<CrsqlSiteVersion>,
+    partials: BTreeMap<CrsqlSiteVersion, PartialVersion>,
+    max: Option<CrsqlSiteVersion>,
 }
 
 impl VersionsSnapshot {
-    pub fn needed(&self) -> &RangeInclusiveSet<Version> {
+    pub fn needed(&self) -> &RangeInclusiveSet<CrsqlSiteVersion> {
         &self.needed
     }
 
     pub fn insert_db(
         &mut self,         // only because we want 1 mt a time here
         conn: &Connection, // usually a `Transaction`
-        versions: RangeInclusiveSet<Version>,
+        versions: RangeInclusiveSet<CrsqlSiteVersion>,
     ) -> rusqlite::Result<()> {
         trace!("wants to insert into db {versions:?}");
         let mut changes = self.compute_gaps_change(versions);
@@ -1223,7 +1240,7 @@ impl VersionsSnapshot {
                 });
 
             if let Err(e) = res {
-                let (actor_id, start, end) : (ActorId, Version, Version) = conn.query_row("SELECT actor_id, start, end FROM __corro_bookkeeping_gaps WHERE actor_id = :actor_id AND start = :start", named_params! {
+                let (actor_id, start, end) : (ActorId, CrsqlSiteVersion, CrsqlSiteVersion) = conn.query_row("SELECT actor_id, start, end FROM __corro_bookkeeping_gaps WHERE actor_id = :actor_id AND start = :start", named_params! {
                     ":actor_id": self.actor_id,
                     ":start": range.start(),
                 }, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
@@ -1240,17 +1257,7 @@ impl VersionsSnapshot {
         Ok(())
     }
 
-    pub fn update_cleared_ts(&mut self, conn: &Connection, ts: Timestamp) -> rusqlite::Result<()> {
-        if self.last_cleared_ts.is_none() || self.last_cleared_ts.unwrap() < ts {
-            self.last_cleared_ts = Some(ts);
-            conn.prepare_cached("INSERT OR REPLACE INTO __corro_sync_state VALUES (?, ?)")?
-                .execute((self.actor_id, ts))?;
-        }
-
-        Ok(())
-    }
-
-    fn compute_gaps_change(&self, versions: RangeInclusiveSet<Version>) -> GapsChanges {
+    fn compute_gaps_change(&self, versions: RangeInclusiveSet<CrsqlSiteVersion>) -> GapsChanges {
         trace!("needed: {:?}", self.needed);
 
         let mut changes = GapsChanges {
@@ -1275,7 +1282,7 @@ impl VersionsSnapshot {
             }
 
             // check if there's a previous range with an end version = start version - 1
-            if let Some(range) = self.needed.get(&Version(versions.start().0 - 1)) {
+            if let Some(range) = self.needed.get(&CrsqlSiteVersion(versions.start().0 - 1)) {
                 trace!(actor_id = %self.actor_id, "got a start - 1: {range:?}");
                 // insert the collapsible range
                 changes.insert_set.insert(range.clone());
@@ -1284,7 +1291,7 @@ impl VersionsSnapshot {
             }
 
             // check if there's a next range with an start version = end version + 1
-            if let Some(range) = self.needed.get(&Version(versions.end().0 + 1)) {
+            if let Some(range) = self.needed.get(&CrsqlSiteVersion(versions.end().0 + 1)) {
                 trace!(actor_id = %self.actor_id, "got a end + 1: {range:?}");
                 // insert the collapsible range
                 changes.insert_set.insert(range.clone());
@@ -1343,10 +1350,9 @@ impl Drop for VersionsSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BookedVersions {
     actor_id: ActorId,
-    pub partials: BTreeMap<Version, PartialVersion>,
-    needed: RangeInclusiveSet<Version>,
-    max: Option<Version>,
-    last_cleared_ts: Option<Timestamp>,
+    pub partials: BTreeMap<CrsqlSiteVersion, PartialVersion>,
+    needed: RangeInclusiveSet<CrsqlSiteVersion>,
+    max: Option<CrsqlSiteVersion>,
 }
 
 impl BookedVersions {
@@ -1356,7 +1362,6 @@ impl BookedVersions {
             partials: Default::default(),
             needed: Default::default(),
             max: Default::default(),
-            last_cleared_ts: Default::default(),
         }
     }
 
@@ -1371,15 +1376,14 @@ impl BookedVersions {
         // fetch the biggest version we know, a partial version might override
         // this below
         bv.max = conn
-            .prepare_cached(
-                "SELECT MAX(start_version) FROM __corro_bookkeeping WHERE actor_id = ?",
-            )?
-            .query_row([actor_id], |row| row.get(0))?;
+            .prepare_cached("SELECT version FROM crsql_site_versions WHERE site_id = ?")?
+            .query_row([actor_id], |row| row.get(0))
+            .optional()?;
 
         {
             // fetch known partial sequences
             let mut prepped = conn.prepare_cached(
-            "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
+            "SELECT site_version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
             )?;
             let mut rows = prepped.query([actor_id])?;
 
@@ -1402,8 +1406,6 @@ impl BookedVersions {
                 }
             }
         }
-
-        bv.last_cleared_ts = get_last_cleared_ts(conn, actor_id)?;
 
         let mut snap = bv.snapshot();
 
@@ -1435,7 +1437,7 @@ impl BookedVersions {
         Ok(bv)
     }
 
-    pub fn contains_version(&self, version: &Version) -> bool {
+    pub fn contains_version(&self, version: &CrsqlSiteVersion) -> bool {
         // corrosion knows about a version if...
 
         // it's not in the list of needed versions
@@ -1446,11 +1448,15 @@ impl BookedVersions {
         // then it fulfills the previous conditions
     }
 
-    pub fn get_partial(&self, version: &Version) -> Option<&PartialVersion> {
+    pub fn get_partial(&self, version: &CrsqlSiteVersion) -> Option<&PartialVersion> {
         self.partials.get(version)
     }
 
-    pub fn contains(&self, version: Version, seqs: Option<&RangeInclusive<CrsqlSeq>>) -> bool {
+    pub fn contains(
+        &self,
+        version: CrsqlSiteVersion,
+        seqs: Option<&RangeInclusive<CrsqlSeq>>,
+    ) -> bool {
         self.contains_version(&version)
             && seqs
                 .map(|check_seqs| match self.partials.get(&version) {
@@ -1464,17 +1470,14 @@ impl BookedVersions {
 
     pub fn contains_all(
         &self,
-        mut versions: RangeInclusive<Version>,
+        mut versions: RangeInclusive<CrsqlSiteVersion>,
         seqs: Option<&RangeInclusive<CrsqlSeq>>,
     ) -> bool {
         versions.all(|version| self.contains(version, seqs))
     }
 
-    pub fn last(&self) -> Option<Version> {
+    pub fn last(&self) -> Option<CrsqlSiteVersion> {
         self.max
-    }
-    pub fn last_cleared_ts(&self) -> Option<Timestamp> {
-        self.last_cleared_ts
     }
 
     pub fn commit_snapshot(&mut self, mut snap: VersionsSnapshot) {
@@ -1482,17 +1485,6 @@ impl BookedVersions {
         self.needed = std::mem::take(&mut snap.needed);
         self.partials = std::mem::take(&mut snap.partials);
         self.max = snap.max.take();
-        if let Some(ts) = snap.last_cleared_ts {
-            if self.last_cleared_ts.is_none() || self.last_cleared_ts().unwrap() < ts {
-                self.last_cleared_ts = Some(ts)
-            }
-        }
-    }
-
-    pub fn update_cleared_ts(&mut self, ts: Timestamp) {
-        if self.last_cleared_ts.is_none() || self.last_cleared_ts().unwrap() < ts {
-            self.last_cleared_ts = Some(ts)
-        }
     }
 
     pub fn snapshot(&self) -> VersionsSnapshot {
@@ -1502,12 +1494,15 @@ impl BookedVersions {
             needed: self.needed.clone(),
             partials: self.partials.clone(),
             max: self.max,
-            last_cleared_ts: self.last_cleared_ts,
         }
     }
 
     // used when the commit has succeeded
-    pub fn insert_partial(&mut self, version: Version, partial: PartialVersion) -> PartialVersion {
+    pub fn insert_partial(
+        &mut self,
+        version: CrsqlSiteVersion,
+        partial: PartialVersion,
+    ) -> PartialVersion {
         debug!(actor_id = %self.actor_id, "insert partial {version:?}");
 
         match self.partials.entry(version) {
@@ -1523,27 +1518,16 @@ impl BookedVersions {
         }
     }
 
-    pub fn needed(&self) -> &RangeInclusiveSet<Version> {
+    pub fn needed(&self) -> &RangeInclusiveSet<CrsqlSiteVersion> {
         &self.needed
     }
 }
 
-pub fn get_last_cleared_ts(
-    conn: &Connection,
-    actor_id: ActorId,
-) -> rusqlite::Result<Option<Timestamp>> {
-    let ts = conn
-        .prepare_cached("SELECT last_cleared_ts FROM __corro_sync_state WHERE actor_id = ?")?
-        .query_row([actor_id], |row| row.get(0))
-        .optional()?;
-    Ok(ts)
-}
-
 #[derive(Debug)]
 pub struct GapsChanges {
-    max: Option<Version>,
-    insert_set: RangeInclusiveSet<Version>,
-    remove_ranges: HashSet<RangeInclusive<Version>>,
+    max: Option<CrsqlSiteVersion>,
+    insert_set: RangeInclusiveSet<CrsqlSiteVersion>,
+    remove_ranges: HashSet<RangeInclusive<CrsqlSiteVersion>>,
 }
 
 pub type BookedInner = Arc<CountedTokioRwLock<BookedVersions>>;
@@ -1700,68 +1684,6 @@ impl Bookie {
     }
 }
 
-/// Prune the database
-pub fn find_overwritten_versions(
-    conn: &Connection,
-) -> rusqlite::Result<BTreeMap<ActorId, RangeInclusiveSet<Version>>> {
-    debug!("find_overwritten_versions");
-
-    let mut prepped = conn.prepare_cached("
-        SELECT v.db_version, si.site_id, EXISTS (SELECT 1 FROM crsql_changes AS c WHERE c.site_id = si.site_id AND c.db_version = v.db_version), bk.start_version
-            FROM __corro_versions_impacted AS v
-            INNER JOIN crsql_site_id AS si ON si.ordinal = v.site_id
-            INNER JOIN __corro_bookkeeping AS bk WHERE bk.actor_id = si.site_id AND bk.db_version IS v.db_version
-        ")?;
-
-    let mut rows = prepped.query([])?;
-
-    let mut all_versions: BTreeMap<ActorId, RangeInclusiveSet<Version>> = BTreeMap::new();
-
-    loop {
-        let row = match rows.next()? {
-            Some(row) => row,
-            None => break,
-        };
-
-        let db_version: CrsqlDbVersion = row.get(0)?;
-        trace!("db version: {db_version}");
-
-        let actor_id = match row.get::<_, Option<ActorId>>(1)? {
-            Some(actor_id) => actor_id,
-            None => {
-                warn!("missing actor_id for an impacted version with db_version = {db_version}");
-                continue;
-            }
-        };
-        trace!("actor_id: {actor_id}");
-
-        let exists: bool = row.get(2)?;
-
-        debug!("exists? {exists}");
-
-        if !exists {
-            debug!("version is gone now");
-            let version = match row.get::<_, Option<Version>>(3)? {
-                Some(version) => version,
-                None => {
-                    warn!("missing start_version for an impacted version: actor_id = {actor_id}, db_version = {db_version}");
-                    continue;
-                }
-            };
-
-            all_versions
-                .entry(actor_id)
-                .or_default()
-                .insert(version..=version);
-        }
-    }
-
-    conn.prepare_cached("DELETE FROM __corro_versions_impacted")?
-        .execute([])?;
-
-    Ok(all_versions)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1785,7 +1707,7 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(1)..=Version(20)],
+            range_inclusive_set![CrsqlSiteVersion(1)..=CrsqlSiteVersion(20)],
         )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
@@ -1793,7 +1715,7 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(1)..=Version(10)],
+            range_inclusive_set![CrsqlSiteVersion(1)..=CrsqlSiteVersion(10)],
         )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
@@ -1806,16 +1728,27 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(1)..=Version(1), Version(4)..=Version(4)],
+            range_inclusive_set![
+                CrsqlSiteVersion(1)..=CrsqlSiteVersion(1),
+                CrsqlSiteVersion(4)..=CrsqlSiteVersion(4)
+            ],
         )?;
-        expect_gaps(&conn, &bv, &all, vec![Version(2)..=Version(3)])?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![CrsqlSiteVersion(2)..=CrsqlSiteVersion(3)],
+        )?;
 
         // fill gap
         insert_everywhere(
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(3)..=Version(3), Version(2)..=Version(2)],
+            range_inclusive_set![
+                CrsqlSiteVersion(3)..=CrsqlSiteVersion(3),
+                CrsqlSiteVersion(2)..=CrsqlSiteVersion(2)
+            ],
         )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
@@ -1828,33 +1761,48 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(5)..=Version(20)],
+            range_inclusive_set![CrsqlSiteVersion(5)..=CrsqlSiteVersion(20)],
         )?;
-        expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(4)])?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![CrsqlSiteVersion(1)..=CrsqlSiteVersion(4)],
+        )?;
 
         // insert a further change that does not overlap a gap
         insert_everywhere(
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(6)..=Version(7)],
+            range_inclusive_set![CrsqlSiteVersion(6)..=CrsqlSiteVersion(7)],
         )?;
-        expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(4)])?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![CrsqlSiteVersion(1)..=CrsqlSiteVersion(4)],
+        )?;
 
         // insert a further change that does overlap a gap
         insert_everywhere(
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(3)..=Version(7)],
+            range_inclusive_set![CrsqlSiteVersion(3)..=CrsqlSiteVersion(7)],
         )?;
-        expect_gaps(&conn, &bv, &all, vec![Version(1)..=Version(2)])?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![CrsqlSiteVersion(1)..=CrsqlSiteVersion(2)],
+        )?;
 
         insert_everywhere(
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(1)..=Version(2)],
+            range_inclusive_set![CrsqlSiteVersion(1)..=CrsqlSiteVersion(2)],
         )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
@@ -1862,21 +1810,29 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(25)..=Version(25)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![Version(21)..=Version(24)])?;
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![Version(30)..=Version(35)],
+            range_inclusive_set![CrsqlSiteVersion(25)..=CrsqlSiteVersion(25)],
         )?;
         expect_gaps(
             &conn,
             &bv,
             &all,
-            vec![Version(21)..=Version(24), Version(26)..=Version(29)],
+            vec![CrsqlSiteVersion(21)..=CrsqlSiteVersion(24)],
+        )?;
+
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![CrsqlSiteVersion(30)..=CrsqlSiteVersion(35)],
+        )?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![
+                CrsqlSiteVersion(21)..=CrsqlSiteVersion(24),
+                CrsqlSiteVersion(26)..=CrsqlSiteVersion(29),
+            ],
         )?;
 
         // NOTE: overlapping partially from the end
@@ -1885,13 +1841,16 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(19)..=Version(22)],
+            range_inclusive_set![CrsqlSiteVersion(19)..=CrsqlSiteVersion(22)],
         )?;
         expect_gaps(
             &conn,
             &bv,
             &all,
-            vec![Version(23)..=Version(24), Version(26)..=Version(29)],
+            vec![
+                CrsqlSiteVersion(23)..=CrsqlSiteVersion(24),
+                CrsqlSiteVersion(26)..=CrsqlSiteVersion(29),
+            ],
         )?;
 
         // NOTE: overlapping partially from the start
@@ -1900,13 +1859,16 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(24)..=Version(25)],
+            range_inclusive_set![CrsqlSiteVersion(24)..=CrsqlSiteVersion(25)],
         )?;
         expect_gaps(
             &conn,
             &bv,
             &all,
-            vec![Version(23)..=Version(23), Version(26)..=Version(29)],
+            vec![
+                CrsqlSiteVersion(23)..=CrsqlSiteVersion(23),
+                CrsqlSiteVersion(26)..=CrsqlSiteVersion(29),
+            ],
         )?;
 
         // NOTE: overlapping 2 ranges
@@ -1915,9 +1877,14 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(23)..=Version(27)],
+            range_inclusive_set![CrsqlSiteVersion(23)..=CrsqlSiteVersion(27)],
         )?;
-        expect_gaps(&conn, &bv, &all, vec![Version(28)..=Version(29)])?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![CrsqlSiteVersion(28)..=CrsqlSiteVersion(29)],
+        )?;
 
         // NOTE: ineffective insert of already known ranges
 
@@ -1925,9 +1892,14 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(1)..=Version(20)],
+            range_inclusive_set![CrsqlSiteVersion(1)..=CrsqlSiteVersion(20)],
         )?;
-        expect_gaps(&conn, &bv, &all, vec![Version(28)..=Version(29)])?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &all,
+            vec![CrsqlSiteVersion(28)..=CrsqlSiteVersion(29)],
+        )?;
 
         // NOTE: overlapping no ranges, but encompassing a full range
 
@@ -1935,7 +1907,7 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(27)..=Version(30)],
+            range_inclusive_set![CrsqlSiteVersion(27)..=CrsqlSiteVersion(30)],
         )?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
@@ -1946,33 +1918,36 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(40)..=Version(45)],
+            range_inclusive_set![CrsqlSiteVersion(40)..=CrsqlSiteVersion(45)],
         )?;
         // create gap 46..=49
         insert_everywhere(
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(50)..=Version(55)],
+            range_inclusive_set![CrsqlSiteVersion(50)..=CrsqlSiteVersion(55)],
         )?;
 
         insert_everywhere(
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![Version(38)..=Version(47)],
+            range_inclusive_set![CrsqlSiteVersion(38)..=CrsqlSiteVersion(47)],
         )?;
         expect_gaps(
             &conn,
             &bv,
             &all,
-            vec![Version(36)..=Version(37), Version(48)..=Version(49)],
+            vec![
+                CrsqlSiteVersion(36)..=CrsqlSiteVersion(37),
+                CrsqlSiteVersion(48)..=CrsqlSiteVersion(49),
+            ],
         )?;
 
         // test loading a bv from the conn, they should be identical!
         let mut bv2 = BookedVersions::from_conn(&conn, actor_id)?;
         // manually set the last version because there's nothing in `__corro_bookkeeping`
-        bv2.max = Some(Version(55));
+        bv2.max = Some(CrsqlSiteVersion(55));
 
         assert_eq!(bv, bv2);
 
@@ -1982,8 +1957,8 @@ mod tests {
     fn insert_everywhere(
         conn: &Connection,
         bv: &mut BookedVersions,
-        all_versions: &mut RangeInclusiveSet<Version>,
-        versions: RangeInclusiveSet<Version>,
+        all_versions: &mut RangeInclusiveSet<CrsqlSiteVersion>,
+        versions: RangeInclusiveSet<CrsqlSiteVersion>,
     ) -> rusqlite::Result<()> {
         all_versions.extend(versions.clone());
         let mut snap = bv.snapshot();
@@ -1995,10 +1970,10 @@ mod tests {
     fn expect_gaps(
         conn: &Connection,
         bv: &BookedVersions,
-        all_versions: &RangeInclusiveSet<Version>,
-        expected: Vec<RangeInclusive<Version>>,
+        all_versions: &RangeInclusiveSet<CrsqlSiteVersion>,
+        expected: Vec<RangeInclusive<CrsqlSiteVersion>>,
     ) -> rusqlite::Result<()> {
-        let gaps: Vec<(ActorId, Version, Version)> = conn
+        let gaps: Vec<(ActorId, CrsqlSiteVersion, CrsqlSiteVersion)> = conn
             .prepare_cached("SELECT actor_id, start, end FROM __corro_bookkeeping_gaps")?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<Vec<_>, _>>()?;
