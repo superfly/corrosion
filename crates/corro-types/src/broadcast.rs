@@ -33,6 +33,7 @@ use crate::{
     channel::CorroSender,
     sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
+    updates::match_changes,
 };
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -74,6 +75,10 @@ pub enum BiPayloadV1 {
         actor_id: ActorId,
         #[speedy(default_on_eof)]
         trace_ctx: SyncTraceContextV1,
+    },
+    Follow {
+        from: Option<CrsqlDbVersion>,
+        local_only: bool,
     },
 }
 
@@ -147,6 +152,7 @@ pub struct ChangesetPerTablePk(IndexMap<ChangeRowKey, Vec<ColumnChange>>);
 pub enum ChangeSource {
     Broadcast,
     Sync,
+    Follow,
 }
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
@@ -578,7 +584,8 @@ pub async fn broadcast_changes(
 
                     trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
-                    agent.subs_manager().match_changes(&changes, db_version);
+                    match_changes(agent.subs_manager(), &changes, db_version);
+                    match_changes(agent.updates_manager(), &changes, db_version);
 
                     let tx_bcast = agent.tx_bcast().clone();
                     tokio::spawn(async move {

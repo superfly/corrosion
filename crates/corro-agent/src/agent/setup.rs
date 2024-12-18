@@ -2,6 +2,7 @@
 
 // External crates
 use arc_swap::ArcSwap;
+use backoff::Backoff;
 use camino::Utf8PathBuf;
 use indexmap::IndexMap;
 use metrics::counter;
@@ -26,8 +27,12 @@ use tripwire::Tripwire;
 // Internals
 use crate::{
     api::{
+        self,
         peer::gossip_server_endpoint,
-        public::pubsub::{process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache},
+        public::{
+            pubsub::{process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache},
+            update::SharedUpdateBroadcastCache,
+        },
     },
     transport::Transport,
 };
@@ -43,6 +48,7 @@ use corro_types::{
     schema::{init_schema, Schema},
     sqlite::CrConn,
 };
+use corro_types::{config::FollowFrom, updates::UpdatesManager};
 
 /// Runtime state for the Corrosion agent
 pub struct AgentOptions {
@@ -59,6 +65,7 @@ pub struct AgentOptions {
     pub rtt_rx: TokioReceiver<(SocketAddr, Duration)>,
     pub subs_manager: SubsManager,
     pub subs_bcast_cache: SharedMatcherBroadcastCache,
+    pub updates_bcast_cache: SharedUpdateBroadcastCache,
     pub tripwire: Tripwire,
 }
 
@@ -108,6 +115,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let subs_manager = SubsManager::default();
 
+    let updates_manager = UpdatesManager::default();
     // Setup subscription handlers
     let subs_bcast_cache = setup_spawn_subscriptions(
         &subs_manager,
@@ -117,6 +125,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         &tripwire,
     )
     .await?;
+
+    let updates_bcast_cache = SharedUpdateBroadcastCache::default();
 
     let cluster_id = {
         let conn = pool.read().await?;
@@ -223,7 +233,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let opts = AgentOptions {
         gossip_server_endpoint,
-        transport,
+        transport: transport.clone(),
         api_listeners,
         lock_registry,
         rx_bcast,
@@ -235,8 +245,11 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         rtt_rx,
         subs_manager: subs_manager.clone(),
         subs_bcast_cache,
+        updates_bcast_cache,
         tripwire: tripwire.clone(),
     };
+
+    let follow = conf.follow.clone();
 
     let agent = Agent::new(AgentConfig {
         actor_id,
@@ -258,8 +271,74 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         schema: RwLock::new(schema),
         cluster_id,
         subs_manager,
+        updates_manager,
         tripwire,
     });
+
+    if let Some(follow) = follow {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            let boff = Backoff::new(0)
+                .timeout_range(Duration::from_millis(100), Duration::from_secs(2))
+                .iter();
+
+            let addr = follow.addr;
+            let (mut last_from, specific_from) = if let FollowFrom::DbVersion(from) = follow.from {
+                (Some(from), true)
+            } else {
+                (None, false)
+            };
+
+            for dur in boff {
+                let from = {
+                    if let Some(from) = last_from.take() {
+                        from
+                    } else {
+                        let conn = agent.pool().read().await.unwrap();
+                        conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))
+                            .unwrap()
+                    }
+                };
+
+                info!("following from db_version = {from}");
+
+                match transport.open_bi(addr).await {
+                    Ok((tx, rx)) => {
+                        match api::peer::follow::follow(
+                            &agent,
+                            tx,
+                            rx,
+                            Some(from),
+                            false,
+                            follow.broadcast.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(dbv) => {
+                                info!("following terminated, last db version: {dbv:?}");
+                                last_from = dbv;
+                            }
+                            Err(e) => {
+                                error!("could not follow to the end: {e}");
+                                if specific_from {
+                                    last_from = Some(from);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("could not open bidirectional stream to {addr}: {e}");
+                    }
+                }
+
+                warn!("follow broken, retrying in {dur:?}");
+
+                tokio::time::sleep(dur).await
+            }
+
+            info!("follow loop done");
+        });
+    }
 
     Ok((agent, opts))
 }

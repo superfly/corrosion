@@ -1,4 +1,4 @@
-use crate::api::peer::serve_sync;
+use crate::api::peer::{follow::serve_follow, serve_sync};
 use corro_types::{
     agent::{Agent, Bookie},
     broadcast::{BiPayload, BiPayloadV1},
@@ -56,7 +56,12 @@ pub fn spawn_bipayload_handler(
                 let agent = agent.clone();
                 let bookie = bookie.clone();
                 async move {
-                    let mut framed = FramedRead::new(rx, LengthDelimitedCodec::builder().max_frame_length(100 * 1_024 * 1_024).new_codec());
+                    let mut framed = FramedRead::new(
+                        rx,
+                        LengthDelimitedCodec::builder()
+                            .max_frame_length(100 * 1_024 * 1_024)
+                            .new_codec(),
+                    );
 
                     loop {
                         match timeout(Duration::from_secs(5), StreamExt::next(&mut framed)).await {
@@ -72,30 +77,38 @@ pub fn spawn_bipayload_handler(
                                     match BiPayload::read_from_buffer(&b) {
                                         Ok(payload) => {
                                             match payload {
-                                                BiPayload::V1 {
-                                                    data:
-                                                        BiPayloadV1::SyncStart {
-                                                            actor_id,
-                                                            trace_ctx,
-                                                        },
-                                                    cluster_id,
-                                                } => {
-                                                    trace!(
-                                                        "framed read buffer len: {}",
-                                                        framed.read_buffer().len()
-                                                    );
+                                                BiPayload::V1 { data, cluster_id } => match data {
+                                                    BiPayloadV1::SyncStart {
+                                                        actor_id,
+                                                        trace_ctx,
+                                                    } => {
+                                                        trace!(
+                                                            "framed read buffer len: {}",
+                                                            framed.read_buffer().len()
+                                                        );
 
-                                                    // println!("got sync state: {state:?}");
-                                                    if let Err(e) = serve_sync(
-                                                        &agent, &bookie, actor_id, trace_ctx,
-                                                        cluster_id, framed, tx,
-                                                    )
-                                                    .await
-                                                    {
-                                                        warn!("could not complete receiving sync: {e}");
+                                                        // println!("got sync state: {state:?}");
+                                                        if let Err(e) = serve_sync(
+                                                            &agent, &bookie, actor_id, trace_ctx,
+                                                            cluster_id, framed, tx,
+                                                        )
+                                                        .await
+                                                        {
+                                                            warn!("could not complete receiving sync: {e}");
+                                                        }
+                                                        break;
                                                     }
-                                                    break;
-                                                }
+                                                    BiPayloadV1::Follow { from, local_only } => {
+                                                        if let Err(e) = serve_follow(
+                                                            &agent, from, local_only, tx,
+                                                        )
+                                                        .await
+                                                        {
+                                                            warn!("could not complete follow: {e}");
+                                                        }
+                                                        break;
+                                                    }
+                                                },
                                             }
                                         }
 

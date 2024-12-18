@@ -536,6 +536,21 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             conn.send_command(corro_admin::Command::Subs(corro_admin::SubsCommand::List))
                 .await?;
         }
+        Command::Debug(DebugCommand::Follow {
+            peer_addr,
+            from,
+            local_only,
+        }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Debug(
+                corro_admin::DebugCommand::Follow {
+                    peer_addr: *peer_addr,
+                    from: *from,
+                    local_only: *local_only,
+                },
+            ))
+            .await?;
+        }
     }
 
     Ok(())
@@ -704,6 +719,10 @@ enum Command {
     /// Subscription related commands
     #[command(subcommand)]
     Subs(SubsCommand),
+
+    /// Debug commands
+    #[command(subcommand)]
+    Debug(DebugCommand),
 }
 
 #[derive(Subcommand)]
@@ -798,5 +817,17 @@ enum SubsCommand {
         hash: Option<String>,
         #[arg(long)]
         id: Option<Uuid>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugCommand {
+    /// Follow a node's changes
+    Follow {
+        peer_addr: SocketAddr,
+        #[arg(long, default_value = None)]
+        from: Option<u64>,
+        #[arg(long, default_value_t = false)]
+        local_only: bool,
     },
 }

@@ -35,6 +35,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
+use crate::updates::UpdatesManager;
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     base::{CrsqlDbVersion, CrsqlSeq},
@@ -80,6 +81,8 @@ pub struct AgentConfig {
 
     pub subs_manager: SubsManager,
 
+    pub updates_manager: UpdatesManager,
+
     pub tripwire: Tripwire,
 }
 
@@ -104,6 +107,7 @@ pub struct AgentInner {
     cluster_id: ArcSwap<ClusterId>,
     limits: Limits,
     subs_manager: SubsManager,
+    updates_manager: UpdatesManager,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +140,7 @@ impl Agent {
                 sync: Arc::new(Semaphore::new(3)),
             },
             subs_manager: config.subs_manager,
+            updates_manager: config.updates_manager,
         }))
     }
 
@@ -239,6 +244,10 @@ impl Agent {
 
     pub fn subs_manager(&self) -> &SubsManager {
         &self.0.subs_manager
+    }
+
+    pub fn updates_manager(&self) -> &UpdatesManager {
+        &self.0.updates_manager
     }
 
     pub fn set_cluster_id(&self, cluster_id: ClusterId) {

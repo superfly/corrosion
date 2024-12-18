@@ -8,6 +8,7 @@ use crate::{
         metrics, setup, util, AgentOptions,
     },
     broadcast::runtime_loop,
+    transport::Transport,
 };
 use corro_types::{
     actor::ActorId,
@@ -26,12 +27,16 @@ use tripwire::Tripwire;
 ///
 /// First initialise `AgentOptions` state via `setup()`, then spawn a
 /// new task that runs the main agent state machine
-pub async fn start_with_config(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Bookie)> {
+pub async fn start_with_config(
+    conf: Config,
+    tripwire: Tripwire,
+) -> eyre::Result<(Agent, Bookie, Transport)> {
     let (agent, opts) = setup(conf.clone(), tripwire.clone()).await?;
+    let transport = opts.transport.clone();
 
     let bookie = run(agent.clone(), opts, conf.perf).await?;
 
-    Ok((agent, bookie))
+    Ok((agent, bookie, transport))
 }
 
 async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Result<Bookie> {
@@ -49,6 +54,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         rx_foca,
         subs_manager,
         subs_bcast_cache,
+        updates_bcast_cache,
         rtt_rx,
     } = opts;
 
@@ -96,6 +102,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         &agent,
         &tripwire,
         subs_bcast_cache,
+        updates_bcast_cache,
         &subs_manager,
         api_listeners,
     )

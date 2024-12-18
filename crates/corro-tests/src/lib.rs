@@ -79,7 +79,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 
     let schema_paths = conf.db.schema_paths.clone();
 
-    let (agent, bookie) = start_with_config(conf.clone(), tripwire).await?;
+    let (agent, bookie, _) = start_with_config(conf.clone(), tripwire).await?;
 
     {
         let client = corro_client::CorrosionApiClient::new(agent.api_addr());

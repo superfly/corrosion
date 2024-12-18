@@ -1,13 +1,24 @@
-use std::{fmt::Display, time::Duration};
+use std::{fmt::Display, net::SocketAddr, time::Duration};
 
+use bytes::BytesMut;
 use camino::Utf8PathBuf;
+use corro_agent::{
+    api::peer::{
+        encode_write_bipayload_msg,
+        follow::{read_follow_msg, FollowMessage, FollowMessageV1},
+    },
+    transport::Transport,
+};
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, Bookie, LockKind, LockMeta, LockState},
+    api::SqliteValueRef,
     base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
-    broadcast::{FocaCmd, FocaInput},
+    broadcast::{BiPayload, Changeset, FocaCmd, FocaInput},
+    pubsub::unpack_columns,
     sqlite::SqlitePoolError,
     sync::generate_sync,
+    updates::Handle,
 };
 use futures::{SinkExt, TryStreamExt};
 use rusqlite::{named_params, OptionalExtension};
@@ -21,7 +32,7 @@ use tokio::{
     task::block_in_place,
 };
 use tokio_serde::{formats::Json, Framed};
-use tokio_util::codec::LengthDelimitedCodec;
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
@@ -41,6 +52,7 @@ pub struct AdminConfig {
 pub fn start_server(
     agent: Agent,
     bookie: Bookie,
+    transport: Transport,
     config: AdminConfig,
     mut tripwire: Tripwire,
 ) -> Result<(), AdminError> {
@@ -74,8 +86,9 @@ pub fn start_server(
                 let agent = agent.clone();
                 let bookie = bookie.clone();
                 let config = config.clone();
+                let transport = transport.clone();
                 async move {
-                    if let Err(e) = handle_conn(agent, &bookie, config, stream).await {
+                    if let Err(e) = handle_conn(agent, &bookie, &transport, config, stream).await {
                         error!("could not handle admin connection: {e}");
                     }
                 }
@@ -95,6 +108,16 @@ pub enum Command {
     Cluster(ClusterCommand),
     Actor(ActorCommand),
     Subs(SubsCommand),
+    Debug(DebugCommand),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DebugCommand {
+    Follow {
+        peer_addr: SocketAddr,
+        from: Option<u64>,
+        local_only: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +216,7 @@ impl From<LockMeta> for LockMetaElapsed {
 async fn handle_conn(
     agent: Agent,
     bookie: &Bookie,
+    transport: &Transport,
     _config: AdminConfig,
     stream: UnixStream,
 ) -> Result<(), AdminError> {
@@ -475,6 +499,132 @@ async fn handle_conn(
                         }
                     };
                 }
+                Command::Debug(DebugCommand::Follow {
+                    peer_addr,
+                    from,
+                    local_only,
+                }) => match transport.open_bi(peer_addr).await {
+                    Ok((mut tx, recv)) => {
+                        let mut codec = LengthDelimitedCodec::builder()
+                            .max_frame_length(100 * 1_024 * 1_024)
+                            .new_codec();
+                        let mut encoding_buf = BytesMut::new();
+                        let mut buf = BytesMut::new();
+
+                        if let Err(e) = encode_write_bipayload_msg(
+                            &mut codec,
+                            &mut encoding_buf,
+                            &mut buf,
+                            BiPayload::V1 {
+                                data: corro_types::broadcast::BiPayloadV1::Follow {
+                                    from: from.map(CrsqlDbVersion),
+                                    local_only,
+                                },
+                                cluster_id: agent.cluster_id(),
+                            },
+                            &mut tx,
+                        )
+                        .await
+                        {
+                            send_error(
+                                &mut stream,
+                                format!("could not send follow payload to {peer_addr}: {e}"),
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        let mut framed = FramedRead::new(
+                            recv,
+                            LengthDelimitedCodec::builder()
+                                .max_frame_length(100 * 1_024 * 1_024)
+                                .new_codec(),
+                        );
+
+                        'msg: loop {
+                            match read_follow_msg(&mut framed).await {
+                                Ok(None) => {
+                                    send_success(&mut stream).await;
+                                    break;
+                                }
+                                Err(e) => {
+                                    send_error(
+                                        &mut stream,
+                                        format!("error receiving follow message: {e}"),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                Ok(Some(msg)) => {
+                                    match msg {
+                                        FollowMessage::V1(FollowMessageV1::Change(change)) => {
+                                            let actor_id = change.actor_id;
+                                            match change.changeset {
+                                                Changeset::Full {
+                                                    version,
+                                                    changes,
+                                                    ts,
+                                                    ..
+                                                } => {
+                                                    if let Err(e) = stream
+                                                        .send(Response::Json(serde_json::json!({
+                                                            "actor_id": actor_id,
+                                                            "type": "full",
+                                                            "version": version,
+                                                            "ts": ts.to_string(),
+                                                        })))
+                                                        .await
+                                                    {
+                                                        warn!("could not send to steam, breaking ({e})");
+                                                        break;
+                                                    }
+
+                                                    for change in changes {
+                                                        if let Err(e) = stream.send(
+                                                            Response::Json(
+                                                                serde_json::json!({
+                                                                    "table": change.table,
+                                                                    "pk": unpack_columns(&change.pk).unwrap().iter().map(SqliteValueRef::to_owned).collect::<Vec<_>>(),
+                                                                    "cid": change.cid,
+                                                                    "val": change.val,
+                                                                    "col_version": change.col_version,
+                                                                    "db_version": change.db_version,
+                                                                    "seq": change.seq,
+                                                                    "site_id": ActorId::from_bytes(change.site_id),
+                                                                    "cl": change.cl,
+                                                                }),
+                                                            ),
+                                                        )
+                                                        .await {
+                                                            warn!("could not send to steam, breaking ({e})");
+                                                            break 'msg;
+                                                        }
+                                                    }
+                                                }
+                                                changeset => {
+                                                    send_log(
+                                                        &mut stream,
+                                                        LogLevel::Warn,
+                                                        format!("unknown change type received: {changeset:?}"),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        send_error(
+                            &mut stream,
+                            format!("could not open bi-directional stream with {peer_addr}: {e}"),
+                        )
+                        .await;
+                        continue;
+                    }
+                },
             },
             Ok(None) => {
                 debug!("done with admin conn");
