@@ -2678,7 +2678,7 @@ mod tests {
                     INSERT INTO crsql_changes
                         ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
                     VALUES
-                        (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?,   ?)
+                        (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?,   1           )
                 "#,
                 )
                 .unwrap()
@@ -2691,7 +2691,7 @@ mod tests {
                     change.db_version,
                     &change.site_id,
                     change.cl,
-                    change.seq,
+                    change.seq
                 ])
                 .unwrap();
             }
