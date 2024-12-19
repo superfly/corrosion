@@ -935,7 +935,14 @@ pub async fn handle_changes(
         }
 
         let cost = change.processing_cost();
-        queue.push_back((change, src, Instant::now()));
+        queue.push_back((change.clone(), src, Instant::now()));
+        let tx_follow = agent.tx_follow().clone();
+        tokio::spawn(async move {
+            if let Err(e) = tx_follow.send(change) {
+                debug!("no receivers: {e}");
+            }
+        });
+        
 
         buf_cost += cost; // tracks the cost, not number of changes
     }

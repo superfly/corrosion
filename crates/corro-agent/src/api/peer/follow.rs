@@ -1,16 +1,16 @@
-use std::{io, time::Duration};
+use std::{collections::HashMap, io, time::Duration};
 
 use bytes::{BufMut, BytesMut};
 use corro_types::{
     actor::ActorId,
     agent::Agent,
-    api::row_to_change,
+    api::{row_to_change},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{BiPayload, ChangeSource, ChangeV1, Changeset, Timestamp},
     change::ChunkedChanges,
     config::FollowBroadcast,
     sqlite::SqlitePoolError,
-};
+}; 
 use futures::{Stream, StreamExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
@@ -149,6 +149,8 @@ pub async fn serve_follow(
 
     let actor_id = agent.actor_id();
 
+    let mut last_empty_ts: HashMap<ActorId, Timestamp> = HashMap::new();
+
     loop {
         let conn = agent.pool().read().await?;
 
@@ -207,8 +209,6 @@ pub async fn serve_follow(
                     })))
                     .map_err(|_| FollowError::ChannelClosed)?;
                 }
-
-                last_db_version = db_version; // record last db version processed for next go around
             }
 
             Ok::<_, FollowError>(())
@@ -217,6 +217,8 @@ pub async fn serve_follow(
         // prevents hot-looping
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+
+    Ok(())
 }
 
 pub async fn read_follow_msg<R: Stream<Item = std::io::Result<BytesMut>> + Unpin>(

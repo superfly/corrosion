@@ -22,9 +22,7 @@ use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
-    AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
-    RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
-    RwLockWriteGuard as TokioRwLockWriteGuard,
+    broadcast, AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit, RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard, RwLockWriteGuard as TokioRwLockWriteGuard
 };
 use tokio::{
     runtime::Handle,
@@ -79,6 +77,8 @@ pub struct AgentConfig {
 
     pub updates_manager: UpdatesManager,
 
+    pub tx_follow: broadcast::Sender<ChangeV1>,
+
     pub tripwire: Tripwire,
 }
 
@@ -104,6 +104,7 @@ pub struct AgentInner {
     limits: Limits,
     subs_manager: SubsManager,
     updates_manager: UpdatesManager,
+    tx_follow: broadcast::Sender<ChangeV1>
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +138,7 @@ impl Agent {
             },
             subs_manager: config.subs_manager,
             updates_manager: config.updates_manager,
+            tx_follow: config.tx_follow,
         }))
     }
 
@@ -188,6 +190,10 @@ impl Agent {
 
     pub fn tx_emptyset(&self) -> &CorroSender<ChangeV1> {
         &self.0.tx_emptyset
+    }
+
+    pub fn tx_follow(&self) -> &broadcast::Sender<ChangeV1> {
+        &self.0.tx_follow
     }
 
     pub fn tx_clear_buf(&self) -> &CorroSender<(ActorId, RangeInclusive<Version>)> {

@@ -17,8 +17,7 @@ use std::{
 use tokio::{
     net::TcpListener,
     sync::{
-        mpsc::{channel as tokio_channel, Receiver as TokioReceiver},
-        RwLock as TokioRwLock, Semaphore,
+        broadcast, mpsc::{channel as tokio_channel, Receiver as TokioReceiver}, RwLock as TokioRwLock, Semaphore
     },
 };
 use tracing::{debug, error, info, trace, warn};
@@ -250,6 +249,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     };
 
     let follow = conf.follow.clone();
+    let (tx_follow, _) = broadcast::channel(100);
 
     let agent = Agent::new(AgentConfig {
         actor_id,
@@ -267,6 +267,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tx_changes,
         tx_emptyset,
         tx_foca,
+        tx_follow,
         write_sema,
         schema: RwLock::new(schema),
         cluster_id,
