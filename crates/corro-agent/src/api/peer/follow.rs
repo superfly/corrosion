@@ -176,7 +176,7 @@ pub async fn serve_follow(
                 FROM __corro_bookkeeping
                 WHERE (db_version IS NOT NULL AND db_version > ?)
                     OR (db_version IS NULL and ts > ?)  {extra_where_clause} 
-                ORDER BY db_version IS NULL db_version ASC, ts ASC"))?;
+                ORDER BY db_version IS NULL, db_version ASC, ts ASC"))?;
 
             let map = |row: &Row| {
                 Ok((
