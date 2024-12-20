@@ -384,6 +384,7 @@ pub fn store_empty_changeset(
     }
 
     debug!(%actor_id, "stored empty changesets in {:?} (total)", start.elapsed());
+    Cleared
 
     Ok(inserted)
 }

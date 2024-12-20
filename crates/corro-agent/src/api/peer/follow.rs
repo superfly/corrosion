@@ -19,7 +19,7 @@ use rusqlite::{params_from_iter, Row, ToSql};
 use speedy::{Readable, Writable};
 use tokio::{sync::mpsc, task::block_in_place};
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
-use tracing::{debug, error, trace};
+use tracing::{debug, warn, error, trace};
 
 use super::{encode_write_bipayload_msg, BiPayloadSendError};
 
@@ -120,7 +120,7 @@ pub async fn serve_follow(
     local_only: bool,
     mut write: SendStream,
 ) -> Result<(), FollowError> {
-    let mut last_db_version = {
+    let last_db_version = {
         if let Some(db_version) = from {
             db_version
         } else {
@@ -129,9 +129,11 @@ pub async fn serve_follow(
         }
     };
 
+    let mut rx_follow = agent.tx_follow().subscribe();
     // channel provides backpressure
     let (tx, mut rx) = mpsc::channel(128);
 
+    let tx = tx.clone();
     tokio::spawn(async move {
         let mut codec = LengthDelimitedCodec::builder()
             .max_frame_length(100 * 1_024 * 1_024)
@@ -147,76 +149,90 @@ pub async fn serve_follow(
         Ok::<_, FollowError>(())
     });
 
+    {
+        let tx = tx.clone();
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            if let Err(e) = get_initial_row(agent, last_db_version, local_only, tx).await {
+                warn!("error sending initial rows: {e}");
+            }
+        });
+    }
+    
+
+    while let Ok(change) = rx_follow.recv().await {
+        tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(change)))
+                    .map_err(|_| FollowError::ChannelClosed)?;
+    }
+
+    warn!("send channel for followers have closed");
+    Ok(())
+}
+
+
+async fn get_initial_row(agent: Agent, last_db_version: CrsqlDbVersion, local_only: bool, tx: mpsc::Sender<FollowMessage>) -> Result<(), FollowError>  {
+    let conn = agent.pool().read().await?;
     let actor_id = agent.actor_id();
 
-    let mut last_empty_ts: HashMap<ActorId, Timestamp> = HashMap::new();
+    block_in_place(|| {
+        let (extra_where_clause, query_params): (_, Vec<&dyn ToSql>) = if local_only {
+            ("AND actor_id = ?", vec![&last_db_version, &actor_id])
+        } else {
+            ("", vec![&last_db_version])
+        };
 
-    loop {
-        let conn = agent.pool().read().await?;
+        let mut bk_prepped = conn.prepare_cached(&format!("SELECT actor_id, start_version, db_version, last_seq, ts FROM __corro_bookkeeping WHERE db_version IS NOT NULL AND db_version > ? {extra_where_clause} ORDER BY db_version ASC"))?;
 
-        block_in_place(|| {
-            let (extra_where_clause, query_params): (_, Vec<&dyn ToSql>) = if local_only {
-                ("AND actor_id = ?", vec![&last_db_version, &actor_id])
-            } else {
-                ("", vec![&last_db_version])
-            };
+        let map = |row: &Row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        };
 
-            let mut bk_prepped = conn.prepare_cached(&format!("SELECT actor_id, start_version, db_version, last_seq, ts FROM __corro_bookkeeping WHERE db_version IS NOT NULL AND db_version > ? {extra_where_clause} ORDER BY db_version ASC"))?;
+        // implicit read transaction
+        let bk_rows = bk_prepped.query_map(params_from_iter(query_params), map)?;
 
-            let map = |row: &Row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            };
+        for bk_res in bk_rows {
+            let (actor_id, version, db_version, last_seq, ts): (
+                ActorId,
+                Version,
+                CrsqlDbVersion,
+                CrsqlSeq,
+                Timestamp,
+            ) = bk_res?;
 
+            debug!("sending changes for: {actor_id} v{version} (db_version: {db_version})");
+
+            let mut prepped = conn.prepare_cached(
+                "SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = ? ORDER BY db_version ASC, seq ASC",
+            )?;
             // implicit read transaction
-            let bk_rows = bk_prepped.query_map(params_from_iter(query_params), map)?;
+            let rows = prepped.query_map([db_version], row_to_change)?;
 
-            for bk_res in bk_rows {
-                let (actor_id, version, db_version, last_seq, ts): (
-                    ActorId,
-                    Version,
-                    CrsqlDbVersion,
-                    CrsqlSeq,
-                    Timestamp,
-                ) = bk_res?;
+            let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, 8192);
 
-                debug!("sending changes for: {actor_id} v{version} (db_version: {db_version})");
-
-                let mut prepped = conn.prepare_cached(
-                    "SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = ? ORDER BY db_version ASC, seq ASC",
-                )?;
-                // implicit read transaction
-                let rows = prepped.query_map([db_version], row_to_change)?;
-
-                let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, 8192);
-
-                for changes_seqs in chunked {
-                    let (changes, seqs) = changes_seqs?;
-                    tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
-                        actor_id,
-                        changeset: Changeset::Full {
-                            version,
-                            changes,
-                            seqs,
-                            last_seq,
-                            ts,
-                        },
-                    })))
-                    .map_err(|_| FollowError::ChannelClosed)?;
-                }
+            for changes_seqs in chunked {
+                let (changes, seqs) = changes_seqs?;
+                tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version,
+                        changes,
+                        seqs,
+                        last_seq,
+                        ts,
+                    },
+                })))
+                .map_err(|_| FollowError::ChannelClosed)?;
             }
+        }
 
-            Ok::<_, FollowError>(())
-        })?;
-
-        // prevents hot-looping
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+        Ok::<_, FollowError>(())
+    })?;
 
     Ok(())
 }

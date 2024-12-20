@@ -527,25 +527,37 @@ pub async fn broadcast_changes(
                     match_changes(agent.subs_manager(), &changes, db_version);
                     match_changes(agent.updates_manager(), &changes, db_version);
 
+                    let change = ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Full {
+                            version,
+                            changes,
+                            seqs,
+                            last_seq,
+                            ts,
+                        },
+                    };
+
                     let tx_bcast = agent.tx_bcast().clone();
-                    // let tx_follow = agent.tx_follow().clone();
+                    let tx_follow = agent.tx_follow().clone();
+                    {
+                        let change = change.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tx_bcast
+                                .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(change )))
+                                .await
+                            {
+                                error!("could not send change message for broadcast: {e}");
+                            }
+                        });
+                    }
+
+
                     tokio::spawn(async move {
-                        if let Err(e) = tx_bcast
-                            .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
-                                ChangeV1 {
-                                    actor_id,
-                                    changeset: Changeset::Full {
-                                        version,
-                                        changes,
-                                        seqs,
-                                        last_seq,
-                                        ts,
-                                    },
-                                },
-                            )))
-                            .await
+                        if let Err(e) = tx_follow
+                            .send(change)
                         {
-                            error!("could not send change message for broadcast: {e}");
+                            error!("no receivers: {e}");
                         }
                     });
                 }

@@ -249,7 +249,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     };
 
     let follow = conf.follow.clone();
-    let (tx_follow, _) = broadcast::channel(100);
+    let (tx_follow, _) = broadcast::channel(1000);
 
     let agent = Agent::new(AgentConfig {
         actor_id,
