@@ -151,7 +151,7 @@ pub async fn serve_follow(
     let from_ts: Timestamp = {
         let conn = agent.pool().read().await?;
         conn.query_row(
-            "SELECT ts FROM __corro_bookkeeping WHERE db_version >= ? and (? or actor_id = ?) ORDER BY ts LIMIT 1",
+            "SELECT MIN(ts) FROM __corro_bookkeeping WHERE db_version >= ? and (? or actor_id = ?)",
             (last_db_version, !local_only, actor_id),
             |row| row.get(0),
         )
@@ -159,6 +159,7 @@ pub async fn serve_follow(
         .unwrap_or(Timestamp::from(agent.clock().new_timestamp()))
     };
 
+    debug!("sending cleared version since from - {from_ts}");
     let mut last_empty_ts: HashMap<ActorId, Timestamp> = HashMap::new();
     loop {
         let conn = agent.pool().read().await?;
@@ -255,6 +256,7 @@ pub async fn serve_follow(
                 for row in empty_rows {
                     let changeset = row?;
                     last_ts = changeset.ts();
+                    debug!("sending cleared versions for {actor_id}, versions - {:?}", changeset.versions());
                     tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
                         actor_id,
                         changeset,
