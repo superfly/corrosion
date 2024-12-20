@@ -234,6 +234,7 @@ pub async fn serve_follow(
                 }
             };
 
+            info!("sending cleared version since from - {from_ts} for {} actors", last_empty_ts.len());
             for id in actor_ids {
                 if !last_empty_ts.contains_key(&id) {
                     last_empty_ts.insert(actor_id, from_ts);
@@ -385,5 +386,49 @@ pub async fn follow(
 
 #[cfg(test)]
 mod tests {
-    // use super::*;
+    use corro_types::config::FollowFrom;
+    use corro_tests::launch_test_agent;
+    use axum::Extension;
+    use hyper::StatusCode;
+    use tripwire::Tripwire;
+    
+    use crate::{
+        api::{
+            public::{api_v1_db_schema, api_v1_transactions},
+        },
+    };
+    use corro_tests::*;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_follow() -> eyre::Result<()> {
+
+        _ = tracing_subscriber::fmt::try_init();
+
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let main = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+        let follower = launch_test_agent(|conf| conf.follow(main.agent.gossip_addr(), FollowFrom::Latest, None).build(), tripwire.clone()).await?;
+    
+        // setup the schema, for both nodes
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(main.agent.clone()),
+            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+        )
+        .await;
+    
+        assert_eq!(status_code, StatusCode::OK);
+    
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(follower.agent.clone()),
+            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK);
+    
+        // make about 50 transactions to ta1
+        insert_rows(follower.agent.clone(), 1, 50).await;
+
+        Ok(())
+    }
 }
