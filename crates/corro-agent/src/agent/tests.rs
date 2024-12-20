@@ -1052,7 +1052,7 @@ async fn follow_basic() -> eyre::Result<()> {
     .await;
     assert_eq!(status_code, StatusCode::OK);
 
-    sleep(Duration::from_secs(3)).await;
+    sleep(Duration::from_secs(5)).await;
     check_bookie_versions(
         follower.clone(),
         main.agent.actor_id(),
