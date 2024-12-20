@@ -769,24 +769,26 @@ pub async fn process_multiple_changes(
             continue;
         }
 
-        let booked_writer = {
-            bookie
-                .write(
-                    "process_multiple_changes(ensure)",
+        if !change.is_empty() {
+            let booked_writer = {
+                bookie
+                    .write(
+                        "process_multiple_changes(ensure)",
+                        change.actor_id.as_simple(),
+                    )
+                    .await
+                    .ensure(change.actor_id)
+            };
+            if booked_writer
+                .read(
+                    "process_multiple_changes(contains_all?)",
                     change.actor_id.as_simple(),
                 )
                 .await
-                .ensure(change.actor_id)
-        };
-        if booked_writer
-            .read(
-                "process_multiple_changes(contains_all?)",
-                change.actor_id.as_simple(),
-            )
-            .await
-            .contains_all(change.versions(), change.seqs())
-        {
-            continue;
+                .contains_all(change.versions(), change.seqs())
+            {
+                continue;
+            }
         }
 
         unknown_changes
@@ -834,7 +836,7 @@ pub async fn process_multiple_changes(
                 trace!("handling a single changeset: {change:?}");
                 let seqs = change.seqs();
                 let ts = change.ts();
-                if booked_write.contains_all(change.versions(), change.seqs()) {
+                if !change.is_empty() && booked_write.contains_all(change.versions(), change.seqs()) {
                     trace!("previously unknown versions are now deemed known, aborting inserts");
                     continue;
                 }

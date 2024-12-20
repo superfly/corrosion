@@ -15,11 +15,11 @@ use futures::{Stream, StreamExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rand::{rngs::OsRng, Rng};
-use rusqlite::{params_from_iter, Row, ToSql};
+use rusqlite::{params_from_iter, OptionalExtension, Row, ToSql};
 use speedy::{Readable, Writable};
 use tokio::{sync::mpsc, task::block_in_place};
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, info, trace};
 
 use super::{encode_write_bipayload_msg, BiPayloadSendError};
 
@@ -148,18 +148,35 @@ pub async fn serve_follow(
     });
 
     let actor_id = agent.actor_id();
+    let mut from_ts: Timestamp = {
+        let conn = agent.pool().read().await?;
+        conn.query_row(
+            "SELECT MIN(ts) FROM __corro_bookkeeping WHERE db_version >= ? and (? or actor_id = ?)",
+            (last_db_version, !local_only, actor_id),
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(Timestamp::from(agent.clock().new_timestamp()))
+    };
+
+    debug!("sending cleared version since from - {from_ts}");
 
     loop {
         let conn = agent.pool().read().await?;
 
         block_in_place(|| {
             let (extra_where_clause, query_params): (_, Vec<&dyn ToSql>) = if local_only {
-                ("AND actor_id = ?", vec![&last_db_version, &actor_id])
+                ("AND actor_id = ?", vec![&last_db_version, &from_ts, &actor_id])
             } else {
-                ("", vec![&last_db_version])
+                ("", vec![&last_db_version, &from_ts])
             };
 
-            let mut bk_prepped = conn.prepare_cached(&format!("SELECT actor_id, start_version, db_version, last_seq, ts FROM __corro_bookkeeping WHERE db_version IS NOT NULL AND db_version > ? {extra_where_clause} ORDER BY db_version ASC"))?;
+
+            let mut bk_prepped = conn.prepare_cached(&format!("SELECT actor_id, start_version, end_version, db_version, last_seq, ts 
+                FROM __corro_bookkeeping
+                WHERE (db_version IS NOT NULL AND db_version > ?)
+                    OR (db_version IS NULL and ts > ?)  {extra_where_clause} 
+                ORDER BY db_version IS NULL, db_version ASC, ts ASC"))?;
 
             let map = |row: &Row| {
                 Ok((
@@ -168,6 +185,7 @@ pub async fn serve_follow(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             };
 
@@ -175,16 +193,33 @@ pub async fn serve_follow(
             let bk_rows = bk_prepped.query_map(params_from_iter(query_params), map)?;
 
             for bk_res in bk_rows {
-                let (actor_id, version, db_version, last_seq, ts): (
+                let (actor_id, start_version, end_version, db_version, last_seq, ts): (
                     ActorId,
                     Version,
-                    CrsqlDbVersion,
-                    CrsqlSeq,
+                    Option<Version>,
+                    Option<CrsqlDbVersion>,
+                    Option<CrsqlSeq>,
                     Timestamp,
                 ) = bk_res?;
 
-                debug!("sending changes for: {actor_id} v{version} (db_version: {db_version})");
+                debug!("sending changes for: {actor_id} v{start_version} (db_version: {db_version:?})");
 
+                if let Some(end) = end_version {
+                    tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Empty {
+                            versions: start_version..=end,
+                            ts: Some(ts),
+                        },
+                    })))
+                    .map_err(|_| FollowError::ChannelClosed)?;
+
+                    from_ts = ts;
+                    continue;
+                }
+
+                let last_seq = last_seq.unwrap();
+                let db_version:CrsqlDbVersion = db_version.unwrap();
                 let mut prepped = conn.prepare_cached(
                     "SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = ? ORDER BY db_version ASC, seq ASC",
                 )?;
@@ -198,7 +233,7 @@ pub async fn serve_follow(
                     tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
                         actor_id,
                         changeset: Changeset::Full {
-                            version,
+                            version: start_version,
                             changes,
                             seqs,
                             last_seq,
@@ -328,5 +363,5 @@ pub async fn follow(
 
 #[cfg(test)]
 mod tests {
-    // use super::*;
+    
 }
