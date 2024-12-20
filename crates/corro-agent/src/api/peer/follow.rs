@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{collections::HashMap, io, time::Duration};
 
 use bytes::{BufMut, BytesMut};
 use corro_types::{
@@ -15,7 +15,7 @@ use futures::{Stream, StreamExt};
 use metrics::counter;
 use quinn::{RecvStream, SendStream};
 use rand::{rngs::OsRng, Rng};
-use rusqlite::{params_from_iter, Row, ToSql};
+use rusqlite::{params_from_iter, OptionalExtension, Row, ToSql};
 use speedy::{Readable, Writable};
 use tokio::{sync::mpsc, task::block_in_place};
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
@@ -148,7 +148,18 @@ pub async fn serve_follow(
     });
 
     let actor_id = agent.actor_id();
+    let from_ts: Timestamp = {
+        let conn = agent.pool().read().await?;
+        conn.query_row(
+            "SELECT ts FROM __corro_bookkeeping WHERE db_version >= ? and (? or actor_id = ?) ORDER BY ts LIMIT 1",
+            (last_db_version, !local_only, actor_id),
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(Timestamp::from(agent.clock().new_timestamp()))
+    };
 
+    let mut last_empty_ts: HashMap<ActorId, Timestamp> = HashMap::new();
     loop {
         let conn = agent.pool().read().await?;
 
@@ -211,6 +222,50 @@ pub async fn serve_follow(
                 last_db_version = db_version; // record last db version processed for next go around
             }
 
+            // we do this everytime so we can pick up new actor_ids
+            let actor_ids = {
+                if local_only {
+                    vec![actor_id]
+                } else {
+                    conn.prepare_cached("SELECT DISTINCT actor_id FROM __corro_bookkeeping")?
+                        .query_map([], |row| Ok(row.get(0)?))
+                        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?
+                }
+            };
+
+            for id in actor_ids {
+                if !last_empty_ts.contains_key(&id) {
+                    last_empty_ts.insert(actor_id, from_ts);
+                }
+            }
+
+            for (actor_id, empty_ts) in last_empty_ts.clone() {
+                let mut empty_prepped = conn.prepare_cached(
+                    "SELECT start_version, end_version, ts FROM __corro_bookkeeping WHERE db_version IS NULL AND ts > ? AND actor_id = ?  ORDER BY ts ASC",
+                )?;
+
+                let empty_rows = empty_prepped.query_map((empty_ts, actor_id), |row| {
+                    Ok(Changeset::Empty {
+                        versions: row.get(0)?..=row.get(1)?,
+                        ts: row.get(2)?,
+                    })
+                })?;
+
+                let mut last_ts: Option<Timestamp> = None;
+                for row in empty_rows {
+                    let changeset = row?;
+                    last_ts = changeset.ts();
+                    tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
+                        actor_id,
+                        changeset,
+                    })))
+                    .map_err(|_| FollowError::ChannelClosed)?;
+                }
+
+                if let Some(ts) = last_ts {
+                    last_empty_ts.insert(actor_id, ts);
+                }
+            }
             Ok::<_, FollowError>(())
         })?;
 
