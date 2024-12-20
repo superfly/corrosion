@@ -32,7 +32,7 @@ use crate::{
     transport::Transport,
 };
 use corro_tests::*;
-use corro_types::broadcast::Timestamp;
+use corro_types::{broadcast::Timestamp, config::FollowFrom};
 use corro_types::change::Change;
 use corro_types::{
     actor::ActorId,
@@ -51,7 +51,7 @@ use corro_types::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn insert_rows_and_gossip() -> eyre::Result<()> {
+pub async fn insert_rows_and_gossip() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
@@ -1015,6 +1015,54 @@ async fn process_failed_changes() -> eyre::Result<()> {
         .query_row([], |row| row.get::<_, String>(0));
     assert!(res.is_err());
     assert_eq!(res, Err(rusqlite::Error::QueryReturnedNoRows));
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn follow_basic() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let main = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    // setup the schema, for both nodes
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(main.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+
+    assert_eq!(status_code, StatusCode::OK);
+
+    // make about 50 transactions to ta1
+    insert_rows(main.agent.clone(), 1, 20).await;
+    // clear some rows
+    insert_rows(main.agent.clone(), 10, 30).await;
+
+    let follower = launch_test_agent(|conf| conf.follow(main.agent.gossip_addr(), FollowFrom::Latest, None).build(), tripwire.clone()).await?;
+    let (status_code, _body) = api_v1_db_schema(
+        Extension(follower.agent.clone()),
+        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    sleep(Duration::from_secs(3)).await;
+    check_bookie_versions(
+        follower.clone(),
+        main.agent.actor_id(),
+        vec![Version(1)..=Version(9)],
+        vec![],
+        vec![],
+        vec![Version(10)..=Version(20)],
+    )
+    .await?;
+
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
