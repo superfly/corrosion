@@ -867,23 +867,21 @@ pub async fn handle_changes(
             counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
         }
 
-        if !change.is_empty() {
-            let booked = {
-                bookie
-                    .read("handle_change(get)", change.actor_id.as_simple())
-                    .await
-                    .get(&change.actor_id)
-                    .cloned()
-            };
-            if let Some(booked) = booked {
-                if booked
-                    .read("handle_change(contains?)", change.actor_id.as_simple())
-                    .await
-                    .contains_all(change.versions(), change.seqs())
-                {
-                    trace!("already seen, stop disseminating");
-                    continue;
-                }
+        let booked = {
+            bookie
+                .read("handle_change(get)", change.actor_id.as_simple())
+                .await
+                .get(&change.actor_id)
+                .cloned()
+        };
+        if let Some(booked) = booked {
+            if booked
+                .read("handle_change(contains?)", change.actor_id.as_simple())
+                .await
+                .contains_all(change.versions(), change.seqs())
+            {
+                trace!("already seen, stop disseminating");
+                continue;
             }
         }
 

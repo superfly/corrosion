@@ -55,7 +55,7 @@ pub enum FollowBroadcast {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(untagged, rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub enum FollowFrom {
     #[default]
     Latest,

@@ -769,27 +769,26 @@ pub async fn process_multiple_changes(
             continue;
         }
 
-        if !change.is_empty() {
-            let booked_writer = {
-                bookie
-                    .write(
-                        "process_multiple_changes(ensure)",
-                        change.actor_id.as_simple(),
-                    )
-                    .await
-                    .ensure(change.actor_id)
-            };
-            if booked_writer
-                .read(
-                    "process_multiple_changes(contains_all?)",
+        let booked_writer = {
+            bookie
+                .write(
+                    "process_multiple_changes(ensure)",
                     change.actor_id.as_simple(),
                 )
                 .await
-                .contains_all(change.versions(), change.seqs())
-            {
-                continue;
-            }
+                .ensure(change.actor_id)
+        };
+        if booked_writer
+            .read(
+                "process_multiple_changes(contains_all?)",
+                change.actor_id.as_simple(),
+            )
+            .await
+            .contains_all(change.versions(), change.seqs())
+        {
+            continue;
         }
+        
 
         unknown_changes
             .entry(change.actor_id)

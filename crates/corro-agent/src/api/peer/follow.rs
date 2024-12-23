@@ -1,9 +1,9 @@
-use std::{io, time::Duration};
+use std::{collections::HashMap, io, time::Duration};
 
 use bytes::{BufMut, BytesMut};
 use corro_types::{
     actor::ActorId,
-    agent::Agent,
+    agent::{Agent, Booked, Bookie},
     api::row_to_change,
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{BiPayload, ChangeSource, ChangeV1, Changeset, Timestamp},
@@ -20,6 +20,8 @@ use speedy::{Readable, Writable};
 use tokio::{sync::mpsc, task::block_in_place};
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace};
+
+use crate::agent::util::log_at_pow_10;
 
 use super::{encode_write_bipayload_msg, BiPayloadSendError};
 
@@ -119,6 +121,7 @@ pub async fn serve_follow(
     from: Option<CrsqlDbVersion>,
     local_only: bool,
     mut write: SendStream,
+    last_ts: HashMap<ActorId, Timestamp>,
 ) -> Result<(), FollowError> {
     let mut last_db_version = {
         if let Some(db_version) = from {
@@ -148,35 +151,25 @@ pub async fn serve_follow(
     });
 
     let actor_id = agent.actor_id();
-    let mut from_ts: Timestamp = {
-        let conn = agent.pool().read().await?;
-        conn.query_row(
-            "SELECT MIN(ts) FROM __corro_bookkeeping WHERE db_version >= ? and (? or actor_id = ?)",
-            (last_db_version, !local_only, actor_id),
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(Timestamp::from(agent.clock().new_timestamp()))
-    };
 
-    debug!("sending cleared version since from - {from_ts}");
-
+    let mut empties = last_ts;
     loop {
         let conn = agent.pool().read().await?;
 
         block_in_place(|| {
             let (extra_where_clause, query_params): (_, Vec<&dyn ToSql>) = if local_only {
-                ("AND actor_id = ?", vec![&last_db_version, &from_ts, &actor_id])
+                ("AND actor_id = ?", vec![&last_db_version, &actor_id])
             } else {
-                ("", vec![&last_db_version, &from_ts])
+                ("", vec![&last_db_version])
             };
 
-
-            let mut bk_prepped = conn.prepare_cached(&format!("SELECT actor_id, start_version, end_version, db_version, last_seq, ts 
+            let query = format!(
+                "SELECT actor_id, start_version, end_version, db_version, last_seq, ts
                 FROM __corro_bookkeeping
-                WHERE (db_version IS NOT NULL AND db_version > ?)
-                    OR (db_version IS NULL and ts > ?)  {extra_where_clause} 
-                ORDER BY db_version IS NULL, db_version ASC, ts ASC"))?;
+                WHERE (db_version IS NOT NULL AND db_version > ?) {extra_where_clause}
+                ORDER BY db_version ASC"
+            );
+            let mut bk_prepped = conn.prepare_cached(&query)?;
 
             let map = |row: &Row| {
                 Ok((
@@ -202,24 +195,26 @@ pub async fn serve_follow(
                     Timestamp,
                 ) = bk_res?;
 
-                debug!("sending changes for: {actor_id} v{start_version} (db_version: {db_version:?})");
+                debug!(
+                    "sending changes for: {actor_id} v{start_version} (db_version: {db_version:?})"
+                );
 
-                if let Some(end) = end_version {
-                    tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
-                        actor_id,
-                        changeset: Changeset::Empty {
-                            versions: start_version..=end,
-                            ts: Some(ts),
-                        },
-                    })))
-                    .map_err(|_| FollowError::ChannelClosed)?;
+                // if let Some(end) = end_version {
+                //     tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
+                //         actor_id,
+                //         changeset: Changeset::Empty {
+                //             versions: start_version..=end,
+                //             ts: Some(ts),
+                //         },
+                //     })))
+                //     .map_err(|_| FollowError::ChannelClosed)?;
 
-                    from_ts = ts;
-                    continue;
-                }
+                //     from_ts = ts;
+                //     continue;
+                // }
 
                 let last_seq = last_seq.unwrap();
-                let db_version:CrsqlDbVersion = db_version.unwrap();
+                let db_version: CrsqlDbVersion = db_version.unwrap();
                 let mut prepped = conn.prepare_cached(
                     "SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = ? ORDER BY db_version ASC, seq ASC",
                 )?;
@@ -244,6 +239,45 @@ pub async fn serve_follow(
                 }
 
                 last_db_version = db_version; // record last db version processed for next go around
+            }
+
+            let last_cleared_ts: HashMap<ActorId, Timestamp> = {
+                conn.prepare_cached("SELECT actor_id, last_cleared_ts FROM __corro_sync_state")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .and_then(|rows| rows.collect::<rusqlite::Result<HashMap<_, _>>>())?
+            };
+
+            for (actor_id, empty_ts) in last_cleared_ts {
+                let prev_ts = empties
+                    .get(&actor_id)
+                    .cloned()
+                    .unwrap_or(Default::default());
+
+                let mut empty_prepped = conn.prepare_cached(
+                    "SELECT start_version, end_version, ts FROM __corro_bookkeeping WHERE db_version IS NULL AND ts > ? and ts <= ? AND actor_id = ?  ORDER BY ts ASC",
+                )?;
+
+                let empty_rows = empty_prepped.query_map((prev_ts, empty_ts, actor_id), |row| {
+                    Ok(Changeset::Empty {
+                        versions: row.get(0)?..=row.get(1)?,
+                        ts: row.get(2)?,
+                    })
+                })?;
+
+                let mut last_ts: Option<Timestamp> = None;
+                for row in empty_rows {
+                    let changeset = row?;
+                    last_ts = changeset.ts();
+                    tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
+                        actor_id,
+                        changeset,
+                    })))
+                    .map_err(|_| FollowError::ChannelClosed)?;
+                }
+
+                if let Some(ts) = last_ts {
+                    empties.insert(actor_id, ts);
+                }
             }
 
             Ok::<_, FollowError>(())
@@ -287,31 +321,31 @@ pub async fn recv_follow(
                 error!("could not receive follow message: {e}");
                 break;
             }
-            Ok(Some(msg)) => match msg {
-                FollowMessage::V1(FollowMessageV1::Change(changeset)) => {
-                    let db_version = changeset.changes().first().map(|change| change.db_version);
-                    debug!(
-                        "received changeset for version(s) {:?} and db_version {db_version:?}",
-                        changeset.versions()
-                    );
-                    let change_src = if local_only
-                        || broadcast
-                            .map(|bcast| should_broadcast(&changeset.actor_id, bcast))
-                            .unwrap_or(false)
-                    {
-                        ChangeSource::Broadcast
-                    } else {
-                        ChangeSource::Follow
-                    };
-                    tx_changes
-                        .send((changeset, change_src))
-                        .await
-                        .map_err(|_| FollowError::ChannelClosed)?;
-                    if let Some(db_version) = db_version {
-                        last_db_version = Some(db_version);
+            Ok(Some(msg)) => {
+                match msg {
+                    FollowMessage::V1(FollowMessageV1::Change(changeset)) => {
+                        let db_version =
+                            changeset.changes().first().map(|change| change.db_version);
+                        debug!("received changeset for {}: version(s) {:?} and db_version {db_version:?}", changeset.actor_id, changeset.versions());
+                        let change_src = if local_only
+                            || broadcast
+                                .map(|bcast| should_broadcast(&changeset.actor_id, bcast))
+                                .unwrap_or(false)
+                        {
+                            ChangeSource::Broadcast
+                        } else {
+                            ChangeSource::Follow
+                        };
+                        tx_changes
+                            .send((changeset, change_src))
+                            .await
+                            .map_err(|_| FollowError::ChannelClosed)?;
+                        if let Some(db_version) = db_version {
+                            last_db_version = Some(db_version);
+                        }
                     }
                 }
-            },
+            }
         }
     }
 
@@ -327,6 +361,7 @@ fn should_broadcast(actor_id: &ActorId, broadcast: &FollowBroadcast) -> bool {
 
 pub async fn follow(
     agent: &Agent,
+    bookie: &Bookie,
     mut tx: SendStream,
     recv: RecvStream,
     from: Option<CrsqlDbVersion>,
@@ -339,12 +374,17 @@ pub async fn follow(
     let mut encoding_buf = BytesMut::new();
     let mut buf = BytesMut::new();
 
+    let empty_ts = all_cleared_ts(bookie).await;
     encode_write_bipayload_msg(
         &mut codec,
         &mut encoding_buf,
         &mut buf,
         BiPayload::V1 {
-            data: corro_types::broadcast::BiPayloadV1::Follow { from, local_only },
+            data: corro_types::broadcast::BiPayloadV1::Follow {
+                from,
+                local_only,
+                empty_ts,
+            },
             cluster_id: agent.cluster_id(),
         },
         &mut tx,
@@ -361,7 +401,27 @@ pub async fn follow(
     recv_follow(agent, framed, local_only, broadcast).await
 }
 
-#[cfg(test)]
-mod tests {
-    
+pub async fn all_cleared_ts(bookie: &Bookie) -> HashMap<ActorId, Timestamp> {
+    let actors: Vec<(ActorId, Booked)> = {
+        bookie
+            .read::<&str, _>("generate_sync", None)
+            .await
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    };
+
+    let mut empty_ts = HashMap::new();
+    for (actor_id, booked) in actors {
+        let bookedr = booked.read("generate_sync", actor_id.as_simple()).await;
+        let ts = bookedr.last_cleared_ts();
+        if let Some(ts) = ts {
+            empty_ts.insert(actor_id, ts);
+        }
+    }
+
+    empty_ts
 }
+
+#[cfg(test)]
+mod tests {}

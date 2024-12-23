@@ -42,7 +42,7 @@ use corro_types::{
     base::Version,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
-    config::Config,
+    config::{Config, FollowConfig},
     members::Members,
     pubsub::{Matcher, SubsManager},
     schema::{init_schema, Schema},
@@ -67,6 +67,7 @@ pub struct AgentOptions {
     pub subs_bcast_cache: SharedMatcherBroadcastCache,
     pub updates_bcast_cache: SharedUpdateBroadcastCache,
     pub tripwire: Tripwire,
+    pub follow: Option<FollowConfig>,
 }
 
 /// Setup an agent runtime and state with a configuration
@@ -247,9 +248,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         subs_bcast_cache,
         updates_bcast_cache,
         tripwire: tripwire.clone(),
+        follow: conf.follow.clone(),
     };
 
-    let follow = conf.follow.clone();
+    // let follow = conf.follow.clone();
 
     let agent = Agent::new(AgentConfig {
         actor_id,
@@ -275,70 +277,71 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tripwire,
     });
 
-    if let Some(follow) = follow {
-        let agent = agent.clone();
-        tokio::spawn(async move {
-            let boff = Backoff::new(0)
-                .timeout_range(Duration::from_millis(100), Duration::from_secs(2))
-                .iter();
+    // if let Some(follow) = follow {
+    //     let agent = agent.clone();
+    //     tokio::spawn(async move {
+    //         let boff = Backoff::new(0)
+    //             .timeout_range(Duration::from_millis(100), Duration::from_secs(2))
+    //             .iter();
 
-            let addr = follow.addr;
-            let (mut last_from, specific_from) = if let FollowFrom::DbVersion(from) = follow.from {
-                (Some(from), true)
-            } else {
-                (None, false)
-            };
+    //         let addr = follow.addr;
+    //         let (mut last_from, specific_from) = if let FollowFrom::DbVersion(from) = follow.from {
+    //             (Some(from), true)
+    //         } else {
+    //             (None, false)
+    //         };
 
-            for dur in boff {
-                let from = {
-                    if let Some(from) = last_from.take() {
-                        from
-                    } else {
-                        let conn = agent.pool().read().await.unwrap();
-                        conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))
-                            .unwrap()
-                    }
-                };
+    //         for dur in boff {
+    //             let from = {
+    //                 if let Some(from) = last_from.take() {
+    //                     from
+    //                 } else {
+    //                     info!("selecting");
+    //                     let conn = agent.pool().read().await.unwrap();
+    //                     conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))
+    //                         .unwrap()
+    //                 }
+    //             };
 
-                info!("following from db_version = {from}");
+    //             info!("following from db_version = {from}");
 
-                match transport.open_bi(addr).await {
-                    Ok((tx, rx)) => {
-                        match api::peer::follow::follow(
-                            &agent,
-                            tx,
-                            rx,
-                            Some(from),
-                            false,
-                            follow.broadcast.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(dbv) => {
-                                info!("following terminated, last db version: {dbv:?}");
-                                last_from = dbv;
-                            }
-                            Err(e) => {
-                                error!("could not follow to the end: {e}");
-                                if specific_from {
-                                    last_from = Some(from);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("could not open bidirectional stream to {addr}: {e}");
-                    }
-                }
+    //             match transport.open_bi(addr).await {
+    //                 Ok((tx, rx)) => {
+    //                     match api::peer::follow::follow(
+    //                         &agent,
+    //                         tx,
+    //                         rx,
+    //                         Some(from),
+    //                         false,
+    //                         follow.broadcast.as_ref(),
+    //                     )
+    //                     .await
+    //                     {
+    //                         Ok(dbv) => {
+    //                             info!("following terminated, last db version: {dbv:?}");
+    //                             last_from = dbv;
+    //                         }
+    //                         Err(e) => {
+    //                             error!("could not follow to the end: {e}");
+    //                             if specific_from {
+    //                                 last_from = Some(from);
+    //                             }
+    //                         }
+    //                     }
+    //                 }
+    //                 Err(e) => {
+    //                     error!("could not open bidirectional stream to {addr}: {e}");
+    //                 }
+    //             }
 
-                warn!("follow broken, retrying in {dur:?}");
+    //             warn!("follow broken, retrying in {dur:?}");
 
-                tokio::time::sleep(dur).await
-            }
+    //             tokio::time::sleep(dur).await
+    //         }
 
-            info!("follow loop done");
-        });
-    }
+    //         info!("follow loop done");
+    //     });
+    // }
 
     Ok((agent, opts))
 }

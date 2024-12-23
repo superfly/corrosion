@@ -7,20 +7,23 @@ use crate::{
         handlers::{self, spawn_handle_db_maintenance},
         metrics, setup, util, AgentOptions,
     },
+    api,
     broadcast::runtime_loop,
     transport::Transport,
 };
+use backoff::Backoff;
 use corro_types::{
     actor::ActorId,
     agent::{Agent, BookedVersions, Bookie},
     base::CrsqlSeq,
     channel::bounded,
-    config::{Config, PerfConfig},
+    config::{Config, FollowFrom, PerfConfig},
 };
 
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use spawn::spawn_counted;
-use tracing::{error, info};
+use tokio::time::Duration;
+use tracing::{error, info, warn};
 use tripwire::Tripwire;
 
 /// Start a new agent with an existing configuration
@@ -56,6 +59,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         subs_bcast_cache,
         updates_bcast_cache,
         rtt_rx,
+        follow,
     } = opts;
 
     // Get our gossip address and make sure it's valid
@@ -194,6 +198,75 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     }
 
     info!("Bookkeeping fully loaded in {:?}", start.elapsed());
+
+    if let Some(follow) = follow {
+        let agent = agent.clone();
+        let bookie = bookie.clone();
+        let transport = transport.clone();
+        tokio::spawn(async move {
+            let boff = Backoff::new(0)
+                .timeout_range(Duration::from_millis(100), Duration::from_secs(2))
+                .iter();
+
+            let addr = follow.addr;
+            let (mut last_from, specific_from) = if let FollowFrom::DbVersion(from) = follow.from {
+                (Some(from), true)
+            } else {
+                (None, false)
+            };
+
+            for dur in boff {
+                let from = {
+                    if let Some(from) = last_from.take() {
+                        from
+                    } else {
+                        info!("selecting");
+                        let conn = agent.pool().read().await.unwrap();
+                        conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))
+                            .unwrap()
+                    }
+                };
+
+                info!("following from db_version = {from}");
+
+                match transport.open_bi(addr).await {
+                    Ok((tx, rx)) => {
+                        match api::peer::follow::follow(
+                            &agent,
+                            &bookie,
+                            tx,
+                            rx,
+                            Some(from),
+                            false,
+                            follow.broadcast.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(dbv) => {
+                                info!("following terminated, last db version: {dbv:?}");
+                                last_from = dbv;
+                            }
+                            Err(e) => {
+                                error!("could not follow to the end: {e}");
+                                if specific_from {
+                                    last_from = Some(from);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("could not open bidirectional stream to {addr}: {e}");
+                    }
+                }
+
+                warn!("follow broken, retrying in {dur:?}");
+
+                tokio::time::sleep(dur).await
+            }
+
+            info!("follow loop done");
+        });
+    }
 
     spawn_counted(
         util::sync_loop(

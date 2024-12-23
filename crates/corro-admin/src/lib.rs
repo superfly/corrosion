@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Display,
     net::SocketAddr,
     time::{Duration, Instant},
@@ -9,7 +10,7 @@ use camino::Utf8PathBuf;
 use corro_agent::{
     api::peer::{
         encode_write_bipayload_msg,
-        follow::{read_follow_msg, FollowMessage, FollowMessageV1},
+        follow::{all_cleared_ts, read_follow_msg, FollowMessage, FollowMessageV1},
     },
     transport::Transport,
 };
@@ -642,6 +643,7 @@ async fn handle_conn(
                                 data: corro_types::broadcast::BiPayloadV1::Follow {
                                     from: from.map(CrsqlDbVersion),
                                     local_only,
+                                    empty_ts: all_cleared_ts(bookie).await,
                                 },
                                 cluster_id: agent.cluster_id(),
                             },
@@ -722,6 +724,20 @@ async fn handle_conn(
                                                             warn!("could not send to steam, breaking ({e})");
                                                             break 'msg;
                                                         }
+                                                    }
+                                                }
+                                                Changeset::Empty { versions, ts } => {
+                                                    if let Err(e) = stream
+                                                        .send(Response::Json(serde_json::json!({
+                                                            "actor_id": actor_id,
+                                                            "type": "empty",
+                                                            "version": versions,
+                                                            "ts": ts.unwrap().to_string(),
+                                                        })))
+                                                        .await
+                                                    {
+                                                        warn!("could not send to steam, breaking ({e})");
+                                                        break;
                                                     }
                                                 }
                                                 changeset => {

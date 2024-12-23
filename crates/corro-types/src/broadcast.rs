@@ -1,8 +1,5 @@
 use std::{
-    cmp, fmt, io,
-    num::NonZeroU32,
-    ops::{Deref, RangeInclusive},
-    time::Duration,
+    cmp, collections::HashMap, fmt, io, num::NonZeroU32, ops::{Deref, RangeInclusive}, time::Duration
 };
 
 use bytes::{Bytes, BytesMut};
@@ -68,6 +65,7 @@ pub enum BiPayloadV1 {
     Follow {
         from: Option<CrsqlDbVersion>,
         local_only: bool,
+        empty_ts: HashMap<ActorId, Timestamp>
     },
 }
 

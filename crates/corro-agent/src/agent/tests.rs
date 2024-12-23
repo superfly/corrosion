@@ -1029,6 +1029,14 @@ async fn follow_basic() -> eyre::Result<()> {
 
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let main = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta2 = launch_test_agent(
+        |conf| {
+            conf.bootstrap(vec![main.agent.gossip_addr().to_string()])
+                .build()
+        },
+        tripwire.clone(),
+    )
+    .await?;
 
     // setup the schema, for both nodes
     let (status_code, _body) = api_v1_db_schema(
@@ -1043,6 +1051,11 @@ async fn follow_basic() -> eyre::Result<()> {
     insert_rows(main.agent.clone(), 1, 20).await;
     // clear some rows
     insert_rows(main.agent.clone(), 10, 30).await;
+
+    // make about 50 transactions to ta1
+    insert_rows(ta2.agent.clone(), 41, 60).await;
+    // clear some rows
+    insert_rows(ta2.agent.clone(), 51, 60).await;
 
     let follower = launch_test_agent(|conf| conf.follow(main.agent.gossip_addr(), FollowFrom::Latest, None).build(), tripwire.clone()).await?;
     let (status_code, _body) = api_v1_db_schema(
@@ -1060,6 +1073,16 @@ async fn follow_basic() -> eyre::Result<()> {
         vec![],
         vec![],
         vec![Version(10)..=Version(20)],
+    )
+    .await?;
+
+    check_bookie_versions(
+        follower.clone(),
+        ta2.agent.actor_id(),
+        vec![Version(1)..=Version(10)],
+        vec![],
+        vec![],
+        vec![Version(11)..=Version(20)],
     )
     .await?;
 
@@ -1247,9 +1270,9 @@ async fn check_bookie_versions(
         for version in versions.clone() {
             let bk: Vec<(ActorId, Version, Option<Version>)> = conn
                 .prepare(
-                    "SELECT actor_id, start_version, end_version FROM __corro_bookkeeping where start_version = ?",
+                    "SELECT actor_id, start_version, end_version FROM __corro_bookkeeping where start_version = ? and actor_id = ?",
                 )?
-                .query_map([version], |row| {
+                .query_map((version, actor_id), |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?.collect::<rusqlite::Result<Vec<_>>>()?;
             assert_eq!(bk, vec![(actor_id, version, None)]);

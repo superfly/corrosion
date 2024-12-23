@@ -98,9 +98,13 @@ pub fn spawn_bipayload_handler(
                                                         }
                                                         break;
                                                     }
-                                                    BiPayloadV1::Follow { from, local_only } => {
+                                                    BiPayloadV1::Follow {
+                                                        from,
+                                                        local_only,
+                                                        empty_ts,
+                                                    } => {
                                                         if let Err(e) = serve_follow(
-                                                            &agent, from, local_only, tx,
+                                                            &agent, from, local_only, tx, empty_ts,
                                                         )
                                                         .await
                                                         {
