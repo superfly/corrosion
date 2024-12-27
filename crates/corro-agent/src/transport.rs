@@ -256,8 +256,9 @@ impl Transport {
                     .set(stats.path.congestion_events as f64);
                 gauge!("corro.transport.path.black_holes_detected", "addr" => addr.to_string())
                     .set(stats.path.black_holes_detected as f64);
+                gauge!("corro.transport.path.lost_packets", "addr" => addr.to_string())
+                    .set(stats.path.lost_packets as f64);
 
-                acc.path.lost_packets += stats.path.lost_packets;
                 acc.path.lost_bytes += stats.path.lost_bytes;
                 acc.path.sent_packets += stats.path.sent_packets;
                 acc.path.sent_plpmtud_probes += stats.path.sent_plpmtud_probes;
@@ -319,7 +320,6 @@ impl Transport {
 
                 acc
             });
-        gauge!("corro.transport.path.lost_packets").set(stats.path.lost_packets as f64);
         gauge!("corro.transport.path.lost_bytes").set(stats.path.lost_bytes as f64);
         gauge!("corro.transport.path.sent_packets").set(stats.path.sent_packets as f64);
         gauge!("corro.transport.path.sent_plpmtud_probes")
