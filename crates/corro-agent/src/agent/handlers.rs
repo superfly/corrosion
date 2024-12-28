@@ -650,7 +650,7 @@ pub async fn process_emptyset(
         debug!(self_actor_id = %agent.actor_id(), "processing emptyset changes, len: {}", versions.len());
         block_in_place(|| {
             let tx = conn
-                .immediate_transaction()
+                .immediate_transaction_timeout(Duration::from_secs(30))
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
                     actor_id: None,
@@ -701,7 +701,7 @@ pub async fn process_emptyset(
         .await;
 
     let tx = conn
-        .immediate_transaction()
+        .immediate_transaction_timeout(Duration::from_secs(30))
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: None,

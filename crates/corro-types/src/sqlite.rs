@@ -1,8 +1,9 @@
 use std::{
     ops::{Deref, DerefMut},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+use abort_on_drop::ChildTask;
 use once_cell::sync::Lazy;
 use rusqlite::{params, Connection, Transaction};
 use sqlite_pool::SqliteConn;
@@ -58,6 +59,17 @@ impl CrConn {
         self.0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
     }
+
+    pub fn immediate_transaction_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> rusqlite::Result<TimeoutTransaction> {
+        Ok(TimeoutTransaction::new(
+            self.0
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?,
+            Instant::now() + timeout,
+        ))
+    }
 }
 
 impl SqliteConn for CrConn {
@@ -85,6 +97,49 @@ impl Drop for CrConn {
         if let Err(e) = self.execute_batch("select crsql_finalize();") {
             error!("could not crsql_finalize: {e}");
         }
+    }
+}
+
+pub struct TimeoutTransaction<'conn> {
+    tx: Transaction<'conn>,
+    _timer_task: ChildTask<()>,
+}
+
+impl<'conn> TimeoutTransaction<'conn> {
+    fn new(tx: Transaction<'conn>, deadline: Instant) -> TimeoutTransaction<'conn> {
+        let interrupt_handle = tx.get_interrupt_handle();
+        Self {
+            tx,
+            _timer_task: tokio::spawn(async move {
+                tokio::time::sleep_until(deadline.into()).await;
+                interrupt_handle.interrupt();
+            })
+            .into(),
+        }
+    }
+
+    #[inline]
+    pub fn commit(self) -> rusqlite::Result<()> {
+        self.tx.commit()
+    }
+
+    #[inline]
+    pub fn rollback(self) -> rusqlite::Result<()> {
+        self.tx.rollback()
+    }
+}
+
+impl<'conn> Deref for TimeoutTransaction<'conn> {
+    type Target = Transaction<'conn>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tx
+    }
+}
+
+impl<'conn> DerefMut for TimeoutTransaction<'conn> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tx
     }
 }
 

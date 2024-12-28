@@ -3,12 +3,10 @@ mod config;
 use std::{
     fmt,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
 };
 
-use deadpool::{
-    async_trait,
-    managed::{self, Object},
-};
+use deadpool::managed::{self, Object, RecycleError};
 
 pub use deadpool::managed::reexports::*;
 pub use rusqlite;
@@ -78,7 +76,6 @@ impl SqliteConn for rusqlite::Connection {
     }
 }
 
-#[async_trait]
 impl<T> managed::Manager for Manager<T>
 where
     T: SqliteConn,
@@ -95,9 +92,15 @@ where
 
     async fn recycle(
         &self,
-        _conn: &mut Self::Type,
-        _: &Metrics,
+        conn: &mut Self::Type,
+        metrics: &Metrics,
     ) -> managed::RecycleResult<Self::Error> {
+        if conn.conn().is_interrupted() {
+            return Err(RecycleError::message("Connection was interrupted"));
+        }
+        if metrics.age() > Duration::from_secs(300) {
+            return Err(RecycleError::message("Max age reached"));
+        }
         let _ = self.recycle_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

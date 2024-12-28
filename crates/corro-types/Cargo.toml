@@ -51,6 +51,7 @@ tripwire = { version = "0.1.0-alpha.0", path = "../tripwire" }
 uhlc = { workspace = true }
 uuid = { workspace = true }
 strum = { workspace = true }
+abort-on-drop = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
