@@ -58,7 +58,6 @@ use tokio::{
         mpsc::{channel, Sender},
         AcquireError, OwnedSemaphorePermit,
     },
-    task::block_in_place,
 };
 use tokio_util::{codec::Framed, sync::CancellationToken};
 use tracing::{debug, error, info, trace, warn};
@@ -549,9 +548,6 @@ pub async fn start(
 
                 let (mut sink, mut stream) = framed.split();
 
-                let conn = agent.pool().client_dedicated().unwrap();
-                trace!("opened connection");
-
                 let cancel = CancellationToken::new();
 
                 tokio::spawn({
@@ -624,107 +620,80 @@ pub async fn start(
                     }
                 });
 
-                let int_handle = conn.get_interrupt_handle();
-                tokio::spawn(async move {
-                    cancel.cancelled().await;
-                    int_handle.interrupt();
-                });
+                let res = tokio::task::spawn_blocking({
+                    let back_tx = back_tx.clone();
+                    move || {
+                        let conn = agent.pool().client_dedicated().unwrap();
+                        trace!("opened connection");
 
-                let res = block_in_place(|| {
-                    conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
+                        let int_handle = conn.get_interrupt_handle();
+                        tokio::spawn(async move {
+                            cancel.cancelled().await;
+                            int_handle.interrupt();
+                        });
 
-                    let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
+                        conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
 
-                    conn.create_module(
-                        "pg_database",
-                        eponymous_only_module::<PgDatabaseTable>(),
-                        Some(dbs),
-                    )?;
-                    conn.create_module("pg_type", eponymous_only_module::<PgTypeTable>(), None)?;
-                    conn.create_module("pg_range", eponymous_only_module::<PgRangeTable>(), None)?;
-                    conn.create_module(
-                        "pg_namespace",
-                        eponymous_only_module::<PgNamespaceTable>(),
-                        None,
-                    )?;
-                    conn.create_module("pg_class", eponymous_only_module::<PgClassTable>(), None)?;
+                        let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
 
-                    conn.create_scalar_function(
-                        "version",
-                        0,
-                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                        |_ctx| Ok("PostgreSQL 14.9"),
-                    )?;
+                        conn.create_module(
+                            "pg_database",
+                            eponymous_only_module::<PgDatabaseTable>(),
+                            Some(dbs),
+                        )?;
+                        conn.create_module(
+                            "pg_type",
+                            eponymous_only_module::<PgTypeTable>(),
+                            None,
+                        )?;
+                        conn.create_module(
+                            "pg_range",
+                            eponymous_only_module::<PgRangeTable>(),
+                            None,
+                        )?;
+                        conn.create_module(
+                            "pg_namespace",
+                            eponymous_only_module::<PgNamespaceTable>(),
+                            None,
+                        )?;
+                        conn.create_module(
+                            "pg_class",
+                            eponymous_only_module::<PgClassTable>(),
+                            None,
+                        )?;
 
-                    conn.create_scalar_function(
-                        "pg_my_temp_schema",
-                        0,
-                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                        |_ctx| Ok(0i64),
-                    )?;
+                        conn.create_scalar_function(
+                            "version",
+                            0,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok("PostgreSQL 14.9"),
+                        )?;
 
-                    conn.create_scalar_function(
-                        "pg_is_other_temp_schema",
-                        1,
-                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                        |_ctx| Ok(false),
-                    )?;
+                        conn.create_scalar_function(
+                            "pg_my_temp_schema",
+                            0,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok(0i64),
+                        )?;
 
-                    let schema = match compute_schema(&conn) {
-                        Ok(schema) => schema,
-                        Err(e) => {
-                            error!("could not parse schema: {e}");
-                            back_tx.blocking_send(
-                                (
-                                    PgWireBackendMessage::ErrorResponse(
-                                        ErrorInfo::new(
-                                            "FATAL".into(),
-                                            "XX000".into(),
-                                            "could not parse database schema".into(),
-                                        )
-                                        .into(),
-                                    ),
-                                    true,
-                                )
-                                    .into(),
-                            )?;
-                            return Ok(());
-                        }
-                    };
+                        conn.create_scalar_function(
+                            "pg_is_other_temp_schema",
+                            1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok(false),
+                        )?;
 
-                    let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
-
-                    let mut portals: HashMap<CompactString, Portal> = HashMap::new();
-
-                    let mut discard_until_sync = false;
-
-                    let mut session = Session {
-                        agent,
-                        tx_state: TxState::default(),
-                    };
-
-                    'outer: while let Some(msg) = front_rx.blocking_recv() {
-                        debug!("msg: {msg:?}");
-
-                        if discard_until_sync
-                            && !matches!(
-                                msg,
-                                PgWireFrontendMessage::Sync(_) | PgWireFrontendMessage::Flush(_)
-                            )
-                        {
-                            debug!("discarding message due to previous error");
-                            continue;
-                        }
-
-                        match msg {
-                            PgWireFrontendMessage::Startup(_) => {
+                        let schema = match compute_schema(&conn) {
+                            Ok(schema) => schema,
+                            Err(e) => {
+                                error!("could not parse schema: {e}");
                                 back_tx.blocking_send(
                                     (
                                         PgWireBackendMessage::ErrorResponse(
                                             ErrorInfo::new(
                                                 "FATAL".into(),
-                                                SqlState::PROTOCOL_VIOLATION.code().into(),
-                                                "unexpected startup message".into(),
+                                                "XX000".into(),
+                                                "could not parse database schema".into(),
                                             )
                                             .into(),
                                         ),
@@ -732,39 +701,84 @@ pub async fn start(
                                     )
                                         .into(),
                                 )?;
+                                return Ok(());
+                            }
+                        };
+
+                        let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
+
+                        let mut portals: HashMap<CompactString, Portal> = HashMap::new();
+
+                        let mut discard_until_sync = false;
+
+                        let mut session = Session {
+                            agent,
+                            tx_state: TxState::default(),
+                        };
+
+                        'outer: while let Some(msg) = front_rx.blocking_recv() {
+                            debug!("msg: {msg:?}");
+
+                            if discard_until_sync
+                                && !matches!(
+                                    msg,
+                                    PgWireFrontendMessage::Sync(_)
+                                        | PgWireFrontendMessage::Flush(_)
+                                )
+                            {
+                                debug!("discarding message due to previous error");
                                 continue;
                             }
-                            PgWireFrontendMessage::Parse(parse) => {
-                                let name: &str = parse.name().as_deref().unwrap_or("");
-                                let mut cmds = match parse_query(parse.query()) {
-                                    Ok(cmds) => cmds,
-                                    Err(e) => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        discard_until_sync = true;
-                                        continue;
-                                    }
-                                };
 
-                                match cmds.pop_front() {
-                                    None => {
-                                        prepared.insert(name.into(), Prepared::Empty);
-                                    }
-                                    Some(parsed_cmd) => {
-                                        if !cmds.is_empty() {
+                            match msg {
+                                PgWireFrontendMessage::Startup(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "FATAL".into(),
+                                                    SqlState::PROTOCOL_VIOLATION.code().into(),
+                                                    "unexpected startup message".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
+                                            .into(),
+                                    )?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::Parse(parse) => {
+                                    let name: &str = parse.name().as_deref().unwrap_or("");
+                                    let mut cmds = match parse_query(parse.query()) {
+                                        Ok(cmds) => cmds,
+                                        Err(e) => {
                                             back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            discard_until_sync = true;
+                                            continue;
+                                        }
+                                    };
+
+                                    match cmds.pop_front() {
+                                        None => {
+                                            prepared.insert(name.into(), Prepared::Empty);
+                                        }
+                                        Some(parsed_cmd) => {
+                                            if !cmds.is_empty() {
+                                                back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
                                                         ErrorInfo::new(
@@ -781,22 +795,130 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            discard_until_sync = true;
-                                            continue;
+                                                discard_until_sync = true;
+                                                continue;
+                                            }
+
+                                            trace!("parsed cmd: {parsed_cmd:#?}");
+
+                                            let prepped = match conn.prepare(parse.query()) {
+                                                Ok(prepped) => prepped,
+                                                Err(e) => {
+                                                    back_tx.blocking_send(
+                                                        (
+                                                            PgWireBackendMessage::ErrorResponse(
+                                                                ErrorInfo::new(
+                                                                    "ERROR".to_owned(),
+                                                                    "XX000".to_owned(),
+                                                                    e.to_string(),
+                                                                )
+                                                                .into(),
+                                                            ),
+                                                            true,
+                                                        )
+                                                            .into(),
+                                                    )?;
+                                                    discard_until_sync = true;
+                                                    continue;
+                                                }
+                                            };
+
+                                            let mut param_types: Vec<Type> = parse
+                                                .type_oids()
+                                                .iter()
+                                                .filter_map(|oid| Type::from_oid(*oid))
+                                                .collect();
+
+                                            debug!("params types {param_types:?}");
+
+                                            if param_types.len() != prepped.parameter_count() {
+                                                param_types = parameter_types(&schema, &parsed_cmd)
+                                                    .params
+                                                    .into_iter()
+                                                    .map(|param| {
+                                                        trace!("got param: {param:?}");
+                                                        match (param.sqlite_type, param.source) {
+                                                            (SqliteType::Null, _) => unreachable!(),
+                                                            (SqliteType::Text, src) => match src {
+                                                                Some("JSON") => Type::JSON,
+                                                                _ => Type::TEXT,
+                                                            },
+                                                            (SqliteType::Numeric, Some(src)) => {
+                                                                match src {
+                                                                    "BOOLEAN" | "BOOL" => {
+                                                                        Type::BOOL
+                                                                    }
+                                                                    "DATETIME" => Type::TIMESTAMP,
+                                                                    _ => Type::FLOAT8,
+                                                                }
+                                                            }
+                                                            (SqliteType::Numeric, None) => {
+                                                                Type::FLOAT8
+                                                            }
+                                                            (SqliteType::Integer, _src) => {
+                                                                Type::INT8
+                                                            }
+                                                            (SqliteType::Real, _src) => {
+                                                                Type::FLOAT8
+                                                            }
+                                                            (SqliteType::Blob, src) => match src {
+                                                                Some("JSONB") => Type::JSONB,
+                                                                _ => Type::BYTEA,
+                                                            },
+                                                        }
+                                                    })
+                                                    .collect();
+                                            }
+
+                                            let fields = match field_types(
+                                                &prepped,
+                                                &parsed_cmd,
+                                                FieldFormats::All(FieldFormat::Text),
+                                            ) {
+                                                Ok(fields) => fields,
+                                                Err(e) => {
+                                                    back_tx
+                                                        .blocking_send((e.into(), true).into())?;
+                                                    discard_until_sync = true;
+                                                    continue 'outer;
+                                                }
+                                            };
+
+                                            prepared.insert(
+                                                name.into(),
+                                                Prepared::NonEmpty {
+                                                    sql: parse.query().clone(),
+                                                    param_types,
+                                                    fields,
+                                                    cmd: parsed_cmd,
+                                                },
+                                            );
                                         }
+                                    }
 
-                                        trace!("parsed cmd: {parsed_cmd:#?}");
-
-                                        let prepped = match conn.prepare(parse.query()) {
-                                            Ok(prepped) => prepped,
-                                            Err(e) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ParseComplete(
+                                                ParseComplete::new(),
+                                            ),
+                                            false,
+                                        )
+                                            .into(),
+                                    )?;
+                                }
+                                PgWireFrontendMessage::Describe(desc) => {
+                                    let name = desc.name().as_deref().unwrap_or("");
+                                    match desc.target_type() {
+                                        // statement
+                                        b'S' => match prepared.get(name) {
+                                            None => {
                                                 back_tx.blocking_send(
                                                     (
                                                         PgWireBackendMessage::ErrorResponse(
                                                             ErrorInfo::new(
-                                                                "ERROR".to_owned(),
-                                                                "XX000".to_owned(),
-                                                                e.to_string(),
+                                                                "ERROR".into(),
+                                                                "XX000".into(),
+                                                                "statement not found".into(),
                                                             )
                                                             .into(),
                                                         ),
@@ -805,94 +927,161 @@ pub async fn start(
                                                         .into(),
                                                 )?;
                                                 discard_until_sync = true;
-                                                continue;
                                             }
-                                        };
-
-                                        let mut param_types: Vec<Type> = parse
-                                            .type_oids()
-                                            .iter()
-                                            .filter_map(|oid| Type::from_oid(*oid))
-                                            .collect();
-
-                                        debug!("params types {param_types:?}");
-
-                                        if param_types.len() != prepped.parameter_count() {
-                                            param_types = parameter_types(&schema, &parsed_cmd)
-                                                .params
-                                                .into_iter()
-                                                .map(|param| {
-                                                    trace!("got param: {param:?}");
-                                                    match (param.sqlite_type, param.source) {
-                                                        (SqliteType::Null, _) => unreachable!(),
-                                                        (SqliteType::Text, src) => match src {
-                                                            Some("JSON") => Type::JSON,
-                                                            _ => Type::TEXT,
-                                                        },
-                                                        (SqliteType::Numeric, Some(src)) => {
-                                                            match src {
-                                                                "BOOLEAN" | "BOOL" => Type::BOOL,
-                                                                "DATETIME" => Type::TIMESTAMP,
-                                                                _ => Type::FLOAT8,
-                                                            }
-                                                        }
-                                                        (SqliteType::Numeric, None) => Type::FLOAT8,
-                                                        (SqliteType::Integer, _src) => Type::INT8,
-                                                        (SqliteType::Real, _src) => Type::FLOAT8,
-                                                        (SqliteType::Blob, src) => match src {
-                                                            Some("JSONB") => Type::JSONB,
-                                                            _ => Type::BYTEA,
-                                                        },
-                                                    }
-                                                })
-                                                .collect();
-                                        }
-
-                                        let fields = match field_types(
-                                            &prepped,
-                                            &parsed_cmd,
-                                            FieldFormats::All(FieldFormat::Text),
-                                        ) {
-                                            Ok(fields) => fields,
-                                            Err(e) => {
-                                                back_tx.blocking_send((e.into(), true).into())?;
-                                                discard_until_sync = true;
-                                                continue 'outer;
+                                            Some(Prepared::Empty) => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::NoData(NoData::new()),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
                                             }
-                                        };
-
-                                        prepared.insert(
-                                            name.into(),
-                                            Prepared::NonEmpty {
-                                                sql: parse.query().clone(),
+                                            Some(Prepared::NonEmpty {
                                                 param_types,
                                                 fields,
-                                                cmd: parsed_cmd,
-                                            },
-                                        );
+                                                ..
+                                            }) => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::ParameterDescription(
+                                                            ParameterDescription::new(
+                                                                param_types
+                                                                    .iter()
+                                                                    .map(|t| t.oid())
+                                                                    .collect(),
+                                                            ),
+                                                        ),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
+
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::RowDescription(
+                                                            RowDescription::new(
+                                                                fields
+                                                                    .iter()
+                                                                    .map(Into::into)
+                                                                    .collect(),
+                                                            ),
+                                                        ),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                            }
+                                        },
+                                        // portal
+                                        b'P' => match portals.get(name) {
+                                            None => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::ErrorResponse(
+                                                            ErrorInfo::new(
+                                                                "ERROR".into(),
+                                                                "XX000".into(),
+                                                                "portal not found".into(),
+                                                            )
+                                                            .into(),
+                                                        ),
+                                                        true,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                                discard_until_sync = true;
+                                            }
+                                            Some(Portal::Empty { .. }) => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::NoData(NoData::new()),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                            }
+                                            Some(Portal::Parsed {
+                                                stmt,
+                                                result_formats,
+                                                cmd,
+                                                ..
+                                            }) => {
+                                                let fields = match field_types(
+                                                    stmt,
+                                                    cmd,
+                                                    FieldFormats::Each(result_formats),
+                                                ) {
+                                                    Ok(fields) => fields,
+                                                    Err(e) => {
+                                                        back_tx.blocking_send(
+                                                            (
+                                                                PgWireBackendMessage::ErrorResponse(
+                                                                    e.into(),
+                                                                ),
+                                                                true,
+                                                            )
+                                                                .into(),
+                                                        )?;
+                                                        continue 'outer;
+                                                    }
+                                                };
+
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::RowDescription(
+                                                            RowDescription::new(
+                                                                fields
+                                                                    .iter()
+                                                                    .map(Into::into)
+                                                                    .collect(),
+                                                            ),
+                                                        ),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                            }
+                                        },
+                                        _ => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "FATAL".into(),
+                                                            SqlState::PROTOCOL_VIOLATION
+                                                                .code()
+                                                                .into(),
+                                                            "unexpected describe type".into(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            discard_until_sync = true;
+                                            continue;
+                                        }
                                     }
                                 }
+                                PgWireFrontendMessage::Bind(bind) => {
+                                    let portal_name = bind
+                                        .portal_name()
+                                        .as_deref()
+                                        .map(CompactString::from)
+                                        .unwrap_or_default();
 
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ParseComplete(ParseComplete::new()),
-                                        false,
-                                    )
-                                        .into(),
-                                )?;
-                            }
-                            PgWireFrontendMessage::Describe(desc) => {
-                                let name = desc.name().as_deref().unwrap_or("");
-                                match desc.target_type() {
-                                    // statement
-                                    b'S' => match prepared.get(name) {
+                                    let stmt_name = bind.statement_name().as_deref().unwrap_or("");
+
+                                    match prepared.get(stmt_name) {
                                         None => {
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
                                                         ErrorInfo::new(
-                                                            "ERROR".into(),
-                                                            "XX000".into(),
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
                                                             "statement not found".into(),
                                                         )
                                                         .into(),
@@ -902,209 +1091,53 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                             discard_until_sync = true;
+                                            continue;
                                         }
                                         Some(Prepared::Empty) => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::NoData(NoData::new()),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
+                                            portals.insert(
+                                                portal_name,
+                                                Portal::Empty {
+                                                    stmt_name: stmt_name.into(),
+                                                },
+                                            );
                                         }
                                         Some(Prepared::NonEmpty {
+                                            sql,
                                             param_types,
-                                            fields,
-                                            ..
-                                        }) => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ParameterDescription(
-                                                        ParameterDescription::new(
-                                                            param_types
-                                                                .iter()
-                                                                .map(|t| t.oid())
-                                                                .collect(),
-                                                        ),
-                                                    ),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
-
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::RowDescription(
-                                                        RowDescription::new(
-                                                            fields.iter().map(Into::into).collect(),
-                                                        ),
-                                                    ),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
-                                        }
-                                    },
-                                    // portal
-                                    b'P' => match portals.get(name) {
-                                        None => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "ERROR".into(),
-                                                            "XX000".into(),
-                                                            "portal not found".into(),
-                                                        )
-                                                        .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-                                            discard_until_sync = true;
-                                        }
-                                        Some(Portal::Empty { .. }) => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::NoData(NoData::new()),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
-                                        }
-                                        Some(Portal::Parsed {
-                                            stmt,
-                                            result_formats,
                                             cmd,
                                             ..
                                         }) => {
-                                            let fields = match field_types(
-                                                stmt,
-                                                cmd,
-                                                FieldFormats::Each(result_formats),
-                                            ) {
-                                                Ok(fields) => fields,
+                                            let mut prepped = match conn.prepare(sql) {
+                                                Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
                                                         (
                                                             PgWireBackendMessage::ErrorResponse(
-                                                                e.into(),
+                                                                ErrorInfo::new(
+                                                                    "ERROR".to_owned(),
+                                                                    "XX000".to_owned(),
+                                                                    e.to_string(),
+                                                                )
+                                                                .into(),
                                                             ),
                                                             true,
                                                         )
                                                             .into(),
                                                     )?;
-                                                    continue 'outer;
+                                                    discard_until_sync = true;
+                                                    continue;
                                                 }
                                             };
 
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::RowDescription(
-                                                        RowDescription::new(
-                                                            fields.iter().map(Into::into).collect(),
-                                                        ),
-                                                    ),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
-                                        }
-                                    },
-                                    _ => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "FATAL".into(),
-                                                        SqlState::PROTOCOL_VIOLATION.code().into(),
-                                                        "unexpected describe type".into(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        discard_until_sync = true;
-                                        continue;
-                                    }
-                                }
-                            }
-                            PgWireFrontendMessage::Bind(bind) => {
-                                let portal_name = bind
-                                    .portal_name()
-                                    .as_deref()
-                                    .map(CompactString::from)
-                                    .unwrap_or_default();
+                                            trace!(
+                                                "bind params count: {}, statement params count: {}",
+                                                bind.parameters().len(),
+                                                prepped.parameter_count()
+                                            );
 
-                                let stmt_name = bind.statement_name().as_deref().unwrap_or("");
+                                            debug!("bind param types: {param_types:?}");
 
-                                match prepared.get(stmt_name) {
-                                    None => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        "statement not found".into(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        discard_until_sync = true;
-                                        continue;
-                                    }
-                                    Some(Prepared::Empty) => {
-                                        portals.insert(
-                                            portal_name,
-                                            Portal::Empty {
-                                                stmt_name: stmt_name.into(),
-                                            },
-                                        );
-                                    }
-                                    Some(Prepared::NonEmpty {
-                                        sql,
-                                        param_types,
-                                        cmd,
-                                        ..
-                                    }) => {
-                                        let mut prepped = match conn.prepare(sql) {
-                                            Ok(prepped) => prepped,
-                                            Err(e) => {
-                                                back_tx.blocking_send(
-                                                    (
-                                                        PgWireBackendMessage::ErrorResponse(
-                                                            ErrorInfo::new(
-                                                                "ERROR".to_owned(),
-                                                                "XX000".to_owned(),
-                                                                e.to_string(),
-                                                            )
-                                                            .into(),
-                                                        ),
-                                                        true,
-                                                    )
-                                                        .into(),
-                                                )?;
-                                                discard_until_sync = true;
-                                                continue;
-                                            }
-                                        };
-
-                                        trace!(
-                                            "bind params count: {}, statement params count: {}",
-                                            bind.parameters().len(),
-                                            prepped.parameter_count()
-                                        );
-
-                                        debug!("bind param types: {param_types:?}");
-
-                                        let mut format_codes = match bind
+                                            let mut format_codes = match bind
                                             .parameter_format_codes()
                                             .iter()
                                             .map(|code| {
@@ -1136,26 +1169,26 @@ pub async fn start(
                                                 continue;
                                             }
                                         };
-                                        if format_codes.is_empty() {
-                                            // no format codes? default to text
-                                            format_codes =
-                                                vec![FormatCode::Text; bind.parameters().len()];
-                                        } else if format_codes.len() == 1 {
-                                            // single code means we should use it for all others
-                                            format_codes =
-                                                vec![format_codes[0]; bind.parameters().len()];
-                                        }
+                                            if format_codes.is_empty() {
+                                                // no format codes? default to text
+                                                format_codes =
+                                                    vec![FormatCode::Text; bind.parameters().len()];
+                                            } else if format_codes.len() == 1 {
+                                                // single code means we should use it for all others
+                                                format_codes =
+                                                    vec![format_codes[0]; bind.parameters().len()];
+                                            }
 
-                                        for (i, param) in bind.parameters().iter().enumerate() {
-                                            let idx = i + 1;
-                                            let b = match param {
-                                                None => {
-                                                    trace!("binding idx {idx} w/ NULL");
-                                                    if let Err(e) = prepped.raw_bind_parameter(
-                                                        idx,
-                                                        rusqlite::types::Null,
-                                                    ) {
-                                                        back_tx.blocking_send(
+                                            for (i, param) in bind.parameters().iter().enumerate() {
+                                                let idx = i + 1;
+                                                let b = match param {
+                                                    None => {
+                                                        trace!("binding idx {idx} w/ NULL");
+                                                        if let Err(e) = prepped.raw_bind_parameter(
+                                                            idx,
+                                                            rusqlite::types::Null,
+                                                        ) {
+                                                            back_tx.blocking_send(
                                                             (
                                                                 PgWireBackendMessage::ErrorResponse(
                                                                     ErrorInfo::new(
@@ -1169,136 +1202,151 @@ pub async fn start(
                                                             )
                                                                 .into(),
                                                         )?;
+                                                            discard_until_sync = true;
+                                                            continue 'outer;
+                                                        }
+                                                        continue;
+                                                    }
+                                                    Some(b) => b,
+                                                };
+
+                                                trace!("got param bytes: {b:?}");
+
+                                                match param_types.get(i) {
+                                                    None => {
+                                                        trace!("no param type found!");
+                                                        back_tx.blocking_send(
+                                                            (
+                                                                PgWireBackendMessage::ErrorResponse(
+                                                                    ErrorInfo::new(
+                                                                        "ERROR".to_owned(),
+                                                                        "XX000".to_owned(),
+                                                                        "missing parameter type"
+                                                                            .into(),
+                                                                    )
+                                                                    .into(),
+                                                                ),
+                                                                true,
+                                                            )
+                                                                .into(),
+                                                        )?;
                                                         discard_until_sync = true;
                                                         continue 'outer;
                                                     }
-                                                    continue;
-                                                }
-                                                Some(b) => b,
-                                            };
+                                                    Some(param_type) => {
+                                                        let format_code = format_codes[i];
+                                                        trace!("parsing param_type {param_type:?}, format_code: {format_code:?}, bytes: {b:?}");
+                                                        match param_type {
+                                                            t @ &Type::BOOL => {
+                                                                let value: bool =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
+                                                            t @ &Type::INT2 => {
+                                                                let value: i16 =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
+                                                            t @ &Type::INT4 => {
+                                                                let value: i32 =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
+                                                            t @ &Type::INT8 => {
+                                                                let value: i64 =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
 
-                                            trace!("got param bytes: {b:?}");
+                                                            t @ &Type::TEXT
+                                                            | t @ &Type::VARCHAR
+                                                            | t @ &Type::JSON => {
+                                                                let value: &str = match format_code
+                                                                {
+                                                                    FormatCode::Text => {
+                                                                        std::str::from_utf8(b)?
+                                                                    }
+                                                                    FormatCode::Binary => {
+                                                                        FromSql::from_sql(t, b)?
+                                                                    }
+                                                                };
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
+                                                            t @ &Type::FLOAT4 => {
+                                                                let value: f32 =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
+                                                            t @ &Type::FLOAT8 => {
+                                                                let value: f64 =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
 
-                                            match param_types.get(i) {
-                                                None => {
-                                                    trace!("no param type found!");
-                                                    back_tx.blocking_send(
-                                                        (
-                                                            PgWireBackendMessage::ErrorResponse(
-                                                                ErrorInfo::new(
-                                                                    "ERROR".to_owned(),
-                                                                    "XX000".to_owned(),
-                                                                    "missing parameter type".into(),
+                                                            &Type::BYTEA | &Type::JSONB => {
+                                                                let maybe_decoded = matches!(
+                                                                    format_code,
+                                                                    FormatCode::Text
                                                                 )
-                                                                .into(),
-                                                            ),
-                                                            true,
-                                                        )
-                                                            .into(),
-                                                    )?;
-                                                    discard_until_sync = true;
-                                                    continue 'outer;
-                                                }
-                                                Some(param_type) => {
-                                                    let format_code = format_codes[i];
-                                                    trace!("parsing param_type {param_type:?}, format_code: {format_code:?}, bytes: {b:?}");
-                                                    match param_type {
-                                                        t @ &Type::BOOL => {
-                                                            let value: bool = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        t @ &Type::INT2 => {
-                                                            let value: i16 = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        t @ &Type::INT4 => {
-                                                            let value: i32 = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        t @ &Type::INT8 => {
-                                                            let value: i64 = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
+                                                                .then(|| hex::decode(b).ok())
+                                                                .flatten();
 
-                                                        t @ &Type::TEXT
-                                                        | t @ &Type::VARCHAR
-                                                        | t @ &Type::JSON => {
-                                                            let value: &str = match format_code {
-                                                                FormatCode::Text => {
-                                                                    std::str::from_utf8(b)?
-                                                                }
-                                                                FormatCode::Binary => {
-                                                                    FromSql::from_sql(t, b)?
-                                                                }
-                                                            };
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        t @ &Type::FLOAT4 => {
-                                                            let value: f32 = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        t @ &Type::FLOAT8 => {
-                                                            let value: f64 = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
+                                                                trace!("binding idx {idx} w/ decoded value: {maybe_decoded:?} (bytes: {b:?})");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx,
+                                                                    maybe_decoded
+                                                                        .as_deref()
+                                                                        .unwrap_or(b),
+                                                                )?;
+                                                            }
 
-                                                        &Type::BYTEA | &Type::JSONB => {
-                                                            let maybe_decoded = matches!(
-                                                                format_code,
-                                                                FormatCode::Text
-                                                            )
-                                                            .then(|| hex::decode(b).ok())
-                                                            .flatten();
-
-                                                            trace!("binding idx {idx} w/ decoded value: {maybe_decoded:?} (bytes: {b:?})");
-                                                            prepped.raw_bind_parameter(
-                                                                idx,
-                                                                maybe_decoded
-                                                                    .as_deref()
-                                                                    .unwrap_or(b),
-                                                            )?;
-                                                        }
-
-                                                        t @ &Type::TIMESTAMP => {
-                                                            let dt = match format_code {
+                                                            t @ &Type::TIMESTAMP => {
+                                                                let dt = match format_code {
                                                                 FormatCode::Text => {
                                                                     let s =
                                                                         String::from_utf8_lossy(b);
@@ -1313,24 +1361,25 @@ pub async fn start(
                                                                         )?
                                                                 }
                                                             };
-                                                            prepped.raw_bind_parameter(idx, dt)?;
-                                                        }
+                                                                prepped
+                                                                    .raw_bind_parameter(idx, dt)?;
+                                                            }
 
-                                                        // t @ &Type::TIMESTAMP => {
-                                                        //     let value: time::OffsetDateTime =
-                                                        //         from_type_and_format(
-                                                        //             t,
-                                                        //             b,
-                                                        //             format_code,
-                                                        //         )?;
+                                                            // t @ &Type::TIMESTAMP => {
+                                                            //     let value: time::OffsetDateTime =
+                                                            //         from_type_and_format(
+                                                            //             t,
+                                                            //             b,
+                                                            //             format_code,
+                                                            //         )?;
 
-                                                        //     trace!("binding idx {idx} w/ value: {value}");
-                                                        //     prepped
-                                                        //         .raw_bind_parameter(idx, value)?;
-                                                        // }
-                                                        t => {
-                                                            warn!("unsupported type: {t:?}");
-                                                            back_tx.blocking_send(
+                                                            //     trace!("binding idx {idx} w/ value: {value}");
+                                                            //     prepped
+                                                            //         .raw_bind_parameter(idx, value)?;
+                                                            // }
+                                                            t => {
+                                                                warn!("unsupported type: {t:?}");
+                                                                back_tx.blocking_send(
                                                                 (
                                                                     PgWireBackendMessage::ErrorResponse(
                                                                         ErrorInfo::new(
@@ -1345,52 +1394,152 @@ pub async fn start(
                                                                     true,
                                                                 ).into(),
                                                             )?;
-                                                            discard_until_sync = true;
-                                                            continue 'outer;
+                                                                discard_until_sync = true;
+                                                                continue 'outer;
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
+
+                                            debug!("EXPANDED SQL: {:?}", prepped.expanded_sql());
+
+                                            portals.insert(
+                                                portal_name,
+                                                Portal::Parsed {
+                                                    stmt_name: stmt_name.into(),
+                                                    stmt: prepped,
+                                                    result_formats: bind
+                                                        .result_column_format_codes()
+                                                        .iter()
+                                                        .copied()
+                                                        .map(FieldFormat::from)
+                                                        .collect(),
+                                                    cmd: cmd.clone(),
+                                                },
+                                            );
                                         }
+                                    }
 
-                                        debug!("EXPANDED SQL: {:?}", prepped.expanded_sql());
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::BindComplete(BindComplete::new()),
+                                            false,
+                                        )
+                                            .into(),
+                                    )?;
+                                }
+                                PgWireFrontendMessage::Sync(_) => {
+                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
 
-                                        portals.insert(
-                                            portal_name,
-                                            Portal::Parsed {
-                                                stmt_name: stmt_name.into(),
-                                                stmt: prepped,
-                                                result_formats: bind
-                                                    .result_column_format_codes()
-                                                    .iter()
-                                                    .copied()
-                                                    .map(FieldFormat::from)
-                                                    .collect(),
-                                                cmd: cmd.clone(),
-                                            },
-                                        );
+                                    // reset this
+                                    discard_until_sync = false;
+                                }
+                                PgWireFrontendMessage::Execute(execute) => {
+                                    let name = execute.name().as_deref().unwrap_or("");
+                                    let (prepped, result_formats, cmd) = match portals.get_mut(name)
+                                    {
+                                        Some(Portal::Empty { .. }) => {
+                                            trace!("empty portal");
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::EmptyQueryResponse(
+                                                        EmptyQueryResponse::new(),
+                                                    ),
+                                                    false,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            continue;
+                                        }
+                                        Some(Portal::Parsed {
+                                            stmt,
+                                            result_formats,
+                                            cmd,
+                                            ..
+                                        }) => (stmt, result_formats, cmd),
+                                        None => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".into(),
+                                                            "XX000".into(),
+                                                            "portal not found".into(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            discard_until_sync = true;
+                                            continue;
+                                        }
+                                    };
+
+                                    trace!("non-empty portal!");
+
+                                    let max_rows = *execute.max_rows();
+                                    let max_rows = if max_rows == 0 {
+                                        usize::MAX
+                                    } else {
+                                        max_rows as usize
+                                    };
+
+                                    if let Err(e) = session.handle_execute(
+                                        &conn,
+                                        prepped,
+                                        result_formats,
+                                        cmd,
+                                        max_rows,
+                                        &back_tx,
+                                    ) {
+                                        back_tx.blocking_send(BackendResponse::Message {
+                                            message: e.try_into()?,
+                                            flush: true,
+                                        })?;
+
+                                        discard_until_sync = true;
+
+                                        send_ready(
+                                            &mut session,
+                                            &conn,
+                                            discard_until_sync,
+                                            &back_tx,
+                                        )?;
+                                        continue;
                                     }
                                 }
+                                PgWireFrontendMessage::Query(query) => {
+                                    let parsed_query = match parse_query(query.query()) {
+                                        Ok(q) => q,
+                                        Err(e) => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            send_ready(
+                                                &mut session,
+                                                &conn,
+                                                discard_until_sync,
+                                                &back_tx,
+                                            )?;
+                                            continue;
+                                        }
+                                    };
 
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::BindComplete(BindComplete::new()),
-                                        false,
-                                    )
-                                        .into(),
-                                )?;
-                            }
-                            PgWireFrontendMessage::Sync(_) => {
-                                send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
-
-                                // reset this
-                                discard_until_sync = false;
-                            }
-                            PgWireFrontendMessage::Execute(execute) => {
-                                let name = execute.name().as_deref().unwrap_or("");
-                                let (prepped, result_formats, cmd) = match portals.get_mut(name) {
-                                    Some(Portal::Empty { .. }) => {
-                                        trace!("empty portal");
+                                    if parsed_query.is_empty() {
                                         back_tx.blocking_send(
                                             (
                                                 PgWireBackendMessage::EmptyQueryResponse(
@@ -1400,80 +1549,7 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
-                                        continue;
-                                    }
-                                    Some(Portal::Parsed {
-                                        stmt,
-                                        result_formats,
-                                        cmd,
-                                        ..
-                                    }) => (stmt, result_formats, cmd),
-                                    None => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".into(),
-                                                        "XX000".into(),
-                                                        "portal not found".into(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        discard_until_sync = true;
-                                        continue;
-                                    }
-                                };
 
-                                trace!("non-empty portal!");
-
-                                let max_rows = *execute.max_rows();
-                                let max_rows = if max_rows == 0 {
-                                    usize::MAX
-                                } else {
-                                    max_rows as usize
-                                };
-
-                                if let Err(e) = session.handle_execute(
-                                    &conn,
-                                    prepped,
-                                    result_formats,
-                                    cmd,
-                                    max_rows,
-                                    &back_tx,
-                                ) {
-                                    back_tx.blocking_send(BackendResponse::Message {
-                                        message: e.try_into()?,
-                                        flush: true,
-                                    })?;
-
-                                    discard_until_sync = true;
-
-                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
-                                    continue;
-                                }
-                            }
-                            PgWireFrontendMessage::Query(query) => {
-                                let parsed_query = match parse_query(query.query()) {
-                                    Ok(q) => q,
-                                    Err(e) => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
                                         send_ready(
                                             &mut session,
                                             &conn,
@@ -1482,225 +1558,235 @@ pub async fn start(
                                         )?;
                                         continue;
                                     }
-                                };
 
-                                if parsed_query.is_empty() {
+                                    for cmd in parsed_query.into_iter() {
+                                        if let Err(e) =
+                                            session.handle_query(&conn, &cmd, &back_tx, true)
+                                        {
+                                            back_tx.blocking_send(BackendResponse::Message {
+                                                message: e.try_into()?,
+                                                flush: true,
+                                            })?;
+                                            send_ready(
+                                                &mut session,
+                                                &conn,
+                                                discard_until_sync,
+                                                &back_tx,
+                                            )?;
+                                            continue 'outer;
+                                        }
+                                    }
+
+                                    // automatically commit an implicit tx
+                                    if session.tx_state.is_implicit() {
+                                        trace!("committing IMPLICIT tx");
+                                        let _permit = session.tx_state.end();
+
+                                        if let Err(e) = session.handle_commit(&conn) {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            send_ready(
+                                                &mut session,
+                                                &conn,
+                                                discard_until_sync,
+                                                &back_tx,
+                                            )?;
+                                            continue;
+                                        }
+                                        trace!("committed IMPLICIT tx");
+                                    }
+
+                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                }
+                                PgWireFrontendMessage::Terminate(_) => {
+                                    break;
+                                }
+
+                                PgWireFrontendMessage::PasswordMessageFamily(_) => {
                                     back_tx.blocking_send(
                                         (
-                                            PgWireBackendMessage::EmptyQueryResponse(
-                                                EmptyQueryResponse::new(),
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "PasswordMessage is not implemented".into(),
+                                                )
+                                                .into(),
                                             ),
-                                            false,
+                                            true,
                                         )
                                             .into(),
                                     )?;
-
-                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
                                     continue;
                                 }
-
-                                for cmd in parsed_query.into_iter() {
-                                    if let Err(e) =
-                                        session.handle_query(&conn, &cmd, &back_tx, true)
-                                    {
-                                        back_tx.blocking_send(BackendResponse::Message {
-                                            message: e.try_into()?,
-                                            flush: true,
-                                        })?;
-                                        send_ready(
-                                            &mut session,
-                                            &conn,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
-                                        continue 'outer;
-                                    }
-                                }
-
-                                // automatically commit an implicit tx
-                                if session.tx_state.is_implicit() {
-                                    trace!("committing IMPLICIT tx");
-                                    let _permit = session.tx_state.end();
-
-                                    if let Err(e) = session.handle_commit(&conn) {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
+                                PgWireFrontendMessage::Close(close) => {
+                                    let name = close.name().as_deref().unwrap_or("");
+                                    match close.target_type() {
+                                        // statement
+                                        b'S' => {
+                                            if prepared.remove(name).is_some() {
+                                                portals
+                                                    .retain(|_, portal| portal.stmt_name() != name);
+                                            }
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::CloseComplete(
+                                                        CloseComplete::new(),
+                                                    ),
+                                                    true,
+                                                )
                                                     .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        send_ready(
-                                            &mut session,
-                                            &conn,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
-                                        continue;
-                                    }
-                                    trace!("committed IMPLICIT tx");
-                                }
-
-                                send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
-                            }
-                            PgWireFrontendMessage::Terminate(_) => {
-                                break;
-                            }
-
-                            PgWireFrontendMessage::PasswordMessageFamily(_) => {
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ErrorResponse(
-                                            ErrorInfo::new(
-                                                "ERROR".into(),
-                                                "XX000".to_owned(),
-                                                "PasswordMessage is not implemented".into(),
-                                            )
-                                            .into(),
-                                        ),
-                                        true,
-                                    )
-                                        .into(),
-                                )?;
-                                continue;
-                            }
-                            PgWireFrontendMessage::Close(close) => {
-                                let name = close.name().as_deref().unwrap_or("");
-                                match close.target_type() {
-                                    // statement
-                                    b'S' => {
-                                        if prepared.remove(name).is_some() {
-                                            portals.retain(|_, portal| portal.stmt_name() != name);
+                                            )?;
+                                            continue;
                                         }
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::CloseComplete(
-                                                    CloseComplete::new(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        continue;
-                                    }
-                                    // portal
-                                    b'P' => {
-                                        portals.remove(name);
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::CloseComplete(
-                                                    CloseComplete::new(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                    }
-                                    _ => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "FATAL".into(),
-                                                        SqlState::PROTOCOL_VIOLATION.code().into(),
-                                                        "unexpected Close target_type".into(),
-                                                    )
+                                        // portal
+                                        b'P' => {
+                                            portals.remove(name);
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::CloseComplete(
+                                                        CloseComplete::new(),
+                                                    ),
+                                                    true,
+                                                )
                                                     .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        discard_until_sync = true;
-                                        continue;
+                                            )?;
+                                        }
+                                        _ => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "FATAL".into(),
+                                                            SqlState::PROTOCOL_VIOLATION
+                                                                .code()
+                                                                .into(),
+                                                            "unexpected Close target_type".into(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            discard_until_sync = true;
+                                            continue;
+                                        }
                                     }
                                 }
-                            }
-                            PgWireFrontendMessage::Flush(_) => {
-                                back_tx.blocking_send(BackendResponse::Flush)?;
-                            }
-                            PgWireFrontendMessage::CopyData(_) => {
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ErrorResponse(
-                                            ErrorInfo::new(
-                                                "ERROR".into(),
-                                                "XX000".to_owned(),
-                                                "CopyData is not implemented".into(),
-                                            )
+                                PgWireFrontendMessage::Flush(_) => {
+                                    back_tx.blocking_send(BackendResponse::Flush)?;
+                                }
+                                PgWireFrontendMessage::CopyData(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "CopyData is not implemented".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
                                             .into(),
-                                        ),
-                                        true,
-                                    )
-                                        .into(),
-                                )?;
-                                continue;
-                            }
-                            PgWireFrontendMessage::CopyFail(_) => {
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ErrorResponse(
-                                            ErrorInfo::new(
-                                                "ERROR".into(),
-                                                "XX000".to_owned(),
-                                                "CopyFail is not implemented".into(),
-                                            )
+                                    )?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::CopyFail(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "CopyFail is not implemented".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
                                             .into(),
-                                        ),
-                                        true,
-                                    )
-                                        .into(),
-                                )?;
-                                continue;
-                            }
-                            PgWireFrontendMessage::CopyDone(_) => {
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ErrorResponse(
-                                            ErrorInfo::new(
-                                                "ERROR".into(),
-                                                "XX000".to_owned(),
-                                                "CopyDone is not implemented".into(),
-                                            )
+                                    )?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::CopyDone(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "CopyDone is not implemented".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
                                             .into(),
-                                        ),
-                                        true,
-                                    )
-                                        .into(),
-                                )?;
-                                continue;
+                                    )?;
+                                    continue;
+                                }
                             }
                         }
+
+                        Ok::<_, BoxError>(())
                     }
+                }).await;
 
-                    Ok::<_, BoxError>(())
-                });
-
-                if let Err(e) = res {
-                    error!("connection failed: {e}");
-                    _ = back_tx
-                        .send(
-                            (
-                                PgWireBackendMessage::ErrorResponse(
-                                    ErrorInfo::new(
-                                        "FATAL".to_owned(),
-                                        "XX000".to_owned(),
-                                        e.to_string(),
-                                    )
+                match res {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        error!("connection failed: {e}");
+                        _ = back_tx
+                            .send(
+                                (
+                                    PgWireBackendMessage::ErrorResponse(
+                                        ErrorInfo::new(
+                                            "FATAL".to_owned(),
+                                            "XX000".to_owned(),
+                                            e.to_string(),
+                                        )
+                                        .into(),
+                                    ),
+                                    true,
+                                )
                                     .into(),
-                                ),
-                                true,
                             )
-                                .into(),
-                        )
-                        .await;
+                            .await;
+                    }
+                    Err(e) => {
+                        error!("spawn_blocking failed: {e}");
+                        _ = back_tx
+                            .send(
+                                (
+                                    PgWireBackendMessage::ErrorResponse(
+                                        ErrorInfo::new(
+                                            "FATAL".to_owned(),
+                                            "XX000".to_owned(),
+                                            e.to_string(),
+                                        )
+                                        .into(),
+                                    ),
+                                    true,
+                                )
+                                    .into(),
+                            )
+                            .await;
+                    }
                 }
 
                 Ok::<_, BoxError>(())
