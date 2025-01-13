@@ -760,10 +760,10 @@ pub async fn handle_changes(
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
-        while buf_cost >= max_changes_chunk && join_set.len() < MAX_CONCURRENT {
-            // we're already bigger than the minimum size of changes batch
-            // so we want to accumulate at least that much and process them
-            // concurrently bvased on MAX_CONCURRENCY
+        while (buf_cost >= max_changes_chunk || !queue.is_empty())
+            && join_set.len() < MAX_CONCURRENT
+        {
+            // Process if we hit the chunk size OR if we have any items and available capacity
             let mut tmp_cost = 0;
             while let Some((change, src, queued_at)) = queue.pop_front() {
                 tmp_cost += change.processing_cost();
