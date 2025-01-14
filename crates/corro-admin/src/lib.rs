@@ -336,9 +336,12 @@ async fn handle_conn(
                                 .clone();
 
                             let mut conn = agent.pool().write_low().await.unwrap();
+                            debug_log(&mut stream, format!("got write conn for actor id: {actor_id}")).await;
+
                             let mut bv = booked
                                 .write::<&str, _>("admin sync reconcile gaps booked versions", None)
                                 .await;
+                            debug_log(&mut stream, format!("got bookie for actor id: {actor_id}")).await;
 
                             if let Err(e) = collapse_gaps(&mut stream, &mut conn, &mut bv).await {
                                 _ = send_error(&mut stream, e).await;

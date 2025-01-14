@@ -447,7 +447,9 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
     let partial_schema = parse_sql(&new_sql)?;
 
+    info!("getting write connection to update schema");
     let mut conn = agent.pool().write_priority().await?;
+    info!("got write connection to update schema");
 
     // hold onto this lock so nothing else makes changes
     let mut schema_write = agent.schema().write();
