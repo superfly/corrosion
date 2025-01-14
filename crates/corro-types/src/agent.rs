@@ -21,11 +21,11 @@ use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{
+use tokio::{sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
     RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
     RwLockWriteGuard as TokioRwLockWriteGuard,
-};
+}, time::error::Elapsed};
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
@@ -532,6 +532,8 @@ pub enum PoolError {
     CallbackClosed,
     #[error("could not acquire write permit")]
     Permit(#[from] AcquireError),
+    #[error("timed out waiting to acquire write connection")]
+    TimedOut(#[from] Elapsed),
 }
 
 #[derive(Debug, thiserror::Error)]
