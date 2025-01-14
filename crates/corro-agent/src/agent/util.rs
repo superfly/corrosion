@@ -800,7 +800,7 @@ pub async fn process_multiple_changes(
         warn!("process_multiple_changes: removing duplicates took too long - {elapsed:?}");
     }
 
-    let mut conn = timeout(Duration::from_secs(10), agent.pool().write_normal())
+    let mut conn = timeout(Duration::from_secs(5 * 60), agent.pool().write_normal())
         .await
         .map_err(PoolError::from)??;
 
