@@ -7,7 +7,7 @@ use std::{
     future::poll_fn,
     net::SocketAddr,
     str::{FromStr, Utf8Error},
-    sync::Arc,
+    sync::Arc, time::Duration,
 };
 
 use bytes::Buf;
@@ -47,6 +47,7 @@ use rusqlite::{
     ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef,
     vtab::eponymous_only_module, Connection, Statement,
 };
+use socket2::{SockRef, TcpKeepalive};
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
     As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Literal,
@@ -486,6 +487,11 @@ pub async fn start(
             let agent = agent.clone();
             tokio::spawn(async move {
                 conn.set_nodelay(true)?;
+                {
+                    let sock = SockRef::from(&conn);
+                    let ka = TcpKeepalive::new().with_time(Duration::from_secs(10)).with_interval(Duration::from_secs(10)).with_retries(4);
+                    sock.set_tcp_keepalive(&ka)?;
+                }
                 let ssl = peek_for_sslrequest(&mut conn, false).await?;
                 trace!("SSL? {ssl}");
 
