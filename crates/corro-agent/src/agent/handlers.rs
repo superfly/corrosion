@@ -760,7 +760,7 @@ pub async fn handle_changes(
     // complicated loop to process changes efficiently w/ a max concurrency
     // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
-        while (buf_cost >= max_changes_chunk || !queue.is_empty())
+        while (buf_cost >= max_changes_chunk || !queue.is_empty() && join_set.is_empty())
             && join_set.len() < MAX_CONCURRENT
         {
             // Process if we hit the chunk size OR if we have any items and available capacity
