@@ -19,6 +19,7 @@ use corro_types::{
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
+    sqlite::CrConn,
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
@@ -43,7 +44,8 @@ use pgwire::{
 };
 use postgres_types::{FromSql, Type};
 use rusqlite::{
-    functions::FunctionFlags, types::ValueRef, vtab::eponymous_only_module, Connection, Statement,
+    ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef,
+    vtab::eponymous_only_module, Connection, Statement,
 };
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
@@ -705,16 +707,17 @@ pub async fn start(
                             }
                         };
 
+                        let mut session = Session {
+                            agent,
+                            conn: &conn,
+                            tx_state: TxState::default(),
+                        };
+
                         let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
 
                         let mut portals: HashMap<CompactString, Portal> = HashMap::new();
 
                         let mut discard_until_sync = false;
-
-                        let mut session = Session {
-                            agent,
-                            tx_state: TxState::default(),
-                        };
 
                         'outer: while let Some(msg) = front_rx.blocking_recv() {
                             debug!("msg: {msg:?}");
@@ -801,7 +804,7 @@ pub async fn start(
 
                                             trace!("parsed cmd: {parsed_cmd:#?}");
 
-                                            let prepped = match conn.prepare(parse.query()) {
+                                            let prepped = match session.conn.prepare(parse.query()) {
                                                 Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
@@ -1107,7 +1110,7 @@ pub async fn start(
                                             cmd,
                                             ..
                                         }) => {
-                                            let mut prepped = match conn.prepare(sql) {
+                                            let mut prepped = match session.conn.prepare(sql) {
                                                 Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
@@ -1430,7 +1433,7 @@ pub async fn start(
                                     )?;
                                 }
                                 PgWireFrontendMessage::Sync(_) => {
-                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                    send_ready(&mut session, discard_until_sync, &back_tx)?;
 
                                     // reset this
                                     discard_until_sync = false;
@@ -1488,13 +1491,15 @@ pub async fn start(
                                     };
 
                                     if let Err(e) = session.handle_execute(
-                                        &conn,
+                                        
                                         prepped,
                                         result_formats,
                                         cmd,
                                         max_rows,
                                         &back_tx,
                                     ) {
+                                        debug!("error in execute: {e}");
+
                                         back_tx.blocking_send(BackendResponse::Message {
                                             message: e.try_into()?,
                                             flush: true,
@@ -1504,7 +1509,7 @@ pub async fn start(
 
                                         send_ready(
                                             &mut session,
-                                            &conn,
+                                            
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1531,7 +1536,7 @@ pub async fn start(
                                             )?;
                                             send_ready(
                                                 &mut session,
-                                                &conn,
+                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;
@@ -1552,7 +1557,7 @@ pub async fn start(
 
                                         send_ready(
                                             &mut session,
-                                            &conn,
+                                            
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1561,7 +1566,7 @@ pub async fn start(
 
                                     for cmd in parsed_query.into_iter() {
                                         if let Err(e) =
-                                            session.handle_query(&conn, &cmd, &back_tx, true)
+                                            session.handle_query(&cmd, &back_tx, true)
                                         {
                                             back_tx.blocking_send(BackendResponse::Message {
                                                 message: e.try_into()?,
@@ -1569,7 +1574,7 @@ pub async fn start(
                                             })?;
                                             send_ready(
                                                 &mut session,
-                                                &conn,
+                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;
@@ -1582,7 +1587,7 @@ pub async fn start(
                                         trace!("committing IMPLICIT tx");
                                         let _permit = session.tx_state.end();
 
-                                        if let Err(e) = session.handle_commit(&conn) {
+                                        if let Err(e) = session.handle_commit() {
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
@@ -1599,7 +1604,7 @@ pub async fn start(
                                             )?;
                                             send_ready(
                                                 &mut session,
-                                                &conn,
+                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;
@@ -1608,7 +1613,7 @@ pub async fn start(
                                         trace!("committed IMPLICIT tx");
                                     }
 
-                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
+                                    send_ready(&mut session, discard_until_sync, &back_tx)?;
                                 }
                                 PgWireFrontendMessage::Terminate(_) => {
                                     break;
@@ -1801,15 +1806,15 @@ pub async fn start(
     Ok(PgServer { local_addr })
 }
 
-struct Session {
+struct Session<'conn> {
     agent: Agent,
+    conn: &'conn CrConn,
     tx_state: TxState,
 }
 
-impl Session {
+impl<'conn> Session<'conn> {
     fn handle_query(
         &mut self,
-        conn: &Connection,
         cmd: &ParsedCmd,
         back_tx: &Sender<BackendResponse>,
         send_row_desc: bool,
@@ -1842,14 +1847,14 @@ impl Session {
 
         // need to start an implicit transaction
         if self.tx_state.is_ended() && !cmd.is_begin() {
-            conn.execute_batch("BEGIN")?;
+            self.conn.execute_batch("BEGIN")?;
             trace!("started IMPLICIT tx");
             self.tx_state.start_implicit();
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
             trace!("committing IMPLICIT tx");
             let _permit = self.tx_state.end();
 
-            self.handle_commit(conn)?;
+            self.handle_commit()?;
             trace!("committed IMPLICIT tx");
         }
 
@@ -1858,22 +1863,22 @@ impl Session {
         let mut changes = 0usize;
 
         let count = if cmd.is_begin() {
-            conn.execute_batch("BEGIN")?;
+            self.conn.execute_batch("BEGIN")?;
             self.tx_state.start_explicit();
             0
         } else if cmd.is_commit() {
             let _permit = self.tx_state.end();
-            self.handle_commit(conn)?;
+            self.handle_commit()?;
             0
         } else if cmd.is_rollback() {
             let _permit = self.tx_state.end();
-            conn.execute_batch("ROLLBACK")?;
+            self.conn.execute_batch("ROLLBACK")?;
             0
         } else {
             let mut prepped = if cmd.is_pg() {
                 return Err(QueryError::NotSqlite);
             } else {
-                conn.prepare(&cmd.to_string())?
+                self.conn.prepare(&cmd.to_string())?
             };
 
             let fields = field_types(&prepped, cmd, FieldFormats::All(FieldFormat::Text))?;
@@ -1934,7 +1939,7 @@ impl Session {
             }
 
             if tag.returns_rows_affected() {
-                changes = conn.changes() as usize;
+                changes = self.conn.changes() as usize;
             }
 
             count
@@ -1962,9 +1967,8 @@ impl Session {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_execute<'conn>(
+    fn handle_execute(
         &mut self,
-        conn: &'conn Connection,
         prepped: &mut Statement<'conn>,
         result_formats: &[FieldFormat],
         cmd: &ParsedCmd,
@@ -1982,15 +1986,19 @@ impl Session {
         let mut opened_implicit_tx = false;
 
         if self.tx_state.is_ended() {
+            debug!("tx is_ended");
             if !cmd.is_begin() && !prepped.readonly() {
+                debug!("tx is_ended && !cmd.is_begin() && !prepped.readonly()");
                 // NOT in a tx and statement mutates DB...
-                conn.execute_batch("BEGIN")?;
+                self.conn.execute_batch("BEGIN")?;
 
                 self.tx_state.start_implicit();
                 opened_implicit_tx = true;
             } else if cmd.is_begin() {
-                conn.execute_batch("BEGIN")?;
+                debug!("cmd is BEGIN");
+                self.conn.execute_batch("BEGIN")?;
                 self.tx_state.start_explicit();
+                debug!("started EXPLICIT tx");
             }
         }
 
@@ -2001,7 +2009,10 @@ impl Session {
 
         if cmd.is_commit() {
             let _permit = self.tx_state.end();
-            self.handle_commit(conn)?;
+            self.handle_commit()?;
+        } else if cmd.is_begin() {
+            // do nothing
+            debug!("cmd is BEGIN");
         } else {
             if !self.tx_state.is_writing() && !prepped.readonly() {
                 trace!("statement writes, acquiring permit...");
@@ -2142,12 +2153,12 @@ impl Session {
             }
 
             if tag.returns_rows_affected() {
-                changes = conn.changes() as usize;
+                changes = self.conn.changes() as usize;
             }
 
             if opened_implicit_tx {
                 let _permit = self.tx_state.end();
-                self.handle_commit(conn)?;
+                self.handle_commit()?;
             }
         }
 
@@ -2169,7 +2180,7 @@ impl Session {
         Ok(())
     }
 
-    fn handle_commit(&self, conn: &Connection) -> Result<(), ChangeError> {
+    fn handle_commit(&self) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
 
         let mut book_writer = self
@@ -2179,8 +2190,9 @@ impl Session {
 
         let actor_id = self.agent.actor_id();
 
-        let insert_info = insert_local_changes(&self.agent, conn, &mut book_writer)?;
-        conn.execute_batch("COMMIT")
+        let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
+        self.conn
+            .execute_batch("COMMIT")
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),
@@ -2210,9 +2222,21 @@ impl Session {
     }
 }
 
+impl<'conn> Drop for Session<'conn> {
+    fn drop(&mut self) {
+        if !self.tx_state.is_ended() {
+            let _permit = self.tx_state.end();
+            if let Err(e) = self.conn.execute_batch("ROLLBACK") {
+                warn!("failed to rollback tx: {e}");
+            } else {
+                debug!("rolled back tx");
+            }
+        }
+    }
+}
+
 fn send_ready(
     session: &mut Session,
-    conn: &Connection,
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
@@ -2221,11 +2245,11 @@ fn send_ready(
         if discard_until_sync {
             // an error occured, rollback implicit tx!
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");
-            conn.execute_batch("ROLLBACK")?;
+            session.conn.execute_batch("ROLLBACK")?;
         } else {
             // no error, commit implicit tx
             warn!("receive Sync message, committing implicit tx");
-            session.handle_commit(conn)?;
+            session.handle_commit()?;
         }
 
         READY_STATUS_IDLE
@@ -2277,9 +2301,19 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
 
     fn try_from(value: QueryError) -> Result<Self, Self::Error> {
         Ok(PgWireBackendMessage::ErrorResponse(match value {
-            QueryError::Rusqlite(e) => {
-                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
-            }
+            QueryError::Rusqlite(e) => match &e {
+                rusqlite::Error::SqliteFailure(sqlite_error, _maybe_sqlite_message)
+                    if sqlite_error.extended_code == SQLITE_CONSTRAINT_UNIQUE =>
+                {
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        SqlState::UNIQUE_VIOLATION.code().into(),
+                        e.to_string(),
+                    )
+                    .into()
+                }
+                _ => ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into(),
+            },
             QueryError::Unsupported(e) => e.into(),
             e @ QueryError::NotSqlite => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
@@ -3450,4 +3484,98 @@ mod tests {
 
         Ok(())
     }
+
+    // #[tokio::test(flavor = "multi_thread")]
+    // async fn test_write_permit_released_on_error() -> Result<(), BoxError> {
+    //     _ = tracing_subscriber::fmt::try_init();
+    //     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    //     let tmpdir = tempfile::tempdir()?;
+
+    //     // Create a test table that will help us verify transaction state
+    //     tokio::fs::write(
+    //         tmpdir.path().join("test.sql"),
+    //         "CREATE TABLE test (id INTEGER PRIMARY KEY NOT NULL, value TEXT);",
+    //     )
+    //     .await?;
+
+    //     let ta = launch_test_agent(
+    //         |builder| {
+    //             builder
+    //                 .add_schema_path(tmpdir.path().display().to_string())
+    //                 .build()
+    //         },
+    //         tripwire.clone(),
+    //     )
+    //     .await?;
+
+    //     let server = start(
+    //         ta.agent.clone(),
+    //         PgConfig {
+    //             bind_addr: "127.0.0.1:0".parse()?,
+    //         },
+    //         tripwire,
+    //     )
+    //     .await?;
+
+    //     let conn_str = format!(
+    //         "host={} port={} user=testuser",
+    //         server.local_addr.ip(),
+    //         server.local_addr.port()
+    //     );
+
+    //     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
+    //     tokio::spawn(connection);
+
+    //     println!("before begin");
+
+    //     // Start transaction
+    //     client.execute("BEGIN", &[]).await?;
+
+    //     println!("after begin");
+
+    //     // Insert valid data to acquire write permit
+    //     client
+    //         .execute("INSERT INTO test (id, value) VALUES (1, 'test')", &[])
+    //         .await?;
+
+    //     // Attempt an invalid insert that will error
+    //     let err = client
+    //         .execute("INSERT INTO test (id, value) VALUES (1, 'duplicate')", &[])
+    //         .await
+    //         .unwrap_err();
+    //     assert!(err.to_string().contains("UNIQUE constraint failed"));
+    //     println!("after error");
+
+    //     // Verify we can still query in failed transaction
+    //     let rows = client.query("SELECT 1", &[]).await.unwrap();
+    //     assert_eq!(
+    //         rows.len(),
+    //         1,
+    //         "Query should succeed but transaction should be marked as failed"
+    //     );
+
+    //     // Try another write - should fail since we're in failed transaction
+    //     let err = client
+    //         .execute("INSERT INTO test (id, value) VALUES (2, 'test2')", &[])
+    //         .await
+    //         .unwrap_err();
+    //     assert!(err.to_string().contains("current transaction is aborted"));
+
+    //     // Verify ROLLBACK works and clears the failed state
+    //     client.execute("ROLLBACK", &[]).await?;
+
+    //     // Verify we can start a new transaction
+    //     client.execute("BEGIN", &[]).await?;
+    //     client
+    //         .execute("INSERT INTO test (id, value) VALUES (2, 'test2')", &[])
+    //         .await?;
+    //     client.execute("COMMIT", &[]).await?;
+
+    //     // Cleanup
+    //     tripwire_tx.send(()).await.ok();
+    //     tripwire_worker.await;
+    //     wait_for_all_pending_handles().await;
+
+    //     Ok(())
+    // }
 }
