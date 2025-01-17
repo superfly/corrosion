@@ -1592,8 +1592,11 @@ pub async fn start(
                                     if session.tx_state.is_implicit() {
                                         trace!("committing IMPLICIT tx");
                                         let _permit = session.tx_state.end();
+                                        if _permit.is_none() {
+                                            warn!("corro_pg: commiting without write permit")
+                                        }
 
-                                        if let Err(e) = session.handle_commit() {
+                                        if let Err(e) = session.handle_commit(None) {
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
@@ -1859,8 +1862,10 @@ impl<'conn> Session<'conn> {
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
             trace!("committing IMPLICIT tx");
             let _permit = self.tx_state.end();
-
-            self.handle_commit()?;
+            if _permit.is_none() {
+                warn!("corro_pg: commiting without write permit")
+            }
+            self.handle_commit(Some("BEGIN".to_string()))?;
             trace!("committed IMPLICIT tx");
         }
 
@@ -1874,7 +1879,10 @@ impl<'conn> Session<'conn> {
             0
         } else if cmd.is_commit() {
             let _permit = self.tx_state.end();
-            self.handle_commit()?;
+            if _permit.is_none() {
+                warn!("corro_pg: commiting without write permit")
+            }
+            self.handle_commit(Some("COMMIT".to_string()))?;
             0
         } else if cmd.is_rollback() {
             let _permit = self.tx_state.end();
@@ -2013,9 +2021,13 @@ impl<'conn> Session<'conn> {
         let mut count = 0;
         let mut changes = 0usize;
 
+        let sql = prepped.expanded_sql().map(|s| s.chars().take(30).collect());
         if cmd.is_commit() {
             let _permit = self.tx_state.end();
-            self.handle_commit()?;
+            if _permit.is_none() {
+                warn!("corro_pg: commiting without write permit")
+            }
+            self.handle_commit(sql)?;
         } else if cmd.is_begin() {
             // do nothing
             debug!("cmd is BEGIN");
@@ -2164,7 +2176,10 @@ impl<'conn> Session<'conn> {
 
             if opened_implicit_tx {
                 let _permit = self.tx_state.end();
-                self.handle_commit()?;
+                if _permit.is_none() {
+                    warn!("corro_pg: commiting without write permit")
+                }
+                self.handle_commit(sql)?;
             }
         }
 
@@ -2186,13 +2201,13 @@ impl<'conn> Session<'conn> {
         Ok(())
     }
 
-    fn handle_commit(&self) -> Result<(), ChangeError> {
+    fn handle_commit(&self, statement: Option<String>) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
 
         let mut book_writer = self
             .agent
             .booked()
-            .blocking_write::<&str, _>("handle_write_tx(book_writer)", None);
+            .blocking_write::<String, _>("handle_write_tx(book_writer)", statement);
 
         let actor_id = self.agent.actor_id();
 
@@ -2255,7 +2270,10 @@ fn send_ready(
         } else {
             // no error, commit implicit tx
             warn!("receive Sync message, committing implicit tx");
-            session.handle_commit()?;
+            if _permit.is_none() {
+                warn!("corro_pg: commiting without write permit")
+            }
+            session.handle_commit(None)?;
         }
 
         READY_STATUS_IDLE

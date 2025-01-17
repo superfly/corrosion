@@ -758,7 +758,7 @@ pub async fn process_multiple_changes(
     counter!("corro.agent.changes.processing.started").increment(changes.len() as u64);
     debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
-    const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+    const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(10);
     let mut seen = HashSet::new();
     let mut unknown_changes: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for (change, src, queued_at) in changes {
@@ -800,7 +800,7 @@ pub async fn process_multiple_changes(
         warn!("process_multiple_changes: removing duplicates took too long - {elapsed:?}");
     }
 
-    let mut conn = timeout(Duration::from_secs(5 * 60), agent.pool().write_normal())
+    let mut conn = timeout(Duration::from_secs(2 * 60), agent.pool().write_normal())
         .await
         .map_err(PoolError::from)??;
 
