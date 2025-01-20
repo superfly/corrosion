@@ -135,6 +135,7 @@ pub struct ApiConfig {
 pub struct PgConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
+    pub tls: Option<TlsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

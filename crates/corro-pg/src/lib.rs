@@ -45,6 +45,7 @@ use postgres_types::{FromSql, Type};
 use rusqlite::{
     functions::FunctionFlags, types::ValueRef, vtab::eponymous_only_module, Connection, Statement,
 };
+use rustls::ServerConfig;
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
     As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Literal,
@@ -60,7 +61,8 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tokio_util::{codec::Framed, sync::CancellationToken};
+use tokio_rustls::TlsAcceptor;
+use tokio_util::{codec::Framed, either::Either, sync::CancellationToken};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
@@ -464,6 +466,85 @@ pub enum PgStartError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Rusqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    PgTlsErrro(#[from] eyre::Error),
+}
+
+async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
+    if pg.tls.is_none() {
+        return Ok((None, false));
+    }
+    let mut ssl_required = false;
+
+    let tls = pg.tls.unwrap();
+
+    let key = tokio::fs::read(&tls.key_file).await?;
+    let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
+        rustls::PrivateKey(key)
+    } else {
+        let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
+        match pkcs8.into_iter().next() {
+            Some(x) => rustls::PrivateKey(x),
+            None => {
+                let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
+                match rsa.into_iter().next() {
+                    Some(x) => rustls::PrivateKey(x),
+                    None => {
+                        eyre::bail!("no private keys found");
+                    }
+                }
+            }
+        }
+    };
+
+    let certs = tokio::fs::read(&tls.cert_file).await?;
+    let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
+        vec![rustls::Certificate(certs)]
+    } else {
+        rustls_pemfile::certs(&mut &*certs)?
+            .into_iter()
+            .map(rustls::Certificate)
+            .collect()
+    };
+
+    let server_crypto = ServerConfig::builder().with_safe_defaults();
+
+    let server_crypto = if tls.client.is_some() {
+        ssl_required = true; // client cert auth is required so don't allow non-ssl connections
+        let ca_file = match &tls.ca_file {
+            None => {
+                eyre::bail!(
+                    "ca_file required in tls config for server client cert auth verification"
+                );
+            }
+            Some(ca_file) => ca_file,
+        };
+
+        let ca_certs = tokio::fs::read(&ca_file).await?;
+        let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
+            vec![rustls::Certificate(ca_certs)]
+        } else {
+            rustls_pemfile::certs(&mut &*ca_certs)?
+                .into_iter()
+                .map(rustls::Certificate)
+                .collect()
+        };
+
+        let mut root_store = rustls::RootCertStore::empty();
+
+        for cert in ca_certs {
+            root_store.add(&cert)?;
+        }
+
+        server_crypto.with_client_cert_verifier(Arc::new(
+            rustls::server::AllowAnyAuthenticatedClient::new(root_store),
+        ))
+    } else {
+        server_crypto.with_no_client_auth()
+    };
+
+    let config = server_crypto.with_single_cert(certs, key)?;
+    Ok((Some(TlsAcceptor::from(Arc::new(config))), ssl_required))
 }
 
 pub async fn start(
@@ -472,7 +553,9 @@ pub async fn start(
     mut tripwire: Tripwire,
 ) -> Result<PgServer, PgStartError> {
     let server = TcpListener::bind(pg.bind_addr).await?;
+    let (tls_acceptor, ssl_required) = setup_tls(pg).await?;
     let local_addr = server.local_addr()?;
+    let ssl_supported = tls_acceptor.is_some();
 
     tokio::spawn(async move {
         loop {
@@ -480,18 +563,48 @@ pub async fn start(
                 Outcome::Completed(res) => res?,
                 Outcome::Preempted(_) => break,
             };
+            let tls_acceptor = tls_acceptor.clone();
             debug!("Accepted a PostgreSQL connection (from: {remote_addr})");
 
             let agent = agent.clone();
             tokio::spawn(async move {
                 conn.set_nodelay(true)?;
-                let ssl = peek_for_sslrequest(&mut conn, false).await?;
+                let ssl = peek_for_sslrequest(&mut conn, ssl_supported).await?;
                 trace!("SSL? {ssl}");
 
-                let mut framed = Framed::new(
-                    conn,
-                    PgWireMessageServerCodec::new(ClientInfoHolder::new(remote_addr, false)),
-                );
+                let mut secured_conn = false;
+
+                let mut framed = {
+                    if ssl_supported && ssl {
+                        // safe to unwrap here because we checked for ssl_supported above
+                        let tls_acceptor = tls_acceptor.unwrap();
+                        let conn = tls_acceptor.accept(conn).await?;
+                        secured_conn = true;
+                        Framed::new(
+                            Either::Left(conn),
+                            PgWireMessageServerCodec::new(ClientInfoHolder::new(local_addr, true)),
+                        )
+                    } else {
+                        Framed::new(
+                            Either::Right(conn),
+                            PgWireMessageServerCodec::new(ClientInfoHolder::new(local_addr, false)),
+                        )
+                    }
+                };
+
+                if ssl_required && !secured_conn {
+                    framed
+                        .send(PgWireBackendMessage::ErrorResponse(
+                            ErrorInfo::new(
+                                "FATAL".into(),
+                                SqlState::PROTOCOL_VIOLATION.code().into(),
+                                "ssl required".into(),
+                            )
+                            .into(),
+                        ))
+                        .await?;
+                    return Ok(());
+                }
 
                 let msg = match framed.next().await {
                     Some(msg) => msg?,
@@ -3190,6 +3303,7 @@ mod tests {
             ta.agent.clone(),
             PgConfig {
                 bind_addr: "127.0.0.1:0".parse()?,
+                tls: None,
             },
             tripwire,
         )
