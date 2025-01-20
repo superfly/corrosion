@@ -215,8 +215,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                     for (id, lock) in top {
                         let duration = lock.started_at.elapsed();
                         warn!(
-                            "{} (id: {id}, type: {:?}, state: {:?}) locked for: {duration:?}",
-                            lock.label, lock.kind, lock.state
+                            "{} (id: {id}, type: {:?}, state: {:?}, extra: {:?}) locked for: {duration:?}",
+                            lock.label, lock.kind, lock.state, lock.extra
                         );
 
                         if duration >= WARNING_THRESHOLD {
