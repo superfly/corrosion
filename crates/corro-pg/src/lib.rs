@@ -423,11 +423,8 @@ enum OpenTxKind {
     Explicit,
 }
 
-async fn peek_for_sslrequest(
-    tcp_socket: &mut TcpStream,
-    ssl_supported: bool,
-) -> std::io::Result<bool> {
-    let mut ssl = false;
+async fn peek_for_sslrequest(tcp_socket: &mut TcpStream) -> std::io::Result<bool> {
+    let mut want_ssl = false;
     let mut buf = [0u8; SslRequest::BODY_SIZE];
     let mut buf = ReadBuf::new(&mut buf);
     loop {
@@ -447,15 +444,10 @@ async fn peek_for_sslrequest(
                     .read_exact(&mut [0u8; SslRequest::BODY_SIZE])
                     .await?;
                 // ssl configured
-                if ssl_supported {
-                    ssl = true;
-                    tcp_socket.write_all(b"S").await?;
-                } else {
-                    tcp_socket.write_all(b"N").await?;
-                }
+                want_ssl = true;
             }
 
-            return Ok(ssl);
+            return Ok(want_ssl);
         }
     }
 }
@@ -555,7 +547,6 @@ pub async fn start(
     let server = TcpListener::bind(pg.bind_addr).await?;
     let (tls_acceptor, ssl_required) = setup_tls(pg).await?;
     let local_addr = server.local_addr()?;
-    let ssl_supported = tls_acceptor.is_some();
 
     tokio::spawn(async move {
         loop {
@@ -569,42 +560,44 @@ pub async fn start(
             let agent = agent.clone();
             tokio::spawn(async move {
                 conn.set_nodelay(true)?;
-                let ssl = peek_for_sslrequest(&mut conn, ssl_supported).await?;
-                trace!("SSL? {ssl}");
+                let is_sslrequest = peek_for_sslrequest(&mut conn).await?;
 
-                let mut secured_conn = false;
+                // reject non-ssl connections if ssl is required (client cert auth)
+                if ssl_required && !is_sslrequest {
+                    return Ok(());
+                }
 
-                let mut framed = {
-                    if ssl_supported && ssl {
-                        // safe to unwrap here because we checked for ssl_supported above
-                        let tls_acceptor = tls_acceptor.unwrap();
-                        let conn = tls_acceptor.accept(conn).await?;
-                        secured_conn = true;
-                        Framed::new(
-                            Either::Left(conn),
-                            PgWireMessageServerCodec::new(ClientInfoHolder::new(local_addr, true)),
+                let (mut framed, secured) = match (tls_acceptor, is_sslrequest) {
+                    (Some(tls_acceptor), true) => {
+                        conn.write_all(b"S").await?;
+                        let tls_conn = tls_acceptor.accept(conn).await?;
+                        (
+                            Framed::new(
+                                Either::Left(tls_conn),
+                                PgWireMessageServerCodec::new(ClientInfoHolder::new(
+                                    local_addr, true,
+                                )),
+                            ),
+                            true,
                         )
-                    } else {
-                        Framed::new(
-                            Either::Right(conn),
-                            PgWireMessageServerCodec::new(ClientInfoHolder::new(local_addr, false)),
+                    }
+                    (_, is_sslreq) => {
+                        if is_sslreq {
+                            conn.write_all(b"N").await?;
+                        }
+                        (
+                            Framed::new(
+                                Either::Right(conn),
+                                PgWireMessageServerCodec::new(ClientInfoHolder::new(
+                                    local_addr, false,
+                                )),
+                            ),
+                            false,
                         )
                     }
                 };
 
-                if ssl_required && !secured_conn {
-                    framed
-                        .send(PgWireBackendMessage::ErrorResponse(
-                            ErrorInfo::new(
-                                "FATAL".into(),
-                                SqlState::PROTOCOL_VIOLATION.code().into(),
-                                "ssl required".into(),
-                            )
-                            .into(),
-                        ))
-                        .await?;
-                    return Ok(());
-                }
+                trace!("SSL ? {secured}");
 
                 let msg = match framed.next().await {
                     Some(msg) => msg?,
