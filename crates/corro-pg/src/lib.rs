@@ -501,7 +501,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
 
     let server_crypto = ServerConfig::builder().with_safe_defaults();
 
-    let server_crypto = if tls.client.is_some() {
+    let server_crypto = if tls.verify_client {
         ssl_required = true; // client cert auth is required so don't allow non-ssl connections
         let ca_file = match &tls.ca_file {
             None => {
@@ -564,6 +564,7 @@ pub async fn start(
 
                 // reject non-ssl connections if ssl is required (client cert auth)
                 if ssl_required && !is_sslrequest {
+                    debug!("rejecting non-ssl connection");
                     return Ok(());
                 }
 
