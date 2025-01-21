@@ -3252,20 +3252,32 @@ fn field_types(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        io::BufReader,
+        time::{Duration, Instant},
+    };
 
+    use camino::Utf8PathBuf;
     use chrono::{DateTime, Utc};
-    use corro_tests::launch_test_agent;
+    use corro_tests::{launch_test_agent, TestAgent};
+    use corro_types::{
+        config::PgTlsConfig,
+        tls::{generate_ca, generate_client_cert, generate_server_cert},
+    };
+    use rcgen::Certificate;
     use spawn::wait_for_all_pending_handles;
+    use tempfile::TempDir;
     use tokio_postgres::NoTls;
+    use tokio_postgres_rustls::MakeRustlsConnect;
     use tripwire::Tripwire;
 
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_pg() -> Result<(), BoxError> {
+    async fn setup_pg_test_server(
+        tripwire: Tripwire,
+        tls_config: Option<PgTlsConfig>,
+    ) -> Result<(TestAgent, PgServer), BoxError> {
         _ = tracing_subscriber::fmt::try_init();
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
         let tmpdir = tempfile::tempdir()?;
 
@@ -3291,17 +3303,26 @@ mod tests {
         )
         .await?;
 
-        let sema = ta.agent.write_sema().clone();
-
         let server = start(
             ta.agent.clone(),
             PgConfig {
                 bind_addr: "127.0.0.1:0".parse()?,
-                tls: None,
+                tls: tls_config,
             },
             tripwire,
         )
         .await?;
+
+        Ok((ta, server))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pg() -> Result<(), BoxError> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let (ta, server) = setup_pg_test_server(tripwire, None).await?;
+
+        let sema = ta.agent.write_sema().clone();
 
         let conn_str = format!(
             "host={} port={} user=testuser",
@@ -3464,6 +3485,193 @@ mod tests {
                 )
                 .await?;
             println!("COUNT ROW: {row:?}");
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    struct TestCertificates {
+        ca_cert: Certificate,
+        client_cert_signed: String,
+        client_key: Vec<u8>,
+        ca_file: Utf8PathBuf,
+        server_cert_file: Utf8PathBuf,
+        server_key_file: Utf8PathBuf,
+    }
+
+    async fn generate_and_write_certs(tmpdir: &TempDir) -> Result<TestCertificates, BoxError> {
+        let ca_cert = generate_ca()?;
+        let (server_cert, server_cert_signed) = generate_server_cert(
+            &ca_cert.serialize_pem()?,
+            &ca_cert.serialize_private_key_pem(),
+            "127.0.0.1".parse()?,
+        )?;
+
+        let (client_cert, client_cert_signed) = generate_client_cert(
+            &ca_cert.serialize_pem()?,
+            &ca_cert.serialize_private_key_pem(),
+        )?;
+
+        let base_path = Utf8PathBuf::from(tmpdir.path().display().to_string());
+
+        let cert_file = base_path.join("cert.pem");
+        let key_file = base_path.join("cert.key");
+        let ca_file = base_path.join("ca.pem");
+
+        let client_cert_file = base_path.join("client-cert.pem");
+        let client_key_file = base_path.join("client-cert.key");
+
+        tokio::fs::write(&cert_file, &server_cert_signed).await?;
+        tokio::fs::write(&key_file, server_cert.serialize_private_key_pem()).await?;
+
+        tokio::fs::write(&ca_file, ca_cert.serialize_pem()?).await?;
+
+        tokio::fs::write(&client_cert_file, &client_cert_signed).await?;
+        tokio::fs::write(&client_key_file, client_cert.serialize_private_key_pem()).await?;
+
+        Ok(TestCertificates {
+            server_cert_file: cert_file,
+            server_key_file: key_file,
+            ca_cert,
+            client_cert_signed: client_cert_signed,
+            client_key: client_cert.serialize_private_key_der(),
+            ca_file,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pg_ssl() -> Result<(), BoxError> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let tmpdir = TempDir::new()?;
+        let certs = generate_and_write_certs(&tmpdir).await?;
+
+        let (ta, server) = setup_pg_test_server(
+            tripwire,
+            Some(PgTlsConfig {
+                cert_file: certs.server_cert_file,
+                key_file: certs.server_key_file,
+                ca_file: None,
+                verify_client: false,
+            }),
+        )
+        .await?;
+
+        let sema = ta.agent.write_sema().clone();
+
+        let conn_str = format!(
+            "host={} port={} user=testuser",
+            server.local_addr.ip(),
+            server.local_addr.port()
+        );
+
+        {
+            let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
+            root_cert_store.add(&rustls::Certificate(certs.ca_cert.serialize_der()?))?;
+            let config = rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth();
+
+            let connector = MakeRustlsConnect::new(config);
+
+            println!("connecting to: {conn_str}");
+
+            let (client, client_conn) = tokio_postgres::connect(&conn_str, connector).await?;
+
+            tokio::spawn(client_conn);
+
+            let _permit = sema.acquire().await;
+
+            println!("before query");
+
+            client.simple_query("SELECT 1").await?;
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pg_mtls() -> Result<(), BoxError> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let tmpdir = TempDir::new()?;
+
+        let certs = generate_and_write_certs(&tmpdir).await?;
+
+        let (ta, server) = setup_pg_test_server(
+            tripwire,
+            Some(PgTlsConfig {
+                cert_file: certs.server_cert_file,
+                key_file: certs.server_key_file,
+                ca_file: Some(certs.ca_file),
+                verify_client: true,
+            }),
+        )
+        .await?;
+
+        let sema = ta.agent.write_sema().clone();
+
+        let conn_str = format!(
+            "host={} port={} user=testuser",
+            server.local_addr.ip(),
+            server.local_addr.port()
+        );
+
+        {
+            let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
+            root_cert_store.add(&rustls::Certificate(certs.ca_cert.serialize_der()?))?;
+
+            let client_cert =
+                rustls_pemfile::certs(&mut BufReader::new(certs.client_cert_signed.as_bytes()))
+                    .map_err(|e| format!("failed to read client cert: {e}"))?;
+
+            let client_cert: Vec<rustls::Certificate> = client_cert
+                .iter()
+                .map(|cert| rustls::Certificate(cert.clone()))
+                .collect();
+
+            let config = rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(root_cert_store.clone())
+                .with_client_auth_cert(client_cert, rustls::PrivateKey(certs.client_key))?;
+
+            let connector = MakeRustlsConnect::new(config);
+
+            println!("connecting to: {conn_str} with client auth cert");
+            let (client, client_conn) = tokio_postgres::connect(&conn_str, connector).await?;
+
+            tokio::spawn(client_conn);
+
+            println!("successfully connected!");
+
+            let _permit = sema.acquire().await;
+
+            client.simple_query("SELECT 1").await?;
+
+            let config = rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth();
+
+            let connector = MakeRustlsConnect::new(config);
+
+            println!("connecting to: {conn_str} without client auth cert");
+            let result = tokio_postgres::connect(&conn_str, connector).await;
+            assert!(
+                result.is_err(),
+                "expected connect to fail without client auth cert"
+            );
+
+            println!("successfully failed to connect without client auth cert");
         }
 
         tripwire_tx.send(()).await.ok();

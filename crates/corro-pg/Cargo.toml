@@ -34,3 +34,6 @@ tokio-rustls = "0.24.1"
 corro-tests = { path = "../corro-tests" }
 tokio-postgres = { version = "0.7.10" }
 tracing-subscriber = { workspace = true }
+camino = { workspace = true }
+tokio-postgres-rustls = "0.10.0"
+rcgen = { workspace = true }
