@@ -466,9 +466,15 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
     if pg.tls.is_none() {
         return Ok((None, false));
     }
-    let mut ssl_required = false;
 
-    let tls = pg.tls.unwrap();
+    let tls = match pg.tls {
+        Some(tls) => tls,
+        None => {
+            return Ok((None, false));
+        }
+    };
+
+    let ssl_required = tls.verify_client;
 
     let key = tokio::fs::read(&tls.key_file).await?;
     let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
@@ -501,8 +507,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
 
     let server_crypto = ServerConfig::builder().with_safe_defaults();
 
-    let server_crypto = if tls.verify_client {
-        ssl_required = true; // client cert auth is required so don't allow non-ssl connections
+    let server_crypto = if ssl_required {
         let ca_file = match &tls.ca_file {
             None => {
                 eyre::bail!(
