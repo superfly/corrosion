@@ -459,14 +459,10 @@ pub enum PgStartError {
     #[error(transparent)]
     Rusqlite(#[from] rusqlite::Error),
     #[error(transparent)]
-    PgTlsErrro(#[from] eyre::Error),
+    PgTlsError(#[from] eyre::Error),
 }
 
 async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
-    if pg.tls.is_none() {
-        return Ok((None, false));
-    }
-
     let tls = match pg.tls {
         Some(tls) => tls,
         None => {
