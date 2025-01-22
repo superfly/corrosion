@@ -8,7 +8,7 @@ pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
 
 const fn default_apply_queue() -> usize {
-    100
+    50
 }
 
 const fn default_wal_threshold() -> usize {
@@ -38,7 +38,7 @@ const fn default_small_channel() -> usize {
 }
 
 const fn default_apply_timeout() -> usize {
-    50
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

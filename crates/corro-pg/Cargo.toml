@@ -28,6 +28,7 @@ tracing = { workspace = true }
 tripwire = { path = "../tripwire" }
 sqlparser = { version = "0.39.0" }
 chrono = { version = "0.4.31" }
+socket2 = { version = "0.5" }
 tokio-rustls = "0.24.1"
 
 [dev-dependencies]
