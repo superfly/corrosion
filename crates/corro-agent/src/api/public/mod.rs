@@ -57,7 +57,7 @@ where
     let start = Instant::now();
     block_in_place(move || {
         let tx = conn
-            .immediate_transaction()
+            .immediate_transaction_timeout(Duration::from_secs(30))
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),

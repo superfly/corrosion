@@ -3442,7 +3442,9 @@ mod tests {
             println!("t2text: {:?}", row.try_get::<_, String>(2));
 
             let now: DateTime<Utc> = Utc::now();
-            let now = NaiveDateTime::from_timestamp_micros(now.timestamp_micros()).unwrap();
+            let now = DateTime::from_timestamp_micros(now.timestamp_micros())
+                .unwrap()
+                .naive_utc();
             println!("NOW: {now:?}");
 
             let row = client
@@ -3459,7 +3461,9 @@ mod tests {
             assert_eq!(now, updated_at);
 
             let future: DateTime<Utc> = Utc::now() + Duration::from_secs(1);
-            let future = NaiveDateTime::from_timestamp_micros(future.timestamp_micros()).unwrap();
+            let future = DateTime::from_timestamp_micros(future.timestamp_micros())
+                .unwrap()
+                .naive_utc();
             println!("NOW: {future:?}");
 
             let row = client

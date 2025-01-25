@@ -432,7 +432,7 @@ pub async fn clear_buffered_meta_loop(
                     let mut conn = pool.write_low().await?;
 
                     block_in_place(|| {
-                        let tx = conn.immediate_transaction()?;
+                        let tx = conn.immediate_transaction_timeout(Duration::from_secs(30))?;
 
                         // TODO: delete buffered changes from deleted sequences only (maybe, it's kind of hard and may not be necessary)
 
@@ -574,7 +574,7 @@ pub async fn process_fully_buffered_changes(
             };
 
             let tx = conn
-                .immediate_transaction()
+                .immediate_transaction_timeout(Duration::from_secs(30))
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
                     actor_id: Some(actor_id),
@@ -807,7 +807,7 @@ pub async fn process_multiple_changes(
     let changesets = block_in_place(|| {
         let start = Instant::now();
         let mut tx = conn
-            .immediate_transaction()
+            .immediate_transaction_timeout(Duration::from_secs(30))
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: None,
