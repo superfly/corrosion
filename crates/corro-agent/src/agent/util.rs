@@ -1046,8 +1046,6 @@ pub async fn process_multiple_changes(
             warn!("process_multiple_changes: commiting transaction took too long - {elapsed:?}");
         }
 
-        // drop connection early
-        drop(conn);
         if let Some(ts) = last_cleared {
             let mut booked_writer = agent
                 .booked()
