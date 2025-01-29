@@ -25,7 +25,7 @@ use tokio::{sync::{
     AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
     RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
     RwLockWriteGuard as TokioRwLockWriteGuard,
-}, time::error::Elapsed};
+}, time::{error::Elapsed, timeout}};
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
@@ -673,7 +673,7 @@ impl SplitPool {
         gauge!("corro.sqlite.pool.write.connections.waiting").set(write_state.waiting as f64);
 
         let available_permit = self.0.write_sema.available_permits();
-        gauge!("corro.sqlite.pool.write_sema.permits.available").set(available_permit as f64);
+        gauge!("corro.sqlite.write_permit.permits.available").set(available_permit as f64);
     }
 
     // get a read-only connection
@@ -752,7 +752,12 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
         return;
     }
 
-    cancel.cancelled().await
+    if timeout(Duration::from_secs(2 * 60), cancel.cancelled()).await.is_err() {
+        warn!("wait_conn_drop is taking longer than two minutes");
+
+        // Continue waiting
+        cancel.cancelled().await;
+    }
 }
 
 pub struct WriteConn {
