@@ -75,6 +75,7 @@ where
             version: insert_info.as_ref().map(|info| info.version),
         })?;
 
+        drop(conn);
         let elapsed = start.elapsed();
 
         match insert_info {
