@@ -671,6 +671,9 @@ impl SplitPool {
         gauge!("corro.sqlite.pool.write.connections").set(write_state.size as f64);
         gauge!("corro.sqlite.pool.write.connections.available").set(write_state.available as f64);
         gauge!("corro.sqlite.pool.write.connections.waiting").set(write_state.waiting as f64);
+
+        let available_permit = self.0.write_sema.available_permits();
+        gauge!("corro.sqlite.pool.write_sema.permits.available").set(available_permit as f64);
     }
 
     // get a read-only connection
