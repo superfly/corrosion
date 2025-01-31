@@ -38,6 +38,7 @@ use corro_types::base::Version;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::store_empty_changeset;
 use foca::Notification;
+use indexmap::map::Entry;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
@@ -890,15 +891,15 @@ pub async fn handle_changes(
             let mut dropped_count = 0;
             if let Some((dropped_change, _, _)) = queue.pop_front() {
                 // this could cause changes to keep being broadcasted
-                // for v in dropped_change.versions() {
-                //     if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
-                //         if let Some(seqs) = dropped_change.seqs().cloned() {
-                //             entry.get_mut().remove(seqs);
-                //         } else {
-                //             entry.remove_entry();
-                //         }
-                //     };
-                // }
+                for v in dropped_change.versions() {
+                    if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
+                        if let Some(seqs) = dropped_change.seqs().cloned() {
+                            entry.get_mut().remove(seqs);
+                        } else {
+                            entry.remove_entry();
+                        }
+                    };
+                }
 
                 buf_cost -= dropped_change.processing_cost();
                 dropped_count += 1;

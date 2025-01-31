@@ -641,15 +641,16 @@ impl SplitPool {
 
         tokio::spawn(async move {
             loop {
-                let tx: oneshot::Sender<CancellationToken> = tokio::select! {
+                
+                let (tx, chan) = tokio::select! {
                     biased;
 
-                    Some(tx) = priority_rx.recv() => tx,
-                    Some(tx) = normal_rx.recv() => tx,
-                    Some(tx) = low_rx.recv() => tx,
+                    Some(tx) = priority_rx.recv() => (tx, "priority"),
+                    Some(tx) = normal_rx.recv() => (tx, "normal"),
+                    Some(tx) = low_rx.recv() => (tx, "low"),
                 };
 
-                wait_conn_drop(tx).await
+                wait_conn_drop(tx, chan).await
             }
         });
 
@@ -727,14 +728,14 @@ impl SplitPool {
         queue: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
-        timeout(Duration::from_secs(5 * 60), chan.send(tx))
+        timeout(Duration::from_secs(6 * 60), chan.send(tx))
             .await
             .map_err(|_| PoolError::TimedOut {
                 op: "tx to oneshot channel".to_string(),
             })?
             .map_err(|_| PoolError::QueueClosed)?;
         let start = Instant::now();
-        let token = timeout(Duration::from_secs(5 * 60), rx)
+        let token = timeout(Duration::from_secs(6 * 60), rx)
             .await
             .map_err(|_| PoolError::TimedOut {
                 op: "rx from oneshot channel".to_string(),
@@ -742,7 +743,7 @@ impl SplitPool {
             .map_err(|_| PoolError::CallbackClosed)?;
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
-        let conn = timeout(Duration::from_secs(5 * 60), self.0.write.get())
+        let conn = timeout(Duration::from_secs(6 * 60), self.0.write.get())
             .await
             .map_err(|_| PoolError::TimedOut {
                 op: "acquiring write conn".to_string(),
@@ -768,7 +769,7 @@ impl SplitPool {
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
+async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, chan: &str) {
     let cancel = CancellationToken::new();
 
     if let Err(_e) = tx.send(cancel.clone()) {
@@ -776,11 +777,11 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
         return;
     }
 
-    if timeout(Duration::from_secs(5 * 60), cancel.cancelled())
+    if timeout(Duration::from_secs(4 * 60), cancel.cancelled())
         .await
         .is_err()
     {
-        warn!("wait_conn_drop is taking longer than five minutes");
+        warn!("wait_conn_drop is taking longer than four minutes - request from {chan}");
 
         // Continue waiting
         cancel.cancelled().await;
