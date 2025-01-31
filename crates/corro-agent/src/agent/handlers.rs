@@ -890,6 +890,7 @@ pub async fn handle_changes(
         if queue.len() >= max_queue_len {
             let mut dropped_count = 0;
             if let Some((dropped_change, _, _)) = queue.pop_front() {
+                // this could cause changes to keep being broadcasted
                 for v in dropped_change.versions() {
                     if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
                         if let Some(seqs) = dropped_change.seqs().cloned() {

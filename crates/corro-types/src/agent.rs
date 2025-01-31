@@ -21,14 +21,17 @@ use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use tokio::{sync::{
-    AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
-    RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
-    RwLockWriteGuard as TokioRwLockWriteGuard,
-}, time::error::Elapsed};
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
+};
+use tokio::{
+    sync::{
+        AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
+        RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
+        RwLockWriteGuard as TokioRwLockWriteGuard,
+    },
+    time::timeout,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace, warn};
@@ -532,8 +535,8 @@ pub enum PoolError {
     CallbackClosed,
     #[error("could not acquire write permit")]
     Permit(#[from] AcquireError),
-    #[error("timed out waiting to acquire write connection")]
-    TimedOut(#[from] Elapsed),
+    #[error("timed out acquiring write permit while {op:?}")]
+    TimedOut { op: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -638,15 +641,16 @@ impl SplitPool {
 
         tokio::spawn(async move {
             loop {
-                let tx: oneshot::Sender<CancellationToken> = tokio::select! {
+                
+                let (tx, chan) = tokio::select! {
                     biased;
 
-                    Some(tx) = priority_rx.recv() => tx,
-                    Some(tx) = normal_rx.recv() => tx,
-                    Some(tx) = low_rx.recv() => tx,
+                    Some(tx) = priority_rx.recv() => (tx, "priority"),
+                    Some(tx) = normal_rx.recv() => (tx, "normal"),
+                    Some(tx) = low_rx.recv() => (tx, "low"),
                 };
 
-                wait_conn_drop(tx).await
+                wait_conn_drop(tx, chan).await
             }
         });
 
@@ -671,6 +675,9 @@ impl SplitPool {
         gauge!("corro.sqlite.pool.write.connections").set(write_state.size as f64);
         gauge!("corro.sqlite.pool.write.connections.available").set(write_state.available as f64);
         gauge!("corro.sqlite.pool.write.connections.waiting").set(write_state.waiting as f64);
+
+        let available_permit = self.0.write_sema.available_permits();
+        gauge!("corro.sqlite.write.permits.available").set(available_permit as f64);
     }
 
     // get a read-only connection
@@ -721,15 +728,36 @@ impl SplitPool {
         queue: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
-        chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
+        timeout(Duration::from_secs(6 * 60), chan.send(tx))
+            .await
+            .map_err(|_| PoolError::TimedOut {
+                op: "tx to oneshot channel".to_string(),
+            })?
+            .map_err(|_| PoolError::QueueClosed)?;
         let start = Instant::now();
-        let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
+        let token = timeout(Duration::from_secs(6 * 60), rx)
+            .await
+            .map_err(|_| PoolError::TimedOut {
+                op: "rx from oneshot channel".to_string(),
+            })?
+            .map_err(|_| PoolError::CallbackClosed)?;
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
-        let conn = self.0.write.get().await?;
+        let conn = timeout(Duration::from_secs(6 * 60), self.0.write.get())
+            .await
+            .map_err(|_| PoolError::TimedOut {
+                op: "acquiring write conn".to_string(),
+            })??;
 
         let start = Instant::now();
-        let _permit = self.0.write_sema.clone().acquire_owned().await?;
+        let _permit = timeout(
+            Duration::from_secs(5 * 60),
+            self.0.write_sema.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| PoolError::TimedOut {
+            op: "acquiring write permit".to_string(),
+        })??;
         histogram!("corro.sqlite.write_permit.acquisition.seconds")
             .record(start.elapsed().as_secs_f64());
 
@@ -741,7 +769,7 @@ impl SplitPool {
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
+async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, chan: &str) {
     let cancel = CancellationToken::new();
 
     if let Err(_e) = tx.send(cancel.clone()) {
@@ -749,7 +777,15 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
         return;
     }
 
-    cancel.cancelled().await
+    if timeout(Duration::from_secs(4 * 60), cancel.cancelled())
+        .await
+        .is_err()
+    {
+        warn!("wait_conn_drop is taking longer than four minutes - request from {chan}");
+
+        // Continue waiting
+        cancel.cancelled().await;
+    }
 }
 
 pub struct WriteConn {

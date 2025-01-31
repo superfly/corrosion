@@ -442,40 +442,42 @@ async fn handle_conn(
                 Command::Cluster(ClusterCommand::SetId(cluster_id)) => {
                     info_log(&mut stream, format!("setting new cluster id: {cluster_id}")).await;
 
-                    let mut conn = match agent.pool().write_priority().await {
-                        Ok(conn) => conn,
-                        Err(e) => {
-                            send_error(&mut stream, e).await;
-                            continue;
-                        }
+                    let res = {
+                        let mut conn = match agent.pool().write_priority().await {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                send_error(&mut stream, e).await;
+                                continue;
+                            }
+                        };
+
+                        block_in_place(|| {
+                            let tx = conn.transaction()?;
+
+                            tx.execute("INSERT OR REPLACE INTO __corro_state (key, value) VALUES ('cluster_id', ?)", [cluster_id])?;
+
+                            let (cb_tx, cb_rx) = oneshot::channel();
+
+                            agent
+                                .tx_foca()
+                                .blocking_send(FocaInput::Cmd(FocaCmd::ChangeIdentity(
+                                    agent.actor(cluster_id),
+                                    cb_tx,
+                                )))
+                                .map_err(|_| ProcessingError::Send)?;
+
+                            cb_rx
+                                .blocking_recv()
+                                .map_err(|_| ProcessingError::CallbackRecv)?
+                                .map_err(|e| ProcessingError::String(e.to_string()))?;
+    
+                            tx.commit()?;
+
+                            agent.set_cluster_id(cluster_id);
+
+                            Ok::<_, ProcessingError>(())
+                        })
                     };
-
-                    let res = block_in_place(|| {
-                        let tx = conn.transaction()?;
-
-                        tx.execute("INSERT OR REPLACE INTO __corro_state (key, value) VALUES ('cluster_id', ?)", [cluster_id])?;
-
-                        let (cb_tx, cb_rx) = oneshot::channel();
-
-                        agent
-                            .tx_foca()
-                            .blocking_send(FocaInput::Cmd(FocaCmd::ChangeIdentity(
-                                agent.actor(cluster_id),
-                                cb_tx,
-                            )))
-                            .map_err(|_| ProcessingError::Send)?;
-
-                        cb_rx
-                            .blocking_recv()
-                            .map_err(|_| ProcessingError::CallbackRecv)?
-                            .map_err(|e| ProcessingError::String(e.to_string()))?;
-
-                        tx.commit()?;
-
-                        agent.set_cluster_id(cluster_id);
-
-                        Ok::<_, ProcessingError>(())
-                    });
 
                     if let Err(e) = res {
                         send_error(&mut stream, e).await;
