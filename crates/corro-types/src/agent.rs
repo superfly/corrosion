@@ -727,14 +727,14 @@ impl SplitPool {
         queue: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
-        timeout(Duration::from_secs(2 * 60), chan.send(tx))
+        timeout(Duration::from_secs(5 * 60), chan.send(tx))
             .await
             .map_err(|_| PoolError::TimedOut {
                 op: "tx to oneshot channel".to_string(),
             })?
             .map_err(|_| PoolError::QueueClosed)?;
         let start = Instant::now();
-        let token = timeout(Duration::from_secs(2 * 60), rx)
+        let token = timeout(Duration::from_secs(5 * 60), rx)
             .await
             .map_err(|_| PoolError::TimedOut {
                 op: "rx from oneshot channel".to_string(),
@@ -742,7 +742,7 @@ impl SplitPool {
             .map_err(|_| PoolError::CallbackClosed)?;
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
-        let conn = timeout(Duration::from_secs(2 * 60), self.0.write.get())
+        let conn = timeout(Duration::from_secs(5 * 60), self.0.write.get())
             .await
             .map_err(|_| PoolError::TimedOut {
                 op: "acquiring write conn".to_string(),
@@ -750,7 +750,7 @@ impl SplitPool {
 
         let start = Instant::now();
         let _permit = timeout(
-            Duration::from_secs(2 * 60),
+            Duration::from_secs(5 * 60),
             self.0.write_sema.clone().acquire_owned(),
         )
         .await
