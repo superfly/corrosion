@@ -5,9 +5,17 @@ edition = "2021"
 
 [dependencies]
 rusqlite = { workspace = true }
-tokio = { workspace = true }
 deadpool = { workspace = true }
+metrics = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [features]
 default = ["rt_tokio_1"]
 rt_tokio_1 = ["deadpool/rt_tokio_1"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+eyre = { workspace = true }
+corro-types = { path = "../corro-types" }
