@@ -8,6 +8,7 @@ bytes = { workspace = true }
 compact_str = { workspace = true }
 corro-types = { path = "../corro-types" }
 eyre = { workspace = true }
+sqlite-pool = { path = "../sqlite-pool" }
 fallible-iterator = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
