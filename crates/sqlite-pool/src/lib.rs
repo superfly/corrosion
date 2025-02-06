@@ -3,7 +3,10 @@ mod config;
 use std::{
     fmt,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use deadpool::{
@@ -11,13 +14,10 @@ use deadpool::{
     managed::{self, Object},
 };
 use metrics::counter;
-use rusqlite::Transaction;
-use tokio::{
-    sync::mpsc,
-    time::{sleep, Duration},
-};
+use rusqlite::{CachedStatement, InterruptHandle, Params, Transaction};
+use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub use deadpool::managed::reexports::*;
 pub use rusqlite;
@@ -114,38 +114,22 @@ where
 
 pub struct InterruptibleTransaction<T> {
     conn: T,
-    timeout: Duration,
-    interrupt_tx: mpsc::Sender<()>,
+    timeout: Option<Duration>,
+    interrupt_hdl: Arc<InterruptHandle>,
 }
 
 impl<T> InterruptibleTransaction<T>
 where
     T: Deref<Target = rusqlite::Connection> + Committable,
 {
-    pub fn new(conn: T, timeout: Duration) -> Self {
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(3);
+    pub fn new(conn: T, timeout: Option<Duration>) -> Self {
         let interrupt_hdl = conn.get_interrupt_handle();
-
-        tokio::spawn(async move {
-            while interrupt_rx.recv().await.is_some() {
-                interrupt_hdl.interrupt();
-                counter!("corro.sqlite.interrupt").increment(1);
-            }
-        });
 
         Self {
             conn,
             timeout,
-            interrupt_tx,
+            interrupt_hdl: Arc::new(interrupt_hdl),
         }
-    }
-
-    pub fn commit(self) -> Result<(), rusqlite::Error> {
-        let token = self.interrupt_on_timeout();
-
-        let res = self.conn.commit();
-        token.cancel();
-        res
     }
 
     pub fn execute(
@@ -158,6 +142,35 @@ where
         let res = self.conn.execute(sql, params);
         token.cancel();
         res
+    }
+
+    pub fn commit(self) -> Result<(), rusqlite::Error> {
+        let token = self.interrupt_on_timeout();
+
+        let res = self.conn.commit();
+        token.cancel();
+        res
+    }
+
+    pub fn prepare(&self, sql: &str) -> Result<InterruptibleStatement<Statement>, rusqlite::Error> {
+        let stmt = self.conn.prepare(sql)?;
+        Ok(InterruptibleStatement::new(
+            Statement(stmt),
+            self.interrupt_hdl.clone(),
+            self.timeout,
+        ))
+    }
+
+    pub fn prepare_cached(
+        &self,
+        sql: &str,
+    ) -> Result<InterruptibleStatement<CachedStatement>, rusqlite::Error> {
+        let stmt = self.conn.prepare_cached(sql)?;
+        Ok(InterruptibleStatement::new(
+            stmt,
+            self.interrupt_hdl.clone(),
+            self.timeout,
+        ))
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<(), rusqlite::Error> {
@@ -177,33 +190,31 @@ where
 
     pub fn interrupt_on_timeout(&self) -> CancellationToken {
         let token = CancellationToken::new();
-        // let interrupt_hdl = self.conn.get_interrupt_handle();
-        let tx = self.interrupt_tx.clone();
-        let cloned_token = token.clone();
-        let timeout = self.timeout;
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = cloned_token.cancelled() => {}
-                _ = sleep(timeout) => {
-                    warn!("sql call took more than {timeout:?}, interrupting..");
-                    // if channel is full, the operation will get still get interrupted.
-                    tx.try_send(()).unwrap_or_else(|e| {
-                        warn!("unable to send interrupt signal: {e}");
-                    });
-                }
-            };
-        });
+        if let Some(timeout) = self.timeout {
+            let cloned_token = token.clone();
+            let interrupt_hdl = self.interrupt_hdl.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cloned_token.cancelled() => {}
+                    _ = sleep(timeout) => {
+                        warn!("sql call took more than {timeout:?}, interrupting..");
+                        interrupt_hdl.interrupt();
+                        counter!("corro.sqlite.interrupt").increment(1);
+                    }
+                };
+            });
+        }
 
         token
     }
 
     pub fn interrupt_on_cancel(&self, cancel: CancellationToken) {
-        let tx = self.interrupt_tx.clone();
+        let interrupt_hdl = self.interrupt_hdl.clone();
         tokio::spawn(async move {
             cancel.cancelled().await;
-            tx.try_send(()).unwrap_or_else(|e| {
-                warn!("unable to send interrupt signal: {e}");
-            });
+            debug!("interruptting sqlite connection");
+            interrupt_hdl.interrupt();
+            counter!("corro.sqlite.interrupt").increment(1);
         });
     }
 }
@@ -225,6 +236,68 @@ where
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn
+    }
+}
+
+pub struct InterruptibleStatement<T> {
+    stmt: T,
+    timeout: Option<Duration>,
+    interrupt_hdl: Arc<InterruptHandle>,
+}
+
+impl<'conn, T> InterruptibleStatement<T>
+where
+    T: Deref<Target = rusqlite::Statement<'conn>> + DerefMut<Target = rusqlite::Statement<'conn>>,
+{
+    pub fn new(stmt: T, interrupt_hdl: Arc<InterruptHandle>, timeout: Option<Duration>) -> Self {
+        Self {
+            stmt,
+            timeout,
+            interrupt_hdl,
+        }
+    }
+
+    pub fn execute<P: Params>(&mut self, params: P) -> Result<usize, rusqlite::Error> {
+        let token = self.interrupt_on_timeout();
+        let res = self.stmt.execute(params);
+        token.cancel();
+        res
+    }
+
+    pub fn interrupt_on_timeout(&self) -> CancellationToken {
+        let token = CancellationToken::new();
+        if let Some(timeout) = self.timeout {
+            let cloned_token = token.clone();
+            let interrupt_hdl = self.interrupt_hdl.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cloned_token.cancelled() => {}
+                    _ = sleep(timeout) => {
+                        warn!("sql call took more than {timeout:?}, interrupting..");
+                        interrupt_hdl.interrupt();
+                        counter!("corro.sqlite.interrupt").increment(1);
+                    }
+                };
+            });
+        }
+
+        token
+    }
+}
+
+impl<'conn, T: Deref<Target = rusqlite::Statement<'conn>>> Deref for InterruptibleStatement<T> {
+    type Target = rusqlite::Statement<'conn>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stmt
+    }
+}
+
+impl<'conn, T: DerefMut<Target = rusqlite::Statement<'conn>>> DerefMut
+    for InterruptibleStatement<T>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stmt
     }
 }
 
@@ -263,6 +336,22 @@ impl Committable for rusqlite::Connection {
         Err(rusqlite::Error::ModuleError(String::from(
             "cannot create savepoint from connection",
         )))
+    }
+}
+
+pub struct Statement<'conn>(rusqlite::Statement<'conn>);
+
+impl<'conn> Deref for Statement<'conn> {
+    type Target = rusqlite::Statement<'conn>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'conn> DerefMut for Statement<'conn> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
