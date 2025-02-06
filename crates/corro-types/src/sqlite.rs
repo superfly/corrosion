@@ -281,13 +281,27 @@ mod tests {
 
         {
             let tx = conn.transaction()?;
-            let itx = InterruptibleTransaction::new(tx, tokio::time::Duration::from_millis(5));
+            let timeout = Some(tokio::time::Duration::from_millis(5));
+            let itx = InterruptibleTransaction::new(tx, timeout);
             let res = itx.execute("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;", &[]);
 
             assert!(res.is_err_and(
                 |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
             ));
         }
+
+        {
+            let tx = conn.transaction()?;
+            let timeout = Some(tokio::time::Duration::from_millis(5));
+            let itx = InterruptibleTransaction::new(tx, timeout);
+            let res = itx.prepare_cached("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;")?
+                        .execute(());
+
+            assert!(res.is_err_and(
+                |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+            ));
+        }
+
 
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM testsbool;", (), |row| row.get(0))?;
         assert_eq!(count, 0);
