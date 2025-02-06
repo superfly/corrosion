@@ -400,11 +400,12 @@ pub async fn apply_fully_buffered_changes_loop(
 ) {
     info!("Starting apply_fully_buffered_changes loop");
 
+    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
     while let Outcome::Completed(Some((actor_id, version))) =
         rx_apply.recv().preemptible(&mut tripwire).await
     {
         debug!(%actor_id, %version, "picked up background apply of buffered changes");
-        match process_fully_buffered_changes(&agent, &bookie, actor_id, version).await {
+        match process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout).await {
             Ok(false) => {
                 warn!(%actor_id, %version, "did not apply buffered changes");
             }
@@ -436,7 +437,7 @@ pub async fn clear_buffered_meta_loop(
                     let mut conn = pool.write_low().await?;
 
                     block_in_place(|| {
-                        let tx = InterruptibleTransaction::new(conn.immediate_transaction()?, tx_timeout);
+                        let tx = InterruptibleTransaction::new(conn.immediate_transaction()?, Some(tx_timeout));
 
                         // TODO: delete buffered changes from deleted sequences only (maybe, it's kind of hard and may not be necessary)
 
@@ -539,9 +540,11 @@ pub async fn process_fully_buffered_changes(
     bookie: &Bookie,
     actor_id: ActorId,
     version: Version,
+    tx_timeout: Duration,
 ) -> Result<bool, ChangeError> {
     let db_version = {
         let mut conn = agent.pool().write_normal().await?;
+
         debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
 
         let booked = {
@@ -577,13 +580,15 @@ pub async fn process_fully_buffered_changes(
                 }
             };
 
-            let tx = conn
+            let base_tx = conn
                 .immediate_transaction()
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
                     actor_id: Some(actor_id),
                     version: Some(version),
                 })?;
+
+            let tx = InterruptibleTransaction::new(base_tx, Some(tx_timeout));
 
             info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
@@ -757,13 +762,13 @@ pub async fn process_multiple_changes(
     agent: Agent,
     bookie: Bookie,
     changes: Vec<(ChangeV1, ChangeSource, Instant)>,
+    tx_timeout: Duration,
 ) -> Result<(), ChangeError> {
     let start = Instant::now();
     counter!("corro.agent.changes.processing.started").increment(changes.len() as u64);
     debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
     const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(5);
-    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
 
     let mut seen = HashSet::new();
     let mut unknown_changes: BTreeMap<_, Vec<_>> = BTreeMap::new();
@@ -818,7 +823,7 @@ pub async fn process_multiple_changes(
                 version: None,
             })?;
 
-        let mut tx = InterruptibleTransaction::new(tx, tx_timeout);
+        let mut tx = InterruptibleTransaction::new(tx, Some(tx_timeout));
         let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
 

@@ -305,7 +305,7 @@ async fn update_hashes(
 
     if !statements.is_empty() {
         if let Some(e) = corrosion
-            .execute(&statements)
+            .execute(&statements, None)
             .await?
             .results
             .into_iter()
@@ -691,7 +691,7 @@ async fn execute(
 
     if !statements.is_empty() {
         if let Some(e) = corrosion
-            .execute(&statements)
+            .execute(&statements, None)
             .await?
             .results
             .into_iter()
@@ -832,7 +832,7 @@ mod tests {
                     svc0_clone.port.into(),
                     svc0_clone.address.into(),
                 ],
-            )])
+            )], None)
             .await?;
 
         update_hashes(&ta1_client, "node-1", &mut svc_hashes, &mut check_hashes).await?;

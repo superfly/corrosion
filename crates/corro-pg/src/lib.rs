@@ -2,7 +2,7 @@ pub mod sql_state;
 mod vtab;
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque}, fmt, future::poll_fn, net::SocketAddr, ops::Deref, str::{FromStr, Utf8Error}, sync::Arc, time::Duration
+    collections::{BTreeSet, HashMap, VecDeque}, fmt, future::poll_fn, net::SocketAddr, ops::{Deref, DerefMut}, str::{FromStr, Utf8Error}, sync::Arc, time::Duration
 };
 
 use bytes::Buf;
@@ -48,7 +48,7 @@ use sqlite3_parser::ast::{
     As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Literal,
     Name, OneSelect, ResultColumn, Select, SelectBody, SelectTable, Stmt, With,
 };
-use sqlite_pool::{Committable, InterruptibleTransaction};
+use sqlite_pool::{Committable, InterruptibleStatement, InterruptibleTransaction};
 use sqlparser::ast::Statement as PgStatement;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
@@ -177,19 +177,21 @@ enum Prepared {
     },
 }
 
-enum Portal<'a> {
+enum Portal<'a, T>
+where T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::Statement<'a>> {
     Empty {
         stmt_name: CompactString,
     },
     Parsed {
         stmt_name: CompactString,
-        stmt: Statement<'a>,
+        stmt: InterruptibleStatement<T>,
         result_formats: Vec<FieldFormat>,
         cmd: ParsedCmd,
     },
 }
 
-impl<'a> Portal<'a> {
+impl<'a, T> Portal<'a, T>
+where T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::Statement<'a>> {
     fn stmt_name(&self) -> &str {
         match self {
             Portal::Empty { stmt_name } | Portal::Parsed { stmt_name, .. } => stmt_name.as_str(),
@@ -537,7 +539,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
     Ok((Some(TlsAcceptor::from(Arc::new(config))), ssl_required))
 }
 
-pub async fn start(
+pub async fn start<'conn>(
     agent: Agent,
     pg: PgConfig,
     mut tripwire: Tripwire,
@@ -736,7 +738,7 @@ pub async fn start(
                     let back_tx = back_tx.clone();
                     move || {
                         let cr_conn = agent.pool().client_dedicated().unwrap();
-                        let conn = InterruptibleTransaction::new(cr_conn, tx_timeout);
+                        let conn = InterruptibleTransaction::new(cr_conn, Some(tx_timeout));
                         trace!("opened connection");
 
                         conn.interrupt_on_cancel(cancel);
@@ -822,7 +824,7 @@ pub async fn start(
 
                         let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
 
-                        let mut portals: HashMap<CompactString, Portal> = HashMap::new();
+                        let mut portals: HashMap<CompactString, _> = HashMap::new();
 
                         let mut discard_until_sync = false;
 
