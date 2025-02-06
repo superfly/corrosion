@@ -7,6 +7,7 @@ edition = "2021"
 bytes = { workspace = true }
 compact_str = { workspace = true }
 corro-types = { path = "../corro-types" }
+eyre = { workspace = true }
 fallible-iterator = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
@@ -15,6 +16,8 @@ metrics = { workspace = true }
 pgwire = { version = "0.16.1" }
 postgres-types = { version = "0.2", features = ["with-time-0_3"] }
 rusqlite = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = "*"
 spawn = { path = "../spawn" }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }
@@ -26,8 +29,12 @@ tripwire = { path = "../tripwire" }
 sqlparser = { version = "0.39.0" }
 chrono = { version = "0.4.31" }
 socket2 = { version = "0.5" }
+tokio-rustls = "0.24.1"
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
 tokio-postgres = { version = "0.7.10" }
 tracing-subscriber = { workspace = true }
+camino = { workspace = true }
+tokio-postgres-rustls = "0.10.0"
+rcgen = { workspace = true }

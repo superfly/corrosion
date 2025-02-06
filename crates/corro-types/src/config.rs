@@ -135,6 +135,17 @@ pub struct ApiConfig {
 pub struct PgConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
+    pub tls: Option<PgTlsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PgTlsConfig {
+    pub cert_file: Utf8PathBuf,
+    pub key_file: Utf8PathBuf,
+    #[serde(default)]
+    pub ca_file: Option<Utf8PathBuf>,
+    #[serde(default)]
+    pub verify_client: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
