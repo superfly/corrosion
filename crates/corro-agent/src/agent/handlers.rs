@@ -888,24 +888,11 @@ pub async fn handle_changes(
 
         // drop old items when the queue is full.
         if queue.len() >= max_queue_len {
-            let mut dropped_count = 0;
             if let Some((dropped_change, _, _)) = queue.pop_front() {
-                for v in dropped_change.versions() {
-                    if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
-                        if let Some(seqs) = dropped_change.seqs().cloned() {
-                            entry.get_mut().remove(seqs);
-                        } else {
-                            entry.remove_entry();
-                        }
-                    };
-                }
-
                 buf_cost -= dropped_change.processing_cost();
-                dropped_count += 1;
+                counter!("corro.agent.changes.dropped").increment(1);
+                log_at_pow_10("dropped old change from queue", &mut drop_log_count);
             }
-            counter!("corro.agent.changes.dropped").increment(dropped_count);
-
-            log_at_pow_10("dropped old change from queue", &mut drop_log_count);
         }
 
         if let Some(recv_lag) = recv_lag {
