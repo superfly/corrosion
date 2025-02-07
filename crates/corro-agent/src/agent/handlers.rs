@@ -38,7 +38,6 @@ use corro_types::base::Version;
 use corro_types::broadcast::Timestamp;
 use corro_types::change::store_empty_changeset;
 use foca::Notification;
-use indexmap::map::Entry;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
