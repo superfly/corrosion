@@ -10,7 +10,7 @@ use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
 use compact_str::{format_compact, ToCompactString};
 use corro_api_types::{
-    Change, ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
+    ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
@@ -44,6 +44,7 @@ use crate::{
     agent::SplitPool,
     api::QueryEvent,
     base::CrsqlDbVersion,
+    change::Change,
     schema::{Schema, Table},
     sqlite::CrConn,
     updates::HandleMetrics,
@@ -528,7 +529,9 @@ pub struct MatcherStmt {
 }
 
 impl MatcherStmt {
-    pub fn new_query(&self) -> &String { &self.new_query }
+    pub fn new_query(&self) -> &String {
+        &self.new_query
+    }
 }
 
 const CHANGE_ID_COL: &str = "id";
@@ -2450,7 +2453,6 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use camino::Utf8PathBuf;
-    use corro_api_types::row_to_change;
     use rusqlite::params;
     use spawn::wait_for_all_pending_handles;
     use tokio::sync::Semaphore;
@@ -2458,6 +2460,7 @@ mod tests {
     use crate::{
         actor::ActorId,
         agent::migrate,
+        change::row_to_change,
         schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
     };

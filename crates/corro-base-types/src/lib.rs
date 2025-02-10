@@ -17,6 +17,12 @@ use speedy::{Context, Readable, Writable};
 #[serde(transparent)]
 pub struct Version(pub u64);
 
+impl From<Version> for u64 {
+    fn from(v: Version) -> Self {
+        v.0
+    }
+}
+
 impl Step for Version {
     fn steps_between(start: &Self, end: &Self) -> Option<usize> {
         u64::steps_between(&start.0, &end.0)
