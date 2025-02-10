@@ -92,6 +92,7 @@ where
 
                 let agent = agent.clone();
 
+                debug!("broadcasting changes...db_version: {db_version}");
                 spawn_counted(async move {
                     broadcast_changes(agent, db_version, last_seq, version, ts).await
                 });

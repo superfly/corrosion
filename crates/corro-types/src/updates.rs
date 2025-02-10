@@ -271,7 +271,7 @@ fn handle_candidates(
         return Ok(());
     }
 
-    trace!(
+    debug!(
         "got some candidates for updates! {:?}",
         candidates.keys().collect::<Vec<_>>()
     );
@@ -310,7 +310,7 @@ async fn batch_candidates(
     const PROCESS_CHANGES_THRESHOLD: usize = 1000;
     const PROCESS_BUFFER_DEADLINE: Duration = Duration::from_millis(600);
 
-    info!(sub_id = %id, "Starting loop to run the subscription");
+    info!(sub_id = %id, "Starting loop to receive candidates from updates");
 
     let mut buf = MatchCandidates::new();
     let mut buf_count = 0;
@@ -328,6 +328,7 @@ async fn batch_candidates(
                 break;
             }
             Some((candidates, _)) = changes_rx.recv() => {
+                debug!(sub_id = %id, "updates got candidates: {candidates:?}");
                 for (table, pk_map) in  candidates {
                     let buffed = buf.entry(table).or_default();
                     for (pk, cl) in pk_map {
@@ -389,7 +390,7 @@ where
     H: Handle + Send + 'static,
 {
     let trait_type = manager.trait_type();
-    trace!(
+    debug!(
         %db_version,
         "trying to match changes to {trait_type}, len: {}",
         changes.len()
@@ -421,7 +422,7 @@ where
                 .increment(pks.len() as u64);
         }
 
-        trace!(sub_id = %id, %db_version, "found {match_count} candidates");
+        debug!(sub_id = %id, %db_version, "found {match_count} candidates");
 
         if let Err(e) = handle.changes_tx().try_send((candidates, db_version)) {
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
