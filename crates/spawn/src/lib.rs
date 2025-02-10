@@ -84,7 +84,7 @@ pin_project! {
     impl<F> PinnedDrop for CountedFut<F> {
         fn drop(this: Pin<&mut Self>) {
             let count = this.pendings.fetch_sub(1, Ordering::SeqCst);
-            trace!("dropping counted fut, count: {}", count - 1);
+            trace!("dropping counted future, count: {}", count - 1);
         }
     }
 }

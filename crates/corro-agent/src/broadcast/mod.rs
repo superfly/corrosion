@@ -186,6 +186,7 @@ pub fn runtime_loop(
                 let branch = tokio::select! {
                     biased;
                     _ = &mut tripwire => {
+                        info!("tripped runtime loop, breaking");
                         break
                     },
                     timer = timer_rx.recv() => match timer {
@@ -322,8 +323,6 @@ pub fn runtime_loop(
                 }
             }
 
-            info!("foca loop is done, leaving cluster");
-
             // leave the cluster gracefully
             if let Err(e) = foca.leave_cluster(&mut runtime) {
                 error!("could not leave cluster: {e}");
@@ -372,11 +371,12 @@ pub fn runtime_loop(
                     error!("could not await task to update member states: {e}");
                 }
             }
+            info!("foca runtime loop is done, leaving cluster");
         }
     });
 
     tokio::spawn(handle_broadcasts(
-        agent, rx_bcast, transport, config, tripwire,
+        agent, rx_bcast, transport, config, tripwire, Default::default()
     ));
 }
 
@@ -387,17 +387,33 @@ type BroadcastRateLimiter = RateLimiter<
     governor::middleware::StateInformationMiddleware,
 >;
 
+#[derive(Debug, Clone, Copy)]
+pub struct BroadcastOpts {
+    pub interval: Duration,
+    pub bcast_cutoff: usize,
+}
+
+impl Default for BroadcastOpts {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_millis(500),
+            bcast_cutoff: 64 * 1024,
+        }
+    }
+}
+
 async fn handle_broadcasts(
     agent: Agent,
     mut rx_bcast: CorroReceiver<BroadcastInput>,
     transport: Transport,
     config: Arc<RwLock<foca::Config>>,
     mut tripwire: Tripwire,
+    opts: BroadcastOpts,
 ) {
     let actor_id = agent.actor_id();
 
     // max broadcast size
-    const BROADCAST_CUTOFF: usize = 64 * 1024;
+    let broadcast_cutoff: usize = opts.bcast_cutoff;
 
     let mut bcast_codec = LengthDelimitedCodec::builder()
         .max_frame_length(10 * 1_024 * 1_024)
@@ -414,7 +430,7 @@ async fn handle_broadcasts(
     let mut idle_pendings =
         FuturesUnordered::<Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>>::new();
 
-    let mut bcast_interval = interval(Duration::from_millis(500));
+    let mut bcast_interval = interval(opts.interval);
 
     enum Branch {
         Broadcast(BroadcastInput),
@@ -483,6 +499,8 @@ async fn handle_broadcasts(
         match branch {
             Branch::Tripped => {
                 // nothing to do here, yet!
+                warn!("tripped broadcast loop");
+                break;
             }
             Branch::BroadcastDeadline => {
                 if !bcast_buf.is_empty() {
@@ -530,7 +548,7 @@ async fn handle_broadcasts(
 
                     to_local_broadcast.push_front(payload);
 
-                    if local_bcast_buf.len() >= BROADCAST_CUTOFF {
+                    if local_bcast_buf.len() >= broadcast_cutoff {
                         to_broadcast.push_front(PendingBroadcast::new_local(
                             local_bcast_buf.split().freeze(),
                         ));
@@ -542,7 +560,7 @@ async fn handle_broadcasts(
                         continue;
                     }
 
-                    if bcast_buf.len() >= BROADCAST_CUTOFF {
+                    if bcast_buf.len() >= broadcast_cutoff {
                         to_broadcast.push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
                     }
                 }
@@ -564,6 +582,7 @@ async fn handle_broadcasts(
         let prev_rate_limited = rate_limited;
 
         // start with local broadcasts, they're higher priority
+        let mut ring0 = HashSet::new();
         while !to_local_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
             // UNWRAP: we just checked that it wasn't empty
             let payload = to_local_broadcast.pop_front().unwrap();
@@ -573,9 +592,11 @@ async fn handle_broadcasts(
             let mut ring0_count = 0;
             for addr in members.ring0(agent.cluster_id()) {
                 if join_set.len() >= MAX_INFLIGHT_BROADCAST {
+                    debug!("breaking, max inflight broadcast reached: {}", MAX_INFLIGHT_BROADCAST);
                     break;
                 }
                 ring0_count += 1;
+                ring0.insert(addr);
 
                 match try_transmit_broadcast(
                     &bytes_per_sec,
@@ -591,6 +612,7 @@ async fn handle_broadcasts(
                         match e {
                             TransmitError::TooBig(_) | TransmitError::InsufficientCapacity(_) => {
                                 // not sure this would ever happen
+                                error!("could not spawn broadcast transmission: {e}");
                                 continue;
                             }
                             TransmitError::QuotaExceeded(_) => {
@@ -643,10 +665,9 @@ async fn handle_broadcasts(
                 }
             };
 
+            debug!("choosing {} broadcasts, ring0 count: {}, MAX_INFLIGHT_BROADCAST: {}", choose_count, ring0_count, MAX_INFLIGHT_BROADCAST);
             while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
                 let mut pending = to_broadcast.pop_front().unwrap();
-
-                trace!("{} to broadcast: {pending:?}", actor_id);
 
                 let broadcast_to = {
                     agent
@@ -656,9 +677,12 @@ async fn handle_broadcasts(
                         .iter()
                         .filter_map(|(member_id, state)| {
                             // don't broadcast to ourselves... or ring0 if local broadcast
+                            // (ring0 could have changed since the time we sent the local broadcast
+                            // so we check the ring0 variable that's created at start of local_broacast
+                            // instead of state.is_ring0())
                             if *member_id == actor_id
                                 || state.cluster_id != agent.cluster_id()
-                                || (pending.is_local && state.is_ring0())
+                                || (pending.is_local && ring0.contains(&state.addr))
                                 || pending.sent_to.contains(&state.addr)
                             // don't broadcast to this peer
                             {
@@ -680,6 +704,7 @@ async fn handle_broadcasts(
                 let pending_sent_instance = pending.sent_to.len();
 
                 let mut spawn_count = 0;
+                trace!("broadcasting to: {:?}", broadcast_to);
                 for addr in broadcast_to {
                     match try_transmit_broadcast(
                         &bytes_per_sec,
@@ -1064,10 +1089,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_broadcast_order() -> eyre::Result<()> {
-        tracing_subscriber::fmt()
+        let _ = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::DEBUG)
-            .init();
+            .try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
         let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
@@ -1090,12 +1115,34 @@ mod tests {
         );
         ta1.agent.members().write().add_member(&ta2_actor);
 
+        let bcast = BroadcastV1::Change(ChangeV1 {
+            actor_id: ta1.agent.actor_id(),
+            changeset: Changeset::Full {
+                version: Version(0),
+                changes: vec![],
+                seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                last_seq: CrsqlSeq(0),
+                ts: Default::default(),
+            },
+        });
+        let mut ser_buf = BytesMut::new();
+        let _ = UniPayload::V1 {
+            data: UniPayloadV1::Broadcast(bcast),
+            cluster_id: ta1.agent.cluster_id(),
+        }
+        .write_to_stream((&mut ser_buf).writer())?;
+        let estimated_size = ser_buf.len();
+
         tokio::spawn(handle_broadcasts(
             ta1.agent.clone(),
             rx_bcast,
             transport,
             config,
             tripwire.clone(),
+            BroadcastOpts{
+                interval: Duration::from_secs(2),
+                bcast_cutoff: 5 * estimated_size,
+            },
         ));
 
         let actor_id = ta1.agent.actor_id();
