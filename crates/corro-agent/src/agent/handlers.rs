@@ -90,6 +90,7 @@ pub fn spawn_gossipserver_handler(
             gossip_server_endpoint.close(0u32.into(), b"shutting down");
         }
     });
+    info!("gossipserver_handler is done");
 }
 
 /// Spawn a task which handles all state and interactions for a given
@@ -194,7 +195,7 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
 /// everyone.
 ///
 ///
-pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
+pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire: Tripwire) {
     tokio::spawn({
         let agent = agent.clone();
         async move {
@@ -205,7 +206,12 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
             tokio::pin!(timer);
 
             loop {
-                timer.as_mut().await;
+                tokio::select! {
+                    _ = &mut tripwire => {
+                        break;
+                    }
+                    _ = timer.as_mut() => {}
+                }
 
                 match bootstrap::generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),
@@ -754,7 +760,14 @@ pub async fn handle_changes(
     ));
 
     let max_seen_cache_len: usize = max_queue_len;
-    let keep_seen_cache_size: usize = cmp::max(10, max_seen_cache_len / 10);
+
+    // unlikely, but max_seen_cache_len can be less than 10, in that case we want to just clear the whole cache
+    // (todo): put some validation in config instead
+    let keep_seen_cache_size: usize = if max_seen_cache_len > 10 {
+        cmp::max(10, max_seen_cache_len / 10)
+    } else {
+        0
+    };
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
     let mut drop_log_count: u64 = 0;
@@ -1107,6 +1120,7 @@ mod tests {
             .build()?;
         config.perf.apply_queue_len = 1;
         config.perf.processing_queue_len = 3;
+        config.perf.changes_channel_len = 1;
 
         let (agent, agent_options) = setup(config, tripwire.clone()).await?;
 
@@ -1139,7 +1153,7 @@ mod tests {
                     cid: ColumnName("text".into()),
                     val: "two override".into(),
                     col_version: 1,
-                    db_version: CrsqlDbVersion(4),
+                    db_version: CrsqlDbVersion(i as u64),
                     seq: CrsqlSeq(0),
                     site_id: agent.actor_id().to_bytes(),
                     cl: 1,

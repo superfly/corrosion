@@ -1670,8 +1670,7 @@ pub async fn start(
                                         )?;
 
                                         send_ready(
-                                            &mut session,
-                                            
+                                            &mut session,               
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
