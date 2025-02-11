@@ -772,7 +772,20 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
         return;
     }
 
-    cancel.cancelled().await
+    let mut interval = tokio::time::interval(Duration::from_secs(5*60));
+    let start = Instant::now();
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                break;
+            }
+            _ = interval.tick() => {
+                let elapsed = start.elapsed();
+                warn!("wait_conn_drop has been running since {elapsed:?}");
+                continue;
+            }
+        }
+    }
 }
 
 async fn timeout_fut<T, F>(op: &'static str, duration: Duration, fut: F) -> Result<T, PoolError>

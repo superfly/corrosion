@@ -1,5 +1,7 @@
 mod config;
 
+use arc_swap::ArcSwap;
+use tracing::warn;
 use std::{
     fmt,
     ops::{Deref, DerefMut},
@@ -17,7 +19,6 @@ use metrics::counter;
 use rusqlite::{CachedStatement, InterruptHandle, Params, Transaction};
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
 
 pub use deadpool::managed::reexports::*;
 pub use rusqlite;
@@ -117,6 +118,7 @@ pub struct InterruptibleTransaction<T> {
     timeout: Option<Duration>,
     interrupt_hdl: Arc<InterruptHandle>,
     source: &'static str,
+    current_sql: Arc<ArcSwap<Option<String>>>,
 }
 
 impl<T> InterruptibleTransaction<T>
@@ -131,6 +133,7 @@ where
             timeout,
             interrupt_hdl: Arc::new(interrupt_hdl),
             source,
+            current_sql: Arc::new(ArcSwap::new(Arc::new(None))),
         }
     }
 
@@ -140,7 +143,7 @@ where
         params: &[&dyn rusqlite::ToSql],
     ) -> Result<usize, rusqlite::Error> {
         let token = self.interrupt_on_timeout();
-
+        self.current_sql.store(Arc::new(Some(sql.to_string())));
         let res = self.conn.execute(sql, params);
         token.cancel();
         res
@@ -156,10 +159,12 @@ where
 
     pub fn prepare(&self, sql: &str) -> Result<InterruptibleStatement<Statement>, rusqlite::Error> {
         let stmt = self.conn.prepare(sql)?;
+        self.current_sql.store(Arc::new(Some(sql.to_string())));
         Ok(InterruptibleStatement::new(
             Statement(stmt),
             self.interrupt_hdl.clone(),
             self.timeout,
+            sql.to_string(),
         ))
     }
 
@@ -168,16 +173,18 @@ where
         sql: &str,
     ) -> Result<InterruptibleStatement<CachedStatement>, rusqlite::Error> {
         let stmt = self.conn.prepare_cached(sql)?;
+        self.current_sql.store(Arc::new(Some(sql.to_string())));
         Ok(InterruptibleStatement::new(
             stmt,
             self.interrupt_hdl.clone(),
             self.timeout,
+            sql.to_string(),
         ))
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<(), rusqlite::Error> {
         let token = self.interrupt_on_timeout();
-
+        self.current_sql.store(Arc::new(Some(sql.to_string())));
         let res = self.conn.execute_batch(sql);
         token.cancel();
         res
@@ -196,11 +203,12 @@ where
             let cloned_token = token.clone();
             let interrupt_hdl = self.interrupt_hdl.clone();
             let source = self.source;
+            let current_sql = self.current_sql.load();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = cloned_token.cancelled() => {}
                     _ = sleep(timeout) => {
-                        warn!("sql call took more than {timeout:?}, interrupting..");
+                        warn!("sql call took more than {timeout:?}, interrupting.. {:?}", current_sql);
                         interrupt_hdl.interrupt();
                         counter!("corro.sqlite.interrupt", "source" => source, "reason" => "timeout").increment(1);
                     }
@@ -214,9 +222,13 @@ where
     pub fn interrupt_on_cancel(&self, cancel: CancellationToken) {
         let interrupt_hdl = self.interrupt_hdl.clone();
         let source = self.source;
+        // let current_sql = self.current_sql.clone();
         tokio::spawn(async move {
             cancel.cancelled().await;
-            debug!("interruptting sqlite connection");
+            // let sql = current_sql.load();
+            // we have sensu checks makes flyd constantly connect to corrosion
+            // pg and this would spam the logs.
+            // warn!("interrupting sqlite connection - sql - {:?})", sql);
             interrupt_hdl.interrupt();
             counter!("corro.sqlite.interrupt", "source" => source, "reason" => "cancellation").increment(1);
         });
@@ -247,17 +259,19 @@ pub struct InterruptibleStatement<T> {
     stmt: T,
     timeout: Option<Duration>,
     interrupt_hdl: Arc<InterruptHandle>,
+    sql: String,
 }
 
 impl<'conn, T> InterruptibleStatement<T>
 where
     T: Deref<Target = rusqlite::Statement<'conn>> + DerefMut<Target = rusqlite::Statement<'conn>>,
 {
-    pub fn new(stmt: T, interrupt_hdl: Arc<InterruptHandle>, timeout: Option<Duration>) -> Self {
+    pub fn new(stmt: T, interrupt_hdl: Arc<InterruptHandle>, timeout: Option<Duration>, sql: String) -> Self {
         Self {
             stmt,
             timeout,
             interrupt_hdl,
+            sql,
         }
     }
 
@@ -273,13 +287,14 @@ where
         if let Some(timeout) = self.timeout {
             let cloned_token = token.clone();
             let interrupt_hdl = self.interrupt_hdl.clone();
+            let current_sql = self.sql.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = cloned_token.cancelled() => {}
                     _ = sleep(timeout) => {
-                        warn!("sql call took more than {timeout:?}, interrupting..");
+                        warn!("sql call took more than {timeout:?}, interrupting.. sql({:?})", current_sql);
                         interrupt_hdl.interrupt();
-                        counter!("corro.sqlite.interrupt").increment(1);
+                        counter!("corro.sqlite.interrupt", "source" => "timeout").increment(1);
                     }
                 };
             });

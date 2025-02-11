@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+arc-swap = { workspace = true }
 rusqlite = { workspace = true }
 deadpool = { workspace = true }
 metrics = { workspace = true }

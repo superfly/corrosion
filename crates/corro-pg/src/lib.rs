@@ -2,7 +2,14 @@ pub mod sql_state;
 mod vtab;
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque}, fmt, future::poll_fn, net::SocketAddr, ops::{Deref, DerefMut}, str::{FromStr, Utf8Error}, sync::Arc, time::Duration
+    collections::{BTreeSet, HashMap, VecDeque},
+    fmt,
+    future::poll_fn,
+    net::SocketAddr,
+    ops::{Deref, DerefMut},
+    str::{FromStr, Utf8Error},
+    sync::Arc,
+    time::Duration,
 };
 
 use bytes::Buf;
@@ -13,7 +20,7 @@ use corro_types::{
     broadcast::broadcast_changes,
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
-    schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table}
+    schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
@@ -178,7 +185,9 @@ enum Prepared {
 }
 
 enum Portal<'a, T>
-where T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::Statement<'a>> {
+where
+    T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::Statement<'a>>,
+{
     Empty {
         stmt_name: CompactString,
     },
@@ -191,7 +200,9 @@ where T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::S
 }
 
 impl<'a, T> Portal<'a, T>
-where T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::Statement<'a>> {
+where
+    T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::Statement<'a>>,
+{
     fn stmt_name(&self) -> &str {
         match self {
             Portal::Empty { stmt_name } | Portal::Parsed { stmt_name, .. } => stmt_name.as_str(),
@@ -563,7 +574,10 @@ pub async fn start<'conn>(
                 conn.set_nodelay(true)?;
                 {
                     let sock = SockRef::from(&conn);
-                    let ka = TcpKeepalive::new().with_time(Duration::from_secs(10)).with_interval(Duration::from_secs(10)).with_retries(4);
+                    let ka = TcpKeepalive::new()
+                        .with_time(Duration::from_secs(10))
+                        .with_interval(Duration::from_secs(10))
+                        .with_retries(4);
                     sock.set_tcp_keepalive(&ka)?;
                 }
                 let is_sslrequest = peek_for_sslrequest(&mut conn).await?;
@@ -1600,7 +1614,6 @@ pub async fn start<'conn>(
                                     };
 
                                     if let Err(e) = session.handle_execute(
-                                        
                                         prepped,
                                         result_formats,
                                         cmd,
@@ -1618,7 +1631,6 @@ pub async fn start<'conn>(
 
                                         send_ready(
                                             &mut session,
-                                            
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1666,7 +1678,6 @@ pub async fn start<'conn>(
 
                                         send_ready(
                                             &mut session,
-                                            
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1683,7 +1694,6 @@ pub async fn start<'conn>(
                                             })?;
                                             send_ready(
                                                 &mut session,
-                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;
@@ -1713,7 +1723,6 @@ pub async fn start<'conn>(
                                             )?;
                                             send_ready(
                                                 &mut session,
-                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;

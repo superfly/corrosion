@@ -4029,6 +4029,7 @@ dependencies = [
 name = "sqlite-pool"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "corro-types",
  "deadpool",
  "eyre",
