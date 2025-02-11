@@ -715,7 +715,7 @@ pub async fn start<'conn>(
                             match back {
                                 BackendResponse::Message { message, flush } => {
                                     if let PgWireBackendMessage::ErrorResponse(e) = &message {
-                                        warn!("sending: {e:?}");
+                                        debug!("sending: {e:?}");
                                     } else {
                                         debug!("sending: {message:?}");
                                     }
@@ -1981,6 +1981,7 @@ impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Session<'conn
             0
         } else if cmd.is_rollback() {
             let _permit = self.tx_state.end();
+            warn!("explicti - roll back tx");
             self.conn.execute_batch("ROLLBACK")?;
             0
         } else {
