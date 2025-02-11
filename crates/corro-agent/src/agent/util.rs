@@ -18,7 +18,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{
         find_overwritten_versions, Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion,
-        PartialVersion, PoolError,
+        PartialVersion,
     },
     api::TableName,
     base::{CrsqlDbVersion, CrsqlSeq, Version},
@@ -55,7 +55,7 @@ use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, params, Connection, OptionalExtension, Savepoint, Transaction};
 use spawn::spawn_counted;
-use tokio::{net::TcpListener, task::block_in_place, time::timeout};
+use tokio::{net::TcpListener, task::block_in_place};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
@@ -800,9 +800,7 @@ pub async fn process_multiple_changes(
         warn!("process_multiple_changes: removing duplicates took too long - {elapsed:?}");
     }
 
-    let mut conn = timeout(Duration::from_secs(5 * 60), agent.pool().write_normal())
-        .await
-        .map_err(PoolError::from)??;
+    let mut conn = agent.pool().write_normal().await?;
 
     let changesets = block_in_place(|| {
         let start = Instant::now();
@@ -1121,7 +1119,7 @@ pub async fn process_multiple_changes(
         match_changes(agent.updates_manager(), changeset.changes(), db_version);
     }
 
-    histogram!("corro.agent.changes.processing.time.seconds").record(start.elapsed());
+    histogram!("corro.agent.changes.processing.time.seconds", "source" => "remote").record(start.elapsed());
     histogram!("corro.agent.changes.processing.chunk_size").record(change_chunk_size as f64);
 
     Ok(())
