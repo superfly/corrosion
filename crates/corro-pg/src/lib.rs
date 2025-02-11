@@ -673,9 +673,12 @@ pub async fn start<'conn>(
 
                         while let Some(decode_res) = stream.next().await {
                             let msg = match decode_res {
-                                Ok(msg) => msg,
+                                Ok(msg) => {
+                                    info!("received msg: {msg:?}");
+                                    msg
+                                },
                                 Err(PgWireError::IoError(io_error)) => {
-                                    debug!("postgres io error: {io_error}");
+                                    warn!("postgres io error: {io_error}");
                                     break;
                                 }
                                 Err(e) => {
@@ -701,7 +704,7 @@ pub async fn start<'conn>(
 
                             front_tx.send(msg).await?;
                         }
-                        debug!("frontend stream is done");
+                        warn!("frontend stream is done");
 
                         Ok::<_, BoxError>(())
                     }
@@ -717,7 +720,7 @@ pub async fn start<'conn>(
                                     if let PgWireBackendMessage::ErrorResponse(e) = &message {
                                         warn!("sending: {e:?}");
                                     } else {
-                                        debug!("sending: {message:?}");
+                                        info!("sending: {message:?}");
                                     }
                                     sink.feed(message).await?;
                                     if flush {
@@ -729,7 +732,7 @@ pub async fn start<'conn>(
                                 }
                             }
                         }
-                        debug!("backend stream is done");
+                        warn!("backend stream is done");
                         Ok::<_, std::io::Error>(())
                     }
                 });
@@ -1607,7 +1610,7 @@ pub async fn start<'conn>(
                                         max_rows,
                                         &back_tx,
                                     ) {
-                                        debug!("error in execute: {e}");
+                                        warn!("error in execute: {e}");
 
                                         back_tx.blocking_send(BackendResponse::Message {
                                             message: e.try_into()?,
@@ -1862,7 +1865,9 @@ pub async fn start<'conn>(
                 }).await;
 
                 match res {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => {
+                        info!("connection done");
+                    }
                     Ok(Err(e)) => {
                         error!("connection failed: {e}");
                         _ = back_tx
@@ -1981,6 +1986,7 @@ impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Session<'conn
             0
         } else if cmd.is_rollback() {
             let _permit = self.tx_state.end();
+            warn!("explicti - roll back tx");
             self.conn.execute_batch("ROLLBACK")?;
             0
         } else {
@@ -2290,7 +2296,7 @@ impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Session<'conn
     }
 
     fn handle_commit(&self) -> Result<(), ChangeError> {
-        trace!("HANDLE COMMIT");
+        warn!("HANDLE COMMIT");
 
         let mut book_writer = self
             .agent
@@ -2316,7 +2322,7 @@ impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Session<'conn
             snap,
         }) = insert_info
         {
-            trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
+            warn!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
             book_writer.commit_snapshot(snap);
 
@@ -2338,7 +2344,7 @@ impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Drop for Sess
             if let Err(e) = self.conn.execute_batch("ROLLBACK") {
                 warn!("failed to rollback tx: {e}");
             } else {
-                debug!("rolled back tx");
+                warn!("rolled back tx");
             }
         }
     }
