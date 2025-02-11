@@ -76,7 +76,7 @@ where
             })?;
 
         let timeout = params.timeout.map(Duration::from_secs);
-        let tx = InterruptibleTransaction::new(tx, timeout);
+        let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
 
         // Execute whatever might mutate state data
         let ret = f(&tx)?;

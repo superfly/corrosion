@@ -437,7 +437,7 @@ pub async fn clear_buffered_meta_loop(
                     let mut conn = pool.write_low().await?;
 
                     block_in_place(|| {
-                        let tx = InterruptibleTransaction::new(conn.immediate_transaction()?, Some(tx_timeout));
+                        let tx = InterruptibleTransaction::new(conn.immediate_transaction()?, Some(tx_timeout), "clear_buffered_meta");
 
                         // TODO: delete buffered changes from deleted sequences only (maybe, it's kind of hard and may not be necessary)
 
@@ -588,7 +588,7 @@ pub async fn process_fully_buffered_changes(
                     version: Some(version),
                 })?;
 
-            let tx = InterruptibleTransaction::new(base_tx, Some(tx_timeout));
+            let tx = InterruptibleTransaction::new(base_tx, Some(tx_timeout), "process_buffered_changes");
 
             info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
@@ -823,7 +823,7 @@ pub async fn process_multiple_changes(
                 version: None,
             })?;
 
-        let mut tx = InterruptibleTransaction::new(tx, Some(tx_timeout));
+        let mut tx = InterruptibleTransaction::new(tx, Some(tx_timeout), "process_multiple_changes");
         let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
 
