@@ -738,7 +738,7 @@ pub async fn start<'conn>(
                     let back_tx = back_tx.clone();
                     move || {
                         let cr_conn = agent.pool().client_dedicated().unwrap();
-                        let conn = InterruptibleTransaction::new(cr_conn, Some(tx_timeout));
+                        let conn = InterruptibleTransaction::new(cr_conn, Some(tx_timeout), "pg");
                         trace!("opened connection");
 
                         conn.interrupt_on_cancel(cancel);

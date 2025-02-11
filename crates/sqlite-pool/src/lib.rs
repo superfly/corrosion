@@ -116,19 +116,21 @@ pub struct InterruptibleTransaction<T> {
     conn: T,
     timeout: Option<Duration>,
     interrupt_hdl: Arc<InterruptHandle>,
+    source: &'static str,
 }
 
 impl<T> InterruptibleTransaction<T>
 where
     T: Deref<Target = rusqlite::Connection> + Committable,
 {
-    pub fn new(conn: T, timeout: Option<Duration>) -> Self {
+    pub fn new(conn: T, timeout: Option<Duration>, source: &'static str) -> Self {
         let interrupt_hdl = conn.get_interrupt_handle();
 
         Self {
             conn,
             timeout,
             interrupt_hdl: Arc::new(interrupt_hdl),
+            source,
         }
     }
 
@@ -185,7 +187,7 @@ where
         &mut self,
     ) -> Result<InterruptibleTransaction<rusqlite::Savepoint<'_>>, rusqlite::Error> {
         let sp = self.conn.savepoint()?;
-        Ok(InterruptibleTransaction::new(sp, self.timeout))
+        Ok(InterruptibleTransaction::new(sp, self.timeout, self.source))
     }
 
     pub fn interrupt_on_timeout(&self) -> CancellationToken {
@@ -193,13 +195,14 @@ where
         if let Some(timeout) = self.timeout {
             let cloned_token = token.clone();
             let interrupt_hdl = self.interrupt_hdl.clone();
+            let source = self.source;
             tokio::spawn(async move {
                 tokio::select! {
                     _ = cloned_token.cancelled() => {}
                     _ = sleep(timeout) => {
                         warn!("sql call took more than {timeout:?}, interrupting..");
                         interrupt_hdl.interrupt();
-                        counter!("corro.sqlite.interrupt").increment(1);
+                        counter!("corro.sqlite.interrupt", "source" => source, "reason" => "timeout").increment(1);
                     }
                 };
             });
@@ -210,11 +213,12 @@ where
 
     pub fn interrupt_on_cancel(&self, cancel: CancellationToken) {
         let interrupt_hdl = self.interrupt_hdl.clone();
+        let source = self.source;
         tokio::spawn(async move {
             cancel.cancelled().await;
             debug!("interruptting sqlite connection");
             interrupt_hdl.interrupt();
-            counter!("corro.sqlite.interrupt").increment(1);
+            counter!("corro.sqlite.interrupt", "source" => source, "reason" => "cancellation").increment(1);
         });
     }
 }
