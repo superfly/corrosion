@@ -279,7 +279,13 @@ fn handle_candidates(
     for (_, pks) in candidates {
         let pks = pks
             .iter()
-            .map(|(pk, cl)| unpack_columns(pk).map(|x| (x, *cl)))
+            .map(|(pk, cl)| {
+                let x = unpack_columns(pk);
+                x.map(|m| {
+                    debug!("unpacked columns: {:?}", m);
+                    (m, *cl)
+                })
+            })
             .collect::<Result<Vec<(Vec<SqliteValueRef>, i64)>, _>>()?;
 
         for (pk, cl) in pks {
