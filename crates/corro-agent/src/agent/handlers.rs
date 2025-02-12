@@ -830,10 +830,8 @@ pub async fn handle_changes(
                     buf_cost = 0;
                 }
 
-                debug!("seen cache len: {}, max_seen_cache_len: {}", seen.len(), max_seen_cache_len);
                 if seen.len() > max_seen_cache_len {
                     // we don't want to keep too many entries in here.
-                    debug!("seen cache is too big, dropping old entries. len {} and keep_seen_cache_size {}", seen.len(), keep_seen_cache_size);
                     seen = seen.split_off(seen.len() - keep_seen_cache_size);
                 }
                 continue

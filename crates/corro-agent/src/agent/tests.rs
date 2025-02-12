@@ -51,7 +51,6 @@ use corro_types::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "reason for ignoring"] 
 
 async fn insert_rows_and_gossip() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
@@ -280,8 +279,7 @@ async fn chill_test() -> eyre::Result<()> {
     configurable_stress_test(2, 1, 1).await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[ignore = "reason for ignoring"] 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)] 
 
 async fn stress_test() -> eyre::Result<()> {
     configurable_stress_test(30, 10, 200).await
@@ -611,7 +609,6 @@ pub async fn configurable_stress_test(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[ignore = "reason for ignoring"] 
 async fn large_tx_sync() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -1357,7 +1354,6 @@ async fn insert_rows(agent: Agent, start: i64, n: i64) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "reason for ignoring"] 
 
 async fn many_small_changes() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
