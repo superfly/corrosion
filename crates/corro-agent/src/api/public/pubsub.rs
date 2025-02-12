@@ -1038,8 +1038,9 @@ mod tests {
                 )
             );
 
+            let evt = rows.recv::<QueryEvent>().await.unwrap().unwrap();
             assert!(matches!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+                evt,
                 QueryEvent::EndOfQuery { .. }
             ));
 
