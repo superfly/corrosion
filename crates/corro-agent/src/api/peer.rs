@@ -211,6 +211,7 @@ async fn build_quinn_server_config(config: &GossipConfig) -> eyre::Result<quinn:
 pub async fn gossip_server_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
     let server_config = build_quinn_server_config(config).await?;
 
+    debug!("binding gossip server to {:?}", config.bind_addr);
     Ok(quinn::Endpoint::server(server_config, config.bind_addr)?)
 }
 
