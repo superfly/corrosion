@@ -103,10 +103,11 @@ pub fn spawn_incoming_connection_handlers(
     let agent = agent.clone();
     let bookie = bookie.clone();
     let tripwire = tripwire.clone();
+    debug!("starting connection looop");
     tokio::spawn(async move {
         let remote_addr = connecting.remote_address();
         // let local_ip = connecting.local_ip().unwrap();
-        trace!("got a connection from {remote_addr}");
+        debug!("got a connection from {remote_addr}");
 
         let conn = match connecting.await {
             Ok(conn) => conn,
@@ -118,7 +119,7 @@ pub fn spawn_incoming_connection_handlers(
 
         counter!("corro.peer.connection.accept.total").increment(1);
 
-        trace!("accepted a QUIC conn from {remote_addr}");
+        debug!("accepted a QUIC conn from {remote_addr}");
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
