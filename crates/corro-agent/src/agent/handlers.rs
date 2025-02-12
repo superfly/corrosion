@@ -753,7 +753,14 @@ pub async fn handle_changes(
     ));
 
     let max_seen_cache_len: usize = max_queue_len;
-    let keep_seen_cache_size: usize = cmp::max(10, max_seen_cache_len / 10);
+
+    // unlikely, but max_seen_cache_len can be less than 10, in that case we want to just clear the whole cache
+    // (todo): put some validation in config instead
+    let keep_seen_cache_size: usize = if max_seen_cache_len > 10 {
+        cmp::max(10, max_seen_cache_len / 10)
+    } else {
+        max_seen_cache_len
+    };
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
     let mut drop_log_count: u64 = 0;

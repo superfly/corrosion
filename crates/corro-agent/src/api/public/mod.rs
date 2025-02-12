@@ -19,7 +19,7 @@ use corro_types::{
 };
 use hyper::StatusCode;
 use rusqlite::{params_from_iter, ToSql, Transaction};
-use spawn::spawn_counted;
+// use spawn::spawn_counted;
 use tokio::{
     sync::{
         mpsc::{self, channel},
@@ -90,7 +90,7 @@ where
 
                 book_writer.commit_snapshot(snap);
 
-                let agent = agent.clone();
+                // let agent = agent.clone();
 
                 // spawn_counted(async move {
                 //     debug!("broadcasting changes...db_version: {db_version}");
