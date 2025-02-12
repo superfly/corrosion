@@ -909,6 +909,7 @@ mod tests {
         api::public::{api_v1_db_schema, api_v1_transactions},
     };
     use corro_tests::launch_test_agent;
+    use corro_tests::tempdir::TempDir;
     use corro_types::api::SqliteValue::Integer;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -917,7 +918,7 @@ mod tests {
 
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
 
-        let dir = tempfile::tempdir()?;
+        let dir = TempDir::new(tempfile::tempdir()?);
 
         let (agent, _agent_options) = setup(
             Config::builder()

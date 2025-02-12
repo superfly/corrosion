@@ -759,7 +759,7 @@ pub async fn handle_changes(
     let keep_seen_cache_size: usize = if max_seen_cache_len > 10 {
         cmp::max(10, max_seen_cache_len / 10)
     } else {
-        max_seen_cache_len
+        0
     };
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
