@@ -202,7 +202,9 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
     assert_eq!(svc.id, 2);
     assert_eq!(svc.text, "hello world 2");
 
+    println!("sleeping 1s");
     sleep(Duration::from_secs(1)).await;
+    println!("done sleeping");
 
     let svc: TestRecord = ta2.agent.pool().read().await?.query_row(
         "SELECT id, text FROM tests WHERE id = 2;",

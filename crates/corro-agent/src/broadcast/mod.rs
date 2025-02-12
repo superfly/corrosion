@@ -483,6 +483,7 @@ async fn handle_broadcasts(
         match branch {
             Branch::Tripped => {
                 // nothing to do here, yet!
+                warn!("tripped broadcast loop");
             }
             Branch::BroadcastDeadline => {
                 if !bcast_buf.is_empty() {
@@ -493,6 +494,7 @@ async fn handle_broadcasts(
                         local_bcast_buf.split().freeze(),
                     ));
                 }
+                info!("broadcast deadline, sending out any pending broadcasts - len: {}", to_broadcast.len());
             }
             Branch::Broadcast(input) => {
                 trace!("handling Branch::Broadcast");
@@ -501,7 +503,7 @@ async fn handle_broadcasts(
                     BroadcastInput::Rebroadcast(bcast) => (bcast, false),
                     BroadcastInput::AddBroadcast(bcast) => (bcast, true),
                 };
-                trace!("adding broadcast: {bcast:?}, local? {is_local}");
+                debug!("adding broadcast: {bcast:?}, local? {is_local}");
 
                 if let Err(e) = (UniPayload::V1 {
                     data: UniPayloadV1::Broadcast(bcast.clone()),
@@ -548,11 +550,11 @@ async fn handle_broadcasts(
                 }
             }
             Branch::WokePendingBroadcast(pending) => {
-                trace!("handling Branch::WokePendingBroadcast");
+                info!("handling Branch::WokePendingBroadcast");
                 to_broadcast.push_front(pending);
             }
             Branch::Metrics => {
-                trace!("handling Branch::Metrics");
+                info!("handling Branch::Metrics");
                 gauge!("corro.broadcast.pending.count").set(idle_pendings.len() as f64);
                 gauge!("corro.broadcast.processing.jobs").set(join_set.len() as f64);
                 gauge!("corro.broadcast.buffer.capacity").set(bcast_buf.capacity() as f64);
