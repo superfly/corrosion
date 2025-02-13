@@ -484,6 +484,7 @@ async fn handle_broadcasts(
             Branch::Tripped => {
                 // nothing to do here, yet!
                 warn!("tripped broadcast loop");
+                break;
             }
             Branch::BroadcastDeadline => {
                 if !bcast_buf.is_empty() {
