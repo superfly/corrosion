@@ -205,7 +205,9 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         bookie.clone(),
         rx_apply,
         tripwire.clone(),
-    ));
+    )
+        .inspect(|_| info!("corrosion buffered changes loop is done"))
+    );
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
@@ -218,14 +220,14 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         bookie.clone(),
         rx_changes,
         tripwire.clone(),
-    ));
+    ).inspect(|_| info!("corrosion handle changes loop is done")));
 
     spawn_counted(handlers::handle_emptyset(
         agent.clone(),
         bookie.clone(),
         rx_emptyset,
         tripwire.clone(),
-    ));
+    ).inspect(|_| info!("corrosion handle emptyset loop is done")));
 
     Ok(bookie)
 }

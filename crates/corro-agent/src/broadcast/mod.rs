@@ -367,11 +367,12 @@ pub fn runtime_loop(
             }
 
             if let Some(handle) = diff_member_states(&agent, &foca, &mut last_states) {
-                info!("Waiting on task to update member states...");
+                debug!("Waiting on task to update member states...");
                 if let Err(e) = handle.await {
                     error!("could not await task to update member states: {e}");
                 }
             }
+            info!("foca runtime loop is done, leaving cluster");
         }
     });
 

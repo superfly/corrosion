@@ -90,6 +90,7 @@ pub fn spawn_gossipserver_handler(
             gossip_server_endpoint.close(0u32.into(), b"shutting down");
         }
     });
+    info!("gossipserver_handler is done");
 }
 
 /// Spawn a task which handles all state and interactions for a given
