@@ -2317,7 +2317,7 @@ impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Session<'conn
             snap,
         }) = insert_info
         {
-            warn!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
+            trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
             book_writer.commit_snapshot(snap);
 
