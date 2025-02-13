@@ -673,12 +673,9 @@ pub async fn start<'conn>(
 
                         while let Some(decode_res) = stream.next().await {
                             let msg = match decode_res {
-                                Ok(msg) => {
-                                    info!("received msg: {msg:?}");
-                                    msg
-                                },
+                                Ok(msg) => msg,
                                 Err(PgWireError::IoError(io_error)) => {
-                                    warn!("postgres io error: {io_error}");
+                                    debug!("postgres io error: {io_error}");
                                     break;
                                 }
                                 Err(e) => {
@@ -704,7 +701,7 @@ pub async fn start<'conn>(
 
                             front_tx.send(msg).await?;
                         }
-                        warn!("frontend stream is done");
+                        debug!("frontend stream is done");
 
                         Ok::<_, BoxError>(())
                     }
@@ -718,9 +715,9 @@ pub async fn start<'conn>(
                             match back {
                                 BackendResponse::Message { message, flush } => {
                                     if let PgWireBackendMessage::ErrorResponse(e) = &message {
-                                        warn!("sending: {e:?}");
+                                        debug!("sending: {e:?}");
                                     } else {
-                                        info!("sending: {message:?}");
+                                        debug!("sending: {message:?}");
                                     }
                                     sink.feed(message).await?;
                                     if flush {
@@ -732,7 +729,7 @@ pub async fn start<'conn>(
                                 }
                             }
                         }
-                        warn!("backend stream is done");
+                        debug!("backend stream is done");
                         Ok::<_, std::io::Error>(())
                     }
                 });
@@ -1610,7 +1607,7 @@ pub async fn start<'conn>(
                                         max_rows,
                                         &back_tx,
                                     ) {
-                                        warn!("error in execute: {e}");
+                                        debug!("error in execute: {e}");
 
                                         back_tx.blocking_send(BackendResponse::Message {
                                             message: e.try_into()?,
@@ -1865,9 +1862,7 @@ pub async fn start<'conn>(
                 }).await;
 
                 match res {
-                    Ok(Ok(_)) => {
-                        info!("connection done");
-                    }
+                    Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         error!("connection failed: {e}");
                         _ = back_tx
@@ -2296,7 +2291,7 @@ impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Session<'conn
     }
 
     fn handle_commit(&self) -> Result<(), ChangeError> {
-        warn!("HANDLE COMMIT");
+        trace!("HANDLE COMMIT");
 
         let mut book_writer = self
             .agent
@@ -2344,7 +2339,7 @@ impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Drop for Sess
             if let Err(e) = self.conn.execute_batch("ROLLBACK") {
                 warn!("failed to rollback tx: {e}");
             } else {
-                warn!("rolled back tx");
+                debug!("rolled back tx");
             }
         }
     }
