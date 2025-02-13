@@ -566,6 +566,7 @@ async fn handle_broadcasts(
         let prev_rate_limited = rate_limited;
 
         // start with local broadcasts, they're higher priority
+        debug!("to_local_broadcast len: {}, join_set len: {}", to_local_broadcast.len(), join_set.len());
         while !to_local_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
             // UNWRAP: we just checked that it wasn't empty
             let payload = to_local_broadcast.pop_front().unwrap();
@@ -575,6 +576,7 @@ async fn handle_broadcasts(
             let mut ring0_count = 0;
             for addr in members.ring0(agent.cluster_id()) {
                 if join_set.len() >= MAX_INFLIGHT_BROADCAST {
+                    debug!("breaking, max inflight broadcast reached: {}", MAX_INFLIGHT_BROADCAST);
                     break;
                 }
                 ring0_count += 1;
@@ -593,6 +595,7 @@ async fn handle_broadcasts(
                         match e {
                             TransmitError::TooBig(_) | TransmitError::InsufficientCapacity(_) => {
                                 // not sure this would ever happen
+                                error!("could not spawn broadcast transmission: {e}");
                                 continue;
                             }
                             TransmitError::QuotaExceeded(_) => {
