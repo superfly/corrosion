@@ -195,7 +195,7 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
 /// everyone.
 ///
 ///
-pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
+pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire: Tripwire) {
     tokio::spawn({
         let agent = agent.clone();
         async move {
@@ -206,7 +206,12 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr) {
             tokio::pin!(timer);
 
             loop {
-                timer.as_mut().await;
+                tokio::select! {
+                    _ = &mut tripwire => {
+                        break;
+                    }
+                    _ = timer.as_mut() => {}
+                }
 
                 match bootstrap::generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),

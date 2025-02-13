@@ -87,7 +87,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     //// Update member connection RTTs
     handlers::spawn_rtt_handler(&agent, rtt_rx);
 
-    handlers::spawn_swim_announcer(&agent, gossip_addr);
+    handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());
 
     // Load existing cluster members into the SWIM runtime
     util::initialise_foca(&agent).await;

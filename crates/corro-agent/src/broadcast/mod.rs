@@ -972,7 +972,7 @@ fn try_transmit_broadcast(
     transport: Transport,
     addr: SocketAddr,
 ) -> Result<Pin<Box<dyn Future<Output = ()> + Send>>, TransmitError> {
-    trace!("singly broadcasting to {addr}");
+    debug!("singly broadcasting to {addr}");
 
     let len = payload.len();
 
