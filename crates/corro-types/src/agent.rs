@@ -713,7 +713,7 @@ impl SplitPool {
 
     // get a normal priority write connection (e.g. sync process)
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn write_normal(&self, op: &'static str,) -> Result<WriteConn, PoolError> {
+    pub async fn write_normal(&self, op: &'static str) -> Result<WriteConn, PoolError> {
         self.write_inner(&self.0.normal_tx, "normal", op).await
     }
 
@@ -724,7 +724,7 @@ impl SplitPool {
     }
 
     async fn write_inner(
-        &self,   
+        &self,
         chan: &CorroSender<(oneshot::Sender<CancellationToken>, &'static str)>,
         queue: &'static str,
         op: &'static str,
