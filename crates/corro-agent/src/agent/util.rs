@@ -429,7 +429,7 @@ pub async fn clear_buffered_meta_loop(
         tokio::spawn(async move {
             loop {
                 let res = {
-                    let mut conn = pool.write_low().await?;
+                    let mut conn = pool.write_low("clear_buffered_meta").await?;
 
                     block_in_place(|| {
                         let tx = conn.immediate_transaction()?;
@@ -537,7 +537,7 @@ pub async fn process_fully_buffered_changes(
     version: Version,
 ) -> Result<bool, ChangeError> {
     let db_version = {
-        let mut conn = agent.pool().write_normal().await?;
+        let mut conn = agent.pool().write_normal("fully_buffered_changes").await?;
         debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
 
         let booked = {
@@ -800,7 +800,7 @@ pub async fn process_multiple_changes(
         warn!("process_multiple_changes: removing duplicates took too long - {elapsed:?}");
     }
 
-    let mut conn = agent.pool().write_normal().await?;
+    let mut conn = agent.pool().write_normal("process_multiple_changes").await?;
 
     let changesets = block_in_place(|| {
         let start = Instant::now();

@@ -522,9 +522,9 @@ struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
 
-    priority_tx: CorroSender<oneshot::Sender<CancellationToken>>,
-    normal_tx: CorroSender<oneshot::Sender<CancellationToken>>,
-    low_tx: CorroSender<oneshot::Sender<CancellationToken>>,
+    priority_tx: CorroSender<(oneshot::Sender<CancellationToken>, &'static str)>,
+    normal_tx: CorroSender<(oneshot::Sender<CancellationToken>, &'static str)>,
+    low_tx: CorroSender<(oneshot::Sender<CancellationToken>, &'static str)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -643,7 +643,7 @@ impl SplitPool {
 
         tokio::spawn(async move {
             loop {
-                let tx: oneshot::Sender<CancellationToken> = tokio::select! {
+                let (tx, op) = tokio::select! {
                     biased;
 
                     Some(tx) = priority_rx.recv() => tx,
@@ -651,7 +651,7 @@ impl SplitPool {
                     Some(tx) = low_rx.recv() => tx,
                 };
 
-                wait_conn_drop(tx).await
+                wait_conn_drop(tx, op).await
             }
         });
 
@@ -707,31 +707,32 @@ impl SplitPool {
 
     // get a high priority write connection (e.g. client input)
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn write_priority(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.priority_tx, "priority").await
+    pub async fn write_priority(&self, op: &'static str) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.priority_tx, "priority", op).await
     }
 
     // get a normal priority write connection (e.g. sync process)
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn write_normal(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.normal_tx, "normal").await
+    pub async fn write_normal(&self, op: &'static str,) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.normal_tx, "normal", op).await
     }
 
     // get a low priority write connection (e.g. background tasks)
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn write_low(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.low_tx, "low").await
+    pub async fn write_low(&self, op: &'static str) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.low_tx, "low", op).await
     }
 
     async fn write_inner(
-        &self,
-        chan: &CorroSender<oneshot::Sender<CancellationToken>>,
+        &self,   
+        chan: &CorroSender<(oneshot::Sender<CancellationToken>, &'static str)>,
         queue: &'static str,
+        op: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
         let max_timeout = Duration::from_secs(5 * 60);
 
-        timeout_fut("tx to oneshot channel", max_timeout, chan.send(tx))
+        timeout_fut("tx to oneshot channel", max_timeout, chan.send((tx, op)))
             .await?
             .map_err(|_| PoolError::QueueClosed)?;
 
@@ -764,7 +765,7 @@ impl SplitPool {
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
+async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, op: &'static str) {
     let cancel = CancellationToken::new();
 
     if let Err(_e) = tx.send(cancel.clone()) {
@@ -772,7 +773,18 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
         return;
     }
 
-    cancel.cancelled().await
+    let start = Instant::now();
+    let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                break;
+            }
+            _ = interval.tick() => {
+                debug!("wait_conn_drop has been running for {op} since: {} ({})", start.elapsed().as_secs_f64(), cancel.is_cancelled());
+            }
+        }
+    }
 }
 
 async fn timeout_fut<T, F>(op: &'static str, duration: Duration, fut: F) -> Result<T, PoolError>

@@ -2484,7 +2484,7 @@ mod tests {
         let clock = Arc::new(uhlc::HLC::default());
 
         {
-            let mut conn = pool.write_priority().await?;
+            let mut conn = pool.write_priority("tests").await?;
             setup_conn(&conn)?;
             migrate(clock, &mut conn)?;
             let tx = conn.transaction()?;
@@ -2603,7 +2603,7 @@ mod tests {
         let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)))
             .await
             .unwrap();
-        let mut conn = pool.write_priority().await.unwrap();
+        let mut conn = pool.write_priority("tests").await.unwrap();
         let clock = Arc::new(uhlc::HLC::default());
         {
             setup_conn(&conn).unwrap();

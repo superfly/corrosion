@@ -848,7 +848,7 @@ fn diff_member_states(
 
     let pool = agent.pool().clone();
     Some(tokio::spawn(async move {
-        let mut conn = match pool.write_low().await {
+        let mut conn = match pool.write_low("process_member_events").await {
             Ok(conn) => conn,
             Err(e) => {
                 error!("could not acquire a r/w conn to process member events: {e}");
