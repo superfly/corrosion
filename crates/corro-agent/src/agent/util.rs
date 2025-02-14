@@ -800,318 +800,317 @@ pub async fn process_multiple_changes(
         warn!("process_multiple_changes: removing duplicates took too long - {elapsed:?}");
     }
 
-    let changesets = {
-        let mut conn = agent.pool().write_normal("process_multiple_changes").await?;
+    let mut conn = agent.pool().write_normal("process_multiple_changes").await?;
 
-        block_in_place(|| {
-            let start = Instant::now(); 
-            let mut tx = conn
-                .immediate_transaction()
+    let changesets = block_in_place(|| {
+        let start = Instant::now();
+        let mut tx = conn
+            .immediate_transaction()
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
+
+        let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
+        let mut changesets = vec![];
+
+        let mut last_db_version = None;
+
+        // let mut writers: BTreeMap<ActorId, _> = Default::default();
+
+        let sub_start = Instant::now();
+        for (actor_id, changes) in unknown_changes {
+            let booked = {
+                bookie
+                    .blocking_write(
+                        "process_multiple_changes(for_actor_blocking)",
+                        actor_id.as_simple(),
+                    )
+                    .ensure(actor_id)
+            };
+            let booked_write = booked.blocking_write(
+                "process_multiple_changes(booked writer, unknown changes)",
+                actor_id.as_simple(),
+            );
+
+            let mut seen = RangeInclusiveMap::new();
+
+            for (change, src) in changes {
+                trace!("handling a single changeset: {change:?}");
+                let seqs = change.seqs();
+                let ts = change.ts();
+                if booked_write.contains_all(change.versions(), change.seqs()) {
+                    trace!("previously unknown versions are now deemed known, aborting inserts");
+                    continue;
+                }
+
+                let versions = change.versions();
+
+                // check if we've seen this version here...
+                if versions.clone().all(|version| match seqs {
+                    Some(check_seqs) => match seen.get(&version) {
+                        Some(known) => match known {
+                            KnownDbVersion::Partial(PartialVersion { seqs, .. }) => {
+                                check_seqs.clone().all(|seq| seqs.contains(&seq))
+                            }
+                            KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
+                        },
+                        None => false,
+                    },
+                    None => seen.contains_key(&version),
+                }) {
+                    continue;
+                }
+
+                // optimizing this, insert later!
+                let known = if change.is_complete() && change.is_empty() {
+                    KnownDbVersion::Cleared
+                } else {
+                    if let Some(seqs) = change.seqs() {
+                        if seqs.end() < seqs.start() {
+                            warn!(%actor_id, versions = ?change.versions(), "received an invalid change, seqs start is greater than seqs end: {seqs:?}");
+                            continue;
+                        }
+                    }
+
+                    let (known, changeset) = {
+                        match process_single_version(&agent, &mut tx, last_db_version, change) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                error!("error processing single version: {e}");
+                                continue;
+                            }
+                        }
+                    };
+
+                    let versions = changeset.versions();
+                    if let KnownDbVersion::Current(CurrentVersion { db_version, .. }) = &known {
+                        last_db_version = Some(*db_version);
+                        changesets.push((actor_id, changeset, *db_version, src));
+                    }
+
+                    debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "got known to insert: {known:?}");
+                    known
+                };
+
+                seen.insert(versions.clone(), known.clone());
+                knowns
+                    .entry(actor_id)
+                    .or_default()
+                    .push((versions, ts, known));
+            }
+            // if knowns.contains_key(&actor_id) {
+            //     writers.insert(actor_id, booked_write);
+            // }
+        }
+
+        let elapsed = sub_start.elapsed();
+        if elapsed >= PROCESSING_WARN_THRESHOLD {
+            warn!("process_multiple_changes:: process_single_version took too long - {elapsed:?}");
+        }
+
+        let mut count = 0;
+        let mut snapshots = BTreeMap::new();
+
+        let sub_start = Instant::now();
+        for (actor_id, knowns) in knowns.iter_mut() {
+            debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} knowns", knowns.len());
+
+            let mut all_versions = RangeInclusiveSet::new();
+
+            for (versions, ts, known) in knowns.iter() {
+                match known {
+                    KnownDbVersion::Partial { .. } => {}
+                    KnownDbVersion::Current(CurrentVersion {
+                        db_version,
+                        last_seq,
+                        ts,
+                    }) => {
+                        count += 1;
+                        let version = versions.start();
+                        debug!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
+                        tx.prepare_cached("
+                            INSERT OR IGNORE INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  last_seq,  ts)
+                                                    VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?
+                            .execute(named_params!{
+                                ":actor_id": actor_id,
+                                ":start_version": *version,
+                                ":db_version": *db_version,
+                                ":last_seq": *last_seq,
+                                ":ts": *ts
+                            }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?;
+                    }
+                    KnownDbVersion::Cleared => {
+                        debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
+                        let ts = ts.unwrap_or(Timestamp::from(agent.clock().new_timestamp()));
+                        store_empty_changeset(&tx, *actor_id, versions.clone(), ts)?;
+                    }
+                }
+
+                all_versions.insert(versions.clone());
+
+                debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserted bookkeeping row");
+            }
+
+            let booked = {
+                bookie
+                    .blocking_write(
+                        "process_multiple_changes(for_actor_blocking)",
+                        actor_id.as_simple(),
+                    )
+                    .ensure(*actor_id)
+            };
+
+            // FIXME: here we're making dangerous assumptions that nothing will modify booked versions
+            let mut snap = match snapshots.remove(actor_id) {
+                Some(snap) => snap,
+                None => {
+                    let booked_write = booked.blocking_write(
+                        "process_multiple_changes(booked writer, during knowns)",
+                        actor_id.as_simple(),
+                    );
+                    booked_write.snapshot()
+                }
+            };
+
+            snap.insert_db(&tx, all_versions)
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(*actor_id),
+                    version: None,
+                })?;
+
+            snapshots.insert(*actor_id, snap);
+        }
+
+        debug!("inserted {count} new changesets");
+
+        let overwritten =
+            find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
+
+        let mut last_cleared: Option<Timestamp> = None;
+        for (actor_id, versions_set) in overwritten {
+            if actor_id != agent.actor_id() {
+                warn!("clearing and setting timestamp for empties from a different node");
+            }
+            for versions in versions_set {
+                let ts = Timestamp::from(agent.clock().new_timestamp());
+                let inserted = store_empty_changeset(&tx, actor_id, versions, ts)?;
+                if inserted > 0 {
+                    last_cleared = Some(ts);
+                }
+            }
+        }
+
+        if let Some(ts) = last_cleared {
+            let mut snap = {
+                agent
+                    .booked()
+                    .blocking_write::<&str, _>(
+                        "process_multiple_changes(update_cleared_ts snapshot)",
+                        None,
+                    )
+                    .snapshot()
+            };
+
+            snap.update_cleared_ts(&tx, ts)
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
                     actor_id: None,
                     version: None,
                 })?;
 
-            let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
-            let mut changesets = vec![];
+            std::mem::forget(snap);
+        }
 
-            let mut last_db_version = None;
+        let elapsed = sub_start.elapsed();
+        if elapsed >= PROCESSING_WARN_THRESHOLD {
+            warn!("process_multiple_changes: processing bookkeeping took too long - {elapsed:?}");
+        }
 
-            // let mut writers: BTreeMap<ActorId, _> = Default::default();
+        let sub_start = Instant::now();
+        tx.commit().map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })?;
+        let elapsed = sub_start.elapsed();
+        if elapsed >= PROCESSING_WARN_THRESHOLD {
+            warn!("process_multiple_changes: commiting transaction took too long - {elapsed:?}");
+        }
 
-            let sub_start = Instant::now();
-            for (actor_id, changes) in unknown_changes {
-                let booked = {
-                    bookie
-                        .blocking_write(
-                            "process_multiple_changes(for_actor_blocking)",
-                            actor_id.as_simple(),
-                        )
-                        .ensure(actor_id)
-                };
-                let booked_write = booked.blocking_write(
-                    "process_multiple_changes(booked writer, unknown changes)",
-                    actor_id.as_simple(),
-                );
+        if let Some(ts) = last_cleared {
+            let mut booked_writer = agent
+                .booked()
+                .blocking_write::<&str, _>("process_multiple_changes(update_cleared_ts)", None);
+            booked_writer.update_cleared_ts(ts);
+        }
 
-                let mut seen = RangeInclusiveMap::new();
+        for (_, changeset, _, _) in changesets.iter() {
+            if let Some(ts) = changeset.ts() {
+                let dur = (agent.clock().new_timestamp().get_time() - ts.0).to_duration();
+                histogram!("corro.agent.changes.commit.lag.seconds").record(dur);
+            }
+        }
 
-                for (change, src) in changes {
-                    trace!("handling a single changeset: {change:?}");
-                    let seqs = change.seqs();
-                    let ts = change.ts();
-                    if booked_write.contains_all(change.versions(), change.seqs()) {
-                        trace!("previously unknown versions are now deemed known, aborting inserts");
-                        continue;
-                    }
+        debug!("committed {count} changes in {:?}", start.elapsed());
 
-                    let versions = change.versions();
+        let sub_start = Instant::now();
+        for (actor_id, knowns) in knowns {
+            let booked = {
+                bookie
+                    .blocking_write(
+                        "process_multiple_changes(for_actor_blocking)",
+                        actor_id.as_simple(),
+                    )
+                    .ensure(actor_id)
+            };
+            let mut booked_write = booked.blocking_write(
+                "process_multiple_changes(booked writer, before apply needed)",
+                actor_id.as_simple(),
+            );
 
-                    // check if we've seen this version here...
-                    if versions.clone().all(|version| match seqs {
-                        Some(check_seqs) => match seen.get(&version) {
-                            Some(known) => match known {
-                                KnownDbVersion::Partial(PartialVersion { seqs, .. }) => {
-                                    check_seqs.clone().all(|seq| seqs.contains(&seq))
-                                }
-                                KnownDbVersion::Current { .. } | KnownDbVersion::Cleared => true,
-                            },
-                            None => false,
-                        },
-                        None => seen.contains_key(&version),
-                    }) {
-                        continue;
-                    }
+            if let Some(snap) = snapshots.remove(&actor_id) {
+                booked_write.commit_snapshot(snap);
+            }
 
-                    // optimizing this, insert later!
-                    let known = if change.is_complete() && change.is_empty() {
-                        KnownDbVersion::Cleared
+            for (versions, _, known) in knowns {
+                let version = *versions.start();
+                if let KnownDbVersion::Partial(partial) = known {
+                    let PartialVersion { seqs, last_seq, .. } =
+                        booked_write.insert_partial(version, partial);
+
+                    let full_seqs_range = CrsqlSeq(0)..=last_seq;
+                    let gaps_count = seqs.gaps(&full_seqs_range).count();
+                    if gaps_count == 0 {
+                        // if we have no gaps, then we can schedule applying all these changes.
+                        debug!(%actor_id, %version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
+                        let tx_apply = agent.tx_apply().clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tx_apply.send((actor_id, version)).await {
+                                error!("could not send trigger for applying fully buffered changes later: {e}");
+                            }
+                        });
                     } else {
-                        if let Some(seqs) = change.seqs() {
-                            if seqs.end() < seqs.start() {
-                                warn!(%actor_id, versions = ?change.versions(), "received an invalid change, seqs start is greater than seqs end: {seqs:?}");
-                                continue;
-                            }
-                        }
-
-                        let (known, changeset) = {
-                            match process_single_version(&agent, &mut tx, last_db_version, change) {
-                                Ok(res) => res,
-                                Err(e) => {
-                                    error!("error processing single version: {e}");
-                                    continue;
-                                }
-                            }
-                        };
-
-                        let versions = changeset.versions();
-                        if let KnownDbVersion::Current(CurrentVersion { db_version, .. }) = &known {
-                            last_db_version = Some(*db_version);
-                            changesets.push((actor_id, changeset, *db_version, src));
-                        }
-
-                        debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "got known to insert: {known:?}");
-                        known
-                    };
-
-                    seen.insert(versions.clone(), known.clone());
-                    knowns
-                        .entry(actor_id)
-                        .or_default()
-                        .push((versions, ts, known));
-                }
-                // if knowns.contains_key(&actor_id) {
-                //     writers.insert(actor_id, booked_write);
-                // }
-            }
-
-            let elapsed = sub_start.elapsed();
-            if elapsed >= PROCESSING_WARN_THRESHOLD {
-                warn!("process_multiple_changes:: process_single_version took too long - {elapsed:?}");
-            }
-
-            let mut count = 0;
-            let mut snapshots = BTreeMap::new();
-
-            let sub_start = Instant::now();
-            for (actor_id, knowns) in knowns.iter_mut() {
-                debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} knowns", knowns.len());
-
-                let mut all_versions = RangeInclusiveSet::new();
-
-                for (versions, ts, known) in knowns.iter() {
-                    match known {
-                        KnownDbVersion::Partial { .. } => {}
-                        KnownDbVersion::Current(CurrentVersion {
-                            db_version,
-                            last_seq,
-                            ts,
-                        }) => {
-                            count += 1;
-                            let version = versions.start();
-                            debug!(%actor_id, self_actor_id = %agent.actor_id(), %version, "inserting bookkeeping row db_version: {db_version}, ts: {ts:?}");
-                            tx.prepare_cached("
-                                INSERT OR IGNORE INTO __corro_bookkeeping ( actor_id,  start_version,  db_version,  last_seq,  ts)
-                                                        VALUES  (:actor_id, :start_version, :db_version, :last_seq, :ts);").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?
-                                .execute(named_params!{
-                                    ":actor_id": actor_id,
-                                    ":start_version": *version,
-                                    ":db_version": *db_version,
-                                    ":last_seq": *last_seq,
-                                    ":ts": *ts
-                                }).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(*actor_id), version: Some(*version)})?;
-                        }
-                        KnownDbVersion::Cleared => {
-                            debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserting CLEARED bookkeeping");
-                            let ts = ts.unwrap_or(Timestamp::from(agent.clock().new_timestamp()));
-                            store_empty_changeset(&tx, *actor_id, versions.clone(), ts)?;
-                        }
-                    }
-
-                    all_versions.insert(versions.clone());
-
-                    debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "inserted bookkeeping row");
-                }
-
-                let booked = {
-                    bookie
-                        .blocking_write(
-                            "process_multiple_changes(for_actor_blocking)",
-                            actor_id.as_simple(),
-                        )
-                        .ensure(*actor_id)
-                };
-
-                // FIXME: here we're making dangerous assumptions that nothing will modify booked versions
-                let mut snap = match snapshots.remove(actor_id) {
-                    Some(snap) => snap,
-                    None => {
-                        let booked_write = booked.blocking_write(
-                            "process_multiple_changes(booked writer, during knowns)",
-                            actor_id.as_simple(),
-                        );
-                        booked_write.snapshot()
-                    }
-                };
-
-                snap.insert_db(&tx, all_versions)
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: Some(*actor_id),
-                        version: None,
-                    })?;
-
-                snapshots.insert(*actor_id, snap);
-            }
-
-            debug!("inserted {count} new changesets");
-
-            let overwritten =
-                find_overwritten_versions(&tx).map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: None,
-                    version: None,
-                })?;
-
-            let mut last_cleared: Option<Timestamp> = None;
-            for (actor_id, versions_set) in overwritten {
-                if actor_id != agent.actor_id() {
-                    warn!("clearing and setting timestamp for empties from a different node");
-                }
-                for versions in versions_set {
-                    let ts = Timestamp::from(agent.clock().new_timestamp());
-                    let inserted = store_empty_changeset(&tx, actor_id, versions, ts)?;
-                    if inserted > 0 {
-                        last_cleared = Some(ts);
+                        debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs: {:?}", seqs.gaps(&full_seqs_range).collect::<Vec<_>>());
                     }
                 }
             }
+        }
 
-            if let Some(ts) = last_cleared {
-                let mut snap = {
-                    agent
-                        .booked()
-                        .blocking_write::<&str, _>(
-                            "process_multiple_changes(update_cleared_ts snapshot)",
-                            None,
-                        )
-                        .snapshot()
-                };
+        let elapsed = sub_start.elapsed();
+        if elapsed >= PROCESSING_WARN_THRESHOLD {
+            warn!("process_multiple_changes: commiting snapshots took too long - {elapsed:?}");
+        }
 
-                snap.update_cleared_ts(&tx, ts)
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: None,
-                        version: None,
-                    })?;
+        Ok::<_, ChangeError>(changesets)
+    })?;
 
-                std::mem::forget(snap);
-            }
-
-            let elapsed = sub_start.elapsed();
-            if elapsed >= PROCESSING_WARN_THRESHOLD {
-                warn!("process_multiple_changes: processing bookkeeping took too long - {elapsed:?}");
-            }
-
-            let sub_start = Instant::now();
-            tx.commit().map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: None,
-                version: None,
-            })?;
-            let elapsed = sub_start.elapsed();
-            if elapsed >= PROCESSING_WARN_THRESHOLD {
-                warn!("process_multiple_changes: commiting transaction took too long - {elapsed:?}");
-            }
-
-            if let Some(ts) = last_cleared {
-                let mut booked_writer = agent
-                    .booked()
-                    .blocking_write::<&str, _>("process_multiple_changes(update_cleared_ts)", None);
-                booked_writer.update_cleared_ts(ts);
-            }
-
-            for (_, changeset, _, _) in changesets.iter() {
-                if let Some(ts) = changeset.ts() {
-                    let dur = (agent.clock().new_timestamp().get_time() - ts.0).to_duration();
-                    histogram!("corro.agent.changes.commit.lag.seconds").record(dur);
-                }
-            }
-
-            debug!("committed {count} changes in {:?}", start.elapsed());
-
-            let sub_start = Instant::now();
-            for (actor_id, knowns) in knowns {
-                let booked = {
-                    bookie
-                        .blocking_write(
-                            "process_multiple_changes(for_actor_blocking)",
-                            actor_id.as_simple(),
-                        )
-                        .ensure(actor_id)
-                };
-                let mut booked_write = booked.blocking_write(
-                    "process_multiple_changes(booked writer, before apply needed)",
-                    actor_id.as_simple(),
-                );
-
-                if let Some(snap) = snapshots.remove(&actor_id) {
-                    booked_write.commit_snapshot(snap);
-                }
-
-                for (versions, _, known) in knowns {
-                    let version = *versions.start();
-                    if let KnownDbVersion::Partial(partial) = known {
-                        let PartialVersion { seqs, last_seq, .. } =
-                            booked_write.insert_partial(version, partial);
-
-                        let full_seqs_range = CrsqlSeq(0)..=last_seq;
-                        let gaps_count = seqs.gaps(&full_seqs_range).count();
-                        if gaps_count == 0 {
-                            // if we have no gaps, then we can schedule applying all these changes.
-                            debug!(%actor_id, %version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
-                            let tx_apply = agent.tx_apply().clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = tx_apply.send((actor_id, version)).await {
-                                    error!("could not send trigger for applying fully buffered changes later: {e}");
-                                }
-                            });
-                        } else {
-                            debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs: {:?}", seqs.gaps(&full_seqs_range).collect::<Vec<_>>());
-                        }
-                    }
-                }
-            }
-
-            let elapsed = sub_start.elapsed();
-            if elapsed >= PROCESSING_WARN_THRESHOLD {
-                warn!("process_multiple_changes: commiting snapshots took too long - {elapsed:?}");
-            }
-
-            Ok::<_, ChangeError>(changesets)
-        })?
-    };
     let mut change_chunk_size = 0;
 
     for (_actor_id, changeset, db_version, _src) in changesets {
