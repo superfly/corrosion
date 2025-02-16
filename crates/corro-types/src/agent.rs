@@ -781,7 +781,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, op: &'static str
                 break;
             }
             _ = interval.tick() => {
-                debug!("wait_conn_drop has been running for {op} since: {} ({})", start.elapsed().as_secs_f64(), cancel.is_cancelled());
+                warn!("wait_conn_drop has been running for {op} since: {} ({})", start.elapsed().as_secs_f64(), cancel.is_cancelled());
             }
         }
     }
