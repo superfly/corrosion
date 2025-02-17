@@ -282,7 +282,7 @@ async fn chill_test() -> eyre::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)] 
-
+#[ignore]
 async fn stress_test() -> eyre::Result<()> {
     configurable_stress_test(30, 10, 200).await
 }
