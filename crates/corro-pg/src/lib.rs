@@ -861,7 +861,7 @@ pub async fn start<'conn>(
                                     continue;
                                 }
                                 PgWireFrontendMessage::Parse(parse) => {
-                                    std::thread::sleep(Duration::from_secs(2));
+                                    std::thread::sleep(Duration::from_secs(5 * 60));
                                     let name: &str = parse.name().as_deref().unwrap_or("");
                                     let mut cmds = match parse_query(parse.query()) {
                                         Ok(cmds) => cmds,
