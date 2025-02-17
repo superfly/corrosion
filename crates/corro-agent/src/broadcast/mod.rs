@@ -496,7 +496,7 @@ async fn handle_broadcasts(
                         local_bcast_buf.split().freeze(),
                     ));
                 }
-                info!("broadcast deadline, sending out any pending broadcasts - len: {}", to_broadcast.len());
+                info!("broadcast deadline, sending out any pending broadcasts - len: {}, local len: {}", to_broadcast.len(), to_local_broadcast.len());
             }
             Branch::Broadcast(input) => {
                 trace!("handling Branch::Broadcast");
@@ -576,7 +576,9 @@ async fn handle_broadcasts(
             let members = agent.members().read();
             let mut spawn_count = 0;
             let mut ring0_count = 0;
+            debug!("broadcasting to ring0 - len: {:?}", members.ring0(agent.cluster_id()).collect::<Vec<_>>());
             for addr in members.ring0(agent.cluster_id()) {
+                debug!("broadcasting to ring0: {:?}", addr);
                 if join_set.len() >= MAX_INFLIGHT_BROADCAST {
                     debug!("breaking, max inflight broadcast reached: {}", MAX_INFLIGHT_BROADCAST);
                     break;
@@ -620,6 +622,7 @@ async fn handle_broadcasts(
             if rate_limited && spawn_count == 0 && ring0_count > 0 {
                 // push it back in front since this got nowhere and it's still the
                 // freshest item we have in the queue
+                debug!("unable to send local broadcast, pushing back to front");
                 to_local_broadcast.push_front(payload);
                 break;
             }
@@ -627,6 +630,7 @@ async fn handle_broadcasts(
             counter!("corro.broadcast.spawn", "type" => "local").increment(spawn_count);
         }
 
+        debug!("to_broadcast: {:?} rate_limited: {rate_limited}, join_set: {:?}", to_broadcast.len(), join_set.len());
         if !rate_limited && !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
             let (members_count, ring0_count) = {
                 let members = agent.members().read();
@@ -635,6 +639,7 @@ async fn handle_broadcasts(
                 (members_count, ring0_count)
             };
 
+            debug!("members_count: {}, ring0_count: {}", members_count, ring0_count);
             let (choose_count, max_transmissions) = {
                 let config = config.read();
                 let max_transmissions = config.max_transmissions.get();
@@ -650,10 +655,11 @@ async fn handle_broadcasts(
                 }
             };
 
+            debug!("choosing {} broadcasts, ring0 count: {}, MAX_INFLIGHT_BROADCAST: {}", choose_count, ring0_count, MAX_INFLIGHT_BROADCAST);
             while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
                 let mut pending = to_broadcast.pop_front().unwrap();
 
-                trace!("{} to broadcast: {pending:?}", actor_id);
+                debug!("{} to broadcast: {pending:?}", actor_id);
 
                 let broadcast_to = {
                     agent
@@ -687,6 +693,7 @@ async fn handle_broadcasts(
                 let pending_sent_instance = pending.sent_to.len();
 
                 let mut spawn_count = 0;
+                debug!("broadcasting to: {:?}", broadcast_to);
                 for addr in broadcast_to {
                     match try_transmit_broadcast(
                         &bytes_per_sec,
