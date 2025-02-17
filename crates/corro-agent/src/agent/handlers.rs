@@ -741,6 +741,7 @@ pub async fn handle_changes(
 ) {
     let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
     let max_queue_len: usize = agent.config().perf.processing_queue_len;
+    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
     let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
     let mut buf = vec![];
     let mut buf_cost = 0;
@@ -781,7 +782,7 @@ pub async fn handle_changes(
             let changes = std::mem::take(&mut buf);
             let agent = agent.clone();
             let bookie = bookie.clone();
-            join_set.spawn(process_multiple_changes(agent, bookie, changes.clone()));
+            join_set.spawn(process_multiple_changes(agent, bookie, changes.clone(), tx_timeout));
             counter!("corro.agent.changes.batch.spawned").increment(1);
 
             buf_cost -= tmp_cost;
@@ -818,7 +819,7 @@ pub async fn handle_changes(
                     let changes: Vec<_> = queue.drain(..).collect();
                     let agent = agent.clone();
                     let bookie = bookie.clone();
-                    join_set.spawn(process_multiple_changes(agent, bookie, changes.clone()));
+                    join_set.spawn(process_multiple_changes(agent, bookie, changes.clone(), tx_timeout));
                     counter!("corro.agent.changes.batch.spawned").increment(1);
                     buf_cost = 0;
                 }
