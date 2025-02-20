@@ -1766,7 +1766,7 @@ mod tests {
             assert_eq!(status_code, StatusCode::OK);
 
             let version = body.0.version.unwrap();
-            assert_eq!(version, Version(i));
+            assert_eq!(version, i);
         }
 
         let dir = tempfile::tempdir()?;
