@@ -18,6 +18,7 @@ use corro_types::{
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
+use metrics::histogram;
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
@@ -76,6 +77,7 @@ where
         })?;
 
         let elapsed = start.elapsed();
+        histogram!("corro.agent.changes.processing.time.seconds", "source" => "local").record(start.elapsed());
 
         match insert_info {
             None => Ok((ret, None, elapsed)),
