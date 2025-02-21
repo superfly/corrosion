@@ -35,7 +35,7 @@ use tokio::{
     },
     time::timeout,
 };
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
@@ -758,7 +758,7 @@ impl SplitPool {
 
         Ok(WriteConn {
             conn,
-            _drop_guard: token.drop_guard(),
+            cancel: token.clone(),
             _permit,
         })
     }
@@ -799,7 +799,7 @@ where
 
 pub struct WriteConn {
     conn: sqlite_pool::Connection<CrConn>,
-    _drop_guard: DropGuard,
+    cancel: CancellationToken,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -814,6 +814,12 @@ impl Deref for WriteConn {
 impl DerefMut for WriteConn {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn
+    }
+}
+
+impl Drop for WriteConn {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
