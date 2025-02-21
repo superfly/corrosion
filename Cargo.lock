@@ -813,7 +813,6 @@ dependencies = [
  "async-trait",
  "camino",
  "compact_str 0.7.0",
- "corro-base-types",
  "corro-speedy",
  "deadpool",
  "hex",

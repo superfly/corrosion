@@ -1067,8 +1067,10 @@ mod tests {
     use super::*;
     use axum::{http::StatusCode, Extension, Json};
     use corro_tests::TEST_SCHEMA;
-    use corro_types::api::{Change, ColumnName, TableName};
-    use corro_types::{base::CrsqlDbVersion, base::Version, config::Config, pubsub::pack_columns};
+    use corro_types::api::{ColumnName, TableName};
+    use corro_types::{
+        base::CrsqlDbVersion, base::Version, change::Change, config::Config, pubsub::pack_columns,
+    };
     use rusqlite::Connection;
     use std::sync::Arc;
     use tokio::sync::Semaphore;

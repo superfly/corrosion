@@ -37,7 +37,7 @@ use corro_types::change::Change;
 use corro_types::{
     actor::ActorId,
     agent::migrate,
-    api::{row_to_change, ExecResponse, ExecResult, Statement},
+    api::{ExecResponse, ExecResult, Statement},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeSource, ChangeV1, Changeset},
     change::store_empty_changeset,
@@ -47,6 +47,7 @@ use corro_types::{
 use corro_types::{
     agent::Agent,
     api::{ColumnName, TableName},
+    change::row_to_change,
     pubsub::pack_columns,
 };
 
@@ -943,7 +944,8 @@ async fn process_failed_changes() -> eyre::Result<()> {
         .await;
         assert_eq!(status_code, StatusCode::OK);
     }
-    let mut good_changes = get_rows(ta2.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
+    let mut good_changes =
+        get_rows(ta2.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
 
     let change6 = Change {
         table: TableName("tests".into()),
@@ -969,22 +971,20 @@ async fn process_failed_changes() -> eyre::Result<()> {
         cl: 1,
     };
 
-    let mut rows = vec![
-        (
-            ChangeV1 {
-                actor_id,
-                changeset: Changeset::Full {
-                    version: Version(1),
-                    changes: vec![change6.clone(), bad_change],
-                    seqs: CrsqlSeq(0)..=CrsqlSeq(1),
-                    last_seq: CrsqlSeq(1),
-                    ts: Default::default(),
-                },
+    let mut rows = vec![(
+        ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: Version(1),
+                changes: vec![change6.clone(), bad_change],
+                seqs: CrsqlSeq(0)..=CrsqlSeq(1),
+                last_seq: CrsqlSeq(1),
+                ts: Default::default(),
             },
-            ChangeSource::Sync,
-            Instant::now(),
-        )
-    ];
+        },
+        ChangeSource::Sync,
+        Instant::now(),
+    )];
 
     rows.append(&mut good_changes);
 
@@ -997,7 +997,10 @@ async fn process_failed_changes() -> eyre::Result<()> {
 
     for i in 1..=5_i64 {
         let pk = pack_columns(&[i.into()])?;
-        let crsql_dbv = conn.prepare_cached(r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ?"#)?
+        let crsql_dbv = conn
+            .prepare_cached(
+                r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ?"#,
+            )?
             .query_row([pk], |row| row.get::<_, CrsqlDbVersion>(0))?;
 
         let booked_dbv = conn.prepare_cached("SELECT db_version from __corro_bookkeeping where start_version = ? and actor_id = ?")?
@@ -2204,7 +2207,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let version = body.0.version.unwrap();
 
-    assert_eq!(version, Version(1));
+    assert_eq!(version, 1);
 
     let conn = ta1.agent.pool().read().await?;
 
@@ -2221,7 +2224,12 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     assert_eq!(
         bk,
-        vec![(ta1.agent.actor_id(), version, None, CrsqlDbVersion(1))]
+        vec![(
+            ta1.agent.actor_id(),
+            Version(version),
+            None,
+            CrsqlDbVersion(1)
+        )]
     );
 
     let mut changes = vec![];
@@ -2243,7 +2251,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
             ChangeV1 {
                 actor_id: ta1.agent.actor_id(),
                 changeset: Changeset::Full {
-                    version,
+                    version: Version(version),
                     changes,
                     seqs: CrsqlSeq(0)..=last_seq,
                     last_seq,
@@ -2269,7 +2277,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let version = body.0.version.unwrap();
 
-    assert_eq!(version, Version(2));
+    assert_eq!(version, 2);
 
     let bk: Vec<(ActorId, Version, Option<Version>, Option<CrsqlDbVersion>)> = conn
         .prepare(
@@ -2284,7 +2292,12 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
         bk,
         vec![
             (ta1.agent.actor_id(), Version(1), Some(Version(1)), None),
-            (ta1.agent.actor_id(), version, None, Some(CrsqlDbVersion(2)))
+            (
+                ta1.agent.actor_id(),
+                Version(version),
+                None,
+                Some(CrsqlDbVersion(2))
+            )
         ]
     );
 
@@ -2305,7 +2318,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
             ChangeV1 {
                 actor_id: ta1.agent.actor_id(),
                 changeset: Changeset::Full {
-                    version,
+                    version: Version(version),
                     changes,
                     seqs: CrsqlSeq(0)..=last_seq,
                     last_seq,
@@ -2338,7 +2351,12 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
                 None,
                 Some(CrsqlDbVersion(1))
             ),
-            (ta1.agent.actor_id(), version, None, Some(CrsqlDbVersion(2)))
+            (
+                ta1.agent.actor_id(),
+                Version(version),
+                None,
+                Some(CrsqlDbVersion(2))
+            )
         ]
     );
 

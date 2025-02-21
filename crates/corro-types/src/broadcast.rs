@@ -6,7 +6,6 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use corro_api_types::{row_to_change, Change};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use itertools::Itertools;
 use metrics::counter;
@@ -28,7 +27,7 @@ use crate::{
     actor::{Actor, ActorId, ClusterId},
     agent::Agent,
     base::{CrsqlDbVersion, CrsqlSeq, Version},
-    change::{ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
+    change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
     sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
