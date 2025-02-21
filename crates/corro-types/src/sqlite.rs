@@ -5,7 +5,7 @@ use std::{
 
 use once_cell::sync::Lazy;
 use rusqlite::{params, Connection, Transaction};
-use sqlite_pool::SqliteConn;
+use sqlite_pool::{Committable, SqliteConn};
 use tempfile::TempDir;
 use tracing::{error, info, trace};
 
@@ -85,6 +85,18 @@ impl Drop for CrConn {
         if let Err(e) = self.execute_batch("select crsql_finalize();") {
             error!("could not crsql_finalize: {e}");
         }
+    }
+}
+
+impl Committable for CrConn {
+    fn commit(self) -> Result<(), rusqlite::Error> {
+        Ok(())
+    }
+
+    fn savepoint(&mut self) -> Result<rusqlite::Savepoint<'_>, rusqlite::Error> {
+        Err(rusqlite::Error::ModuleError(String::from(
+            "cannot create savepoint from connection",
+        )))
     }
 }
 
@@ -184,6 +196,8 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
 #[cfg(test)]
 mod tests {
     use futures::{stream::FuturesUnordered, TryStreamExt};
+    use sqlite_pool::Config;
+    use sqlite_pool::InterruptibleTransaction;
     use tokio::task::block_in_place;
 
     use super::*;
@@ -245,6 +259,52 @@ mod tests {
 
         assert_eq!(count, total * per_worker);
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_interruptible_transaction() -> Result<(), Box<dyn std::error::Error>> {
+        let tmpdir = tempfile::tempdir()?;
+
+        let path = tmpdir.path().join("db.sqlite");
+        let pool = Config::new(path)
+            .max_size(1)
+            .create_pool_transform(rusqlite_to_crsqlite)?;
+
+        let mut conn = pool.get().await.unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS testsbool (
+            id INTEGER NOT NULL PRIMARY KEY,
+            b boolean not null default false
+        ); SELECT crsql_as_crr('testsbool')",
+        )?;
+
+        {
+            let tx = conn.transaction()?;
+            let timeout = Some(tokio::time::Duration::from_millis(5));
+            let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
+            let res = itx.execute("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;", &[]);
+
+            assert!(res.is_err_and(
+                |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+            ));
+        }
+
+        {
+            let tx = conn.transaction()?;
+            let timeout = Some(tokio::time::Duration::from_millis(5));
+            let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
+            let res = itx.prepare_cached("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;")?
+                        .execute(());
+
+            assert!(res.is_err_and(
+                |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+            ));
+        }
+
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM testsbool;", (), |row| row.get(0))?;
+        assert_eq!(count, 0);
         Ok(())
     }
 

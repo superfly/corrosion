@@ -6,8 +6,10 @@ use std::{
     fmt,
     future::poll_fn,
     net::SocketAddr,
+    ops::{Deref, DerefMut},
     str::{FromStr, Utf8Error},
-    sync::Arc, time::Duration,
+    sync::Arc,
+    time::Duration,
 };
 
 use bytes::Buf;
@@ -19,7 +21,6 @@ use corro_types::{
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
-    sqlite::CrConn,
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
@@ -54,6 +55,7 @@ use sqlite3_parser::ast::{
     As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Literal,
     Name, OneSelect, ResultColumn, Select, SelectBody, SelectTable, Stmt, With,
 };
+use sqlite_pool::{Committable, InterruptibleStatement, InterruptibleTransaction};
 use sqlparser::ast::Statement as PgStatement;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
@@ -182,19 +184,25 @@ enum Prepared {
     },
 }
 
-enum Portal<'a> {
+enum Portal<'a, T>
+where
+    T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::Statement<'a>>,
+{
     Empty {
         stmt_name: CompactString,
     },
     Parsed {
         stmt_name: CompactString,
-        stmt: Statement<'a>,
+        stmt: InterruptibleStatement<T>,
         result_formats: Vec<FieldFormat>,
         cmd: ParsedCmd,
     },
 }
 
-impl<'a> Portal<'a> {
+impl<'a, T> Portal<'a, T>
+where
+    T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::Statement<'a>>,
+{
     fn stmt_name(&self) -> &str {
         match self {
             Portal::Empty { stmt_name } | Portal::Parsed { stmt_name, .. } => stmt_name.as_str(),
@@ -542,7 +550,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
     Ok((Some(TlsAcceptor::from(Arc::new(config))), ssl_required))
 }
 
-pub async fn start(
+pub async fn start<'conn>(
     agent: Agent,
     pg: PgConfig,
     mut tripwire: Tripwire,
@@ -550,6 +558,7 @@ pub async fn start(
     let server = TcpListener::bind(pg.bind_addr).await?;
     let (tls_acceptor, ssl_required) = setup_tls(pg).await?;
     let local_addr = server.local_addr()?;
+    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
 
     tokio::spawn(async move {
         loop {
@@ -565,7 +574,10 @@ pub async fn start(
                 conn.set_nodelay(true)?;
                 {
                     let sock = SockRef::from(&conn);
-                    let ka = TcpKeepalive::new().with_time(Duration::from_secs(10)).with_interval(Duration::from_secs(10)).with_retries(4);
+                    let ka = TcpKeepalive::new()
+                        .with_time(Duration::from_secs(10))
+                        .with_interval(Duration::from_secs(10))
+                        .with_retries(4);
                     sock.set_tcp_keepalive(&ka)?;
                 }
                 let is_sslrequest = peek_for_sslrequest(&mut conn).await?;
@@ -739,14 +751,11 @@ pub async fn start(
                 let res = tokio::task::spawn_blocking({
                     let back_tx = back_tx.clone();
                     move || {
-                        let conn = agent.pool().client_dedicated().unwrap();
+                        let cr_conn = agent.pool().client_dedicated().unwrap();
+                        let conn = InterruptibleTransaction::new(cr_conn, Some(tx_timeout), "pg");
                         trace!("opened connection");
 
-                        let int_handle = conn.get_interrupt_handle();
-                        tokio::spawn(async move {
-                            cancel.cancelled().await;
-                            int_handle.interrupt();
-                        });
+                        conn.interrupt_on_cancel(cancel);
 
                         conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
 
@@ -829,7 +838,7 @@ pub async fn start(
 
                         let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
 
-                        let mut portals: HashMap<CompactString, Portal> = HashMap::new();
+                        let mut portals: HashMap<CompactString, _> = HashMap::new();
 
                         let mut discard_until_sync = false;
 
@@ -1605,7 +1614,6 @@ pub async fn start(
                                     };
 
                                     if let Err(e) = session.handle_execute(
-                                        
                                         prepped,
                                         result_formats,
                                         cmd,
@@ -1623,7 +1631,6 @@ pub async fn start(
 
                                         send_ready(
                                             &mut session,
-                                            
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1671,7 +1678,6 @@ pub async fn start(
 
                                         send_ready(
                                             &mut session,
-                                            
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1688,7 +1694,6 @@ pub async fn start(
                                             })?;
                                             send_ready(
                                                 &mut session,
-                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;
@@ -1718,7 +1723,6 @@ pub async fn start(
                                             )?;
                                             send_ready(
                                                 &mut session,
-                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;
@@ -1920,13 +1924,13 @@ pub async fn start(
     Ok(PgServer { local_addr })
 }
 
-struct Session<'conn> {
+struct Session<'conn, T: Deref<Target = rusqlite::Connection> + Committable> {
     agent: Agent,
-    conn: &'conn CrConn,
+    conn: &'conn InterruptibleTransaction<T>,
     tx_state: TxState,
 }
 
-impl<'conn> Session<'conn> {
+impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Session<'conn, T> {
     fn handle_query(
         &mut self,
         cmd: &ParsedCmd,
@@ -2336,7 +2340,7 @@ impl<'conn> Session<'conn> {
     }
 }
 
-impl<'conn> Drop for Session<'conn> {
+impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Drop for Session<'conn, T> {
     fn drop(&mut self) {
         if !self.tx_state.is_ended() {
             let _permit = self.tx_state.end();
@@ -2349,8 +2353,8 @@ impl<'conn> Drop for Session<'conn> {
     }
 }
 
-fn send_ready(
-    session: &mut Session,
+fn send_ready<T: Deref<Target = rusqlite::Connection> + Committable>(
+    session: &mut Session<T>,
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
