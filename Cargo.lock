@@ -903,7 +903,6 @@ dependencies = [
  "rustls-pemfile",
  "socket2 0.5.5",
  "spawn",
- "sqlite-pool",
  "sqlite3-parser",
  "sqlparser",
  "tempfile",

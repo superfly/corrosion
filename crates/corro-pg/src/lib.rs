@@ -6,10 +6,8 @@ use std::{
     fmt,
     future::poll_fn,
     net::SocketAddr,
-    ops::{Deref, DerefMut},
     str::{FromStr, Utf8Error},
-    sync::Arc,
-    time::Duration,
+    sync::Arc, time::Duration,
 };
 
 use bytes::Buf;
@@ -21,6 +19,7 @@ use corro_types::{
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
+    sqlite::CrConn,
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
@@ -55,7 +54,6 @@ use sqlite3_parser::ast::{
     As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Literal,
     Name, OneSelect, ResultColumn, Select, SelectBody, SelectTable, Stmt, With,
 };
-use sqlite_pool::{Committable, InterruptibleStatement, InterruptibleTransaction};
 use sqlparser::ast::Statement as PgStatement;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
@@ -184,25 +182,19 @@ enum Prepared {
     },
 }
 
-enum Portal<'a, T>
-where
-    T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::Statement<'a>>,
-{
+enum Portal<'a> {
     Empty {
         stmt_name: CompactString,
     },
     Parsed {
         stmt_name: CompactString,
-        stmt: InterruptibleStatement<T>,
+        stmt: Statement<'a>,
         result_formats: Vec<FieldFormat>,
         cmd: ParsedCmd,
     },
 }
 
-impl<'a, T> Portal<'a, T>
-where
-    T: Deref<Target = rusqlite::Statement<'a>> + DerefMut<Target = rusqlite::Statement<'a>>,
-{
+impl<'a> Portal<'a> {
     fn stmt_name(&self) -> &str {
         match self {
             Portal::Empty { stmt_name } | Portal::Parsed { stmt_name, .. } => stmt_name.as_str(),
@@ -328,7 +320,7 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
                 break;
             }
             Err(e) => {
-                debug!("could not parse as sqlite: {e}");
+                debug!("could not parse statement ({sql:?}) as sqlite: {e}");
                 let stmts = sqlparser::parser::Parser::parse_sql(
                     &sqlparser::dialect::PostgreSqlDialect {},
                     normalized,
@@ -550,7 +542,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
     Ok((Some(TlsAcceptor::from(Arc::new(config))), ssl_required))
 }
 
-pub async fn start<'conn>(
+pub async fn start(
     agent: Agent,
     pg: PgConfig,
     mut tripwire: Tripwire,
@@ -558,7 +550,6 @@ pub async fn start<'conn>(
     let server = TcpListener::bind(pg.bind_addr).await?;
     let (tls_acceptor, ssl_required) = setup_tls(pg).await?;
     let local_addr = server.local_addr()?;
-    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
 
     tokio::spawn(async move {
         loop {
@@ -574,10 +565,7 @@ pub async fn start<'conn>(
                 conn.set_nodelay(true)?;
                 {
                     let sock = SockRef::from(&conn);
-                    let ka = TcpKeepalive::new()
-                        .with_time(Duration::from_secs(10))
-                        .with_interval(Duration::from_secs(10))
-                        .with_retries(4);
+                    let ka = TcpKeepalive::new().with_time(Duration::from_secs(10)).with_interval(Duration::from_secs(10)).with_retries(4);
                     sock.set_tcp_keepalive(&ka)?;
                 }
                 let is_sslrequest = peek_for_sslrequest(&mut conn).await?;
@@ -751,11 +739,14 @@ pub async fn start<'conn>(
                 let res = tokio::task::spawn_blocking({
                     let back_tx = back_tx.clone();
                     move || {
-                        let cr_conn = agent.pool().client_dedicated().unwrap();
-                        let conn = InterruptibleTransaction::new(cr_conn, Some(tx_timeout), "pg");
+                        let conn = agent.pool().client_dedicated().unwrap();
                         trace!("opened connection");
 
-                        conn.interrupt_on_cancel(cancel);
+                        let int_handle = conn.get_interrupt_handle();
+                        tokio::spawn(async move {
+                            cancel.cancelled().await;
+                            int_handle.interrupt();
+                        });
 
                         conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
 
@@ -838,7 +829,7 @@ pub async fn start<'conn>(
 
                         let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
 
-                        let mut portals: HashMap<CompactString, _> = HashMap::new();
+                        let mut portals: HashMap<CompactString, Portal> = HashMap::new();
 
                         let mut discard_until_sync = false;
 
@@ -1614,6 +1605,7 @@ pub async fn start<'conn>(
                                     };
 
                                     if let Err(e) = session.handle_execute(
+                                        
                                         prepped,
                                         result_formats,
                                         cmd,
@@ -1631,6 +1623,7 @@ pub async fn start<'conn>(
 
                                         send_ready(
                                             &mut session,
+                                            
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1678,6 +1671,7 @@ pub async fn start<'conn>(
 
                                         send_ready(
                                             &mut session,
+                                            
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1694,6 +1688,7 @@ pub async fn start<'conn>(
                                             })?;
                                             send_ready(
                                                 &mut session,
+                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;
@@ -1723,6 +1718,7 @@ pub async fn start<'conn>(
                                             )?;
                                             send_ready(
                                                 &mut session,
+                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;
@@ -1924,13 +1920,13 @@ pub async fn start<'conn>(
     Ok(PgServer { local_addr })
 }
 
-struct Session<'conn, T: Deref<Target = rusqlite::Connection> + Committable> {
+struct Session<'conn> {
     agent: Agent,
-    conn: &'conn InterruptibleTransaction<T>,
+    conn: &'conn CrConn,
     tx_state: TxState,
 }
 
-impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Session<'conn, T> {
+impl<'conn> Session<'conn> {
     fn handle_query(
         &mut self,
         cmd: &ParsedCmd,
@@ -2340,7 +2336,7 @@ impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Session<'conn
     }
 }
 
-impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Drop for Session<'conn, T> {
+impl<'conn> Drop for Session<'conn> {
     fn drop(&mut self) {
         if !self.tx_state.is_ended() {
             let _permit = self.tx_state.end();
@@ -2353,8 +2349,8 @@ impl<'conn, T: Deref<Target = rusqlite::Connection> + Committable> Drop for Sess
     }
 }
 
-fn send_ready<T: Deref<Target = rusqlite::Connection> + Committable>(
-    session: &mut Session<T>,
+fn send_ready(
+    session: &mut Session,
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
