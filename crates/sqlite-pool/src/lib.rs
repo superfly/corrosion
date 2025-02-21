@@ -222,11 +222,13 @@ where
     pub fn interrupt_on_cancel(&self, cancel: CancellationToken) {
         let interrupt_hdl = self.interrupt_hdl.clone();
         let source = self.source;
-        let current_sql = self.current_sql.clone();
+        // let current_sql = self.current_sql.clone();
         tokio::spawn(async move {
             cancel.cancelled().await;
-            let sql = current_sql.load();
-            warn!("interrupting sqlite connection - sql - {:?})", sql);
+            // let sql = current_sql.load();
+            // we have sensu checks makes flyd constantly connect to corrosion
+            // pg and this would spam the logs.
+            // warn!("interrupting sqlite connection - sql - {:?})", sql);
             interrupt_hdl.interrupt();
             counter!("corro.sqlite.interrupt", "source" => source, "reason" => "cancellation").increment(1);
         });
