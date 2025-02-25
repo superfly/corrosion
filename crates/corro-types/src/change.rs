@@ -1,7 +1,7 @@
 use std::{iter::Peekable, ops::RangeInclusive};
 
 pub use corro_api_types::{row_to_change, Change, SqliteValue};
-use corro_base_types::{CrsqlDbVersion, CrsqlSiteVersion};
+use corro_base_types::{CrsqlDbVersion};
 use rusqlite::{Connection, OptionalExtension};
 use tracing::trace;
 
@@ -123,7 +123,6 @@ where
 pub const MAX_CHANGES_BYTE_SIZE: usize = 8 * 1024;
 
 pub struct InsertChangesInfo {
-    pub version: CrsqlSiteVersion,
     pub db_version: CrsqlDbVersion,
     pub last_seq: CrsqlSeq,
     pub ts: Timestamp,
@@ -152,8 +151,8 @@ pub fn insert_local_changes(
             version: None,
         })?;
 
-    let version_max_seq: Option<(CrsqlSiteVersion, CrsqlSeq)> = tx
-        .prepare_cached("SELECT site_version, MAX(seq) FROM crsql_changes WHERE db_version = ? GROUP BY db_version;")
+    let version_max_seq: Option<(CrsqlDbVersion, CrsqlSeq)> = tx
+        .prepare_cached("SELECT db_version, MAX(seq) FROM crsql_changes WHERE db_version = ? GROUP BY db_version;")
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
@@ -168,23 +167,22 @@ pub fn insert_local_changes(
 
     match version_max_seq {
         None => Ok(None),
-        Some((version, last_seq)) => {
+        Some((db_version, last_seq)) => {
             trace!(
-                "found site_version {version} for db_version {db_version} (last seq: {last_seq})"
+                "found db_version {db_version} (last seq: {last_seq})"
             );
 
-            let versions = version..=version;
+            let db_versions = db_version..=db_version;
 
             let mut snap = book_writer.snapshot();
-            snap.insert_db(tx, [versions].into())
+            snap.insert_db(tx, [db_versions].into())
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
                     actor_id: Some(actor_id),
-                    version: Some(version),
+                    version: Some(db_version),
                 })?;
 
             Ok(Some(InsertChangesInfo {
-                version,
                 db_version,
                 last_seq,
                 ts,

@@ -12,7 +12,7 @@ use corro_types::{
         ColumnName, ExecResponse, ExecResult, QueryEvent, Statement, TableStatRequest,
         TableStatResponse,
     },
-    base::CrsqlSiteVersion,
+    base::CrsqlDbVersion,
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
@@ -38,7 +38,7 @@ pub mod update;
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     f: F,
-) -> Result<(T, Option<CrsqlSiteVersion>, Duration), ChangeError>
+) -> Result<(T, Option<CrsqlDbVersion>, Duration), ChangeError>
 where
     F: Fn(&Transaction) -> Result<T, ChangeError>,
 {
@@ -72,7 +72,7 @@ where
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
-            version: insert_info.as_ref().map(|info| info.version),
+            version: insert_info.as_ref().map(|info| info.db_version),
         })?;
 
         let elapsed = start.elapsed();
@@ -80,23 +80,22 @@ where
         match insert_info {
             None => Ok((ret, None, elapsed)),
             Some(InsertChangesInfo {
-                version,
                 db_version,
                 last_seq,
                 ts,
                 snap,
             }) => {
-                trace!("committed tx, version: {version}, db_version: {db_version}, last_seq: {last_seq:?}");
+                trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
                 book_writer.commit_snapshot(snap);
 
                 let agent = agent.clone();
 
                 spawn_counted(async move {
-                    broadcast_changes(agent, db_version, last_seq, version, ts).await
+                    broadcast_changes(agent, db_version, last_seq, ts).await
                 });
 
-                Ok::<_, ChangeError>((ret, Some(version), elapsed))
+                Ok::<_, ChangeError>((ret, Some(db_version), elapsed))
             }
         }
     })
@@ -605,7 +604,7 @@ mod tests {
     use bytes::Bytes;
     use corro_types::{
         api::RowId,
-        base::CrsqlSiteVersion,
+        base::CrsqlDbVersion,
         broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
         config::Config,
         schema::SqliteType,
@@ -685,7 +684,7 @@ mod tests {
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
                 changeset: Changeset::Full {
-                    version: CrsqlSiteVersion(1),
+                    version: CrsqlDbVersion(1),
                     ..
                 },
                 ..
@@ -694,7 +693,7 @@ mod tests {
 
         assert_eq!(
             agent.booked().read::<&str, _>("test", None).await.last(),
-            Some(CrsqlSiteVersion(1))
+            Some(CrsqlDbVersion(1))
         );
 
         println!("second req...");

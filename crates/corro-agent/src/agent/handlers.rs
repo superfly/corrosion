@@ -34,7 +34,7 @@ use corro_types::{
 
 use bytes::Bytes;
 use corro_types::agent::ChangeError;
-use corro_types::base::CrsqlSiteVersion;
+use corro_types::base::CrsqlDbVersion;
 use corro_types::broadcast::Timestamp;
 use foca::Notification;
 use indexmap::map::Entry;
@@ -507,141 +507,6 @@ async fn wal_checkpoint_over_threshold(
     Ok(should_truncate)
 }
 
-/// Handle incoming emptyset received during syncs
-///_
-#[allow(dead_code)]
-pub async fn handle_emptyset(
-    agent: Agent,
-    bookie: Bookie,
-    mut rx_emptysets: CorroReceiver<ChangeV1>,
-    mut tripwire: Tripwire,
-) {
-    type EmptyQueue = VecDeque<Vec<RangeInclusive<CrsqlSiteVersion>>>;
-    let mut buf: HashMap<ActorId, EmptyQueue> = HashMap::new();
-
-    let mut join_set: JoinSet<HashMap<ActorId, EmptyQueue>> = JoinSet::new();
-
-    loop {
-        tokio::select! {
-            res = join_set.join_next(), if !join_set.is_empty() => {
-                debug!("processed emptysets!");
-                if let Some(Ok(res)) = res {
-                    for (actor_id, mut changes) in res {
-                        if !changes.is_empty() {
-                            let curr = buf.entry(actor_id).or_default();
-                            changes.append(curr);
-                            *curr = changes;
-                        }
-                    }
-                }
-            },
-            maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
-                Some(change) => {
-                    if let Changeset::EmptySet { versions, .. } = change.changeset {
-                        buf.entry(change.actor_id).or_default().push_back(versions);
-                    } else {
-                        warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
-                    }
-                },
-                None => break,
-            },
-            _ = &mut tripwire => {
-                break;
-            }
-        }
-
-        if join_set.is_empty() && !buf.is_empty() {
-            let mut to_process = std::mem::take(&mut buf);
-            let agent = agent.clone();
-            let bookie = bookie.clone();
-            join_set.spawn(async move {
-                for (actor, changes) in &mut to_process {
-                    while !changes.is_empty() {
-                        let change = changes.pop_front().unwrap();
-
-                        match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await
-                        {
-                            Ok(()) => {}
-                            Err(e) => {
-                                warn!("encountered error when processing emptyset - {e}");
-                                changes.push_front(change);
-                                break;
-                            }
-                        }
-                    }
-                }
-                to_process
-            });
-        };
-    }
-
-    info!("shutting down handle empties loop");
-}
-
-#[allow(dead_code)]
-pub async fn process_emptyset(
-    agent: Agent,
-    bookie: Bookie,
-    actor_id: ActorId,
-    versions: &[RangeInclusive<CrsqlSiteVersion>],
-) -> Result<(), ChangeError> {
-    let version_iter = versions.chunks(100);
-
-    for chunk in version_iter {
-        let mut conn = agent.pool().write_low().await?;
-        debug!("processing emptyset from {:?}", actor_id);
-        let booked = {
-            bookie
-                .write(
-                    "process_emptyset(booked writer, updates timestamp)",
-                    actor_id.as_simple(),
-                )
-                .await
-                .ensure(actor_id)
-        };
-
-        let mut booked_write = booked
-            .write(
-                "process_emptyset(booked writer, updates timestamp)",
-                actor_id.as_simple(),
-            )
-            .await;
-
-        let mut snap = booked_write.snapshot();
-
-        debug!(self_actor_id = %agent.actor_id(), "processing emptyset changes, len: {}", versions.len());
-        block_in_place(|| {
-            let tx = conn
-                .immediate_transaction()
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: None,
-                    version: None,
-                })?;
-
-            snap.insert_db(&tx, RangeInclusiveSet::from_iter(chunk.iter().cloned()))
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: None,
-                    version: None,
-                })?;
-
-            tx.commit().map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: None,
-                version: None,
-            })?;
-
-            booked_write.commit_snapshot(snap);
-            counter!("corro.sync.empties.count", "actor" => format!("{}", actor_id.to_string()))
-                .increment(chunk.len() as u64);
-
-            Ok::<_, ChangeError>(())
-        })?;
-    }
-
-    Ok(())
-}
 
 /// Bundle incoming changes to optimise transaction sizes with SQLite
 ///
@@ -973,7 +838,6 @@ mod tests {
     use axum::{http::StatusCode, Extension, Json};
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{Change, ColumnName, TableName};
-    use corro_types::base::CrsqlSiteVersion;
     use corro_types::{base::CrsqlDbVersion, config::Config, pubsub::pack_columns};
     use rusqlite::Connection;
     use std::sync::Arc;
@@ -1052,7 +916,7 @@ mod tests {
                     ChangeV1 {
                         actor_id: other_actor,
                         changeset: Changeset::Full {
-                            version: CrsqlSiteVersion(i as u64),
+                            version: CrsqlDbVersion(i as u64),
                             changes: vec![crsql_row.clone()],
                             seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                             last_seq: CrsqlSeq(0),
@@ -1074,10 +938,10 @@ mod tests {
             .unwrap()
             .read::<&str, _>("test", None)
             .await;
-        assert!(booked.contains_all(CrsqlSiteVersion(6)..=CrsqlSiteVersion(10), None));
-        assert!(booked.contains_all(CrsqlSiteVersion(1)..=CrsqlSiteVersion(3), None));
-        assert!(!booked.contains_version(&CrsqlSiteVersion(5)));
-        assert!(!booked.contains_version(&CrsqlSiteVersion(4)));
+        assert!(booked.contains_all(CrsqlDbVersion(6)..=CrsqlDbVersion(10), None));
+        assert!(booked.contains_all(CrsqlDbVersion(1)..=CrsqlDbVersion(3), None));
+        assert!(!booked.contains_version(&CrsqlDbVersion(5)));
+        assert!(!booked.contains_version(&CrsqlDbVersion(4)));
 
         Ok(())
     }

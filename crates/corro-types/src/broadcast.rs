@@ -28,7 +28,7 @@ use uhlc::{ParseNTP64Error, NTP64};
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     agent::Agent,
-    base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
+    base::{CrsqlDbVersion, CrsqlSeq},
     change::{ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
     sqlite::SqlitePoolError,
@@ -122,7 +122,6 @@ pub struct ChangeV2 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable, Hash, Eq)]
 pub struct VersionKey {
     pub actor_id: ActorId,
-    pub site_version: CrsqlSiteVersion,
     pub db_version: CrsqlDbVersion,
 }
 
@@ -172,12 +171,12 @@ impl Deref for ChangeV1 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum Changeset {
     Empty {
-        versions: RangeInclusive<CrsqlSiteVersion>,
+        versions: RangeInclusive<CrsqlDbVersion>,
         #[speedy(default_on_eof)]
         ts: Option<Timestamp>,
     },
     Full {
-        version: CrsqlSiteVersion,
+        version: CrsqlDbVersion,
         changes: Vec<Change>,
         // cr-sqlite sequences contained in this changeset
         seqs: RangeInclusive<CrsqlSeq>,
@@ -186,7 +185,7 @@ pub enum Changeset {
         ts: Timestamp,
     },
     EmptySet {
-        versions: Vec<RangeInclusive<CrsqlSiteVersion>>,
+        versions: Vec<RangeInclusive<CrsqlDbVersion>>,
         ts: Timestamp,
     },
 }
@@ -204,7 +203,7 @@ impl From<ChangesetParts> for Changeset {
 }
 
 pub struct ChangesetParts {
-    pub version: CrsqlSiteVersion,
+    pub version: CrsqlDbVersion,
     pub changes: Vec<Change>,
     pub seqs: RangeInclusive<CrsqlSeq>,
     pub last_seq: CrsqlSeq,
@@ -212,12 +211,12 @@ pub struct ChangesetParts {
 }
 
 impl Changeset {
-    pub fn versions(&self) -> RangeInclusive<CrsqlSiteVersion> {
+    pub fn versions(&self) -> RangeInclusive<CrsqlDbVersion> {
         match self {
             Changeset::Empty { versions, .. } => versions.clone(),
             // todo: this returns dummy version because empty set has an array of versions.
             // probably shouldn't be doing this
-            Changeset::EmptySet { .. } => CrsqlSiteVersion(0)..=CrsqlSiteVersion(0),
+            Changeset::EmptySet { .. } => CrsqlDbVersion(0)..=CrsqlDbVersion(0),
             Changeset::Full { version, .. } => *version..=*version,
         }
     }
@@ -556,7 +555,6 @@ pub async fn broadcast_changes(
     agent: Agent,
     db_version: CrsqlDbVersion,
     last_seq: CrsqlSeq,
-    version: CrsqlSiteVersion,
     ts: Timestamp,
 ) -> Result<(), BroadcastError> {
     let actor_id = agent.actor_id();
@@ -567,7 +565,7 @@ pub async fn broadcast_changes(
         // TODO: make this more generic so both sync and local changes can use it.
         let mut prepped = conn.prepare_cached(
             r#"
-                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version
+                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                     FROM crsql_changes
                     WHERE db_version = ?
                     ORDER BY seq ASC
@@ -594,7 +592,7 @@ pub async fn broadcast_changes(
                                 ChangeV1 {
                                     actor_id,
                                     changeset: Changeset::Full {
-                                        version,
+                                        version: db_version,
                                         changes,
                                         seqs,
                                         last_seq,

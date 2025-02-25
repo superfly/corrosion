@@ -266,87 +266,87 @@ impl fmt::Display for CrsqlSeq {
     }
 }
 
-#[derive(
-    Copy, Clone, Debug, Default, Ord, PartialOrd, Eq, PartialEq, Hash, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct CrsqlSiteVersion(pub u64);
+// #[derive(
+//     Copy, Clone, Debug, Default, Ord, PartialOrd, Eq, PartialEq, Hash, Serialize, Deserialize,
+// )]
+// #[serde(transparent)]
+// pub struct CrsqlSiteVersion(pub u64);
 
-impl Step for CrsqlSiteVersion {
-    fn steps_between(start: &Self, end: &Self) -> Option<usize> {
-        u64::steps_between(&start.0, &end.0)
-    }
+// impl Step for CrsqlSiteVersion {
+//     fn steps_between(start: &Self, end: &Self) -> Option<usize> {
+//         u64::steps_between(&start.0, &end.0)
+//     }
 
-    fn forward_checked(start: Self, count: usize) -> Option<Self> {
-        u64::forward_checked(start.0, count).map(Self)
-    }
+//     fn forward_checked(start: Self, count: usize) -> Option<Self> {
+//         u64::forward_checked(start.0, count).map(Self)
+//     }
 
-    fn backward_checked(start: Self, count: usize) -> Option<Self> {
-        u64::backward_checked(start.0, count).map(Self)
-    }
-}
+//     fn backward_checked(start: Self, count: usize) -> Option<Self> {
+//         u64::backward_checked(start.0, count).map(Self)
+//     }
+// }
 
-impl StepLite for CrsqlSiteVersion {
-    fn add_one(&self) -> Self {
-        Self(self.0 + 1)
-    }
+// impl StepLite for CrsqlSiteVersion {
+//     fn add_one(&self) -> Self {
+//         Self(self.0 + 1)
+//     }
 
-    fn sub_one(&self) -> Self {
-        Self(self.0 - 1)
-    }
-}
+//     fn sub_one(&self) -> Self {
+//         Self(self.0 - 1)
+//     }
+// }
 
-impl ToSql for CrsqlSiteVersion {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        self.0.to_sql()
-    }
-}
+// impl ToSql for CrsqlSiteVersion {
+//     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+//         self.0.to_sql()
+//     }
+// }
 
-impl FromSql for CrsqlSiteVersion {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        u64::column_result(value).map(Self)
-    }
-}
+// impl FromSql for CrsqlSiteVersion {
+//     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+//         u64::column_result(value).map(Self)
+//     }
+// }
 
-impl Add<u64> for CrsqlSiteVersion {
-    type Output = Self;
+// impl Add<u64> for CrsqlSiteVersion {
+//     type Output = Self;
 
-    fn add(self, rhs: u64) -> Self::Output {
-        Self(self.0.add(rhs))
-    }
-}
+//     fn add(self, rhs: u64) -> Self::Output {
+//         Self(self.0.add(rhs))
+//     }
+// }
 
-impl Sub<u64> for CrsqlSiteVersion {
-    type Output = Self;
+// impl Sub<u64> for CrsqlSiteVersion {
+//     type Output = Self;
 
-    fn sub(self, rhs: u64) -> Self::Output {
-        Self(self.0.sub(rhs))
-    }
-}
+//     fn sub(self, rhs: u64) -> Self::Output {
+//         Self(self.0.sub(rhs))
+//     }
+// }
 
-impl<'a, C> Readable<'a, C> for CrsqlSiteVersion
-where
-    C: Context,
-{
-    fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, <C as Context>::Error> {
-        u64::read_from(reader).map(Self)
-    }
-}
+// impl<'a, C> Readable<'a, C> for CrsqlSiteVersion
+// where
+//     C: Context,
+// {
+//     fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, <C as Context>::Error> {
+//         u64::read_from(reader).map(Self)
+//     }
+// }
 
-impl<C> Writable<C> for CrsqlSiteVersion
-where
-    C: Context,
-{
-    fn write_to<T: ?Sized + speedy::Writer<C>>(
-        &self,
-        writer: &mut T,
-    ) -> Result<(), <C as Context>::Error> {
-        self.0.write_to(writer)
-    }
-}
+// impl<C> Writable<C> for CrsqlSiteVersion
+// where
+//     C: Context,
+// {
+//     fn write_to<T: ?Sized + speedy::Writer<C>>(
+//         &self,
+//         writer: &mut T,
+//     ) -> Result<(), <C as Context>::Error> {
+//         self.0.write_to(writer)
+//     }
+// }
 
-impl fmt::Display for CrsqlSiteVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
+// impl fmt::Display for CrsqlSiteVersion {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         self.0.fmt(f)
+//     }
+// }

@@ -884,7 +884,7 @@ mod tests {
     use corro_types::actor::ActorId;
     use corro_types::api::NotifyEvent;
     use corro_types::api::{Change, ColumnName, TableName};
-    use corro_types::base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion};
+    use corro_types::base::{CrsqlDbVersion, CrsqlSeq};
     use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
     use corro_types::pubsub::pack_columns;
     use corro_types::{
@@ -1473,7 +1473,7 @@ mod tests {
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: CrsqlSiteVersion(1),
+                version: CrsqlDbVersion(1),
                 changes: vec![change1, change2],
                 seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(1)),
                 last_seq: CrsqlSeq(1),
@@ -1560,7 +1560,7 @@ mod tests {
             cid: ColumnName("col1".into()),
             val: "two".into(),
             col_version: 1,
-            db_version: CrsqlDbVersion(1),
+            db_version: CrsqlDbVersion(2),
             seq: CrsqlSeq(0),
             site_id: actor_id.to_bytes(),
             cl: 1,
@@ -1569,7 +1569,7 @@ mod tests {
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: CrsqlSiteVersion(2),
+                version: CrsqlDbVersion(2),
                 changes: vec![change3],
                 seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(0)),
                 last_seq: CrsqlSeq(1),
@@ -1588,7 +1588,7 @@ mod tests {
         {
             let conn = ta1.agent.pool().read().await?;
             let end = conn.query_row(
-                "SELECT end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND site_version = ?",
+                "SELECT end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
                 (actor_id, 2),
                 |row| row.get::<_, CrsqlSeq>(0),
             )?;
@@ -1601,7 +1601,7 @@ mod tests {
             cid: ColumnName("col2".into()),
             val: "two line".into(),
             col_version: 1,
-            db_version: CrsqlDbVersion(1),
+            db_version: CrsqlDbVersion(2),
             seq: CrsqlSeq(1),
             site_id: actor_id.to_bytes(),
             cl: 1,
@@ -1610,7 +1610,7 @@ mod tests {
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: CrsqlSiteVersion(2),
+                version: CrsqlDbVersion(2),
                 changes: vec![change4],
                 seqs: RangeInclusive::new(CrsqlSeq(1), CrsqlSeq(1)),
                 last_seq: CrsqlSeq(1),

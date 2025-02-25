@@ -2658,7 +2658,7 @@ mod tests {
             }
 
             let changes = {
-                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version FROM crsql_changes WHERE db_version = ? ORDER BY seq ASC"#).unwrap();
+                let mut prepped = conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = ? ORDER BY seq ASC"#).unwrap();
                 let rows = prepped.query_map([1], row_to_change).unwrap();
 
                 let mut changes = vec![];
@@ -2676,7 +2676,7 @@ mod tests {
                 tx.prepare_cached(
                     r#"
                     INSERT INTO crsql_changes
-                        ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
+                        ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
                     VALUES
                         (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?,   1           )
                 "#,
@@ -2990,7 +2990,7 @@ mod tests {
     ) -> rusqlite::Result<()> {
         let mut candidates = MatchCandidates::new();
 
-        let mut prepped = state_conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl, site_version FROM crsql_changes WHERE site_id = COALESCE(?, crsql_site_id()) AND db_version = ? ORDER BY seq ASC"#)?;
+        let mut prepped = state_conn.prepare_cached(r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl  FROM crsql_changes WHERE site_id = COALESCE(?, crsql_site_id()) AND db_version = ? ORDER BY seq ASC"#)?;
         let rows = prepped
             .query_map(params![actor_id, db_version], row_to_change)
             .unwrap();

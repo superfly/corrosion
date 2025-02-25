@@ -13,7 +13,7 @@ use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, Bookie, LockKind, LockMeta, LockState},
     api::SqliteValueRef,
-    base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
+    base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{BiPayload, Changeset, FocaCmd, FocaInput},
     pubsub::unpack_columns,
     sqlite::SqlitePoolError,
@@ -147,7 +147,7 @@ pub enum ClusterCommand {
 pub enum ActorCommand {
     Version {
         actor_id: ActorId,
-        version: CrsqlSiteVersion,
+        version: CrsqlDbVersion,
     },
 }
 
@@ -405,7 +405,7 @@ async fn handle_conn(
                                 },
                                 None => {
                                     match agent.pool().read().await {
-                                        Ok(conn) => match conn.prepare_cached("SELECT db_version, MAX(seq) AS last_seq FROM crsql_changes WHERE site_id = :actor_id AND site_version = :version GROUP BY db_version") {
+                                        Ok(conn) => match conn.prepare_cached("SELECT db_version, MAX(seq) AS last_seq FROM crsql_changes WHERE site_id = :actor_id AND db_version = :version") {
                                             Ok(mut prepped) => match prepped.query_row(named_params! {":actor_id": actor_id, ":version": version}, |row| Ok((row.get::<_, Option<CrsqlDbVersion>>(0)?, row.get::<_, Option<CrsqlSeq>>(1)?))).optional() {
                                                 Ok(Some((Some(db_version), Some(last_seq)))) => {
                                                     Ok(serde_json::json!({"current": {"db_version": db_version, "last_seq": last_seq}}))

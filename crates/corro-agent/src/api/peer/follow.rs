@@ -5,7 +5,7 @@ use corro_types::{
     actor::ActorId,
     agent::Agent,
     api::row_to_change,
-    base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
+    base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{BiPayload, ChangeSource, ChangeV1, Changeset, Timestamp},
     change::ChunkedChanges,
     config::FollowBroadcast,
@@ -177,7 +177,7 @@ pub async fn serve_follow(
             for bk_res in bk_rows {
                 let (actor_id, version, db_version, last_seq, ts): (
                     ActorId,
-                    CrsqlSiteVersion,
+                    CrsqlDbVersion,
                     CrsqlDbVersion,
                     CrsqlSeq,
                     Timestamp,
@@ -198,7 +198,7 @@ pub async fn serve_follow(
                     tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
                         actor_id,
                         changeset: Changeset::Full {
-                            version,
+                            version: db_version,
                             changes,
                             seqs,
                             last_seq,

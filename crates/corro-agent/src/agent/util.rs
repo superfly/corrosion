@@ -18,7 +18,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
     api::TableName,
-    base::{CrsqlDbVersion, CrsqlSeq, CrsqlSiteVersion},
+    base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
     channel::CorroReceiver,
     config::AuthzConfig,
@@ -389,7 +389,7 @@ pub async fn sync_loop(agent: Agent, bookie: Bookie, transport: Transport, mut t
 pub async fn apply_fully_buffered_changes_loop(
     agent: Agent,
     bookie: Bookie,
-    mut rx_apply: CorroReceiver<(ActorId, CrsqlSiteVersion)>,
+    mut rx_apply: CorroReceiver<(ActorId, CrsqlDbVersion)>,
     mut tripwire: Tripwire,
 ) {
     info!("Starting apply_fully_buffered_changes loop");
@@ -417,7 +417,7 @@ pub async fn apply_fully_buffered_changes_loop(
 /// Compact the database by finding cleared versions
 pub async fn clear_buffered_meta_loop(
     agent: Agent,
-    mut rx_partials: CorroReceiver<(ActorId, RangeInclusive<CrsqlSiteVersion>)>,
+    mut rx_partials: CorroReceiver<(ActorId, RangeInclusive<CrsqlDbVersion>)>,
 ) {
     while let Some((actor_id, versions)) = rx_partials.recv().await {
         let pool = agent.pool().clone();
@@ -434,12 +434,12 @@ pub async fn clear_buffered_meta_loop(
 
                         // sub query required due to DELETE and LIMIT interaction
                         let seq_count = tx
-                            .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, site_version, start_seq) IN (SELECT site_id, site_version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND site_version >= ? AND site_version <= ? LIMIT ?)")?
+                            .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id,version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
                             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
                         // sub query required due to DELETE and LIMIT interaction
                         let buf_count = tx
-                            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, site_version, seq) IN (SELECT site_id, db_version, site_version, seq FROM __corro_buffered_changes WHERE site_id = ? AND site_version >= ? AND site_version <= ? LIMIT ?)")?
+                            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, seq) IN (SELECT site_id, db_version, seq FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ? LIMIT ?)")?
                             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
                         tx.commit()?;
@@ -530,7 +530,7 @@ pub async fn process_fully_buffered_changes(
     agent: &Agent,
     bookie: &Bookie,
     actor_id: ActorId,
-    version: CrsqlSiteVersion,
+    version: CrsqlDbVersion,
 ) -> Result<bool, ChangeError> {
     let db_version = {
         let mut conn = agent.pool().write_normal().await?;
@@ -579,7 +579,7 @@ pub async fn process_fully_buffered_changes(
 
             info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
-            let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND site_version = ?").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional().map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
+            let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND db_version = ?").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional().map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
 
             let start = Instant::now();
 
@@ -588,11 +588,11 @@ pub async fn process_fully_buffered_changes(
                 let count = tx
             .prepare_cached(
                 r#"
-                INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
-                    SELECT                 "table", pk, cid, val, col_version, ? as db_version, site_id, cl, seq, site_version
+                INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                    SELECT                 "table", pk, cid, val, col_version, ? as db_version, site_id, cl, seq
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
-                              AND site_version = ?
+                              AND db_version = ?
                             ORDER BY db_version ASC, seq ASC
                             "#,
             ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
@@ -977,10 +977,10 @@ pub fn process_incomplete_version(
         let new_insertion = sp.prepare_cached(
             r#"
                 INSERT INTO __corro_buffered_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
+                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, version)
                 VALUES
                     (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq, :version)
-                ON CONFLICT (site_id, db_version, site_version, seq)
+                ON CONFLICT (site_id, db_version, version, seq)
                     DO NOTHING
             "#,
         )?
@@ -1012,7 +1012,7 @@ pub fn process_incomplete_version(
         .prepare_cached(
             "
             DELETE FROM __corro_seq_bookkeeping
-                WHERE site_id = :actor_id AND site_version = :version AND
+                WHERE site_id = :actor_id AND version = :version AND
                 (
                     -- [:start]---[start_seq]---[:end]
                     ( start_seq BETWEEN :start AND :end ) OR
@@ -1062,7 +1062,7 @@ pub fn process_incomplete_version(
         sp
         .prepare_cached(
             "
-                INSERT INTO __corro_seq_bookkeeping (site_id, site_version, start_seq, end_seq, last_seq, ts)
+                INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
                     VALUES (?, ?, ?, ?, ?, ?);
             ",
         )?
@@ -1086,7 +1086,7 @@ pub fn process_complete_version(
     sp: &Savepoint,
     actor_id: ActorId,
     last_db_version: Option<CrsqlDbVersion>,
-    versions: RangeInclusive<CrsqlSiteVersion>,
+    versions: RangeInclusive<CrsqlDbVersion>,
     parts: ChangesetParts,
 ) -> rusqlite::Result<(KnownDbVersion, Changeset, BTreeMap<TableName, u64>)> {
     let ChangesetParts {
@@ -1099,15 +1099,18 @@ pub fn process_complete_version(
 
     let len = changes.len();
 
-    let max_db_version = changes
-        .iter()
-        .map(|c| c.db_version)
-        .max()
-        .unwrap_or(CrsqlDbVersion(0));
+    // we no longer need to do this, probably
+    // we take the db_version of the node we are getting
+    // probably need to do something on conflict
+    // let max_db_version = changes
+    //     .iter()
+    //     .map(|c| c.db_version)
+    //     .max()
+    //     .unwrap_or(CrsqlDbVersion(0));
 
-    debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
+    debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}");
 
-    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize);
+    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize, "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
 
     let mut impactful_changeset = vec![];
 
@@ -1116,9 +1119,9 @@ pub fn process_complete_version(
     let mut changes_per_table = BTreeMap::new();
 
     // we need to manually increment the next db version for each changeset
-    sp
-        .prepare_cached("SELECT CASE WHEN COALESCE(?, crsql_db_version()) >= ? THEN crsql_next_db_version(crsql_next_db_version() + 1) END")?
-        .query_row(params![last_db_version, max_db_version], |_row| Ok(()))?;
+    // sp
+    //     .prepare_cached("SELECT CASE WHEN COALESCE(?, crsql_db_version()) >= ? THEN crsql_next_db_version(crsql_next_db_version() + 1) END")?
+    //     .query_row(params![last_db_version, max_db_version], |_row| Ok(()))?;
 
     for change in changes {
         trace!("inserting change! {change:?}");
@@ -1126,9 +1129,9 @@ pub fn process_complete_version(
         sp.prepare_cached(
             r#"
                 INSERT INTO crsql_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, site_version)
+                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
                 VALUES
-                    (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?,   ?)
+                    (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?)
             "#,
         )?
         .execute(params![
@@ -1142,7 +1145,6 @@ pub fn process_complete_version(
             change.cl,
             // increment the seq by the start_seq or else we'll have multiple change rows with the same seq
             change.seq,
-            version,
         ])?;
         let rows_impacted: i64 = sp
             .prepare_cached("SELECT crsql_rows_impacted()")?
@@ -1197,14 +1199,14 @@ pub fn process_complete_version(
 pub fn check_buffered_meta_to_clear(
     conn: &Connection,
     actor_id: ActorId,
-    versions: RangeInclusive<CrsqlSiteVersion>,
+    versions: RangeInclusive<CrsqlDbVersion>,
 ) -> rusqlite::Result<bool> {
-    let should_clear: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND site_version >= ? AND site_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))?;
+    let should_clear: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))?;
     if should_clear {
         return Ok(true);
     }
 
-    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND site_version >= ? AND site_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
 }
 
 pub fn log_at_pow_10(msg: &str, count: &mut u64) {
