@@ -623,16 +623,16 @@ pub async fn process_fully_buffered_changes(
             debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
             let db_version = if rows_impacted > 0 {
-                let db_version: CrsqlDbVersion = tx
-                    .query_row("SELECT crsql_next_db_version()", [], |row| row.get(0))
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: Some(actor_id),
-                        version: Some(version),
-                    })?;
-                debug!("db version: {db_version}");
+                // let db_version: CrsqlDbVersion = tx
+                //     .query_row("SELECT crsql_next_db_version()", [], |row| row.get(0))
+                //     .map_err(|source| ChangeError::Rusqlite {
+                //         source,
+                //         actor_id: Some(actor_id),
+                //         version: Some(version),
+                //     })?;
+                // debug!("db version: {db_version}");
 
-                Some(db_version)
+                Some(version)
             } else {
                 None
             };
@@ -1174,12 +1174,13 @@ pub fn process_complete_version(
         )
     } else {
         // TODO: find a way to avoid this...
-        let db_version: CrsqlDbVersion = sp
-            .prepare_cached("SELECT crsql_next_db_version()")?
-            .query_row([], |row| row.get(0))?;
+        // let db_version: CrsqlDbVersion = sp
+        //     .prepare_cached("SELECT crsql_next_db_version()")?
+        //     .query_row([], |row| row.get(0))?;
+        // TODO: (we assume there's not conflict here)
         (
             KnownDbVersion::Current(CurrentVersion {
-                db_version,
+                db_version: version,
                 last_seq,
                 ts,
             }),

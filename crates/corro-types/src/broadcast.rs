@@ -22,7 +22,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::block_in_place,
 };
-use tracing::{error, trace};
+use tracing::{error, trace, debug};
 use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
@@ -568,6 +568,7 @@ pub async fn broadcast_changes(
                 SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                     FROM crsql_changes
                     WHERE db_version = ?
+                    AND site_id = crsql_site_id()
                     ORDER BY seq ASC
             "#,
         )?;
@@ -587,6 +588,7 @@ pub async fn broadcast_changes(
 
                     let tx_bcast = agent.tx_bcast().clone();
                     tokio::spawn(async move {
+                        debug!(?actor_id, ?db_version, "sending broadcast changeset {actor_id:} {db_version:?} {:?} {last_seq:?}", changes.len());
                         if let Err(e) = tx_bcast
                             .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
                                 ChangeV1 {
