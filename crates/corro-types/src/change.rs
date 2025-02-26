@@ -1,7 +1,7 @@
 use std::{iter::Peekable, ops::RangeInclusive};
 
 pub use corro_api_types::{row_to_change, Change, SqliteValue};
-use corro_base_types::{CrsqlDbVersion};
+use corro_base_types::CrsqlDbVersion;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::trace;
 
@@ -151,26 +151,26 @@ pub fn insert_local_changes(
             version: None,
         })?;
 
-    let version_max_seq: Option<(CrsqlDbVersion, CrsqlSeq)> = tx
-        .prepare_cached("SELECT db_version, MAX(seq) FROM crsql_changes WHERE db_version = ? GROUP BY db_version;")
+    let version_max_seq: Option<CrsqlSeq> = tx
+        .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?;")
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
             version: None,
         })?
-        .query_row([db_version], |row| Ok((row.get(0)?, row.get(1)?))).optional()
+        .query_row([db_version], |row| row.get(0))
+        .optional()
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
             version: None,
-        })?;
+        })?
+        .flatten();
 
     match version_max_seq {
         None => Ok(None),
-        Some((db_version, last_seq)) => {
-            trace!(
-                "found db_version {db_version} (last seq: {last_seq})"
-            );
+        Some(last_seq) => {
+            trace!("found db_version {db_version} (last seq: {last_seq})");
 
             let db_versions = db_version..=db_version;
 

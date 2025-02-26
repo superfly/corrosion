@@ -166,16 +166,8 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
     assert_eq!(
         bk,
         vec![
-            (
-                ta1.agent.actor_id(),
-                CrsqlDbVersion(1),
-                Some(CrsqlSeq(0))
-            ),
-            (
-                ta1.agent.actor_id(),
-                CrsqlDbVersion(2),
-                Some(CrsqlSeq(0))
-            )
+            (ta1.agent.actor_id(), CrsqlDbVersion(1), Some(CrsqlSeq(0))),
+            (ta1.agent.actor_id(), CrsqlDbVersion(2), Some(CrsqlSeq(0)))
         ]
     );
 
@@ -540,8 +532,7 @@ pub async fn configurable_stress_test(
 
                 for (actor_id, versions) in per_actor {
                     if let Some(versions_len) = actor_versions.get(&actor_id) {
-                        let full_range =
-                            CrsqlDbVersion(1)..=CrsqlDbVersion(*versions_len as u64);
+                        let full_range = CrsqlDbVersion(1)..=CrsqlDbVersion(*versions_len as u64);
                         let gaps = versions.gaps(&full_range);
                         for gap in gaps {
                             println!("{} db gap! {actor_id} => {gap:?}", ta.agent.actor_id());
@@ -734,7 +725,9 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         if count as usize != expected_count {
             let buf_count: Vec<(CrsqlDbVersion, u64)> = conn
-                .prepare("select db_version,count(*) from __corro_buffered_changes group by db_version")?
+                .prepare(
+                    "select db_version,count(*) from __corro_buffered_changes group by db_version",
+                )?
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             println!(
@@ -963,21 +956,13 @@ async fn process_failed_changes() -> eyre::Result<()> {
 
     for i in 1..=5_i64 {
         let pk = pack_columns(&[i.into()])?;
-        // let crsql_dbv = conn
-        //     .prepare_cached(
-        //         r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ?"#,
-        //     )?
-        //     .query_row([pk], |row| row.get::<_, CrsqlDbVersion>(0))?;
+        let crsql_dbv = conn
+            .prepare_cached(
+                r#"SELECT db_version, site_id from crsql_changes where "table" = "tests" and pk = ? and site_id = ?"#,
+            )?
+            .query_row((pk, ta2.agent.actor_id()), |row| row.get::<_, CrsqlDbVersion>(0))?;
 
-        // let booked_dbv = conn
-        //     .prepare_cached(
-        //         "SELECT db_version from crsql_changes where db_version = ? and site_id = ?",
-        //     )?
-        //     .query_row((i, ta2.agent.actor_id()), |row| {
-        //         row.get::<_, CrsqlDbVersion>(0)
-        //     })?;
-
-        // assert_eq!(crsql_dbv, booked_dbv);
+        assert_eq!(crsql_dbv, CrsqlDbVersion(i as u64));
 
         let conn = ta1.agent.pool().read().await?;
         conn.prepare_cached("SELECT text from tests where id = ?")?
@@ -1035,7 +1020,6 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        
         vec![CrsqlDbVersion(1)..=CrsqlDbVersion(5)],
         vec![],
         vec![],

@@ -2,9 +2,6 @@
 //!
 //! This module is _big_ and maybe should be split up further.
 
-use std::collections::HashMap;
-use std::ops::RangeInclusive;
-
 use std::{
     cmp,
     collections::VecDeque,
@@ -26,16 +23,14 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, FocaInput},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
     channel::CorroReceiver,
     members::MemberAddedResult,
     sync::generate_sync,
 };
 
 use bytes::Bytes;
-use corro_types::agent::ChangeError;
-use corro_types::base::CrsqlDbVersion;
-use corro_types::broadcast::Timestamp;
+use corro_types::broadcast::{Timestamp, Changeset};
 use foca::Notification;
 use indexmap::map::Entry;
 use indexmap::IndexMap;

@@ -183,8 +183,6 @@ pub async fn serve_follow(
                     Timestamp,
                 ) = bk_res?;
 
-                debug!("sending changes for: {actor_id} v{version} (db_version: {db_version})");
-
                 let mut prepped = conn.prepare_cached(
                     "SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = ? ORDER BY db_version ASC, seq ASC",
                 )?;

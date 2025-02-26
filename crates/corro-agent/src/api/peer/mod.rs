@@ -438,15 +438,6 @@ fn handle_need(
                     row_to_change,
                 )?;
 
-                // let rows2 = prepped.query_map(
-                //     named_params! {
-                //         ":actor_id": actor_id,
-                //         ":version": version
-                //     },
-                //     row_to_change,
-                // )?;
-
-                // let rows_len = rows.cloned().collect::<rusqlite::Result<Vec<_>>>()?.len();
                 debug!(%actor_id, ?version, ?last_seq, "not empty");
 
                 send_change_chunks(
@@ -749,8 +740,6 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
                     warn!(%actor_id, %version, "got an empty changes we should've had");
                     return Ok(());
                 } else {
-                    let changes_len = changes.len();
-                    debug!(%actor_id, %version, ?seqs, ?last_seq, ?changes_len,  "sending changeset");
                     sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                         actor_id,
                         changeset: Changeset::Full {

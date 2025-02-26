@@ -1,6 +1,7 @@
 use crate::agent::SplitPool;
 use crate::pubsub::{unpack_columns, MatchCandidates, MatchableChange, MatcherError};
 use crate::schema::Schema;
+use crate::actor::ActorId;
 use async_trait::async_trait;
 use corro_api_types::sqlite::ChangeType;
 use corro_api_types::{Change, ColumnName, NotifyEvent, SqliteValueRef, TableName};
@@ -450,6 +451,7 @@ pub fn match_changes_from_db_version<H>(
     manager: &impl Manager<H>,
     conn: &Connection,
     db_version: CrsqlDbVersion,
+    actor_id: ActorId,
 ) -> rusqlite::Result<()>
 where
     H: Handle + Send + 'static,
@@ -471,11 +473,12 @@ where
         SELECT "table", pk, cid, cl
             FROM crsql_changes
             WHERE db_version = ?
+              AND site_id = ?
             ORDER BY seq ASC
         "#,
         )?;
 
-        let rows = prepped.query_map([db_version], |row| {
+        let rows = prepped.query_map((db_version, actor_id), |row| {
             Ok((
                 row.get::<_, TableName>(0)?,
                 row.get::<_, Vec<u8>>(1)?,

@@ -22,7 +22,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::block_in_place,
 };
-use tracing::{error, trace, debug};
+use tracing::{error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
@@ -588,7 +588,6 @@ pub async fn broadcast_changes(
 
                     let tx_bcast = agent.tx_bcast().clone();
                     tokio::spawn(async move {
-                        debug!(?actor_id, ?db_version, "sending broadcast changeset {actor_id:} {db_version:?} {:?} {last_seq:?}", changes.len());
                         if let Err(e) = tx_bcast
                             .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
                                 ChangeV1 {

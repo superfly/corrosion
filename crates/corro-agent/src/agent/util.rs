@@ -49,7 +49,7 @@ use futures::FutureExt;
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{named_params, params, Connection, OptionalExtension, Savepoint, Transaction};
+use rusqlite::{named_params, params, Connection, Savepoint, Transaction};
 use spawn::spawn_counted;
 use tokio::{net::TcpListener, task::block_in_place};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
@@ -474,7 +474,6 @@ pub async fn clear_buffered_meta_loop(
 pub fn process_single_version(
     agent: &Agent,
     tx: &mut Transaction,
-    last_db_version: Option<CrsqlDbVersion>,
     change: ChangeV1,
 ) -> rusqlite::Result<(KnownDbVersion, Changeset)> {
     let ChangeV1 {
@@ -491,7 +490,6 @@ pub fn process_single_version(
             agent.clone(),
             &sp,
             actor_id,
-            last_db_version,
             versions,
             changeset
                 .into_parts()
@@ -577,26 +575,29 @@ pub async fn process_fully_buffered_changes(
                     version: Some(version),
                 })?;
 
-            info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
+            info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, db_version: {version}, last_seq: {last_seq})");
 
-            let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND db_version = ?").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional().map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
+            let rows_present: bool = tx.prepare_cached("SELECT EXISTS (SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version = ?)")
+                                    .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
+                                    .query_row(params![actor_id, version], |row| row.get(0))
+                                    .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
 
             let start = Instant::now();
 
-            if let Some(max_db_version) = max_db_version.flatten() {
+            if rows_present {
                 // insert all buffered changes into crsql_changes directly from the buffered changes table
                 let count = tx
             .prepare_cached(
                 r#"
                 INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
-                    SELECT                 "table", pk, cid, val, col_version, ? as db_version, site_id, cl, seq
+                    SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
                               AND db_version = ?
                             ORDER BY db_version ASC, seq ASC
                             "#,
             ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
-            .execute(params![max_db_version, actor_id.as_bytes(), version]).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
+            .execute(params![actor_id.as_bytes(), version]).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
                 info!(%actor_id, %version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
             } else {
                 info!(%actor_id, %version, "No buffered rows, skipped insertion into crsql_changes");
@@ -623,15 +624,6 @@ pub async fn process_fully_buffered_changes(
             debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
             let db_version = if rows_impacted > 0 {
-                // let db_version: CrsqlDbVersion = tx
-                //     .query_row("SELECT crsql_next_db_version()", [], |row| row.get(0))
-                //     .map_err(|source| ChangeError::Rusqlite {
-                //         source,
-                //         actor_id: Some(actor_id),
-                //         version: Some(version),
-                //     })?;
-                // debug!("db version: {db_version}");
-
                 Some(version)
             } else {
                 None
@@ -660,14 +652,16 @@ pub async fn process_fully_buffered_changes(
     if let Some(db_version) = db_version {
         let conn = agent.pool().read().await?;
         block_in_place(|| {
-            if let Err(e) = match_changes_from_db_version(agent.subs_manager(), &conn, db_version) {
+            if let Err(e) =
+                match_changes_from_db_version(agent.subs_manager(), &conn, db_version, actor_id)
+            {
                 error!(%db_version, "could not match changes for subs from db version: {e}");
             }
         });
 
         block_in_place(|| {
             if let Err(e) =
-                match_changes_from_db_version(agent.updates_manager(), &conn, db_version)
+                match_changes_from_db_version(agent.updates_manager(), &conn, db_version, actor_id)
             {
                 error!(%db_version, "could not match changes for updates from db version: {e}");
             }
@@ -740,7 +734,7 @@ pub async fn process_multiple_changes(
         let mut processed: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
 
-        let mut last_db_version = None;
+        // let mut last_db_version = None;
 
         let mut count = 0;
 
@@ -799,7 +793,7 @@ pub async fn process_multiple_changes(
                     }
 
                     let (known, changeset) = {
-                        match process_single_version(&agent, &mut tx, last_db_version, change) {
+                        match process_single_version(&agent, &mut tx, change) {
                             Ok(res) => {
                                 count += 1;
                                 res
@@ -813,7 +807,7 @@ pub async fn process_multiple_changes(
 
                     let versions = changeset.versions();
                     if let KnownDbVersion::Current(CurrentVersion { db_version, .. }) = &known {
-                        last_db_version = Some(*db_version);
+                        // last_db_version = Some(*db_version);
                         changesets.push((actor_id, changeset, *db_version, src));
                     }
 
@@ -974,28 +968,28 @@ pub fn process_incomplete_version(
         trace!("buffering change! {change:?}");
 
         // insert change, do nothing on conflict
-        let new_insertion = sp.prepare_cached(
-            r#"
+        let new_insertion = sp
+            .prepare_cached(
+                r#"
                 INSERT INTO __corro_buffered_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, version)
+                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
                 VALUES
-                    (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq, :version)
-                ON CONFLICT (site_id, db_version, version, seq)
+                    (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq)
+                ON CONFLICT (site_id, db_version, seq)
                     DO NOTHING
             "#,
-        )?
-        .execute(named_params!{
-            ":table": change.table.as_str(),
-            ":pk": change.pk,
-            ":cid": change.cid.as_str(),
-            ":val": &change.val,
-            ":col_version": change.col_version,
-            ":db_version": change.db_version,
-            ":site_id": &change.site_id,
-            ":cl": change.cl,
-            ":seq": change.seq,
-            ":version": version,
-        })?;
+            )?
+            .execute(named_params! {
+                ":table": change.table.as_str(),
+                ":pk": change.pk,
+                ":cid": change.cid.as_str(),
+                ":val": &change.val,
+                ":col_version": change.col_version,
+                ":db_version": change.db_version,
+                ":site_id": &change.site_id,
+                ":cl": change.cl,
+                ":seq": change.seq,
+            })?;
 
         inserted += new_insertion;
 
@@ -1080,12 +1074,11 @@ pub fn process_incomplete_version(
     }))
 }
 
-#[tracing::instrument(skip(agent, sp, last_db_version, parts), err)]
+#[tracing::instrument(skip(agent, sp, parts), err)]
 pub fn process_complete_version(
     agent: Agent,
     sp: &Savepoint,
     actor_id: ActorId,
-    last_db_version: Option<CrsqlDbVersion>,
     versions: RangeInclusive<CrsqlDbVersion>,
     parts: ChangesetParts,
 ) -> rusqlite::Result<(KnownDbVersion, Changeset, BTreeMap<TableName, u64>)> {

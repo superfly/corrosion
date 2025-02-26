@@ -269,7 +269,7 @@ pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result
         Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_ts_index_bookkeeping_table),
         Box::new(create_sync_state(clock)),
-        // Box::new(use_db_version),
+        Box::new(use_db_version),
     ];
 
     crate::sqlite::migrate(conn, migrations)
@@ -278,10 +278,29 @@ pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result
 fn use_db_version(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         // Drop db_version instead?
-        "
-        ALTER TABLE __corro_buffered_changes RENAME COLUMN version TO db_version;
-        ALTER TABLE __corro_seq_bookkeeping RENAME COLUMN version TO db_version;
-    ",
+        r#"
+            CREATE TABLE __corro_buffered_changes_new (
+                "table" TEXT NOT NULL,
+                pk BLOB NOT NULL,
+                cid TEXT NOT NULL,
+                val ANY, -- shouldn't matter I don't think
+                col_version INTEGER NOT NULL,
+                db_version INTEGER NOT NULL,
+                site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
+                seq INTEGER NOT NULL,
+                cl INTEGER NOT NULL, -- causal length
+
+                PRIMARY KEY (site_id, db_version, seq)
+            ) WITHOUT ROWID;
+
+            INSERT INTO __corro_buffered_changes_new SELECT "table", pk, cid, val, col_version, db_version, site_id, seq, cl FROM __corro_buffered_changes;
+
+            ALTER TABLE __corro_buffered_changes RENAME TO __corro_buffered_changes_old;
+            ALTER TABLE __corro_buffered_changes_new RENAME TO __corro_buffered_changes;
+
+            DROP TABLE __corro_buffered_changes_old;
+
+        "#,
     )
 }
 
@@ -1382,7 +1401,7 @@ impl BookedVersions {
 
         {
             // fetch known partial sequences
-            let mut prepped: rusqlite::CachedStatement<'_> = conn.prepare_cached(
+            let mut prepped = conn.prepare_cached(
             "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
             )?;
             let mut rows = prepped.query([actor_id])?;
