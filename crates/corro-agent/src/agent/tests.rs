@@ -958,7 +958,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
         let pk = pack_columns(&[i.into()])?;
         let crsql_dbv = conn
             .prepare_cached(
-                r#"SELECT db_version, site_id from crsql_changes where "table" = "tests" and pk = ? and site_id = ?"#,
+                r#"SELECT db_version from crsql_changes where "table" = "tests" and pk = ? and site_id = ?"#,
             )?
             .query_row((pk, ta2.agent.actor_id()), |row| row.get::<_, CrsqlDbVersion>(0))?;
 
