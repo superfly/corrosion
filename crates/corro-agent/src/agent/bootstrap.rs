@@ -1,14 +1,14 @@
 use crate::agent::RANDOM_NODES_CHOICES;
 use corro_types::{agent::SplitPool, config::DEFAULT_GOSSIP_PORT};
 
+use hickory_resolver::{
+    error::ResolveErrorKind,
+    proto::rr::{RData, RecordType},
+};
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use std::{collections::HashSet, net::SocketAddr};
 use tokio::task::block_in_place;
 use tracing::{debug, error, warn};
-use trust_dns_resolver::{
-    error::ResolveErrorKind,
-    proto::rr::{RData, RecordType},
-};
 
 /// Apply the user-provided set of bootstrap nodes
 pub async fn generate_bootstrap(
@@ -59,8 +59,8 @@ async fn resolve_bootstrap(
     bootstrap: &[String],
     our_addr: SocketAddr,
 ) -> eyre::Result<HashSet<SocketAddr>> {
-    use trust_dns_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-    use trust_dns_resolver::{AsyncResolver, TokioAsyncResolver};
+    use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
+    use hickory_resolver::{AsyncResolver, TokioAsyncResolver};
 
     let mut addrs = HashSet::new();
 
@@ -92,7 +92,7 @@ async fn resolve_bootstrap(
                         NameServerConfigGroup::from_ips_clear(&[ip], port, true),
                     ),
                     ResolverOpts::default(),
-                )?);
+                ));
                 debug!("using resolver: {dns_server}");
             }
             if let Some(hostname) = host_port.next() {
@@ -117,8 +117,8 @@ async fn resolve_bootstrap(
                             .and_then(|p| p.parse().ok())
                             .unwrap_or(DEFAULT_GOSSIP_PORT);
                         for addr in response.iter().filter_map(|rdata| match rdata {
-                            RData::A(ip) => Some(SocketAddr::from((*ip, port))),
-                            RData::AAAA(ip) => Some(SocketAddr::from((*ip, port))),
+                            RData::A(ip) => Some(SocketAddr::from((ip.0, port))),
+                            RData::AAAA(ip) => Some(SocketAddr::from((ip.0, port))),
                             _ => None,
                         }) {
                             match (our_addr, addr) {

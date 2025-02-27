@@ -18,6 +18,7 @@ use corro_types::{
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
+use metrics::histogram;
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use spawn::spawn_counted;
 use tokio::{
@@ -76,6 +77,7 @@ where
         })?;
 
         let elapsed = start.elapsed();
+        histogram!("corro.agent.changes.processing.time.seconds", "source" => "local").record(start.elapsed());
 
         match insert_info {
             None => Ok((ret, None, elapsed)),
@@ -201,7 +203,7 @@ pub async fn api_v1_transactions(
         axum::Json(ExecResponse {
             results,
             time: elapsed.as_secs_f64(),
-            version,
+            version: version.map(Into::into),
         }),
     )
 }
@@ -447,7 +449,9 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
     let partial_schema = parse_sql(&new_sql)?;
 
+    info!("getting write connection to update schema");
     let mut conn = agent.pool().write_priority().await?;
+    info!("got write connection to update schema");
 
     // hold onto this lock so nothing else makes changes
     let mut schema_write = agent.schema().write();

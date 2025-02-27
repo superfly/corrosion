@@ -758,6 +758,7 @@ pub async fn process_multiple_changes(
     counter!("corro.agent.changes.processing.started").increment(changes.len() as u64);
     debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
+    const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(5);
     let mut seen = HashSet::new();
     let mut unknown_changes: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for (change, src, queued_at) in changes {
@@ -794,6 +795,10 @@ pub async fn process_multiple_changes(
             .or_default()
             .push((change, src));
     }
+    let elapsed = start.elapsed();
+    if elapsed >= PROCESSING_WARN_THRESHOLD {
+        warn!("process_multiple_changes: removing duplicates took too long - {elapsed:?}");
+    }
 
     let mut conn = agent.pool().write_normal().await?;
 
@@ -814,6 +819,7 @@ pub async fn process_multiple_changes(
 
         // let mut writers: BTreeMap<ActorId, _> = Default::default();
 
+        let sub_start = Instant::now();
         for (actor_id, changes) in unknown_changes {
             let booked = {
                 bookie
@@ -899,9 +905,15 @@ pub async fn process_multiple_changes(
             // }
         }
 
+        let elapsed = sub_start.elapsed();
+        if elapsed >= PROCESSING_WARN_THRESHOLD {
+            warn!("process_multiple_changes:: process_single_version took too long - {elapsed:?}");
+        }
+
         let mut count = 0;
         let mut snapshots = BTreeMap::new();
 
+        let sub_start = Instant::now();
         for (actor_id, knowns) in knowns.iter_mut() {
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} knowns", knowns.len());
 
@@ -1016,11 +1028,21 @@ pub async fn process_multiple_changes(
             std::mem::forget(snap);
         }
 
+        let elapsed = sub_start.elapsed();
+        if elapsed >= PROCESSING_WARN_THRESHOLD {
+            warn!("process_multiple_changes: processing bookkeeping took too long - {elapsed:?}");
+        }
+
+        let sub_start = Instant::now();
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: None,
             version: None,
         })?;
+        let elapsed = sub_start.elapsed();
+        if elapsed >= PROCESSING_WARN_THRESHOLD {
+            warn!("process_multiple_changes: commiting transaction took too long - {elapsed:?}");
+        }
 
         if let Some(ts) = last_cleared {
             let mut booked_writer = agent
@@ -1038,6 +1060,7 @@ pub async fn process_multiple_changes(
 
         debug!("committed {count} changes in {:?}", start.elapsed());
 
+        let sub_start = Instant::now();
         for (actor_id, knowns) in knowns {
             let booked = {
                 bookie
@@ -1080,6 +1103,11 @@ pub async fn process_multiple_changes(
             }
         }
 
+        let elapsed = sub_start.elapsed();
+        if elapsed >= PROCESSING_WARN_THRESHOLD {
+            warn!("process_multiple_changes: commiting snapshots took too long - {elapsed:?}");
+        }
+
         Ok::<_, ChangeError>(changesets)
     })?;
 
@@ -1091,7 +1119,7 @@ pub async fn process_multiple_changes(
         match_changes(agent.updates_manager(), changeset.changes(), db_version);
     }
 
-    histogram!("corro.agent.changes.processing.time.seconds").record(start.elapsed());
+    histogram!("corro.agent.changes.processing.time.seconds", "source" => "remote").record(start.elapsed());
     histogram!("corro.agent.changes.processing.chunk_size").record(change_chunk_size as f64);
 
     Ok(())

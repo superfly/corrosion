@@ -17,6 +17,7 @@ eyre = { workspace = true }
 foca = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
+hickory-resolver = { workspace = true }
 hyper = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
@@ -50,7 +51,6 @@ tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tripwire = { path = "../tripwire" }
-trust-dns-resolver = { workspace = true }
 uhlc = { workspace = true }
 uuid = { workspace = true }
 corro-pg = { path = "../corro-pg" }

@@ -13,6 +13,41 @@ use crate::actor::ActorId;
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
 
+
+const fn default_apply_queue() -> usize {
+    50
+}
+
+const fn default_wal_threshold() -> usize {
+    10
+}
+
+const fn default_processing_queue() -> usize {
+    20000
+}
+
+/// Used for the apply channel
+const fn default_huge_channel() -> usize {
+    2048
+}
+
+//
+const fn default_big_channel() -> usize {
+    1024
+}
+
+const fn default_mid_channel() -> usize {
+    512
+}
+
+const fn default_small_channel() -> usize {
+    256
+}
+
+const fn default_apply_timeout() -> usize {
+    10
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub db: DbConfig,
@@ -135,6 +170,17 @@ pub struct ApiConfig {
 pub struct PgConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
+    pub tls: Option<PgTlsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PgTlsConfig {
+    pub cert_file: Utf8PathBuf,
+    pub key_file: Utf8PathBuf,
+    #[serde(default)]
+    pub ca_file: Option<Utf8PathBuf>,
+    #[serde(default)]
+    pub verify_client: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

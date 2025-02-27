@@ -10,8 +10,6 @@ use crate::{
 
 /// Configuration object.
 #[derive(Clone, Debug, Default)]
-#[cfg_attr(feature = "serde", derive(serde_1::Deserialize, serde_1::Serialize))]
-#[cfg_attr(feature = "serde", serde(crate = "serde_1"))]
 pub struct Config {
     /// Path to SQLite database file.
     pub path: PathBuf,

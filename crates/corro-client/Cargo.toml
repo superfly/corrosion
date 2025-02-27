@@ -11,6 +11,7 @@ license = "MIT"
 bytes = { workspace = true }
 corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
 futures = { workspace = true }
+hickory-resolver = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
 pin-project-lite = { workspace = true }
@@ -22,6 +23,5 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 sqlite-pool = { path = "../sqlite-pool" }
 serde = { workspace = true }
-trust-dns-resolver = { workspace = true }
 
 [features]
