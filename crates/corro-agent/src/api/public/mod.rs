@@ -91,9 +91,9 @@ where
 
                 let agent = agent.clone();
 
-                spawn_counted(async move {
-                    broadcast_changes(agent, db_version, last_seq, ts).await
-                });
+                spawn_counted(
+                    async move { broadcast_changes(agent, db_version, last_seq, ts).await },
+                );
 
                 Ok::<_, ChangeError>((ret, Some(db_version), elapsed))
             }
@@ -157,24 +157,26 @@ pub async fn api_v1_transactions(
             .iter()
             .map(|stmt| {
                 let start = Instant::now();
-                let res = execute_statement(tx, stmt);
+                let res = execute_statement(tx, stmt).map_err(|e| ChangeError::Rusqlite {
+                    source: e,
+                    actor_id: None,
+                    version: None,
+                });
 
                 match res {
                     Ok(rows_affected) => {
                         total_rows_affected += rows_affected;
-                        ExecResult::Execute {
+                        Ok(ExecResult::Execute {
                             rows_affected,
                             time: start.elapsed().as_secs_f64(),
-                        }
+                        })
                     }
-                    Err(e) => ExecResult::Error {
-                        error: e.to_string(),
-                    },
+                    Err(e) => Err(e),
                 }
             })
-            .collect::<Vec<ExecResult>>();
+            .collect::<Result<Vec<ExecResult>, ChangeError>>();
 
-        Ok(results)
+        results
     })
     .await;
 

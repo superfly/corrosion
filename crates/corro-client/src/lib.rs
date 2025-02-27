@@ -267,13 +267,26 @@ impl CorrosionApiClient {
 
         let res = self.api_client.request(req).await?;
 
-        if !res.status().is_success() {
-            return Err(Error::UnexpectedStatusCode(res.status()));
+        let status = res.status();
+        let bytes = hyper::body::to_bytes(res.into_body()).await?;
+        let body: ExecResponse = serde_json::from_slice(&bytes)?;
+
+        if !status.is_success() {
+            let err = body.results.iter().find_map(|r| {
+                if let ExecResult::Error { error } = r {
+                    Some(error.to_string())
+                } else {
+                    None
+                }
+            });
+            if let Some(err) = err {
+                return Err(Error::ResponseError(err));
+            }
+
+            return Err(Error::UnexpectedStatusCode(status));
         }
 
-        let bytes = hyper::body::to_bytes(res.into_body()).await?;
-
-        Ok(serde_json::from_slice(&bytes)?)
+        Ok(body)
     }
 
     pub async fn schema(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
