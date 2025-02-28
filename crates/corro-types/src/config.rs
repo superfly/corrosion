@@ -337,39 +337,6 @@ impl Config {
     }
 }
 
-const fn default_apply_queue() -> usize {
-    100
-}
-
-const fn default_wal_threshold() -> usize {
-    10
-}
-
-const fn default_processing_queue() -> usize {
-    20000
-}
-
-/// Used for the apply channel
-const fn default_huge_channel() -> usize {
-    2048
-}
-
-//
-const fn default_big_channel() -> usize {
-    1024
-}
-
-const fn default_mid_channel() -> usize {
-    512
-}
-
-const fn default_small_channel() -> usize {
-    256
-}
-
-const fn default_apply_timeout() -> usize {
-    50
-}
 
 #[derive(Debug, Default)]
 pub struct ConfigBuilder {

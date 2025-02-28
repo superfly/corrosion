@@ -4,7 +4,7 @@ use bytes::{BufMut, BytesMut};
 use corro_types::{
     actor::ActorId,
     agent::Agent,
-    api::row_to_change,
+    change::row_to_change,
     base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{BiPayload, ChangeSource, ChangeV1, Changeset, Timestamp},
     change::ChunkedChanges,
@@ -159,7 +159,7 @@ pub async fn serve_follow(
                 ("", vec![&last_db_version])
             };
 
-            let mut bk_prepped = conn.prepare_cached(&format!("SELECT actor_id, start_version, db_version, last_seq, ts FROM __corro_bookkeeping WHERE db_version IS NOT NULL AND db_version > ? {extra_where_clause} ORDER BY db_version ASC"))?;
+            let mut bk_prepped = conn.prepare_cached(&format!("SELECT actor_id, start_version, end_version, db_version, last_seq, ts FROM __corro_bookkeeping WHERE db_version IS NOT NULL AND db_version > ? {extra_where_clause} ORDER BY db_version ASC"))?;
 
             let map = |row: &Row| {
                 Ok((
@@ -168,6 +168,7 @@ pub async fn serve_follow(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             };
 
@@ -175,15 +176,29 @@ pub async fn serve_follow(
             let bk_rows = bk_prepped.query_map(params_from_iter(query_params), map)?;
 
             for bk_res in bk_rows {
-                let (actor_id, version, db_version, last_seq, ts): (
+                let (actor_id, version, end_version, db_version, last_seq, ts): (
                     ActorId,
                     Version,
+                    Option<Version>,
                     CrsqlDbVersion,
                     CrsqlSeq,
                     Timestamp,
                 ) = bk_res?;
 
                 debug!("sending changes for: {actor_id} v{version} (db_version: {db_version})");
+
+                if let Some(end_version) = end_version {
+                    tx.blocking_send(FollowMessage::V1(FollowMessageV1::Change(ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Empty {
+                            versions: version..=end_version,
+                            ts: Some(ts),
+                        },
+                    })))
+                    .map_err(|_| FollowError::ChannelClosed)?;
+
+                    continue;
+                }
 
                 let mut prepped = conn.prepare_cached(
                     "SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl FROM crsql_changes WHERE db_version = ? ORDER BY db_version ASC, seq ASC",
