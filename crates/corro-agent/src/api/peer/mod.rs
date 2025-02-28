@@ -466,7 +466,7 @@ fn handle_need(
                                 SELECT 1
                                 FROM __corro_buffered_changes
                                     WHERE site_id = :actor_id
-                                      AND db_version = :version
+                                      AND version = :version
                             ) AS buffered",
                         )?
                         .query_row(
@@ -499,7 +499,7 @@ fn handle_need(
                                 SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                                     FROM __corro_buffered_changes
                                     WHERE site_id = :actor_id
-                                        AND db_version = :version
+                                        AND version = :version
                                         AND seq BETWEEN :start_seq AND :end_seq
                                     ORDER BY seq ASC
                             "#,
@@ -602,7 +602,7 @@ fn handle_need(
                                 SELECT 1
                                 FROM __corro_buffered_changes
                                     WHERE site_id = :actor_id
-                                      AND db_version = :version
+                                      AND version = :version
                             ) AS buffered",
                         )?
                         .query_row(
@@ -663,7 +663,7 @@ fn handle_need(
                                     SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                                         FROM __corro_buffered_changes
                                         WHERE site_id = :actor_id
-                                            AND db_version = :version
+                                            AND version = :version
                                             AND seq BETWEEN :start_seq AND :end_seq
                                         ORDER BY seq ASC
                                 "#,

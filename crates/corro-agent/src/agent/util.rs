@@ -56,6 +56,7 @@ use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+use rusqlite::OptionalExtension;
 
 use super::BcastCache;
 
@@ -439,7 +440,7 @@ pub async fn clear_buffered_meta_loop(
 
                         // sub query required due to DELETE and LIMIT interaction
                         let buf_count = tx
-                            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, seq) IN (SELECT site_id, db_version, seq FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ? LIMIT ?)")?
+                            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
                             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
                         tx.commit()?;
@@ -577,14 +578,16 @@ pub async fn process_fully_buffered_changes(
 
             info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, db_version: {version}, last_seq: {last_seq})");
 
-            let rows_present: bool = tx.prepare_cached("SELECT EXISTS (SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version = ?)")
-                                    .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
-                                    .query_row(params![actor_id, version], |row| row.get(0))
-                                    .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
+            let max_db_version: Option<Option<CrsqlDbVersion>> = tx.prepare_cached("SELECT MAX(db_version) FROM __corro_buffered_changes WHERE site_id = ? AND version = ?").map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?.query_row(params![actor_id.as_bytes(), version], |row| row.get(0)).optional().map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
+
+            // let rows_present: bool = tx.prepare_cached("SELECT EXISTS (SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version = ?)")
+            //                         .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
+            //                         .query_row(params![actor_id, version], |row| row.get(0))
+            //                         .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
 
             let start = Instant::now();
 
-            if rows_present {
+            if let Some(max_db_version) = max_db_version.flatten() {
                 // insert all buffered changes into crsql_changes directly from the buffered changes table
                 let count = tx
             .prepare_cached(
@@ -593,7 +596,7 @@ pub async fn process_fully_buffered_changes(
                     SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq
                         FROM __corro_buffered_changes
                             WHERE site_id = ?
-                              AND db_version = ?
+                              AND version = ?
                             ORDER BY db_version ASC, seq ASC
                             "#,
             ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
@@ -645,7 +648,7 @@ pub async fn process_fully_buffered_changes(
 
             bookedw.commit_snapshot(snap);
 
-            Ok::<_, ChangeError>(db_version)
+            Ok::<_, ChangeError>(max_db_version.flatten())
         })
     }?;
 
@@ -972,10 +975,10 @@ pub fn process_incomplete_version(
             .prepare_cached(
                 r#"
                 INSERT INTO __corro_buffered_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, version)
                 VALUES
-                    (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq)
-                ON CONFLICT (site_id, db_version, seq)
+                    (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq, :version)
+                ON CONFLICT (site_id, db_version, version, seq)
                     DO NOTHING
             "#,
             )?
@@ -989,6 +992,7 @@ pub fn process_incomplete_version(
                 ":site_id": &change.site_id,
                 ":cl": change.cl,
                 ":seq": change.seq,
+                ":version": version,
             })?;
 
         inserted += new_insertion;

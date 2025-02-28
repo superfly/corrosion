@@ -269,40 +269,42 @@ pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result
         Box::new(create_impacted_versions as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(create_ts_index_bookkeeping_table),
         Box::new(create_sync_state(clock)),
-        Box::new(use_db_version),
+        // Box::new(use_db_version),
     ];
 
     crate::sqlite::migrate(conn, migrations)
 }
 
-fn use_db_version(tx: &Transaction) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        // Drop db_version instead?
-        r#"
-            CREATE TABLE __corro_buffered_changes_new (
-                "table" TEXT NOT NULL,
-                pk BLOB NOT NULL,
-                cid TEXT NOT NULL,
-                val ANY, -- shouldn't matter I don't think
-                col_version INTEGER NOT NULL,
-                db_version INTEGER NOT NULL,
-                site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
-                seq INTEGER NOT NULL,
-                cl INTEGER NOT NULL, -- causal length
+// fn use_db_version(tx: &Transaction) -> rusqlite::Result<()> {
+//     tx.execute_batch(
+//         // Drop db_version instead?
+//         r#"
+//             CREATE TABLE __corro_buffered_changes_new (
+//                 "table" TEXT NOT NULL,
+//                 pk BLOB NOT NULL,
+//                 cid TEXT NOT NULL,
+//                 val ANY, -- shouldn't matter I don't think
+//                 col_version INTEGER NOT NULL,
+//                 db_version INTEGER NOT NULL,
+//                 site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
+//                 seq INTEGER NOT NULL,
+//                 cl INTEGER NOT NULL, -- causal length
 
-                PRIMARY KEY (site_id, db_version, seq)
-            ) WITHOUT ROWID;
+//                 PRIMARY KEY (site_id, db_version, seq)
+//             ) WITHOUT ROWID;
 
-            INSERT INTO __corro_buffered_changes_new SELECT "table", pk, cid, val, col_version, db_version, site_id, seq, cl FROM __corro_buffered_changes;
+//             INSERT INTO __corro_buffered_changes_new SELECT "table", pk, cid, val, col_version, db_version, site_id, seq, cl FROM __corro_buffered_changes;
 
-            ALTER TABLE __corro_buffered_changes RENAME TO __corro_buffered_changes_old;
-            ALTER TABLE __corro_buffered_changes_new RENAME TO __corro_buffered_changes;
+//             ALTER TABLE __corro_buffered_changes RENAME TO __corro_buffered_changes_old;
+//             ALTER TABLE __corro_buffered_changes_new RENAME TO __corro_buffered_changes;
 
-            DROP TABLE __corro_buffered_changes_old;
+//             DROP TABLE __corro_buffered_changes_old;
 
-        "#,
-    )
-}
+//         "#,
+//     )
+
+//     tx.execute_batch("ALTER TABLE __corro_seq_bookkeeping ADD COLUMN db_version INTEGER")
+// }
 
 fn create_impacted_versions(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(

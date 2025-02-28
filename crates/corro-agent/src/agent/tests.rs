@@ -726,7 +726,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
         if count as usize != expected_count {
             let buf_count: Vec<(CrsqlDbVersion, u64)> = conn
                 .prepare(
-                    "select db_version,count(*) from __corro_buffered_changes group by db_version",
+                    "select version,count(*) from __corro_buffered_changes group by version",
                 )?
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
