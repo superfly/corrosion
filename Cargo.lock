@@ -788,6 +788,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spawn",
+ "sqlite-pool",
  "sqlite3-parser",
  "strum",
  "tempfile",
@@ -4027,9 +4028,16 @@ dependencies = [
 name = "sqlite-pool"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "corro-types",
  "deadpool",
+ "eyre",
+ "metrics",
  "rusqlite",
+ "tempfile",
  "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

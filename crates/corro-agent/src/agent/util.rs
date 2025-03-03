@@ -29,17 +29,19 @@ use corro_types::{
     pubsub::SubsManager,
     updates::{match_changes, match_changes_from_db_version},
 };
+
 use std::{
     cmp,
     collections::{BTreeMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
-    ops::RangeInclusive,
+    ops::{Deref, RangeInclusive},
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
 
 use crate::api::public::update::api_v1_updates;
+use sqlite_pool::{Committable, InterruptibleTransaction};
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
@@ -53,7 +55,7 @@ use futures::FutureExt;
 use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{named_params, params, Connection, OptionalExtension, Savepoint, Transaction};
+use rusqlite::{named_params, params, Connection, OptionalExtension};
 use spawn::spawn_counted;
 use tokio::{net::TcpListener, task::block_in_place};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
@@ -398,11 +400,12 @@ pub async fn apply_fully_buffered_changes_loop(
 ) {
     info!("Starting apply_fully_buffered_changes loop");
 
+    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
     while let Outcome::Completed(Some((actor_id, version))) =
         rx_apply.recv().preemptible(&mut tripwire).await
     {
         debug!(%actor_id, %version, "picked up background apply of buffered changes");
-        match process_fully_buffered_changes(&agent, &bookie, actor_id, version).await {
+        match process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout).await {
             Ok(false) => {
                 warn!(%actor_id, %version, "did not apply buffered changes");
             }
@@ -423,6 +426,8 @@ pub async fn clear_buffered_meta_loop(
     agent: Agent,
     mut rx_partials: CorroReceiver<(ActorId, RangeInclusive<Version>)>,
 ) {
+    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
+
     while let Some((actor_id, versions)) = rx_partials.recv().await {
         let pool = agent.pool().clone();
         let self_actor_id = agent.actor_id();
@@ -432,7 +437,7 @@ pub async fn clear_buffered_meta_loop(
                     let mut conn = pool.write_low().await?;
 
                     block_in_place(|| {
-                        let tx = conn.immediate_transaction()?;
+                        let tx = InterruptibleTransaction::new(conn.immediate_transaction()?, Some(tx_timeout), "clear_buffered_meta");
 
                         // TODO: delete buffered changes from deleted sequences only (maybe, it's kind of hard and may not be necessary)
 
@@ -475,9 +480,9 @@ pub async fn clear_buffered_meta_loop(
 }
 
 #[tracing::instrument(skip_all, err)]
-pub fn process_single_version(
+pub fn process_single_version<T: Deref<Target = rusqlite::Connection> + Committable>(
     agent: &Agent,
-    tx: &mut Transaction,
+    tx: &mut InterruptibleTransaction<T>,
     last_db_version: Option<CrsqlDbVersion>,
     change: ChangeV1,
 ) -> rusqlite::Result<(KnownDbVersion, Changeset)> {
@@ -535,9 +540,11 @@ pub async fn process_fully_buffered_changes(
     bookie: &Bookie,
     actor_id: ActorId,
     version: Version,
+    tx_timeout: Duration,
 ) -> Result<bool, ChangeError> {
     let db_version = {
         let mut conn = agent.pool().write_normal().await?;
+
         debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
 
         let booked = {
@@ -573,13 +580,15 @@ pub async fn process_fully_buffered_changes(
                 }
             };
 
-            let tx = conn
+            let base_tx = conn
                 .immediate_transaction()
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
                     actor_id: Some(actor_id),
                     version: Some(version),
                 })?;
+
+            let tx = InterruptibleTransaction::new(base_tx, Some(tx_timeout), "process_buffered_changes");
 
             info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
@@ -753,12 +762,14 @@ pub async fn process_multiple_changes(
     agent: Agent,
     bookie: Bookie,
     changes: Vec<(ChangeV1, ChangeSource, Instant)>,
+    tx_timeout: Duration,
 ) -> Result<(), ChangeError> {
     let start = Instant::now();
     counter!("corro.agent.changes.processing.started").increment(changes.len() as u64);
     debug!(self_actor_id = %agent.actor_id(), "processing multiple changes, len: {}", changes.iter().map(|(change, _, _)| cmp::max(change.len(), 1)).sum::<usize>());
 
     const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+
     let mut seen = HashSet::new();
     let mut unknown_changes: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for (change, src, queued_at) in changes {
@@ -804,7 +815,7 @@ pub async fn process_multiple_changes(
 
     let changesets = block_in_place(|| {
         let start = Instant::now();
-        let mut tx = conn
+        let tx = conn
             .immediate_transaction()
             .map_err(|source| ChangeError::Rusqlite {
                 source,
@@ -812,6 +823,7 @@ pub async fn process_multiple_changes(
                 version: None,
             })?;
 
+        let mut tx = InterruptibleTransaction::new(tx, Some(tx_timeout), "process_multiple_changes");
         let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
 
@@ -1039,6 +1051,7 @@ pub async fn process_multiple_changes(
             actor_id: None,
             version: None,
         })?;
+
         let elapsed = sub_start.elapsed();
         if elapsed >= PROCESSING_WARN_THRESHOLD {
             warn!("process_multiple_changes: commiting transaction took too long - {elapsed:?}");
@@ -1126,8 +1139,8 @@ pub async fn process_multiple_changes(
 }
 
 #[tracing::instrument(skip(sp, parts), err)]
-pub fn process_incomplete_version(
-    sp: &Savepoint,
+pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Committable>(
+    sp: &InterruptibleTransaction<T>,
     actor_id: ActorId,
     parts: &ChangesetParts,
 ) -> rusqlite::Result<KnownDbVersion> {
@@ -1254,9 +1267,9 @@ pub fn process_incomplete_version(
 }
 
 #[tracing::instrument(skip(agent, sp, last_db_version, parts), err)]
-pub fn process_complete_version(
+pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Committable>(
     agent: Agent,
-    sp: &Savepoint,
+    sp: &InterruptibleTransaction<T>,
     actor_id: ActorId,
     last_db_version: Option<CrsqlDbVersion>,
     versions: RangeInclusive<Version>,

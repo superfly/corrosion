@@ -27,7 +27,7 @@ use crate::{
     agent::process_multiple_changes,
     api::{
         peer::parallel_sync,
-        public::{api_v1_db_schema, api_v1_transactions},
+        public::{api_v1_db_schema, api_v1_transactions, TransactionParams},
     },
     transport::Transport,
 };
@@ -791,6 +791,8 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
+    let tx_timeout = Duration::from_secs(60);
+
     let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
     let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
     // setup the schema, for both nodes
@@ -813,7 +815,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     insert_rows(ta1.agent.clone(), 1, 50).await;
     // send them all
     let rows = get_rows(ta1.agent.clone(), vec![(Version(1)..=Version(50), None)]).await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
 
     // overwrite different version ranges
     insert_rows(ta1.agent.clone(), 1, 5).await;
@@ -831,7 +833,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
@@ -936,6 +938,9 @@ async fn process_failed_changes() -> eyre::Result<()> {
     for i in 1..=5_i64 {
         let (status_code, _) = api_v1_transactions(
             Extension(ta2.agent.clone()),
+            axum::extract::Query(TransactionParams {
+                timeout: None,
+            }),
             axum::Json(vec![Statement::WithParams(
                 "INSERT OR REPLACE INTO tests (id,text) VALUES (?,?)".into(),
                 vec![i.into(), "service-text".into()],
@@ -988,7 +993,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
 
     rows.append(&mut good_changes);
 
-    let res = process_multiple_changes(ta1.agent.clone(), ta1.bookie.clone(), rows).await;
+    let res = process_multiple_changes(ta1.agent.clone(), ta1.bookie.clone(), rows, Duration::from_secs(60)).await;
 
     assert!(res.is_ok());
 
@@ -1033,6 +1038,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let tx_timeout = Duration::from_secs(60);
 
     // setup the schema, for both nodes
     let (status_code, _body) = api_v1_db_schema(
@@ -1055,7 +1061,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
 
     // sent 1-5
     let rows = get_rows(ta1.agent.clone(), vec![(Version(1)..=Version(5), None)]).await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check ta2 bookie
     check_bookie_versions(
         ta2.clone(),
@@ -1069,7 +1075,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
 
     // sent: 1-5, 9-10
     let rows = get_rows(ta1.agent.clone(), vec![(Version(9)..=Version(10), None)]).await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check for gap 6-8
     check_bookie_versions(
         ta2.clone(),
@@ -1092,7 +1098,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check for gap 11-14 and 17-19
     check_bookie_versions(
         ta2.clone(),
@@ -1116,7 +1122,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
 
     check_bookie_versions(
         ta2.clone(),
@@ -1139,7 +1145,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
@@ -1164,7 +1170,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
@@ -1333,6 +1339,7 @@ async fn insert_rows(agent: Agent, start: i64, n: i64) {
     for i in start..=n {
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TransactionParams{timeout: None}),
             axum::Json(vec![Statement::WithParams(
                 "INSERT OR REPLACE INTO tests3 (id,text,text2, num, num2) VALUES (?,?,?,?,?)"
                     .into(),
@@ -2176,6 +2183,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let tx_timeout = Duration::from_secs(60);
 
     // setup the schema, for both nodes
     let (status_code, _body) = api_v1_db_schema(
@@ -2196,6 +2204,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let (status_code, body) = api_v1_transactions(
         Extension(ta1.agent.clone()),
+        axum::extract::Query(TransactionParams{timeout: None}),
         axum::Json(vec![Statement::WithParams(
             "insert into tests (id, text) values (?,?)".into(),
             vec!["service-id".into(), "service-name".into()],
@@ -2261,11 +2270,13 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
             ChangeSource::Broadcast,
             Instant::now(),
         )],
+        tx_timeout,
     )
     .await?;
 
     let (status_code, body) = api_v1_transactions(
         Extension(ta1.agent.clone()),
+        axum::extract::Query(TransactionParams{timeout: None}),
         axum::Json(vec![Statement::WithParams(
             "insert or replace into tests (id, text) values (?,?)".into(),
             vec!["service-id".into(), "service-name-overwrite".into()],
@@ -2328,6 +2339,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
             ChangeSource::Broadcast,
             Instant::now(),
         )],
+        tx_timeout,
     )
     .await?;
 
