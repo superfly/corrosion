@@ -19,7 +19,7 @@ use corro_types::{
 };
 use hyper::StatusCode;
 use rusqlite::{params_from_iter, ToSql, Transaction};
-// use spawn::spawn_counted;
+use spawn::spawn_counted;
 use tokio::{
     sync::{
         mpsc::{self, channel},
@@ -90,12 +90,12 @@ where
 
                 book_writer.commit_snapshot(snap);
 
-                // let agent = agent.clone();
+                let agent = agent.clone();
 
-                // spawn_counted(async move {
-                //     debug!("broadcasting changes...db_version: {db_version}");
-                //     broadcast_changes(agent, db_version, last_seq, version, ts).await
-                // });
+                spawn_counted(async move {
+                    debug!("broadcasting changes...db_version: {db_version}");
+                    broadcast_changes(agent, db_version, last_seq, version, ts).await
+                });
 
                 Ok::<_, ChangeError>((ret, Some((version, db_version, last_seq, ts)), elapsed))
             }
@@ -104,11 +104,11 @@ where
 
     let (ret, version, elapsed) = res;
     
-    if let Some((version, db_version, last_seq, ts)) = version {
-        broadcast_changes(agent.clone(), db_version, last_seq, version, ts).await.unwrap_or_else(|e| {
-            error!("could not broadcast changes: {e}");
-        });
-    }
+    // if let Some((version, db_version, last_seq, ts)) = version {
+    //     broadcast_changes(agent.clone(), db_version, last_seq, version, ts).await.unwrap_or_else(|e| {
+    //         error!("could not broadcast changes: {e}");
+    //     });
+    // }
 
     Ok((ret, version.map(|v| v.0), elapsed))
 }

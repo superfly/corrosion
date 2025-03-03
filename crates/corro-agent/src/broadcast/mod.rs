@@ -186,6 +186,7 @@ pub fn runtime_loop(
                 let branch = tokio::select! {
                     biased;
                     _ = &mut tripwire => {
+                        info!("tripped tripwire, breaking");
                         break
                     },
                     timer = timer_rx.recv() => match timer {
@@ -496,7 +497,7 @@ async fn handle_broadcasts(
                         local_bcast_buf.split().freeze(),
                     ));
                 }
-                info!("broadcast deadline, sending out any pending broadcasts - len: {}, local len: {}", to_broadcast.len(), to_local_broadcast.len());
+                // info!("broadcast deadline, sending out any pending broadcasts - len: {}, local len: {}", to_broadcast.len(), to_local_broadcast.len());
             }
             Branch::Broadcast(input) => {
                 trace!("handling Branch::Broadcast");
@@ -505,7 +506,7 @@ async fn handle_broadcasts(
                     BroadcastInput::Rebroadcast(bcast) => (bcast, false),
                     BroadcastInput::AddBroadcast(bcast) => (bcast, true),
                 };
-                debug!("adding broadcast: {bcast:?}, local? {is_local}");
+                // debug!("adding broadcast: {bcast:?}, local? {is_local}");
 
                 if let Err(e) = (UniPayload::V1 {
                     data: UniPayloadV1::Broadcast(bcast.clone()),
@@ -568,7 +569,7 @@ async fn handle_broadcasts(
         let prev_rate_limited = rate_limited;
 
         // start with local broadcasts, they're higher priority
-        debug!("to_local_broadcast len: {}, join_set len: {}", to_local_broadcast.len(), join_set.len());
+        let mut ring0 = HashSet::new();
         while !to_local_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
             // UNWRAP: we just checked that it wasn't empty
             let payload = to_local_broadcast.pop_front().unwrap();
@@ -584,6 +585,7 @@ async fn handle_broadcasts(
                     break;
                 }
                 ring0_count += 1;
+                ring0.insert(addr);
 
                 match try_transmit_broadcast(
                     &bytes_per_sec,
@@ -669,9 +671,12 @@ async fn handle_broadcasts(
                         .iter()
                         .filter_map(|(member_id, state)| {
                             // don't broadcast to ourselves... or ring0 if local broadcast
+                            // (ring0 could have changed since the time we sent the local broadcast
+                            // so we check the ring0 variable that's created at start of local_broacast
+                            // instead of state.is_ring0())
                             if *member_id == actor_id
                                 || state.cluster_id != agent.cluster_id()
-                                || (pending.is_local && state.is_ring0())
+                                || (pending.is_local && ring0.contains(&state.addr))
                                 || pending.sent_to.contains(&state.addr)
                             // don't broadcast to this peer
                             {

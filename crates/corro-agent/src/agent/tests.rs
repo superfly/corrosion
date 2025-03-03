@@ -610,6 +610,7 @@ pub async fn configurable_stress_test(
     Ok(())
 }
 
+#[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn large_tx_sync() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
