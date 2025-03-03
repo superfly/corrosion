@@ -905,6 +905,7 @@ mod tests {
     use super::*;
     use crate::agent::process_multiple_changes;
     use crate::api::public::update::{api_v1_updates, SharedUpdateBroadcastCache};
+    use crate::api::public::TransactionParams;
     use crate::{
         agent::setup,
         api::public::{api_v1_db_schema, api_v1_transactions},
@@ -940,6 +941,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TransactionParams { timeout: None }),
             axum::Json(vec![
                 Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
@@ -997,6 +999,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-3".into(), "service-name-3".into()],
@@ -1055,6 +1058,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-4".into(), "service-name-4".into()],
@@ -1147,6 +1151,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-5".into(), "service-name-5".into()],
@@ -1252,6 +1257,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-6".into(), "service-name-6".into()],
@@ -1263,6 +1269,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "delete from  tests where id = ?".into(),
                     vec!["service-id-6".into()],
@@ -1363,6 +1370,7 @@ mod tests {
 
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TransactionParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "insert into tests (id, text) values (?,?)".into(),
                 vec!["service-id-6".into(), "service-name-6".into()],
@@ -1431,6 +1439,7 @@ mod tests {
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
         let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+        let tx_timeout = Duration::from_secs(60);
 
         let schema = "CREATE TABLE buftests (
             pk int NOT NULL PRIMARY KEY,
@@ -1486,6 +1495,7 @@ mod tests {
             ta1.agent.clone(),
             ta1.bookie.clone(),
             vec![(changes, ChangeSource::Sync, Instant::now())],
+            tx_timeout,
         )
         .await?;
 
@@ -1582,6 +1592,7 @@ mod tests {
             ta1.agent.clone(),
             ta1.bookie.clone(),
             vec![(changes, ChangeSource::Sync, Instant::now())],
+            tx_timeout,
         )
         .await?;
 
@@ -1623,6 +1634,7 @@ mod tests {
             ta1.agent.clone(),
             ta1.bookie.clone(),
             vec![(changes, ChangeSource::Sync, Instant::now())],
+            tx_timeout,
         )
         .await?;
 

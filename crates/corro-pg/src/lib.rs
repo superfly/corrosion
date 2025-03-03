@@ -320,7 +320,7 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
                 break;
             }
             Err(e) => {
-                debug!("could not parse as sqlite: {e}");
+                debug!("could not parse statement ({sql:?}) as sqlite: {e}");
                 let stmts = sqlparser::parser::Parser::parse_sql(
                     &sqlparser::dialect::PostgreSqlDialect {},
                     normalized,
