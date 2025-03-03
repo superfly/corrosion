@@ -773,7 +773,10 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
     }
 
     let mut interval = tokio::time::interval(Duration::from_secs(5*60));
+    // skip first tick
+    interval.tick().await;
     let start = Instant::now();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
