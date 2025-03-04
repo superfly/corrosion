@@ -186,7 +186,7 @@ pub fn runtime_loop(
                 let branch = tokio::select! {
                     biased;
                     _ = &mut tripwire => {
-                        info!("tripped tripwire, breaking");
+                        info!("tripped runtime loop, breaking");
                         break
                     },
                     timer = timer_rx.recv() => match timer {
@@ -322,8 +322,6 @@ pub fn runtime_loop(
                     warn!("took {elapsed:?} to execute branch: {to_s}");
                 }
             }
-
-            info!("foca loop is done, leaving cluster");
 
             // leave the cluster gracefully
             if let Err(e) = foca.leave_cluster(&mut runtime) {
@@ -660,9 +658,7 @@ async fn handle_broadcasts(
             debug!("choosing {} broadcasts, ring0 count: {}, MAX_INFLIGHT_BROADCAST: {}", choose_count, ring0_count, MAX_INFLIGHT_BROADCAST);
             while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
                 let mut pending = to_broadcast.pop_front().unwrap();
-
-                debug!("{} to broadcast: {pending:?}", actor_id);
-
+                
                 let broadcast_to = {
                     agent
                         .members()

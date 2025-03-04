@@ -1273,15 +1273,23 @@ mod tests {
 
             assert_eq!(status_code, StatusCode::OK);
 
-            assert_eq!(
-                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
-                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-6".into()],)
-            );
-
-            assert_eq!(
-                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
-                NotifyEvent::Notify(ChangeType::Delete, vec!["service-id-6".into()],)
-            );
+            // when we make changes to the same primary key in quick succession,
+            // the newer event might get sent first (but in that case, the older one should be dropped)
+            match notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap() {
+                NotifyEvent::Notify(ChangeType::Update, pk) => {
+                    assert_eq!(pk, vec!["service-id-6".into()]);
+                    assert_eq!(
+                        notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                        NotifyEvent::Notify(ChangeType::Delete, vec!["service-id-6".into()],)
+                    );
+                }
+                NotifyEvent::Notify(ChangeType::Delete, pk) => {
+                    assert_eq!(pk, vec!["service-id-6".into()]);
+                    // check that we dont get an update after
+                    assert!(tokio::time::timeout(Duration::from_secs(2), notify_rows.recv::<NotifyEvent>()).await.is_err());
+                }
+                _ => panic!("expected notify event"),
+            }
         }
 
         // previous subs have been dropped.

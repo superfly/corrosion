@@ -103,12 +103,6 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     )
     .await?;
 
-    // spawn_counted(util::write_empties_loop(
-    //     agent.clone(),
-    //     rx_empty,
-    //     tripwire.clone(),
-    // ));
-
     tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
 
     tokio::spawn(metrics::metrics_loop(agent.clone(), transport.clone()));

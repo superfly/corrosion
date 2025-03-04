@@ -34,6 +34,8 @@ async fn test_query() {
 
     let expected = ta.agent.actor_id().as_simple().to_string().to_uppercase();
 
+    println!("got command, running query");
+
     let assert = cmd
         .arg("--api-addr")
         .arg(api_addr.to_string())
@@ -45,6 +47,7 @@ async fn test_query() {
 
     assert.success().stdout(format!("{expected}\n"));
 
+    println!("tripping tripwire");
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;

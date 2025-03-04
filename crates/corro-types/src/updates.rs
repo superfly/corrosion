@@ -6,6 +6,7 @@ use corro_api_types::sqlite::ChangeType;
 use corro_api_types::{Change, ColumnName, NotifyEvent, SqliteValueRef, TableName};
 use corro_base_types::CrsqlDbVersion;
 use metrics::{counter, histogram, Counter};
+use indexmap::{IndexMap, map::Entry};
 use parking_lot::RwLock;
 use rusqlite::Connection;
 use spawn::spawn_counted;
@@ -318,12 +319,12 @@ async fn batch_candidates(
     const MAX_CACHE_ENTRIES: usize = 2000;
     const KEEP_CACHE_ENTRIES: usize = 1000;
 
-    // small cache to ensure we don't send an older pk when changes to the same pk
-    // are made in quick succession. changes aren't sent in order, and there's just one situation where this 
+    // small cache to ensure we don't send an older update when changes to the same pk
+    // are made in quick succession. Changes aren't sent in order, and there's just one situation where this 
     // can be problematic, when we have a delete before an update but those
     // get sent in reverse order. so the client might delete a key that's actually present in the db.
     //
-    // (TODO: maybe we should just send the latest change for a pk?)
+    // (TODO: maybe we could send the cl to the client? or read from db?)
     let mut cl_cache: IndexMap<(TableName, Vec<u8>), i64> = IndexMap::new();
 
     info!(sub_id = %id, "Starting loop to receive candidates from updates");
@@ -346,31 +347,29 @@ async fn batch_candidates(
             Some((candidates, _)) = changes_rx.recv() => {
                 debug!(sub_id = %id, "updates got candidates: {candidates:?}");
                 for (table, pk_map) in  candidates {
-                    let buffed = buf.entry(table).or_default();
+                    let buffed = buf.entry(table.clone()).or_default();
+        
                     for (pk, cl) in pk_map {
-                        if let Some(last_cl) = cl_cache.get(&(table, pk)) {
-                            if *last_cl >= cl {
-                                continue;
+                        let e = cl_cache.entry((table.clone(), pk.clone()));
+                        match e {
+                            Entry::Occupied(mut o) => {
+                                if *o.get() >= cl {
+                                    continue;
+                                }
+                                o.insert(cl);
+                            }
+                            Entry::Vacant(v) => {
+                                v.insert(cl);
                             }
                         }
 
-                        cl_cache.insert((table, pk), cl);
                         buffed.insert(pk, cl);
                         buf_count += 1;
-
-                        // match buffed.get(&pk) {
-                        //     Some(existing_cl) if *existing_cl > cl  => continue,
-                        //     _ => {
-                        //         if buffed.insert(pk, cl).is_none() {
-                        //             buf_count += 1;
-                        //         }
-                        //     }
-                        // }
-
-                        if cl_cache.len() > MAX_CACHE_ENTRIES {
-                            cl_cache = cl_cache.split_off(cl_cache.len() - KEEP_CACHE_ENTRIES);
-                        }
                     }
+                }
+
+                if cl_cache.len() > MAX_CACHE_ENTRIES {
+                    cl_cache = cl_cache.split_off(cl_cache.len() - KEEP_CACHE_ENTRIES);
                 }
 
                 if buf_count >= PROCESS_CHANGES_THRESHOLD {
@@ -396,6 +395,7 @@ async fn batch_candidates(
 
         if process {
             let start = Instant::now();
+
             if let Err(e) =
                 block_in_place(|| handle_candidates(evt_tx.clone(), std::mem::take(&mut buf)))
             {
