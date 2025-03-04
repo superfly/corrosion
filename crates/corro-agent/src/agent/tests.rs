@@ -50,7 +50,7 @@ use corro_types::{
     pubsub::pack_columns,
 };
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 
 async fn insert_rows_and_gossip() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
@@ -202,9 +202,7 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
     assert_eq!(svc.id, 2);
     assert_eq!(svc.text, "hello world 2");
 
-    println!("sleeping 1s");
     sleep(Duration::from_secs(1)).await;
-    println!("done sleeping");
 
     let svc: TestRecord = ta2.agent.pool().read().await?.query_row(
         "SELECT id, text FROM tests WHERE id = 2;",
@@ -1356,7 +1354,6 @@ async fn insert_rows(agent: Agent, start: i64, n: i64) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-
 async fn many_small_changes() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();

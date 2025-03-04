@@ -272,7 +272,7 @@ fn handle_candidates(
         return Ok(());
     }
 
-    debug!(
+    trace!(
         "got some candidates for updates! {:?}",
         candidates.keys().collect::<Vec<_>>()
     );
@@ -280,13 +280,7 @@ fn handle_candidates(
     for (_, pks) in candidates {
         let pks = pks
             .iter()
-            .map(|(pk, cl)| {
-                let x = unpack_columns(pk);
-                x.map(|m| {
-                    debug!("unpacked columns: {:?}", m);
-                    (m, *cl)
-                })
-            })
+            .map(|(pk, cl)| unpack_columns(pk).map(|x| (x, *cl)))
             .collect::<Result<Vec<(Vec<SqliteValueRef>, i64)>, _>>()?;
 
         for (pk, cl) in pks {
@@ -425,7 +419,7 @@ where
     H: Handle + Send + 'static,
 {
     let trait_type = manager.trait_type();
-    debug!(
+    trace!(
         %db_version,
         "trying to match changes to {trait_type}, len: {}",
         changes.len()
@@ -457,7 +451,7 @@ where
                 .increment(pks.len() as u64);
         }
 
-        debug!(sub_id = %id, %db_version, "found {match_count} candidates");
+        trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
         if let Err(e) = handle.changes_tx().try_send((candidates, db_version)) {
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");

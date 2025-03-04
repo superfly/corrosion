@@ -55,7 +55,7 @@ where
         .await;
 
     let start = Instant::now();
-    let res = block_in_place(move || {
+    block_in_place(move || {
         let tx = conn
             .immediate_transaction()
             .map_err(|source| ChangeError::Rusqlite {
@@ -93,24 +93,14 @@ where
                 let agent = agent.clone();
 
                 spawn_counted(async move {
-                    debug!("broadcasting changes...db_version: {db_version}");
                     broadcast_changes(agent, db_version, last_seq, version, ts).await
                 });
 
-                Ok::<_, ChangeError>((ret, Some((version, db_version, last_seq, ts)), elapsed))
+                Ok::<_, ChangeError>((ret, Some(version), elapsed))
             }
         }
-    })?;
+    })?
 
-    let (ret, version, elapsed) = res;
-    
-    // if let Some((version, db_version, last_seq, ts)) = version {
-    //     broadcast_changes(agent.clone(), db_version, last_seq, version, ts).await.unwrap_or_else(|e| {
-    //         error!("could not broadcast changes: {e}");
-    //     });
-    // }
-
-    Ok((ret, version.map(|v| v.0), elapsed))
 }
 
 #[tracing::instrument(skip_all, err)]

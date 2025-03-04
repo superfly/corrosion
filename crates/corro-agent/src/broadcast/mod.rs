@@ -366,7 +366,7 @@ pub fn runtime_loop(
             }
 
             if let Some(handle) = diff_member_states(&agent, &foca, &mut last_states) {
-                debug!("Waiting on task to update member states...");
+                info!("Waiting on task to update member states...");
                 if let Err(e) = handle.await {
                     error!("could not await task to update member states: {e}");
                 }
@@ -495,7 +495,6 @@ async fn handle_broadcasts(
                         local_bcast_buf.split().freeze(),
                     ));
                 }
-                // info!("broadcast deadline, sending out any pending broadcasts - len: {}, local len: {}", to_broadcast.len(), to_local_broadcast.len());
             }
             Branch::Broadcast(input) => {
                 trace!("handling Branch::Broadcast");
@@ -504,7 +503,7 @@ async fn handle_broadcasts(
                     BroadcastInput::Rebroadcast(bcast) => (bcast, false),
                     BroadcastInput::AddBroadcast(bcast) => (bcast, true),
                 };
-                // debug!("adding broadcast: {bcast:?}, local? {is_local}");
+                trace!("adding broadcast: {bcast:?}, local? {is_local}");
 
                 if let Err(e) = (UniPayload::V1 {
                     data: UniPayloadV1::Broadcast(bcast.clone()),
@@ -551,11 +550,11 @@ async fn handle_broadcasts(
                 }
             }
             Branch::WokePendingBroadcast(pending) => {
-                info!("handling Branch::WokePendingBroadcast");
+                trace!("handling Branch::WokePendingBroadcast");
                 to_broadcast.push_front(pending);
             }
             Branch::Metrics => {
-                info!("handling Branch::Metrics");
+                trace!("handling Branch::Metrics");
                 gauge!("corro.broadcast.pending.count").set(idle_pendings.len() as f64);
                 gauge!("corro.broadcast.processing.jobs").set(join_set.len() as f64);
                 gauge!("corro.broadcast.buffer.capacity").set(bcast_buf.capacity() as f64);
@@ -575,9 +574,7 @@ async fn handle_broadcasts(
             let members = agent.members().read();
             let mut spawn_count = 0;
             let mut ring0_count = 0;
-            debug!("broadcasting to ring0 - len: {:?}", members.ring0(agent.cluster_id()).collect::<Vec<_>>());
             for addr in members.ring0(agent.cluster_id()) {
-                debug!("broadcasting to ring0: {:?}", addr);
                 if join_set.len() >= MAX_INFLIGHT_BROADCAST {
                     debug!("breaking, max inflight broadcast reached: {}", MAX_INFLIGHT_BROADCAST);
                     break;
@@ -622,7 +619,6 @@ async fn handle_broadcasts(
             if rate_limited && spawn_count == 0 && ring0_count > 0 {
                 // push it back in front since this got nowhere and it's still the
                 // freshest item we have in the queue
-                debug!("unable to send local broadcast, pushing back to front");
                 to_local_broadcast.push_front(payload);
                 break;
             }
@@ -630,7 +626,6 @@ async fn handle_broadcasts(
             counter!("corro.broadcast.spawn", "type" => "local").increment(spawn_count);
         }
 
-        debug!("to_broadcast: {:?} rate_limited: {rate_limited}, join_set: {:?}", to_broadcast.len(), join_set.len());
         if !rate_limited && !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
             let (members_count, ring0_count) = {
                 let members = agent.members().read();
@@ -639,7 +634,6 @@ async fn handle_broadcasts(
                 (members_count, ring0_count)
             };
 
-            debug!("members_count: {}, ring0_count: {}", members_count, ring0_count);
             let (choose_count, max_transmissions) = {
                 let config = config.read();
                 let max_transmissions = config.max_transmissions.get();
@@ -658,7 +652,7 @@ async fn handle_broadcasts(
             debug!("choosing {} broadcasts, ring0 count: {}, MAX_INFLIGHT_BROADCAST: {}", choose_count, ring0_count, MAX_INFLIGHT_BROADCAST);
             while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
                 let mut pending = to_broadcast.pop_front().unwrap();
-                
+
                 let broadcast_to = {
                     agent
                         .members()
@@ -694,7 +688,7 @@ async fn handle_broadcasts(
                 let pending_sent_instance = pending.sent_to.len();
 
                 let mut spawn_count = 0;
-                debug!("broadcasting to: {:?}", broadcast_to);
+                trace!("broadcasting to: {:?}", broadcast_to);
                 for addr in broadcast_to {
                     match try_transmit_broadcast(
                         &bytes_per_sec,
@@ -980,7 +974,7 @@ fn try_transmit_broadcast(
     transport: Transport,
     addr: SocketAddr,
 ) -> Result<Pin<Box<dyn Future<Output = ()> + Send>>, TransmitError> {
-    debug!("singly broadcasting to {addr}");
+    trace!("singly broadcasting to {addr}");
 
     let len = payload.len();
 
