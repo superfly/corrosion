@@ -18,7 +18,6 @@ use corro_types::{
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
-use indexmap::IndexMap;
 use hyper::StatusCode;
 use metrics::histogram;
 use rusqlite::{params_from_iter, ToSql, Transaction};

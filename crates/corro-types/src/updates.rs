@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use corro_api_types::sqlite::ChangeType;
 use corro_api_types::{ColumnName, NotifyEvent, SqliteValueRef, TableName};
 use corro_base_types::CrsqlDbVersion;
-use indexmap::IndexMap;
 use metrics::{counter, histogram, Counter};
 use indexmap::{IndexMap, map::Entry};
 use parking_lot::RwLock;
