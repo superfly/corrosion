@@ -35,7 +35,7 @@ use tokio::{
     },
     time::timeout,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
@@ -643,15 +643,15 @@ impl SplitPool {
 
         tokio::spawn(async move {
             loop {
-                let tx: oneshot::Sender<CancellationToken> = tokio::select! {
+                let (tx, channel) = tokio::select! {
                     biased;
 
-                    Some(tx) = priority_rx.recv() => tx,
-                    Some(tx) = normal_rx.recv() => tx,
-                    Some(tx) = low_rx.recv() => tx,
+                    Some(tx) = priority_rx.recv() => (tx, "priority"),
+                    Some(tx) = normal_rx.recv() => (tx, "normal"),
+                    Some(tx) = low_rx.recv() => (tx, "low"),
                 };
 
-                wait_conn_drop(tx).await
+                wait_conn_drop(tx, channel).await
             }
         });
 
@@ -758,13 +758,13 @@ impl SplitPool {
 
         Ok(WriteConn {
             conn,
-            cancel: token.clone(),
+            _drop_guard: token.drop_guard(),
             _permit,
         })
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
+async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'static str) {
     let cancel = CancellationToken::new();
 
     if let Err(_e) = tx.send(cancel.clone()) {
@@ -784,7 +784,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
             }
             _ = interval.tick() => {
                 let elapsed = start.elapsed();
-                warn!("wait_conn_drop has been running since {elapsed:?}, token - {:?}", cancel.is_cancelled());
+                warn!("wait_conn_drop has been running since {elapsed:?}, token_is_cancelled - {:?}, channel - {channel}", cancel.is_cancelled());
                 continue;
             }
         }
@@ -802,7 +802,7 @@ where
 
 pub struct WriteConn {
     conn: sqlite_pool::Connection<CrConn>,
-    cancel: CancellationToken,
+    _drop_guard: DropGuard,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -819,13 +819,6 @@ impl DerefMut for WriteConn {
         &mut self.conn
     }
 }
-
-impl Drop for WriteConn {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
-}
-
 pub struct CountedTokioRwLock<T> {
     registry: LockRegistry,
     lock: Arc<TokioRwLock<T>>,
