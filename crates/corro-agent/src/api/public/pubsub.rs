@@ -1434,7 +1434,7 @@ mod tests {
         };
 
         assert_eq!(
-            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
+            tokio::time::timeout(Duration::from_secs(5), rows_from.recv::<QueryEvent>()).await.unwrap().unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(6),
