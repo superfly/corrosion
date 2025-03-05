@@ -414,6 +414,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             query,
             param,
             timer,
+            timeout
         } => {
             let stmt = if param.is_empty() {
                 Statement::Simple(query.clone())
@@ -424,7 +425,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 )
             };
 
-            let res = cli.api_client()?.execute(&[stmt]).await?;
+            let res = cli.api_client()?.execute(&[stmt], *timeout).await?;
 
             for res in res.results {
                 match res {
@@ -669,6 +670,8 @@ enum Command {
         param: Vec<String>,
         #[arg(long, default_value = "false")]
         timer: bool,
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Reload the config

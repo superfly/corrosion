@@ -643,15 +643,15 @@ impl SplitPool {
 
         tokio::spawn(async move {
             loop {
-                let tx: oneshot::Sender<CancellationToken> = tokio::select! {
+                let (tx, channel) = tokio::select! {
                     biased;
 
-                    Some(tx) = priority_rx.recv() => tx,
-                    Some(tx) = normal_rx.recv() => tx,
-                    Some(tx) = low_rx.recv() => tx,
+                    Some(tx) = priority_rx.recv() => (tx, "priority"),
+                    Some(tx) = normal_rx.recv() => (tx, "normal"),
+                    Some(tx) = low_rx.recv() => (tx, "low"),
                 };
 
-                wait_conn_drop(tx).await
+                wait_conn_drop(tx, channel).await
             }
         });
 
@@ -764,7 +764,7 @@ impl SplitPool {
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
+async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'static str) {
     let cancel = CancellationToken::new();
 
     if let Err(_e) = tx.send(cancel.clone()) {
@@ -772,7 +772,23 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
         return;
     }
 
-    cancel.cancelled().await
+    let mut interval = tokio::time::interval(Duration::from_secs(5*60));
+    // skip first tick
+    interval.tick().await;
+    let start = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                break;
+            }
+            _ = interval.tick() => {
+                let elapsed = start.elapsed();
+                warn!("wait_conn_drop has been running since {elapsed:?}, token_is_cancelled - {:?}, channel - {channel}", cancel.is_cancelled());
+                continue;
+            }
+        }
+    }
 }
 
 async fn timeout_fut<T, F>(op: &'static str, duration: Duration, fut: F) -> Result<T, PoolError>
@@ -803,7 +819,6 @@ impl DerefMut for WriteConn {
         &mut self.conn
     }
 }
-
 pub struct CountedTokioRwLock<T> {
     registry: LockRegistry,
     lock: Arc<TokioRwLock<T>>,
