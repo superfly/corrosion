@@ -675,7 +675,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
     let ta4_transport = Transport::new(&ta4.agent.config().gossip, rtt_tx.clone()).await?;
 
     println!("starting sync!?");
-    for _ in 0..6 {
+    for _ in 0..7 {
         let res = parallel_sync(
             &ta2.agent,
             &ta2_transport,
@@ -715,7 +715,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         println!("ta4 synced {res}");
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     tokio::time::sleep(Duration::from_secs(10)).await;

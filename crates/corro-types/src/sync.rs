@@ -157,7 +157,6 @@ impl SyncStateV1 {
                 }
 
                 // we are left with all the versions they fully have!
-
                 haves
             };
 
