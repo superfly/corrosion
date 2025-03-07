@@ -20,7 +20,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::block_in_place,
 };
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 use uhlc::{ParseNTP64Error, NTP64};
 
 use crate::{
@@ -518,6 +518,7 @@ pub async fn broadcast_changes(
 
                     trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
+                    debug!("match_changes db_version: {db_version}");
                     match_changes(agent.subs_manager(), &changes, db_version);
                     match_changes(agent.updates_manager(), &changes, db_version);
 

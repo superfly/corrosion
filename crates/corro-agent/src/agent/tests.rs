@@ -52,6 +52,7 @@ use corro_types::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+
 async fn insert_rows_and_gossip() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -376,57 +377,61 @@ pub async fn configurable_stress_test(
         .unwrap()
     });
 
-    let actor_versions = tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
-        let addrs = addrs.clone();
-        let client = client.clone();
-        move |statements| {
+    let actor_versions = {
+        let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
+
+        tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
             let addrs = addrs.clone();
             let client = client.clone();
-            Ok(async move {
-                let mut rng = StdRng::from_entropy();
-                let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
-
-                let res = client
-                    .request(
-                        hyper::Request::builder()
-                            .method(hyper::Method::POST)
-                            .uri(format!("http://{chosen}/v1/transactions"))
-                            .header(hyper::header::CONTENT_TYPE, "application/json")
-                            .body(serde_json::to_vec(&statements)?.into())?,
-                    )
-                    .await?;
-
-                if res.status() != StatusCode::OK {
-                    eyre::bail!("unexpected status code: {}", res.status());
-                }
-
-                let body: ExecResponse =
-                    serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
-
-                for (i, statement) in statements.iter().enumerate() {
-                    if !matches!(
-                        body.results[i],
-                        ExecResult::Execute {
-                            rows_affected: 1,
-                            ..
-                        }
-                    ) {
-                        eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
+            move |statements| {
+                let addrs = addrs.clone();
+                let client = client.clone();
+                Ok(async move {
+                    let mut rng = StdRng::from_entropy();
+                    let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
+    
+                    let res = client
+                        .request(
+                            hyper::Request::builder()
+                                .method(hyper::Method::POST)
+                                .uri(format!("http://{chosen}/v1/transactions"))
+                                .header(hyper::header::CONTENT_TYPE, "application/json")
+                                .body(serde_json::to_vec(&statements)?.into())?,
+                        )
+                        .await?;
+    
+                    if res.status() != StatusCode::OK {
+                        eyre::bail!("unexpected status code: {}", res.status());
                     }
-                }
-
-                Ok::<_, eyre::Report>((*actor_id, 1))
-            })
-        }
-    })
-    .try_buffer_unordered(10)
-    .try_fold(BTreeMap::new(), |mut acc, item| {
-        {
-            *acc.entry(item.0).or_insert(0) += item.1
-        }
-        future::ready(Ok(acc))
-    })
-    .await?;
+    
+                    let body: ExecResponse =
+                        serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+    
+                    for (i, statement) in statements.iter().enumerate() {
+                        if !matches!(
+                            body.results[i],
+                            ExecResult::Execute {
+                                rows_affected: 1,
+                                ..
+                            }
+                        ) {
+                            eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
+                        }
+                    }
+    
+                    Ok::<_, eyre::Report>((*actor_id, 1))
+                })
+            }
+        })
+        .try_buffer_unordered(10)
+        .try_fold(BTreeMap::new(), |mut acc, item| {
+            {
+                *acc.entry(item.0).or_insert(0) += item.1
+            }
+            future::ready(Ok(acc))
+        })
+        .await?
+    };
 
     let changes_count: i64 = 4 * input_count as i64;
 
@@ -599,6 +604,7 @@ pub async fn configurable_stress_test(
         );
     }
 
+    println!("waiting for things to shut down");
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;
@@ -669,7 +675,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
     let ta4_transport = Transport::new(&ta4.agent.config().gossip, rtt_tx.clone()).await?;
 
     println!("starting sync!?");
-    for _ in 0..6 {
+    for _ in 0..7 {
         let res = parallel_sync(
             &ta2.agent,
             &ta2_transport,
@@ -709,7 +715,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         println!("ta4 synced {res}");
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -764,7 +770,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
     for (name, actor_id, count) in ta_counts {
         assert_eq!(
             count, expected_count,
-            "{name}: actor {actor_id} did not reach 10K rows",
+            "{name}: actor {actor_id} did not reach {expected_count} rows",
         );
     }
 

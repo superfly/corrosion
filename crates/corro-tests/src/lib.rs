@@ -7,7 +7,7 @@ use corro_types::{
 };
 use tripwire::Tripwire;
 
-mod tempdir;
+pub mod tempdir;
 use tempdir::TempDir;
 
 pub const TEST_SCHEMA: &str = r#"

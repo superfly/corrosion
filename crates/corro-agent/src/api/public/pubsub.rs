@@ -911,6 +911,7 @@ mod tests {
         api::public::{api_v1_db_schema, api_v1_transactions},
     };
     use corro_tests::launch_test_agent;
+    use corro_tests::tempdir::TempDir;
     use corro_types::api::SqliteValue::Integer;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -919,7 +920,7 @@ mod tests {
 
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
 
-        let dir = tempfile::tempdir()?;
+        let dir = TempDir::new(tempfile::tempdir()?);
 
         let (agent, _agent_options) = setup(
             Config::builder()
@@ -981,6 +982,10 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK);
 
             // only want notifications
+            // small sleep here to make sure `broadcast_changes` has already run
+            // for earlier transactions
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
             let mut notify_res = api_v1_updates(
                 Extension(agent.clone()),
                 Extension(update_bcast_cache.clone()),
@@ -1041,8 +1046,9 @@ mod tests {
                 )
             );
 
+            let evt = rows.recv::<QueryEvent>().await.unwrap().unwrap();
             assert!(matches!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+                evt,
                 QueryEvent::EndOfQuery { .. }
             ));
 
@@ -1279,15 +1285,23 @@ mod tests {
 
             assert_eq!(status_code, StatusCode::OK);
 
-            assert_eq!(
-                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
-                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-6".into()],)
-            );
-
-            assert_eq!(
-                notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
-                NotifyEvent::Notify(ChangeType::Delete, vec!["service-id-6".into()],)
-            );
+            // when we make changes to the same primary key in quick succession,
+            // the newer event might get sent first (but in that case, the older one should be dropped)
+            match notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap() {
+                NotifyEvent::Notify(ChangeType::Update, pk) => {
+                    assert_eq!(pk, vec!["service-id-6".into()]);
+                    assert_eq!(
+                        notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
+                        NotifyEvent::Notify(ChangeType::Delete, vec!["service-id-6".into()],)
+                    );
+                }
+                NotifyEvent::Notify(ChangeType::Delete, pk) => {
+                    assert_eq!(pk, vec!["service-id-6".into()]);
+                    // check that we dont get an update after
+                    assert!(tokio::time::timeout(Duration::from_secs(2), notify_rows.recv::<NotifyEvent>()).await.is_err());
+                }
+                _ => panic!("expected notify event"),
+            }
         }
 
         // previous subs have been dropped.
@@ -1420,7 +1434,7 @@ mod tests {
         };
 
         assert_eq!(
-            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
+            tokio::time::timeout(Duration::from_secs(5), rows_from.recv::<QueryEvent>()).await.unwrap().unwrap().unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(6),

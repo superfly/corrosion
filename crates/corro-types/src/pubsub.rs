@@ -1139,7 +1139,7 @@ impl Matcher {
                     }
                 },
                 _ = &mut tripwire => {
-                    trace!(sub_id = %self.id, "tripped cmd_loop, returning");
+                    info!(sub_id = %self.id, "tripped cmd_loop, returning");
                     // just return!
                     return;
                 }
