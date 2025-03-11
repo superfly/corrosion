@@ -128,6 +128,7 @@ where
 {
     let mut prepped = tx.prepare(stmt.query())?;
 
+    info!("executing statement: {:?}", stmt);
     match stmt {
         Statement::Simple(_)
         | Statement::Verbose {
