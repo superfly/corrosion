@@ -109,6 +109,7 @@ pub struct AgentInner {
     limits: Limits,
     subs_manager: SubsManager,
     updates_manager: UpdatesManager,
+    last_stmt: ArcSwap<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +143,7 @@ impl Agent {
             },
             subs_manager: config.subs_manager,
             updates_manager: config.updates_manager,
+            last_stmt: ArcSwap::from_pointee(None)  ,
         }))
     }
 
@@ -257,6 +259,14 @@ impl Agent {
 
     pub fn cluster_id(&self) -> ClusterId {
         *self.0.cluster_id.load().as_ref()
+    }
+
+    pub fn set_last_stmt(&self, stmt: String) {
+        self.0.last_stmt.store(Arc::new(Some(stmt)));
+    }
+
+    pub fn last_stmt(&self) -> Option<String> {
+        self.0.last_stmt.load().as_ref().clone()
     }
 }
 

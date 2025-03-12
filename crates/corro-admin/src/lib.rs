@@ -99,6 +99,7 @@ pub enum Command {
     Cluster(ClusterCommand),
     Actor(ActorCommand),
     Subs(SubsCommand),
+    Stmt,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -600,6 +601,11 @@ async fn handle_conn(
                             continue;
                         }
                     };
+                }
+                Command::Stmt => {
+                    let stmt = agent.last_stmt();
+                    send(&mut stream, Response::Json(serde_json::json!({"stmt": stmt}))).await;
+                    send_success(&mut stream).await;
                 }
             },
             Ok(None) => {

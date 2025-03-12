@@ -128,7 +128,7 @@ where
 {
     let mut prepped = tx.prepare(stmt.query())?;
 
-    info!("executing statement: {:?}", stmt);
+    debug!("executing statement: {:?}", stmt);
     match stmt {
         Statement::Simple(_)
         | Statement::Verbose {
@@ -175,12 +175,14 @@ pub async fn api_v1_transactions(
         );
     }
 
+    let cloned_agent = agent.clone();
     let res = make_broadcastable_changes(&agent, params, move |tx| {
         let mut total_rows_affected = 0;
 
         let results = statements
             .iter()
             .map(|stmt| {
+                cloned_agent.set_last_stmt(stmt.query().to_string());
                 let start = Instant::now();
                 let res = execute_statement(tx, stmt).map_err(|e| ChangeError::Rusqlite{
                     source: e,

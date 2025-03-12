@@ -490,38 +490,45 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
-        Command::Db(DbCommand::Lock { cmd }) => {
-            let config = match cli.config() {
-                Ok(config) => config,
-                Err(_e) => {
-                    eyre::bail!(
-                        "path to current database is required via the config file passed as --config"
-                    );
-                }
-            };
-
-            let db_path = &config.db.path;
-            info!("Opening DB file at {db_path}");
-            let mut db_file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(db_path)?;
-
-            info!("Acquiring lock...");
-            let start = Instant::now();
-            let _lock = sqlite3_restore::lock_all(&mut db_file, db_path, Duration::from_secs(30))?;
-            info!("Lock acquired after {:?}", start.elapsed());
-
-            info!("Launching command {cmd}");
-            let mut splitted_cmd = shell_words::split(cmd.as_str())?;
-            let exit = std::process::Command::new(splitted_cmd.remove(0))
-                .args(splitted_cmd)
-                .spawn()?
-                .wait()?;
-
-            info!("Exited with code: {:?}", exit.code());
-            std::process::exit(exit.code().unwrap_or(1));
+        Command::Db(db_cmd) => match db_cmd{
+            DbCommand::Lock { cmd } => {
+                let config = match cli.config() {
+                    Ok(config) => config,
+                    Err(_e) => {
+                        eyre::bail!(
+                            "path to current database is required via the config file passed as --config"
+                        );
+                    }
+                };
+    
+                let db_path = &config.db.path;
+                info!("Opening DB file at {db_path}");
+                let mut db_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(db_path)?;
+    
+                info!("Acquiring lock...");
+                let start = Instant::now();
+                let _lock = sqlite3_restore::lock_all(&mut db_file, db_path, Duration::from_secs(30))?;
+                info!("Lock acquired after {:?}", start.elapsed());
+    
+                info!("Launching command {cmd}");
+                let mut splitted_cmd = shell_words::split(cmd.as_str())?;
+                let exit = std::process::Command::new(splitted_cmd.remove(0))
+                    .args(splitted_cmd)
+                    .spawn()?
+                    .wait()?;
+    
+                info!("Exited with code: {:?}", exit.code());
+                std::process::exit(exit.code().unwrap_or(1));
+            }
+            DbCommand::LastStmt => {
+                let mut conn = AdminConn::connect(cli.admin_path()).await?;
+                conn.send_command(corro_admin::Command::Stmt)
+                .await?;
+            }
         }
         Command::Subs(SubsCommand::Info { hash, id }) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
@@ -788,6 +795,8 @@ enum TlsClientCommand {
 enum DbCommand {
     /// Acquires the lock on the DB
     Lock { cmd: String },
+    /// Shows the last statement executed on the DB
+    LastStmt,
 }
 
 #[derive(Subcommand)]
