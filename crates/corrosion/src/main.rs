@@ -795,7 +795,7 @@ enum TlsClientCommand {
 enum DbCommand {
     /// Acquires the lock on the DB
     Lock { cmd: String },
-    /// Shows the last statement executed on the DB
+    /// Shows the last statement executed through the API
     LastStmt,
 }
 
