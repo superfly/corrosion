@@ -13,7 +13,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
+use uuid::Uuid;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
@@ -532,9 +532,9 @@ struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
 
-    priority_tx: CorroSender<oneshot::Sender<CancellationToken>>,
-    normal_tx: CorroSender<oneshot::Sender<CancellationToken>>,
-    low_tx: CorroSender<oneshot::Sender<CancellationToken>>,
+    priority_tx: CorroSender<(oneshot::Sender<CancellationToken>, Uuid)>,
+    normal_tx: CorroSender<(oneshot::Sender<CancellationToken>, Uuid)>,
+    low_tx: CorroSender<(oneshot::Sender<CancellationToken>, Uuid)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -653,15 +653,15 @@ impl SplitPool {
 
         tokio::spawn(async move {
             loop {
-                let (tx, channel) = tokio::select! {
+                let (tx, uuid, channel) = tokio::select! {
                     biased;
 
-                    Some(tx) = priority_rx.recv() => (tx, "priority"),
-                    Some(tx) = normal_rx.recv() => (tx, "normal"),
-                    Some(tx) = low_rx.recv() => (tx, "low"),
+                    Some((tx, uuid)) = priority_rx.recv() => (tx, uuid, "priority"),
+                    Some((tx, uuid)) = normal_rx.recv() => (tx, uuid, "normal"),
+                    Some((tx, uuid)) = low_rx.recv() => (tx, uuid, "low"),
                 };
 
-                wait_conn_drop(tx, channel).await
+                wait_conn_drop(tx, uuid, channel).await
             }
         });
 
@@ -735,13 +735,14 @@ impl SplitPool {
 
     async fn write_inner(
         &self,
-        chan: &CorroSender<oneshot::Sender<CancellationToken>>,
+        chan: &CorroSender<(oneshot::Sender<CancellationToken>, Uuid)>,
         queue: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
         let max_timeout = Duration::from_secs(5 * 60);
 
-        timeout_fut("tx to oneshot channel", max_timeout, chan.send(tx))
+        let uuid = Uuid::new_v4();
+        timeout_fut("tx to oneshot channel", max_timeout, chan.send((tx, uuid)))
             .await?
             .map_err(|_| PoolError::QueueClosed)?;
 
@@ -767,14 +768,15 @@ impl SplitPool {
             .record(start.elapsed().as_secs_f64());
 
         Ok(WriteConn {
+            uuid,
             conn,
-            _drop_guard: token.drop_guard(),
+            token,
             _permit,
         })
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'static str) {
+async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, uuid: Uuid, channel: &'static str) {
     let cancel = CancellationToken::new();
 
     if let Err(_e) = tx.send(cancel.clone()) {
@@ -794,7 +796,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'stati
             }
             _ = interval.tick() => {
                 let elapsed = start.elapsed();
-                warn!("wait_conn_drop has been running since {elapsed:?}, token_is_cancelled - {:?}, channel - {channel}", cancel.is_cancelled());
+                warn!("wait_conn_drop has been running since {elapsed:?}. token_is_cancelled - {:?}, channel - {channel}, uuid - {uuid}", cancel.is_cancelled());
                 continue;
             }
         }
@@ -811,9 +813,17 @@ where
 }
 
 pub struct WriteConn {
+    pub uuid: Uuid,
     conn: sqlite_pool::Connection<CrConn>,
-    _drop_guard: DropGuard,
+    token: CancellationToken,
     _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for WriteConn {
+    fn drop(&mut self) {
+        warn!("dropping write conn, uuid - {uuid}", uuid = self.uuid);
+        self.token.cancel();
+    }
 }
 
 impl Deref for WriteConn {

@@ -1135,6 +1135,7 @@ pub async fn process_multiple_changes(
     histogram!("corro.agent.changes.processing.time.seconds", "source" => "remote").record(start.elapsed());
     histogram!("corro.agent.changes.processing.chunk_size").record(change_chunk_size as f64);
 
+    info!("exiting process_multiple_changes. used write_conn with uuid - {}", conn.uuid);
     Ok(())
 }
 
