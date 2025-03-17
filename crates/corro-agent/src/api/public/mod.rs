@@ -93,7 +93,7 @@ where
         let elapsed = start.elapsed();
         histogram!("corro.agent.changes.processing.time.seconds", "source" => "local").record(start.elapsed());
 
-        match insert_info {
+        let res = match insert_info {
             None => Ok((ret, None, elapsed)),
             Some(InsertChangesInfo {
                 version,
@@ -114,7 +114,9 @@ where
 
                 Ok::<_, ChangeError>((ret, Some(version), elapsed))
             }
-        }
+        };
+        info!("exiting make_broadcastable_changes. used write_conn with uuid - {}", conn.uuid);
+        res
     })
 }
 
