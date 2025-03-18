@@ -90,6 +90,7 @@ where
             version: insert_info.as_ref().map(|info| info.version),
         })?;
 
+        info!("done committing tx in make_broadcastable_changes. used write_conn with uuid - {}", conn.uuid);
         let elapsed = start.elapsed();
         histogram!("corro.agent.changes.processing.time.seconds", "source" => "local").record(start.elapsed());
 
@@ -115,7 +116,7 @@ where
                 Ok::<_, ChangeError>((ret, Some(version), elapsed))
             }
         };
-        info!("exiting make_broadcastable_changes. used write_conn with uuid - {}", conn.uuid);
+        // info!("exiting make_broadcastable_changes. used write_conn with uuid - {}", conn.uuid);
         res
     })
 }
