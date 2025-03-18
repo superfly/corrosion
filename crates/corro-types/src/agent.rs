@@ -821,7 +821,6 @@ pub struct WriteConn {
 
 impl Drop for WriteConn {
     fn drop(&mut self) {
-        warn!("dropping write conn, uuid - {uuid}", uuid = self.uuid);
         self.token.cancel();
     }
 }
