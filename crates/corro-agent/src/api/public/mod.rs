@@ -83,6 +83,7 @@ where
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
+        info!("starting tx in make_broadcastable_changes. used write_conn with uuid - {}", conn.uuid);
         let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
