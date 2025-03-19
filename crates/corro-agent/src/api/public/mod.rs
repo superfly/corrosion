@@ -68,6 +68,7 @@ where
         .await;
     let conn_uuid = conn.uuid;
     let start = Instant::now();
+    info!("starting tx in make_broadcastable_changes. used write_conn with uuid - {}", conn_uuid);
     block_in_place(move || {
         let tx = conn
             .immediate_transaction()
@@ -91,7 +92,6 @@ where
             version: insert_info.as_ref().map(|info| info.version),
         })?;
 
-        info!("done committing tx in make_broadcastable_changes. used write_conn with uuid - {}", conn_uuid);
         let elapsed = start.elapsed();
         histogram!("corro.agent.changes.processing.time.seconds", "source" => "local").record(start.elapsed());
 
