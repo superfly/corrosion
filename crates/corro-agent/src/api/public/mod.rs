@@ -66,7 +66,7 @@ where
         .booked()
         .write::<&str, _>("make_broadcastable_changes(booked writer)", None)
         .await;
-
+    let conn_uuid = conn.uuid;
     let start = Instant::now();
     block_in_place(move || {
         let tx = conn
@@ -83,7 +83,7 @@ where
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
-        info!("starting tx in make_broadcastable_changes. used write_conn with uuid - {}", conn.uuid);
+        info!("starting tx in make_broadcastable_changes. used write_conn with uuid - {}", conn_uuid);
         let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
@@ -91,7 +91,7 @@ where
             version: insert_info.as_ref().map(|info| info.version),
         })?;
 
-        info!("done committing tx in make_broadcastable_changes. used write_conn with uuid - {}", conn.uuid);
+        info!("done committing tx in make_broadcastable_changes. used write_conn with uuid - {}", conn_uuid);
         let elapsed = start.elapsed();
         histogram!("corro.agent.changes.processing.time.seconds", "source" => "local").record(start.elapsed());
 
@@ -117,7 +117,6 @@ where
                 Ok::<_, ChangeError>((ret, Some(version), elapsed))
             }
         };
-        // info!("exiting make_broadcastable_changes. used write_conn with uuid - {}", conn.uuid);
         res
     })
 }
