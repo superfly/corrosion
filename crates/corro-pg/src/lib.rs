@@ -2296,6 +2296,11 @@ impl<'conn> Session<'conn> {
     fn handle_commit(&self) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
 
+        // we are grabbing the bookie, but we don't have the write permit here
+        if !self.tx_state.is_writing() {
+            warn!("grabbing bookie without write permit in corro-pg");
+        }
+
         let mut book_writer = self
             .agent
             .booked()
