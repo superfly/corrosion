@@ -436,7 +436,7 @@ async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
 
     let (busy_timeout, cache_size) = {
         // update settings in write conn
-        let conn = pool.write_low().await?;
+        let conn = pool.write_low("vacuum_db_settings").await?;
         let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
         conn.pragma_update(None, "busy_timeout", 60000)?;
 
@@ -446,7 +446,7 @@ async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
     };
 
     while freelist >= lim {
-        let conn = pool.write_low().await?;
+        let conn = pool.write_low("vacuum_db").await?;
 
         block_in_place(|| {
             let start = Instant::now();
@@ -467,7 +467,7 @@ async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
         sleep(Duration::from_secs(1)).await;
     }
 
-    let conn = pool.write_low().await?;
+    let conn = pool.write_low("vacuum_db_settings").await?;
     conn.pragma_update(None, "busy_timeout", busy_timeout)?;
     conn.pragma_update(None, "cache_size", cache_size)?;
 
@@ -527,7 +527,7 @@ async fn wal_checkpoint_over_threshold(
 ) -> eyre::Result<bool> {
     let should_truncate = wal_path.metadata()?.len() > threshold;
     if should_truncate {
-        let conn = pool.write_low().await?;
+        let conn = pool.write_low("wal_checkpoint").await?;
         block_in_place(|| wal_checkpoint(&conn))?;
     }
     Ok(should_truncate)
@@ -632,7 +632,7 @@ pub async fn process_emptyset(
     let version_iter = versions.chunks(100);
 
     for chunk in version_iter {
-        let mut conn = agent.pool().write_low().await?;
+        let mut conn = agent.pool().write_low("process_emptyset").await?;
         debug!("processing emptyset from {:?}", actor_id);
         let booked = {
             bookie
@@ -688,7 +688,7 @@ pub async fn process_emptyset(
         })?;
     }
 
-    let mut conn = agent.pool().write_low().await?;
+    let mut conn = agent.pool().write_low("process_emptyset").await?;
     let booked = {
         bookie
             .write(
@@ -1208,7 +1208,7 @@ mod tests {
         let pool = SplitPool::create(db_path, write_sema.clone()).await?;
 
         {
-            let mut conn = pool.write_priority().await?;
+            let mut conn = pool.write_priority("test_vacuum").await?;
             conn.execute(
                 r#"
             CREATE TABLE test (

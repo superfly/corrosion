@@ -532,9 +532,9 @@ struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
 
-    priority_tx: CorroSender<(oneshot::Sender<CancellationToken>, Uuid)>,
-    normal_tx: CorroSender<(oneshot::Sender<CancellationToken>, Uuid)>,
-    low_tx: CorroSender<(oneshot::Sender<CancellationToken>, Uuid)>,
+    priority_tx: CorroSender<(oneshot::Sender<CancellationToken>, Uuid, &'static str)>,
+    normal_tx: CorroSender<(oneshot::Sender<CancellationToken>, Uuid, &'static str)>,
+    low_tx: CorroSender<(oneshot::Sender<CancellationToken>, Uuid, &'static str)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -653,15 +653,15 @@ impl SplitPool {
 
         tokio::spawn(async move {
             loop {
-                let (tx, uuid, channel) = tokio::select! {
+                let (tx, uuid, channel, op) = tokio::select! {
                     biased;
 
-                    Some((tx, uuid)) = priority_rx.recv() => (tx, uuid, "priority"),
-                    Some((tx, uuid)) = normal_rx.recv() => (tx, uuid, "normal"),
-                    Some((tx, uuid)) = low_rx.recv() => (tx, uuid, "low"),
+                    Some((tx, uuid, op)) = priority_rx.recv() => (tx, uuid, "priority", op),
+                    Some((tx, uuid, op)) = normal_rx.recv() => (tx, uuid, "normal", op),
+                    Some((tx, uuid, op)) = low_rx.recv() => (tx, uuid, "low", op),
                 };
 
-                wait_conn_drop(tx, uuid, channel).await
+                wait_conn_drop(tx, uuid, channel, op).await
             }
         });
 
@@ -717,32 +717,33 @@ impl SplitPool {
 
     // get a high priority write connection (e.g. client input)
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn write_priority(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.priority_tx, "priority").await
+    pub async fn write_priority(&self, op: &'static str) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.priority_tx, "priority", op).await
     }
 
     // get a normal priority write connection (e.g. sync process)
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn write_normal(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.normal_tx, "normal").await
+    pub async fn write_normal(&self, op: &'static str) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.normal_tx, "normal", op).await
     }
 
     // get a low priority write connection (e.g. background tasks)
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn write_low(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.low_tx, "low").await
+    pub async fn write_low(&self, op: &'static str) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.low_tx, "low", op).await
     }
 
     async fn write_inner(
         &self,
-        chan: &CorroSender<(oneshot::Sender<CancellationToken>, Uuid)>,
+        chan: &CorroSender<(oneshot::Sender<CancellationToken>, Uuid, &'static str)>,
         queue: &'static str,
+        op: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
         let max_timeout = Duration::from_secs(5 * 60);
 
         let uuid = Uuid::new_v4();
-        timeout_fut("tx to oneshot channel", max_timeout, chan.send((tx, uuid)))
+        timeout_fut("tx to oneshot channel", max_timeout, chan.send((tx, uuid, op)))
             .await?
             .map_err(|_| PoolError::QueueClosed)?;
 
@@ -776,7 +777,7 @@ impl SplitPool {
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, uuid: Uuid, channel: &'static str) {
+async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, uuid: Uuid, channel: &'static str, op: &'static str) {
     let cancel = CancellationToken::new();
 
     if let Err(_e) = tx.send(cancel.clone()) {
@@ -796,7 +797,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, uuid: Uuid, chan
             }
             _ = interval.tick() => {
                 let elapsed = start.elapsed();
-                warn!("wait_conn_drop has been running since {elapsed:?}. token_is_cancelled - {:?}, channel - {channel}, uuid - {uuid}", cancel.is_cancelled());
+                warn!("wait_conn_drop has been running since {elapsed:?}. token_is_cancelled - {:?}, channel - {channel}, uuid - {uuid}, op - {op}", cancel.is_cancelled());
                 continue;
             }
         }

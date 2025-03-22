@@ -56,10 +56,12 @@ where
     F: Fn(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
     trace!("getting conn...");
-    let mut conn = agent.pool().write_priority().await?;
+    let mut conn = agent.pool().write_priority("make_broadcastable_changes").await?;
     trace!("got conn");
 
     let actor_id = agent.actor_id();
+    info!("starting tx in make_broadcastable_changes. used write_conn with uuid - {}", conn.uuid);
+
     // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
     // so it probably doesn't matter too much, except for reads of internal state
     let mut book_writer = agent
@@ -68,7 +70,6 @@ where
         .await;
     let conn_uuid = conn.uuid;
     let start = Instant::now();
-    info!("starting tx in make_broadcastable_changes. used write_conn with uuid - {}", conn_uuid);
     block_in_place(move || {
         let tx = conn
             .immediate_transaction()
@@ -84,7 +85,6 @@ where
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
-        info!("starting tx in make_broadcastable_changes. used write_conn with uuid - {}", conn_uuid);
         let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
@@ -479,7 +479,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     let partial_schema = parse_sql(&new_sql)?;
 
     info!("getting write connection to update schema");
-    let mut conn = agent.pool().write_priority().await?;
+    let mut conn = agent.pool().write_priority("execute_schema").await?;
     info!("got write connection to update schema");
 
     // hold onto this lock so nothing else makes changes
@@ -959,7 +959,7 @@ mod tests {
 
         {
             // adding the table and an index
-            let conn = agent.pool().write_priority().await?;
+            let conn = agent.pool().write_priority("test_api").await?;
             conn.execute_batch(create_stmt)?;
             conn.execute_batch("CREATE INDEX tests3_updated_at ON tests3 (updated_at);")?;
             assert_eq!(

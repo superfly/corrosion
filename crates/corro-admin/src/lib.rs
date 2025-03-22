@@ -336,7 +336,7 @@ async fn handle_conn(
                                 .unwrap()
                                 .clone();
 
-                            let mut conn = agent.pool().write_low().await.unwrap();
+                            let mut conn = agent.pool().write_low("admin sync reconcile gaps").await.unwrap();
                             debug_log(&mut stream, format!("got write conn for actor id: {actor_id}")).await;
 
                             let mut bv = booked
@@ -443,7 +443,7 @@ async fn handle_conn(
                 Command::Cluster(ClusterCommand::SetId(cluster_id)) => {
                     info_log(&mut stream, format!("setting new cluster id: {cluster_id}")).await;
 
-                    let mut conn = match agent.pool().write_priority().await {
+                    let mut conn = match agent.pool().write_priority("set_cluster_id").await {
                         Ok(conn) => conn,
                         Err(e) => {
                             send_error(&mut stream, e).await;
