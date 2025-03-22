@@ -1139,7 +1139,7 @@ mod tests {
 
         {
             // hold write connection so that max_concurrency is reached
-            let _conn = agent.pool().write_normal().await?;
+            let _conn = agent.pool().write_normal("test_loadshed_handle_changes").await?;
 
             // queue size is very small - only three changes
             // 10-6 are stuck proecessing because we hold the write conn
