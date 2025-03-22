@@ -753,6 +753,7 @@ impl SplitPool {
             .await?
             .map_err(|_| PoolError::CallbackClosed)?;
 
+        info!("done receiving token in write_inner for write_conn with uuid - {}", uuid);
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
         let conn = timeout_fut("acquiring write conn", max_timeout, self.0.write.get()).await??;
@@ -765,6 +766,7 @@ impl SplitPool {
         )
         .await??;
 
+        info!("done acquiring write permit in write_inner for write_conn with uuid - {}", uuid);
         histogram!("corro.sqlite.write_permit.acquisition.seconds")
             .record(start.elapsed().as_secs_f64());
 

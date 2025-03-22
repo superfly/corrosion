@@ -68,7 +68,7 @@ where
         .booked()
         .write::<&str, _>("make_broadcastable_changes(booked writer)", None)
         .await;
-    info!("after bookie make_broadcastable_changes. used write_conn with uuid - {}", conn.uuid);
+
     let conn_uuid = conn.uuid;
     let start = Instant::now();
     block_in_place(move || {
