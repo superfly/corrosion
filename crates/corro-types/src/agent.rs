@@ -740,6 +740,7 @@ impl SplitPool {
         let token = timeout_fut("rx from oneshot channel", max_timeout, rx)
             .await?
             .map_err(|_| PoolError::CallbackClosed)?;
+        let _drop_guard = token.drop_guard();
 
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
@@ -758,7 +759,7 @@ impl SplitPool {
 
         Ok(WriteConn {
             conn,
-            _drop_guard: token.drop_guard(),
+            _drop_guard,
             _permit,
         })
     }
