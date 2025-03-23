@@ -522,9 +522,9 @@ struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
 
-    priority_tx: CorroSender<oneshot::Sender<CancellationToken>>,
-    normal_tx: CorroSender<oneshot::Sender<CancellationToken>>,
-    low_tx: CorroSender<oneshot::Sender<CancellationToken>>,
+    priority_tx: CorroSender<oneshot::Sender<DropGuard>>,
+    normal_tx: CorroSender<oneshot::Sender<DropGuard>>,
+    low_tx: CorroSender<oneshot::Sender<DropGuard>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -725,7 +725,7 @@ impl SplitPool {
 
     async fn write_inner(
         &self,
-        chan: &CorroSender<oneshot::Sender<CancellationToken>>,
+        chan: &CorroSender<oneshot::Sender<DropGuard>>,
         queue: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
@@ -737,10 +737,9 @@ impl SplitPool {
 
         let start = Instant::now();
 
-        let token = timeout_fut("rx from oneshot channel", max_timeout, rx)
+        let _drop_guard = timeout_fut("rx from oneshot channel", max_timeout, rx)
             .await?
             .map_err(|_| PoolError::CallbackClosed)?;
-        let _drop_guard = token.drop_guard();
 
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
@@ -765,15 +764,15 @@ impl SplitPool {
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'static str) {
+async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str) {
     let cancel = CancellationToken::new();
 
-    if let Err(_e) = tx.send(cancel.clone()) {
+    if let Err(_e) = tx.send(cancel.clone().drop_guard()) {
         error!("could not send back drop guard for pooled conn, oneshot channel likely closed");
         return;
     }
 
-    let mut interval = tokio::time::interval(Duration::from_secs(5*60));
+    let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
     // skip first tick
     interval.tick().await;
     let start = Instant::now();
