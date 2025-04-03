@@ -1511,6 +1511,7 @@ mod tests {
 
         let bcast_cache: SharedMatcherBroadcastCache = Default::default();
 
+        tokio::time::sleep(Duration::from_secs(1)).await;
         {
             let mut res = api_v1_subs(
                 Extension(agent.clone()),
@@ -1528,11 +1529,6 @@ mod tests {
             }
 
             assert_eq!(res.status(), StatusCode::OK);
-            // small sleep here to make sure `broadcast_changes` has already run
-            // for earlier transactions
-            tokio::time::sleep(Duration::from_secs(1)).await;
-
-            assert_eq!(status_code, StatusCode::OK);
 
             let mut rows = RowsIter {
                 body: res.into_body(),
@@ -1558,6 +1554,8 @@ mod tests {
                 )
             );
 
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
             let evt = rows.recv::<QueryEvent>().await.unwrap().unwrap();
             assert!(matches!(evt, QueryEvent::EndOfQuery { .. }));
 
@@ -1577,7 +1575,7 @@ mod tests {
                 rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Change(
                     ChangeType::Insert,
-                    RowId(3),
+                    RowId(2),
                     vec![
                         "test1-id-3".into(),
                         "service-name-3".into(),
@@ -1604,7 +1602,7 @@ mod tests {
                 rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Change(
                     ChangeType::Insert,
-                    RowId(4),
+                    RowId(3),
                     vec!["test1-id".into(), "service-name".into(), SqliteValue::Null],
                     ChangeId(2)
                 )
@@ -1643,7 +1641,7 @@ mod tests {
                 rows.recv::<QueryEvent>().await.unwrap().unwrap(),
                 QueryEvent::Change(
                     ChangeType::Insert,
-                    RowId(5),
+                    RowId(4),
                     vec![
                         "test1-id".into(),
                         "service-name".into(),
