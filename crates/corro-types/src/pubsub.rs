@@ -1549,7 +1549,7 @@ impl Matcher {
                     .map(|x| x.preload_query.clone())
                 {
                     let (preload_query, sub_pk) = preload_params;
-                    info!("running preload query: {:?}", preload_query);
+                    debug!("running preload query: {:?}", preload_query);
                     let mut preload_prepped = tx.prepare_cached(&format!(
                         "INSERT INTO query ({}) VALUES ({}) ON CONFLICT DO NOTHING",
                         sub_pk.join(","),
@@ -1560,9 +1560,7 @@ impl Matcher {
                     let mut rows = preload_stmt.query(())?;
                     while let Some(row) = rows.next()? {
                         for i in 0..sub_pk.len() {
-                            let cell = SqliteValueRef::from(row.get_ref(i)?);
-                            info!("cell: {:?}", cell.as_text());
-                            preload_prepped.raw_bind_parameter(i + 1, cell)?;
+                            preload_prepped.raw_bind_parameter(i + 1,  SqliteValueRef::from(row.get_ref(i)?))?;
                         }
                         preload_prepped.raw_execute()?;
                     }
