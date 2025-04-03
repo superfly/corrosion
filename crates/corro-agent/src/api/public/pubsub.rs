@@ -912,7 +912,7 @@ mod tests {
     };
     use corro_tests::launch_test_agent;
     use corro_tests::tempdir::TempDir;
-    use corro_types::api::SqliteValue::Integer;
+    use corro_types::api::SqliteValue;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_v1_subs() -> eyre::Result<()> {
@@ -1047,10 +1047,7 @@ mod tests {
             );
 
             let evt = rows.recv::<QueryEvent>().await.unwrap().unwrap();
-            assert!(matches!(
-                evt,
-                QueryEvent::EndOfQuery { .. }
-            ));
+            assert!(matches!(evt, QueryEvent::EndOfQuery { .. }));
 
             assert_eq!(
                 rows.recv::<QueryEvent>().await.unwrap().unwrap(),
@@ -1298,7 +1295,12 @@ mod tests {
                 NotifyEvent::Notify(ChangeType::Delete, pk) => {
                     assert_eq!(pk, vec!["service-id-6".into()]);
                     // check that we dont get an update after
-                    assert!(tokio::time::timeout(Duration::from_secs(2), notify_rows.recv::<NotifyEvent>()).await.is_err());
+                    assert!(tokio::time::timeout(
+                        Duration::from_secs(2),
+                        notify_rows.recv::<NotifyEvent>()
+                    )
+                    .await
+                    .is_err());
                 }
                 _ => panic!("expected notify event"),
             }
@@ -1434,7 +1436,11 @@ mod tests {
         };
 
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), rows_from.recv::<QueryEvent>()).await.unwrap().unwrap().unwrap(),
+            tokio::time::timeout(Duration::from_secs(5), rows_from.recv::<QueryEvent>())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(6),
@@ -1447,6 +1453,235 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_subs_left_join() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
+        let dir = TempDir::new(tempfile::tempdir()?);
+
+        let (agent, _agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire.clone(),
+        )
+        .await?;
+
+        let left_join_schema = "
+        create table test1 (
+            id text not null primary key,
+            text text not null default ''
+        );
+        create table test2 (
+            id text not null primary key,
+            test1_id text not null default '',
+            text text
+        );";
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![left_join_schema.into()]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::Json(vec![
+                Statement::WithParams(
+                    "insert into test1 (id, text) values (?,?)".into(),
+                    vec!["test1-id".into(), "service-name".into()],
+                ),
+                Statement::WithParams(
+                    "insert into test2 (id, test1_id, text) values (?, ?, ?)".into(),
+                    vec!["test2-id".into(), "test1-id".into(), "service-text".into()],
+                ),
+            ]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        assert!(body.0.results.len() == 2);
+
+        let bcast_cache: SharedMatcherBroadcastCache = Default::default();
+
+        {
+            let mut res = api_v1_subs(
+                Extension(agent.clone()),
+                Extension(bcast_cache.clone()),
+                Extension(tripwire.clone()),
+                axum::extract::Query(SubParams::default()),
+                axum::Json(Statement::Simple("select t1.id, t1.text, t2.text from test1 t1 left join test2 t2 on t1.id = t2.test1_id".into())),
+            )
+            .await
+            .into_response();
+
+            if !res.status().is_success() {
+                let b = res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(res.status(), StatusCode::OK);
+            // small sleep here to make sure `broadcast_changes` has already run
+            // for earlier transactions
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            let mut rows = RowsIter {
+                body: res.into_body(),
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            };
+
+            assert_eq!(
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+                QueryEvent::Columns(vec!["id".into(), "text".into(), "text".into()])
+            );
+
+            assert_eq!(
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(1),
+                    vec![
+                        "test1-id".into(),
+                        "service-name".into(),
+                        "service-text".into()
+                    ]
+                )
+            );
+
+            let evt = rows.recv::<QueryEvent>().await.unwrap().unwrap();
+            assert!(matches!(evt, QueryEvent::EndOfQuery { .. }));
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into test1 (id, text) values (?,?)".into(),
+                    vec!["test1-id-3".into(), "service-name-3".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            assert_eq!(
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+                QueryEvent::Change(
+                    ChangeType::Insert,
+                    RowId(3),
+                    vec![
+                        "test1-id-3".into(),
+                        "service-name-3".into(),
+                        SqliteValue::Null
+                    ],
+                    ChangeId(1)
+                )
+            );
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
+                axum::Json(vec![Statement::WithParams(
+                    "delete from test2 where id = ?".into(),
+                    vec!["test2-id".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            assert_eq!(
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+                QueryEvent::Change(
+                    ChangeType::Insert,
+                    RowId(4),
+                    vec!["test1-id".into(), "service-name".into(), SqliteValue::Null],
+                    ChangeId(2)
+                )
+            );
+
+            assert_eq!(
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+                QueryEvent::Change(
+                    ChangeType::Delete,
+                    RowId(1),
+                    vec![
+                        "test1-id".into(),
+                        "service-name".into(),
+                        "service-text".into()
+                    ],
+                    ChangeId(3)
+                )
+            );
+
+            //insert again
+            let (status_code, body) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TransactionParams { timeout: None }),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into test2 (id, test1_id, text) values (?, ?, ?)".into(),
+                    vec!["test2-id".into(), "test1-id".into(), "service-text".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+            assert!(body.0.results.len() == 1);
+            println!("body: {:?}", body.0.results);
+
+            assert_eq!(
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+                QueryEvent::Change(
+                    ChangeType::Insert,
+                    RowId(5),
+                    vec![
+                        "test1-id".into(),
+                        "service-name".into(),
+                        "service-text".into()
+                    ],
+                    ChangeId(4)
+                )
+            );
+
+            // let (status_code, body) = api_v1_transactions(
+            //     Extension(agent.clone()),
+            //     axum::extract::Query(TransactionParams { timeout: None }),
+            //     axum::Json(vec![
+            //         Statement::WithParams(
+            //             "insert into test1 (id, text) values (?,?)".into(),
+            //             vec!["test1-id2".into(), "service-name2".into()],
+            //         ),
+            //     ]),
+            // )
+            // .await;
+
+            // assert_eq!(status_code, StatusCode::OK);
+
+            // assert!(body.0.results.len() == 1);
+            // assert_eq!(
+            //     rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+            //     QueryEvent::Change(
+            //         ChangeType::Insert,
+            //         RowId(7),
+            //         vec!["test1-id2".into(), "service-name2".into(), SqliteValue::Null],
+            //         ChangeId(6)
+            //     )
+            // );
+        }
+
+        Ok(())
+    }
+
     async fn match_buffered_changes() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
 
@@ -1570,7 +1805,10 @@ mod tests {
 
         assert_eq!(
             rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Row(RowId(1), vec![Integer(1), "one".into(), "one line".into()])
+            QueryEvent::Row(
+                RowId(1),
+                vec![SqliteValue::Integer(1), "one".into(), "one line".into()]
+            )
         );
 
         assert!(matches!(
@@ -1659,7 +1897,7 @@ mod tests {
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(2),
-                vec![Integer(2), "two".into(), "two line".into()],
+                vec![SqliteValue::Integer(2), "two".into(), "two line".into()],
                 ChangeId(1)
             )
         );
@@ -1667,7 +1905,7 @@ mod tests {
         let notify_res = timeout(Duration::from_secs(5), notify_rows.recv::<NotifyEvent>()).await?;
         assert_eq!(
             notify_res.unwrap().unwrap(),
-            NotifyEvent::Notify(ChangeType::Update, vec![Integer(2)],)
+            NotifyEvent::Notify(ChangeType::Update, vec![SqliteValue::Integer(2)],)
         );
 
         tripwire_tx.send(()).await.ok();

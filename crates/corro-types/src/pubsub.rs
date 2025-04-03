@@ -26,7 +26,7 @@ use spawn::spawn_counted;
 use sqlite3_parser::{
     ast::{
         As, Cmd, Expr, FromClause, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, Name,
-        OneSelect, Operator, QualifiedName, ResultColumn, Select, SelectTable, Stmt,
+        OneSelect, Operator, QualifiedName, ResultColumn, Select, SelectBody, SelectTable, Stmt,
     },
     lexer::sql::Parser,
 };
@@ -526,6 +526,7 @@ pub struct Matcher {
 pub struct MatcherStmt {
     new_query: String,
     temp_query: String,
+    preload_query: Option<(String, Vec<String>)>,
 }
 
 impl MatcherStmt {
@@ -646,7 +647,7 @@ impl Matcher {
         }
 
         for (idx, (tbl_name, _cols)) in parsed.table_columns.iter().enumerate() {
-            let expr = table_to_expr(
+            let mut expr = table_to_expr(
                 &parsed.aliases,
                 schema
                     .tables
@@ -657,11 +658,75 @@ impl Matcher {
 
             let mut stmt = stmt.clone();
 
+            let mut preload_query: Option<(String, Vec<String>)> = None;
             if let Stmt::Select(select) = &mut stmt {
                 if let OneSelect::Select {
                     where_clause, from, ..
                 } = &mut select.body.select
                 {
+                    match from {
+                        Some(from) if idx > 0 => {
+                            let cloned_from = from.clone();
+                            if let FromClause {
+                                select: Some(select),
+                                joins: Some(joins),
+                                ..
+                            } = from
+                            {
+                                // Replace LEFT JOIN with INNER join if the target is the joined table
+                                if let Some(JoinedSelectTable {
+                                    operator:
+                                        JoinOperator::TypedJoin {
+                                            join_type: Some(JoinType::LeftOuter | JoinType::Left),
+                                            ..
+                                        },
+                                    table: SelectTable::Table(joined_qname, _, _),
+                                    ..
+                                }) = joins.get_mut(idx - 1)
+                                {
+                                    if let SelectTable::Table(qname, _, _) = &**select {
+                                        let (main, joined) =
+                                            (qname.name.to_string(), joined_qname.name.to_string());
+                                        let (new_expr, preload_select) = joined_table_to_expr(
+                                            &parsed.aliases,
+                                            schema.tables.get(&main).expect(
+                                                "this should not happen, missing table in schema",
+                                            ),
+                                            schema.tables.get(&joined).expect(
+                                                "this should not happen, missing table in schema",
+                                            ),
+                                            &pks,
+                                            cloned_from,
+                                            idx,
+                                        )?;
+
+                                        let sub_pk = pks
+                                            .get(&main)
+                                            .cloned()
+                                            .ok_or(MatcherError::MissingPrimaryKeys)?
+                                            .into_iter()
+                                            .chain(
+                                                pks.get(&joined)
+                                                    .cloned()
+                                                    .ok_or(MatcherError::MissingPrimaryKeys)?
+                                                    .into_iter(),
+                                            )
+                                            .collect::<Vec<_>>();
+
+                                        expr = new_expr;
+                                        let mut preload_stmt = Cmd::Stmt(preload_select).to_string();
+                                        // remove the semicolon
+                                        preload_stmt.pop();
+                                        preload_query = Some((preload_stmt, sub_pk));
+
+                                        debug!("PRELOAD QUERY: {:?} for table {main} joined with {joined}", preload_query);
+                                    }
+                                };
+                            }
+                        }
+                        _ => (),
+                    };
+
                     *where_clause = if let Some(prev) = where_clause.take() {
                         Some(Expr::Binary(
                             Box::new(expr),
@@ -670,37 +735,6 @@ impl Matcher {
                         ))
                     } else {
                         Some(expr)
-                    };
-
-                    match from {
-                        Some(FromClause {
-                            joins: Some(joins), ..
-                        }) if idx > 0 => {
-                            // Replace LEFT JOIN with INNER join if the target is the joined table
-                            if let Some(JoinedSelectTable {
-                                operator:
-                                    JoinOperator::TypedJoin {
-                                        join_type:
-                                            join_type @ Some(JoinType::LeftOuter | JoinType::Left),
-                                        ..
-                                    },
-                                ..
-                            }) = joins.get_mut(idx - 1)
-                            {
-                                *join_type = Some(JoinType::Inner);
-                            };
-
-                            // Remove all custom INDEXED BY clauses for the table as the most efficient
-                            // way is to query it by the primary keys
-                            if let Some(JoinedSelectTable {
-                                table: SelectTable::Table(_, _, indexed @ Some(_)),
-                                ..
-                            }) = joins.get_mut(idx - 1)
-                            {
-                                *indexed = None
-                            };
-                        }
-                        _ => (),
                     };
                 }
             }
@@ -732,6 +766,7 @@ impl Matcher {
                 MatcherStmt {
                     new_query,
                     temp_query,
+                    preload_query,
                 },
             );
         }
@@ -1504,6 +1539,39 @@ impl Matcher {
             query_cols.push(col_name);
         }
 
+        {
+            let tx = self.conn.transaction()?;
+            let state_tx = state_conn.transaction()?;
+            for table in tables.iter() {
+                if let Some(Some(ref preload_params)) = self
+                    .cached_statements
+                    .get(table.as_str())
+                    .map(|x| x.preload_query.clone())
+                {
+                    let (preload_query, sub_pk) = preload_params;
+                    info!("running preload query: {:?}", preload_query);
+                    let mut preload_prepped = tx.prepare_cached(&format!(
+                        "INSERT INTO query ({}) VALUES ({}) ON CONFLICT DO NOTHING",
+                        sub_pk.join(","),
+                        sub_pk.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+                    ))?;
+
+                    let mut preload_stmt = state_tx.prepare_cached(preload_query)?;
+                    let mut rows = preload_stmt.query(())?;
+                    while let Some(row) = rows.next()? {
+                        for i in 0..sub_pk.len() {
+                            let cell = SqliteValueRef::from(row.get_ref(i)?);
+                            info!("cell: {:?}", cell.as_text());
+                            preload_prepped.raw_bind_parameter(i + 1, cell)?;
+                        }
+                        preload_prepped.raw_execute()?;
+                    }
+                }
+            }
+
+            tx.commit()?;
+        }
+
         // start a new tx
         let tx = self.conn.transaction()?;
 
@@ -1585,7 +1653,7 @@ impl Matcher {
                     return_cols = query_cols.join(",")
                 );
 
-                trace!("INSERT SQL: {sql}");
+                trace!("DELETE SQL: {sql}");
 
                 let insert_prepped = tx.prepare_cached(&sql)?;
 
@@ -1603,8 +1671,6 @@ impl Matcher {
                     query_query = stmt.temp_query,
                     return_cols = query_cols.join(",")
                 );
-
-                trace!("DELETE SQL: {sql}");
 
                 let delete_prepped = tx.prepare_cached(&sql)?;
 
@@ -2195,6 +2261,148 @@ fn table_to_expr(
     );
 
     Ok(expr)
+}
+
+fn joined_table_to_expr(
+    aliases: &HashMap<String, String>,
+    tbl: &Table,
+    joined_tbl: &Table,
+    sub_pks: &IndexMap<String, Vec<String>>,
+    mut from: FromClause,
+    index: usize,
+) -> Result<(Expr, Stmt), MatcherError> {
+    let table = &tbl.name;
+    let joined_table = &joined_tbl.name;
+    let tbl_name = aliases
+        .iter()
+        .find_map(|(alias, actual)| (actual == table).then_some(alias))
+        .cloned()
+        .unwrap_or_else(|| table.to_owned());
+
+    let joined_tbl_name = aliases
+        .iter()
+        .find_map(|(alias, actual)| (actual == joined_table).then_some(alias))
+        .cloned()
+        .unwrap_or_else(|| joined_table.to_owned());
+
+    let mut cloned_from = from.clone();
+    // we can't initialize a from clause, so we modify it in place
+    cloned_from.select = Some(Box::new(SelectTable::Table(
+        QualifiedName::fullname(Name("__corro_sub".into()), Name("query".into())),
+        None,
+        None,
+    )));
+    cloned_from.joins = None;
+    let expr = Expr::in_select(
+        Expr::Parenthesized(
+            tbl.pk
+                .iter()
+                .map(|pk| Expr::Qualified(Name(tbl_name.clone()), Name(pk.to_owned())))
+                .collect(),
+        ),
+        false,
+        Select {
+            with: None,
+            body: SelectBody {
+                select: OneSelect::Select {
+                    distinctness: None,
+                    columns: sub_pks
+                        .get(table)
+                        .cloned()
+                        .ok_or(MatcherError::MissingPrimaryKeys)?
+                        .iter()
+                        .map(|pk| ResultColumn::Expr(Expr::Name(Name(pk.to_owned())), None))
+                        .collect(),
+                    from: Some(cloned_from),
+                    where_clause: Some(Expr::in_table(
+                        Expr::Parenthesized(
+                            sub_pks
+                                .get(joined_table)
+                                .cloned()
+                                .ok_or(MatcherError::MissingPrimaryKeys)?
+                                .iter()
+                                .map(|pk| Expr::Name(Name(pk.to_owned())))
+                                .collect(),
+                        ),
+                        false,
+                        QualifiedName::fullname(
+                            Name("__corro_sub".into()),
+                            Name(format!("temp_{joined_table}").into()),
+                        ),
+                        None,
+                    )),
+                    group_by: None,
+                    window_clause: None,
+                },
+                compounds: None,
+            },
+            order_by: None,
+            limit: None,
+        },
+    );
+
+    if let Some(ref mut joins) = from.joins {
+        if let Some(JoinedSelectTable {
+            operator:
+                JoinOperator::TypedJoin {
+                    join_type: join_type @ Some(JoinType::LeftOuter | JoinType::Left),
+                    ..
+                },
+            ..
+        }) = joins.get_mut(index - 1)
+        {
+            *join_type = Some(JoinType::Inner);
+        }
+    }
+    let preload_select = Stmt::Select(Select {
+        with: None,
+        body: SelectBody {
+            select: OneSelect::Select {
+                distinctness: None,
+                columns: tbl
+                    .pk
+                    .iter()
+                    .map(|pk| {
+                        ResultColumn::Expr(
+                            Expr::Qualified(Name(tbl_name.clone()), Name(pk.to_owned())),
+                            None,
+                        )
+                    })
+                    .chain(joined_tbl.pk.iter().map(|pk| {
+                        ResultColumn::Expr(
+                            Expr::Qualified(Name(joined_tbl_name.clone()), Name(pk.to_owned())),
+                            None,
+                        )
+                    }))
+                    .collect(),
+                where_clause: Some(Expr::in_table(
+                    Expr::Parenthesized(
+                        joined_tbl
+                            .pk
+                            .iter()
+                            .map(|pk| {
+                                Expr::Qualified(Name(joined_tbl_name.clone()), Name(pk.to_owned()))
+                            })
+                            .collect(),
+                    ),
+                    false,
+                    QualifiedName::fullname(
+                        Name("__corro_sub".into()),
+                        Name(format!("temp_{joined_table}").into()),
+                    ),
+                    None,
+                )),
+                window_clause: None,
+                group_by: None,
+                from: Some(from),
+            },
+            compounds: None,
+        },
+        order_by: None,
+        limit: None,
+    });
+
+    Ok((expr, preload_select))
 }
 
 #[derive(Debug, thiserror::Error)]
