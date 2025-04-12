@@ -7,7 +7,8 @@ use std::{
     future::poll_fn,
     net::SocketAddr,
     str::{FromStr, Utf8Error},
-    sync::Arc, time::Duration,
+    sync::Arc,
+    time::Duration,
 };
 
 use bytes::Buf;
@@ -565,7 +566,10 @@ pub async fn start(
                 conn.set_nodelay(true)?;
                 {
                     let sock = SockRef::from(&conn);
-                    let ka = TcpKeepalive::new().with_time(Duration::from_secs(10)).with_interval(Duration::from_secs(10)).with_retries(4);
+                    let ka = TcpKeepalive::new()
+                        .with_time(Duration::from_secs(10))
+                        .with_interval(Duration::from_secs(10))
+                        .with_retries(4);
                     sock.set_tcp_keepalive(&ka)?;
                 }
                 let is_sslrequest = peek_for_sslrequest(&mut conn).await?;
@@ -1605,7 +1609,6 @@ pub async fn start(
                                     };
 
                                     if let Err(e) = session.handle_execute(
-                                        
                                         prepped,
                                         result_formats,
                                         cmd,
@@ -1623,7 +1626,6 @@ pub async fn start(
 
                                         send_ready(
                                             &mut session,
-                                            
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1650,7 +1652,6 @@ pub async fn start(
                                             )?;
                                             send_ready(
                                                 &mut session,
-                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;
@@ -1670,7 +1671,7 @@ pub async fn start(
                                         )?;
 
                                         send_ready(
-                                            &mut session,               
+                                            &mut session,
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
@@ -1687,7 +1688,6 @@ pub async fn start(
                                             })?;
                                             send_ready(
                                                 &mut session,
-                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;
@@ -1717,7 +1717,6 @@ pub async fn start(
                                             )?;
                                             send_ready(
                                                 &mut session,
-                                                
                                                 discard_until_sync,
                                                 &back_tx,
                                             )?;

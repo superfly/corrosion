@@ -1,5 +1,7 @@
 use corro_types::{
-    actor::ClusterId, broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1}, channel::CorroSender
+    actor::ClusterId,
+    broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
+    channel::CorroSender,
 };
 use metrics::counter;
 use speedy::Readable;
@@ -10,7 +12,12 @@ use tripwire::Tripwire;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
-pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, cluster_id: ClusterId, tx_changes: CorroSender<(ChangeV1, ChangeSource)>) {
+pub fn spawn_unipayload_handler(
+    tripwire: &Tripwire,
+    conn: &quinn::Connection,
+    cluster_id: ClusterId,
+    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+) {
     tokio::spawn({
         let conn = conn.clone();
         let mut tripwire = tripwire.clone();
@@ -57,7 +64,6 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, c
                                         Ok(payload) => {
                                             trace!("parsed a payload: {payload:?}");
 
-       
                                             match payload {
                                                 UniPayload::V1 {
                                                     data:
@@ -87,15 +93,10 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, c
                         }
 
                         for change in changes.into_iter().rev() {
-                            if let Err(e) = tx_changes
-                                    .send(change)
-                                    .await
-                                {
-                                    error!(
-                                        "could not send change for processing: {e}"
-                                    );
-                                    return;
-                                }
+                            if let Err(e) = tx_changes.send(change).await {
+                                error!("could not send change for processing: {e}");
+                                return;
+                            }
                         }
                     }
                 });

@@ -653,7 +653,8 @@ async fn execute(
                     vec![id.clone().into()],
                 ));
                 statements.push(Statement::WithParams(
-                    "DELETE FROM consul_services WHERE node = ? AND id = ? AND source IS NULL;".into(),
+                    "DELETE FROM consul_services WHERE node = ? AND id = ? AND source IS NULL;"
+                        .into(),
                     vec![node.into(), id.into()],
                 ));
             }
@@ -679,7 +680,8 @@ async fn execute(
                     vec![id.clone().into()],
                 ));
                 statements.push(Statement::WithParams(
-                    "DELETE FROM consul_checks WHERE node = ? AND id = ? AND source IS NULL;".into(),
+                    "DELETE FROM consul_checks WHERE node = ? AND id = ? AND source IS NULL;"
+                        .into(),
                     vec![node.into(), id.into()],
                 ));
             }
@@ -819,20 +821,23 @@ mod tests {
         // let conn = ta1_client.pool().get().await?;
         let svc0_clone = svc0.clone();
         ta1_client
-            .execute(&[Statement::WithParams(
-                "INSERT INTO consul_services ( node, id, name, tags, meta, port, address)
+            .execute(
+                &[Statement::WithParams(
+                    "INSERT INTO consul_services ( node, id, name, tags, meta, port, address)
                      VALUES (?,?,?,?,?,?,?)"
-                    .into(),
-                vec![
-                    "node-1".into(),
-                    svc0_clone.id.into(),
-                    svc0_clone.name.into(),
-                    serde_json::to_string(&svc0_clone.tags).unwrap().into(),
-                    serde_json::to_string(&svc0_clone.meta).unwrap().into(),
-                    svc0_clone.port.into(),
-                    svc0_clone.address.into(),
-                ],
-            )], None)
+                        .into(),
+                    vec![
+                        "node-1".into(),
+                        svc0_clone.id.into(),
+                        svc0_clone.name.into(),
+                        serde_json::to_string(&svc0_clone.tags).unwrap().into(),
+                        serde_json::to_string(&svc0_clone.meta).unwrap().into(),
+                        svc0_clone.port.into(),
+                        svc0_clone.address.into(),
+                    ],
+                )],
+                None,
+            )
             .await?;
 
         update_hashes(&ta1_client, "node-1", &mut svc_hashes, &mut check_hashes).await?;

@@ -41,7 +41,6 @@ use std::{
 };
 
 use crate::api::public::update::api_v1_updates;
-use sqlite_pool::{Committable, InterruptibleTransaction};
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
@@ -57,6 +56,7 @@ use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, params, Connection, OptionalExtension};
 use spawn::spawn_counted;
+use sqlite_pool::{Committable, InterruptibleTransaction};
 use tokio::{net::TcpListener, task::block_in_place};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
@@ -437,7 +437,11 @@ pub async fn clear_buffered_meta_loop(
                     let mut conn = pool.write_low().await?;
 
                     block_in_place(|| {
-                        let tx = InterruptibleTransaction::new(conn.immediate_transaction()?, Some(tx_timeout), "clear_buffered_meta");
+                        let tx = InterruptibleTransaction::new(
+                            conn.immediate_transaction()?,
+                            Some(tx_timeout),
+                            "clear_buffered_meta",
+                        );
 
                         // TODO: delete buffered changes from deleted sequences only (maybe, it's kind of hard and may not be necessary)
 
@@ -588,7 +592,11 @@ pub async fn process_fully_buffered_changes(
                     version: Some(version),
                 })?;
 
-            let tx = InterruptibleTransaction::new(base_tx, Some(tx_timeout), "process_buffered_changes");
+            let tx = InterruptibleTransaction::new(
+                base_tx,
+                Some(tx_timeout),
+                "process_buffered_changes",
+            );
 
             info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
@@ -823,7 +831,8 @@ pub async fn process_multiple_changes(
                 version: None,
             })?;
 
-        let mut tx = InterruptibleTransaction::new(tx, Some(tx_timeout), "process_multiple_changes");
+        let mut tx =
+            InterruptibleTransaction::new(tx, Some(tx_timeout), "process_multiple_changes");
         let mut knowns: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
 
@@ -1132,7 +1141,8 @@ pub async fn process_multiple_changes(
         match_changes(agent.updates_manager(), changeset.changes(), db_version);
     }
 
-    histogram!("corro.agent.changes.processing.time.seconds", "source" => "remote").record(start.elapsed());
+    histogram!("corro.agent.changes.processing.time.seconds", "source" => "remote")
+        .record(start.elapsed());
     histogram!("corro.agent.changes.processing.chunk_size").record(change_chunk_size as f64);
 
     Ok(())

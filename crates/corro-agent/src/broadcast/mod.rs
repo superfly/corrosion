@@ -376,7 +376,12 @@ pub fn runtime_loop(
     });
 
     tokio::spawn(handle_broadcasts(
-        agent, rx_bcast, transport, config, tripwire, Default::default()
+        agent,
+        rx_bcast,
+        transport,
+        config,
+        tripwire,
+        Default::default(),
     ));
 }
 
@@ -592,7 +597,10 @@ async fn handle_broadcasts(
             let mut ring0_count = 0;
             for addr in members.ring0(agent.cluster_id()) {
                 if join_set.len() >= MAX_INFLIGHT_BROADCAST {
-                    debug!("breaking, max inflight broadcast reached: {}", MAX_INFLIGHT_BROADCAST);
+                    debug!(
+                        "breaking, max inflight broadcast reached: {}",
+                        MAX_INFLIGHT_BROADCAST
+                    );
                     break;
                 }
                 ring0_count += 1;
@@ -665,7 +673,10 @@ async fn handle_broadcasts(
                 }
             };
 
-            debug!("choosing {} broadcasts, ring0 count: {}, MAX_INFLIGHT_BROADCAST: {}", choose_count, ring0_count, MAX_INFLIGHT_BROADCAST);
+            debug!(
+                "choosing {} broadcasts, ring0 count: {}, MAX_INFLIGHT_BROADCAST: {}",
+                choose_count, ring0_count, MAX_INFLIGHT_BROADCAST
+            );
             while !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
                 let mut pending = to_broadcast.pop_front().unwrap();
 
@@ -1139,7 +1150,7 @@ mod tests {
             transport,
             config,
             tripwire.clone(),
-            BroadcastOpts{
+            BroadcastOpts {
                 interval: Duration::from_secs(2),
                 bcast_cutoff: 5 * estimated_size,
             },

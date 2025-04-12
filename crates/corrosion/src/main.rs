@@ -414,7 +414,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             query,
             param,
             timer,
-            timeout
+            timeout,
         } => {
             let stmt = if param.is_empty() {
                 Statement::Simple(query.clone())

@@ -720,16 +720,19 @@ mod tests {
             .unwrap();
 
         client
-            .execute(&[
-                Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id".into(), "service-name".into()],
-                ),
-                Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id-2".into(), "service-name-2".into()],
-                ),
-            ], None)
+            .execute(
+                &[
+                    Statement::WithParams(
+                        "insert into tests (id, text) values (?,?)".into(),
+                        vec!["service-id".into(), "service-name".into()],
+                    ),
+                    Statement::WithParams(
+                        "insert into tests (id, text) values (?,?)".into(),
+                        vec!["service-id-2".into(), "service-name-2".into()],
+                    ),
+                ],
+                None,
+            )
             .await
             .unwrap();
 
@@ -767,10 +770,13 @@ mod tests {
             println!("output: {output}");
 
             client
-                .execute(&[Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id-3".into(), "service-name-3".into()],
-                )], None)
+                .execute(
+                    &[Statement::WithParams(
+                        "insert into tests (id, text) values (?,?)".into(),
+                        vec!["service-id-3".into(), "service-name-3".into()],
+                    )],
+                    None,
+                )
                 .await
                 .unwrap();
 

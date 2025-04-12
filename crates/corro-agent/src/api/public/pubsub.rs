@@ -1047,10 +1047,7 @@ mod tests {
             );
 
             let evt = rows.recv::<QueryEvent>().await.unwrap().unwrap();
-            assert!(matches!(
-                evt,
-                QueryEvent::EndOfQuery { .. }
-            ));
+            assert!(matches!(evt, QueryEvent::EndOfQuery { .. }));
 
             assert_eq!(
                 rows.recv::<QueryEvent>().await.unwrap().unwrap(),
@@ -1298,7 +1295,12 @@ mod tests {
                 NotifyEvent::Notify(ChangeType::Delete, pk) => {
                     assert_eq!(pk, vec!["service-id-6".into()]);
                     // check that we dont get an update after
-                    assert!(tokio::time::timeout(Duration::from_secs(2), notify_rows.recv::<NotifyEvent>()).await.is_err());
+                    assert!(tokio::time::timeout(
+                        Duration::from_secs(2),
+                        notify_rows.recv::<NotifyEvent>()
+                    )
+                    .await
+                    .is_err());
                 }
                 _ => panic!("expected notify event"),
             }
@@ -1434,7 +1436,11 @@ mod tests {
         };
 
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), rows_from.recv::<QueryEvent>()).await.unwrap().unwrap().unwrap(),
+            tokio::time::timeout(Duration::from_secs(5), rows_from.recv::<QueryEvent>())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
             QueryEvent::Change(
                 ChangeType::Insert,
                 RowId(6),
