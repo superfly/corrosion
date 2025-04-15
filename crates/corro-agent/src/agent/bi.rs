@@ -56,7 +56,12 @@ pub fn spawn_bipayload_handler(
                 let agent = agent.clone();
                 let bookie = bookie.clone();
                 async move {
-                    let mut framed = FramedRead::new(rx, LengthDelimitedCodec::builder().max_frame_length(100 * 1_024 * 1_024).new_codec());
+                    let mut framed = FramedRead::new(
+                        rx,
+                        LengthDelimitedCodec::builder()
+                            .max_frame_length(100 * 1_024 * 1_024)
+                            .new_codec(),
+                    );
 
                     loop {
                         match timeout(Duration::from_secs(5), StreamExt::next(&mut framed)).await {

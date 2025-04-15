@@ -795,7 +795,12 @@ pub async fn handle_changes(
             let changes = std::mem::take(&mut buf);
             let agent = agent.clone();
             let bookie = bookie.clone();
-            join_set.spawn(process_multiple_changes(agent, bookie, changes.clone(), tx_timeout));
+            join_set.spawn(process_multiple_changes(
+                agent,
+                bookie,
+                changes.clone(),
+                tx_timeout,
+            ));
             counter!("corro.agent.changes.batch.spawned").increment(1);
 
             buf_cost -= tmp_cost;

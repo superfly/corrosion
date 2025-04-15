@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use corro_api_types::sqlite::ChangeType;
 use corro_api_types::{ColumnName, NotifyEvent, SqliteValueRef, TableName};
 use corro_base_types::CrsqlDbVersion;
+use indexmap::{map::Entry, IndexMap};
 use metrics::{counter, histogram, Counter};
-use indexmap::{IndexMap, map::Entry};
 use parking_lot::RwLock;
 use rusqlite::Connection;
 use spawn::spawn_counted;
@@ -315,7 +315,7 @@ async fn batch_candidates(
     const KEEP_CACHE_ENTRIES: usize = 1000;
 
     // small cache to ensure we don't send an older update when changes to the same pk
-    // are made in quick succession. Changes aren't sent in order, and there's just one situation where this 
+    // are made in quick succession. Changes aren't sent in order, and there's just one situation where this
     // can be problematic, when we have a delete before an update but those
     // get sent in reverse order. so the client might delete a key that's actually present in the db.
     //
@@ -343,7 +343,7 @@ async fn batch_candidates(
                 debug!(sub_id = %id, "updates got candidates: {candidates:?}");
                 for (table, pk_map) in  candidates {
                     let buffed = buf.entry(table.clone()).or_default();
-        
+
                     for (pk, cl) in pk_map {
                         let e = cl_cache.entry((table.clone(), pk.clone()));
                         match e {

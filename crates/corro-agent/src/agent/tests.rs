@@ -389,7 +389,7 @@ pub async fn configurable_stress_test(
                 Ok(async move {
                     let mut rng = StdRng::from_entropy();
                     let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
-    
+
                     let res = client
                         .request(
                             hyper::Request::builder()
@@ -399,14 +399,14 @@ pub async fn configurable_stress_test(
                                 .body(serde_json::to_vec(&statements)?.into())?,
                         )
                         .await?;
-    
+
                     if res.status() != StatusCode::OK {
                         eyre::bail!("unexpected status code: {}", res.status());
                     }
-    
+
                     let body: ExecResponse =
                         serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
-    
+
                     for (i, statement) in statements.iter().enumerate() {
                         if !matches!(
                             body.results[i],
@@ -418,7 +418,7 @@ pub async fn configurable_stress_test(
                             eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
                         }
                     }
-    
+
                     Ok::<_, eyre::Report>((*actor_id, 1))
                 })
             }
@@ -944,9 +944,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
     for i in 1..=5_i64 {
         let (status_code, _) = api_v1_transactions(
             Extension(ta2.agent.clone()),
-            axum::extract::Query(TransactionParams {
-                timeout: None,
-            }),
+            axum::extract::Query(TransactionParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "INSERT OR REPLACE INTO tests (id,text) VALUES (?,?)".into(),
                 vec![i.into(), "service-text".into()],
@@ -999,7 +997,13 @@ async fn process_failed_changes() -> eyre::Result<()> {
 
     rows.append(&mut good_changes);
 
-    let res = process_multiple_changes(ta1.agent.clone(), ta1.bookie.clone(), rows, Duration::from_secs(60)).await;
+    let res = process_multiple_changes(
+        ta1.agent.clone(),
+        ta1.bookie.clone(),
+        rows,
+        Duration::from_secs(60),
+    )
+    .await;
 
     assert!(res.is_ok());
 
@@ -1345,7 +1349,7 @@ async fn insert_rows(agent: Agent, start: i64, n: i64) {
     for i in start..=n {
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::extract::Query(TransactionParams{timeout: None}),
+            axum::extract::Query(TransactionParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "INSERT OR REPLACE INTO tests3 (id,text,text2, num, num2) VALUES (?,?,?,?,?)"
                     .into(),
@@ -2210,7 +2214,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let (status_code, body) = api_v1_transactions(
         Extension(ta1.agent.clone()),
-        axum::extract::Query(TransactionParams{timeout: None}),
+        axum::extract::Query(TransactionParams { timeout: None }),
         axum::Json(vec![Statement::WithParams(
             "insert into tests (id, text) values (?,?)".into(),
             vec!["service-id".into(), "service-name".into()],
@@ -2282,7 +2286,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let (status_code, body) = api_v1_transactions(
         Extension(ta1.agent.clone()),
-        axum::extract::Query(TransactionParams{timeout: None}),
+        axum::extract::Query(TransactionParams { timeout: None }),
         axum::Json(vec![Statement::WithParams(
             "insert or replace into tests (id, text) values (?,?)".into(),
             vec!["service-id".into(), "service-name-overwrite".into()],

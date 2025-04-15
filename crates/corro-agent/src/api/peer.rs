@@ -1757,7 +1757,7 @@ mod tests {
         for i in versions_range.clone() {
             let (status_code, body) = api_v1_transactions(
                 Extension(ta1.agent.clone()),
-                axum::extract::Query(TransactionParams{timeout: None}),
+                axum::extract::Query(TransactionParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "INSERT OR REPLACE INTO testsblob (id,text) VALUES (?,?)".into(),
                     vec![format!("service-id-{i}").into(), "service-name".into()],

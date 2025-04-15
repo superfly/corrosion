@@ -302,7 +302,6 @@ mod tests {
             ));
         }
 
-
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM testsbool;", (), |row| row.get(0))?;
         assert_eq!(count, 0);
         Ok(())

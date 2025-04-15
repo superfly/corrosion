@@ -42,6 +42,9 @@ jobs:
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.3
 
+      - name: Run formatting check
+        run: cargo fmt --check
+
       - name: Test with latest nextest release
         run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
   

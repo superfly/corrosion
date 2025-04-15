@@ -257,9 +257,16 @@ impl CorrosionApiClient {
         self.updates_typed(table).await
     }
 
-    pub async fn execute(&self, statements: &[Statement], timeout: Option<u64>) -> Result<ExecResponse, Error> {
+    pub async fn execute(
+        &self,
+        statements: &[Statement],
+        timeout: Option<u64>,
+    ) -> Result<ExecResponse, Error> {
         let uri = if let Some(timeout) = timeout {
-            format!("http://{}/v1/transactions?timeout={}", self.api_addr, timeout)
+            format!(
+                "http://{}/v1/transactions?timeout={}",
+                self.api_addr, timeout
+            )
         } else {
             format!("http://{}/v1/transactions", self.api_addr)
         };

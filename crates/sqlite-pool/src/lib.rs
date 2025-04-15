@@ -1,7 +1,6 @@
 mod config;
 
 use arc_swap::ArcSwap;
-use tracing::warn;
 use std::{
     fmt,
     ops::{Deref, DerefMut},
@@ -10,6 +9,7 @@ use std::{
         Arc,
     },
 };
+use tracing::warn;
 
 use deadpool::{
     async_trait,
@@ -230,7 +230,8 @@ where
             // pg and this would spam the logs.
             // warn!("interrupting sqlite connection - sql - {:?})", sql);
             interrupt_hdl.interrupt();
-            counter!("corro.sqlite.interrupt", "source" => source, "reason" => "cancellation").increment(1);
+            counter!("corro.sqlite.interrupt", "source" => source, "reason" => "cancellation")
+                .increment(1);
         });
     }
 }
@@ -266,7 +267,12 @@ impl<'conn, T> InterruptibleStatement<T>
 where
     T: Deref<Target = rusqlite::Statement<'conn>> + DerefMut<Target = rusqlite::Statement<'conn>>,
 {
-    pub fn new(stmt: T, interrupt_hdl: Arc<InterruptHandle>, timeout: Option<Duration>, sql: String) -> Self {
+    pub fn new(
+        stmt: T,
+        interrupt_hdl: Arc<InterruptHandle>,
+        timeout: Option<Duration>,
+        sql: String,
+    ) -> Self {
         Self {
             stmt,
             timeout,
