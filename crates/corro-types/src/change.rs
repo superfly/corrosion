@@ -5,6 +5,8 @@ use corro_api_types::{ColumnName, TableName};
 use corro_base_types::{CrsqlDbVersion, Version};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, params, Connection, Row};
+use serde_json::json;
+use antithesis_sdk::assert_always;
 use speedy::{Readable, Writable};
 use tracing::{debug, trace, warn};
 
@@ -109,7 +111,8 @@ where
             return None;
         }
 
-        debug_assert!(self.changes.is_empty());
+        let details = json!({});
+        assert_always!(self.changes.is_empty(), "changes is empty", &details);
 
         // reset the buffered size
         self.buffered_size = 0;

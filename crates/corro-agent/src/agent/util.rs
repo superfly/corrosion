@@ -39,7 +39,7 @@ use std::{
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
-
+use antithesis_sdk::assert_always;
 use crate::api::public::update::api_v1_updates;
 use axum::{
     error_handling::HandleErrorLayer,
@@ -62,7 +62,7 @@ use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
-
+use serde_json::json;
 use super::BcastCache;
 
 pub async fn initialise_foca(agent: &Agent) {
@@ -1303,7 +1303,8 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
 
-    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize);
+    let details = json!({"len": len, "seqs": seqs.start().0, "seqs_end": seqs.end().0});
+    assert_always!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize, "bumber of changes is greater than the seq num", &details);
 
     let mut impactful_changeset = vec![];
 

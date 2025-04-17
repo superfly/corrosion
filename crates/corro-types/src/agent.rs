@@ -23,10 +23,12 @@ use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
 };
+use antithesis_sdk::assert_always;
 use tokio::{
     sync::{
         AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
@@ -1252,7 +1254,8 @@ impl VersionsSnapshot {
             if count != 1 {
                 warn!(actor_id = %self.actor_id, "did not delete gap from db: {range:?}");
             }
-            debug_assert_eq!(count, 1, "ineffective deletion of gaps in-db: {range:?}");
+            let details = json!({"count": count, "range": range});
+            assert_always!(count == 1, "ineffective deletion of gaps in-db", &details);
             for version in range.clone() {
                 self.partials.remove(&version);
             }

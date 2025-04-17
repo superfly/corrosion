@@ -1,0 +1,13 @@
+app = "corrosion"
+
+[env]
+RUST_BACKTRACE="1"
+# RUST_LOG="info,foca=debug"
+
+[mounts]
+source = "corro_data"
+destination = "/var/lib/corrosion"
+
+[metrics]
+port = 9090
+path = "/"
