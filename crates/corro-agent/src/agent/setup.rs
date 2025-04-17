@@ -1,12 +1,14 @@
 //! Setup main agent state
 
 // External crates
+use antithesis_sdk::assert_always;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use indexmap::IndexMap;
 use metrics::counter;
 use parking_lot::RwLock;
 use rusqlite::{Connection, OptionalExtension};
+use serde_json::json;
 use std::{
     net::SocketAddr,
     ops::{DerefMut, RangeInclusive},
@@ -21,6 +23,7 @@ use tokio::{
     },
 };
 use tracing::{debug, error, info, trace, warn};
+use tracing_subscriber::fmt::format::Json;
 use tripwire::Tripwire;
 
 // Internals
@@ -37,7 +40,9 @@ use crate::{
 use corro_types::updates::UpdatesManager;
 use corro_types::{
     actor::ActorId,
-    agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
+    agent::{
+        migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool,
+    },
     base::Version,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
@@ -203,10 +208,23 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                         .collect()
                 };
 
-                if top
-                    .values()
-                    .any(|meta| meta.started_at.elapsed() >= WARNING_THRESHOLD)
-                {
+                if top.values().any(|meta| {
+                    let duration = meta.started_at.elapsed();
+                    if matches!(meta.state, LockState::Locked) {
+                        let details = json!({
+                            "duration": duration,
+                            "label": meta.label,
+                            "kind": meta.kind,
+                            "state": meta.state,
+                        });
+                        assert_always!(
+                            duration < Duration::from_secs(1 * 60),
+                            "bookie lock held for too long",
+                            &details
+                        );
+                    }
+                    duration >= WARNING_THRESHOLD
+                }) {
                     warn!(
                         "lock registry shows locks held for a long time! top {} locks:",
                         top.len()

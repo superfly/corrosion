@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use itertools::Itertools;
@@ -523,6 +524,7 @@ pub async fn broadcast_changes(
                     match_changes(agent.updates_manager(), &changes, db_version);
 
                     let tx_bcast = agent.tx_bcast().clone();
+                    assert_sometimes!(true, "Corrosion broadcasts changes");
                     tokio::spawn(async move {
                         if let Err(e) = tx_bcast
                             .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(

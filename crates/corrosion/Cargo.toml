@@ -4,6 +4,7 @@ version = "0.2.0-beta.0"
 edition = "2021"
 
 [dependencies]
+antithesis_sdk = { workspace = true }
 build-info = { workspace = true }
 bytes = { workspace = true }
 camino = { workspace = true }

@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
+use antithesis_sdk::assert_sometimes;
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::ToCompactString;
@@ -32,6 +33,8 @@ pub async fn api_v1_updates(
     axum::extract::Path(table): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     info!("Received update request for table: {table}");
+
+    assert_sometimes!(true, "Corrosion receives requests for table updates");
 
     let mut bcast_write = bcast_cache.write().await;
     let updates = agent.updates_manager();

@@ -275,7 +275,7 @@ impl CorrosionApiClient {
         } else {
             format!("http://{}/v1/transactions", self.api_addr)
         };
-        println!("uri: {:?}", uri);
+        // println!("uri: {:?}", uri);
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(uri)

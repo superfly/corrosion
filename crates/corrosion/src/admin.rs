@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use corro_admin::{Command, LogLevel, Response};
+use eyre::eyre;
 use futures::{SinkExt, TryStreamExt};
 use tokio::net::UnixStream;
 use tokio_serde::{formats::Json, Framed};
@@ -43,7 +44,7 @@ impl AdminConn {
             match res {
                 None => {
                     error!("Failed to get response from Corrosion's admin!");
-                    break;
+                    return Err(eyre!("Failed to get response from Corrosion's admin!"));
                 }
                 Some(res) => match res {
                     Response::Log { level, msg, ts } => match level {
@@ -55,7 +56,7 @@ impl AdminConn {
                     },
                     Response::Error { msg } => {
                         error!("{msg}");
-                        break;
+                        return Err(eyre!("{msg}"));
                     }
                     Response::Success => {
                         break;

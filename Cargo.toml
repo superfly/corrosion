@@ -1,5 +1,5 @@
 [workspace]
-members = [
+members = [ ".antithesis/client/rust-load-generator",
 	"crates/*",
 	"integration-tests"
 ]
@@ -7,6 +7,7 @@ resolver = "2"
 
 [workspace.dependencies]
 arc-swap = { version = "1.6.0" }
+antithesis_sdk = { version = "0.2.5" }
 assert2 = "0.3.10"
 async-trait = "0.1.68"
 axum = { version = "0.6.15", features = ["http2", "ws", "tracing", "headers"] }
