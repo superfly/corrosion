@@ -8,8 +8,9 @@ use metrics::gauge;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use metrics_util::MetricKindMask;
 use spawn::wait_for_all_pending_handles;
-use tokio_metrics::RuntimeMonitor;
+// use tokio_metrics::RuntimeMonitor;
 use tracing::{error, info};
+use antithesis_sdk::prelude::*;
 
 use crate::VERSION;
 
@@ -48,7 +49,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
             }
         });
 
-        start_tokio_runtime_reporter();
+        // start_tokio_runtime_reporter();
     }
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
@@ -85,6 +86,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
         }
     }
 
+    antithesis_init();
     tripwire_worker.await;
 
     wait_for_all_pending_handles().await;
@@ -118,6 +120,7 @@ fn setup_prometheus(addr: SocketAddr) -> eyre::Result<()> {
         .install()?;
     Ok(())
 }
+
 
 fn start_tokio_runtime_reporter() {
     let handle = tokio::runtime::Handle::current();
