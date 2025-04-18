@@ -204,7 +204,7 @@ pub async fn api_v1_transactions(
     })
     .await;
 
-    let (results, version, elapsed) = match res {
+    let (mut results, version, elapsed) = match res {
         Ok(res) => res,
         Err(e) => {
             error!("could not execute statement(s): {e}");
@@ -220,6 +220,15 @@ pub async fn api_v1_transactions(
             );
         }
     };
+
+    // no change happened, so we update rows_affected to zero
+    if version.is_none() {
+        results.iter_mut().for_each(|result| {
+            if let ExecResult::Execute { rows_affected, .. } = result {
+                *rows_affected = 0;
+            }
+        });
+    }
 
     (
         StatusCode::OK,
