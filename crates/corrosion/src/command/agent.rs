@@ -122,62 +122,60 @@ fn setup_prometheus(addr: SocketAddr) -> eyre::Result<()> {
 }
 
 
-// TODO: The llvm-args seem to interfere with tokio_metrics crate, so disabling for now
+fn start_tokio_runtime_reporter() {
+    let handle = tokio::runtime::Handle::current();
 
-// fn start_tokio_runtime_reporter() {
-//     let handle = tokio::runtime::Handle::current();
+    {
+        let runtime_monitor = RuntimeMonitor::new(&handle);
+        tokio::spawn(async move {
+            for metrics in runtime_monitor.intervals() {
+                gauge!("corro.tokio.workers_count").set(metrics.workers_count as f64);
+                gauge!("corro.tokio.total_park_count").set(metrics.total_park_count as f64);
+                gauge!("corro.tokio.max_park_count").set(metrics.max_park_count as f64);
+                gauge!("corro.tokio.min_park_count").set(metrics.min_park_count as f64);
+                gauge!("corro.tokio.total_noop_count").set(metrics.total_noop_count as f64);
+                gauge!("corro.tokio.max_noop_count").set(metrics.max_noop_count as f64);
+                gauge!("corro.tokio.min_noop_count").set(metrics.min_noop_count as f64);
+                gauge!("corro.tokio.total_steal_count").set(metrics.total_steal_count as f64);
+                gauge!("corro.tokio.max_steal_count").set(metrics.max_steal_count as f64);
+                gauge!("corro.tokio.min_steal_count").set(metrics.min_steal_count as f64);
+                gauge!("corro.tokio.total_steal_operations")
+                    .set(metrics.total_steal_operations as f64);
+                gauge!("corro.tokio.max_steal_operations").set(metrics.max_steal_operations as f64);
+                gauge!("corro.tokio.min_steal_operations").set(metrics.min_steal_operations as f64);
+                gauge!("corro.tokio.num_remote_schedules").set(metrics.num_remote_schedules as f64);
+                gauge!("corro.tokio.total_local_schedule_count")
+                    .set(metrics.total_local_schedule_count as f64);
+                gauge!("corro.tokio.max_local_schedule_count")
+                    .set(metrics.max_local_schedule_count as f64);
+                gauge!("corro.tokio.min_local_schedule_count")
+                    .set(metrics.min_local_schedule_count as f64);
+                gauge!("corro.tokio.total_overflow_count").set(metrics.total_overflow_count as f64);
+                gauge!("corro.tokio.max_overflow_count").set(metrics.max_overflow_count as f64);
+                gauge!("corro.tokio.min_overflow_count").set(metrics.min_overflow_count as f64);
+                gauge!("corro.tokio.total_polls_count").set(metrics.total_polls_count as f64);
+                gauge!("corro.tokio.max_polls_count").set(metrics.max_polls_count as f64);
+                gauge!("corro.tokio.min_polls_count").set(metrics.min_polls_count as f64);
+                gauge!("corro.tokio.total_busy_seconds")
+                    .set(metrics.total_busy_duration.as_secs_f64());
+                gauge!("corro.tokio.max_busy_seconds").set(metrics.max_busy_duration.as_secs_f64());
+                gauge!("corro.tokio.min_busy_seconds").set(metrics.min_busy_duration.as_secs_f64());
+                gauge!("corro.tokio.injection_queue_depth")
+                    .set(metrics.injection_queue_depth as f64);
+                gauge!("corro.tokio.total_local_queue_depth")
+                    .set(metrics.total_local_queue_depth as f64);
+                gauge!("corro.tokio.max_local_queue_depth")
+                    .set(metrics.max_local_queue_depth as f64);
+                gauge!("corro.tokio.min_local_queue_depth")
+                    .set(metrics.min_local_queue_depth as f64);
+                gauge!("corro.tokio.budget_forced_yield_count")
+                    .set(metrics.budget_forced_yield_count as f64);
+                gauge!("corro.tokio.io_driver_ready_count")
+                    .set(metrics.io_driver_ready_count as f64);
 
-//     {
-//         let runtime_monitor = RuntimeMonitor::new(&handle);
-//         tokio::spawn(async move {
-//             for metrics in runtime_monitor.intervals() {
-//                 gauge!("corro.tokio.workers_count").set(metrics.workers_count as f64);
-//                 gauge!("corro.tokio.total_park_count").set(metrics.total_park_count as f64);
-//                 gauge!("corro.tokio.max_park_count").set(metrics.max_park_count as f64);
-//                 gauge!("corro.tokio.min_park_count").set(metrics.min_park_count as f64);
-//                 gauge!("corro.tokio.total_noop_count").set(metrics.total_noop_count as f64);
-//                 gauge!("corro.tokio.max_noop_count").set(metrics.max_noop_count as f64);
-//                 gauge!("corro.tokio.min_noop_count").set(metrics.min_noop_count as f64);
-//                 gauge!("corro.tokio.total_steal_count").set(metrics.total_steal_count as f64);
-//                 gauge!("corro.tokio.max_steal_count").set(metrics.max_steal_count as f64);
-//                 gauge!("corro.tokio.min_steal_count").set(metrics.min_steal_count as f64);
-//                 gauge!("corro.tokio.total_steal_operations")
-//                     .set(metrics.total_steal_operations as f64);
-//                 gauge!("corro.tokio.max_steal_operations").set(metrics.max_steal_operations as f64);
-//                 gauge!("corro.tokio.min_steal_operations").set(metrics.min_steal_operations as f64);
-//                 gauge!("corro.tokio.num_remote_schedules").set(metrics.num_remote_schedules as f64);
-//                 gauge!("corro.tokio.total_local_schedule_count")
-//                     .set(metrics.total_local_schedule_count as f64);
-//                 gauge!("corro.tokio.max_local_schedule_count")
-//                     .set(metrics.max_local_schedule_count as f64);
-//                 gauge!("corro.tokio.min_local_schedule_count")
-//                     .set(metrics.min_local_schedule_count as f64);
-//                 gauge!("corro.tokio.total_overflow_count").set(metrics.total_overflow_count as f64);
-//                 gauge!("corro.tokio.max_overflow_count").set(metrics.max_overflow_count as f64);
-//                 gauge!("corro.tokio.min_overflow_count").set(metrics.min_overflow_count as f64);
-//                 gauge!("corro.tokio.total_polls_count").set(metrics.total_polls_count as f64);
-//                 gauge!("corro.tokio.max_polls_count").set(metrics.max_polls_count as f64);
-//                 gauge!("corro.tokio.min_polls_count").set(metrics.min_polls_count as f64);
-//                 gauge!("corro.tokio.total_busy_seconds")
-//                     .set(metrics.total_busy_duration.as_secs_f64());
-//                 gauge!("corro.tokio.max_busy_seconds").set(metrics.max_busy_duration.as_secs_f64());
-//                 gauge!("corro.tokio.min_busy_seconds").set(metrics.min_busy_duration.as_secs_f64());
-//                 gauge!("corro.tokio.injection_queue_depth")
-//                     .set(metrics.injection_queue_depth as f64);
-//                 gauge!("corro.tokio.total_local_queue_depth")
-//                     .set(metrics.total_local_queue_depth as f64);
-//                 gauge!("corro.tokio.max_local_queue_depth")
-//                     .set(metrics.max_local_queue_depth as f64);
-//                 gauge!("corro.tokio.min_local_queue_depth")
-//                     .set(metrics.min_local_queue_depth as f64);
-//                 gauge!("corro.tokio.budget_forced_yield_count")
-//                     .set(metrics.budget_forced_yield_count as f64);
-//                 gauge!("corro.tokio.io_driver_ready_count")
-//                     .set(metrics.io_driver_ready_count as f64);
-
-//                 // wait 2s
-//                 tokio::time::sleep(Duration::from_secs(2)).await;
-//             }
-//         });
-//     }
-// }
+                // wait 2s
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+}

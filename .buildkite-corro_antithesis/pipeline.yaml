@@ -20,7 +20,7 @@ steps:
     priority: 70
     key: build-config
     commands:
-      - envsubst < .antithesis/config/docker-compose.yaml.tmpl > .antithesis/config/docker-compose.yaml
+      - envs
       - docker build -f .antithesis/Dockerfile -t ${ANTITHEIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT} .
       - docker push ${ANTITHEIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT}
     plugins:
