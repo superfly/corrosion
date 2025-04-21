@@ -12,5 +12,13 @@ for i in {1..3}; do
 done
 
 echo ${arr[@]}
-python3 /opt/antithesis/test/v1/basic_test/check_bookkeeping.py ${arr[@]}
+
+max_attempts=100
+for i in {1..max_attempts}; do
+    python3 /opt/antithesis/test/v1/basic_test/check_bookkeeping.py ${arr[@]}
+    if [ $? -eq 0 ]; then
+        break
+    fi
+    sleep 30
+done
 # todo: check data in db

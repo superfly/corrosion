@@ -13,6 +13,7 @@ steps:
       - docker-login#v3.0.0::
           username: _json_key
           password-env: ANTITHEIS_REGISTRY_PASSWORD
+          server: https://us-central1-docker.pkg.dev
     agents:
       queue: "high-concurrency"
 
@@ -20,7 +21,7 @@ steps:
     priority: 70
     key: build-config
     commands:
-      - envs
+      - envsubst < .antithesis/config/docker-compose.yaml.tmpl > .antithesis/config/docker-compose.yaml
       - docker build -f .antithesis/Dockerfile -t ${ANTITHEIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT} .
       - docker push ${ANTITHEIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT}
     plugins:

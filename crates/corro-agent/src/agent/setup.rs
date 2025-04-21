@@ -1,12 +1,15 @@
 //! Setup main agent state
 
 // External crates
+use antithesis_sdk::assert_always;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use indexmap::IndexMap;
 use metrics::counter;
 use parking_lot::RwLock;
 use rusqlite::{Connection, OptionalExtension};
+use tracing_subscriber::fmt::format::Json;
+use serde_json::json;
 use std::{
     net::SocketAddr,
     ops::{DerefMut, RangeInclusive},
@@ -37,7 +40,7 @@ use crate::{
 use corro_types::updates::UpdatesManager;
 use corro_types::{
     actor::ActorId,
-    agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
+    agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool},
     base::Version,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
@@ -219,6 +222,16 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                             lock.label, lock.kind, lock.state
                         );
 
+                        if matches!(lock.state, LockState::Locked) {
+                            let details = json!({
+                                "duration": duration,
+                                "id": id,
+                                "label": lock.label,
+                                "kind": lock.kind,
+                                "state": lock.state,
+                            });
+                            assert_always!(duration < WARNING_THRESHOLD, "bookie lock held for too long", &details);
+                        }
                         if duration >= WARNING_THRESHOLD {
                             counter!("corro.agent.lock.slow.count", "name" => lock.label)
                                 .increment(1);

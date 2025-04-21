@@ -1,12 +1,12 @@
 use std::{iter::Peekable, ops::RangeInclusive, time::Instant};
 
+use antithesis_sdk::assert_always;
 pub use corro_api_types::SqliteValue;
 use corro_api_types::{ColumnName, TableName};
 use corro_base_types::{CrsqlDbVersion, Version};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, params, Connection, Row};
 use serde_json::json;
-use antithesis_sdk::assert_always;
 use speedy::{Readable, Writable};
 use tracing::{debug, trace, warn};
 

@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
+use antithesis_sdk::prelude::*;
 use build_info::VersionControl;
 use camino::Utf8PathBuf;
 use corro_admin::AdminConfig;
@@ -8,9 +9,8 @@ use metrics::gauge;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use metrics_util::MetricKindMask;
 use spawn::wait_for_all_pending_handles;
-// use tokio_metrics::RuntimeMonitor;
+use tokio_metrics::RuntimeMonitor;
 use tracing::{error, info};
-use antithesis_sdk::prelude::*;
 
 use crate::VERSION;
 
@@ -120,7 +120,6 @@ fn setup_prometheus(addr: SocketAddr) -> eyre::Result<()> {
         .install()?;
     Ok(())
 }
-
 
 fn start_tokio_runtime_reporter() {
     let handle = tokio::runtime::Handle::current();
