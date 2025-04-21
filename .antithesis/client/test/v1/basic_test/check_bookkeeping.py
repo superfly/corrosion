@@ -9,12 +9,11 @@ def calculate_need(data):
         for uuid, ranges in data['need'].items():
             print(uuid)
             for range in ranges:
-                need += range['end'] - range['start']
+                need += range['end'] - range['start'] + 1
 
     if "partial_need" in data:
-        for uuid, ranges in data["partial_need"]:
-            for range in versions:
-                for version in range:
+        for actor_id, versions in data["partial_need"].items():
+            for version in versions.keys():
                     need += 1
 
     return need

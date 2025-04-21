@@ -5,7 +5,7 @@ schema_paths = ["/etc/corrosion/schemas"]
 [gossip]
 # addr for Fly.io deployment example are written
 # on startup by entrypoint script
-addr = "$IP_ADDR:8787"
+
 # TODO: (maybe use a broadcast address instead?)
 bootstrap = ["corrosion1:8787"]
 plaintext = true   # Cryptography and authz are handled by Fly.io private networking

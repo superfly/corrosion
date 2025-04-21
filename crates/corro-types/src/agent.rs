@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use antithesis_sdk::assert_always;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
@@ -28,7 +29,6 @@ use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
 };
-use antithesis_sdk::assert_always;
 use tokio::{
     sync::{
         AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
@@ -41,7 +41,6 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
-use crate::updates::UpdatesManager;
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
@@ -51,6 +50,7 @@ use crate::{
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn, Migration, SqlitePool, SqlitePoolError},
+    updates::UpdatesManager,
 };
 
 use super::members::Members;
