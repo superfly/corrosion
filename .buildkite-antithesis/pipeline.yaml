@@ -33,10 +33,10 @@ steps:
           password-env: ANTITHESIS_REGISTRY_PASSWORD
     agents:
       queue: "high-concurrency"
-    depends_on: [build-corrosion, build-client]
-    env:
-      ANTITHESIS_REGISTRY_PASSWORD: "$ANTITHESIS_REGISTRY_PASSWORD"
-      ANTITHESIS_REGISTRY: "$ANTITHESIS_REGISTRY"
+    # depends_on: [build-corrosion, build-client]
+    # env:
+    #   ANTITHESIS_REGISTRY_PASSWORD: "$ANTITHESIS_REGISTRY_PASSWORD"
+    #   ANTITHESIS_REGISTRY: "$ANTITHESIS_REGISTRY"
 
   - label: "☁️ Test on Antithesis"
     priority: 50
