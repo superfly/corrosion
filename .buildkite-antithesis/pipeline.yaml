@@ -4,11 +4,11 @@ steps:
     key: build-corrosion
     commands:
       - docker build -f .antithesis/corrosion/Dockerfile -t corrosion .
-      - docker tag corrosion -t ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT} .
-      - docker push ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT}
+      - docker tag corrosion ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT:0:8}
+      - docker push ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT:0:8}
       # client image is built from corrosion image
-      - docker build -f .antithesis/client/Dockerfile -t ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT} .
-      - docker push ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT}
+      - docker build -f .antithesis/client/Dockerfile -t ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT:0:8} .
+      - docker push ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT:0:8}
     plugins:
       - docker-login#v3.0.0:
           username: _json_key
@@ -24,25 +24,22 @@ steps:
     priority: 70
     key: build-config
     commands:
+      - export SHORT_COMMIT=${BUILDKITE_COMMIT:0:8}
       - envsubst < .antithesis/config/docker-compose.yaml.tmpl > .antithesis/config/docker-compose.yaml
-      - docker build -f .antithesis/Dockerfile -t ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT} .
-      - docker push ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT}
+      - docker build -f .antithesis/Dockerfile -t ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT:0:8} .
+      - docker push ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT:0:8}
     plugins:
-      - docker-login#v3.0.0::
+      - docker-login#v3.0.0:
           username: _json_key
           password-env: ANTITHESIS_REGISTRY_PASSWORD
+          server: https://us-central1-docker.pkg.dev
     agents:
       queue: "high-concurrency"
-    depends_on: [build-corrosion, build-client]
-    env:
-      ANTITHESIS_REGISTRY_PASSWORD: "$ANTITHESIS_REGISTRY_PASSWORD"
-      ANTITHESIS_REGISTRY: "$ANTITHESIS_REGISTRY"
+    depends_on: [build-corrosion]
 
   - label: "☁️ Test on Antithesis"
     priority: 50
     key: deploy
     commands:
-      - .buildkite-corro_antithesis/test.sh
+      - .buildkite-antithesis/test.sh
     depends_on: [build-config]
-    env:
-      ANTITHESIS_PASSWORD: "$ANTITHESIS_PASSWORD"

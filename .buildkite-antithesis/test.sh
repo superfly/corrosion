@@ -2,10 +2,14 @@
 
 set -e
 
-response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" -X POST https://flyio.antithesis.com/api/v1/launch/basic_test -d "{\"params\": { \"antithesis.description\":\"basic_test on main\",
-    \"antithesis.duration\":\"3\",
-    \"antithesis.config_image\":\"antithesis-config:${BUILDKITE_COMMIT}\",
-    \"antithesis.images\":\"corrosion:${BUILDKITE_COMMIT},corro-client:${BUILDKITE_COMMIT}\", 
+CUSTOM_DURATION=${CUSTOM_DURATION:-0.1}
+
+COMMIT_HASH=${BUILDKITE_COMMIT:0:8}
+
+response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" -X POST https://flyio.antithesis.com/api/v1/launch/flyio -d "{\"params\": { \"antithesis.description\":\"basic_test on main\",
+    \"antithesis.duration\":\"${CUSTOM_DURATION}\",
+    \"antithesis.config_image\":\"antithesis-config:${COMMIT_HASH}\",
+    \"antithesis.images\":\"corrosion:${COMMIT_HASH},corro-client:${COMMIT_HASH}\", 
     \"antithesis.report.recipients\":\"somtochi@fly.io\"
 }}")
 
