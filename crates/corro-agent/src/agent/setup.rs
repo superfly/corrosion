@@ -8,7 +8,6 @@ use indexmap::IndexMap;
 use metrics::counter;
 use parking_lot::RwLock;
 use rusqlite::{Connection, OptionalExtension};
-use tracing_subscriber::fmt::format::Json;
 use serde_json::json;
 use std::{
     net::SocketAddr,
@@ -24,6 +23,7 @@ use tokio::{
     },
 };
 use tracing::{debug, error, info, trace, warn};
+use tracing_subscriber::fmt::format::Json;
 use tripwire::Tripwire;
 
 // Internals
@@ -40,7 +40,9 @@ use crate::{
 use corro_types::updates::UpdatesManager;
 use corro_types::{
     actor::ActorId,
-    agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool},
+    agent::{
+        migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool,
+    },
     base::Version,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
@@ -230,7 +232,11 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                                 "kind": lock.kind,
                                 "state": lock.state,
                             });
-                            assert_always!(duration < WARNING_THRESHOLD, "bookie lock held for too long", &details);
+                            assert_always!(
+                                duration < WARNING_THRESHOLD,
+                                "bookie lock held for too long",
+                                &details
+                            );
                         }
                         if duration >= WARNING_THRESHOLD {
                             counter!("corro.agent.lock.slow.count", "name" => lock.label)

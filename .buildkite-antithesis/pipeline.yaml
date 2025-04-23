@@ -10,7 +10,7 @@ steps:
       - docker build -f .antithesis/client/Dockerfile -t ${ANTITHEIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT} .
       - docker push ${ANTITHEIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT}
     plugins:
-      - docker-login#v3.0.0::
+      - docker-login#v3.0.0:
           username: _json_key
           password-env: ANTITHEIS_REGISTRY_PASSWORD
           server: https://us-central1-docker.pkg.dev
