@@ -28,16 +28,17 @@ steps:
       - docker build -f .antithesis/Dockerfile -t ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT} .
       - docker push ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT}
     plugins:
-      - docker-login#v3.0.0::
+      - docker-login#v3.0.0:
           username: _json_key
           password-env: ANTITHESIS_REGISTRY_PASSWORD
           server: https://us-central1-docker.pkg.dev
     agents:
       queue: "high-concurrency"
+    depends_on: [build-corrosion]
 
   - label: "☁️ Test on Antithesis"
     priority: 50
     key: deploy
     commands:
-      - .buildkite-corro_antithesis/test.sh
+      - .buildkite-antithesis/test.sh
     depends_on: [build-config]
