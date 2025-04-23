@@ -16,6 +16,9 @@ steps:
           server: https://us-central1-docker.pkg.dev
     agents:
       queue: "high-concurrency"
+    env:
+      ANTITHEIS_REGISTRY_PASSWORD: "$ANTITHEIS_REGISTRY_PASSWORD"
+      ANTITHEIS_REGISTRY: "$ANTITHEIS_REGISTRY"
 
   - label: "🔨 Build Config"
     priority: 70
@@ -31,6 +34,9 @@ steps:
     agents:
       queue: "high-concurrency"
     depends_on: [build-corrosion, build-client]
+    env:
+      ANTITHEIS_REGISTRY_PASSWORD: "$ANTITHEIS_REGISTRY_PASSWORD"
+      ANTITHEIS_REGISTRY: "$ANTITHEIS_REGISTRY"
 
   - label: "☁️ Test on Antithesis"
     priority: 50
@@ -38,3 +44,5 @@ steps:
     commands:
       - .buildkite-corro_antithesis/test.sh
     depends_on: [build-config]
+    env:
+      ANTITHEIS_REGISTRY_PASSWORD: "$ANTITHEIS_PASSWORD"
