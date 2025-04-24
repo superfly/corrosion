@@ -4,11 +4,11 @@ steps:
     key: build-corrosion
     commands:
       - docker build -f .antithesis/corrosion/Dockerfile -t corrosion .
-      - docker tag corrosion ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT}
-      - docker push ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT}
+      - docker tag corrosion ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT:0:8}
+      - docker push ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT:0:8}
       # client image is built from corrosion image
-      - docker build -f .antithesis/client/Dockerfile -t ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT} .
-      - docker push ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT}
+      - docker build -f .antithesis/client/Dockerfile -t ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT:0:8} .
+      - docker push ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT:0:8}
     plugins:
       - docker-login#v3.0.0:
           username: _json_key
@@ -25,8 +25,8 @@ steps:
     key: build-config
     commands:
       - envsubst < .antithesis/config/docker-compose.yaml.tmpl > .antithesis/config/docker-compose.yaml
-      - docker build -f .antithesis/Dockerfile -t ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT} .
-      - docker push ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT}
+      - docker build -f .antithesis/Dockerfile -t ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT:0:8} .
+      - docker push ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT:0:8}
     plugins:
       - docker-login#v3.0.0:
           username: _json_key
