@@ -280,12 +280,39 @@ impl CorrosionApiClient {
 
         let res = self.api_client.request(req).await?;
 
-        if !res.status().is_success() {
-            return Err(Error::UnexpectedStatusCode(res.status()));
+        let status = res.status();
+        if !status.is_success() {
+            match hyper::body::to_bytes(res.into_body()).await {
+                Ok(b) => match serde_json::from_slice(&b) {
+                    Ok(res) => match res {
+                        ExecResponse { results, .. } => {
+                            if let Some(ExecResult::Error { error }) = results
+                                .into_iter()
+                                .find(|r| matches!(r, ExecResult::Error { .. }))
+                            {
+                                return Err(Error::ResponseError(error));
+                            }
+                            return Err(Error::UnexpectedStatusCode(status));
+                        }
+                    },
+                    Err(e) => {
+                        debug!(
+                            error = %e,
+                            "could not deserialize response body, sending generic error..."
+                        );
+                        return Err(Error::UnexpectedStatusCode(status));
+                    }
+                },
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        "could not aggregate response body bytes, sending generic error..."
+                    );
+                    return Err(Error::UnexpectedStatusCode(status));
+                }
+            }
         }
-
         let bytes = hyper::body::to_bytes(res.into_body()).await?;
-
         Ok(serde_json::from_slice(&bytes)?)
     }
 
