@@ -391,12 +391,12 @@ pub async fn handle_notifications(
 /// multiple gigabytes and needs periodic truncation.  We don't want
 /// to schedule this task too often since it locks the whole DB.
 // TODO: can we get around the lock somehow?
-fn wal_checkpoint(conn: &rusqlite::Connection) -> eyre::Result<()> {
+fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()> {
     debug!("handling db_cleanup (WAL truncation)");
     let start = Instant::now();
 
     let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
-    conn.pragma_update(None, "busy_timeout", 60000)?;
+    conn.pragma_update(None, "busy_timeout", timeout)?;
 
     let busy: bool = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
     if busy {
@@ -438,8 +438,6 @@ async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
         // update settings in write conn
         let conn = pool.write_low().await?;
         let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
-        conn.pragma_update(None, "busy_timeout", 60000)?;
-
         let cache_size: i64 = conn.pragma_query_value(None, "cache_size", |row| row.get(0))?;
         conn.pragma_update(None, "cache_size", 100000)?;
         (orig, cache_size)
@@ -527,10 +525,28 @@ async fn wal_checkpoint_over_threshold(
 ) -> eyre::Result<bool> {
     let should_truncate = wal_path.metadata()?.len() > threshold;
     if should_truncate {
+        let timeout = calc_busy_timeout(wal_path.metadata()?.len(), threshold);
         let conn = pool.write_low().await?;
-        block_in_place(|| wal_checkpoint(&conn))?;
+        block_in_place(|| wal_checkpoint(&conn, timeout))?;
     }
     Ok(should_truncate)
+}
+
+fn calc_busy_timeout(wal_size: u64, threshold: u64) -> u64 {
+    let wal_size_gb = wal_size / (1024 * 1024 * 1024);
+    let threshold_gb = threshold / (1024 * 1024 * 1024);
+    let base_timeout = 30000;
+    if wal_size_gb <= threshold_gb {
+        return base_timeout;
+    }
+
+    // Double the timeout every 10gb and cap at 64 minutes
+    let diff = cmp::min(7, wal_size_gb / 10);
+    let timeout = base_timeout * 2_u64.pow(diff as u32);
+    if diff >= 5 {
+        warn!("WAL size is too large, setting busy timeout {timeout}ms");
+    }
+    timeout
 }
 
 /// Handle incoming emptyset received during syncs
@@ -1103,7 +1119,7 @@ mod tests {
         let pragma_value = 12345u64;
         conn.pragma_update(None, "busy_timeout", pragma_value)?;
 
-        wal_checkpoint(&conn)?;
+        wal_checkpoint(&conn, 60000)?;
         assert_eq!(
             conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))?,
             pragma_value
@@ -1251,5 +1267,23 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn check_busy_timeout() {
+        assert_eq!(calc_busy_timeout(to_bytes(1), to_bytes(5)), 30000); // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(5), to_bytes(5)), 30000); // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(10), to_bytes(5)), 60000); // 60s
+        assert_eq!(calc_busy_timeout(to_bytes(20), to_bytes(5)), 120000); // 2m
+        assert_eq!(calc_busy_timeout(to_bytes(30), to_bytes(5)), 240000); // 4m
+        assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(5)), 480000); // 8m
+        assert_eq!(calc_busy_timeout(to_bytes(57), to_bytes(5)), 960000); // 16m
+        assert_eq!(calc_busy_timeout(to_bytes(60), to_bytes(5)), 1920000); // 32m
+        assert_eq!(calc_busy_timeout(to_bytes(100), to_bytes(5)), 3840000); // 64m maybe too aggressive?
+        assert_eq!(calc_busy_timeout(to_bytes(1000), to_bytes(5)), 3840000); // 64m
+    }
+
+    fn to_bytes(gb: u64) -> u64 {
+        gb * 1024 * 1024 * 1024
     }
 }

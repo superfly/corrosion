@@ -19,7 +19,7 @@ use corro_types::{
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
-use metrics::histogram;
+use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
@@ -410,9 +410,11 @@ pub async fn api_v1_queries(
 ) -> impl IntoResponse {
     let (mut tx, body) = hyper::Body::channel();
 
+    counter!("corro.api.queries.count").increment(1);
     // TODO: timeout on data send instead of infinitely waiting for channel space.
     let (data_tx, mut data_rx) = channel(512);
 
+    let start = Instant::now();
     tokio::spawn(async move {
         let mut buf = BytesMut::new();
 
@@ -447,6 +449,8 @@ pub async fn api_v1_queries(
 
     match build_query_rows_response(&agent, data_tx, stmt).await {
         Ok(_) => {
+            histogram!("corro.api.queries.processing.time.seconds", "result" => "success")
+                .record(start.elapsed());
             #[allow(clippy::needless_return)]
             return hyper::Response::builder()
                 .status(StatusCode::OK)
@@ -454,6 +458,8 @@ pub async fn api_v1_queries(
                 .expect("could not build query response body");
         }
         Err((status, res)) => {
+            histogram!("corro.api.queries.processing.time.seconds", "result" => "error")
+                .record(start.elapsed());
             #[allow(clippy::needless_return)]
             return hyper::Response::builder()
                 .status(status)
