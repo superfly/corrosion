@@ -1,10 +1,11 @@
 use std::{
     collections::BTreeSet,
+    net::SocketAddr,
     ops::Deref,
     time::{Duration, Instant},
 };
 
-use axum::{response::IntoResponse, Extension};
+use axum::{extract::ConnectInfo, response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
@@ -32,7 +33,7 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
 
@@ -241,6 +242,7 @@ pub enum QueryError {
 
 async fn build_query_rows_response(
     agent: &Agent,
+    client_addr: SocketAddr,
     data_tx: mpsc::Sender<QueryEvent>,
     stmt: Statement,
 ) -> Result<(), (StatusCode, ExecResult)> {
@@ -261,6 +263,8 @@ async fn build_query_rows_response(
                 return;
             }
         };
+
+        trace!(%client_addr, "Preparing statement {}", stmt.query());
 
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
 
@@ -304,7 +308,9 @@ async fn build_query_rows_response(
 
             let start = Instant::now();
 
-            let query = match stmt {
+            trace!(%client_addr, "Executing statement {}", stmt.query());
+
+            let query = match &stmt {
                 Statement::Simple(_)
                 | Statement::Verbose {
                     params: None,
@@ -342,6 +348,12 @@ async fn build_query_rows_response(
                 }
             };
             let elapsed = start.elapsed();
+
+            trace!(%client_addr, elapsed = %elapsed.as_secs(), "Statement finished executing {}", stmt.query());
+
+            if elapsed > Duration::from_secs(10) {
+                warn!(%client_addr, elapsed = %elapsed.as_secs(), "Slow read statement {}!", stmt.query());
+            }
 
             if let Err(_e) = res_tx.send(Ok(())) {
                 error!("could not send back response through oneshot channel, aborting");
@@ -406,6 +418,7 @@ async fn build_query_rows_response(
 
 pub async fn api_v1_queries(
     Extension(agent): Extension<Agent>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
     let (mut tx, body) = hyper::Body::channel();
@@ -445,7 +458,7 @@ pub async fn api_v1_queries(
 
     trace!("building query rows response...");
 
-    match build_query_rows_response(&agent, data_tx, stmt).await {
+    match build_query_rows_response(&agent, client_addr, data_tx, stmt).await {
         Ok(_) => {
             #[allow(clippy::needless_return)]
             return hyper::Response::builder()
@@ -792,6 +805,7 @@ mod tests {
 
         let res = api_v1_queries(
             Extension(agent.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await
