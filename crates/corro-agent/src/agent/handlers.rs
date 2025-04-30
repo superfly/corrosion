@@ -396,7 +396,7 @@ fn wal_checkpoint(conn: &rusqlite::Connection) -> eyre::Result<()> {
     let start = Instant::now();
 
     let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
-    conn.pragma_update(None, "busy_timeout", 60000)?;
+    conn.pragma_update(None, "busy_timeout", 600000)?;
 
     let busy: bool = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
     if busy {
