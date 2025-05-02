@@ -52,7 +52,7 @@ use corro_types::broadcast::Timestamp;
 use foca::Member;
 use futures::FutureExt;
 use hyper::{server::conn::AddrIncoming, StatusCode};
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, params, Connection, OptionalExtension};
 use spawn::spawn_counted;
