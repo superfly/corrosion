@@ -44,5 +44,5 @@ steps:
     priority: 50
     key: deploy
     commands:
-      - .buildkite-antithesis/test.sh
+      - .buildkite-antithesis/scripts/test.sh
     depends_on: [build-config, trigger]
