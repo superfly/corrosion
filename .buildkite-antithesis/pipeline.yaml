@@ -37,11 +37,12 @@ steps:
       queue: "high-concurrency"
     depends_on: [build-corrosion]
 
-  - block: ":rocket: Trigger tests"
+  - block: ":rocket: Trigger"
+    key: trigger
 
   - label: "☁️ Test on Antithesis"
     priority: 50
     key: deploy
     commands:
       - .buildkite-antithesis/test.sh
-    depends_on: [build-config]
+    depends_on: [build-config, trigger]
