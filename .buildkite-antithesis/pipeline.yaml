@@ -37,8 +37,7 @@ steps:
       queue: "high-concurrency"
     depends_on: [build-corrosion]
 
-  - trigger: "test-on-antithesis"
-    depends_on: [build-config]
+  - block: ":rocket: Trigger tests"
 
   - label: "☁️ Test on Antithesis"
     priority: 50
