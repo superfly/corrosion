@@ -112,7 +112,7 @@ where
         }
 
         let details = json!({});
-        assert_always!(self.changes.is_empty(), "changes is empty", &details);
+        assert_always!(self.changes.is_empty(), "iterator for ChunkedChanges still has changes when next() is called", &details);
 
         // reset the buffered size
         self.buffered_size = 0;
