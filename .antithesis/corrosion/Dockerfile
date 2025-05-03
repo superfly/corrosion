@@ -37,7 +37,7 @@ COPY .antithesis/corrosion/entrypoint.sh /entrypoint.sh
 
 # COPY examples/fly/corrosion-files/* /etc/corrosion/
 
-COPY .antithesis/corrosion/config.toml /etc/corrosion/config.toml
+COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl
 COPY .antithesis/corrosion/schemas /etc/corrosion/schemas
 COPY .antithesis/corrosion/templates /etc/corrosion/templates
 

@@ -37,6 +37,9 @@ steps:
       queue: "high-concurrency"
     depends_on: [build-corrosion]
 
+  - trigger: "test-on-antithesis"
+    depends_on: [build-config]
+
   - label: "☁️ Test on Antithesis"
     priority: 50
     key: deploy
