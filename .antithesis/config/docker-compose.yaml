@@ -2,7 +2,7 @@ services:
   corrosion1:
     container_name: corrosion1
     hostname: corrosion1
-    image: corrosion:pre-v1.2
+    image: corrosion
     environment:
       - RUST_LOG=corro=debug
     volumes: 
@@ -11,18 +11,18 @@ services:
   corrosion2:
     container_name: corrosion2
     hostname: corrosion2
-    image: corrosion:pre-v1.2
+    image: corrosion
     volumes: 
       - ./volumes/corrosion2:/var/lib/corrosion
 
   corrosion3:
     container_name: corrosion3
     hostname: corrosion3
-    image: corrosion:pre-v1.2
+    image: corrosion
     volumes: 
       - ./volumes/corrosion3:/var/lib/corrosion
 
   corro-client:
     container_name: corro-client
     hostname: corro-client
-    image: corro-client:pre-v1.2
+    image: corro-client

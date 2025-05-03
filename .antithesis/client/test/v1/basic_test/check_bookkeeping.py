@@ -34,6 +34,8 @@ def main():
         print("no config file provided")
         exit(1)
     sync_states = {}
+
+    got_need = False
     for config in config_files:
         print(f"getting sync state for {config}")
         result = subprocess.run(f"corrosion --config {config} sync generate", shell=True, capture_output=True, text=True)
@@ -47,8 +49,12 @@ def main():
         need_count = calculate_need(data)
         if need_count > 0:
             print(f"node (with config {config}) missing {need_count} versions")
-            exit(1)
-    
+            got_need = True
+
+    if got_need:
+        print("Some nodes are missing versions, check output")
+        exit(1)
+
     if len(sync_states) <= 1:
         print("less than two nodes, skipping heads check")
         exit(0)

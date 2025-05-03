@@ -1306,7 +1306,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     let details = json!({"len": len, "seqs": seqs.start().0, "seqs_end": seqs.end().0});
     assert_always!(
         len <= (seqs.end().0 - seqs.start().0 + 1) as usize,
-        "bumber of changes is greater than the seq num",
+        "number of changes is greater than the seq num",
         &details
     );
 
