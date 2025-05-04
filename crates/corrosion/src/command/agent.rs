@@ -49,7 +49,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
             }
         });
 
-        // start_tokio_runtime_reporter();
+        start_tokio_runtime_reporter();
     }
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
