@@ -19,6 +19,10 @@ RUN set -eux; \
 
 WORKDIR /usr/src/app
 COPY . .
+
+COPY .antithesis/libvoidstar.so /usr/lib/antithesis/lib/libvoidstar.so
+ENV LD_LIBRARY_PATH=/usr/lib/antithesis/lib
+
 # Will build and cache the binary and dependent crates in release mode
 RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/local/cargo \
     --mount=type=cache,target=target \
