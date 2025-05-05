@@ -541,8 +541,9 @@ fn calc_busy_timeout(wal_size: u64, threshold: u64) -> u64 {
     }
 
     // Double the timeout every 10gb and cap at 64 minutes
-    let diff = cmp::min(7, wal_size_gb / 10);
+    let diff = cmp::min(6, wal_size_gb / 10);
     let timeout = base_timeout * 2_u64.pow(diff as u32);
+    // we are using a 16min timeout, something is wrong if we get here
     if diff >= 5 {
         warn!("WAL size is too large, setting busy timeout {timeout}ms");
     }
@@ -1279,8 +1280,9 @@ mod tests {
         assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(5)), 480000); // 8m
         assert_eq!(calc_busy_timeout(to_bytes(57), to_bytes(5)), 960000); // 16m
         assert_eq!(calc_busy_timeout(to_bytes(60), to_bytes(5)), 1920000); // 32m
-        assert_eq!(calc_busy_timeout(to_bytes(100), to_bytes(5)), 3840000); // 64m maybe too aggressive?
-        assert_eq!(calc_busy_timeout(to_bytes(1000), to_bytes(5)), 3840000); // 64m
+        assert_eq!(calc_busy_timeout(to_bytes(70), to_bytes(5)), 1920000); // 32m
+        assert_eq!(calc_busy_timeout(to_bytes(100), to_bytes(5)), 1920000); // 32m
+        assert_eq!(calc_busy_timeout(to_bytes(1000), to_bytes(5)), 1920000); // 32m
     }
 
     fn to_bytes(gb: u64) -> u64 {
