@@ -21,6 +21,7 @@ use crate::{
     api::peer::parallel_sync,
     transport::Transport,
 };
+use antithesis_sdk::assert_always;
 use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
@@ -44,6 +45,7 @@ use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
+use serde_json::json;
 use tokio::time::sleep;
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
@@ -525,7 +527,12 @@ async fn wal_checkpoint_over_threshold(
     pool: &SplitPool,
     threshold: u64,
 ) -> eyre::Result<bool> {
-    let should_truncate = wal_path.metadata()?.len() > threshold;
+    let wal_size = wal_path.metadata()?.len();
+    let should_truncate = wal_size > threshold;
+    let warn_threshold = 40 * 1024 * 1024 * 1024;
+    let wal_size_gb = wal_size / 1024 / 1024 / 1024;
+    let details = json!({"wal_size": wal_size_gb});
+    assert_always!(wal_size < warn_threshold, "wal_size is too big", &details);
     if should_truncate {
         let conn = pool.write_low().await?;
         block_in_place(|| wal_checkpoint(&conn))?;

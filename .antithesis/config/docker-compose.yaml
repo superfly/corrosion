@@ -5,6 +5,7 @@ services:
     image: corrosion
     environment:
       - RUST_LOG=corro=debug
+      - LD_LIBRARY_PATH=/usr/lib/antithesis/lib
     volumes: 
       - ./volumes/corrosion1:/var/lib/corrosion
 
