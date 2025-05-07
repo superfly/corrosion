@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use eyre::eyre;
 use corro_admin::{Command, LogLevel, Response};
+use eyre::eyre;
 use futures::{SinkExt, TryStreamExt};
 use tokio::net::UnixStream;
 use tokio_serde::{formats::Json, Framed};
