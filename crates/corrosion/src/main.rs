@@ -11,6 +11,7 @@ use command::{
     tls::{generate_ca, generate_client_cert, generate_server_cert},
     tpl::TemplateFlags,
 };
+use corro_admin::TracingHandle;
 use corro_api_types::SqliteParam;
 use corro_client::CorrosionApiClient;
 use corro_types::{
@@ -52,11 +53,12 @@ build_info::build_info!(pub fn version);
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
+fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
+    let mut tracing_handle = None;
     if matches!(cli.command, Command::Agent) {
         let config = cli.config()?;
 
-        let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+        let directives: String = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
         let (filter, diags) = tracing_filter::legacy::Filter::parse(&directives);
         if let Some(diags) = diags {
             eprintln!("While parsing env filters: {diags}, using default");
@@ -65,8 +67,8 @@ fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
         global::set_text_map_propagator(TraceContextPropagator::new());
 
         // Tracing
-        let (env_filter, _handle) = tracing_subscriber::reload::Layer::new(filter.layer());
-
+        let (env_filter, handle) = tracing_subscriber::reload::Layer::new(filter.layer());
+        tracing_handle = Some(handle);
         let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
 
         if let Some(otel) = &config.telemetry.open_telemetry {
@@ -143,14 +145,16 @@ fn init_tracing(cli: &Cli) -> Result<(), ConfigError> {
             .init();
     }
 
-    Ok(())
+    Ok(tracing_handle)
 }
 
 async fn process_cli(cli: Cli) -> eyre::Result<()> {
-    init_tracing(&cli)?;
+    let tracing_handle = init_tracing(&cli)?;
 
     match &cli.command {
-        Command::Agent => command::agent::run(cli.config()?, &cli.config_path).await?,
+        Command::Agent => {
+            command::agent::run(cli.config()?, &cli.config_path, tracing_handle).await?
+        }
 
         Command::Backup { path } => {
             let db_path = cli.db_path()?;
@@ -536,6 +540,18 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             conn.send_command(corro_admin::Command::Subs(corro_admin::SubsCommand::List))
                 .await?;
         }
+        Command::Log(LogCommand::Set { filter }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Log(corro_admin::LogCommand::Set {
+                filter: filter.clone(),
+            }))
+            .await?;
+        }
+        Command::Log(LogCommand::Reset) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Log(corro_admin::LogCommand::Reset))
+                .await?;
+        }
     }
 
     Ok(())
@@ -706,6 +722,10 @@ enum Command {
     /// Subscription related commands
     #[command(subcommand)]
     Subs(SubsCommand),
+
+    /// Log related commands
+    #[command(subcommand)]
+    Log(LogCommand),
 }
 
 #[derive(Subcommand)]
@@ -801,4 +821,12 @@ enum SubsCommand {
         #[arg(long)]
         id: Option<Uuid>,
     },
+}
+
+#[derive(Subcommand)]
+enum LogCommand {
+    /// Set the log filter
+    Set { filter: String },
+    /// Reset the log filter to default
+    Reset,
 }
