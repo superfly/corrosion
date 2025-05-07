@@ -37,6 +37,8 @@ COPY --from=builder /usr/local/bin/nperf /usr/src/app/corrosion /usr/local/bin/
 # Create "corrosion" user
 RUN useradd -ms /bin/bash corrosion
 
+ENV LD_LIBRARY_PATH=/usr/lib/antithesis/lib
+COPY .antithesis/libvoidstar.so /usr/lib/antithesis/lib/libvoidstar.so
 COPY .antithesis/corrosion/entrypoint.sh /entrypoint.sh
 
 # COPY examples/fly/corrosion-files/* /etc/corrosion/
