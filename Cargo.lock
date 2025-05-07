@@ -742,6 +742,8 @@ dependencies = [
  "tokio-serde",
  "tokio-util",
  "tracing",
+ "tracing-filter",
+ "tracing-subscriber",
  "tripwire",
  "uuid",
 ]
