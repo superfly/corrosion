@@ -44,8 +44,8 @@ use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
-use spawn::spawn_counted;
 use serde_json::json;
+use spawn::spawn_counted;
 use tokio::time::sleep;
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
