@@ -126,8 +126,13 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     let start = Instant::now();
     {
         let conn = agent.pool().read().await?;
+        // check __corro_seq_bookkeeping for any actor ids that we only have partial changes for.
         let actor_ids: Vec<ActorId> = conn
-            .prepare("SELECT site_id FROM crsql_site_id WHERE ordinal > 0")?
+            .prepare(
+                "SELECT site_id FROM crsql_site_id WHERE ordinal > 0
+                        UNION
+                    SELECT distinct site_id FROM __corro_seq_bookkeeping",
+            )?
             .query_map([], |row| row.get(0))
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
 
