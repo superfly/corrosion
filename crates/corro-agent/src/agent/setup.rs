@@ -210,7 +210,23 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
                 if top
                     .values()
-                    .any(|meta| meta.started_at.elapsed() >= WARNING_THRESHOLD)
+                    .any(|meta| {
+                        let duration = meta.started_at.elapsed();
+                        if matches!(meta.state, LockState::Locked) {
+                            let details = json!({
+                                "duration": duration,
+                                "label": meta.label,
+                                "kind": meta.kind,
+                                "state": meta.state,
+                            });
+                            assert_always!(
+                                duration < WARNING_THRESHOLD,
+                                "bookie lock held for too long",
+                                &details
+                            );
+                        }
+                        duration >= WARNING_THRESHOLD
+                    })
                 {
                     warn!(
                         "lock registry shows locks held for a long time! top {} locks:",
@@ -224,20 +240,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                             lock.label, lock.kind, lock.state
                         );
 
-                        if matches!(lock.state, LockState::Locked) {
-                            let details = json!({
-                                "duration": duration,
-                                "id": id,
-                                "label": lock.label,
-                                "kind": lock.kind,
-                                "state": lock.state,
-                            });
-                            assert_always!(
-                                duration < WARNING_THRESHOLD,
-                                "bookie lock held for too long",
-                                &details
-                            );
-                        }
                         if duration >= WARNING_THRESHOLD {
                             counter!("corro.agent.lock.slow.count", "name" => lock.label)
                                 .increment(1);

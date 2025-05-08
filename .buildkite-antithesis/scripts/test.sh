@@ -2,7 +2,12 @@
 
 set -e
 
-CUSTOM_DURATION=${CUSTOM_DURATION:-0.1}
+set -eo pipefail
+
+CUSTOM_DURATION="0.1"
+if buildkite-agent meta-data exists "test-duration"; then
+    CUSTOM_DURATION=$(buildkite-agent meta-data get test-duration)
+fi
 
 COMMIT_HASH=${BUILDKITE_COMMIT:0:8}
 
