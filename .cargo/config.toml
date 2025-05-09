@@ -7,6 +7,7 @@ rustflags = [
     "-C", "codegen-units=1",
     "-C", "passes=sancov-module",
     "-C", "llvm-args=-sanitizer-coverage-level=3",
+    "-C", "llvm-args=-sanitizer-coverage-trace-pc-guard",
     "-C", "link-arg=-Wl,--build-id",
     "-L", "/usr/lib/antithesis/lib/",
     "-l", "voidstar",
