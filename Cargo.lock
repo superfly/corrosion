@@ -3624,6 +3624,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-load-generator"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "corro-api-types",
+ "corro-client",
+ "eyre",
+ "futures",
+ "hickory-resolver",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tripwire",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

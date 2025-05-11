@@ -35,7 +35,7 @@ pub struct CorrosionApiClient {
 }
 
 impl CorrosionApiClient {
-    pub fn new(api_addr: SocketAddr) -> Self {
+    pub fn new(api_addr: SocketAddr) ->  Self {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(HTTP2_CONNECT_TIMEOUT));
         Self {

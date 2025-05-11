@@ -6,6 +6,7 @@ schema_paths = ["/etc/corrosion/schemas"]
 # addr for Fly.io deployment example are written
 # on startup by entrypoint script
 addr = "$IP_ADDR:8787"
+pg.addr = "$IP_ADDR:5470"
 
 # TODO: (maybe use a broadcast address instead?)
 bootstrap = ["corrosion1:8787"]

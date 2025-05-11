@@ -1,5 +1,5 @@
 CREATE TABLE deployments (
-    id TEXT NOT NULL PRIMARY KEY,
+    id INTEGER NOT NULL PRIMARY KEY,
     node TEXT NOT NULL default '',
     name TEXT NOT NULL default '',
     version TEXT NOT NULL default '',
@@ -11,6 +11,6 @@ CREATE TABLE deployments (
 
     team_id INTEGER NOT NULL default 0,
     net_id INTEGER NOT NULL default 0,
-    created_at integer not null default 0,
+    created_at INTEGER NOT NULL default 0,
     updated_at INTEGER NOT NULL default 0
 ) WITHOUT ROWID;
