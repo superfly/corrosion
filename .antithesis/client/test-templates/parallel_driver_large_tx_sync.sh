@@ -24,5 +24,3 @@ for count in ${counts[@]}; do
         echo "Response body: $body"
     fi
 done
-
-INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 10  ) SELECT id FROM cte;\"

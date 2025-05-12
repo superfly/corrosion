@@ -12,7 +12,6 @@ services:
     hostname: corrosion1
     image: corrosion
     environment:
-      - RUST_LOG=corro=debug
     volumes: 
       - ./volumes/corrosion1:/var/lib/corrosion
 
@@ -34,3 +33,8 @@ services:
     container_name: corro-client
     hostname: corro-client
     image: corro-client
+
+  consul:
+    container_name: consul
+    hostname: consul
+    image: consul:1.15.4

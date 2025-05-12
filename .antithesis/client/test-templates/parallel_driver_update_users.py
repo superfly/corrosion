@@ -40,7 +40,7 @@ def update_in_corrosion(address, port, table, id, new_data):
     if not success:
         print(f"Error executing updating {table} {id}: {err}")
         return
-    print(f"Successfully updated {table} {id} in Corrosion node.")
+    # print(f"Successfully updated {table} {id} in Corrosion node.")
 
 def get_ids(address, port, table):
     data, err = helper.query_sql(address, port, f"SELECT id FROM {table} ORDER BY RANDOM() LIMIT 100")
