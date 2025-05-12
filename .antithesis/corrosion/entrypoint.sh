@@ -12,4 +12,11 @@ su - corrosion
 # access admin socket over network
 socat TCP-LISTEN:6644,reuseaddr,fork UNIX-CONNECT:/app/admin.sock &
 
+# start consul agent
+# TODO: bind to IP_ADDR
+consul agent -dev --retry-join consul -bind=0.0.0.0 -client=0.0.0.0 &
+
+# start corro-consul
+corrosion consul sync &
+
 exec "$@"

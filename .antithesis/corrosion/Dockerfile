@@ -1,7 +1,7 @@
 # build image
 FROM rust:bookworm AS builder
 
-RUN apt update && apt install -y build-essential gcc-x86-64-linux-gnu clang llvm
+RUN apt update && apt install -y build-essential gcc-x86-64-linux-gnu clang llvm unzip
 
 # Install mold
 ENV MOLD_VERSION=1.11.0
@@ -17,6 +17,15 @@ RUN set -eux; \
     rm /tmp/nperf.tar.gz; \
     nperf --version;
 
+ENV CONSUL_VERSION="1.14.3"
+
+RUN set -eux; \
+    curl --silent --remote-name https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip; \
+    unzip consul_${CONSUL_VERSION}_linux_amd64.zip; \
+    mv consul /usr/local/bin/consul; \
+    rm consul_${CONSUL_VERSION}_linux_amd64.zip; \
+    consul --version;
+
 WORKDIR /usr/src/app
 COPY . .
 
@@ -31,8 +40,8 @@ RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/lo
 # Runtime image
 FROM debian:bookworm-slim
 
-RUN apt update && apt install -y sqlite3 watch socat iproute2 gettext-base && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /usr/local/bin/nperf /usr/src/app/corrosion /usr/src/app/rust-load-generator /usr/local/bin/
+RUN apt update && apt install -y sqlite3 sqlite3-tools watch socat iproute2 gettext-base && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /usr/local/bin/nperf /usr/local/bin/consul /usr/src/app/corrosion /usr/src/app/rust-load-generator /usr/local/bin/
 
 # Create "corrosion" user
 RUN useradd -ms /bin/bash corrosion

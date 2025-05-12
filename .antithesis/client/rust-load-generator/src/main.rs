@@ -5,7 +5,7 @@ use eyre::{eyre, Result};
 use futures::StreamExt;
 use hickory_resolver::AsyncResolver;
 use serde::Deserialize;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info};
@@ -95,7 +95,7 @@ fn query_all(corrosion_addrs: Vec<String>, tripwire: Tripwire) {
     }
 }
 
-async fn query(addr: String, mut tripwire: Tripwire) -> eyre::Result<()> {
+async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
     let mut corro_client = None;
     loop {
         if tripwire.is_shutting_down() {

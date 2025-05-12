@@ -8,9 +8,13 @@ echo ${arr[@]}
 
 max_attempts=100
 for i in {1..100}; do
-    python3 /opt/antithesis/test/v1/basic_test/check_bookkeeping.py ${arr[@]}
+    python3 /opt/antithesis/py-resources/check_bookkeeping.py ${arr[@]}
     if [ $? -eq 0 ]; then
-        break
+        echo "Bookkeeping is consistent"
+        exit 0
     fi
     sleep 30
 done
+
+echo "Bookkeeping is inconsistent, check output for more details"
+exit 1

@@ -32,7 +32,7 @@ use corro_types::{
 
 use super::BcastCache;
 use crate::api::public::update::api_v1_updates;
-use antithesis_sdk::{assert_always, assert_always_less_than};
+use antithesis_sdk::assert_always;
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
@@ -1127,9 +1127,8 @@ pub async fn process_multiple_changes(
 
         let elapsed = sub_start.elapsed();
         let details = json!({"elapsed": elapsed.as_secs_f32()});
-        assert_always_less_than!(
-            elapsed,
-            Duration::from_secs(3),
+        assert_always!(
+            elapsed < Duration::from_secs(3),
             "process_multiple_changes took too long",
             &details
         );

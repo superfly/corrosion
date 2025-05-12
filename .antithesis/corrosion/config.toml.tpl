@@ -25,3 +25,6 @@ prometheus.addr = "0.0.0.0:9090"
 
 [log]
 colors = false
+
+[consul.client]
+address = "localhost:8500"

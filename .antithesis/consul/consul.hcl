@@ -1,1 +1,0 @@
-retry_join = ["consul"]

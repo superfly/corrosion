@@ -27,21 +27,22 @@ for i in {1..40}; do
         fi
     done
 
+    all_zero=true
+    for addr in "${addrs[@]}"; do
+        if [[ ${queue_state[$addr]} -ne 0 ]]; then
+            all_zero=false
+            break
+        fi
+    done
+
+    if [[ $all_zero == true ]]; then
+        echo "[+] All queues are consistently ok"
+        exit 0
+    fi
+    
     sleep 60
 done
 
-exit_code=0
-for addr in "${addrs[@]}"; do
-    if [[ ${queue_state[$addr]} -gt 30 ]]; then
-        echo "[-] $addr has too many changes in the queue"
-        exit_code=1
-    fi
-done
 
-if [[ $exit_code -eq 0 ]]; then
-    echo "[+] All queues are ok"
-    exit 0
-fi
-
-echo "[-] Some queues have too many changes"
+echo "[-] Some nodes have too many changes in the queue"
 exit 1
