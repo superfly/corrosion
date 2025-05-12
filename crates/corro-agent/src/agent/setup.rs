@@ -208,26 +208,23 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                         .collect()
                 };
 
-                if top
-                    .values()
-                    .any(|meta| {
-                        let duration = meta.started_at.elapsed();
-                        if matches!(meta.state, LockState::Locked) {
-                            let details = json!({
-                                "duration": duration,
-                                "label": meta.label,
-                                "kind": meta.kind,
-                                "state": meta.state,
-                            });
-                            assert_always!(
-                                duration < WARNING_THRESHOLD,
-                                "bookie lock held for too long",
-                                &details
-                            );
-                        }
-                        duration >= WARNING_THRESHOLD
-                    })
-                {
+                if top.values().any(|meta| {
+                    let duration = meta.started_at.elapsed();
+                    if matches!(meta.state, LockState::Locked) {
+                        let details = json!({
+                            "duration": duration,
+                            "label": meta.label,
+                            "kind": meta.kind,
+                            "state": meta.state,
+                        });
+                        assert_always!(
+                            duration < WARNING_THRESHOLD,
+                            "bookie lock held for too long",
+                            &details
+                        );
+                    }
+                    duration >= WARNING_THRESHOLD
+                }) {
                     warn!(
                         "lock registry shows locks held for a long time! top {} locks:",
                         top.len()

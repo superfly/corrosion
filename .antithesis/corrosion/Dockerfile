@@ -26,23 +26,24 @@ ENV LD_LIBRARY_PATH=/usr/lib/antithesis/lib
 # Will build and cache the binary and dependent crates in release mode
 RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/local/cargo \
     --mount=type=cache,target=target \
-    cargo build --release && mv target/release/corrosion ./
+    cargo build --release && mv target/release/corrosion ./ && mv target/release/rust-load-generator ./
 
 # Runtime image
 FROM debian:bookworm-slim
 
 RUN apt update && apt install -y sqlite3 watch socat iproute2 gettext-base && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /usr/local/bin/nperf /usr/src/app/corrosion /usr/local/bin/
+COPY --from=builder /usr/local/bin/nperf /usr/src/app/corrosion /usr/src/app/rust-load-generator /usr/local/bin/
 
 # Create "corrosion" user
 RUN useradd -ms /bin/bash corrosion
 
 ENV LD_LIBRARY_PATH=/usr/lib/antithesis/lib
 COPY .antithesis/libvoidstar.so /usr/lib/antithesis/lib/libvoidstar.so
+
+RUN mkdir -p /symbols
+COPY --from=builder /usr/src/app/corrosion /symbols/corrosion
+
 COPY .antithesis/corrosion/entrypoint.sh /entrypoint.sh
-
-# COPY examples/fly/corrosion-files/* /etc/corrosion/
-
 COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl
 COPY .antithesis/corrosion/schemas /etc/corrosion/schemas
 COPY .antithesis/corrosion/templates /etc/corrosion/templates

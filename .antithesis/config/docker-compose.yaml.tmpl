@@ -1,4 +1,12 @@
 services:
+  load-generator:
+    container_name: load-generator
+    hostname: load-generator
+    image: corrosion:$SHORT_COMMIT
+    command: ["rust-load-generator", "corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]
+    environment:
+    - RUST_LOG=info
+
   corrosion1:
     container_name: corrosion1
     hostname: corrosion1
@@ -14,8 +22,6 @@ services:
     image: corrosion:$SHORT_COMMIT
     volumes: 
       - ./volumes/corrosion2:/var/lib/corrosion
-    environment:
-      - RUST_LOG=corro=debug
 
   corrosion3:
     container_name: corrosion3
@@ -23,8 +29,6 @@ services:
     image: corrosion:$SHORT_COMMIT
     volumes: 
       - ./volumes/corrosion3:/var/lib/corrosion
-    environment:
-      - RUST_LOG=corro=debug
 
   corro-client:
     container_name: corro-client

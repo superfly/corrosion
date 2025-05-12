@@ -1,5 +1,5 @@
 [workspace]
-members = [
+members = [ ".antithesis/client/rust-load-generator",
 	"crates/*",
 	"integration-tests"
 ]

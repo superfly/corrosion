@@ -13,8 +13,7 @@ def calculate_need(data):
 
     if "partial_need" in data:
         for actor_id, versions in data["partial_need"].items():
-            for version in versions.keys():
-                    need += 1
+            need += len(versions.keys())
 
     return need
 

@@ -9,9 +9,7 @@ counts=(10000 1000 900 800 700 600 500 400 300 200 100 1000 900 800 700 600 500
     1000 900 800 700 600 500 400 300 200 100 1000 900 800 700 600 500 400 300
     200 100 1000 900 800 700 600 500 400 300 200 100
 );
-
-
-
+    
 for count in ${counts[@]}; do
     addr=${addrs[$((RANDOM % 3))]}
     echo "Count: $count, addr: $addr"
@@ -26,4 +24,3 @@ for count in ${counts[@]}; do
         echo "Response body: $body"
     fi
 done
-

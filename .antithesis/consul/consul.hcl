@@ -1,0 +1,1 @@
+retry_join = ["consul"]

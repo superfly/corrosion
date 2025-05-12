@@ -408,6 +408,12 @@ pub fn store_empty_changeset(
     debug!(%actor_id, "new ranges: {new_ranges:?}");
 
     // we should never have deleted non-contiguous ranges, abort!
+    let details = json!({"new_ranges": new_ranges,});
+    assert_always!(
+        new_ranges.len() == 1,
+        "deleted non-contiguous ranges! {new_ranges:?}",
+        &details
+    );
     if new_ranges.len() > 1 {
         warn!("deleted non-contiguous ranges! {new_ranges:?}");
         return Err(ChangeError::NonContiguousDelete);

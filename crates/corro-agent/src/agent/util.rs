@@ -32,7 +32,7 @@ use corro_types::{
 
 use super::BcastCache;
 use crate::api::public::update::api_v1_updates;
-use antithesis_sdk::assert_always;
+use antithesis_sdk::{assert_always, assert_always_less_than};
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
@@ -1126,6 +1126,13 @@ pub async fn process_multiple_changes(
         }
 
         let elapsed = sub_start.elapsed();
+        let details = json!({"elapsed": elapsed.as_secs_f32()});
+        assert_always_less_than!(
+            elapsed,
+            Duration::from_secs(3),
+            "process_multiple_changes took too long",
+            &details
+        );
         if elapsed >= PROCESSING_WARN_THRESHOLD {
             warn!("process_multiple_changes: commiting snapshots took too long - {elapsed:?}");
         }
@@ -1246,6 +1253,12 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
     new_ranges.insert(seqs.clone());
 
+    let details = json!({"new_ranges": new_ranges});
+    assert_always!(
+        new_ranges.len() == 1,
+        "deleted non-contiguous seq ranges!",
+        &details
+    );
     // we should never have deleted non-contiguous seq ranges, abort!
     if new_ranges.len() > 1 {
         warn!("deleted non-contiguous seq ranges! {new_ranges:?}");
