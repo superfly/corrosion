@@ -527,7 +527,7 @@ async fn wal_checkpoint_over_threshold(
 ) -> eyre::Result<bool> {
     let wal_size = wal_path.metadata()?.len();
     let should_truncate = wal_size > threshold;
-    let warn_threshold = 40 * 1024 * 1024 * 1024;
+    let warn_threshold = 20 * 1024 * 1024 * 1024;
     let wal_size_gb = wal_size / 1024 / 1024 / 1024;
     let details = json!({"wal_size": wal_size_gb});
     assert_always!(wal_size < warn_threshold, "wal_size is too big", &details);

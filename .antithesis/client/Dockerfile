@@ -12,7 +12,7 @@ COPY .antithesis/client/test-templates/eventually_* /opt/antithesis/test/v1/basi
 
 COPY .antithesis/client/test-templates/anytime_* /opt/antithesis/test/v1/basic_test/
 
-COPY .antithesis/client/config.toml /opt/antithesis/test/v1/basic_test/config.toml
+COPY .antithesis/client/config.toml /opt/antithesis/config.toml
 
 COPY .antithesis/client/test-templates/py-resources/helper.py /opt/antithesis/py-resources/helper.py
 
