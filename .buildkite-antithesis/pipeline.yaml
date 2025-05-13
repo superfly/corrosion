@@ -24,10 +24,10 @@ steps:
     priority: 70
     key: build-config
     commands:
-      - export SHORT_COMMIT=${BUILDKITE_COMMIT:0:8}
+      - export SHORT_COMMIT=${BUILDKITE_BRANCH}-${BUILDKITE_COMMIT:0:8}
       - envsubst < .antithesis/config/docker-compose.yaml.tmpl > .antithesis/config/docker-compose.yaml
-      - docker build -f .antithesis/Dockerfile -t ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT:0:8} .
-      - docker push ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT:0:8}
+      - docker build -f .antithesis/Dockerfile -t ${ANTITHESIS_REGISTRY}/antithesis-config:${SHORT_COMMIT} .
+      - docker push ${ANTITHESIS_REGISTRY}/antithesis-config:${SHORT_COMMIT}
     plugins:
       - docker-login#v3.0.0:
           username: _json_key
