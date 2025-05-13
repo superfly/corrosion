@@ -774,7 +774,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'stati
         return;
     }
 
-    let mut interval = tokio::time::interval(Duration::from_secs(2 * 60));
+    let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
     // skip first tick
     interval.tick().await;
     let start = Instant::now();
