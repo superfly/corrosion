@@ -51,6 +51,7 @@ COPY .antithesis/libvoidstar.so /usr/lib/antithesis/lib/libvoidstar.so
 
 RUN mkdir -p /symbols
 COPY --from=builder /usr/src/app/corrosion /symbols/corrosion
+COPY --from=builder /usr/src/app/rust-load-generator /symbols/rust-load-generator
 
 COPY .antithesis/corrosion/entrypoint.sh /entrypoint.sh
 COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl

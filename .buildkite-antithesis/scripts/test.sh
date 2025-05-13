@@ -4,7 +4,7 @@ set -e
 
 set -eo pipefail
 
-CUSTOM_DURATION="0.1"
+CUSTOM_DURATION="1"
 if buildkite-agent meta-data exists "test-duration"; then
     CUSTOM_DURATION=$(buildkite-agent meta-data get test-duration)
 fi
@@ -14,7 +14,7 @@ COMMIT_HASH=${BUILDKITE_COMMIT:0:8}
 response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" -X POST https://flyio.antithesis.com/api/v1/launch/flyio -d "{\"params\": { \"antithesis.description\":\"basic_test on main\",
     \"antithesis.duration\":\"${CUSTOM_DURATION}\",
     \"antithesis.config_image\":\"antithesis-config:${COMMIT_HASH}\",
-    \"antithesis.images\":\"corrosion:${COMMIT_HASH},corro-client:${COMMIT_HASH}\", 
+    \"antithesis.images\":\"corrosion:${COMMIT_HASH},corro-client:${COMMIT_HASH},consul:1.15.4\",
     \"antithesis.report.recipients\":\"somtochi@fly.io\"
 }}")
 

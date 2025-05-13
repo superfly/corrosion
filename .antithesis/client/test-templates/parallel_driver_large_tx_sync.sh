@@ -17,9 +17,7 @@ for count in ${counts[@]}; do
     http_code=$(echo "$response" | tail -n1)
     body=$(echo "$response" | sed '$d')
     # Check if status code is 200
-    if [ "$http_code" -eq 200 ]; then
-        echo "Response body: $body"
-    else
+    if [ "$http_code" -ne 200 ]; then
         echo "Error! Response code: $http_code"
         echo "Response body: $body"
     fi

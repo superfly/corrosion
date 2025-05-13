@@ -54,8 +54,8 @@ def insert_deployment(conn, team_id, net_id):
     success, err = helper.execute_psql(conn, sql_command, params)
     if not success:
         print(f"Error inserting deployment: {err}")
-    else:
-        print(f"Inserted deployment {data['id']} for team {team_id}")
+    # else:
+    #     print(f"Inserted deployment {data['id']} for team {team_id}")
 
 def insert_user(address, team_id):
     name = helper.random_name()
@@ -64,8 +64,8 @@ def insert_user(address, team_id):
     success, err = helper.execute_sql(address, sql_command)
     if not success:
         print(f"Error inserting user: {err}")
-    else:
-        print(f"Inserted user {name} for team {team_id}")
+    # else:
+    #     print(f"Inserted user {name} for team {team_id}")
 
 def insert_team(address):
     data = {
@@ -90,7 +90,7 @@ def insert_team(address):
         print(f"Error inserting team: {err}")
         return None
     
-    print(f"Inserted team {data['id']}")
+    # print(f"Inserted team {data['id']}")
     return data['id']
  
 def do_inserts(address):
