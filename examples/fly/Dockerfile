@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/lo
 # Runtime image
 FROM debian:bookworm-slim
 
-RUN apt update && apt install -y sqlite3 watch && rm -rf /var/lib/apt/lists/*
+RUN apt update && apt install -y sqlite3 watch ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/nperf /usr/src/app/corrosion /usr/local/bin/
 
 # Create "corrosion" user
