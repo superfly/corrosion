@@ -774,7 +774,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str) {
         return;
     }
 
-    let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
+    let mut interval = tokio::time::interval(Duration::from_secs(2 * 60));
     // skip first tick
     interval.tick().await;
     let start = Instant::now();
@@ -782,10 +782,10 @@ async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str) {
     loop {
         let details = json!({
             "channel": channel,
-            "elapsed": start.elapsed().as_secs_f64()
+            "elapsed": start.elapsed()
         });
         assert_always!(
-            start.elapsed() < Duration::from_secs(5 * 60),
+            start.elapsed() < Duration::from_secs(2 * 60),
             "wait_conn_drop has been running for too long",
             &details
         );
