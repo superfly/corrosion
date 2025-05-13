@@ -8,6 +8,8 @@ CUSTOM_DURATION=${CUSTOM_DURATION:-1}
 
 COMMIT_HASH=${BUILDKITE_COMMIT:0:8}
 
+echo "Launching Antithesis test ${BUILDKITE_BRANCH} ${COMMIT_HASH}"
+
 response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" -X POST https://flyio.antithesis.com/api/v1/launch/flyio -d "{\"params\": { \"antithesis.description\":\"basic_test on main\",
     \"antithesis.duration\":\"${CUSTOM_DURATION}\",
     \"antithesis.config_image\":\"antithesis-config:${COMMIT_HASH}\",
