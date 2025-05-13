@@ -14,7 +14,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use antithesis_sdk::assert_always;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
@@ -24,7 +23,6 @@ use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
@@ -41,6 +39,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
+use crate::updates::UpdatesManager;
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
@@ -50,7 +49,6 @@ use crate::{
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn, Migration, SqlitePool, SqlitePoolError},
-    updates::UpdatesManager,
 };
 
 use super::members::Members;
@@ -524,9 +522,9 @@ struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
 
-    priority_tx: CorroSender<oneshot::Sender<DropGuard>>,
-    normal_tx: CorroSender<oneshot::Sender<DropGuard>>,
-    low_tx: CorroSender<oneshot::Sender<DropGuard>>,
+    priority_tx: CorroSender<oneshot::Sender<CancellationToken>>,
+    normal_tx: CorroSender<oneshot::Sender<CancellationToken>>,
+    low_tx: CorroSender<oneshot::Sender<CancellationToken>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -727,7 +725,7 @@ impl SplitPool {
 
     async fn write_inner(
         &self,
-        chan: &CorroSender<oneshot::Sender<DropGuard>>,
+        chan: &CorroSender<oneshot::Sender<CancellationToken>>,
         queue: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
@@ -739,7 +737,7 @@ impl SplitPool {
 
         let start = Instant::now();
 
-        let _drop_guard = timeout_fut("rx from oneshot channel", max_timeout, rx)
+        let token = timeout_fut("rx from oneshot channel", max_timeout, rx)
             .await?
             .map_err(|_| PoolError::CallbackClosed)?;
 
@@ -760,16 +758,16 @@ impl SplitPool {
 
         Ok(WriteConn {
             conn,
-            _drop_guard,
+            _drop_guard: token.drop_guard(),
             _permit,
         })
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str) {
+async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'static str) {
     let cancel = CancellationToken::new();
 
-    if let Err(_e) = tx.send(cancel.clone().drop_guard()) {
+    if let Err(_e) = tx.send(cancel.clone()) {
         error!("could not send back drop guard for pooled conn, oneshot channel likely closed");
         return;
     }
@@ -780,21 +778,17 @@ async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str) {
     let start = Instant::now();
 
     loop {
-        let details = json!({
-            "channel": channel,
-            "elapsed": start.elapsed()
-        });
-        assert_always!(
-            start.elapsed() < Duration::from_secs(2 * 60),
-            "wait_conn_drop has been running for too long",
-            &details
-        );
-
         tokio::select! {
             _ = cancel.cancelled() => {
                 break;
             }
             _ = interval.tick() => {
+                let details = json!({"channel": channel, "elapsed": start.elapsed()});
+                assert_always!(
+                    start.elapsed() < Duration::from_secs(2 * 60),
+                    "wait_conn_drop has been running for too long",
+                    &details
+                );
                 let elapsed = start.elapsed();
                 warn!("wait_conn_drop has been running since {elapsed:?}, token_is_cancelled - {:?}, channel - {channel}", cancel.is_cancelled());
                 continue;
