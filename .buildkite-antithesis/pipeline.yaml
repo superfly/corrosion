@@ -37,17 +37,9 @@ steps:
       queue: "high-concurrency"
     depends_on: [build-corrosion]
 
-  - block: ":rocket: Trigger Tests"
-    prompt: "Specify custom duration for tests"
-    fields:
-      - text: "Duration in seconds"
-        key: "test-duration"
-        required: false
-    key: trigger
-
   - label: "☁️ Test on Antithesis"
     priority: 50
     key: deploy
     commands:
       - .buildkite-antithesis/scripts/test.sh
-    depends_on: [build-config, trigger]
+    depends_on: [build-config]
