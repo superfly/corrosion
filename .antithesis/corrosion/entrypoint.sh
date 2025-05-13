@@ -14,7 +14,7 @@ socat TCP-LISTEN:6644,reuseaddr,fork UNIX-CONNECT:/app/admin.sock &
 
 # start consul agent
 # TODO: bind to IP_ADDR
-consul agent -dev --retry-join consul -bind=0.0.0.0 -client=0.0.0.0 -log-level=warn &
+consul agent -dev --retry-join consul -bind=0.0.0.0 -client=0.0.0.0 -log-level=warn -log-file=/tmp/consul.log &
 
 # start corro-consul
 corrosion consul sync &
