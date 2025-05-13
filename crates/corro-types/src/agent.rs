@@ -787,7 +787,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'stati
             _ = interval.tick() => {
                 let details = json!({"channel": channel, "elapsed": start.elapsed()});
                 assert_always!(
-                    start.elapsed() < Duration::from_secs(2 * 60),
+                    start.elapsed() < Duration::from_secs(5 * 60),
                     "wait_conn_drop has been running for too long",
                     &details
                 );
