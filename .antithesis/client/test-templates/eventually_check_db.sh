@@ -1,3 +1,5 @@
+#!/bin/bash
+
 tables=("users" "teams" "deployments" "consul_services" "consul_checks")
 default_dir="/var/lib/corrosion1/state.db"
 default_corrosion_dirs=("/var/lib/corrosion2/state.db" "/var/lib/corrosion3/state.db")

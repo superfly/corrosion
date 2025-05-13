@@ -24,10 +24,10 @@ steps:
     priority: 70
     key: build-config
     commands:
-      - export SHORT_COMMIT=${BUILDKITE_BRANCH}-${BUILDKITE_COMMIT:0:8}
+      - export SHORT_COMMIT=${BUILDKITE_COMMIT:0:8}
       - envsubst < .antithesis/config/docker-compose.yaml.tmpl > .antithesis/config/docker-compose.yaml
-      - docker build -f .antithesis/Dockerfile -t ${ANTITHESIS_REGISTRY}/antithesis-config:${SHORT_COMMIT} .
-      - docker push ${ANTITHESIS_REGISTRY}/antithesis-config:${SHORT_COMMIT}
+      - docker build -f .antithesis/Dockerfile -t ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT:0:8} .
+      - docker push ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT:0:8}
     plugins:
       - docker-login#v3.0.0:
           username: _json_key
@@ -36,14 +36,6 @@ steps:
     agents:
       queue: "high-concurrency"
     depends_on: [build-corrosion]
-
-  - block: ":rocket: Trigger Tests"
-    prompt: "Specify custom duration for tests"
-    fields:
-      - text: "Duration in seconds"
-        key: "test-duration"
-        required: false
-    key: trigger
 
   - label: "☁️ Test on Antithesis"
     priority: 50
