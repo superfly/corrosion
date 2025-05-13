@@ -42,4 +42,4 @@ steps:
     key: deploy
     commands:
       - .buildkite-antithesis/scripts/test.sh
-    depends_on: [build-config, trigger]
+    depends_on: [build-config]
