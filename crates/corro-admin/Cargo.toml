@@ -18,6 +18,8 @@ tokio = { workspace = true }
 tokio-serde = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-filter = { workspace = true }
 tripwire = { path = "../tripwire" }
 rangemap = { workspace = true }
 uuid = { workspace = true }

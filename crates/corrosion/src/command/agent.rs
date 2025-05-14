@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use build_info::VersionControl;
 use camino::Utf8PathBuf;
-use corro_admin::AdminConfig;
+use corro_admin::{AdminConfig, TracingHandle};
 use corro_types::config::{Config, PrometheusConfig};
 use metrics::gauge;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
@@ -13,7 +13,11 @@ use tracing::{error, info};
 
 use crate::VERSION;
 
-pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> {
+pub async fn run(
+    config: Config,
+    config_path: &Utf8PathBuf,
+    tracing_handle: Option<TracingHandle>,
+) -> eyre::Result<()> {
     info!("Starting Corrosion Agent v{VERSION}");
 
     if let Some(PrometheusConfig { bind_addr }) = config.telemetry.prometheus {
@@ -64,6 +68,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
             listen_path: config.admin.uds_path.clone(),
             config_path: config_path.clone(),
         },
+        tracing_handle,
         tripwire,
     )?;
 
