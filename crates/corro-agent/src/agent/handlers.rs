@@ -53,6 +53,15 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 
+#[derive(thiserror::Error, Debug)]
+pub enum WalCheckpointError {
+    #[error("WAL checkpoint failed with timeout {timeout_ms}ms: {source}")]
+    Failed {
+        timeout_ms: u64,
+        source: eyre::Report,
+    },
+}
+
 /// Spawn a tree of tasks that handles incoming gossip server
 /// connections, streams, and their respective payloads.
 pub fn spawn_gossipserver_handler(
@@ -527,7 +536,12 @@ async fn wal_checkpoint_over_threshold(
     if should_truncate {
         let timeout = calc_busy_timeout(wal_path.metadata()?.len(), threshold);
         let conn = pool.write_low().await?;
-        block_in_place(|| wal_checkpoint(&conn, timeout))?;
+        block_in_place(|| wal_checkpoint(&conn, timeout)).map_err(|e| {
+            WalCheckpointError::Failed {
+                timeout_ms: timeout,
+                source: e,
+            }
+        })?;
     }
     Ok(should_truncate)
 }
@@ -535,14 +549,16 @@ async fn wal_checkpoint_over_threshold(
 fn calc_busy_timeout(wal_size: u64, threshold: u64) -> u64 {
     let wal_size_gb = wal_size / (1024 * 1024 * 1024);
     let threshold_gb = threshold / (1024 * 1024 * 1024);
-    let base_timeout = 30000;
+    let base_timeout = 60000;
     if wal_size_gb <= threshold_gb {
         return base_timeout;
     }
 
     // Double the timeout every 10gb and cap at 64 minutes
-    let diff = cmp::min(6, wal_size_gb / 10);
-    let timeout = base_timeout * 2_u64.pow(diff as u32);
+    let diff = cmp::min(5, (wal_size_gb - threshold_gb) / 10);
+    // add extra (five * diff) seconds for every extra 1gb over 10gb
+    let linear_increase = (wal_size_gb % 10) * 5000 * (diff + 1);
+    let timeout = base_timeout * 2_u64.pow(diff as u32) + linear_increase;
     // we are using a 16min timeout, something is wrong if we get here
     if diff >= 5 {
         warn!("WAL size is too large, setting busy timeout {timeout}ms");
@@ -1272,17 +1288,27 @@ mod tests {
 
     #[test]
     fn check_busy_timeout() {
-        assert_eq!(calc_busy_timeout(to_bytes(1), to_bytes(5)), 30000); // 30s
-        assert_eq!(calc_busy_timeout(to_bytes(5), to_bytes(5)), 30000); // 30s
-        assert_eq!(calc_busy_timeout(to_bytes(10), to_bytes(5)), 60000); // 60s
-        assert_eq!(calc_busy_timeout(to_bytes(20), to_bytes(5)), 120000); // 2m
-        assert_eq!(calc_busy_timeout(to_bytes(30), to_bytes(5)), 240000); // 4m
-        assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(5)), 480000); // 8m
-        assert_eq!(calc_busy_timeout(to_bytes(57), to_bytes(5)), 960000); // 16m
-        assert_eq!(calc_busy_timeout(to_bytes(60), to_bytes(5)), 1920000); // 32m
-        assert_eq!(calc_busy_timeout(to_bytes(70), to_bytes(5)), 1920000); // 32m
-        assert_eq!(calc_busy_timeout(to_bytes(100), to_bytes(5)), 1920000); // 32m
-        assert_eq!(calc_busy_timeout(to_bytes(1000), to_bytes(5)), 1920000); // 32m
+        // TODO: test other values of WAL threshold
+        assert_eq!(calc_busy_timeout(to_bytes(1), to_bytes(10)), 60000); // 60s
+        assert_eq!(calc_busy_timeout(to_bytes(5), to_bytes(10)), 60000); // 60s
+        assert_eq!(calc_busy_timeout(to_bytes(10), to_bytes(10)), 60000); // 60s
+        assert_eq!(calc_busy_timeout(to_bytes(11), to_bytes(10)), 65000); // 65s (linear increase of 5s)
+        assert_eq!(calc_busy_timeout(to_bytes(12), to_bytes(10)), 70000); // 70s
+        assert_eq!(calc_busy_timeout(to_bytes(13), to_bytes(10)), 75000); // 75s
+        assert_eq!(calc_busy_timeout(to_bytes(17), to_bytes(10)), 95000); // 95s
+        assert_eq!(calc_busy_timeout(to_bytes(20), to_bytes(10)), 120000); // 2m (linear increase of 10s)
+        assert_eq!(calc_busy_timeout(to_bytes(23), to_bytes(10)), 150000); // 2m30s
+        assert_eq!(calc_busy_timeout(to_bytes(28), to_bytes(10)), 200000); // 3m20s
+        assert_eq!(calc_busy_timeout(to_bytes(30), to_bytes(10)), 240000); // 4m
+        assert_eq!(calc_busy_timeout(to_bytes(31), to_bytes(10)), 255000); // 4m15s
+        assert_eq!(calc_busy_timeout(to_bytes(39), to_bytes(10)), 375000); // 6m15s
+        assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(10)), 480000); // 8m
+        assert_eq!(calc_busy_timeout(to_bytes(50), to_bytes(10)), 960000); // 16m
+        assert_eq!(calc_busy_timeout(to_bytes(57), to_bytes(10)), 1135000); //
+        assert_eq!(calc_busy_timeout(to_bytes(60), to_bytes(10)), 1920000); // 32m
+        assert_eq!(calc_busy_timeout(to_bytes(70), to_bytes(10)), 1920000); // 32m
+        assert_eq!(calc_busy_timeout(to_bytes(100), to_bytes(10)), 1920000); // 32m
+        assert_eq!(calc_busy_timeout(to_bytes(1000), to_bytes(10)), 1920000); // 32m
     }
 
     fn to_bytes(gb: u64) -> u64 {
