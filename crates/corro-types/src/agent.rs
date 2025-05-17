@@ -735,7 +735,7 @@ impl SplitPool {
         let (tx, rx) = oneshot::channel();
         let max_timeout = Duration::from_secs(5 * 60);
 
-        info!("sending token to oneshot channel for uuid - {uuid:?}");
+        debug!("sending token to oneshot channel for uuid - {uuid:?}");
         timeout_fut("tx to oneshot channel", max_timeout, chan.send((tx, uuid)), uuid)
             .await?
             .map_err(|_| {
@@ -745,7 +745,7 @@ impl SplitPool {
 
         let start = Instant::now();
 
-        info!("waiting for token from oneshot channel for uuid - {uuid:?}");
+        debug!("waiting for token from oneshot channel for uuid - {uuid:?}");
 
         let token = timeout_fut("rx from oneshot channel", max_timeout, rx, uuid)
             .await?
@@ -754,7 +754,7 @@ impl SplitPool {
                 PoolError::CallbackClosed
             })?;
 
-        info!("received token from oneshot channel for uuid - {uuid:?}");
+        debug!("received token from oneshot channel for uuid - {uuid:?}");
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
         let conn = timeout_fut("acquiring write conn", max_timeout, self.0.write.get(), uuid).await?.map_err(|e| {
@@ -762,7 +762,7 @@ impl SplitPool {
                 e
             })?;
 
-        info!("acquired write conn for uuid - {uuid:?}");
+        debug!("acquired write conn for uuid - {uuid:?}");
         let start = Instant::now();
         let _permit = timeout_fut(
             "acquiring write semaphore",
