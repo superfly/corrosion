@@ -800,17 +800,17 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'stati
     let start = Instant::now();
 
     loop {
+        let details = json!({"channel": channel, "elapsed": start.elapsed(), "uuid": uuid});
+        assert_always!(
+            start.elapsed() < Duration::from_secs(5 * 60),
+            "wait_conn_drop has been running for too long",
+            &details
+        );
         tokio::select! {
             _ = cancel.cancelled() => {
                 break;
             }
             _ = interval.tick() => {
-                let details = json!({"channel": channel, "elapsed": start.elapsed(), "uuid": uuid});
-                assert_always!(
-                    start.elapsed() < Duration::from_secs(5 * 60),
-                    "wait_conn_drop has been running for too long",
-                    &details
-                );
                 let elapsed = start.elapsed();
                 warn!("wait_conn_drop has been running since {elapsed:?}, token_is_cancelled - {:?}, channel - {channel}, uuid - {uuid:?}", cancel.is_cancelled());
                 continue;
