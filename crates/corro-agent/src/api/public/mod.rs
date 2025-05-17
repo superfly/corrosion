@@ -58,7 +58,7 @@ where
     trace!("getting conn...");
     let uuid = uuid::Uuid::new_v4();
     let mut conn = agent.pool().write_priority(uuid).await?;
-    info!("got conn for uuid - {uuid:?}");
+    debug!("got conn for uuid - {uuid:?}");
     trace!("got conn");
 
     let actor_id = agent.actor_id();

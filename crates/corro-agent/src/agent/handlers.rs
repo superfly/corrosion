@@ -1237,7 +1237,7 @@ mod tests {
         let pool = SplitPool::create(db_path, write_sema.clone()).await?;
 
         {
-            let mut conn = pool.write_priority().await?;
+            let mut conn = pool.write_priority(uuid::Uuid::new_v4()).await?;
             conn.execute(
                 r#"
             CREATE TABLE test (
