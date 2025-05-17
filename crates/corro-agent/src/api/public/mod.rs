@@ -56,7 +56,9 @@ where
     F: Fn(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
     trace!("getting conn...");
-    let mut conn = agent.pool().write_priority().await?;
+    let uuid = uuid::Uuid::new_v4();
+    let mut conn = agent.pool().write_priority(uuid).await?;
+    info!("got conn for uuid - {uuid:?}");
     trace!("got conn");
 
     let actor_id = agent.actor_id();
@@ -492,7 +494,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     let partial_schema = parse_sql(&new_sql)?;
 
     info!("getting write connection to update schema");
-    let mut conn = agent.pool().write_priority().await?;
+    let mut conn = agent.pool().write_priority(uuid::Uuid::new_v4()).await?;
     info!("got write connection to update schema");
 
     // hold onto this lock so nothing else makes changes
@@ -973,7 +975,7 @@ mod tests {
 
         {
             // adding the table and an index
-            let conn = agent.pool().write_priority().await?;
+            let conn = agent.pool().write_priority(uuid::Uuid::new_v4()).await?;
             conn.execute_batch(create_stmt)?;
             conn.execute_batch("CREATE INDEX tests3_updated_at ON tests3 (updated_at);")?;
             assert_eq!(

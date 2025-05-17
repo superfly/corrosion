@@ -39,7 +39,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use tripwire::Tripwire;
 
 use crate::updates::UpdatesManager;
@@ -710,8 +710,8 @@ impl SplitPool {
 
     // get a high priority write connection (e.g. client input)
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn write_priority(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.priority_tx, "priority", uuid::Uuid::new_v4()).await
+    pub async fn write_priority(&self, uuid: Uuid) -> Result<WriteConn, PoolError> {
+        self.write_inner(&self.0.priority_tx, "priority", uuid).await
     }
 
     // get a normal priority write connection (e.g. sync process)
@@ -735,20 +735,34 @@ impl SplitPool {
         let (tx, rx) = oneshot::channel();
         let max_timeout = Duration::from_secs(5 * 60);
 
+        info!("sending token to oneshot channel for uuid - {uuid:?}");
         timeout_fut("tx to oneshot channel", max_timeout, chan.send((tx, uuid)), uuid)
             .await?
-            .map_err(|_| PoolError::QueueClosed)?;
+            .map_err(|_| {
+                error!("could not send token to oneshot channel for uuid - {uuid:?}");
+                PoolError::QueueClosed
+            })?;
 
         let start = Instant::now();
 
+        info!("waiting for token from oneshot channel for uuid - {uuid:?}");
+
         let token = timeout_fut("rx from oneshot channel", max_timeout, rx, uuid)
             .await?
-            .map_err(|_| PoolError::CallbackClosed)?;
+            .map_err(|_| {
+                error!("could not receive token from oneshot channel for uuid - {uuid:?}");
+                PoolError::CallbackClosed
+            })?;
 
+        info!("received token from oneshot channel for uuid - {uuid:?}");
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
-        let conn = timeout_fut("acquiring write conn", max_timeout, self.0.write.get(), uuid).await??;
+        let conn = timeout_fut("acquiring write conn", max_timeout, self.0.write.get(), uuid).await?.map_err(|e| {
+                error!("could not acquire write conn for uuid - {uuid:?}");
+                e
+            })?;
 
+        info!("acquired write conn for uuid - {uuid:?}");
         let start = Instant::now();
         let _permit = timeout_fut(
             "acquiring write semaphore",
@@ -756,7 +770,10 @@ impl SplitPool {
             self.0.write_sema.clone().acquire_owned(),
             uuid,
         )
-        .await??;
+        .await?.map_err(|e| {
+            error!("could not acquire write semaphore for uuid - {uuid:?}");
+            e
+        })?;
 
         histogram!("corro.sqlite.write_permit.acquisition.seconds")
             .record(start.elapsed().as_secs_f64());

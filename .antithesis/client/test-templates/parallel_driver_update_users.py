@@ -37,9 +37,9 @@ def update_in_corrosion(address, port, table, id, new_data):
     conn = helper.get_db_connection(address, port)
     success, err = helper.execute_psql(conn, sql_command)
 
-    if not success:
-        print(f"Error executing updating {table} {id}: {err}")
-        return
+    # if not success:
+    #     print(f"Error executing updating {table} {id}: {err}")
+    # return
     # print(f"Successfully updated {table} {id} in Corrosion node.")
 
 def get_ids(address, port, table):

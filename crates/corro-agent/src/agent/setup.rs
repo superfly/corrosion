@@ -108,7 +108,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     );
 
     let schema = {
-        let mut conn = pool.write_priority().await?;
+        let mut conn = pool.write_priority(uuid::Uuid::new_v4()).await?;
         migrate(clock.clone(), &mut conn)?;
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
