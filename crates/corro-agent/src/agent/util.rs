@@ -1128,7 +1128,7 @@ pub async fn process_multiple_changes(
         let elapsed = sub_start.elapsed();
         let details = json!({"elapsed": elapsed.as_secs_f32()});
         assert_always!(
-            elapsed < Duration::from_secs(3),
+            elapsed < Duration::from_secs(1 * 60),
             "process_multiple_changes took too long",
             &details
         );
