@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use antithesis_sdk::assert_always;
+use antithesis_sdk::{assert_always, assert_always_or_unreachable};
 use serde_json::json;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
@@ -808,7 +808,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'stati
                 let elapsed = start.elapsed();
                 warn!("wait_conn_drop has been running since {elapsed:?}, token_is_cancelled - {:?}, channel - {channel}, uuid - {uuid:?}", cancel.is_cancelled());
                 let details = json!({"channel": channel, "elapsed": start.elapsed(), "uuid": uuid});
-                assert_always!(
+                assert_always_or_unreachable!(
                     start.elapsed() < Duration::from_secs(5 * 60),
                     "wait_conn_drop has been running for too long",
                     &details
