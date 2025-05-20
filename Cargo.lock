@@ -2412,8 +2412,7 @@ dependencies = [
 [[package]]
 name = "libsqlite3-sys"
 version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf4e226dcd58b4be396f7bd3c20da8fdee2911400705297ba7d2d7cc2c30f716"
+source = "git+https://github.com/somtochiama/rusqlite?rev=8527e41#8527e411ef1cf00746e7ec6a22e0cd0a3861b87b"
 dependencies = [
  "cc",
  "pkg-config",
@@ -3559,8 +3558,7 @@ dependencies = [
 [[package]]
 name = "rusqlite"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a78046161564f5e7cd9008aff3b2990b3850dc8e0349119b98e8f251e099f24d"
+source = "git+https://github.com/somtochiama/rusqlite?rev=8527e41#8527e411ef1cf00746e7ec6a22e0cd0a3861b87b"
 dependencies = [
  "bitflags 2.8.0",
  "chrono",
