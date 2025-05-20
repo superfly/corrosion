@@ -2412,7 +2412,7 @@ dependencies = [
 [[package]]
 name = "libsqlite3-sys"
 version = "0.27.0"
-source = "git+https://github.com/somtochiama/rusqlite?rev=4f3c7e4#4f3c7e4a6b34c6b08eebbb2f94cb05cabc6b5c33"
+source = "git+https://github.com/somtochiama/rusqlite?rev=0fdaef9#0fdaef9c8b23376bddd5025ee2c49bb5a0fa782d"
 dependencies = [
  "cc",
  "pkg-config",
@@ -3558,7 +3558,7 @@ dependencies = [
 [[package]]
 name = "rusqlite"
 version = "0.30.0"
-source = "git+https://github.com/somtochiama/rusqlite?rev=4f3c7e4#4f3c7e4a6b34c6b08eebbb2f94cb05cabc6b5c33"
+source = "git+https://github.com/somtochiama/rusqlite?rev=0fdaef9#0fdaef9c8b23376bddd5025ee2c49bb5a0fa782d"
 dependencies = [
  "bitflags 2.8.0",
  "chrono",
