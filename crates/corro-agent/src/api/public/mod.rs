@@ -294,19 +294,24 @@ async fn build_query_rows_response(
 
         // TODO: put this into InterruptibleStatement
         let int_handle = conn.get_interrupt_handle();
-        let token = CancellationToken::new();
-        let query = stmt.query().to_string();
-        tokio::spawn(async move {
-            let timeout = Duration::from_secs(5 * 60);
-            tokio::select! {
-                _ = token.cancelled() => {}
-                _ = tokio::time::sleep(timeout) => {
-                    warn!("query timed out, interrupting: {:?}", query);
-                    int_handle.interrupt();
+        let cancel = CancellationToken::new();
+
+        tokio::spawn({
+            let cancel = cancel.clone();
+            let query = stmt.query().to_string();
+            async move {
+                let timeout = Duration::from_secs(4 * 60);
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = tokio::time::sleep(timeout) => {
+                        warn!("query timed out, interrupting: {:?}", query);
+                        int_handle.interrupt();
+                    }
                 }
             }
         });
 
+        let _drop_guard = cancel.drop_guard();
         block_in_place(|| {
             let col_count = prepped.column_count();
             trace!("inside block in place, col count: {col_count}");
