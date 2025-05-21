@@ -33,6 +33,7 @@ use tokio::{
     },
     task::block_in_place,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
@@ -290,6 +291,21 @@ async fn build_query_rows_response(
             )));
             return;
         }
+
+        // TODO: put this into InterruptibleStatement
+        let int_handle = conn.get_interrupt_handle();
+        let token = CancellationToken::new();
+        let query = stmt.query().to_string();
+        tokio::spawn(async move {
+            let timeout = Duration::from_secs(5 * 60);
+            tokio::select! {
+                _ = token.cancelled() => {}
+                _ = tokio::time::sleep(timeout) => {
+                    warn!("query timed out, interrupting: {:?}", query);
+                    int_handle.interrupt();
+                }
+            }
+        });
 
         block_in_place(|| {
             let col_count = prepped.column_count();
