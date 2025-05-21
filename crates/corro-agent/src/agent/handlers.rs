@@ -409,7 +409,7 @@ fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()>
 
     let busy: bool = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
     if busy {
-        warn!("could not truncate sqlite WAL, database busy");
+        warn!("could not truncate sqlite WAL, database busy - with timeout: {timeout}");
         counter!("corro.db.wal.truncate.busy").increment(1);
     } else {
         debug!("successfully truncated sqlite WAL!");
