@@ -549,15 +549,15 @@ async fn wal_checkpoint_over_threshold(
 fn calc_busy_timeout(wal_size: u64, threshold: u64) -> u64 {
     let wal_size_gb = wal_size / (1024 * 1024 * 1024);
     let threshold_gb = threshold / (1024 * 1024 * 1024);
-    let base_timeout = 60000;
+    let base_timeout = 30000;
     if wal_size_gb <= threshold_gb {
         return base_timeout;
     }
 
     // Double the timeout every 10gb and cap at 64 minutes
-    let diff = cmp::min(5, (wal_size_gb - threshold_gb) / 10);
+    let diff = cmp::min(5, wal_size_gb / 10);
     // add extra (five * diff) seconds for every extra 1gb over 10gb
-    let linear_increase = (wal_size_gb % 10) * 5000 * (diff + 1);
+    let linear_increase = (wal_size_gb % 10) * 5000 * diff;
     let timeout = base_timeout * 2_u64.pow(diff as u32) + linear_increase;
     // we are using a 16min timeout, something is wrong if we get here
     if diff >= 5 {
@@ -1285,30 +1285,36 @@ mod tests {
 
         Ok(())
     }
-
     #[test]
     fn check_busy_timeout() {
-        // TODO: test other values of WAL threshold
-        assert_eq!(calc_busy_timeout(to_bytes(1), to_bytes(10)), 60000); // 60s
-        assert_eq!(calc_busy_timeout(to_bytes(5), to_bytes(10)), 60000); // 60s
-        assert_eq!(calc_busy_timeout(to_bytes(10), to_bytes(10)), 60000); // 60s
-        assert_eq!(calc_busy_timeout(to_bytes(11), to_bytes(10)), 65000); // 65s (linear increase of 5s)
-        assert_eq!(calc_busy_timeout(to_bytes(12), to_bytes(10)), 70000); // 70s
-        assert_eq!(calc_busy_timeout(to_bytes(13), to_bytes(10)), 75000); // 75s
-        assert_eq!(calc_busy_timeout(to_bytes(17), to_bytes(10)), 95000); // 95s
-        assert_eq!(calc_busy_timeout(to_bytes(20), to_bytes(10)), 120000); // 2m (linear increase of 10s)
-        assert_eq!(calc_busy_timeout(to_bytes(23), to_bytes(10)), 150000); // 2m30s
-        assert_eq!(calc_busy_timeout(to_bytes(28), to_bytes(10)), 200000); // 3m20s
-        assert_eq!(calc_busy_timeout(to_bytes(30), to_bytes(10)), 240000); // 4m
-        assert_eq!(calc_busy_timeout(to_bytes(31), to_bytes(10)), 255000); // 4m15s
-        assert_eq!(calc_busy_timeout(to_bytes(39), to_bytes(10)), 375000); // 6m15s
-        assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(10)), 480000); // 8m
-        assert_eq!(calc_busy_timeout(to_bytes(50), to_bytes(10)), 960000); // 16m
-        assert_eq!(calc_busy_timeout(to_bytes(57), to_bytes(10)), 1135000); //
-        assert_eq!(calc_busy_timeout(to_bytes(60), to_bytes(10)), 1920000); // 32m
-        assert_eq!(calc_busy_timeout(to_bytes(70), to_bytes(10)), 1920000); // 32m
-        assert_eq!(calc_busy_timeout(to_bytes(100), to_bytes(10)), 1920000); // 32m
-        assert_eq!(calc_busy_timeout(to_bytes(1000), to_bytes(10)), 1920000); // 32m
+        // Base timeout (30s) applies up to threshold
+        assert_eq!(calc_busy_timeout(to_bytes(1), to_bytes(5)), 30000);  // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(4), to_bytes(5)), 30000);  // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(5), to_bytes(5)), 30000);  // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(9), to_bytes(5)), 30000);  // 30s
+
+        // At 10GB we hit first doubling + linear increases (5s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(10), to_bytes(5)), 60000);  // 1m
+        assert_eq!(calc_busy_timeout(to_bytes(11), to_bytes(5)), 65000);  // 1m10s
+        assert_eq!(calc_busy_timeout(to_bytes(15), to_bytes(5)), 85000); // 1m50s
+
+        // At 20GB we hit second doubling + linear increases (10s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(20), to_bytes(5)), 120000); // 2m
+        assert_eq!(calc_busy_timeout(to_bytes(21), to_bytes(5)), 130000); // 2m10s
+        assert_eq!(calc_busy_timeout(to_bytes(25), to_bytes(5)), 170000); // 2m50s
+
+        // At 30GB we hit third doubling + linear increases (15s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(30), to_bytes(5)), 240000); // 4m
+        assert_eq!(calc_busy_timeout(to_bytes(31), to_bytes(5)), 255000); // 4m15s
+
+        // At 40GB we hit fourth doubling + linear increases (20s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(5)), 480000); // 8m
+        assert_eq!(calc_busy_timeout(to_bytes(41), to_bytes(5)), 500000); // 8m20s
+
+        // At 50GB we hit fifth doubling and cap at 16m
+        assert_eq!(calc_busy_timeout(to_bytes(50), to_bytes(5)), 960000); // 16m
+        assert_eq!(calc_busy_timeout(to_bytes(51), to_bytes(5)), 985000); // 16m25s (capped)
+        assert_eq!(calc_busy_timeout(to_bytes(100), to_bytes(5)), 960000); // 16m (capped)
     }
 
     fn to_bytes(gb: u64) -> u64 {
