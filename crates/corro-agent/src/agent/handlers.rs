@@ -1288,14 +1288,14 @@ mod tests {
     #[test]
     fn check_busy_timeout() {
         // Base timeout (30s) applies up to threshold
-        assert_eq!(calc_busy_timeout(to_bytes(1), to_bytes(5)), 30000);  // 30s
-        assert_eq!(calc_busy_timeout(to_bytes(4), to_bytes(5)), 30000);  // 30s
-        assert_eq!(calc_busy_timeout(to_bytes(5), to_bytes(5)), 30000);  // 30s
-        assert_eq!(calc_busy_timeout(to_bytes(9), to_bytes(5)), 30000);  // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(1), to_bytes(5)), 30000); // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(4), to_bytes(5)), 30000); // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(5), to_bytes(5)), 30000); // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(9), to_bytes(5)), 30000); // 30s
 
         // At 10GB we hit first doubling + linear increases (5s per GB)
-        assert_eq!(calc_busy_timeout(to_bytes(10), to_bytes(5)), 60000);  // 1m
-        assert_eq!(calc_busy_timeout(to_bytes(11), to_bytes(5)), 65000);  // 1m10s
+        assert_eq!(calc_busy_timeout(to_bytes(10), to_bytes(5)), 60000); // 1m
+        assert_eq!(calc_busy_timeout(to_bytes(11), to_bytes(5)), 65000); // 1m10s
         assert_eq!(calc_busy_timeout(to_bytes(15), to_bytes(5)), 85000); // 1m50s
 
         // At 20GB we hit second doubling + linear increases (10s per GB)
