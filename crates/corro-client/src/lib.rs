@@ -51,10 +51,14 @@ impl CorrosionApiClient {
     pub async fn query_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
+        timeout: Option<u64>,
     ) -> Result<QueryStream<T>, Error> {
+        let params = timeout
+            .map(|t| format!("?timeout={}", t))
+            .unwrap_or_default();
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/v1/queries", self.api_addr))
+            .uri(format!("http://{}/v1/queries{}", self.api_addr, params))
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statement)?))?;
@@ -93,8 +97,9 @@ impl CorrosionApiClient {
     pub async fn query(
         &self,
         statement: &Statement,
+        timeout: Option<u64>,
     ) -> Result<QueryStream<Vec<SqliteValue>>, Error> {
-        self.query_typed(statement).await
+        self.query_typed(statement, timeout).await
     }
 
     pub async fn subscribe_typed<T: DeserializeOwned + Unpin>(
@@ -494,10 +499,11 @@ impl CorrosionPooledClient {
     pub async fn query_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
+        timeout: Option<u64>,
     ) -> Result<QueryStream<T>, Error> {
         let (response, generation) = {
             let (client, generation) = self.get_client().await?;
-            let response = client.query_typed(statement).await;
+            let response = client.query_typed(statement, timeout).await;
 
             (response, generation)
         };

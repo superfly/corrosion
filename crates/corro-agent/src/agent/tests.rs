@@ -27,7 +27,7 @@ use crate::{
     agent::process_multiple_changes,
     api::{
         peer::parallel_sync,
-        public::{api_v1_db_schema, api_v1_transactions, TransactionParams},
+        public::{api_v1_db_schema, api_v1_transactions, TimeoutParams},
     },
     transport::Transport,
 };
@@ -944,7 +944,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
     for i in 1..=5_i64 {
         let (status_code, _) = api_v1_transactions(
             Extension(ta2.agent.clone()),
-            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "INSERT OR REPLACE INTO tests (id,text) VALUES (?,?)".into(),
                 vec![i.into(), "service-text".into()],
@@ -1349,7 +1349,7 @@ async fn insert_rows(agent: Agent, start: i64, n: i64) {
     for i in start..=n {
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "INSERT OR REPLACE INTO tests3 (id,text,text2, num, num2) VALUES (?,?,?,?,?)"
                     .into(),
@@ -2214,7 +2214,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let (status_code, body) = api_v1_transactions(
         Extension(ta1.agent.clone()),
-        axum::extract::Query(TransactionParams { timeout: None }),
+        axum::extract::Query(TimeoutParams { timeout: None }),
         axum::Json(vec![Statement::WithParams(
             "insert into tests (id, text) values (?,?)".into(),
             vec!["service-id".into(), "service-name".into()],
@@ -2286,7 +2286,7 @@ async fn test_automatic_bookkeeping_clearing() -> eyre::Result<()> {
 
     let (status_code, body) = api_v1_transactions(
         Extension(ta1.agent.clone()),
-        axum::extract::Query(TransactionParams { timeout: None }),
+        axum::extract::Query(TimeoutParams { timeout: None }),
         axum::Json(vec![Statement::WithParams(
             "insert or replace into tests (id, text) values (?,?)".into(),
             vec!["service-id".into(), "service-name-overwrite".into()],

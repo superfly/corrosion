@@ -369,6 +369,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             columns: show_columns,
             timer,
             param,
+            timeout,
         } => {
             let stmt = if param.is_empty() {
                 Statement::Simple(query.clone())
@@ -379,7 +380,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 )
             };
 
-            let mut query = cli.api_client()?.query(&stmt).await?;
+            let mut query = cli.api_client()?.query(&stmt, *timeout).await?;
             while let Some(res) = query.next().await {
                 match res {
                     Ok(QueryEvent::Columns(cols)) => {
@@ -674,7 +675,8 @@ enum Command {
         columns: bool,
         #[arg(long, default_value = "false")]
         timer: bool,
-
+        #[arg(long)]
+        timeout: Option<u64>,
         #[arg(long)]
         param: Vec<String>,
     },

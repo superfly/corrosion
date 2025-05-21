@@ -53,15 +53,6 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 
-#[derive(thiserror::Error, Debug)]
-pub enum WalCheckpointError {
-    #[error("WAL checkpoint failed with timeout {timeout_ms}ms: {source}")]
-    Failed {
-        timeout_ms: u64,
-        source: eyre::Report,
-    },
-}
-
 /// Spawn a tree of tasks that handles incoming gossip server
 /// connections, streams, and their respective payloads.
 pub fn spawn_gossipserver_handler(
@@ -536,12 +527,7 @@ async fn wal_checkpoint_over_threshold(
     if should_truncate {
         let timeout = calc_busy_timeout(wal_path.metadata()?.len(), threshold);
         let conn = pool.write_low().await?;
-        block_in_place(|| wal_checkpoint(&conn, timeout)).map_err(|e| {
-            WalCheckpointError::Failed {
-                timeout_ms: timeout,
-                source: e,
-            }
-        })?;
+        block_in_place(|| wal_checkpoint(&conn, timeout))?;
     }
     Ok(should_truncate)
 }
