@@ -12,7 +12,7 @@ const fn default_apply_queue() -> usize {
 }
 
 const fn default_wal_threshold() -> usize {
-    10
+    5
 }
 
 const fn default_processing_queue() -> usize {
