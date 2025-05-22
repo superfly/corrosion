@@ -22,8 +22,7 @@ use tokio::{
         RwLock as TokioRwLock, Semaphore,
     },
 };
-use tracing::{debug, error, info, trace, warn};
-use tracing_subscriber::fmt::format::Json;
+use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
 // Internals
