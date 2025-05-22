@@ -15,17 +15,16 @@ use std::{
 };
 
 use antithesis_sdk::{assert_always, assert_unreachable};
-use serde_json::json;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
-use uuid::Uuid;
 use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
@@ -41,6 +40,7 @@ use tokio::{
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::Tripwire;
+use uuid::Uuid;
 
 use crate::updates::UpdatesManager;
 use crate::{
@@ -711,19 +711,22 @@ impl SplitPool {
     // get a high priority write connection (e.g. client input)
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_priority(&self, uuid: Uuid) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.priority_tx, "priority", uuid).await
+        self.write_inner(&self.0.priority_tx, "priority", uuid)
+            .await
     }
 
     // get a normal priority write connection (e.g. sync process)
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_normal(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.normal_tx, "normal", uuid::Uuid::new_v4()).await
+        self.write_inner(&self.0.normal_tx, "normal", uuid::Uuid::new_v4())
+            .await
     }
 
     // get a low priority write connection (e.g. background tasks)
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_low(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.low_tx, "low", uuid::Uuid::new_v4()).await
+        self.write_inner(&self.0.low_tx, "low", uuid::Uuid::new_v4())
+            .await
     }
 
     async fn write_inner(
@@ -733,47 +736,42 @@ impl SplitPool {
         uuid: Uuid,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
-        let max_timeout = Duration::from_secs(5 * 60);
 
         debug!("sending token to oneshot channel for uuid - {uuid:?}");
-        timeout_fut("tx to oneshot channel", max_timeout, chan.send((tx, uuid)), uuid)
-            .await?
-            .map_err(|_| {
-                error!("could not send token to oneshot channel for uuid - {uuid:?}");
-                PoolError::QueueClosed
-            })?;
+        chan.send((tx, uuid)).await.map_err(|_| {
+            error!("could not send token to oneshot channel for uuid - {uuid:?}");
+            PoolError::QueueClosed
+        })?;
 
         let start = Instant::now();
 
         debug!("waiting for token from oneshot channel for uuid - {uuid:?}");
 
-        let token = timeout_fut("rx from oneshot channel", max_timeout, rx, uuid)
-            .await?
-            .map_err(|_| {
-                error!("could not receive token from oneshot channel for uuid - {uuid:?}");
-                PoolError::CallbackClosed
-            })?;
+        let token = rx.await.map_err(|_| {
+            error!("could not receive token from oneshot channel for uuid - {uuid:?}");
+            PoolError::CallbackClosed
+        })?;
 
         debug!("received token from oneshot channel for uuid - {uuid:?}");
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
-        let conn = timeout_fut("acquiring write conn", max_timeout, self.0.write.get(), uuid).await?.map_err(|e| {
-                error!("could not acquire write conn for uuid - {uuid:?}");
-                e
-            })?;
+        let conn = self.0.write.get().await.map_err(|e| {
+            error!("could not acquire write conn for uuid - {uuid:?}");
+            e
+        })?;
 
         debug!("acquired write conn for uuid - {uuid:?}");
         let start = Instant::now();
-        let _permit = timeout_fut(
-            "acquiring write semaphore",
-            max_timeout,
-            self.0.write_sema.clone().acquire_owned(),
-            uuid,
-        )
-        .await?.map_err(|e| {
-            error!("could not acquire write semaphore for uuid - {uuid:?}");
-            e
-        })?;
+        let _permit = self
+            .0
+            .write_sema
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| {
+                error!("could not acquire write semaphore for uuid - {uuid:?}");
+                e
+            })?;
 
         histogram!("corro.sqlite.write_permit.acquisition.seconds")
             .record(start.elapsed().as_secs_f64());
@@ -813,15 +811,6 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'stati
             }
         }
     }
-}
-
-async fn timeout_fut<T, F>(op: &'static str, duration: Duration, fut: F, uuid: Uuid) -> Result<T, PoolError>
-where
-    F: Future<Output = T>,
-{
-    timeout(duration, fut)
-        .await
-        .map_err(|_| PoolError::TimedOut { op: op.to_string(), uuid })
 }
 
 pub struct WriteConn {

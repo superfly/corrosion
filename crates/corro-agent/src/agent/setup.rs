@@ -22,7 +22,7 @@ use tokio::{
         RwLock as TokioRwLock, Semaphore,
     },
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use tripwire::Tripwire;
 
 // Internals
