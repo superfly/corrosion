@@ -32,7 +32,7 @@ use corro_types::{
 
 use super::BcastCache;
 use crate::api::public::update::api_v1_updates;
-use antithesis_sdk::assert_always;
+use antithesis_sdk::{assert_always, assert_unreachable};
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
@@ -900,6 +900,12 @@ pub async fn process_multiple_changes(
                             Ok(res) => res,
                             Err(e) => {
                                 error!("error processing single version: {e}");
+                                if e.sqlite_error_code()
+                                    .is_some_and(|code| code != rusqlite::ErrorCode::DiskFull)
+                                {
+                                    let details = json!({"error": e.to_string()});
+                                    assert_unreachable!("error committing transaction", &details);
+                                }
                                 continue;
                             }
                         }
@@ -1055,10 +1061,21 @@ pub async fn process_multiple_changes(
         }
 
         let sub_start = Instant::now();
-        tx.commit().map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
+        tx.commit().map_err(|source| {
+            // only sqlite error we expect is SQLITE_FULL if disk is full
+            if source
+                .sqlite_error_code()
+                .is_some_and(|code| code != rusqlite::ErrorCode::DiskFull)
+            {
+                let details =
+                    json!({"elapsed": elapsed.as_secs_f32(), "error": source.to_string()});
+                assert_unreachable!("error committing transaction", &details);
+            }
+            ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            }
         })?;
 
         let elapsed = sub_start.elapsed();
