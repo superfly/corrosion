@@ -1,3 +1,4 @@
+use antithesis_sdk::random;
 use clap::Parser;
 use corro_api_types::{sqlite::ChangeType, Statement, TypedQueryEvent};
 use corro_client::CorrosionClient;
@@ -66,7 +67,7 @@ async fn main() -> eyre::Result<()> {
 
     subscribe_all(app.corrosion_addr.clone(), tripwire.clone());
 
-    //  query_all(app.corrosion_addr, tripwire.clone());
+    query_all(app.corrosion_addr, tripwire.clone());
 
     println!("tripwire_worker.await");
     tripwire_worker.await;
@@ -119,7 +120,9 @@ async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
         let client: &CorrosionClient = corro_client.as_ref().unwrap();
         // flood corrosion with queries
         // TODO: limit the number of task we are spawning
-        for _ in 0..5000 {
+        let num_range = (1..500).collect::<Vec<_>>();
+        let loop_count = random::random_choice(&num_range).cloned().unwrap_or(500);
+        for _ in 0..loop_count {
             let client = client.clone();
             tokio::spawn(async move {
                 let letters = "abcdefghijklmnopqrstuvwxyz";
@@ -145,7 +148,10 @@ async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
                 }
             });
         }
-        sleep(Duration::from_secs(3)).await;
+
+        let num_range = (1..10).collect::<Vec<_>>();
+        let random_timeout = random::random_choice(&num_range).unwrap_or(&2);
+        sleep(Duration::from_secs(random_timeout * 60)).await;
     }
     Ok(())
 }

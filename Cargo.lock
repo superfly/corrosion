@@ -3627,6 +3627,7 @@ dependencies = [
 name = "rust-load-generator"
 version = "0.1.0"
 dependencies = [
+ "antithesis_sdk",
  "clap",
  "corro-api-types",
  "corro-client",
