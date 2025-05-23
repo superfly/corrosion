@@ -711,6 +711,7 @@ impl SplitPool {
     // get a high priority write connection (e.g. client input)
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_priority(&self, uuid: Uuid) -> Result<WriteConn, PoolError> {
+        info!("attempting to acquire priority write conn - uuid: {uuid:?}");
         self.write_inner(&self.0.priority_tx, "priority", uuid).await
     }
 
