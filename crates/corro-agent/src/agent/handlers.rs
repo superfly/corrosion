@@ -53,7 +53,6 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 
-
 /// Spawn a tree of tasks that handles incoming gossip server
 /// connections, streams, and their respective payloads.
 pub fn spawn_gossipserver_handler(
