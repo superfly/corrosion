@@ -1,3 +1,5 @@
+#!/bin/bash
+
 query=$(cat <<"EOF"
 SELECT count(*) from 
     (select actor_id, db_version, start_version FROM __corro_bookkeeping WHERE end_version IS NULL) as n 

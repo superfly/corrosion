@@ -6,11 +6,14 @@ services:
     command: ["rust-load-generator", "corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]
     environment:
     - RUST_LOG=info
+    - RUST_BACKTRACE=full
 
   corrosion1:
     container_name: corrosion1
     hostname: corrosion1
     image: corrosion
+    environment:
+      - RUST_BACKTRACE=full
     volumes: 
       - ./volumes/corrosion1:/var/lib/corrosion
 

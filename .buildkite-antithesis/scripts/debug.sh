@@ -2,11 +2,9 @@
 
 set -e
 
-CUSTOM_DURATION=${CUSTOM_DURATION:-0.1}
-
 COMMIT_HASH=${BUILDKITE_COMMIT:0:8}
 
-echo "Launching Antithesis test with params: ${SESSION_ID}, ${INPUT_HASH}, ${VTIME}, ${EMAIL}, ${CUSTOM_DURATION}"
+echo "Launching Antithesis debugging with: ${SESSION_ID}, ${INPUT_HASH}, ${VTIME}"
 response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" \
 -X POST https://flyio.antithesis.com/api/v1/launch/debugging \
 -d "{\"params\": { 
@@ -19,8 +17,8 @@ response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" \
 status=$(echo $response | jq -r '.statusCode')
 
 if [ "$status" != "200" ]; then
-    echo "Failed to launch Antithesis test $response"
+    echo "Failed to launch Antithesis debug session $response"
     exit 1
 fi
 
-echo "Launched Antithesis test $response"
+echo "Launched Antithesis debug session $response"
