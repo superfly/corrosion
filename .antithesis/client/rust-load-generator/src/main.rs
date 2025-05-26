@@ -8,6 +8,7 @@ use hickory_resolver::AsyncResolver;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Instant;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info};
 use tripwire::Tripwire;
@@ -129,10 +130,13 @@ async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
                 let letters = "abcdefghijkl";
                 for letter in letters.chars() {
                     match client
-                        .query_typed::<TeamStats>(&Statement::WithParams(
-                            TEAM_QUERY.into(),
-                            vec![format!("%{}%", letter).into()],
-                        ))
+                        .query_typed::<TeamStats>(
+                            &Statement::WithParams(
+                                TEAM_QUERY.into(),
+                                vec![format!("%{}%", letter).into()],
+                            ),
+                            None,
+                        )
                         .await
                     {
                         Ok(mut res) => {

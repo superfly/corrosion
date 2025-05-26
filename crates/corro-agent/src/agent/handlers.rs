@@ -530,7 +530,11 @@ async fn wal_checkpoint_over_threshold(
     let warn_threshold = 25 * 1024 * 1024 * 1024;
     let wal_size_gb = wal_size / 1024 / 1024 / 1024;
     let details = json!({"wal_size": wal_size_gb});
-    assert_always!(wal_size < warn_threshold, "wal_size is under 25gb", &details);
+    assert_always!(
+        wal_size < warn_threshold,
+        "wal_size is under 25gb",
+        &details
+    );
     if should_truncate {
         let timeout = calc_busy_timeout(wal_path.metadata()?.len(), threshold);
         let conn = pool.write_low().await?;
