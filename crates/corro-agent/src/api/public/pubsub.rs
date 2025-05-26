@@ -905,7 +905,7 @@ mod tests {
     use super::*;
     use crate::agent::process_multiple_changes;
     use crate::api::public::update::{api_v1_updates, SharedUpdateBroadcastCache};
-    use crate::api::public::TransactionParams;
+    use crate::api::public::TimeoutParams;
     use crate::{
         agent::setup,
         api::public::{api_v1_db_schema, api_v1_transactions},
@@ -942,7 +942,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![
                 Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
@@ -1004,7 +1004,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
-                axum::extract::Query(TransactionParams { timeout: None }),
+                axum::extract::Query(TimeoutParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-3".into(), "service-name-3".into()],
@@ -1061,7 +1061,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
-                axum::extract::Query(TransactionParams { timeout: None }),
+                axum::extract::Query(TimeoutParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-4".into(), "service-name-4".into()],
@@ -1154,7 +1154,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
-                axum::extract::Query(TransactionParams { timeout: None }),
+                axum::extract::Query(TimeoutParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-5".into(), "service-name-5".into()],
@@ -1260,7 +1260,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
-                axum::extract::Query(TransactionParams { timeout: None }),
+                axum::extract::Query(TimeoutParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
                     vec!["service-id-6".into(), "service-name-6".into()],
@@ -1272,7 +1272,7 @@ mod tests {
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
-                axum::extract::Query(TransactionParams { timeout: None }),
+                axum::extract::Query(TimeoutParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "delete from  tests where id = ?".into(),
                     vec!["service-id-6".into()],
@@ -1386,7 +1386,7 @@ mod tests {
 
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "insert into tests (id, text) values (?,?)".into(),
                 vec!["service-id-6".into(), "service-name-6".into()],

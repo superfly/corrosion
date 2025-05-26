@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     net::SocketAddr,
     ops::Deref,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -24,7 +25,9 @@ use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
-use sqlite_pool::{Committable, InterruptibleTransaction};
+use sqlite_pool::{
+    Committable, InterruptibleStatement, InterruptibleTransaction, Statement as PoolStatement,
+};
 
 use tokio::{
     sync::{
@@ -42,14 +45,14 @@ pub mod pubsub;
 pub mod update;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
-pub struct TransactionParams {
+pub struct TimeoutParams {
     #[serde(default)]
     pub timeout: Option<u64>,
 }
 
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
-    params: TransactionParams,
+    timeout: Option<u64>,
     f: F,
 ) -> Result<(T, Option<Version>, Duration), ChangeError>
 where
@@ -77,7 +80,7 @@ where
                 version: None,
             })?;
 
-        let timeout = params.timeout.map(Duration::from_secs);
+        let timeout = timeout.map(Duration::from_secs);
         let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
 
         // Execute whatever might mutate state data
@@ -159,7 +162,7 @@ where
 pub async fn api_v1_transactions(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Extension(agent): Extension<Agent>,
-    axum::extract::Query(params): axum::extract::Query<TransactionParams>,
+    axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
     if statements.is_empty() {
@@ -175,7 +178,7 @@ pub async fn api_v1_transactions(
         );
     }
 
-    let res = make_broadcastable_changes(&agent, params, move |tx| {
+    let res = make_broadcastable_changes(&agent, params.timeout, move |tx| {
         let mut total_rows_affected = 0;
 
         let results = statements
@@ -245,6 +248,7 @@ async fn build_query_rows_response(
     client_addr: SocketAddr,
     data_tx: mpsc::Sender<QueryEvent>,
     stmt: Statement,
+    timeout: Option<u64>,
 ) -> Result<(), (StatusCode, ExecResult)> {
     let (res_tx, res_rx) = oneshot::channel();
 
@@ -268,7 +272,7 @@ async fn build_query_rows_response(
 
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
 
-        let mut prepped = match prepped_res {
+        let prepped = match prepped_res {
             Ok(prepped) => prepped,
             Err(e) => {
                 _ = res_tx.send(Err((
@@ -291,6 +295,20 @@ async fn build_query_rows_response(
             return;
         }
 
+        let timeout = timeout.unwrap_or(4);
+        let timeout: Option<Duration> = if timeout > 0 {
+            Some(Duration::from_secs(timeout * 60))
+        } else {
+            None
+        };
+
+        let int_handle = conn.get_interrupt_handle();
+        let mut prepped = InterruptibleStatement::new(
+            PoolStatement(prepped),
+            Arc::new(int_handle),
+            timeout,
+            stmt.query().to_string(),
+        );
         block_in_place(|| {
             let col_count = prepped.column_count();
             trace!("inside block in place, col count: {col_count}");
@@ -309,6 +327,7 @@ async fn build_query_rows_response(
             let start = Instant::now();
 
             trace!(%client_addr, "Executing statement {}", stmt.query());
+            let elapsed = start.elapsed();
 
             let query = match &stmt {
                 Statement::Simple(_)
@@ -347,7 +366,6 @@ async fn build_query_rows_response(
                     return;
                 }
             };
-            let elapsed = start.elapsed();
 
             trace!(%client_addr, elapsed = %elapsed.as_secs(), "Statement finished executing {}", stmt.query());
 
@@ -419,6 +437,7 @@ async fn build_query_rows_response(
 pub async fn api_v1_queries(
     Extension(agent): Extension<Agent>,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
     let (mut tx, body) = hyper::Body::channel();
@@ -460,7 +479,7 @@ pub async fn api_v1_queries(
 
     trace!("building query rows response...");
 
-    match build_query_rows_response(&agent, client_addr, data_tx, stmt).await {
+    match build_query_rows_response(&agent, client_addr, data_tx, stmt, params.timeout).await {
         Ok(_) => {
             histogram!("corro.api.queries.processing.time.seconds", "result" => "success")
                 .record(start.elapsed());
@@ -700,7 +719,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "insert into tests (id, text) values (?,?)".into(),
                 vec!["service-id".into(), "service-name".into()],
@@ -739,7 +758,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "update tests SET text = ? where id = ?".into(),
                 vec!["service-name".into(), "service-id".into()],
@@ -787,7 +806,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
-            axum::extract::Query(TransactionParams { timeout: None }),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![
                 Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
@@ -812,6 +831,7 @@ mod tests {
         let res = api_v1_queries(
             Extension(agent.clone()),
             ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await

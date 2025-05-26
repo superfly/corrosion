@@ -33,7 +33,10 @@ jobs:
 
       - name: Install and Display Rust specified toolchain
         run: rustup show
-        
+
+      - name: Install rustfmt
+        run: rustup component add --toolchain nightly-2023-12-03-${{ matrix.target }} rustfmt
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
