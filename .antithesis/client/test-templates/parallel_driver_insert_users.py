@@ -97,7 +97,7 @@ def do_inserts(address):
     host, port = address.split(':')
     id = insert_team(address)
     if id is not None:
-        for j in range(helper.random_int(1, 100)):
+        for j in range(helper.random_int(1, 300)):
             insert_user(address, id)
             conn = helper.get_db_connection(host, "5470")
             if conn is not None:

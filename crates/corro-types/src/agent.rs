@@ -733,7 +733,7 @@ impl SplitPool {
         uuid: Uuid,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
-        let max_timeout = Duration::from_secs(5 * 60);
+        let max_timeout = Duration::from_secs(3 * 60);
 
         debug!("sending token to oneshot channel for uuid - {uuid:?}");
         timeout_fut("tx to oneshot channel", max_timeout, chan.send((tx, uuid)), uuid)
