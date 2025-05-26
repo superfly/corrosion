@@ -711,7 +711,6 @@ impl SplitPool {
     // get a high priority write connection (e.g. client input)
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_priority(&self, uuid: Uuid) -> Result<WriteConn, PoolError> {
-        info!("attempting to acquire priority write conn - uuid: {uuid:?}");
         self.write_inner(&self.0.priority_tx, "priority", uuid).await
     }
 
@@ -746,7 +745,7 @@ impl SplitPool {
 
         let start = Instant::now();
 
-        debug!("waiting for token from oneshot channel for uuid - {uuid:?}");
+        info!("waiting for token from oneshot channel for uuid - {uuid:?}");
 
         let token = timeout_fut("rx from oneshot channel", max_timeout, rx, uuid)
             .await?
@@ -755,7 +754,7 @@ impl SplitPool {
                 PoolError::CallbackClosed
             })?;
 
-        debug!("received token from oneshot channel for uuid - {uuid:?}");
+        info!("received token from oneshot channel for uuid - {uuid:?}");
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
         let conn = timeout_fut("acquiring write conn", max_timeout, self.0.write.get(), uuid).await?.map_err(|e| {
