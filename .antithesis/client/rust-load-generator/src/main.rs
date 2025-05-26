@@ -120,12 +120,13 @@ async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
         let client: &CorrosionClient = corro_client.as_ref().unwrap();
         // flood corrosion with queries
         // TODO: limit the number of task we are spawning
-        let num_range = (1..500).collect::<Vec<_>>();
+        let num_range = (1..10).collect::<Vec<_>>();
         let loop_count = random::random_choice(&num_range).cloned().unwrap_or(500);
         for _ in 0..loop_count {
             let client = client.clone();
             tokio::spawn(async move {
-                let letters = "abcdefghijklmnopqrstuvwxyz";
+                let start = Instant::now();
+                let letters = "abcdefghijkl";
                 for letter in letters.chars() {
                     match client
                         .query_typed::<TeamStats>(&Statement::WithParams(
@@ -146,6 +147,8 @@ async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
                         }
                     }
                 }
+
+                info!("query took: {:?}", start.elapsed());
             });
         }
 
