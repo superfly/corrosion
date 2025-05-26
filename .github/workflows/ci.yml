@@ -44,6 +44,9 @@ jobs:
         with:
           version: "v0.10.0"
 
+      - name: Install rustfmt
+        run: rustup component add --toolchain nightly-2023-12-03-${{ matrix.target }} rustfmt
+
       - name: Run formatting check
         run: cargo fmt --check
 

@@ -24,7 +24,8 @@ use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
-use sqlite_pool::{Committable, InterruptibleTransaction};
+use std::sync::Arc;
+use sqlite_pool::{Committable, InterruptibleTransaction, Statement as PoolStatement, InterruptibleStatement};
 
 use tokio::{
     sync::{
@@ -283,6 +284,7 @@ async fn build_query_rows_response(
             }
         };
 
+        
         if !prepped.readonly() {
             _ = res_tx.send(Err((
                 StatusCode::BAD_REQUEST,
@@ -293,141 +295,132 @@ async fn build_query_rows_response(
             return;
         }
 
-        // TODO: put this into InterruptibleStatement
         let int_handle = conn.get_interrupt_handle();
-        let cancel = CancellationToken::new();
-
-        let timeout = timeout.unwrap_or(4);
-
-        if timeout > 0 {
-            tokio::spawn({
-                let cancel = cancel.clone();
-                let query = stmt.query().to_string();
-                async move {
-                    let timeout = Duration::from_secs(timeout * 60);
-                    tokio::select! {
-                        _ = cancel.cancelled() => {}
-                        _ = tokio::time::sleep(timeout) => {
-                            warn!("query timed out, interrupting: {:?}", query);
-                            int_handle.interrupt();
-                        }
-                    }
-                }
-            });
+        {
+            let mut int_prepped = InterruptibleStatement::new(PoolStatement(prepped), Arc::new(int_handle), Some(Duration::from_secs(5)), "query".to_string());
+            {
+                let rows = int_prepped.query(());
+                let rows = rows.unwrap();
+                drop(rows);
+            }
         }
 
-        let _drop_guard = cancel.drop_guard();
+
         block_in_place(|| {
-            let col_count = prepped.column_count();
-            trace!("inside block in place, col count: {col_count}");
+            // let col_count = prepped.column_count();
+            // trace!("inside block in place, col count: {col_count}");
 
-            if let Err(e) = data_tx.blocking_send(QueryEvent::Columns(
-                prepped
-                    .columns()
-                    .into_iter()
-                    .map(|col| ColumnName(col.name().to_compact_string()))
-                    .collect(),
-            )) {
-                error!("could not send back columns: {e}");
-                return;
-            }
+            // if let Err(e) = data_tx.blocking_send(QueryEvent::Columns(
+            //     prepped
+            //         .columns()
+            //         .into_iter()
+            //         .map(|col| ColumnName(col.name().to_compact_string()))
+            //         .collect(),
+            // )) {
+            //     error!("could not send back columns: {e}");
+            //     return;
+            // }
 
-            let start = Instant::now();
+            // let start = Instant::now();
 
-            trace!(%client_addr, "Executing statement {}", stmt.query());
-            let elapsed = start.elapsed();
+            // trace!(%client_addr, "Executing statement {}", stmt.query());
+            // let elapsed = start.elapsed();
 
-            let query = match &stmt {
-                Statement::Simple(_)
-                | Statement::Verbose {
-                    params: None,
-                    named_params: None,
-                    ..
-                } => prepped.query(()),
-                Statement::WithParams(_, params)
-                | Statement::Verbose {
-                    params: Some(params),
-                    ..
-                } => prepped.query(params_from_iter(params)),
-                Statement::WithNamedParams(_, params)
-                | Statement::Verbose {
-                    named_params: Some(params),
-                    ..
-                } => prepped.query(
-                    params
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
-                        .collect::<Vec<(&str, &dyn ToSql)>>()
-                        .as_slice(),
-                ),
-            };
+            // {
+            //     let query = match &stmt {
+            //         Statement::Simple(_)
+            //         | Statement::Verbose {
+            //             params: None,
+            //             named_params: None,
+            //             ..
+            //         } => prepped.query(()),
+            //         Statement::WithParams(_, params)
+            //         | Statement::Verbose {
+            //             params: Some(params),
+            //             ..
+            //         } => prepped.query(params_from_iter(params)),
+            //         Statement::WithNamedParams(_, params)
+            //         | Statement::Verbose {
+            //             named_params: Some(params),
+            //             ..
+            //         } => prepped.query(
+            //             params
+            //                 .iter()
+            //                 .map(|(k, v)| (k.as_str(), v as &dyn ToSql))
+            //                 .collect::<Vec<(&str, &dyn ToSql)>>()
+            //                 .as_slice(),
+            //         ),
+            //     };
+    
+            //     let mut rows = match query {
+            //         Ok(rows) => rows,
+            //         Err(e) => {
+            //             _ = res_tx.send(Err((
+            //                 StatusCode::INTERNAL_SERVER_ERROR,
+            //                 ExecResult::Error {
+            //                     error: e.to_string(),
+            //                 },
+            //             )));
+            //             return;
+            //         }
+            //     };
+    
+            // }
 
-            let mut rows = match query {
-                Ok(rows) => rows,
-                Err(e) => {
-                    _ = res_tx.send(Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ExecResult::Error {
-                            error: e.to_string(),
-                        },
-                    )));
-                    return;
-                }
-            };
+            
+            // trace!(%client_addr, elapsed = %elapsed.as_secs(), "Statement finished executing {}", stmt.query());
 
-            trace!(%client_addr, elapsed = %elapsed.as_secs(), "Statement finished executing {}", stmt.query());
+            // if elapsed > Duration::from_secs(10) {
+            //     warn!(%client_addr, elapsed = %elapsed.as_secs(), "Slow read statement {}!", stmt.query());
+            // }
 
-            if elapsed > Duration::from_secs(10) {
-                warn!(%client_addr, elapsed = %elapsed.as_secs(), "Slow read statement {}!", stmt.query());
-            }
+            // if let Err(_e) = res_tx.send(Ok(())) {
+            //     error!("could not send back response through oneshot channel, aborting");
+            //     return;
+            // }
 
-            if let Err(_e) = res_tx.send(Ok(())) {
-                error!("could not send back response through oneshot channel, aborting");
-                return;
-            }
+            // let mut rowid = 1;
 
-            let mut rowid = 1;
+            // trace!("about to loop through rows!");
 
-            trace!("about to loop through rows!");
+            // loop {
+            //     match rows.next() {
+            //         Ok(Some(row)) => {
+            //             trace!("got a row: {row:?}");
+            //             match (0..col_count)
+            //                 .map(|i| row.get::<_, SqliteValue>(i))
+            //                 .collect::<rusqlite::Result<Vec<_>>>()
+            //             {
+            //                 Ok(cells) => {
+            //                     if let Err(e) =
+            //                         data_tx.blocking_send(QueryEvent::Row(rowid.into(), cells))
+            //                     {
+            //                         error!("could not send back row: {e}");
+            //                         return;
+            //                     }
+            //                     rowid += 1;
+            //                 }
+            //                 Err(e) => {
+            //                     _ = data_tx.blocking_send(QueryEvent::Error(e.to_compact_string()));
+            //                     return;
+            //                 }
+            //             }
+            //         }
+            //         Ok(None) => {
+            //             // done!
+            //             break;
+            //         }
+            //         Err(e) => {
+            //             _ = data_tx.blocking_send(QueryEvent::Error(e.to_compact_string()));
+            //             return;
+            //         }
+            //     }
+            // }
 
-            loop {
-                match rows.next() {
-                    Ok(Some(row)) => {
-                        trace!("got a row: {row:?}");
-                        match (0..col_count)
-                            .map(|i| row.get::<_, SqliteValue>(i))
-                            .collect::<rusqlite::Result<Vec<_>>>()
-                        {
-                            Ok(cells) => {
-                                if let Err(e) =
-                                    data_tx.blocking_send(QueryEvent::Row(rowid.into(), cells))
-                                {
-                                    error!("could not send back row: {e}");
-                                    return;
-                                }
-                                rowid += 1;
-                            }
-                            Err(e) => {
-                                _ = data_tx.blocking_send(QueryEvent::Error(e.to_compact_string()));
-                                return;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // done!
-                        break;
-                    }
-                    Err(e) => {
-                        _ = data_tx.blocking_send(QueryEvent::Error(e.to_compact_string()));
-                        return;
-                    }
-                }
-            }
-
-            _ = data_tx.blocking_send(QueryEvent::EndOfQuery {
-                time: elapsed.as_secs_f64(),
-                change_id: None,
-            });
+            // _ = data_tx.blocking_send(QueryEvent::EndOfQuery {
+            //     time: elapsed.as_secs_f64(),
+            //     change_id: None,
+            // });
         });
     });
 
