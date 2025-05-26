@@ -899,8 +899,18 @@ pub async fn process_multiple_changes(
                         match process_single_version(&agent, &mut tx, last_db_version, change) {
                             Ok(res) => res,
                             Err(e) => {
-                                error!("error processing single version: {e}");
-                                continue;
+                                // the transaction was rolled back, so we need to return.
+                                if tx.is_autocommit() {
+                                    error!("error processing single version: {e} and transaction was rolled back");
+                                    return Err(ChangeError::Rusqlite {
+                                        source: e,
+                                        actor_id: None,
+                                        version: None,
+                                    });
+                                } else {
+                                    error!("error processing single version: {e}");
+                                    continue;
+                                }
                             }
                         }
                     };
