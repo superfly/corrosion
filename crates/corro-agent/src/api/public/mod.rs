@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     net::SocketAddr,
     ops::Deref,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -24,7 +25,9 @@ use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
-use sqlite_pool::{Committable, InterruptibleTransaction};
+use sqlite_pool::{
+    Committable, InterruptibleStatement, InterruptibleTransaction, Statement as PoolStatement,
+};
 
 use tokio::{
     sync::{
@@ -33,7 +36,6 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
@@ -270,7 +272,7 @@ async fn build_query_rows_response(
 
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
 
-        let mut prepped = match prepped_res {
+        let prepped = match prepped_res {
             Ok(prepped) => prepped,
             Err(e) => {
                 _ = res_tx.send(Err((
@@ -293,30 +295,20 @@ async fn build_query_rows_response(
             return;
         }
 
-        // TODO: put this into InterruptibleStatement
-        let int_handle = conn.get_interrupt_handle();
-        let cancel = CancellationToken::new();
-
         let timeout = timeout.unwrap_or(4);
+        let timeout: Option<Duration> = if timeout > 0 {
+            Some(Duration::from_secs(timeout * 60))
+        } else {
+            None
+        };
 
-        if timeout > 0 {
-            tokio::spawn({
-                let cancel = cancel.clone();
-                let query = stmt.query().to_string();
-                async move {
-                    let timeout = Duration::from_secs(timeout * 60);
-                    tokio::select! {
-                        _ = cancel.cancelled() => {}
-                        _ = tokio::time::sleep(timeout) => {
-                            warn!("query timed out, interrupting: {:?}", query);
-                            int_handle.interrupt();
-                        }
-                    }
-                }
-            });
-        }
-
-        let _drop_guard = cancel.drop_guard();
+        let int_handle = conn.get_interrupt_handle();
+        let mut prepped = InterruptibleStatement::new(
+            PoolStatement(prepped),
+            Arc::new(int_handle),
+            timeout,
+            stmt.query().to_string(),
+        );
         block_in_place(|| {
             let col_count = prepped.column_count();
             trace!("inside block in place, col count: {col_count}");
