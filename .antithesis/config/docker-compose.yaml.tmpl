@@ -28,6 +28,21 @@ services:
     volumes: 
       - ./volumes/corrosion3:/var/lib/corrosion
 
+  
+  corrosion4:
+    container_name: corrosion4
+    hostname: corrosion4
+    image: corrosion:$SHORT_COMMIT
+    volumes: 
+      - ./volumes/corrosion4:/var/lib/corrosion
+
+  corrosion5:
+    container_name: corrosion5
+    hostname: corrosion5
+    image: corrosion:$SHORT_COMMIT
+    volumes: 
+      - ./volumes/corrosion5:/var/lib/corrosion
+
   corro-client:
     container_name: corro-client
     hostname: corro-client
@@ -36,6 +51,8 @@ services:
       - ./volumes/corrosion1:/var/lib/corrosion1
       - ./volumes/corrosion2:/var/lib/corrosion2
       - ./volumes/corrosion3:/var/lib/corrosion3
+      - ./volumes/corrosion4:/var/lib/corrosion4
+      - ./volumes/corrosion5:/var/lib/corrosion5
 
   consul:
     container_name: consul
