@@ -1082,7 +1082,7 @@ pub async fn parallel_sync(
 
                     let needs = our_sync_state.compute_available_needs(&their_sync_state);
 
-                    trace!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs");
+                    debug!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs: {:?}, their_sync_state: {:?}", needs, their_sync_state);
 
                     Ok::<_, SyncError>((needs, tx, read))
                 }.await
@@ -1671,7 +1671,7 @@ mod tests {
 
     use crate::{
         agent::{process_multiple_changes, setup},
-        api::public::api_v1_db_schema,
+        api::public::{api_v1_db_schema, TimeoutParams},
     };
 
     use super::*;
@@ -1689,6 +1689,7 @@ mod tests {
         for i in versions_range.clone() {
             let (status_code, body) = api_v1_transactions(
                 Extension(ta1.agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
                 axum::Json(vec![Statement::WithParams(
                     "INSERT OR REPLACE INTO testsblob (id,text) VALUES (?,?)".into(),
                     vec![format!("service-id-{i}").into(), "service-name".into()],
@@ -1734,6 +1735,7 @@ mod tests {
         _ = tracing_subscriber::fmt::try_init();
 
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let tx_timeout = Duration::from_secs(60);
 
         let dir = tempfile::tempdir()?;
 
@@ -1815,6 +1817,7 @@ mod tests {
                     Instant::now(),
                 ),
             ],
+            tx_timeout,
         )
         .await?;
 
@@ -1934,6 +1937,7 @@ mod tests {
                 ChangeSource::Sync,
                 Instant::now(),
             )],
+            tx_timeout,
         )
         .await?;
 
@@ -2078,6 +2082,7 @@ mod tests {
                 ChangeSource::Sync,
                 Instant::now(),
             )],
+            tx_timeout,
         )
         .await?;
 
@@ -2149,6 +2154,7 @@ mod tests {
                 .iter()
                 .map(|change| (change.clone(), ChangeSource::Sync, Instant::now()))
                 .collect(),
+            tx_timeout,
         )
         .await?;
 

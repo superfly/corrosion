@@ -305,7 +305,7 @@ async fn update_hashes(
 
     if !statements.is_empty() {
         if let Some(e) = corrosion
-            .execute(&statements)
+            .execute(&statements, None)
             .await?
             .results
             .into_iter()
@@ -412,7 +412,8 @@ fn append_upsert_service_statements(
         meta = excluded.meta,
         port = excluded.port,
         address = excluded.address,
-        updated_at = excluded.updated_at;"
+        updated_at = excluded.updated_at
+    WHERE source IS NULL;"
             .into(),
         vec![
             node.into(),
@@ -457,7 +458,8 @@ fn append_upsert_check_statements(
         name = excluded.name,
         status = excluded.status,
         output = excluded.output,
-        updated_at = excluded.updated_at;"
+        updated_at = excluded.updated_at
+    WHERE source IS NULL;"
                                           .into(),vec![
                                               node.into(),
                                               check.id.into(),
@@ -650,7 +652,8 @@ async fn execute(
                     vec![id.clone().into()],
                 ));
                 statements.push(Statement::WithParams(
-                    "DELETE FROM consul_services WHERE node = ? AND id = ?;".into(),
+                    "DELETE FROM consul_services WHERE node = ? AND id = ? AND source IS NULL;"
+                        .into(),
                     vec![node.into(), id.into()],
                 ));
             }
@@ -676,7 +679,8 @@ async fn execute(
                     vec![id.clone().into()],
                 ));
                 statements.push(Statement::WithParams(
-                    "DELETE FROM consul_checks WHERE node = ? AND id = ?;".into(),
+                    "DELETE FROM consul_checks WHERE node = ? AND id = ? AND source IS NULL;"
+                        .into(),
                     vec![node.into(), id.into()],
                 ));
             }
@@ -688,7 +692,7 @@ async fn execute(
 
     if !statements.is_empty() {
         if let Some(e) = corrosion
-            .execute(&statements)
+            .execute(&statements, None)
             .await?
             .results
             .into_iter()
@@ -816,20 +820,23 @@ mod tests {
         // let conn = ta1_client.pool().get().await?;
         let svc0_clone = svc0.clone();
         ta1_client
-            .execute(&[Statement::WithParams(
-                "INSERT INTO consul_services ( node, id, name, tags, meta, port, address)
+            .execute(
+                &[Statement::WithParams(
+                    "INSERT INTO consul_services ( node, id, name, tags, meta, port, address)
                      VALUES (?,?,?,?,?,?,?)"
-                    .into(),
-                vec![
-                    "node-1".into(),
-                    svc0_clone.id.into(),
-                    svc0_clone.name.into(),
-                    serde_json::to_string(&svc0_clone.tags).unwrap().into(),
-                    serde_json::to_string(&svc0_clone.meta).unwrap().into(),
-                    svc0_clone.port.into(),
-                    svc0_clone.address.into(),
-                ],
-            )])
+                        .into(),
+                    vec![
+                        "node-1".into(),
+                        svc0_clone.id.into(),
+                        svc0_clone.name.into(),
+                        serde_json::to_string(&svc0_clone.tags).unwrap().into(),
+                        serde_json::to_string(&svc0_clone.meta).unwrap().into(),
+                        svc0_clone.port.into(),
+                        svc0_clone.address.into(),
+                    ],
+                )],
+                None,
+            )
             .await?;
 
         update_hashes(&ta1_client, "node-1", &mut svc_hashes, &mut check_hashes).await?;

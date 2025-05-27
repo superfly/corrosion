@@ -33,14 +33,22 @@ jobs:
 
       - name: Install and Display Rust specified toolchain
         run: rustup show
-        
+
+      - name: Install rustfmt
+        run: rustup component add --toolchain nightly-2023-12-03-${{ matrix.target }} rustfmt
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
 
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
+      - name: Run formatting check
+        run: cargo fmt --check
 
       - name: Test with latest nextest release
         run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}

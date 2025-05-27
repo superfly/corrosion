@@ -1,0 +1,47 @@
+services:
+  load-generator:
+    container_name: load-generator
+    hostname: load-generator
+    image: corrosion
+    command: ["rust-load-generator", "corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]
+    environment:
+    - RUST_LOG=info
+    - RUST_BACKTRACE=full
+
+  corrosion1:
+    container_name: corrosion1
+    hostname: corrosion1
+    image: corrosion
+    environment:
+      - RUST_BACKTRACE=full
+    volumes: 
+      - ./volumes/corrosion1:/var/lib/corrosion
+
+  corrosion2:
+    container_name: corrosion2
+    hostname: corrosion2
+    image: corrosion
+    volumes: 
+      - ./volumes/corrosion2:/var/lib/corrosion
+
+  corrosion3:
+    container_name: corrosion3
+    hostname: corrosion3
+    image: corrosion
+    volumes: 
+      - ./volumes/corrosion3:/var/lib/corrosion
+
+  corro-client:
+    container_name: corro-client
+    hostname: corro-client
+    image: corro-client
+    volumes:
+      - ./volumes/corrosion1:/var/lib/corrosion1
+      - ./volumes/corrosion2:/var/lib/corrosion2
+      - ./volumes/corrosion3:/var/lib/corrosion3
+
+  consul:
+    container_name: consul
+    hostname: consul
+    image: consul:1.15.4
+    command: consul agent -data-dir=/consul/data -config-dir=/consul/config -dev -server -bind=0.0.0.0 -client=0.0.0.0 -log-level=warn -log-file=/tmp/consul.log

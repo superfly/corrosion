@@ -1,9 +1,12 @@
 use std::{
     collections::BTreeSet,
+    net::SocketAddr,
+    ops::Deref,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use axum::{response::IntoResponse, Extension};
+use axum::{extract::ConnectInfo, response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
@@ -18,8 +21,14 @@ use corro_types::{
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
+use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
+use serde::Deserialize;
 use spawn::spawn_counted;
+use sqlite_pool::{
+    Committable, InterruptibleStatement, InterruptibleTransaction, Statement as PoolStatement,
+};
+
 use tokio::{
     sync::{
         mpsc::{self, channel},
@@ -27,7 +36,7 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
 
@@ -35,12 +44,19 @@ pub mod pubsub;
 
 pub mod update;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub struct TimeoutParams {
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
+    timeout: Option<u64>,
     f: F,
 ) -> Result<(T, Option<CrsqlDbVersion>, Duration), ChangeError>
 where
-    F: Fn(&Transaction) -> Result<T, ChangeError>,
+    F: Fn(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
     trace!("getting conn...");
     let mut conn = agent.pool().write_priority().await?;
@@ -64,11 +80,13 @@ where
                 version: None,
             })?;
 
+        let timeout = timeout.map(Duration::from_secs);
+        let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
+
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
         let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
-
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
@@ -76,6 +94,8 @@ where
         })?;
 
         let elapsed = start.elapsed();
+        histogram!("corro.agent.changes.processing.time.seconds", "source" => "local")
+            .record(start.elapsed());
 
         match insert_info {
             None => Ok((ret, None, elapsed)),
@@ -102,7 +122,13 @@ where
 }
 
 #[tracing::instrument(skip_all, err)]
-fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usize> {
+fn execute_statement<T>(
+    tx: &InterruptibleTransaction<T>,
+    stmt: &Statement,
+) -> rusqlite::Result<usize>
+where
+    T: Deref<Target = rusqlite::Connection> + Committable,
+{
     let mut prepped = tx.prepare(stmt.query())?;
 
     match stmt {
@@ -135,6 +161,7 @@ fn execute_statement(tx: &Transaction, stmt: &Statement) -> rusqlite::Result<usi
 pub async fn api_v1_transactions(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Extension(agent): Extension<Agent>,
+    axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
     if statements.is_empty() {
@@ -150,7 +177,7 @@ pub async fn api_v1_transactions(
         );
     }
 
-    let res = make_broadcastable_changes(&agent, move |tx| {
+    let res = make_broadcastable_changes(&agent, params.timeout, move |tx| {
         let mut total_rows_affected = 0;
 
         let results = statements
@@ -202,7 +229,7 @@ pub async fn api_v1_transactions(
         axum::Json(ExecResponse {
             results,
             time: elapsed.as_secs_f64(),
-            version,
+            version: version.map(Into::into),
         }),
     )
 }
@@ -217,8 +244,10 @@ pub enum QueryError {
 
 async fn build_query_rows_response(
     agent: &Agent,
+    client_addr: SocketAddr,
     data_tx: mpsc::Sender<QueryEvent>,
     stmt: Statement,
+    timeout: Option<u64>,
 ) -> Result<(), (StatusCode, ExecResult)> {
     let (res_tx, res_rx) = oneshot::channel();
 
@@ -238,9 +267,11 @@ async fn build_query_rows_response(
             }
         };
 
+        trace!(%client_addr, "Preparing statement {}", stmt.query());
+
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
 
-        let mut prepped = match prepped_res {
+        let prepped = match prepped_res {
             Ok(prepped) => prepped,
             Err(e) => {
                 _ = res_tx.send(Err((
@@ -263,6 +294,20 @@ async fn build_query_rows_response(
             return;
         }
 
+        let timeout = timeout.unwrap_or(4);
+        let timeout: Option<Duration> = if timeout > 0 {
+            Some(Duration::from_secs(timeout * 60))
+        } else {
+            None
+        };
+
+        let int_handle = conn.get_interrupt_handle();
+        let mut prepped = InterruptibleStatement::new(
+            PoolStatement(prepped),
+            Arc::new(int_handle),
+            timeout,
+            stmt.query().to_string(),
+        );
         block_in_place(|| {
             let col_count = prepped.column_count();
             trace!("inside block in place, col count: {col_count}");
@@ -280,7 +325,10 @@ async fn build_query_rows_response(
 
             let start = Instant::now();
 
-            let query = match stmt {
+            trace!(%client_addr, "Executing statement {}", stmt.query());
+            let elapsed = start.elapsed();
+
+            let query = match &stmt {
                 Statement::Simple(_)
                 | Statement::Verbose {
                     params: None,
@@ -317,7 +365,12 @@ async fn build_query_rows_response(
                     return;
                 }
             };
-            let elapsed = start.elapsed();
+
+            trace!(%client_addr, elapsed = %elapsed.as_secs(), "Statement finished executing {}", stmt.query());
+
+            if elapsed > Duration::from_secs(10) {
+                warn!(%client_addr, elapsed = %elapsed.as_secs(), "Slow read statement {}!", stmt.query());
+            }
 
             if let Err(_e) = res_tx.send(Ok(())) {
                 error!("could not send back response through oneshot channel, aborting");
@@ -382,13 +435,17 @@ async fn build_query_rows_response(
 
 pub async fn api_v1_queries(
     Extension(agent): Extension<Agent>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
     let (mut tx, body) = hyper::Body::channel();
 
+    counter!("corro.api.queries.count").increment(1);
     // TODO: timeout on data send instead of infinitely waiting for channel space.
     let (data_tx, mut data_rx) = channel(512);
 
+    let start = Instant::now();
     tokio::spawn(async move {
         let mut buf = BytesMut::new();
 
@@ -421,8 +478,10 @@ pub async fn api_v1_queries(
 
     trace!("building query rows response...");
 
-    match build_query_rows_response(&agent, data_tx, stmt).await {
+    match build_query_rows_response(&agent, client_addr, data_tx, stmt, params.timeout).await {
         Ok(_) => {
+            histogram!("corro.api.queries.processing.time.seconds", "result" => "success")
+                .record(start.elapsed());
             #[allow(clippy::needless_return)]
             return hyper::Response::builder()
                 .status(StatusCode::OK)
@@ -430,6 +489,8 @@ pub async fn api_v1_queries(
                 .expect("could not build query response body");
         }
         Err((status, res)) => {
+            histogram!("corro.api.queries.processing.time.seconds", "result" => "error")
+                .record(start.elapsed());
             #[allow(clippy::needless_return)]
             return hyper::Response::builder()
                 .status(status)
@@ -448,7 +509,9 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
     let partial_schema = parse_sql(&new_sql)?;
 
+    info!("getting write connection to update schema");
     let mut conn = agent.pool().write_priority().await?;
+    info!("got write connection to update schema");
 
     // hold onto this lock so nothing else makes changes
     let mut schema_write = agent.schema().write();
@@ -664,6 +727,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "insert into tests (id, text) values (?,?)".into(),
                 vec!["service-id".into(), "service-name".into()],
@@ -702,6 +766,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "update tests SET text = ? where id = ?".into(),
                 vec!["service-name".into(), "service-id".into()],
@@ -749,6 +814,7 @@ mod tests {
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![
                 Statement::WithParams(
                     "insert into tests (id, text) values (?,?)".into(),
@@ -772,6 +838,8 @@ mod tests {
 
         let res = api_v1_queries(
             Extension(agent.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(Statement::Simple("select * from tests".into())),
         )
         .await

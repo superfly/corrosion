@@ -8,6 +8,7 @@ use std::{
     net::SocketAddr,
     str::{FromStr, Utf8Error},
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::Buf;
@@ -19,6 +20,7 @@ use corro_types::{
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
+    sqlite::CrConn,
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
@@ -43,8 +45,11 @@ use pgwire::{
 };
 use postgres_types::{FromSql, Type};
 use rusqlite::{
-    functions::FunctionFlags, types::ValueRef, vtab::eponymous_only_module, Connection, Statement,
+    ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef,
+    vtab::eponymous_only_module, Connection, Statement,
 };
+use rustls::ServerConfig;
+use socket2::{SockRef, TcpKeepalive};
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
     As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Literal,
@@ -58,9 +63,9 @@ use tokio::{
         mpsc::{channel, Sender},
         AcquireError, OwnedSemaphorePermit,
     },
-    task::block_in_place,
 };
-use tokio_util::{codec::Framed, sync::CancellationToken};
+use tokio_rustls::TlsAcceptor;
+use tokio_util::{codec::Framed, either::Either, sync::CancellationToken};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
@@ -316,7 +321,7 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
                 break;
             }
             Err(e) => {
-                debug!("could not parse as sqlite: {e}");
+                debug!("could not parse statement ({sql:?}) as sqlite: {e}");
                 let stmts = sqlparser::parser::Parser::parse_sql(
                     &sqlparser::dialect::PostgreSqlDialect {},
                     normalized,
@@ -421,11 +426,8 @@ enum OpenTxKind {
     Explicit,
 }
 
-async fn peek_for_sslrequest(
-    tcp_socket: &mut TcpStream,
-    ssl_supported: bool,
-) -> std::io::Result<bool> {
-    let mut ssl = false;
+async fn peek_for_sslrequest(tcp_socket: &mut TcpStream) -> std::io::Result<bool> {
+    let mut want_ssl = false;
     let mut buf = [0u8; SslRequest::BODY_SIZE];
     let mut buf = ReadBuf::new(&mut buf);
     loop {
@@ -445,15 +447,10 @@ async fn peek_for_sslrequest(
                     .read_exact(&mut [0u8; SslRequest::BODY_SIZE])
                     .await?;
                 // ssl configured
-                if ssl_supported {
-                    ssl = true;
-                    tcp_socket.write_all(b"S").await?;
-                } else {
-                    tcp_socket.write_all(b"N").await?;
-                }
+                want_ssl = true;
             }
 
-            return Ok(ssl);
+            return Ok(want_ssl);
         }
     }
 }
@@ -464,6 +461,86 @@ pub enum PgStartError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Rusqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    PgTlsError(#[from] eyre::Error),
+}
+
+async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
+    let tls = match pg.tls {
+        Some(tls) => tls,
+        None => {
+            return Ok((None, false));
+        }
+    };
+
+    let ssl_required = tls.verify_client;
+
+    let key = tokio::fs::read(&tls.key_file).await?;
+    let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
+        rustls::PrivateKey(key)
+    } else {
+        let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
+        match pkcs8.into_iter().next() {
+            Some(x) => rustls::PrivateKey(x),
+            None => {
+                let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
+                match rsa.into_iter().next() {
+                    Some(x) => rustls::PrivateKey(x),
+                    None => {
+                        eyre::bail!("no private keys found");
+                    }
+                }
+            }
+        }
+    };
+
+    let certs = tokio::fs::read(&tls.cert_file).await?;
+    let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
+        vec![rustls::Certificate(certs)]
+    } else {
+        rustls_pemfile::certs(&mut &*certs)?
+            .into_iter()
+            .map(rustls::Certificate)
+            .collect()
+    };
+
+    let server_crypto = ServerConfig::builder().with_safe_defaults();
+
+    let server_crypto = if ssl_required {
+        let ca_file = match &tls.ca_file {
+            None => {
+                eyre::bail!(
+                    "ca_file required in tls config for server client cert auth verification"
+                );
+            }
+            Some(ca_file) => ca_file,
+        };
+
+        let ca_certs = tokio::fs::read(&ca_file).await?;
+        let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
+            vec![rustls::Certificate(ca_certs)]
+        } else {
+            rustls_pemfile::certs(&mut &*ca_certs)?
+                .into_iter()
+                .map(rustls::Certificate)
+                .collect()
+        };
+
+        let mut root_store = rustls::RootCertStore::empty();
+
+        for cert in ca_certs {
+            root_store.add(&cert)?;
+        }
+
+        server_crypto.with_client_cert_verifier(Arc::new(
+            rustls::server::AllowAnyAuthenticatedClient::new(root_store),
+        ))
+    } else {
+        server_crypto.with_no_client_auth()
+    };
+
+    let config = server_crypto.with_single_cert(certs, key)?;
+    Ok((Some(TlsAcceptor::from(Arc::new(config))), ssl_required))
 }
 
 pub async fn start(
@@ -472,6 +549,7 @@ pub async fn start(
     mut tripwire: Tripwire,
 ) -> Result<PgServer, PgStartError> {
     let server = TcpListener::bind(pg.bind_addr).await?;
+    let (tls_acceptor, ssl_required) = setup_tls(pg).await?;
     let local_addr = server.local_addr()?;
 
     tokio::spawn(async move {
@@ -480,18 +558,59 @@ pub async fn start(
                 Outcome::Completed(res) => res?,
                 Outcome::Preempted(_) => break,
             };
+            let tls_acceptor = tls_acceptor.clone();
             debug!("Accepted a PostgreSQL connection (from: {remote_addr})");
 
             let agent = agent.clone();
             tokio::spawn(async move {
                 conn.set_nodelay(true)?;
-                let ssl = peek_for_sslrequest(&mut conn, false).await?;
-                trace!("SSL? {ssl}");
+                {
+                    let sock = SockRef::from(&conn);
+                    let ka = TcpKeepalive::new()
+                        .with_time(Duration::from_secs(10))
+                        .with_interval(Duration::from_secs(10))
+                        .with_retries(4);
+                    sock.set_tcp_keepalive(&ka)?;
+                }
+                let is_sslrequest = peek_for_sslrequest(&mut conn).await?;
 
-                let mut framed = Framed::new(
-                    conn,
-                    PgWireMessageServerCodec::new(ClientInfoHolder::new(remote_addr, false)),
-                );
+                // reject non-ssl connections if ssl is required (client cert auth)
+                if ssl_required && !is_sslrequest {
+                    debug!("rejecting non-ssl connection");
+                    return Ok(());
+                }
+
+                let (mut framed, secured) = match (tls_acceptor, is_sslrequest) {
+                    (Some(tls_acceptor), true) => {
+                        conn.write_all(b"S").await?;
+                        let tls_conn = tls_acceptor.accept(conn).await?;
+                        (
+                            Framed::new(
+                                Either::Left(tls_conn),
+                                PgWireMessageServerCodec::new(ClientInfoHolder::new(
+                                    local_addr, true,
+                                )),
+                            ),
+                            true,
+                        )
+                    }
+                    (_, is_sslreq) => {
+                        if is_sslreq {
+                            conn.write_all(b"N").await?;
+                        }
+                        (
+                            Framed::new(
+                                Either::Right(conn),
+                                PgWireMessageServerCodec::new(ClientInfoHolder::new(
+                                    local_addr, false,
+                                )),
+                            ),
+                            false,
+                        )
+                    }
+                };
+
+                trace!("SSL ? {secured}");
 
                 let msg = match framed.next().await {
                     Some(msg) => msg?,
@@ -548,9 +667,6 @@ pub async fn start(
                 let (back_tx, mut back_rx) = channel(1024);
 
                 let (mut sink, mut stream) = framed.split();
-
-                let conn = agent.pool().client_dedicated().unwrap();
-                trace!("opened connection");
 
                 let cancel = CancellationToken::new();
 
@@ -624,107 +740,80 @@ pub async fn start(
                     }
                 });
 
-                let int_handle = conn.get_interrupt_handle();
-                tokio::spawn(async move {
-                    cancel.cancelled().await;
-                    int_handle.interrupt();
-                });
+                let res = tokio::task::spawn_blocking({
+                    let back_tx = back_tx.clone();
+                    move || {
+                        let conn = agent.pool().client_dedicated().unwrap();
+                        trace!("opened connection");
 
-                let res = block_in_place(|| {
-                    conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
+                        let int_handle = conn.get_interrupt_handle();
+                        tokio::spawn(async move {
+                            cancel.cancelled().await;
+                            int_handle.interrupt();
+                        });
 
-                    let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
+                        conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
 
-                    conn.create_module(
-                        "pg_database",
-                        eponymous_only_module::<PgDatabaseTable>(),
-                        Some(dbs),
-                    )?;
-                    conn.create_module("pg_type", eponymous_only_module::<PgTypeTable>(), None)?;
-                    conn.create_module("pg_range", eponymous_only_module::<PgRangeTable>(), None)?;
-                    conn.create_module(
-                        "pg_namespace",
-                        eponymous_only_module::<PgNamespaceTable>(),
-                        None,
-                    )?;
-                    conn.create_module("pg_class", eponymous_only_module::<PgClassTable>(), None)?;
+                        let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
 
-                    conn.create_scalar_function(
-                        "version",
-                        0,
-                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                        |_ctx| Ok("PostgreSQL 14.9"),
-                    )?;
+                        conn.create_module(
+                            "pg_database",
+                            eponymous_only_module::<PgDatabaseTable>(),
+                            Some(dbs),
+                        )?;
+                        conn.create_module(
+                            "pg_type",
+                            eponymous_only_module::<PgTypeTable>(),
+                            None,
+                        )?;
+                        conn.create_module(
+                            "pg_range",
+                            eponymous_only_module::<PgRangeTable>(),
+                            None,
+                        )?;
+                        conn.create_module(
+                            "pg_namespace",
+                            eponymous_only_module::<PgNamespaceTable>(),
+                            None,
+                        )?;
+                        conn.create_module(
+                            "pg_class",
+                            eponymous_only_module::<PgClassTable>(),
+                            None,
+                        )?;
 
-                    conn.create_scalar_function(
-                        "pg_my_temp_schema",
-                        0,
-                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                        |_ctx| Ok(0i64),
-                    )?;
+                        conn.create_scalar_function(
+                            "version",
+                            0,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok("PostgreSQL 14.9"),
+                        )?;
 
-                    conn.create_scalar_function(
-                        "pg_is_other_temp_schema",
-                        1,
-                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                        |_ctx| Ok(false),
-                    )?;
+                        conn.create_scalar_function(
+                            "pg_my_temp_schema",
+                            0,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok(0i64),
+                        )?;
 
-                    let schema = match compute_schema(&conn) {
-                        Ok(schema) => schema,
-                        Err(e) => {
-                            error!("could not parse schema: {e}");
-                            back_tx.blocking_send(
-                                (
-                                    PgWireBackendMessage::ErrorResponse(
-                                        ErrorInfo::new(
-                                            "FATAL".into(),
-                                            "XX000".into(),
-                                            "could not parse database schema".into(),
-                                        )
-                                        .into(),
-                                    ),
-                                    true,
-                                )
-                                    .into(),
-                            )?;
-                            return Ok(());
-                        }
-                    };
+                        conn.create_scalar_function(
+                            "pg_is_other_temp_schema",
+                            1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok(false),
+                        )?;
 
-                    let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
-
-                    let mut portals: HashMap<CompactString, Portal> = HashMap::new();
-
-                    let mut discard_until_sync = false;
-
-                    let mut session = Session {
-                        agent,
-                        tx_state: TxState::default(),
-                    };
-
-                    'outer: while let Some(msg) = front_rx.blocking_recv() {
-                        debug!("msg: {msg:?}");
-
-                        if discard_until_sync
-                            && !matches!(
-                                msg,
-                                PgWireFrontendMessage::Sync(_) | PgWireFrontendMessage::Flush(_)
-                            )
-                        {
-                            debug!("discarding message due to previous error");
-                            continue;
-                        }
-
-                        match msg {
-                            PgWireFrontendMessage::Startup(_) => {
+                        let schema = match compute_schema(&conn) {
+                            Ok(schema) => schema,
+                            Err(e) => {
+                                error!("could not parse schema: {e}");
                                 back_tx.blocking_send(
                                     (
                                         PgWireBackendMessage::ErrorResponse(
                                             ErrorInfo::new(
                                                 "FATAL".into(),
-                                                SqlState::PROTOCOL_VIOLATION.code().into(),
-                                                "unexpected startup message".into(),
+                                                "XX000".into(),
+                                                "could not parse database schema".into(),
                                             )
                                             .into(),
                                         ),
@@ -732,39 +821,85 @@ pub async fn start(
                                     )
                                         .into(),
                                 )?;
+                                return Ok(());
+                            }
+                        };
+
+                        let mut session = Session {
+                            agent,
+                            conn: &conn,
+                            tx_state: TxState::default(),
+                        };
+
+                        let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
+
+                        let mut portals: HashMap<CompactString, Portal> = HashMap::new();
+
+                        let mut discard_until_sync = false;
+
+                        'outer: while let Some(msg) = front_rx.blocking_recv() {
+                            debug!("msg: {msg:?}");
+
+                            if discard_until_sync
+                                && !matches!(
+                                    msg,
+                                    PgWireFrontendMessage::Sync(_)
+                                        | PgWireFrontendMessage::Flush(_)
+                                )
+                            {
+                                debug!("discarding message due to previous error");
                                 continue;
                             }
-                            PgWireFrontendMessage::Parse(parse) => {
-                                let name: &str = parse.name().as_deref().unwrap_or("");
-                                let mut cmds = match parse_query(parse.query()) {
-                                    Ok(cmds) => cmds,
-                                    Err(e) => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        discard_until_sync = true;
-                                        continue;
-                                    }
-                                };
 
-                                match cmds.pop_front() {
-                                    None => {
-                                        prepared.insert(name.into(), Prepared::Empty);
-                                    }
-                                    Some(parsed_cmd) => {
-                                        if !cmds.is_empty() {
+                            match msg {
+                                PgWireFrontendMessage::Startup(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "FATAL".into(),
+                                                    SqlState::PROTOCOL_VIOLATION.code().into(),
+                                                    "unexpected startup message".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
+                                            .into(),
+                                    )?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::Parse(parse) => {
+                                    let name: &str = parse.name().as_deref().unwrap_or("");
+                                    let mut cmds = match parse_query(parse.query()) {
+                                        Ok(cmds) => cmds,
+                                        Err(e) => {
                                             back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            discard_until_sync = true;
+                                            continue;
+                                        }
+                                    };
+
+                                    match cmds.pop_front() {
+                                        None => {
+                                            prepared.insert(name.into(), Prepared::Empty);
+                                        }
+                                        Some(parsed_cmd) => {
+                                            if !cmds.is_empty() {
+                                                back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
                                                         ErrorInfo::new(
@@ -781,22 +916,130 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            discard_until_sync = true;
-                                            continue;
+                                                discard_until_sync = true;
+                                                continue;
+                                            }
+
+                                            trace!("parsed cmd: {parsed_cmd:#?}");
+
+                                            let prepped = match session.conn.prepare(parse.query()) {
+                                                Ok(prepped) => prepped,
+                                                Err(e) => {
+                                                    back_tx.blocking_send(
+                                                        (
+                                                            PgWireBackendMessage::ErrorResponse(
+                                                                ErrorInfo::new(
+                                                                    "ERROR".to_owned(),
+                                                                    "XX000".to_owned(),
+                                                                    e.to_string(),
+                                                                )
+                                                                .into(),
+                                                            ),
+                                                            true,
+                                                        )
+                                                            .into(),
+                                                    )?;
+                                                    discard_until_sync = true;
+                                                    continue;
+                                                }
+                                            };
+
+                                            let mut param_types: Vec<Type> = parse
+                                                .type_oids()
+                                                .iter()
+                                                .filter_map(|oid| Type::from_oid(*oid))
+                                                .collect();
+
+                                            debug!("params types {param_types:?}");
+
+                                            if param_types.len() != prepped.parameter_count() {
+                                                param_types = parameter_types(&schema, &parsed_cmd)
+                                                    .params
+                                                    .into_iter()
+                                                    .map(|param| {
+                                                        trace!("got param: {param:?}");
+                                                        match (param.sqlite_type, param.source) {
+                                                            (SqliteType::Null, _) => unreachable!(),
+                                                            (SqliteType::Text, src) => match src {
+                                                                Some("JSON") => Type::JSON,
+                                                                _ => Type::TEXT,
+                                                            },
+                                                            (SqliteType::Numeric, Some(src)) => {
+                                                                match src {
+                                                                    "BOOLEAN" | "BOOL" => {
+                                                                        Type::BOOL
+                                                                    }
+                                                                    "DATETIME" => Type::TIMESTAMP,
+                                                                    _ => Type::FLOAT8,
+                                                                }
+                                                            }
+                                                            (SqliteType::Numeric, None) => {
+                                                                Type::FLOAT8
+                                                            }
+                                                            (SqliteType::Integer, _src) => {
+                                                                Type::INT8
+                                                            }
+                                                            (SqliteType::Real, _src) => {
+                                                                Type::FLOAT8
+                                                            }
+                                                            (SqliteType::Blob, src) => match src {
+                                                                Some("JSONB") => Type::JSONB,
+                                                                _ => Type::BYTEA,
+                                                            },
+                                                        }
+                                                    })
+                                                    .collect();
+                                            }
+
+                                            let fields = match field_types(
+                                                &prepped,
+                                                &parsed_cmd,
+                                                FieldFormats::All(FieldFormat::Text),
+                                            ) {
+                                                Ok(fields) => fields,
+                                                Err(e) => {
+                                                    back_tx
+                                                        .blocking_send((e.into(), true).into())?;
+                                                    discard_until_sync = true;
+                                                    continue 'outer;
+                                                }
+                                            };
+
+                                            prepared.insert(
+                                                name.into(),
+                                                Prepared::NonEmpty {
+                                                    sql: parse.query().clone(),
+                                                    param_types,
+                                                    fields,
+                                                    cmd: parsed_cmd,
+                                                },
+                                            );
                                         }
+                                    }
 
-                                        trace!("parsed cmd: {parsed_cmd:#?}");
-
-                                        let prepped = match conn.prepare(parse.query()) {
-                                            Ok(prepped) => prepped,
-                                            Err(e) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ParseComplete(
+                                                ParseComplete::new(),
+                                            ),
+                                            false,
+                                        )
+                                            .into(),
+                                    )?;
+                                }
+                                PgWireFrontendMessage::Describe(desc) => {
+                                    let name = desc.name().as_deref().unwrap_or("");
+                                    match desc.target_type() {
+                                        // statement
+                                        b'S' => match prepared.get(name) {
+                                            None => {
                                                 back_tx.blocking_send(
                                                     (
                                                         PgWireBackendMessage::ErrorResponse(
                                                             ErrorInfo::new(
-                                                                "ERROR".to_owned(),
-                                                                "XX000".to_owned(),
-                                                                e.to_string(),
+                                                                "ERROR".into(),
+                                                                "XX000".into(),
+                                                                "statement not found".into(),
                                                             )
                                                             .into(),
                                                         ),
@@ -805,94 +1048,161 @@ pub async fn start(
                                                         .into(),
                                                 )?;
                                                 discard_until_sync = true;
-                                                continue;
                                             }
-                                        };
-
-                                        let mut param_types: Vec<Type> = parse
-                                            .type_oids()
-                                            .iter()
-                                            .filter_map(|oid| Type::from_oid(*oid))
-                                            .collect();
-
-                                        debug!("params types {param_types:?}");
-
-                                        if param_types.len() != prepped.parameter_count() {
-                                            param_types = parameter_types(&schema, &parsed_cmd)
-                                                .params
-                                                .into_iter()
-                                                .map(|param| {
-                                                    trace!("got param: {param:?}");
-                                                    match (param.sqlite_type, param.source) {
-                                                        (SqliteType::Null, _) => unreachable!(),
-                                                        (SqliteType::Text, src) => match src {
-                                                            Some("JSON") => Type::JSON,
-                                                            _ => Type::TEXT,
-                                                        },
-                                                        (SqliteType::Numeric, Some(src)) => {
-                                                            match src {
-                                                                "BOOLEAN" | "BOOL" => Type::BOOL,
-                                                                "DATETIME" => Type::TIMESTAMP,
-                                                                _ => Type::FLOAT8,
-                                                            }
-                                                        }
-                                                        (SqliteType::Numeric, None) => Type::FLOAT8,
-                                                        (SqliteType::Integer, _src) => Type::INT8,
-                                                        (SqliteType::Real, _src) => Type::FLOAT8,
-                                                        (SqliteType::Blob, src) => match src {
-                                                            Some("JSONB") => Type::JSONB,
-                                                            _ => Type::BYTEA,
-                                                        },
-                                                    }
-                                                })
-                                                .collect();
-                                        }
-
-                                        let fields = match field_types(
-                                            &prepped,
-                                            &parsed_cmd,
-                                            FieldFormats::All(FieldFormat::Text),
-                                        ) {
-                                            Ok(fields) => fields,
-                                            Err(e) => {
-                                                back_tx.blocking_send((e.into(), true).into())?;
-                                                discard_until_sync = true;
-                                                continue 'outer;
+                                            Some(Prepared::Empty) => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::NoData(NoData::new()),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
                                             }
-                                        };
-
-                                        prepared.insert(
-                                            name.into(),
-                                            Prepared::NonEmpty {
-                                                sql: parse.query().clone(),
+                                            Some(Prepared::NonEmpty {
                                                 param_types,
                                                 fields,
-                                                cmd: parsed_cmd,
-                                            },
-                                        );
+                                                ..
+                                            }) => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::ParameterDescription(
+                                                            ParameterDescription::new(
+                                                                param_types
+                                                                    .iter()
+                                                                    .map(|t| t.oid())
+                                                                    .collect(),
+                                                            ),
+                                                        ),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
+
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::RowDescription(
+                                                            RowDescription::new(
+                                                                fields
+                                                                    .iter()
+                                                                    .map(Into::into)
+                                                                    .collect(),
+                                                            ),
+                                                        ),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                            }
+                                        },
+                                        // portal
+                                        b'P' => match portals.get(name) {
+                                            None => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::ErrorResponse(
+                                                            ErrorInfo::new(
+                                                                "ERROR".into(),
+                                                                "XX000".into(),
+                                                                "portal not found".into(),
+                                                            )
+                                                            .into(),
+                                                        ),
+                                                        true,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                                discard_until_sync = true;
+                                            }
+                                            Some(Portal::Empty { .. }) => {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::NoData(NoData::new()),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                            }
+                                            Some(Portal::Parsed {
+                                                stmt,
+                                                result_formats,
+                                                cmd,
+                                                ..
+                                            }) => {
+                                                let fields = match field_types(
+                                                    stmt,
+                                                    cmd,
+                                                    FieldFormats::Each(result_formats),
+                                                ) {
+                                                    Ok(fields) => fields,
+                                                    Err(e) => {
+                                                        back_tx.blocking_send(
+                                                            (
+                                                                PgWireBackendMessage::ErrorResponse(
+                                                                    e.into(),
+                                                                ),
+                                                                true,
+                                                            )
+                                                                .into(),
+                                                        )?;
+                                                        continue 'outer;
+                                                    }
+                                                };
+
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::RowDescription(
+                                                            RowDescription::new(
+                                                                fields
+                                                                    .iter()
+                                                                    .map(Into::into)
+                                                                    .collect(),
+                                                            ),
+                                                        ),
+                                                        false,
+                                                    )
+                                                        .into(),
+                                                )?;
+                                            }
+                                        },
+                                        _ => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "FATAL".into(),
+                                                            SqlState::PROTOCOL_VIOLATION
+                                                                .code()
+                                                                .into(),
+                                                            "unexpected describe type".into(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            discard_until_sync = true;
+                                            continue;
+                                        }
                                     }
                                 }
+                                PgWireFrontendMessage::Bind(bind) => {
+                                    let portal_name = bind
+                                        .portal_name()
+                                        .as_deref()
+                                        .map(CompactString::from)
+                                        .unwrap_or_default();
 
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ParseComplete(ParseComplete::new()),
-                                        false,
-                                    )
-                                        .into(),
-                                )?;
-                            }
-                            PgWireFrontendMessage::Describe(desc) => {
-                                let name = desc.name().as_deref().unwrap_or("");
-                                match desc.target_type() {
-                                    // statement
-                                    b'S' => match prepared.get(name) {
+                                    let stmt_name = bind.statement_name().as_deref().unwrap_or("");
+
+                                    match prepared.get(stmt_name) {
                                         None => {
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
                                                         ErrorInfo::new(
-                                                            "ERROR".into(),
-                                                            "XX000".into(),
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
                                                             "statement not found".into(),
                                                         )
                                                         .into(),
@@ -902,209 +1212,53 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                             discard_until_sync = true;
+                                            continue;
                                         }
                                         Some(Prepared::Empty) => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::NoData(NoData::new()),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
+                                            portals.insert(
+                                                portal_name,
+                                                Portal::Empty {
+                                                    stmt_name: stmt_name.into(),
+                                                },
+                                            );
                                         }
                                         Some(Prepared::NonEmpty {
+                                            sql,
                                             param_types,
-                                            fields,
-                                            ..
-                                        }) => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ParameterDescription(
-                                                        ParameterDescription::new(
-                                                            param_types
-                                                                .iter()
-                                                                .map(|t| t.oid())
-                                                                .collect(),
-                                                        ),
-                                                    ),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
-
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::RowDescription(
-                                                        RowDescription::new(
-                                                            fields.iter().map(Into::into).collect(),
-                                                        ),
-                                                    ),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
-                                        }
-                                    },
-                                    // portal
-                                    b'P' => match portals.get(name) {
-                                        None => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "ERROR".into(),
-                                                            "XX000".into(),
-                                                            "portal not found".into(),
-                                                        )
-                                                        .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-                                            discard_until_sync = true;
-                                        }
-                                        Some(Portal::Empty { .. }) => {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::NoData(NoData::new()),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
-                                        }
-                                        Some(Portal::Parsed {
-                                            stmt,
-                                            result_formats,
                                             cmd,
                                             ..
                                         }) => {
-                                            let fields = match field_types(
-                                                stmt,
-                                                cmd,
-                                                FieldFormats::Each(result_formats),
-                                            ) {
-                                                Ok(fields) => fields,
+                                            let mut prepped = match session.conn.prepare(sql) {
+                                                Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
                                                         (
                                                             PgWireBackendMessage::ErrorResponse(
-                                                                e.into(),
+                                                                ErrorInfo::new(
+                                                                    "ERROR".to_owned(),
+                                                                    "XX000".to_owned(),
+                                                                    e.to_string(),
+                                                                )
+                                                                .into(),
                                                             ),
                                                             true,
                                                         )
                                                             .into(),
                                                     )?;
-                                                    continue 'outer;
+                                                    discard_until_sync = true;
+                                                    continue;
                                                 }
                                             };
 
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::RowDescription(
-                                                        RowDescription::new(
-                                                            fields.iter().map(Into::into).collect(),
-                                                        ),
-                                                    ),
-                                                    false,
-                                                )
-                                                    .into(),
-                                            )?;
-                                        }
-                                    },
-                                    _ => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "FATAL".into(),
-                                                        SqlState::PROTOCOL_VIOLATION.code().into(),
-                                                        "unexpected describe type".into(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        discard_until_sync = true;
-                                        continue;
-                                    }
-                                }
-                            }
-                            PgWireFrontendMessage::Bind(bind) => {
-                                let portal_name = bind
-                                    .portal_name()
-                                    .as_deref()
-                                    .map(CompactString::from)
-                                    .unwrap_or_default();
+                                            trace!(
+                                                "bind params count: {}, statement params count: {}",
+                                                bind.parameters().len(),
+                                                prepped.parameter_count()
+                                            );
 
-                                let stmt_name = bind.statement_name().as_deref().unwrap_or("");
+                                            debug!("bind param types: {param_types:?}");
 
-                                match prepared.get(stmt_name) {
-                                    None => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        "statement not found".into(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        discard_until_sync = true;
-                                        continue;
-                                    }
-                                    Some(Prepared::Empty) => {
-                                        portals.insert(
-                                            portal_name,
-                                            Portal::Empty {
-                                                stmt_name: stmt_name.into(),
-                                            },
-                                        );
-                                    }
-                                    Some(Prepared::NonEmpty {
-                                        sql,
-                                        param_types,
-                                        cmd,
-                                        ..
-                                    }) => {
-                                        let mut prepped = match conn.prepare(sql) {
-                                            Ok(prepped) => prepped,
-                                            Err(e) => {
-                                                back_tx.blocking_send(
-                                                    (
-                                                        PgWireBackendMessage::ErrorResponse(
-                                                            ErrorInfo::new(
-                                                                "ERROR".to_owned(),
-                                                                "XX000".to_owned(),
-                                                                e.to_string(),
-                                                            )
-                                                            .into(),
-                                                        ),
-                                                        true,
-                                                    )
-                                                        .into(),
-                                                )?;
-                                                discard_until_sync = true;
-                                                continue;
-                                            }
-                                        };
-
-                                        trace!(
-                                            "bind params count: {}, statement params count: {}",
-                                            bind.parameters().len(),
-                                            prepped.parameter_count()
-                                        );
-
-                                        debug!("bind param types: {param_types:?}");
-
-                                        let mut format_codes = match bind
+                                            let mut format_codes = match bind
                                             .parameter_format_codes()
                                             .iter()
                                             .map(|code| {
@@ -1136,26 +1290,26 @@ pub async fn start(
                                                 continue;
                                             }
                                         };
-                                        if format_codes.is_empty() {
-                                            // no format codes? default to text
-                                            format_codes =
-                                                vec![FormatCode::Text; bind.parameters().len()];
-                                        } else if format_codes.len() == 1 {
-                                            // single code means we should use it for all others
-                                            format_codes =
-                                                vec![format_codes[0]; bind.parameters().len()];
-                                        }
+                                            if format_codes.is_empty() {
+                                                // no format codes? default to text
+                                                format_codes =
+                                                    vec![FormatCode::Text; bind.parameters().len()];
+                                            } else if format_codes.len() == 1 {
+                                                // single code means we should use it for all others
+                                                format_codes =
+                                                    vec![format_codes[0]; bind.parameters().len()];
+                                            }
 
-                                        for (i, param) in bind.parameters().iter().enumerate() {
-                                            let idx = i + 1;
-                                            let b = match param {
-                                                None => {
-                                                    trace!("binding idx {idx} w/ NULL");
-                                                    if let Err(e) = prepped.raw_bind_parameter(
-                                                        idx,
-                                                        rusqlite::types::Null,
-                                                    ) {
-                                                        back_tx.blocking_send(
+                                            for (i, param) in bind.parameters().iter().enumerate() {
+                                                let idx = i + 1;
+                                                let b = match param {
+                                                    None => {
+                                                        trace!("binding idx {idx} w/ NULL");
+                                                        if let Err(e) = prepped.raw_bind_parameter(
+                                                            idx,
+                                                            rusqlite::types::Null,
+                                                        ) {
+                                                            back_tx.blocking_send(
                                                             (
                                                                 PgWireBackendMessage::ErrorResponse(
                                                                     ErrorInfo::new(
@@ -1169,136 +1323,151 @@ pub async fn start(
                                                             )
                                                                 .into(),
                                                         )?;
+                                                            discard_until_sync = true;
+                                                            continue 'outer;
+                                                        }
+                                                        continue;
+                                                    }
+                                                    Some(b) => b,
+                                                };
+
+                                                trace!("got param bytes: {b:?}");
+
+                                                match param_types.get(i) {
+                                                    None => {
+                                                        trace!("no param type found!");
+                                                        back_tx.blocking_send(
+                                                            (
+                                                                PgWireBackendMessage::ErrorResponse(
+                                                                    ErrorInfo::new(
+                                                                        "ERROR".to_owned(),
+                                                                        "XX000".to_owned(),
+                                                                        "missing parameter type"
+                                                                            .into(),
+                                                                    )
+                                                                    .into(),
+                                                                ),
+                                                                true,
+                                                            )
+                                                                .into(),
+                                                        )?;
                                                         discard_until_sync = true;
                                                         continue 'outer;
                                                     }
-                                                    continue;
-                                                }
-                                                Some(b) => b,
-                                            };
+                                                    Some(param_type) => {
+                                                        let format_code = format_codes[i];
+                                                        trace!("parsing param_type {param_type:?}, format_code: {format_code:?}, bytes: {b:?}");
+                                                        match param_type {
+                                                            t @ &Type::BOOL => {
+                                                                let value: bool =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
+                                                            t @ &Type::INT2 => {
+                                                                let value: i16 =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
+                                                            t @ &Type::INT4 => {
+                                                                let value: i32 =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
+                                                            t @ &Type::INT8 => {
+                                                                let value: i64 =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
 
-                                            trace!("got param bytes: {b:?}");
+                                                            t @ &Type::TEXT
+                                                            | t @ &Type::VARCHAR
+                                                            | t @ &Type::JSON => {
+                                                                let value: &str = match format_code
+                                                                {
+                                                                    FormatCode::Text => {
+                                                                        std::str::from_utf8(b)?
+                                                                    }
+                                                                    FormatCode::Binary => {
+                                                                        FromSql::from_sql(t, b)?
+                                                                    }
+                                                                };
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
+                                                            t @ &Type::FLOAT4 => {
+                                                                let value: f32 =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
+                                                            t @ &Type::FLOAT8 => {
+                                                                let value: f64 =
+                                                                    from_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ value: {value}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, value,
+                                                                )?;
+                                                            }
 
-                                            match param_types.get(i) {
-                                                None => {
-                                                    trace!("no param type found!");
-                                                    back_tx.blocking_send(
-                                                        (
-                                                            PgWireBackendMessage::ErrorResponse(
-                                                                ErrorInfo::new(
-                                                                    "ERROR".to_owned(),
-                                                                    "XX000".to_owned(),
-                                                                    "missing parameter type".into(),
+                                                            &Type::BYTEA | &Type::JSONB => {
+                                                                let maybe_decoded = matches!(
+                                                                    format_code,
+                                                                    FormatCode::Text
                                                                 )
-                                                                .into(),
-                                                            ),
-                                                            true,
-                                                        )
-                                                            .into(),
-                                                    )?;
-                                                    discard_until_sync = true;
-                                                    continue 'outer;
-                                                }
-                                                Some(param_type) => {
-                                                    let format_code = format_codes[i];
-                                                    trace!("parsing param_type {param_type:?}, format_code: {format_code:?}, bytes: {b:?}");
-                                                    match param_type {
-                                                        t @ &Type::BOOL => {
-                                                            let value: bool = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        t @ &Type::INT2 => {
-                                                            let value: i16 = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        t @ &Type::INT4 => {
-                                                            let value: i32 = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        t @ &Type::INT8 => {
-                                                            let value: i64 = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
+                                                                .then(|| hex::decode(b).ok())
+                                                                .flatten();
 
-                                                        t @ &Type::TEXT
-                                                        | t @ &Type::VARCHAR
-                                                        | t @ &Type::JSON => {
-                                                            let value: &str = match format_code {
-                                                                FormatCode::Text => {
-                                                                    std::str::from_utf8(b)?
-                                                                }
-                                                                FormatCode::Binary => {
-                                                                    FromSql::from_sql(t, b)?
-                                                                }
-                                                            };
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        t @ &Type::FLOAT4 => {
-                                                            let value: f32 = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
-                                                        t @ &Type::FLOAT8 => {
-                                                            let value: f64 = from_type_and_format(
-                                                                t,
-                                                                b,
-                                                                format_code,
-                                                            )?;
-                                                            trace!("binding idx {idx} w/ value: {value}");
-                                                            prepped
-                                                                .raw_bind_parameter(idx, value)?;
-                                                        }
+                                                                trace!("binding idx {idx} w/ decoded value: {maybe_decoded:?} (bytes: {b:?})");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx,
+                                                                    maybe_decoded
+                                                                        .as_deref()
+                                                                        .unwrap_or(b),
+                                                                )?;
+                                                            }
 
-                                                        &Type::BYTEA | &Type::JSONB => {
-                                                            let maybe_decoded = matches!(
-                                                                format_code,
-                                                                FormatCode::Text
-                                                            )
-                                                            .then(|| hex::decode(b).ok())
-                                                            .flatten();
-
-                                                            trace!("binding idx {idx} w/ decoded value: {maybe_decoded:?} (bytes: {b:?})");
-                                                            prepped.raw_bind_parameter(
-                                                                idx,
-                                                                maybe_decoded
-                                                                    .as_deref()
-                                                                    .unwrap_or(b),
-                                                            )?;
-                                                        }
-
-                                                        t @ &Type::TIMESTAMP => {
-                                                            let dt = match format_code {
+                                                            t @ &Type::TIMESTAMP => {
+                                                                let dt = match format_code {
                                                                 FormatCode::Text => {
                                                                     let s =
                                                                         String::from_utf8_lossy(b);
@@ -1313,12 +1482,25 @@ pub async fn start(
                                                                         )?
                                                                 }
                                                             };
-                                                            prepped.raw_bind_parameter(idx, dt)?;
-                                                        }
+                                                                prepped
+                                                                    .raw_bind_parameter(idx, dt)?;
+                                                            }
 
-                                                        t => {
-                                                            warn!("unsupported type: {t:?}");
-                                                            back_tx.blocking_send(
+                                                            // t @ &Type::TIMESTAMP => {
+                                                            //     let value: time::OffsetDateTime =
+                                                            //         from_type_and_format(
+                                                            //             t,
+                                                            //             b,
+                                                            //             format_code,
+                                                            //         )?;
+
+                                                            //     trace!("binding idx {idx} w/ value: {value}");
+                                                            //     prepped
+                                                            //         .raw_bind_parameter(idx, value)?;
+                                                            // }
+                                                            t => {
+                                                                warn!("unsupported type: {t:?}");
+                                                                back_tx.blocking_send(
                                                                 (
                                                                     PgWireBackendMessage::ErrorResponse(
                                                                         ErrorInfo::new(
@@ -1333,52 +1515,151 @@ pub async fn start(
                                                                     true,
                                                                 ).into(),
                                                             )?;
-                                                            discard_until_sync = true;
-                                                            continue 'outer;
+                                                                discard_until_sync = true;
+                                                                continue 'outer;
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
+
+                                            debug!("EXPANDED SQL: {:?}", prepped.expanded_sql());
+
+                                            portals.insert(
+                                                portal_name,
+                                                Portal::Parsed {
+                                                    stmt_name: stmt_name.into(),
+                                                    stmt: prepped,
+                                                    result_formats: bind
+                                                        .result_column_format_codes()
+                                                        .iter()
+                                                        .copied()
+                                                        .map(FieldFormat::from)
+                                                        .collect(),
+                                                    cmd: cmd.clone(),
+                                                },
+                                            );
                                         }
+                                    }
 
-                                        debug!("EXPANDED SQL: {:?}", prepped.expanded_sql());
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::BindComplete(BindComplete::new()),
+                                            false,
+                                        )
+                                            .into(),
+                                    )?;
+                                }
+                                PgWireFrontendMessage::Sync(_) => {
+                                    send_ready(&mut session, discard_until_sync, &back_tx)?;
 
-                                        portals.insert(
-                                            portal_name,
-                                            Portal::Parsed {
-                                                stmt_name: stmt_name.into(),
-                                                stmt: prepped,
-                                                result_formats: bind
-                                                    .result_column_format_codes()
-                                                    .iter()
-                                                    .copied()
-                                                    .map(FieldFormat::from)
-                                                    .collect(),
-                                                cmd: cmd.clone(),
-                                            },
-                                        );
+                                    // reset this
+                                    discard_until_sync = false;
+                                }
+                                PgWireFrontendMessage::Execute(execute) => {
+                                    let name = execute.name().as_deref().unwrap_or("");
+                                    let (prepped, result_formats, cmd) = match portals.get_mut(name)
+                                    {
+                                        Some(Portal::Empty { .. }) => {
+                                            trace!("empty portal");
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::EmptyQueryResponse(
+                                                        EmptyQueryResponse::new(),
+                                                    ),
+                                                    false,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            continue;
+                                        }
+                                        Some(Portal::Parsed {
+                                            stmt,
+                                            result_formats,
+                                            cmd,
+                                            ..
+                                        }) => (stmt, result_formats, cmd),
+                                        None => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".into(),
+                                                            "XX000".into(),
+                                                            "portal not found".into(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            discard_until_sync = true;
+                                            continue;
+                                        }
+                                    };
+
+                                    trace!("non-empty portal!");
+
+                                    let max_rows = *execute.max_rows();
+                                    let max_rows = if max_rows == 0 {
+                                        usize::MAX
+                                    } else {
+                                        max_rows as usize
+                                    };
+
+                                    if let Err(e) = session.handle_execute(
+                                        prepped,
+                                        result_formats,
+                                        cmd,
+                                        max_rows,
+                                        &back_tx,
+                                    ) {
+                                        debug!("error in execute: {e}");
+
+                                        back_tx.blocking_send(BackendResponse::Message {
+                                            message: e.try_into()?,
+                                            flush: true,
+                                        })?;
+
+                                        discard_until_sync = true;
+
+                                        send_ready(
+                                            &mut session,
+                                            discard_until_sync,
+                                            &back_tx,
+                                        )?;
+                                        continue;
                                     }
                                 }
+                                PgWireFrontendMessage::Query(query) => {
+                                    let parsed_query = match parse_query(query.query()) {
+                                        Ok(q) => q,
+                                        Err(e) => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            send_ready(
+                                                &mut session,
+                                                discard_until_sync,
+                                                &back_tx,
+                                            )?;
+                                            continue;
+                                        }
+                                    };
 
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::BindComplete(BindComplete::new()),
-                                        false,
-                                    )
-                                        .into(),
-                                )?;
-                            }
-                            PgWireFrontendMessage::Sync(_) => {
-                                send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
-
-                                // reset this
-                                discard_until_sync = false;
-                            }
-                            PgWireFrontendMessage::Execute(execute) => {
-                                let name = execute.name().as_deref().unwrap_or("");
-                                let (prepped, result_formats, cmd) = match portals.get_mut(name) {
-                                    Some(Portal::Empty { .. }) => {
-                                        trace!("empty portal");
+                                    if parsed_query.is_empty() {
                                         back_tx.blocking_send(
                                             (
                                                 PgWireBackendMessage::EmptyQueryResponse(
@@ -1388,307 +1669,241 @@ pub async fn start(
                                             )
                                                 .into(),
                                         )?;
-                                        continue;
-                                    }
-                                    Some(Portal::Parsed {
-                                        stmt,
-                                        result_formats,
-                                        cmd,
-                                        ..
-                                    }) => (stmt, result_formats, cmd),
-                                    None => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".into(),
-                                                        "XX000".into(),
-                                                        "portal not found".into(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        discard_until_sync = true;
-                                        continue;
-                                    }
-                                };
 
-                                trace!("non-empty portal!");
-
-                                let max_rows = *execute.max_rows();
-                                let max_rows = if max_rows == 0 {
-                                    usize::MAX
-                                } else {
-                                    max_rows as usize
-                                };
-
-                                if let Err(e) = session.handle_execute(
-                                    &conn,
-                                    prepped,
-                                    result_formats,
-                                    cmd,
-                                    max_rows,
-                                    &back_tx,
-                                ) {
-                                    back_tx.blocking_send(BackendResponse::Message {
-                                        message: e.try_into()?,
-                                        flush: true,
-                                    })?;
-
-                                    discard_until_sync = true;
-
-                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
-                                    continue;
-                                }
-                            }
-                            PgWireFrontendMessage::Query(query) => {
-                                let parsed_query = match parse_query(query.query()) {
-                                    Ok(q) => q,
-                                    Err(e) => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
                                         send_ready(
                                             &mut session,
-                                            &conn,
                                             discard_until_sync,
                                             &back_tx,
                                         )?;
                                         continue;
                                     }
-                                };
 
-                                if parsed_query.is_empty() {
+                                    for cmd in parsed_query.into_iter() {
+                                        if let Err(e) =
+                                            session.handle_query(&cmd, &back_tx, true)
+                                        {
+                                            back_tx.blocking_send(BackendResponse::Message {
+                                                message: e.try_into()?,
+                                                flush: true,
+                                            })?;
+                                            send_ready(
+                                                &mut session,
+                                                discard_until_sync,
+                                                &back_tx,
+                                            )?;
+                                            continue 'outer;
+                                        }
+                                    }
+
+                                    // automatically commit an implicit tx
+                                    if session.tx_state.is_implicit() {
+                                        trace!("committing IMPLICIT tx");
+                                        let _permit = session.tx_state.end();
+
+                                        if let Err(e) = session.handle_commit() {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            send_ready(
+                                                &mut session,
+                                                discard_until_sync,
+                                                &back_tx,
+                                            )?;
+                                            continue;
+                                        }
+                                        trace!("committed IMPLICIT tx");
+                                    }
+
+                                    send_ready(&mut session, discard_until_sync, &back_tx)?;
+                                }
+                                PgWireFrontendMessage::Terminate(_) => {
+                                    break;
+                                }
+
+                                PgWireFrontendMessage::PasswordMessageFamily(_) => {
                                     back_tx.blocking_send(
                                         (
-                                            PgWireBackendMessage::EmptyQueryResponse(
-                                                EmptyQueryResponse::new(),
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "PasswordMessage is not implemented".into(),
+                                                )
+                                                .into(),
                                             ),
-                                            false,
+                                            true,
                                         )
                                             .into(),
                                     )?;
-
-                                    send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
                                     continue;
                                 }
-
-                                for cmd in parsed_query.into_iter() {
-                                    if let Err(e) =
-                                        session.handle_query(&conn, &cmd, &back_tx, true)
-                                    {
-                                        back_tx.blocking_send(BackendResponse::Message {
-                                            message: e.try_into()?,
-                                            flush: true,
-                                        })?;
-                                        send_ready(
-                                            &mut session,
-                                            &conn,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
-                                        continue 'outer;
-                                    }
-                                }
-
-                                // automatically commit an implicit tx
-                                if session.tx_state.is_implicit() {
-                                    trace!("committing IMPLICIT tx");
-                                    let _permit = session.tx_state.end();
-
-                                    if let Err(e) = session.handle_commit(&conn) {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "ERROR".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
+                                PgWireFrontendMessage::Close(close) => {
+                                    let name = close.name().as_deref().unwrap_or("");
+                                    match close.target_type() {
+                                        // statement
+                                        b'S' => {
+                                            if prepared.remove(name).is_some() {
+                                                portals
+                                                    .retain(|_, portal| portal.stmt_name() != name);
+                                            }
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::CloseComplete(
+                                                        CloseComplete::new(),
+                                                    ),
+                                                    true,
+                                                )
                                                     .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        send_ready(
-                                            &mut session,
-                                            &conn,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
-                                        continue;
-                                    }
-                                    trace!("committed IMPLICIT tx");
-                                }
-
-                                send_ready(&mut session, &conn, discard_until_sync, &back_tx)?;
-                            }
-                            PgWireFrontendMessage::Terminate(_) => {
-                                break;
-                            }
-
-                            PgWireFrontendMessage::PasswordMessageFamily(_) => {
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ErrorResponse(
-                                            ErrorInfo::new(
-                                                "ERROR".into(),
-                                                "XX000".to_owned(),
-                                                "PasswordMessage is not implemented".into(),
-                                            )
-                                            .into(),
-                                        ),
-                                        true,
-                                    )
-                                        .into(),
-                                )?;
-                                continue;
-                            }
-                            PgWireFrontendMessage::Close(close) => {
-                                let name = close.name().as_deref().unwrap_or("");
-                                match close.target_type() {
-                                    // statement
-                                    b'S' => {
-                                        if prepared.remove(name).is_some() {
-                                            portals.retain(|_, portal| portal.stmt_name() != name);
+                                            )?;
+                                            continue;
                                         }
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::CloseComplete(
-                                                    CloseComplete::new(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        continue;
-                                    }
-                                    // portal
-                                    b'P' => {
-                                        portals.remove(name);
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::CloseComplete(
-                                                    CloseComplete::new(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                    }
-                                    _ => {
-                                        back_tx.blocking_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "FATAL".into(),
-                                                        SqlState::PROTOCOL_VIOLATION.code().into(),
-                                                        "unexpected Close target_type".into(),
-                                                    )
+                                        // portal
+                                        b'P' => {
+                                            portals.remove(name);
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::CloseComplete(
+                                                        CloseComplete::new(),
+                                                    ),
+                                                    true,
+                                                )
                                                     .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        )?;
-                                        discard_until_sync = true;
-                                        continue;
+                                            )?;
+                                        }
+                                        _ => {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "FATAL".into(),
+                                                            SqlState::PROTOCOL_VIOLATION
+                                                                .code()
+                                                                .into(),
+                                                            "unexpected Close target_type".into(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            discard_until_sync = true;
+                                            continue;
+                                        }
                                     }
                                 }
-                            }
-                            PgWireFrontendMessage::Flush(_) => {
-                                back_tx.blocking_send(BackendResponse::Flush)?;
-                            }
-                            PgWireFrontendMessage::CopyData(_) => {
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ErrorResponse(
-                                            ErrorInfo::new(
-                                                "ERROR".into(),
-                                                "XX000".to_owned(),
-                                                "CopyData is not implemented".into(),
-                                            )
+                                PgWireFrontendMessage::Flush(_) => {
+                                    back_tx.blocking_send(BackendResponse::Flush)?;
+                                }
+                                PgWireFrontendMessage::CopyData(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "CopyData is not implemented".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
                                             .into(),
-                                        ),
-                                        true,
-                                    )
-                                        .into(),
-                                )?;
-                                continue;
-                            }
-                            PgWireFrontendMessage::CopyFail(_) => {
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ErrorResponse(
-                                            ErrorInfo::new(
-                                                "ERROR".into(),
-                                                "XX000".to_owned(),
-                                                "CopyFail is not implemented".into(),
-                                            )
+                                    )?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::CopyFail(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "CopyFail is not implemented".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
                                             .into(),
-                                        ),
-                                        true,
-                                    )
-                                        .into(),
-                                )?;
-                                continue;
-                            }
-                            PgWireFrontendMessage::CopyDone(_) => {
-                                back_tx.blocking_send(
-                                    (
-                                        PgWireBackendMessage::ErrorResponse(
-                                            ErrorInfo::new(
-                                                "ERROR".into(),
-                                                "XX000".to_owned(),
-                                                "CopyDone is not implemented".into(),
-                                            )
+                                    )?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::CopyDone(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "CopyDone is not implemented".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
                                             .into(),
-                                        ),
-                                        true,
-                                    )
-                                        .into(),
-                                )?;
-                                continue;
+                                    )?;
+                                    continue;
+                                }
                             }
                         }
+
+                        Ok::<_, BoxError>(())
                     }
+                }).await;
 
-                    Ok::<_, BoxError>(())
-                });
-
-                if let Err(e) = res {
-                    error!("connection failed: {e}");
-                    _ = back_tx
-                        .send(
-                            (
-                                PgWireBackendMessage::ErrorResponse(
-                                    ErrorInfo::new(
-                                        "FATAL".to_owned(),
-                                        "XX000".to_owned(),
-                                        e.to_string(),
-                                    )
+                match res {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        error!("connection failed: {e}");
+                        _ = back_tx
+                            .send(
+                                (
+                                    PgWireBackendMessage::ErrorResponse(
+                                        ErrorInfo::new(
+                                            "FATAL".to_owned(),
+                                            "XX000".to_owned(),
+                                            e.to_string(),
+                                        )
+                                        .into(),
+                                    ),
+                                    true,
+                                )
                                     .into(),
-                                ),
-                                true,
                             )
-                                .into(),
-                        )
-                        .await;
+                            .await;
+                    }
+                    Err(e) => {
+                        error!("spawn_blocking failed: {e}");
+                        _ = back_tx
+                            .send(
+                                (
+                                    PgWireBackendMessage::ErrorResponse(
+                                        ErrorInfo::new(
+                                            "FATAL".to_owned(),
+                                            "XX000".to_owned(),
+                                            e.to_string(),
+                                        )
+                                        .into(),
+                                    ),
+                                    true,
+                                )
+                                    .into(),
+                            )
+                            .await;
+                    }
                 }
 
                 Ok::<_, BoxError>(())
@@ -1703,15 +1918,15 @@ pub async fn start(
     Ok(PgServer { local_addr })
 }
 
-struct Session {
+struct Session<'conn> {
     agent: Agent,
+    conn: &'conn CrConn,
     tx_state: TxState,
 }
 
-impl Session {
+impl<'conn> Session<'conn> {
     fn handle_query(
         &mut self,
-        conn: &Connection,
         cmd: &ParsedCmd,
         back_tx: &Sender<BackendResponse>,
         send_row_desc: bool,
@@ -1744,14 +1959,14 @@ impl Session {
 
         // need to start an implicit transaction
         if self.tx_state.is_ended() && !cmd.is_begin() {
-            conn.execute_batch("BEGIN")?;
+            self.conn.execute_batch("BEGIN")?;
             trace!("started IMPLICIT tx");
             self.tx_state.start_implicit();
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
             trace!("committing IMPLICIT tx");
             let _permit = self.tx_state.end();
 
-            self.handle_commit(conn)?;
+            self.handle_commit()?;
             trace!("committed IMPLICIT tx");
         }
 
@@ -1760,22 +1975,22 @@ impl Session {
         let mut changes = 0usize;
 
         let count = if cmd.is_begin() {
-            conn.execute_batch("BEGIN")?;
+            self.conn.execute_batch("BEGIN")?;
             self.tx_state.start_explicit();
             0
         } else if cmd.is_commit() {
             let _permit = self.tx_state.end();
-            self.handle_commit(conn)?;
+            self.handle_commit()?;
             0
         } else if cmd.is_rollback() {
             let _permit = self.tx_state.end();
-            conn.execute_batch("ROLLBACK")?;
+            self.conn.execute_batch("ROLLBACK")?;
             0
         } else {
             let mut prepped = if cmd.is_pg() {
                 return Err(QueryError::NotSqlite);
             } else {
-                conn.prepare(&cmd.to_string())?
+                self.conn.prepare(&cmd.to_string())?
             };
 
             let fields = field_types(&prepped, cmd, FieldFormats::All(FieldFormat::Text))?;
@@ -1836,7 +2051,7 @@ impl Session {
             }
 
             if tag.returns_rows_affected() {
-                changes = conn.changes() as usize;
+                changes = self.conn.changes() as usize;
             }
 
             count
@@ -1864,9 +2079,8 @@ impl Session {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_execute<'conn>(
+    fn handle_execute(
         &mut self,
-        conn: &'conn Connection,
         prepped: &mut Statement<'conn>,
         result_formats: &[FieldFormat],
         cmd: &ParsedCmd,
@@ -1884,15 +2098,19 @@ impl Session {
         let mut opened_implicit_tx = false;
 
         if self.tx_state.is_ended() {
+            debug!("tx is_ended");
             if !cmd.is_begin() && !prepped.readonly() {
+                debug!("tx is_ended && !cmd.is_begin() && !prepped.readonly()");
                 // NOT in a tx and statement mutates DB...
-                conn.execute_batch("BEGIN")?;
+                self.conn.execute_batch("BEGIN")?;
 
                 self.tx_state.start_implicit();
                 opened_implicit_tx = true;
             } else if cmd.is_begin() {
-                conn.execute_batch("BEGIN")?;
+                debug!("cmd is BEGIN");
+                self.conn.execute_batch("BEGIN")?;
                 self.tx_state.start_explicit();
+                debug!("started EXPLICIT tx");
             }
         }
 
@@ -1903,7 +2121,10 @@ impl Session {
 
         if cmd.is_commit() {
             let _permit = self.tx_state.end();
-            self.handle_commit(conn)?;
+            self.handle_commit()?;
+        } else if cmd.is_begin() {
+            // do nothing
+            debug!("cmd is BEGIN");
         } else {
             if !self.tx_state.is_writing() && !prepped.readonly() {
                 trace!("statement writes, acquiring permit...");
@@ -2044,12 +2265,12 @@ impl Session {
             }
 
             if tag.returns_rows_affected() {
-                changes = conn.changes() as usize;
+                changes = self.conn.changes() as usize;
             }
 
             if opened_implicit_tx {
                 let _permit = self.tx_state.end();
-                self.handle_commit(conn)?;
+                self.handle_commit()?;
             }
         }
 
@@ -2071,7 +2292,7 @@ impl Session {
         Ok(())
     }
 
-    fn handle_commit(&self, conn: &Connection) -> Result<(), ChangeError> {
+    fn handle_commit(&self) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
 
         let mut book_writer = self
@@ -2081,8 +2302,9 @@ impl Session {
 
         let actor_id = self.agent.actor_id();
 
-        let insert_info = insert_local_changes(&self.agent, conn, &mut book_writer)?;
-        conn.execute_batch("COMMIT")
+        let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
+        self.conn
+            .execute_batch("COMMIT")
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),
@@ -2111,9 +2333,21 @@ impl Session {
     }
 }
 
+impl<'conn> Drop for Session<'conn> {
+    fn drop(&mut self) {
+        if !self.tx_state.is_ended() {
+            let _permit = self.tx_state.end();
+            if let Err(e) = self.conn.execute_batch("ROLLBACK") {
+                warn!("failed to rollback tx: {e}");
+            } else {
+                debug!("rolled back tx");
+            }
+        }
+    }
+}
+
 fn send_ready(
     session: &mut Session,
-    conn: &Connection,
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
@@ -2122,11 +2356,11 @@ fn send_ready(
         if discard_until_sync {
             // an error occured, rollback implicit tx!
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");
-            conn.execute_batch("ROLLBACK")?;
+            session.conn.execute_batch("ROLLBACK")?;
         } else {
             // no error, commit implicit tx
             warn!("receive Sync message, committing implicit tx");
-            session.handle_commit(conn)?;
+            session.handle_commit()?;
         }
 
         READY_STATUS_IDLE
@@ -2178,9 +2412,19 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
 
     fn try_from(value: QueryError) -> Result<Self, Self::Error> {
         Ok(PgWireBackendMessage::ErrorResponse(match value {
-            QueryError::Rusqlite(e) => {
-                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
-            }
+            QueryError::Rusqlite(e) => match &e {
+                rusqlite::Error::SqliteFailure(sqlite_error, _maybe_sqlite_message)
+                    if sqlite_error.extended_code == SQLITE_CONSTRAINT_UNIQUE =>
+                {
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        SqlState::UNIQUE_VIOLATION.code().into(),
+                        e.to_string(),
+                    )
+                    .into()
+                }
+                _ => ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into(),
+            },
             QueryError::Unsupported(e) => e.into(),
             e @ QueryError::NotSqlite => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
@@ -3131,20 +3375,32 @@ fn field_types(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        io::BufReader,
+        time::{Duration, Instant},
+    };
 
+    use camino::Utf8PathBuf;
     use chrono::{DateTime, Utc};
-    use corro_tests::launch_test_agent;
+    use corro_tests::{launch_test_agent, TestAgent};
+    use corro_types::{
+        config::PgTlsConfig,
+        tls::{generate_ca, generate_client_cert, generate_server_cert},
+    };
+    use rcgen::Certificate;
     use spawn::wait_for_all_pending_handles;
+    use tempfile::TempDir;
     use tokio_postgres::NoTls;
+    use tokio_postgres_rustls::MakeRustlsConnect;
     use tripwire::Tripwire;
 
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_pg() -> Result<(), BoxError> {
+    async fn setup_pg_test_server(
+        tripwire: Tripwire,
+        tls_config: Option<PgTlsConfig>,
+    ) -> Result<(TestAgent, PgServer), BoxError> {
         _ = tracing_subscriber::fmt::try_init();
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
         let tmpdir = tempfile::tempdir()?;
 
@@ -3170,16 +3426,26 @@ mod tests {
         )
         .await?;
 
-        let sema = ta.agent.write_sema().clone();
-
         let server = start(
             ta.agent.clone(),
             PgConfig {
                 bind_addr: "127.0.0.1:0".parse()?,
+                tls: tls_config,
             },
             tripwire,
         )
         .await?;
+
+        Ok((ta, server))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pg() -> Result<(), BoxError> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let (ta, server) = setup_pg_test_server(tripwire, None).await?;
+
+        let sema = ta.agent.write_sema().clone();
 
         let conn_str = format!(
             "host={} port={} user=testuser",
@@ -3349,4 +3615,285 @@ mod tests {
 
         Ok(())
     }
+
+    struct TestCertificates {
+        ca_cert: Certificate,
+        client_cert_signed: String,
+        client_key: Vec<u8>,
+        ca_file: Utf8PathBuf,
+        server_cert_file: Utf8PathBuf,
+        server_key_file: Utf8PathBuf,
+    }
+
+    async fn generate_and_write_certs(tmpdir: &TempDir) -> Result<TestCertificates, BoxError> {
+        let ca_cert = generate_ca()?;
+        let (server_cert, server_cert_signed) = generate_server_cert(
+            &ca_cert.serialize_pem()?,
+            &ca_cert.serialize_private_key_pem(),
+            "127.0.0.1".parse()?,
+        )?;
+
+        let (client_cert, client_cert_signed) = generate_client_cert(
+            &ca_cert.serialize_pem()?,
+            &ca_cert.serialize_private_key_pem(),
+        )?;
+
+        let base_path = Utf8PathBuf::from(tmpdir.path().display().to_string());
+
+        let cert_file = base_path.join("cert.pem");
+        let key_file = base_path.join("cert.key");
+        let ca_file = base_path.join("ca.pem");
+
+        let client_cert_file = base_path.join("client-cert.pem");
+        let client_key_file = base_path.join("client-cert.key");
+
+        tokio::fs::write(&cert_file, &server_cert_signed).await?;
+        tokio::fs::write(&key_file, server_cert.serialize_private_key_pem()).await?;
+
+        tokio::fs::write(&ca_file, ca_cert.serialize_pem()?).await?;
+
+        tokio::fs::write(&client_cert_file, &client_cert_signed).await?;
+        tokio::fs::write(&client_key_file, client_cert.serialize_private_key_pem()).await?;
+
+        Ok(TestCertificates {
+            server_cert_file: cert_file,
+            server_key_file: key_file,
+            ca_cert,
+            client_cert_signed: client_cert_signed,
+            client_key: client_cert.serialize_private_key_der(),
+            ca_file,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pg_ssl() -> Result<(), BoxError> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let tmpdir = TempDir::new()?;
+        let certs = generate_and_write_certs(&tmpdir).await?;
+
+        let (ta, server) = setup_pg_test_server(
+            tripwire,
+            Some(PgTlsConfig {
+                cert_file: certs.server_cert_file,
+                key_file: certs.server_key_file,
+                ca_file: None,
+                verify_client: false,
+            }),
+        )
+        .await?;
+
+        let sema = ta.agent.write_sema().clone();
+
+        let conn_str = format!(
+            "host={} port={} user=testuser",
+            server.local_addr.ip(),
+            server.local_addr.port()
+        );
+
+        {
+            let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
+            root_cert_store.add(&rustls::Certificate(certs.ca_cert.serialize_der()?))?;
+            let config = rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth();
+
+            let connector = MakeRustlsConnect::new(config);
+
+            println!("connecting to: {conn_str}");
+
+            let (client, client_conn) = tokio_postgres::connect(&conn_str, connector).await?;
+
+            tokio::spawn(client_conn);
+
+            let _permit = sema.acquire().await;
+
+            println!("before query");
+
+            client.simple_query("SELECT 1").await?;
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pg_mtls() -> Result<(), BoxError> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let tmpdir = TempDir::new()?;
+
+        let certs = generate_and_write_certs(&tmpdir).await?;
+
+        let (ta, server) = setup_pg_test_server(
+            tripwire,
+            Some(PgTlsConfig {
+                cert_file: certs.server_cert_file,
+                key_file: certs.server_key_file,
+                ca_file: Some(certs.ca_file),
+                verify_client: true,
+            }),
+        )
+        .await?;
+
+        let sema = ta.agent.write_sema().clone();
+
+        let conn_str = format!(
+            "host={} port={} user=testuser",
+            server.local_addr.ip(),
+            server.local_addr.port()
+        );
+
+        {
+            let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
+            root_cert_store.add(&rustls::Certificate(certs.ca_cert.serialize_der()?))?;
+
+            let client_cert =
+                rustls_pemfile::certs(&mut BufReader::new(certs.client_cert_signed.as_bytes()))
+                    .map_err(|e| format!("failed to read client cert: {e}"))?;
+
+            let client_cert: Vec<rustls::Certificate> = client_cert
+                .iter()
+                .map(|cert| rustls::Certificate(cert.clone()))
+                .collect();
+
+            let config = rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(root_cert_store.clone())
+                .with_client_auth_cert(client_cert, rustls::PrivateKey(certs.client_key))?;
+
+            let connector = MakeRustlsConnect::new(config);
+
+            println!("connecting to: {conn_str} with client auth cert");
+            let (client, client_conn) = tokio_postgres::connect(&conn_str, connector).await?;
+
+            tokio::spawn(client_conn);
+
+            println!("successfully connected!");
+
+            let _permit = sema.acquire().await;
+
+            client.simple_query("SELECT 1").await?;
+
+            let config = rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth();
+
+            let connector = MakeRustlsConnect::new(config);
+
+            println!("connecting to: {conn_str} without client auth cert");
+            let result = tokio_postgres::connect(&conn_str, connector).await;
+            assert!(
+                result.is_err(),
+                "expected connect to fail without client auth cert"
+            );
+
+            println!("successfully failed to connect without client auth cert");
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    // #[tokio::test(flavor = "multi_thread")]
+    // async fn test_write_permit_released_on_error() -> Result<(), BoxError> {
+    //     _ = tracing_subscriber::fmt::try_init();
+    //     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    //     let tmpdir = tempfile::tempdir()?;
+
+    //     // Create a test table that will help us verify transaction state
+    //     tokio::fs::write(
+    //         tmpdir.path().join("test.sql"),
+    //         "CREATE TABLE test (id INTEGER PRIMARY KEY NOT NULL, value TEXT);",
+    //     )
+    //     .await?;
+
+    //     let ta = launch_test_agent(
+    //         |builder| {
+    //             builder
+    //                 .add_schema_path(tmpdir.path().display().to_string())
+    //                 .build()
+    //         },
+    //         tripwire.clone(),
+    //     )
+    //     .await?;
+
+    //     let server = start(
+    //         ta.agent.clone(),
+    //         PgConfig {
+    //             bind_addr: "127.0.0.1:0".parse()?,
+    //         },
+    //         tripwire,
+    //     )
+    //     .await?;
+
+    //     let conn_str = format!(
+    //         "host={} port={} user=testuser",
+    //         server.local_addr.ip(),
+    //         server.local_addr.port()
+    //     );
+
+    //     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
+    //     tokio::spawn(connection);
+
+    //     println!("before begin");
+
+    //     // Start transaction
+    //     client.execute("BEGIN", &[]).await?;
+
+    //     println!("after begin");
+
+    //     // Insert valid data to acquire write permit
+    //     client
+    //         .execute("INSERT INTO test (id, value) VALUES (1, 'test')", &[])
+    //         .await?;
+
+    //     // Attempt an invalid insert that will error
+    //     let err = client
+    //         .execute("INSERT INTO test (id, value) VALUES (1, 'duplicate')", &[])
+    //         .await
+    //         .unwrap_err();
+    //     assert!(err.to_string().contains("UNIQUE constraint failed"));
+    //     println!("after error");
+
+    //     // Verify we can still query in failed transaction
+    //     let rows = client.query("SELECT 1", &[]).await.unwrap();
+    //     assert_eq!(
+    //         rows.len(),
+    //         1,
+    //         "Query should succeed but transaction should be marked as failed"
+    //     );
+
+    //     // Try another write - should fail since we're in failed transaction
+    //     let err = client
+    //         .execute("INSERT INTO test (id, value) VALUES (2, 'test2')", &[])
+    //         .await
+    //         .unwrap_err();
+    //     assert!(err.to_string().contains("current transaction is aborted"));
+
+    //     // Verify ROLLBACK works and clears the failed state
+    //     client.execute("ROLLBACK", &[]).await?;
+
+    //     // Verify we can start a new transaction
+    //     client.execute("BEGIN", &[]).await?;
+    //     client
+    //         .execute("INSERT INTO test (id, value) VALUES (2, 'test2')", &[])
+    //         .await?;
+    //     client.execute("COMMIT", &[]).await?;
+
+    //     // Cleanup
+    //     tripwire_tx.send(()).await.ok();
+    //     tripwire_worker.await;
+    //     wait_for_all_pending_handles().await;
+
+    //     Ok(())
+    // }
 }

@@ -27,7 +27,7 @@ use crate::{
     agent::process_multiple_changes,
     api::{
         peer::parallel_sync,
-        public::{api_v1_db_schema, api_v1_transactions},
+        public::{api_v1_db_schema, api_v1_transactions, TimeoutParams},
     },
     transport::Transport,
 };
@@ -35,18 +35,21 @@ use corro_tests::*;
 use corro_types::change::Change;
 use corro_types::{
     actor::ActorId,
+    agent::migrate,
     api::{row_to_change, ExecResponse, ExecResult, Statement},
-    base::{CrsqlDbVersion, CrsqlSeq},
+    base::{CrsqlDbVersion, CrsqlSeq, Version},
     broadcast::{ChangeSource, ChangeV1, Changeset},
     sync::generate_sync,
 };
 use corro_types::{
     agent::Agent,
     api::{ColumnName, TableName},
+    change::row_to_change,
     pubsub::pack_columns,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+
 async fn insert_rows_and_gossip() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -359,57 +362,61 @@ pub async fn configurable_stress_test(
         .unwrap()
     });
 
-    let actor_versions = tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
-        let addrs = addrs.clone();
-        let client = client.clone();
-        move |statements| {
+    let actor_versions = {
+        let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
+
+        tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
             let addrs = addrs.clone();
             let client = client.clone();
-            Ok(async move {
-                let mut rng = StdRng::from_entropy();
-                let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
+            move |statements| {
+                let addrs = addrs.clone();
+                let client = client.clone();
+                Ok(async move {
+                    let mut rng = StdRng::from_entropy();
+                    let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
 
-                let res = client
-                    .request(
-                        hyper::Request::builder()
-                            .method(hyper::Method::POST)
-                            .uri(format!("http://{chosen}/v1/transactions"))
-                            .header(hyper::header::CONTENT_TYPE, "application/json")
-                            .body(serde_json::to_vec(&statements)?.into())?,
-                    )
-                    .await?;
+                    let res = client
+                        .request(
+                            hyper::Request::builder()
+                                .method(hyper::Method::POST)
+                                .uri(format!("http://{chosen}/v1/transactions"))
+                                .header(hyper::header::CONTENT_TYPE, "application/json")
+                                .body(serde_json::to_vec(&statements)?.into())?,
+                        )
+                        .await?;
 
-                if res.status() != StatusCode::OK {
-                    eyre::bail!("unexpected status code: {}", res.status());
-                }
-
-                let body: ExecResponse =
-                    serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
-
-                for (i, statement) in statements.iter().enumerate() {
-                    if !matches!(
-                        body.results[i],
-                        ExecResult::Execute {
-                            rows_affected: 1,
-                            ..
-                        }
-                    ) {
-                        eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
+                    if res.status() != StatusCode::OK {
+                        eyre::bail!("unexpected status code: {}", res.status());
                     }
-                }
 
-                Ok::<_, eyre::Report>((*actor_id, 1))
-            })
-        }
-    })
-    .try_buffer_unordered(10)
-    .try_fold(BTreeMap::new(), |mut acc, item| {
-        {
-            *acc.entry(item.0).or_insert(0) += item.1
-        }
-        future::ready(Ok(acc))
-    })
-    .await?;
+                    let body: ExecResponse =
+                        serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+
+                    for (i, statement) in statements.iter().enumerate() {
+                        if !matches!(
+                            body.results[i],
+                            ExecResult::Execute {
+                                rows_affected: 1,
+                                ..
+                            }
+                        ) {
+                            eyre::bail!("unexpected exec result for statement {i}: {statement:?}");
+                        }
+                    }
+
+                    Ok::<_, eyre::Report>((*actor_id, 1))
+                })
+            }
+        })
+        .try_buffer_unordered(10)
+        .try_fold(BTreeMap::new(), |mut acc, item| {
+            {
+                *acc.entry(item.0).or_insert(0) += item.1
+            }
+            future::ready(Ok(acc))
+        })
+        .await?
+    };
 
     let changes_count: i64 = 4 * input_count as i64;
 
@@ -584,6 +591,7 @@ pub async fn configurable_stress_test(
         );
     }
 
+    println!("waiting for things to shut down");
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;
@@ -654,7 +662,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
     let ta4_transport = Transport::new(&ta4.agent.config().gossip, rtt_tx.clone()).await?;
 
     println!("starting sync!?");
-    for _ in 0..6 {
+    for _ in 0..7 {
         let res = parallel_sync(
             &ta2.agent,
             &ta2_transport,
@@ -691,7 +699,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         println!("ta4 synced {res}");
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -748,7 +756,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
     for (name, actor_id, count) in ta_counts {
         assert_eq!(
             count, expected_count,
-            "{name}: actor {actor_id} did not reach 10K rows",
+            "{name}: actor {actor_id} did not reach {expected_count} rows",
         );
     }
 
@@ -774,6 +782,8 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    let tx_timeout = Duration::from_secs(60);
 
     let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
     let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
@@ -801,7 +811,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         vec![(CrsqlDbVersion(1)..=CrsqlDbVersion(50), None)],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
 
     // overwrite different version ranges
     insert_rows(ta1.agent.clone(), 1, 5).await;
@@ -819,7 +829,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
@@ -892,6 +902,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
     for i in 1..=5_i64 {
         let (status_code, _) = api_v1_transactions(
             Extension(ta2.agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "INSERT OR REPLACE INTO tests (id,text) VALUES (?,?)".into(),
                 vec![i.into(), "service-text".into()],
@@ -947,7 +958,13 @@ async fn process_failed_changes() -> eyre::Result<()> {
 
     rows.append(&mut good_changes);
 
-    let res = process_multiple_changes(ta1.agent.clone(), ta1.bookie.clone(), rows).await;
+    let res = process_multiple_changes(
+        ta1.agent.clone(),
+        ta1.bookie.clone(),
+        rows,
+        Duration::from_secs(60),
+    )
+    .await;
 
     assert!(res.is_ok());
 
@@ -989,6 +1006,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let tx_timeout = Duration::from_secs(60);
 
     // setup the schema, for both nodes
     let (status_code, _body) = api_v1_db_schema(
@@ -1015,7 +1033,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         vec![(CrsqlDbVersion(1)..=CrsqlDbVersion(5), None)],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check ta2 bookie
     check_bookie_versions(
         ta2.clone(),
@@ -1033,7 +1051,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         vec![(CrsqlDbVersion(9)..=CrsqlDbVersion(10), None)],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows,tx_timeout).await?;
     // check for gap 6-8
     check_bookie_versions(
         ta2.clone(),
@@ -1059,7 +1077,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check for gap 11-14 and 17-19
     check_bookie_versions(
         ta2.clone(),
@@ -1089,7 +1107,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
 
     check_bookie_versions(
         ta2.clone(),
@@ -1118,7 +1136,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
@@ -1146,7 +1164,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
@@ -1311,6 +1329,7 @@ async fn insert_rows(agent: Agent, start: i64, n: i64) {
     for i in start..=n {
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
             axum::Json(vec![Statement::WithParams(
                 "INSERT OR REPLACE INTO tests3 (id,text,text2, num, num2) VALUES (?,?,?,?,?)"
                     .into(),

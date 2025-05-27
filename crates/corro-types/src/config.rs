@@ -135,6 +135,17 @@ pub struct ApiConfig {
 pub struct PgConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
+    pub tls: Option<PgTlsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PgTlsConfig {
+    pub cert_file: Utf8PathBuf,
+    pub key_file: Utf8PathBuf,
+    #[serde(default)]
+    pub ca_file: Option<Utf8PathBuf>,
+    #[serde(default)]
+    pub verify_client: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +204,8 @@ pub struct PerfConfig {
     pub wal_threshold_gb: usize,
     #[serde(default = "default_processing_queue")]
     pub processing_queue_len: usize,
+    #[serde(default = "default_sql_tx_timeout")]
+    pub sql_tx_timeout: usize,
 }
 
 impl Default for PerfConfig {
@@ -211,6 +224,7 @@ impl Default for PerfConfig {
             apply_queue_len: default_apply_queue(),
             wal_threshold_gb: default_wal_threshold(),
             processing_queue_len: default_processing_queue(),
+            sql_tx_timeout: default_sql_tx_timeout(),
         }
     }
 }
@@ -323,6 +337,10 @@ const fn default_small_channel() -> usize {
 
 const fn default_apply_timeout() -> usize {
     50
+}
+
+const fn default_sql_tx_timeout() -> usize {
+    60
 }
 
 #[derive(Debug, Default)]

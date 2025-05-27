@@ -1,8 +1,9 @@
 use std::{net::SocketAddr, time::Duration};
 
+use antithesis_sdk::prelude::*;
 use build_info::VersionControl;
 use camino::Utf8PathBuf;
-use corro_admin::AdminConfig;
+use corro_admin::{AdminConfig, TracingHandle};
 use corro_types::config::{Config, PrometheusConfig};
 use metrics::gauge;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
@@ -10,10 +11,16 @@ use metrics_util::MetricKindMask;
 use spawn::wait_for_all_pending_handles;
 use tokio_metrics::RuntimeMonitor;
 use tracing::{error, info};
+// use tracing_filter::{legacy::Filter, FilterLayer};
+// use tracing_subscriber::{reload::Handle, Registry};
 
 use crate::VERSION;
 
-pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> {
+pub async fn run(
+    config: Config,
+    config_path: &Utf8PathBuf,
+    tracing_handle: Option<TracingHandle>,
+) -> eyre::Result<()> {
     info!("Starting Corrosion Agent v{VERSION}");
 
     if let Some(PrometheusConfig { bind_addr }) = config.telemetry.prometheus {
@@ -66,6 +73,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
             listen_path: config.admin.uds_path.clone(),
             config_path: config_path.clone(),
         },
+        tracing_handle,
         tripwire,
     )?;
 
@@ -87,6 +95,7 @@ pub async fn run(config: Config, config_path: &Utf8PathBuf) -> eyre::Result<()> 
         }
     }
 
+    antithesis_init();
     tripwire_worker.await;
 
     wait_for_all_pending_handles().await;

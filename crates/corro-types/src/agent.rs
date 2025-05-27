@@ -1,7 +1,9 @@
 use std::{
     cmp,
     collections::{btree_map, BTreeMap, HashMap, HashSet},
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
     path::{Path, PathBuf},
@@ -12,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use antithesis_sdk::assert_always;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
@@ -21,20 +24,23 @@ use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{
-    AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
-    RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
-    RwLockWriteGuard as TokioRwLockWriteGuard,
-};
+use serde_json::json;
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
+};
+use tokio::{
+    sync::{
+        AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
+        RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
+        RwLockWriteGuard as TokioRwLockWriteGuard,
+    },
+    time::timeout,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
-use crate::updates::UpdatesManager;
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     base::{CrsqlDbVersion, CrsqlSeq},
@@ -47,6 +53,7 @@ use crate::{
         rusqlite_to_crsqlite, rusqlite_to_crsqlite_write, setup_conn, CrConn, Migration,
         SqlitePool, SqlitePoolError,
     },
+    updates::UpdatesManager,
 };
 
 use super::members::Members;
@@ -550,9 +557,9 @@ struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
 
-    priority_tx: CorroSender<oneshot::Sender<CancellationToken>>,
-    normal_tx: CorroSender<oneshot::Sender<CancellationToken>>,
-    low_tx: CorroSender<oneshot::Sender<CancellationToken>>,
+    priority_tx: CorroSender<oneshot::Sender<DropGuard>>,
+    normal_tx: CorroSender<oneshot::Sender<DropGuard>>,
+    low_tx: CorroSender<oneshot::Sender<DropGuard>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -565,6 +572,8 @@ pub enum PoolError {
     CallbackClosed,
     #[error("could not acquire write permit")]
     Permit(#[from] AcquireError),
+    #[error("timed out acquiring write permit while {op:?}")]
+    TimedOut { op: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -669,15 +678,15 @@ impl SplitPool {
 
         tokio::spawn(async move {
             loop {
-                let tx: oneshot::Sender<CancellationToken> = tokio::select! {
+                let (tx, channel) = tokio::select! {
                     biased;
 
-                    Some(tx) = priority_rx.recv() => tx,
-                    Some(tx) = normal_rx.recv() => tx,
-                    Some(tx) = low_rx.recv() => tx,
+                    Some(tx) = priority_rx.recv() => (tx, "priority"),
+                    Some(tx) = normal_rx.recv() => (tx, "normal"),
+                    Some(tx) = low_rx.recv() => (tx, "low"),
                 };
 
-                wait_conn_drop(tx).await
+                wait_conn_drop(tx, channel).await
             }
         });
 
@@ -702,6 +711,9 @@ impl SplitPool {
         gauge!("corro.sqlite.pool.write.connections").set(write_state.size as f64);
         gauge!("corro.sqlite.pool.write.connections.available").set(write_state.available as f64);
         gauge!("corro.sqlite.pool.write.connections.waiting").set(write_state.waiting as f64);
+
+        let available_permit = self.0.write_sema.available_permits();
+        gauge!("corro.sqlite.write.permits.available").set(available_permit as f64);
     }
 
     // get a read-only connection
@@ -752,39 +764,89 @@ impl SplitPool {
 
     async fn write_inner(
         &self,
-        chan: &CorroSender<oneshot::Sender<CancellationToken>>,
+        chan: &CorroSender<oneshot::Sender<DropGuard>>,
         queue: &'static str,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
-        chan.send(tx).await.map_err(|_| PoolError::QueueClosed)?;
-        let start = Instant::now();
-        let token = rx.await.map_err(|_| PoolError::CallbackClosed)?;
-        histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
-            .record(start.elapsed().as_secs_f64());
-        let conn = self.0.write.get().await?;
+        let max_timeout = Duration::from_secs(5 * 60);
+
+        timeout_fut("tx to oneshot channel", max_timeout, chan.send(tx))
+            .await?
+            .map_err(|_| PoolError::QueueClosed)?;
 
         let start = Instant::now();
-        let _permit = self.0.write_sema.clone().acquire_owned().await?;
+
+        let _drop_guard = timeout_fut("rx from oneshot channel", max_timeout, rx)
+            .await?
+            .map_err(|_| PoolError::CallbackClosed)?;
+
+        histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
+            .record(start.elapsed().as_secs_f64());
+        let conn = timeout_fut("acquiring write conn", max_timeout, self.0.write.get()).await??;
+
+        let start = Instant::now();
+        let _permit = timeout_fut(
+            "acquiring write semaphore",
+            max_timeout,
+            self.0.write_sema.clone().acquire_owned(),
+        )
+        .await??;
+
         histogram!("corro.sqlite.write_permit.acquisition.seconds")
             .record(start.elapsed().as_secs_f64());
 
         Ok(WriteConn {
             conn,
-            _drop_guard: token.drop_guard(),
+            _drop_guard,
             _permit,
         })
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>) {
+async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str) {
     let cancel = CancellationToken::new();
 
-    if let Err(_e) = tx.send(cancel.clone()) {
+    if let Err(_e) = tx.send(cancel.clone().drop_guard()) {
         error!("could not send back drop guard for pooled conn, oneshot channel likely closed");
         return;
     }
 
-    cancel.cancelled().await
+    let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
+    // skip first tick
+    interval.tick().await;
+    let start = Instant::now();
+
+    loop {
+        let details = json!({
+            "channel": channel,
+            "elapsed": start.elapsed().as_secs_f64()
+        });
+        assert_always!(
+            start.elapsed() < Duration::from_secs(5 * 60),
+            "wait_conn_drop has been running for too long",
+            &details
+        );
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                break;
+            }
+            _ = interval.tick() => {
+                let elapsed = start.elapsed();
+                warn!("wait_conn_drop has been running since {elapsed:?}, token_is_cancelled - {:?}, channel - {channel}", cancel.is_cancelled());
+                continue;
+            }
+        }
+    }
+}
+
+async fn timeout_fut<T, F>(op: &'static str, duration: Duration, fut: F) -> Result<T, PoolError>
+where
+    F: Future<Output = T>,
+{
+    timeout(duration, fut)
+        .await
+        .map_err(|_| PoolError::TimedOut { op: op.to_string() })
 }
 
 pub struct WriteConn {
@@ -806,7 +868,6 @@ impl DerefMut for WriteConn {
         &mut self.conn
     }
 }
-
 pub struct CountedTokioRwLock<T> {
     registry: LockRegistry,
     lock: Arc<TokioRwLock<T>>,
@@ -1239,7 +1300,8 @@ impl VersionsSnapshot {
             if count != 1 {
                 warn!(actor_id = %self.actor_id, "did not delete gap from db: {range:?}");
             }
-            debug_assert_eq!(count, 1, "ineffective deletion of gaps in-db: {range:?}");
+            let details = json!({"count": count, "range": range});
+            assert_always!(count == 1, "ineffective deletion of gaps in-db", &details);
             for version in range.clone() {
                 self.partials.remove(&version);
             }

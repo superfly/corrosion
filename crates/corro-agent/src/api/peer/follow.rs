@@ -175,7 +175,7 @@ pub async fn serve_follow(
             let bk_rows = bk_prepped.query_map(params_from_iter(query_params), map)?;
 
             for bk_res in bk_rows {
-                let (actor_id, version, db_version, last_seq, ts): (
+                let (actor_id, _version, db_version, last_seq, ts): (
                     ActorId,
                     CrsqlDbVersion,
                     CrsqlDbVersion,

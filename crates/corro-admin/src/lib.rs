@@ -34,6 +34,8 @@ use tokio::{
 use tokio_serde::{formats::Json, Framed};
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, info, warn};
+use tracing_filter::{legacy::Filter, FilterLayer};
+use tracing_subscriber::{reload::Handle as ReloadHandle, Registry};
 use tripwire::Tripwire;
 use uuid::Uuid;
 
@@ -49,11 +51,14 @@ pub struct AdminConfig {
     pub config_path: Utf8PathBuf,
 }
 
+pub type TracingHandle = ReloadHandle<FilterLayer<Filter>, Registry>;
+
 pub fn start_server(
     agent: Agent,
     bookie: Bookie,
     transport: Transport,
     config: AdminConfig,
+    tracing_handle: Option<TracingHandle>,
     mut tripwire: Tripwire,
 ) -> Result<(), AdminError> {
     _ = std::fs::remove_file(&config.listen_path);
@@ -87,8 +92,11 @@ pub fn start_server(
                 let bookie = bookie.clone();
                 let config = config.clone();
                 let transport = transport.clone();
+                let tracing_handle = tracing_handle.clone();
                 async move {
-                    if let Err(e) = handle_conn(agent, &bookie, &transport, config, stream).await {
+                    if let Err(e) =
+                        handle_conn(agent, &bookie,  &transport, config, stream, tracing_handle).await
+                    {
                         error!("could not handle admin connection: {e}");
                     }
                 }
@@ -109,6 +117,7 @@ pub enum Command {
     Actor(ActorCommand),
     Subs(SubsCommand),
     Debug(DebugCommand),
+    Log(LogCommand),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +142,12 @@ pub enum SubsCommand {
         id: Option<Uuid>,
     },
     List,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LogCommand {
+    Set { filter: String },
+    Reset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +234,7 @@ async fn handle_conn(
     transport: &Transport,
     _config: AdminConfig,
     stream: UnixStream,
+    tracing_handle: Option<TracingHandle>,
 ) -> Result<(), AdminError> {
     // wrap in stream in line delimited json decoder
     let mut stream: FramedStream = tokio_serde::Framed::new(
@@ -623,6 +639,59 @@ async fn handle_conn(
                         )
                         .await;
                         continue;
+                    }
+                }
+                Command::Log(cmd) => match cmd {
+                    LogCommand::Set { filter } => {
+                        if let Some(ref handle) = tracing_handle {
+                            let (filter, diags) = tracing_filter::legacy::Filter::parse(&filter);
+                            if let Some(diags) = diags {
+                                send_error(
+                                    &mut stream,
+                                    format!("While parsing env filters: {diags}, using default"),
+                                )
+                                .await;
+                            }
+                            if let Err(e) = handle.reload(filter.layer()) {
+                                send_error(
+                                    &mut stream,
+                                    format!("could not reload tracing handle: {e}"),
+                                )
+                                .await;
+                            }
+
+                            info_log(&mut stream, format!("reloaded tracing handle")).await;
+                            send_success(&mut stream).await;
+                        }
+                    }
+                    LogCommand::Reset => {
+                        if let Some(ref handle) = tracing_handle {
+                            let directives: String =
+                                std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+                            let (filter, diags) =
+                                tracing_filter::legacy::Filter::parse(&directives);
+                            if let Some(diags) = diags {
+                                send_error(
+                                    &mut stream,
+                                    format!("While parsing env filters: {diags}, using default"),
+                                )
+                                .await;
+                            }
+
+                            match handle.reload(filter.layer()) {
+                                Ok(_) => {
+                                    info_log(&mut stream, format!("reloaded tracing handle")).await;
+                                    send_success(&mut stream).await;
+                                }
+                                Err(e) => {
+                                    send_error(
+                                        &mut stream,
+                                        format!("could not reload tracing handle: {e}"),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                     }
                 },
             },

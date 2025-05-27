@@ -1140,7 +1140,7 @@ impl Matcher {
                     }
                 },
                 _ = &mut tripwire => {
-                    trace!(sub_id = %self.id, "tripped cmd_loop, returning");
+                    info!(sub_id = %self.id, "tripped cmd_loop, returning");
                     // just return!
                     return;
                 }
@@ -2454,7 +2454,6 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use camino::Utf8PathBuf;
-    use corro_api_types::row_to_change;
     use rusqlite::params;
     use spawn::wait_for_all_pending_handles;
     use tokio::sync::Semaphore;
@@ -2462,6 +2461,7 @@ mod tests {
     use crate::{
         actor::ActorId,
         agent::migrate,
+        change::row_to_change,
         schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
     };

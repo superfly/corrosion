@@ -50,7 +50,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         rx_apply,
         rx_clear_buf,
         rx_changes,
-        rx_emptyset,
+        rx_emptyset: _,
         rx_foca,
         subs_manager,
         subs_bcast_cache,
@@ -92,7 +92,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     //// Update member connection RTTs
     handlers::spawn_rtt_handler(&agent, rtt_rx);
 
-    handlers::spawn_swim_announcer(&agent, gossip_addr);
+    handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());
 
     // Load existing cluster members into the SWIM runtime
     util::initialise_foca(&agent).await;
@@ -107,12 +107,6 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         api_listeners,
     )
     .await?;
-
-    // spawn_counted(util::write_empties_loop(
-    //     agent.clone(),
-    //     rx_empty,
-    //     tripwire.clone(),
-    // ));
 
     tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
 
@@ -137,8 +131,13 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     let start = Instant::now();
     {
         let conn = agent.pool().read().await?;
+        // check __corro_seq_bookkeeping for any actor ids that we only have partial changes for.
         let actor_ids: Vec<ActorId> = conn
-            .prepare("SELECT site_id FROM crsql_site_id WHERE ordinal > 0")?
+            .prepare(
+                "SELECT site_id FROM crsql_site_id WHERE ordinal > 0
+                        UNION
+                    SELECT distinct site_id FROM __corro_seq_bookkeeping",
+            )?
             .query_map([], |row| row.get(0))
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
 
@@ -205,12 +204,15 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         .inspect(|_| info!("corrosion agent sync loop is done")),
     );
 
-    spawn_counted(util::apply_fully_buffered_changes_loop(
-        agent.clone(),
-        bookie.clone(),
-        rx_apply,
-        tripwire.clone(),
-    ));
+    spawn_counted(
+        util::apply_fully_buffered_changes_loop(
+            agent.clone(),
+            bookie.clone(),
+            rx_apply,
+            tripwire.clone(),
+        )
+        .inspect(|_| info!("corrosion buffered changes loop is done")),
+    );
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
@@ -218,12 +220,10 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     //// future tree spawns additional message type sub-handlers
     handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
 
-    spawn_counted(handlers::handle_changes(
-        agent.clone(),
-        bookie.clone(),
-        rx_changes,
-        tripwire.clone(),
-    ));
+    spawn_counted(
+        handlers::handle_changes(agent.clone(), bookie.clone(), rx_changes, tripwire.clone())
+            .inspect(|_| info!("corrosion handle changes loop is done")),
+    );
 
     // spawn_counted(handlers::handle_emptyset(
     //     agent.clone(),

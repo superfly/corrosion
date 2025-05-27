@@ -1,8 +1,10 @@
 use std::{iter::Peekable, ops::RangeInclusive};
 
-pub use corro_api_types::{row_to_change, Change, SqliteValue};
-use corro_base_types::CrsqlDbVersion;
+use antithesis_sdk::assert_always;
+pub use corro_api_types::{row_to_change, Change, SqliteValue, TableName};
+use corro_base_types::{CrsqlDbVersion};
 use rusqlite::{Connection, OptionalExtension};
+use serde_json::json;
 use tracing::trace;
 
 use crate::{
@@ -60,7 +62,12 @@ where
             return None;
         }
 
-        debug_assert!(self.changes.is_empty());
+        let details = json!({});
+        assert_always!(
+            self.changes.is_empty(),
+            "iterator for ChunkedChanges still has changes when next() is called",
+            &details
+        );
 
         // reset the buffered size
         self.buffered_size = 0;

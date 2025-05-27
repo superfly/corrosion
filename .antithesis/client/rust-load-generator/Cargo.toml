@@ -1,0 +1,20 @@
+[package]
+name = "rust-load-generator"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
+antithesis_sdk = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+hickory-resolver = { workspace = true }
+futures = { workspace = true }
+tripwire = { path = "../../../crates/tripwire" }
+corro-client = { path = "../../../crates/corro-client" }
+corro-api-types = { path = "../../../crates/corro-api-types" }
+eyre.workspace = true
+tokio.workspace = true
