@@ -748,7 +748,10 @@ impl SplitPool {
         info!("waiting for token from oneshot channel for uuid - {uuid:?}");
 
         let token = timeout_fut("rx from oneshot channel", max_timeout, rx, uuid)
-            .await?
+            .await.map_err(|e| {
+                error!("could not receive token from oneshot channel for uuid - {uuid:?}, error - {e:?}");
+                e
+            })?.
             .map_err(|_| {
                 error!("could not receive token from oneshot channel for uuid - {uuid:?}");
                 PoolError::CallbackClosed
@@ -794,6 +797,7 @@ async fn wait_conn_drop(tx: oneshot::Sender<CancellationToken>, channel: &'stati
         return;
     }
 
+    info!("sent back drop guard for pooled conn, uuid - {uuid:?}");
     let mut interval = tokio::time::interval(Duration::from_secs(3 * 60));
     // skip first tick
     interval.tick().await;
