@@ -5,11 +5,11 @@
   inputs = {
     ## The fenix flake gives us access to nightly rust toolchains
     fenix = {
-      url = "github:nix-community/fenix";
+      url = "github:nix-community/fenix?rev=1c050d9008ff9e934f8bb5298c902259ea2cb3f7";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    nixpkgs.url = "nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    nixpkgs.url = "nixpkgs/nixos-25.05";
+    flake-utils.url = "github:numtide/flake-utils?rev=11707dc2f618dd54ca8739b309ec4fc024de578b";
   };
 
   ## Specify flake environment outputs
