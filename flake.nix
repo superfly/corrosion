@@ -53,6 +53,19 @@
             mdbook serve
           '';
         };
+
+        # Run using `nix develop`. This devShell sets up the same dependencies and toolchain used in package.default
+        devShells.default = pkgs.mkShell {
+          name = "test-shell";
+          nativeBuildInputs = with pkgs; [
+            clang
+            mold
+            toolchain
+            pkg-config
+          ];
+
+          RUST_BACKTRACE = 1;
+        };
         ## Here we declare the only flake output to be a nix build
         ## of the corrosion crate tree
         packages.default = rust.buildRustPackage {
