@@ -64,6 +64,11 @@
             pkg-config
           ];
 
+          # Keep shell hook from packages.default
+          shellHook = ''
+            ulimit -n 65536
+          '';
+
           RUST_BACKTRACE = 1;
         };
         ## Here we declare the only flake output to be a nix build
