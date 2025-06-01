@@ -2,7 +2,7 @@ use std::{iter::Peekable, ops::RangeInclusive};
 
 use antithesis_sdk::assert_always;
 pub use corro_api_types::{row_to_change, Change, SqliteValue, TableName};
-use corro_base_types::{CrsqlDbVersion};
+use corro_base_types::CrsqlDbVersion;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 use tracing::trace;

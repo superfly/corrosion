@@ -32,20 +32,15 @@ use crate::{
     transport::Transport,
 };
 use corro_tests::*;
-use corro_types::change::Change;
 use corro_types::{
     actor::ActorId,
-    agent::migrate,
-    api::{row_to_change, ExecResponse, ExecResult, Statement},
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
+    agent::{migrate, Agent},
+    api::{row_to_change, ColumnName, ExecResponse, ExecResult, Statement, TableName},
+    base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{ChangeSource, ChangeV1, Changeset},
-    sync::generate_sync,
-};
-use corro_types::{
-    agent::Agent,
-    api::{ColumnName, TableName},
-    change::row_to_change,
+    change::Change,
     pubsub::pack_columns,
+    sync::generate_sync,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1051,7 +1046,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         vec![(CrsqlDbVersion(9)..=CrsqlDbVersion(10), None)],
     )
     .await?;
-    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows,tx_timeout).await?;
+    process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check for gap 6-8
     check_bookie_versions(
         ta2.clone(),

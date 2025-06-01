@@ -1132,7 +1132,7 @@ mod tests {
         let bcast = BroadcastV1::Change(ChangeV1 {
             actor_id: ta1.agent.actor_id(),
             changeset: Changeset::Full {
-                version: Version(0),
+                version: CrsqlDbVersion(0),
                 changes: vec![],
                 seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                 last_seq: CrsqlSeq(0),
@@ -1187,10 +1187,7 @@ mod tests {
                 let changes = tokio::time::timeout(Duration::from_secs(5), rx_changes.recv())
                     .await?
                     .unwrap();
-                assert_eq!(
-                    changes.0.versions(),
-                    CrsqlDbVersion(i)..=CrsqlDbVersion(i)
-                );
+                assert_eq!(changes.0.versions(), CrsqlDbVersion(i)..=CrsqlDbVersion(i));
             }
         }
 

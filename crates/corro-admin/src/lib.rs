@@ -95,7 +95,8 @@ pub fn start_server(
                 let tracing_handle = tracing_handle.clone();
                 async move {
                     if let Err(e) =
-                        handle_conn(agent, &bookie,  &transport, config, stream, tracing_handle).await
+                        handle_conn(agent, &bookie, &transport, config, stream, tracing_handle)
+                            .await
                     {
                         error!("could not handle admin connection: {e}");
                     }
@@ -640,7 +641,7 @@ async fn handle_conn(
                         .await;
                         continue;
                     }
-                }
+                },
                 Command::Log(cmd) => match cmd {
                     LogCommand::Set { filter } => {
                         if let Some(ref handle) = tracing_handle {

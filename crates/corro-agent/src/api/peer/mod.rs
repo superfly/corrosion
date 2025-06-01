@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::{BufMut, BytesMut};
 use corro_types::actor::ClusterId;
 use corro_types::agent::{Agent, SplitPool};
-use corro_types::base::{CrsqlSeq, CrsqlDbVersion};
+use corro_types::base::{CrsqlDbVersion, CrsqlSeq};
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
@@ -429,7 +429,7 @@ fn handle_need(
                             ORDER BY seq ASC
                     "#,
                 )?;
-                
+
                 let rows = prepped.query_map(
                     named_params! {
                         ":actor_id": actor_id,
@@ -1721,10 +1721,7 @@ mod tests {
             let changes = tokio::time::timeout(Duration::from_secs(5), ta2_opts.rx_changes.recv())
                 .await?
                 .unwrap();
-            assert_eq!(
-                changes.0.versions(),
-                CrsqlDbVersion(i)..=CrsqlDbVersion(i)
-            );
+            assert_eq!(changes.0.versions(), CrsqlDbVersion(i)..=CrsqlDbVersion(i));
         }
 
         Ok(())
@@ -1980,10 +1977,7 @@ mod tests {
             {
                 assert_eq!(actor_id, actor);
                 assert!(changeset.is_empty());
-                assert_eq!(
-                    changeset.versions(),
-                    CrsqlDbVersion(1)..=CrsqlDbVersion(1)
-                );
+                assert_eq!(changeset.versions(), CrsqlDbVersion(1)..=CrsqlDbVersion(1));
             } else {
                 panic!("{msg:?} doesn't contain an empty changeset");
             }
@@ -2043,10 +2037,7 @@ mod tests {
             {
                 assert_eq!(actor_id, actor);
                 assert!(changeset.is_empty());
-                assert_eq!(
-                    changeset.versions(),
-                    CrsqlDbVersion(1)..=CrsqlDbVersion(1)
-                );
+                assert_eq!(changeset.versions(), CrsqlDbVersion(1)..=CrsqlDbVersion(1));
             } else {
                 panic!("{msg:?} doesn't contain an empty changeset");
             }
@@ -2227,10 +2218,7 @@ mod tests {
             {
                 assert_eq!(actor_id, actor);
                 assert!(changeset.is_empty());
-                assert_eq!(
-                    changeset.versions(),
-                    CrsqlDbVersion(1)..=CrsqlDbVersion(2)
-                );
+                assert_eq!(changeset.versions(), CrsqlDbVersion(1)..=CrsqlDbVersion(2));
             } else {
                 panic!("{msg:?} doesn't contain an empty changeset");
             }

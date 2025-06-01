@@ -11,7 +11,7 @@ use compact_str::CompactString;
 use corro_base_types::{CrsqlDbVersion, CrsqlSeq};
 use rusqlite::{
     types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
-    ToSql, Row,
+    Row, ToSql,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;

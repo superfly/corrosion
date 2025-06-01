@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::{
     actor::ActorId,
     agent::{Booked, Bookie},
-    base::{CrsqlSeq, CrsqlDbVersion},
+    base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{ChangeV1, Timestamp},
 };
 

@@ -1,7 +1,7 @@
+use crate::actor::ActorId;
 use crate::agent::SplitPool;
 use crate::pubsub::{unpack_columns, MatchCandidates, MatchableChange, MatcherError};
 use crate::schema::Schema;
-use crate::actor::ActorId;
 use async_trait::async_trait;
 use corro_api_types::sqlite::ChangeType;
 use corro_api_types::{Change, ColumnName, NotifyEvent, SqliteValueRef, TableName};

@@ -1811,7 +1811,7 @@ mod tests {
             &mut all,
             range_inclusive_set![
                 CrsqlDbVersion(1)..=CrsqlDbVersion(1),
-                    CrsqlDbVersion(4)..=CrsqlDbVersion(4)
+                CrsqlDbVersion(4)..=CrsqlDbVersion(4)
             ],
         )?;
         expect_gaps(
@@ -1973,7 +1973,7 @@ mod tests {
             &conn,
             &mut bv,
             &mut all,
-                range_inclusive_set![CrsqlDbVersion(1)..=CrsqlDbVersion(20)],
+            range_inclusive_set![CrsqlDbVersion(1)..=CrsqlDbVersion(20)],
         )?;
         expect_gaps(
             &conn,

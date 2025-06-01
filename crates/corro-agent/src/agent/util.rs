@@ -867,7 +867,7 @@ pub async fn process_multiple_changes(
             warn!("process_multiple_changes:: process_single_version took too long - {elapsed:?}");
         }
 
-        let sub_start = Instant::now();    
+        let sub_start = Instant::now();
         let mut snapshots = BTreeMap::new();
 
         for (actor_id, processed) in processed.iter() {

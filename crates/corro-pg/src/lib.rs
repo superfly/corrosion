@@ -2324,9 +2324,7 @@ impl<'conn> Session<'conn> {
 
             let agent = self.agent.clone();
 
-            spawn_counted(async move {
-                broadcast_changes(agent, db_version, last_seq, ts).await
-            });
+            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
         }
 
         Ok(())

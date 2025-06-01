@@ -1081,6 +1081,7 @@ mod tests {
     use axum::{http::StatusCode, Extension, Json};
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{Change, ColumnName, TableName};
+    use corro_types::broadcast::Changeset;
     use corro_types::{base::CrsqlDbVersion, config::Config, pubsub::pack_columns};
     use rusqlite::Connection;
     use std::sync::Arc;
