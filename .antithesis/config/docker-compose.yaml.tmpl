@@ -13,6 +13,8 @@ services:
     image: corrosion:$SHORT_COMMIT
     volumes: 
       - ./volumes/corrosion1:/var/lib/corrosion
+    environment:
+    - RUST_LOG=debug
 
   corrosion2:
     container_name: corrosion2
@@ -20,6 +22,8 @@ services:
     image: corrosion:$SHORT_COMMIT
     volumes: 
       - ./volumes/corrosion2:/var/lib/corrosion
+    environment:
+    - RUST_LOG=debug
 
   corrosion3:
     container_name: corrosion3
@@ -27,6 +31,8 @@ services:
     image: corrosion:$SHORT_COMMIT
     volumes: 
       - ./volumes/corrosion3:/var/lib/corrosion
+    environment:
+    - RUST_LOG=debug
 
   corro-client:
     container_name: corro-client
