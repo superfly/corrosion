@@ -173,13 +173,13 @@ pub fn insert_local_changes(
     }
 
     let version_max_seq: Option<CrsqlSeq> = tx
-        .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?;")
+        .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE site_id = ? AND db_version = ?;")
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
             version: None,
         })?
-        .query_row([db_version], |row| row.get(0))
+        .query_row((agent.actor_id(), db_version), |row| row.get(0))
         .optional()
         .map_err(|source| ChangeError::Rusqlite {
             source,
