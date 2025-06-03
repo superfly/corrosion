@@ -34,7 +34,7 @@ use crate::{
 use corro_tests::*;
 use corro_types::{
     actor::ActorId,
-    agent::{migrate, Agent},
+    agent::Agent,
     api::{row_to_change, ColumnName, ExecResponse, ExecResult, Statement, TableName},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{ChangeSource, ChangeV1, Changeset},

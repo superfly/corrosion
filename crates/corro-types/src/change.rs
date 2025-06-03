@@ -144,8 +144,10 @@ pub fn insert_local_changes(
     let actor_id = agent.actor_id();
     let ts = Timestamp::from(agent.clock().new_timestamp());
 
+    let last_db_version = book_writer.last();
+
     let db_version: CrsqlDbVersion = tx
-        .prepare_cached("SELECT crsql_next_db_version()")
+        .prepare_cached("SELECT crsql_peek_next_db_version()")
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
@@ -157,6 +159,18 @@ pub fn insert_local_changes(
             actor_id: Some(actor_id),
             version: None,
         })?;
+
+    let details = json!({
+        "last_db_version": last_db_version,
+        "db_version": db_version,
+    });
+    if let Some(last_dbv) = last_db_version {
+        assert_always!(
+            last_dbv + 1 == db_version,
+            "next_db_version is one more than db_version",
+            &details
+        );
+    }
 
     let version_max_seq: Option<CrsqlSeq> = tx
         .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE db_version = ?;")
