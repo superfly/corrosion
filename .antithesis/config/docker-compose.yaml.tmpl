@@ -14,7 +14,7 @@ services:
     volumes: 
       - ./volumes/corrosion1:/var/lib/corrosion
     environment:
-    - RUST_LOG=debug
+    - RUST_LOG=corro=debug
 
   corrosion2:
     container_name: corrosion2
@@ -23,7 +23,7 @@ services:
     volumes: 
       - ./volumes/corrosion2:/var/lib/corrosion
     environment:
-    - RUST_LOG=debug
+    - RUST_LOG=corro=debug
 
   corrosion3:
     container_name: corrosion3
@@ -32,7 +32,7 @@ services:
     volumes: 
       - ./volumes/corrosion3:/var/lib/corrosion
     environment:
-    - RUST_LOG=debug
+    - RUST_LOG=corro=debug
 
   corro-client:
     container_name: corro-client
