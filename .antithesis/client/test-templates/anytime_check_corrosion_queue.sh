@@ -39,7 +39,7 @@ for i in {1..40}; do
         echo "[+] All queues are consistently ok"
         exit 0
     fi
-    
+
     sleep 60
 done
 

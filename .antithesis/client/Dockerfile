@@ -20,4 +20,6 @@ COPY .antithesis/client/test-templates/check_bookkeeping.py /opt/antithesis/py-r
 
 COPY .antithesis/client/entrypoint.sh /entrypoint.sh
 
+RUN rm /opt/antithesis/test/v1/basic_test/parallel_driver_restore_corrosion_backup.sh
+
 ENTRYPOINT ["/entrypoint.sh"]

@@ -492,10 +492,6 @@ where
         return Ok(());
     }
 
-    assert_sometimes!(
-        true,
-        "Corrosion matches changes for updates from db version"
-    );
     let trait_type = manager.trait_type();
     let mut candidates = handles
         .iter()

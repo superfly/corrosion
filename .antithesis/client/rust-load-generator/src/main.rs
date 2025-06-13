@@ -73,8 +73,6 @@ async fn main() -> eyre::Result<()> {
 
     table_updates_all(app.corrosion_addr, tripwire.clone());
 
-    // table_updates(app.corrosion_addr, tripwire.clone());
-
     println!("tripwire_worker.await");
     tripwire_worker.await;
     Ok(())
@@ -114,50 +112,51 @@ fn table_updates_all(corrosion_addrs: Vec<String>, tripwire: Tripwire) {
 }
 
 async fn table_updates(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
-    let mut corro_client = None;
-    loop {
-        if tripwire.is_shutting_down() {
-            info!("tripped! Shutting down");
-            break;
-        }
-
-        if corro_client.is_none() {
+    info!("starting table updates for {addr}");
+    let client = {
+        loop {
             match create_client(&addr).await {
-                Ok(client) => {
-                    corro_client = Some(client);
-                }
+                Ok(client) => break client,
                 Err(e) => {
                     error!("could not create corrosion client: {e}");
                     sleep(Duration::from_secs(60)).await;
-                    continue;
                 }
             }
         }
+    };
 
-        let client: &CorrosionClient = corro_client.as_ref().unwrap();
-        // todo: subscribe to updates for each table
-        let tables = vec!["users", "teams", "deployments", "consul_services"];
-        for table in tables {
-            let client = client.clone();
-            tokio::spawn(async move {
-                loop {
-                    match client.updates(table).await {
-                        Ok(mut stream) => {
-                            while let Some(update) = stream.next().await {
+    // todo: subscribe to updates for each table
+    let tables = vec!["users", "teams", "deployments"];
+    // let tables = vec!["todos"];
+    for table in tables {
+        let client = client.clone();
+        let tripwire = tripwire.clone();
+        tokio::spawn(async move {
+            loop {
+                if tripwire.is_shutting_down() {
+                    info!("tripped! Shutting down");
+                    break;
+                }
+
+                info!("subscribing to updates for table: {table}");
+                match client.updates(table).await {
+                    Ok(mut stream) => {
+                        info!("subscribed to updates for table: {table}");
+                        while let Some(update) = stream.next().await {
                             // todo: check if the update is right e.g row should be absent on delete
                             // but present on upserts.
                             debug!("update: {update:?}");
-                            }
-                        }
-                        Err(e) => {
-                            error!("failed to subscribe to updates: {e}");
                         }
                     }
-                    sleep(Duration::from_secs(60)).await;
+                    Err(e) => {
+                        error!("failed to subscribe to updates: {e}");
+                    }
                 }
-            });
-        }
+                sleep(Duration::from_secs(60)).await;
+            }
+        });
     }
+
     Ok(())
 }
 

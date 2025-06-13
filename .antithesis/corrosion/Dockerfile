@@ -40,7 +40,7 @@ RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/lo
 # Runtime image
 FROM debian:bookworm-slim
 
-RUN apt update && apt install -y sqlite3 sqlite3-tools watch socat iproute2 gettext-base ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt update && apt install -y sqlite3 sqlite3-tools watch socat iproute2 gettext-base ca-certificates supervisor && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/nperf /usr/local/bin/consul /usr/src/app/corrosion /usr/src/app/rust-load-generator /usr/local/bin/
 
 # Create "corrosion" user
@@ -58,6 +58,13 @@ COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl
 COPY .antithesis/corrosion/schemas /etc/corrosion/schemas
 COPY .antithesis/corrosion/templates /etc/corrosion/templates
 
+COPY .antithesis/corrosion/test-templates/* /opt/antithesis/test/v1/basic_test/
+
+# Create supervisor configuration directory
+RUN mkdir -p /etc/supervisor/conf.d
+COPY .antithesis/corrosion/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
 ENTRYPOINT ["/entrypoint.sh"]
 # Run the app
-CMD ["corrosion", "agent"]
+# CMD ["corrosion", "agent"]
+CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
