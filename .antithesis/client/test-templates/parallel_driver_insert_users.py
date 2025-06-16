@@ -80,19 +80,19 @@ def insert_team(address):
         "updated_at": time.time()
     }
 
-    sql_command = f"""INSERT INTO teams 
-        (name, net_id, role, settings, state, balancer_ip, created_at, updated_at) 
-    VALUES 
+    sql_command = f"""INSERT INTO teams
+        (name, net_id, role, settings, state, balancer_ip, created_at, updated_at)
+    VALUES
         ('{data['name']}', {data['net_id']}, '{data['role']}', '{data['settings']}', '{data['state']}', '{data['balancer_ip']}', {data['created_at']}, {data['updated_at']})
     ON CONFLICT DO NOTHING"""
     success, err = helper.execute_sql(address, sql_command)
     if not success:
         print(f"Error inserting team: {err}")
         return None
-    
+
     # print(f"Inserted team {data['id']}")
     return data['id']
- 
+
 def do_inserts(address):
     host, port = address.split(':')
     id = insert_team(address)
@@ -103,8 +103,8 @@ def do_inserts(address):
             if conn is not None:
                 for j in range(helper.random_int(1, 1000)):
                     insert_deployment(conn, id, helper.random_int(1, 1000))
-            
- 
+
+
 def main():
     parser = argparse.ArgumentParser(description='Insert teams and users into corrosion databases')
     parser.add_argument('--addrs', nargs='+', help='List of corrosion addresses (e.g., --addresses corrosion1:8080 corrosion2:8080)')
@@ -120,6 +120,6 @@ def main():
 
     for thread in threads:
         thread.join()
-        
+
 if __name__ == "__main__":
     main()
