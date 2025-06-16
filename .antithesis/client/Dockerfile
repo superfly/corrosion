@@ -1,6 +1,6 @@
 FROM corrosion
 
-RUN apt-get update && apt-get install -y curl socat python3 
+RUN apt-get update && apt-get install -y curl socat python3
 
 RUN apt install -y python3-pip python3-requests
 
@@ -19,5 +19,7 @@ COPY .antithesis/client/test-templates/py-resources/helper.py /opt/antithesis/py
 COPY .antithesis/client/test-templates/check_bookkeeping.py /opt/antithesis/py-resources/check_bookkeeping.py
 
 COPY .antithesis/client/entrypoint.sh /entrypoint.sh
+
+RUN rm /opt/antithesis/test/v1/basic_test/parallel_driver_restore_corrosion_backup.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

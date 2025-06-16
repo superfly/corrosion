@@ -1,5 +1,14 @@
 #! /bin/bash
 
+function start_corrosion {
+  echo "Restarting corrosion"
+  supervisorctl start corrosion
+  supervisorctl start corro-consul
+}
+
+trap start_corrosion EXIT
+
+
 if [ -f "/var/lib/corrosion/backups/state.db" ]; then
     echo "Restoring backup for corrosion"
 
