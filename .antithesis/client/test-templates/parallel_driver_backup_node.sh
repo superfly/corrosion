@@ -4,12 +4,19 @@ addrs=("corrosion1" "corrosion2" "corrosion3")
 
 
 addr=${addrs[$((RANDOM % 3))]}
-backup_to=${addrs[$((RANDOM % 3))]}
 
-echo "Backup $addr to $backup_to dir"
+backup_candidates=()
+for a in "${addrs[@]}"; do
+    if [ "$a" != "$addr" ]; then
+        backup_candidates+=("$a")
+    fi
+done
+backup_addr=${backup_candidates[$((RANDOM % ${#backup_candidates[@]}))]}
 
-if [ -f "/var/lib/${backup_to}/backups/state.db" ]; then
-    rm /var/lib/${backup_to}/backups/state.db
+echo "Backup $addr to $backup_addr dir"
+
+if [ -f "/var/lib/${backup_addr}/backups/state.db" ]; then
+    rm /var/lib/${backup_addr}/backups/state.db
 fi
 
-corrosion -c /tmp/${addr}.toml backup  /var/lib/${addr}/backups/state.db
+corrosion -c /tmp/${addr}.toml backup  /var/lib/${backup_addr}/backups/state.db
