@@ -60,6 +60,8 @@ COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl
 COPY .antithesis/corrosion/schemas /etc/corrosion/schemas
 COPY .antithesis/corrosion/templates /etc/corrosion/templates
 
+COPY .antithesis/corrosion/test-templates/* /opt/antithesis/test/v1/basic_test/
+
 # Create supervisor configuration directory
 RUN mkdir -p /etc/supervisor/conf.d
 COPY .antithesis/corrosion/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
