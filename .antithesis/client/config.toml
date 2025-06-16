@@ -1,9 +1,9 @@
 [db]
-path = "/var/lib/corrosion/state.db"
+path = "/var/lib/corrosion${ID}/state.db"
 schema_paths = ["/etc/corrosion/schemas"]
-    
+
 [gossip]
-# addr and bootstrap for Fly.io deployment example are written 
+# addr and bootstrap for Fly.io deployment example are written
 # on startup by entrypoint script
 addr = "[::]:8787"
 plaintext = true   # Cryptography and authz are handled by Fly.io private networking
@@ -14,6 +14,7 @@ disable_gso = true # For Fly.io private network
 addr = "[::]:8080" # Must be available on IPv6 for Fly.io private network
 
 [admin]
+path = "/tmp/corrosion${ID}_admin.sock"
 
 [telemetry]
 prometheus.addr = "0.0.0.0:9090"
