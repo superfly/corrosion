@@ -140,17 +140,20 @@ async fn table_updates(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
         for table in tables {
             let client = client.clone();
             tokio::spawn(async move {
-                match client.updates(table).await {
-                    Ok(mut stream) => {
-                        while let Some(update) = stream.next().await {
+                loop {
+                    match client.updates(table).await {
+                        Ok(mut stream) => {
+                            while let Some(update) = stream.next().await {
                             // todo: check if the update is right e.g row should be absent on delete
                             // but present on upserts.
                             debug!("update: {update:?}");
+                            }
+                        }
+                        Err(e) => {
+                            error!("failed to subscribe to updates: {e}");
                         }
                     }
-                    Err(e) => {
-                        error!("failed to subscribe to updates: {e}");
-                    }
+                    sleep(Duration::from_secs(60)).await;
                 }
             });
         }
