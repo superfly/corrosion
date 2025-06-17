@@ -14,6 +14,8 @@ use crate::{
     },
     transport::Transport,
 };
+
+use antithesis_sdk::assert_sometimes;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{

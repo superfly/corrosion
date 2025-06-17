@@ -66,9 +66,12 @@ async fn main() -> eyre::Result<()> {
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
     tracing_subscriber::fmt::init();
 
+    // todo: Pass CorrosionClient to all functions instead of addresses
     subscribe_all(app.corrosion_addr.clone(), tripwire.clone());
 
-    query_all(app.corrosion_addr, tripwire.clone());
+    query_all(app.corrosion_addr.clone(), tripwire.clone());
+
+    table_updates_all(app.corrosion_addr, tripwire.clone());
 
     // table_updates(app.corrosion_addr, tripwire.clone());
 
@@ -97,6 +100,62 @@ fn query_all(corrosion_addrs: Vec<String>, tripwire: Tripwire) {
             }
         });
     }
+}
+
+fn table_updates_all(corrosion_addrs: Vec<String>, tripwire: Tripwire) {
+    for addr in corrosion_addrs {
+        let new_tripwire: Tripwire = tripwire.clone();
+        tokio::spawn(async move {
+            if let Err(e) = table_updates(addr, new_tripwire).await {
+                error!("failed to table updates: {e}");
+            }
+        });
+    }
+}
+
+async fn table_updates(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
+    let mut corro_client = None;
+    loop {
+        if tripwire.is_shutting_down() {
+            info!("tripped! Shutting down");
+            break;
+        }
+
+        if corro_client.is_none() {
+            match create_client(&addr).await {
+                Ok(client) => {
+                    corro_client = Some(client);
+                }
+                Err(e) => {
+                    error!("could not create corrosion client: {e}");
+                    sleep(Duration::from_secs(60)).await;
+                    continue;
+                }
+            }
+        }
+
+        let client: &CorrosionClient = corro_client.as_ref().unwrap();
+        // todo: subscribe to updates for each table
+        let tables = vec!["users", "teams", "deployments", "consul_services"];
+        for table in tables {
+            let client = client.clone();
+            tokio::spawn(async move {
+                match client.updates(table).await {
+                    Ok(mut stream) => {
+                        while let Some(update) = stream.next().await {
+                            // todo: check if the update is right e.g row should be absent on delete
+                            // but present on upserts.
+                            debug!("update: {update:?}");
+                        }
+                    }
+                    Err(e) => {
+                        error!("failed to subscribe to updates: {e}");
+                    }
+                }
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {

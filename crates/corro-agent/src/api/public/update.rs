@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
+use antithesis_sdk::assert_sometimes;
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::ToCompactString;

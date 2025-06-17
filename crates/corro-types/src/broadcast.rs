@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use itertools::Itertools;
