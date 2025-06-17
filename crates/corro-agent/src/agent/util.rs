@@ -464,6 +464,7 @@ pub async fn clear_buffered_meta_loop(
                 match res {
                     Ok((buf_count, seq_count)) => {
                         if buf_count + seq_count > 0 {
+                            assert_sometimes!(true, "Corrosion clears buffered meta");
                             info!(%actor_id, %self_actor_id, "cleared {} buffered meta rows for versions {versions:?}", buf_count + seq_count);
                         }
                         if buf_count < TO_CLEAR_COUNT && seq_count < TO_CLEAR_COUNT {
@@ -550,7 +551,7 @@ pub async fn process_fully_buffered_changes(
         let mut conn = agent.pool().write_normal().await?;
 
         debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
-
+        assert_sometimes!(true, "Corrosion processes fully buffered changes");
         let booked = {
             bookie
                 .write("process_fully_buffered(ensure)", actor_id.as_simple())
@@ -1188,6 +1189,7 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     let mut changes_per_table = BTreeMap::new();
 
     debug!(%actor_id, %version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
+    assert_sometimes!(true, "Corrosion processes incomplete changes");
     let mut inserted = 0;
     for change in changes.iter() {
         trace!("buffering change! {change:?}");

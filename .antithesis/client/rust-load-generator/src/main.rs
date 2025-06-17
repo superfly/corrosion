@@ -24,7 +24,7 @@ pub(crate) struct App {
 }
 
 const DEPLOY_STATS_QUERY: &str = r#"
-SELECT 
+SELECT
     t.name as team_name,
     t.state as team_state,
     COUNT(DISTINCT d.id) as active_deployments,
@@ -69,6 +69,8 @@ async fn main() -> eyre::Result<()> {
     subscribe_all(app.corrosion_addr.clone(), tripwire.clone());
 
     query_all(app.corrosion_addr, tripwire.clone());
+
+    // table_updates(app.corrosion_addr, tripwire.clone());
 
     println!("tripwire_worker.await");
     tripwire_worker.await;

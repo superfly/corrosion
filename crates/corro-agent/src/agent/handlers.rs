@@ -21,7 +21,7 @@ use crate::{
     api::peer::parallel_sync,
     transport::Transport,
 };
-use antithesis_sdk::assert_always;
+use antithesis_sdk::{assert_always, assert_sometimes};
 use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
@@ -234,6 +234,8 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire
                             } else {
                                 debug!("successfully sent announce message");
                             }
+
+                            assert_sometimes!(true, "Corrosion bootstraps with other nodes")
                         }
                     }
                     Err(e) => {
@@ -397,6 +399,7 @@ fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()>
     debug!("handling db_cleanup (WAL truncation)");
     let start = Instant::now();
 
+    assert_sometimes!(true, "Corrosion truncates WAL");
     let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
     conn.pragma_update(None, "busy_timeout", timeout)?;
 
@@ -664,6 +667,7 @@ pub async fn process_emptyset(
     for chunk in version_iter {
         let mut conn = agent.pool().write_low().await?;
         debug!("processing emptyset from {:?}", actor_id);
+        assert_sometimes!(true, "Corrosion sometimes processes empties");
         let booked = {
             bookie
                 .write(
@@ -864,6 +868,7 @@ pub async fn handle_changes(
                 if buf_cost < max_changes_chunk && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     // we can process this right away
                     debug!(%buf_cost, "spawning processing multiple changes from max wait interval");
+                    assert_sometimes!(true, "Corrosion processes changes");
                     let changes: Vec<_> = queue.drain(..).collect();
                     let agent = agent.clone();
                     let bookie = bookie.clone();
@@ -971,7 +976,12 @@ pub async fn handle_changes(
             }
         }
 
+        assert_sometimes!(
+            matches!(src, ChangeSource::Sync),
+            "Corrosion receives changes through sync"
+        );
         if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
+            assert_sometimes!(true, "Corrosion rebroadcasts changes");
             if let Err(_e) =
                 agent
                     .tx_bcast()
@@ -1039,6 +1049,7 @@ pub async fn handle_sync(
 
         debug!("found {} candidates to synchronize with", candidates.len());
 
+        assert_sometimes!(true, "Corrosion syncs with other nodes");
         let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
         debug!("Selected {desired_count} nodes to sync with");
 

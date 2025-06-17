@@ -33,6 +33,8 @@ pub async fn api_v1_updates(
 ) -> impl IntoResponse {
     info!("Received update request for table: {table}");
 
+    assert_sometimes!(true, "Corrosion receives requests for table updates");
+
     let mut bcast_write = bcast_cache.write().await;
     let updates = agent.updates_manager();
 

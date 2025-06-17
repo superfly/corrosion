@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use antithesis_sdk::assert_sometimes;
 use axum::{extract::ConnectInfo, response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
@@ -178,6 +179,7 @@ pub async fn api_v1_transactions(
         );
     }
 
+    assert_sometimes!(true, "Corrosion receives transactions through HTTP API");
     let res = make_broadcastable_changes(&agent, params.timeout, move |tx| {
         let mut total_rows_affected = 0;
 
@@ -478,6 +480,7 @@ pub async fn api_v1_queries(
     });
 
     trace!("building query rows response...");
+    assert_sometimes!(true, "Corrosion accepts queries");
 
     match build_query_rows_response(&agent, client_addr, data_tx, stmt, params.timeout).await {
         Ok(_) => {
@@ -570,6 +573,7 @@ pub async fn api_v1_db_schema(
 
     let start = Instant::now();
 
+    assert_sometimes!(true, "Corrosion applies schema");
     if let Err(e) = execute_schema(&agent, statements).await {
         error!("could not merge schemas: {e}");
         return (

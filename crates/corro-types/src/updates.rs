@@ -434,6 +434,7 @@ where
         return;
     }
 
+    // assert_sometimes!(true, "Corrosion matches changes for updates");
     for (id, handle) in handles.iter() {
         trace!(sub_id = %id, %db_version, "attempting to match changes to a subscription");
         let mut candidates = MatchCandidates::new();
@@ -490,6 +491,10 @@ where
         return Ok(());
     }
 
+    // assert_sometimes!(
+    //     true,
+    //     "Corrosion matches changes for updates from db version"
+    // );
     let trait_type = manager.trait_type();
     let mut candidates = handles
         .iter()

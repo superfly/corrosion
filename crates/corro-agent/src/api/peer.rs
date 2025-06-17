@@ -359,6 +359,7 @@ fn handle_need(
 
     let mut empties: RangeInclusiveMap<Version, Timestamp> = RangeInclusiveMap::new();
 
+    assert_sometimes!(true, "Corrosion handles sync requests from other nodes");
     // this is a read transaction!
     let tx = conn.transaction()?;
 
@@ -644,13 +645,13 @@ fn handle_need(
                                         (
                                             -- [:start]---[start_seq]---[:end]
                                             ( start_seq BETWEEN :start AND :end ) OR
-                        
+
                                             -- [start_seq]---[:start]---[:end]---[end_seq]
                                             ( start_seq <= :start AND end_seq >= :end ) OR
-                        
+
                                             -- [:start]---[start_seq]---[:end]---[end_seq]
                                             ( start_seq <= :end AND end_seq >= :end ) OR
-                        
+
                                             -- [:start]---[end_seq]---[:end]
                                             ( end_seq BETWEEN :start AND :end )
                                         )
@@ -1154,6 +1155,7 @@ pub async fn parallel_sync(
 
     debug!("collected member needs and such!");
 
+    assert_sometimes!(true, "Corrosion initializes sync with other nodes");
     #[allow(clippy::manual_try_fold)]
     let syncers = results
         .into_iter()
