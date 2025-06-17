@@ -4107,12 +4107,14 @@ dependencies = [
 name = "sqlite-pool"
 version = "0.1.0"
 dependencies = [
+ "antithesis_sdk",
  "arc-swap",
  "corro-types",
  "deadpool",
  "eyre",
  "metrics",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

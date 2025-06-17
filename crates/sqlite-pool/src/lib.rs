@@ -1,6 +1,8 @@
 mod config;
 
+use antithesis_sdk::assert_sometimes;
 use arc_swap::ArcSwap;
+use serde_json::json;
 use std::{
     fmt,
     ops::{Deref, DerefMut},
@@ -208,6 +210,13 @@ where
                 tokio::select! {
                     _ = cloned_token.cancelled() => {}
                     _ = sleep(timeout) => {
+                        let sql = current_sql.as_ref();
+                        let details = json!({
+                            "sql": sql,
+                            "source": source,
+                            "timeout": timeout,
+                        });
+                        assert_sometimes!(true, "sql statement is interrupted by timeout", &details);
                         warn!("sql call took more than {timeout:?}, interrupting.. {:?}", current_sql);
                         interrupt_hdl.interrupt();
                         counter!("corro.sqlite.interrupt", "source" => source, "reason" => "timeout").increment(1);

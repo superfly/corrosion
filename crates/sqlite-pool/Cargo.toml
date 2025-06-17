@@ -11,7 +11,8 @@ metrics = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-
+antithesis_sdk = { workspace = true }
+serde_json = { workspace = true }
 [features]
 default = ["rt_tokio_1"]
 rt_tokio_1 = ["deadpool/rt_tokio_1"]
