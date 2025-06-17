@@ -42,7 +42,7 @@ const fn default_apply_timeout() -> usize {
 }
 
 fn default_sql_tx_timeout() -> usize {
-    40
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
