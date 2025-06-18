@@ -1,4 +1,5 @@
 CREATE TABLE todos (
     id BLOB NOT NULL PRIMARY KEY,
-    titulo TEXT NOT NULL DEFAULT ''
+    title TEXT NOT NULL DEFAULT '',
+    completed_at TEXT DEFAULT 100
 );

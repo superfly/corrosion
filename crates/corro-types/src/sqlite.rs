@@ -201,6 +201,7 @@ mod tests {
     use tokio::task::block_in_place;
 
     use super::*;
+    use crate::change::{row_to_change, Change};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writes() -> Result<(), Box<dyn std::error::Error>> {
@@ -289,21 +290,96 @@ mod tests {
                 |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
             ));
         }
-
-        {
-            let tx = conn.transaction()?;
-            let timeout = Some(tokio::time::Duration::from_millis(5));
-            let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
-            let res = itx.prepare_cached("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;")?
-                        .execute(());
-
-            assert!(res.is_err_and(
-                |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
-            ));
-        }
-
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM testsbool;", (), |row| row.get(0))?;
         assert_eq!(count, 0);
+
+        // let this run to completion and interrupt when inserting into another db
+        println!("Inserting rows into db 1");
+        {
+            let tx = conn.transaction()?;
+            let itx = InterruptibleTransaction::new(tx, None, "test_interruptible_transaction");
+            itx.prepare_cached("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 1000000 ) SELECT id FROM cte;")?
+                        .execute(()).unwrap();
+
+            itx.commit()?;
+        }
+
+        let path2 = tmpdir.path().join("db2.sqlite");
+        let pool2 = Config::new(path2)
+            .max_size(1)
+            .create_pool_transform(rusqlite_to_crsqlite)?;
+
+        let mut conn2 = pool2.get().await.unwrap();
+        conn2.execute_batch(
+            "CREATE TABLE IF NOT EXISTS testsbool (
+            id INTEGER NOT NULL PRIMARY KEY,
+            b boolean not null default false
+        ); SELECT crsql_as_crr('testsbool')",
+        )?;
+
+        println!("Inserting changes into db 2");
+        let changes = conn.prepare("SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl from crsql_changes")?.query_map((), row_to_change)?.collect::<Result<Vec<_>, _>>()?;
+        let res = || -> Result<(), rusqlite::Error> {
+            let tx = conn2.transaction()?;
+            let timeout = Some(tokio::time::Duration::from_millis(5));
+            let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
+
+            for change in changes.clone() {
+                itx.prepare_cached(
+                    r#"
+                        INSERT INTO crsql_changes
+                            ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                        VALUES
+                            (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?)
+                    "#,
+                )?
+                .execute(params![
+                    change.table.as_str(),
+                    change.pk,
+                    change.cid.as_str(),
+                    &change.val,
+                    change.col_version,
+                    change.db_version,
+                    &change.site_id,
+                    change.cl,
+                    change.seq,
+                ])?;
+            }
+            itx.commit()?;
+            Ok(())
+        }();
+        assert!(res.is_err_and(
+            |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+        ));
+
+        // try again to be sure things still work without the interrupt.
+        {
+            let tx = conn2.transaction()?;
+
+            for change in changes.clone() {
+                tx.prepare_cached(
+                    r#"
+                        INSERT INTO crsql_changes
+                            ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                        VALUES
+                            (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?)
+                    "#,
+                )?
+                .execute(params![
+                    change.table.as_str(),
+                    change.pk,
+                    change.cid.as_str(),
+                    &change.val,
+                    change.col_version,
+                    change.db_version,
+                    &change.site_id,
+                    change.cl,
+                    change.seq,
+                ])?;
+            }
+            tx.commit()?;
+        }
+
         Ok(())
     }
 
