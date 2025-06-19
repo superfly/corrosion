@@ -101,7 +101,7 @@ sqlite> select crsql_as_crr('my_machines');
 └─────────────────────────────┘
 ```
 
-Now, something I ignored in the previous insert is the `side_id` (in corrosion parlour the "actor ID").  Each change has a source after all, which is represented by the actor ID.  In our case it is `D5F143E7BA65421C938C850CE78FC9F2` for node 1 and `75D983BA38A644E987735592FB89CA70` for node 2.  And so, when inserting into `test2.db`'s crsql_changes we need to consider it.
+Now, something I ignored in the previous insert is the `site_id` (in corrosion parlour the "actor ID").  Each change has a source after all, which is represented by the actor ID.  In our case it is `D5F143E7BA65421C938C850CE78FC9F2` for node 1 and `75D983BA38A644E987735592FB89CA70` for node 2.  And so, when inserting into `test2.db`'s crsql_changes we need to consider it.
 
 ```sqlite
 sqlite> insert into crsql_changes values ('my_machines', X'010901', 'name', 'meow', 1, 1, X'D5F143E7BA65421C938C850CE78FC9F2', 1, 0);
