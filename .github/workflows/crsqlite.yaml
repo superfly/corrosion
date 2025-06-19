@@ -1,4 +1,4 @@
-name: Release
+name: Download crsqlite
 
 permissions:
   contents: write
