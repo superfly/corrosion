@@ -45,3 +45,11 @@ jobs:
               - darwin-aarch64
               - linux-x86_64
               - linux-aarch64
+
+
+      - uses: EndBug/add-and-commit@v9
+        with:
+          add: crates/corro-types
+          message: "Update crsqlite to ${inputs.tag}"
+          push: true
+          token: ${{ secrets.GITHUB_TOKEN }}
