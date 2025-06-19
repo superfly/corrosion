@@ -52,4 +52,3 @@ jobs:
           add: crates/corro-types
           message: "Update crsqlite to ${inputs.tag}"
           push: true
-          token: ${{ secrets.GITHUB_TOKEN }}
