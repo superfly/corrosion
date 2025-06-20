@@ -1,0 +1,49 @@
+name: Download crsqlite
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Crsqlite tag to download artifacts"
+        required: true
+
+      branch:
+        description: "Target branch for commit"
+        required: true
+
+      repo:
+        description: "The repository to download crsqlite [optional]"
+        default: ""
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checks out repository to runner
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download crsqlite
+        run: |
+          INPUT_BRANCH=${{ inputs.branch }}
+          if [[ -z "$INPUT_BRANCH" || "$INPUT_BRANCH" == "main" ]]; then
+              echo "Please specify a different commit branch, main is not allowed"
+              exit 1
+          fi
+
+          INPUT_REPO=${{ inputs.repo }}
+          if [[ -z "$INPUT_REPO" ]]; then
+            INPUT_REPO=${{ github.repository_owner }}
+          fi
+          TAG=${{ inputs.tag }} REPO=${INPUT_REPO} ./.buildkite/download-crsqlite.sh
+
+      - uses: EndBug/add-and-commit@v9
+        with:
+          add: crates/corro-types
+          new_branch: "${{ inputs.branch }}"
+          message: "Update crsqlite to ${{ inputs.tag }}"
+          push: true
