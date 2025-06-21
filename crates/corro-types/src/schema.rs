@@ -277,6 +277,7 @@ pub fn apply_schema(
     tx: &Transaction,
     schema: &Schema,
     new_schema: &mut Schema,
+    destructive: bool,
 ) -> Result<(), ApplySchemaError> {
     if let Some(name) = schema
         .tables
@@ -286,9 +287,11 @@ pub fn apply_schema(
         .next()
     {
         // TODO: add options and check flag
-        return Err(ApplySchemaError::DropTableWithoutDestructiveFlag(
-            (*name).clone(),
-        ));
+        if !destructive {
+            return Err(ApplySchemaError::DropTableWithoutDestructiveFlag(
+                (*name).clone(),
+            ));
+        }
     }
 
     let mut schema_to_merge = Schema::default();
@@ -424,10 +427,10 @@ pub fn apply_schema(
 
         debug!("dropped cols: {dropped_cols:?}");
 
-        if let Some(col_name) = dropped_cols.into_iter().next() {
+        if !destructive && !dropped_cols.is_empty() {
             return Err(ApplySchemaError::RemoveColumnWithoutDestructiveFlag(
                 name.clone(),
-                col_name.clone(),
+                dropped_cols.into_iter().next().unwrap().clone(),
             ));
         }
 
@@ -449,8 +452,7 @@ pub fn apply_schema(
             changed_cols.keys().collect::<Vec<_>>()
         );
 
-        if !changed_cols.is_empty() {
-            // TODO: add destructive flag
+        if !destructive && !changed_cols.is_empty() {
             return Err(ApplySchemaError::ChangeColumnWithoutDestructiveFlag(
                 table.name.clone(),
                 changed_cols.keys().cloned().collect::<Vec<_>>().join(","),

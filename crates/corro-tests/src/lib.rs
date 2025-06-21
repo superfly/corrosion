@@ -83,7 +83,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 
     {
         let client = corro_client::CorrosionApiClient::new(agent.api_addr());
-        client.schema_from_paths(&schema_paths).await?;
+        client.schema_from_paths(&schema_paths, false).await?;
     }
 
     Ok(TestAgent {

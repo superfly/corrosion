@@ -50,6 +50,12 @@ pub struct TimeoutParams {
     pub timeout: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub struct SchemaParams {
+    #[serde(default)]
+    pub destructive: bool,
+}
+
 pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     timeout: Option<u64>,
@@ -505,7 +511,11 @@ pub async fn api_v1_queries(
     }
 }
 
-async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
+async fn execute_schema(
+    agent: &Agent,
+    statements: Vec<String>,
+    destructive: bool,
+) -> eyre::Result<()> {
     let new_sql: String = statements.join(";");
 
     let partial_schema = parse_sql(&new_sql)?;
@@ -532,7 +542,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
     block_in_place(|| {
         let tx = conn.immediate_transaction()?;
 
-        apply_schema(&tx, &schema_write, &mut new_schema)?;
+        apply_schema(&tx, &schema_write, &mut new_schema, destructive)?;
 
         for tbl_name in partial_schema.tables.keys() {
             tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
@@ -553,6 +563,7 @@ async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<
 
 pub async fn api_v1_db_schema(
     Extension(agent): Extension<Agent>,
+    axum::extract::Query(params): axum::extract::Query<SchemaParams>,
     axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
     if statements.is_empty() {
@@ -570,7 +581,7 @@ pub async fn api_v1_db_schema(
 
     let start = Instant::now();
 
-    if let Err(e) = execute_schema(&agent, statements).await {
+    if let Err(e) = execute_schema(&agent, statements, params.destructive).await {
         error!("could not merge schemas: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

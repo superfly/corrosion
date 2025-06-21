@@ -3,10 +3,14 @@ use std::{net::SocketAddr, path::Path};
 use corro_client::CorrosionApiClient;
 use tracing::info;
 
-pub async fn run<P: AsRef<Path>>(api_addr: SocketAddr, schema_paths: &[P]) -> eyre::Result<()> {
+pub async fn run<P: AsRef<Path>>(
+    api_addr: SocketAddr,
+    schema_paths: &[P],
+    destructive: bool,
+) -> eyre::Result<()> {
     let client = CorrosionApiClient::new(api_addr);
 
-    client.schema_from_paths(schema_paths).await?;
+    client.schema_from_paths(schema_paths, destructive).await?;
     info!("Successfully reloaded Corrosion's schema from paths!");
     Ok(())
 }
