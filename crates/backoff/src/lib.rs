@@ -41,7 +41,7 @@ impl Backoff {
     #[inline]
     pub fn jitter(mut self, jitter: f32) -> Self {
         assert!(
-            jitter > 0f32 && jitter < 1f32,
+            jitter >= 0f32 && jitter <= 1f32,
             "<exponential-backoff>: jitter must be between 0 and 1."
         );
         self.jitter = jitter;
