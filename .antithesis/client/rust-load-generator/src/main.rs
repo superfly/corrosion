@@ -43,6 +43,7 @@ const TEAM_QUERY: &str = r#"
     GROUP BY t.id
 "#;
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
 struct TeamStats {
     id: i64,
@@ -50,6 +51,7 @@ struct TeamStats {
     active_users: i64,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
 struct DeploymentStats {
     team_name: String,

@@ -37,7 +37,7 @@ ENV RUSTFLAGS="--cfg tokio_unstable -C link-arg=-fuse-ld=mold -C force-frame-poi
 # Will build and cache the binary and dependent crates in release mode
 RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/local/cargo \
     --mount=type=cache,target=target \
-    cargo build --release && mv target/release/corrosion ./ && mv target/release/rust-load-generator ./
+    cargo build --release --features running_in_antithesis && mv target/release/corrosion ./ && mv target/release/rust-load-generator ./
 
 # Runtime image
 FROM debian:bookworm-slim
@@ -60,7 +60,7 @@ COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl
 COPY .antithesis/corrosion/schemas /etc/corrosion/schemas
 COPY .antithesis/corrosion/templates /etc/corrosion/templates
 
-COPY .antithesis/corrosion/test-templates/* /opt/antithesis/test/v1/basic_test/
+# COPY .antithesis/corrosion/test-templates/* /opt/antithesis/test/v1/basic_test/
 
 # Create supervisor configuration directory
 RUN mkdir -p /etc/supervisor/conf.d

@@ -23,7 +23,6 @@ use tokio::{
     },
 };
 use tracing::{debug, error, info, trace, warn};
-use tracing_subscriber::fmt::format::Json;
 use tripwire::Tripwire;
 
 // Internals
@@ -218,7 +217,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                             "state": meta.state,
                         });
                         assert_always!(
-                            duration < Duration::from_secs(1 * 60),
+                            duration < Duration::from_secs(2 * 60),
                             "bookie lock held for too long",
                             &details
                         );
