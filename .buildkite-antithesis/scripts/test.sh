@@ -16,7 +16,9 @@ response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" -X POST https://flyio.a
     \"antithesis.config_image\":\"antithesis-config:${COMMIT_HASH}\",
     \"antithesis.images\":\"corrosion:${COMMIT_HASH},corro-client:${COMMIT_HASH},consul:1.15.4\",
     \"antithesis.report.recipients\":\"somtochi@fly.io\",
-    \"antithesis.source\":\"${BUILDKITE_BRANCH}\"
+    \"antithesis.source\":\"${BUILDKITE_BRANCH}\",
+    \"antithesis.intense_pausing\":\"true\",
+    \"antithesis.reduced_disk\":\"false\"
 }}")
 
 status=$(echo $response | jq -r '.statusCode')
