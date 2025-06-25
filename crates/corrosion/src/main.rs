@@ -158,7 +158,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
         }
 
         Command::Backup { path } => {
-            assert_sometimes!(true, "Corrosion database is backed up");
+            // assert_sometimes!(true, "Corrosion database is backed up");
             let db_path = cli.db_path()?;
 
             {
