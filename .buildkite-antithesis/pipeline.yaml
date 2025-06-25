@@ -36,9 +36,6 @@ steps:
     agents:
       queue: "high-concurrency"
     depends_on: [build-corrosion]
-    env:
-      ANTITHESIS_REGISTRY_PASSWORD: "$ANTITHESIS_REGISTRY_PASSWORD"
-      ANTITHESIS_REGISTRY: "$ANTITHESIS_REGISTRY"
 
   - label: "☁️ Test on Antithesis"
     priority: 50

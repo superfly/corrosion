@@ -32,6 +32,8 @@ COPY . .
 COPY .antithesis/libvoidstar.so /usr/lib/antithesis/lib/libvoidstar.so
 ENV LD_LIBRARY_PATH=/usr/lib/antithesis/lib
 
+ENV RUSTFLAGS="--cfg tokio_unstable -C link-arg=-fuse-ld=mold -C force-frame-pointers -C symbol-mangling-version=v0 -C codegen-units=1 -C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3 -C llvm-args=-sanitizer-coverage-trace-pc-guard -C link-arg=-Wl,--build-id -C link-arg=-Wl,--build-id -L /usr/lib/antithesis/lib/ -l voidstar"
+
 # Will build and cache the binary and dependent crates in release mode
 RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/local/cargo \
     --mount=type=cache,target=target \

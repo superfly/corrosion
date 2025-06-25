@@ -6,7 +6,7 @@ use eyre::{eyre, Result};
 use futures::StreamExt;
 use hickory_resolver::AsyncResolver;
 use serde::Deserialize;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
