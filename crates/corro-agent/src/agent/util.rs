@@ -543,7 +543,7 @@ pub async fn process_fully_buffered_changes(
     version: CrsqlDbVersion,
     tx_timeout: Duration,
 ) -> Result<bool, ChangeError> {
-    let db_version = {
+    let rows_impacted = {
         let mut conn = agent.pool().write_normal().await?;
 
         debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
@@ -570,13 +570,13 @@ pub async fn process_fully_buffered_changes(
                         if seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).count() != 0 {
                             error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
                             // TODO: return an error here
-                            return Ok(None);
+                            return Ok(false);
                         }
                         *last_seq
                     }
                     None => {
                         warn!(%actor_id, %version, "version not found in cache, returning");
-                        return Ok(None);
+                        return Ok(false);
                     }
                 }
             };
@@ -643,12 +643,6 @@ pub async fn process_fully_buffered_changes(
 
             debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
-            let db_version = if rows_impacted > 0 {
-                Some(version)
-            } else {
-                None
-            };
-
             let mut snap = bookedw.snapshot();
             snap.insert_db(&tx, [version..=version].into())
                 .map_err(|source| ChangeError::Rusqlite {
@@ -665,30 +659,30 @@ pub async fn process_fully_buffered_changes(
 
             bookedw.commit_snapshot(snap);
 
-            Ok::<_, ChangeError>(db_version)
+            Ok::<_, ChangeError>(rows_impacted > 0)
         })
     }?;
 
-    if let Some(db_version) = db_version {
+    if rows_impacted {
         let conn = agent.pool().read().await?;
         block_in_place(|| {
             if let Err(e) =
-                match_changes_from_db_version(agent.subs_manager(), &conn, db_version, actor_id)
+                match_changes_from_db_version(agent.subs_manager(), &conn, version, actor_id)
             {
-                error!(%db_version, "could not match changes for subs from db version: {e}");
+                error!(%version, "could not match changes for subs from db version: {e}");
             }
         });
 
         block_in_place(|| {
             if let Err(e) =
-                match_changes_from_db_version(agent.updates_manager(), &conn, db_version, actor_id)
+                match_changes_from_db_version(agent.updates_manager(), &conn, version, actor_id)
             {
-                error!(%db_version, "could not match changes for updates from db version: {e}");
+                error!(%version, "could not match changes for updates from db version: {e}");
             }
         });
     }
 
-    Ok(db_version.is_some())
+    Ok(rows_impacted)
 }
 
 #[tracing::instrument(skip(agent, bookie, changes), err)]
@@ -762,8 +756,6 @@ pub async fn process_multiple_changes(
             InterruptibleTransaction::new(tx, Some(tx_timeout), "process_multiple_changes");
         let mut processed: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
-
-        // let mut last_db_version = None;
 
         let mut count = 0;
 
@@ -1224,11 +1216,6 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
             },
         )
     } else {
-        // TODO: find a way to avoid this...
-        // let db_version: CrsqlDbVersion = sp
-        //     .prepare_cached("SELECT crsql_next_db_version()")?
-        //     .query_row([], |row| row.get(0))?;
-        // TODO: (we assume there's not conflict here)
         (
             KnownDbVersion::Current(CurrentVersion {
                 db_version: version,
