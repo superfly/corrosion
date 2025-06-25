@@ -794,7 +794,7 @@ dependencies = [
  "hickory-resolver",
  "http-body",
  "hyper",
- "indexmap 1.9.3",
+ "indexmap 2.1.0",
  "itertools",
  "metrics",
  "opentelemetry",
@@ -981,7 +981,7 @@ dependencies = [
  "futures",
  "hex",
  "hostname",
- "indexmap 1.9.3",
+ "indexmap 2.1.0",
  "rhai",
  "rhai-tpl",
  "serde",
@@ -1018,7 +1018,7 @@ dependencies = [
  "foca",
  "futures",
  "hex",
- "indexmap 1.9.3",
+ "indexmap 2.1.0",
  "itertools",
  "metrics",
  "once_cell",
@@ -2235,6 +2235,7 @@ checksum = "d530e1a18b1cb4c484e6e34556a0d948706958449fca0cab753d649f2bce3d1f"
 dependencies = [
  "equivalent",
  "hashbrown 0.14.5",
+ "serde",
 ]
 
 [[package]]
