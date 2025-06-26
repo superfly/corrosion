@@ -1,10 +1,12 @@
 use std::{iter::Peekable, ops::RangeInclusive, time::Instant};
 
+use antithesis_sdk::assert_always;
 pub use corro_api_types::SqliteValue;
 use corro_api_types::{ColumnName, TableName};
 use corro_base_types::{CrsqlDbVersion, Version};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, params, Connection, Row};
+use serde_json::json;
 use speedy::{Readable, Writable};
 use tracing::{debug, trace, warn};
 
@@ -109,7 +111,12 @@ where
             return None;
         }
 
-        debug_assert!(self.changes.is_empty());
+        let details = json!({});
+        assert_always!(
+            self.changes.is_empty(),
+            "iterator for ChunkedChanges still has changes when next() is called",
+            &details
+        );
 
         // reset the buffered size
         self.buffered_size = 0;
@@ -401,6 +408,12 @@ pub fn store_empty_changeset(
     debug!(%actor_id, "new ranges: {new_ranges:?}");
 
     // we should never have deleted non-contiguous ranges, abort!
+    let details = json!({"new_ranges": new_ranges,});
+    assert_always!(
+        new_ranges.len() == 1,
+        "deleted non-contiguous ranges! {new_ranges:?}",
+        &details
+    );
     if new_ranges.len() > 1 {
         warn!("deleted non-contiguous ranges! {new_ranges:?}");
         return Err(ChangeError::NonContiguousDelete);

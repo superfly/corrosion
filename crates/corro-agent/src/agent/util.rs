@@ -14,6 +14,8 @@ use crate::{
     },
     transport::Transport,
 };
+
+use antithesis_sdk::assert_sometimes;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
@@ -30,17 +32,9 @@ use corro_types::{
     updates::{match_changes, match_changes_from_db_version},
 };
 
-use std::{
-    cmp,
-    collections::{BTreeMap, HashSet},
-    convert::Infallible,
-    net::SocketAddr,
-    ops::{Deref, RangeInclusive},
-    sync::{atomic::AtomicI64, Arc},
-    time::{Duration, Instant},
-};
-
+use super::BcastCache;
 use crate::api::public::update::api_v1_updates;
+use antithesis_sdk::{assert_always, assert_unreachable};
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
@@ -55,15 +49,23 @@ use hyper::{server::conn::AddrIncoming, StatusCode};
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, params, Connection, OptionalExtension};
+use serde_json::json;
 use spawn::spawn_counted;
 use sqlite_pool::{Committable, InterruptibleTransaction};
+use std::{
+    cmp,
+    collections::{BTreeMap, HashSet},
+    convert::Infallible,
+    net::SocketAddr,
+    ops::{Deref, RangeInclusive},
+    sync::{atomic::AtomicI64, Arc},
+    time::{Duration, Instant},
+};
 use tokio::{net::TcpListener, task::block_in_place};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
-
-use super::BcastCache;
 
 pub async fn initialise_foca(agent: &Agent) {
     let states = load_member_states(agent).await;
@@ -464,6 +466,7 @@ pub async fn clear_buffered_meta_loop(
                 match res {
                     Ok((buf_count, seq_count)) => {
                         if buf_count + seq_count > 0 {
+                            assert_sometimes!(true, "Corrosion clears buffered meta");
                             info!(%actor_id, %self_actor_id, "cleared {} buffered meta rows for versions {versions:?}", buf_count + seq_count);
                         }
                         if buf_count < TO_CLEAR_COUNT && seq_count < TO_CLEAR_COUNT {
@@ -550,7 +553,7 @@ pub async fn process_fully_buffered_changes(
         let mut conn = agent.pool().write_normal().await?;
 
         debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
-
+        assert_sometimes!(true, "Corrosion processes fully buffered changes");
         let booked = {
             bookie
                 .write("process_fully_buffered(ensure)", actor_id.as_simple())
@@ -899,6 +902,13 @@ pub async fn process_multiple_changes(
                         match process_single_version(&agent, &mut tx, last_db_version, change) {
                             Ok(res) => res,
                             Err(e) => {
+                                error!("error processing single version: {e}");
+                                if e.sqlite_error_code()
+                                    .is_some_and(|code| code != rusqlite::ErrorCode::DiskFull)
+                                {
+                                    let details = json!({"error": e.to_string()});
+                                    assert_unreachable!("error committing transaction", &details);
+                                }
                                 // the transaction was rolled back, so we need to return.
                                 if tx.is_autocommit() {
                                     error!("error processing single version: {e} and transaction was rolled back");
@@ -1065,10 +1075,21 @@ pub async fn process_multiple_changes(
         }
 
         let sub_start = Instant::now();
-        tx.commit().map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
+        tx.commit().map_err(|source| {
+            // only sqlite error we expect is SQLITE_FULL if disk is full
+            if source
+                .sqlite_error_code()
+                .is_some_and(|code| code != rusqlite::ErrorCode::DiskFull)
+            {
+                let details =
+                    json!({"elapsed": elapsed.as_secs_f32(), "error": source.to_string()});
+                assert_unreachable!("error committing transaction", &details);
+            }
+            ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            }
         })?;
 
         let elapsed = sub_start.elapsed();
@@ -1136,6 +1157,12 @@ pub async fn process_multiple_changes(
         }
 
         let elapsed = sub_start.elapsed();
+        let details = json!({"elapsed": elapsed.as_secs_f32()});
+        assert_always!(
+            elapsed < Duration::from_secs(1 * 60),
+            "process_multiple_changes took too long",
+            &details
+        );
         if elapsed >= PROCESSING_WARN_THRESHOLD {
             warn!("process_multiple_changes: commiting snapshots took too long - {elapsed:?}");
         }
@@ -1175,6 +1202,7 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     let mut changes_per_table = BTreeMap::new();
 
     debug!(%actor_id, %version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
+    assert_sometimes!(true, "Corrosion processes incomplete changes");
     let mut inserted = 0;
     for change in changes.iter() {
         trace!("buffering change! {change:?}");
@@ -1313,7 +1341,12 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
 
-    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize);
+    let details = json!({"len": len, "seqs": seqs.start().0, "seqs_end": seqs.end().0});
+    assert_always!(
+        len <= (seqs.end().0 - seqs.start().0 + 1) as usize,
+        "number of changes is greater than the seq num",
+        &details
+    );
 
     let mut impactful_changeset = vec![];
 

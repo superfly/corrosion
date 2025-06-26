@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use antithesis_sdk::assert_always;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
@@ -23,6 +24,7 @@ use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
@@ -39,7 +41,6 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
-use crate::updates::UpdatesManager;
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     base::{CrsqlDbVersion, CrsqlSeq, Version},
@@ -49,6 +50,7 @@ use crate::{
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn, Migration, SqlitePool, SqlitePoolError},
+    updates::UpdatesManager,
 };
 
 use super::members::Members;
@@ -778,6 +780,16 @@ async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str) {
     let start = Instant::now();
 
     loop {
+        let details = json!({
+            "channel": channel,
+            "elapsed": start.elapsed().as_secs_f64()
+        });
+        assert_always!(
+            start.elapsed() < Duration::from_secs(5 * 60),
+            "wait_conn_drop has been running for too long",
+            &details
+        );
+
         tokio::select! {
             _ = cancel.cancelled() => {
                 break;
@@ -1252,7 +1264,8 @@ impl VersionsSnapshot {
             if count != 1 {
                 warn!(actor_id = %self.actor_id, "did not delete gap from db: {range:?}");
             }
-            debug_assert_eq!(count, 1, "ineffective deletion of gaps in-db: {range:?}");
+            let details = json!({"count": count, "range": range});
+            assert_always!(count == 1, "ineffective deletion of gaps in-db", &details);
             for version in range.clone() {
                 self.partials.remove(&version);
             }

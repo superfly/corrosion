@@ -21,6 +21,7 @@ use crate::{
     api::peer::parallel_sync,
     transport::Transport,
 };
+use antithesis_sdk::{assert_always, assert_sometimes};
 use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
@@ -43,6 +44,7 @@ use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
+use serde_json::json;
 use spawn::spawn_counted;
 use tokio::time::sleep;
 use tokio::{
@@ -232,6 +234,8 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire
                             } else {
                                 debug!("successfully sent announce message");
                             }
+
+                            assert_sometimes!(true, "Corrosion bootstraps with other nodes")
                         }
                     }
                     Err(e) => {
@@ -395,6 +399,7 @@ fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()>
     debug!("handling db_cleanup (WAL truncation)");
     let start = Instant::now();
 
+    assert_sometimes!(true, "Corrosion truncates WAL");
     let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
     conn.pragma_update(None, "busy_timeout", timeout)?;
 
@@ -481,7 +486,7 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
     let pool = agent.pool().clone();
 
     tokio::spawn(async move {
-        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024 * 1024;
+        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024;
 
         // try to initially truncate the WAL
         match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold).await
@@ -523,7 +528,16 @@ async fn wal_checkpoint_over_threshold(
     pool: &SplitPool,
     threshold: u64,
 ) -> eyre::Result<bool> {
-    let should_truncate = wal_path.metadata()?.len() > threshold;
+    let wal_size = wal_path.metadata()?.len();
+    let should_truncate = wal_size > threshold;
+    let warn_threshold = 25 * 1024 * 1024 * 1024;
+    let wal_size_gb = wal_size / 1024 / 1024 / 1024;
+    let details = json!({"wal_size": wal_size_gb});
+    assert_always!(
+        wal_size < warn_threshold,
+        "wal_size is under 25gb",
+        &details
+    );
     if should_truncate {
         let timeout = calc_busy_timeout(wal_path.metadata()?.len(), threshold);
         let conn = pool.write_low().await?;
@@ -653,6 +667,7 @@ pub async fn process_emptyset(
     for chunk in version_iter {
         let mut conn = agent.pool().write_low().await?;
         debug!("processing emptyset from {:?}", actor_id);
+        assert_sometimes!(true, "Corrosion sometimes processes empties");
         let booked = {
             bookie
                 .write(
@@ -853,6 +868,7 @@ pub async fn handle_changes(
                 if buf_cost < max_changes_chunk && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     // we can process this right away
                     debug!(%buf_cost, "spawning processing multiple changes from max wait interval");
+                    assert_sometimes!(true, "Corrosion processes changes");
                     let changes: Vec<_> = queue.drain(..).collect();
                     let agent = agent.clone();
                     let bookie = bookie.clone();
@@ -960,7 +976,12 @@ pub async fn handle_changes(
             }
         }
 
+        assert_sometimes!(
+            matches!(src, ChangeSource::Sync),
+            "Corrosion receives changes through sync"
+        );
         if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
+            assert_sometimes!(true, "Corrosion rebroadcasts changes");
             if let Err(_e) =
                 agent
                     .tx_bcast()
@@ -1028,6 +1049,7 @@ pub async fn handle_sync(
 
         debug!("found {} candidates to synchronize with", candidates.len());
 
+        assert_sometimes!(true, "Corrosion syncs with other nodes");
         let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
         debug!("Selected {desired_count} nodes to sync with");
 

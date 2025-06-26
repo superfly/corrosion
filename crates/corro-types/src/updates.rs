@@ -2,6 +2,7 @@ use crate::agent::SplitPool;
 use crate::change::Change;
 use crate::pubsub::{unpack_columns, MatchCandidates, MatchableChange, MatcherError};
 use crate::schema::Schema;
+use antithesis_sdk::assert_sometimes;
 use async_trait::async_trait;
 use corro_api_types::sqlite::ChangeType;
 use corro_api_types::{ColumnName, NotifyEvent, SqliteValueRef, TableName};
@@ -434,6 +435,7 @@ where
         return;
     }
 
+    assert_sometimes!(true, "Corrosion matches changes for updates");
     for (id, handle) in handles.iter() {
         trace!(sub_id = %id, %db_version, "attempting to match changes to a subscription");
         let mut candidates = MatchCandidates::new();
