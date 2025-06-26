@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+antithesis_sdk = { workspace = true }
 arc-swap = { workspace = true }
 axum = { workspace = true }
 backoff = { path = "../backoff" }

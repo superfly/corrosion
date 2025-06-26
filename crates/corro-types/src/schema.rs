@@ -15,8 +15,6 @@ use sqlite3_parser::ast::{
 };
 use tracing::{debug, info, trace};
 
-use crate::agent::create_clock_change_trigger;
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Column {
     pub name: String,
@@ -361,7 +359,9 @@ pub fn apply_schema(
                 schema_to_merge.tables.insert(name.clone(), parsed_table);
             }
 
+            debug!("selecting crsql_as_crr");
             tx.execute_batch(&format!("SELECT crsql_as_crr('{name}'); CREATE INDEX IF NOT EXISTS corro_{name}__crsql_clock_site_id_dbv ON {name}__crsql_clock (site_id, db_version);"))?;
+            debug!("done selecting as crr");
 
             if schema_to_merge.tables.contains_key(name) {
                 // just merged!
@@ -382,9 +382,6 @@ pub fn apply_schema(
                     .to_string(),
                 )?;
             }
-
-            // create the trigger for this table, in case it does not exist
-            create_clock_change_trigger(tx, name)?;
         }
     }
 

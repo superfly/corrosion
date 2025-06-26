@@ -21,7 +21,7 @@ jobs:
             os: macos-latest
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-    
+
     runs-on: ${{ matrix.os }}
 
     env:
@@ -35,7 +35,7 @@ jobs:
         run: rustup show
 
       - name: Install rustfmt
-        run: rustup component add --toolchain nightly-2023-12-03-${{ matrix.target }} rustfmt
+        run: rustup component add rustfmt
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -52,16 +52,16 @@ jobs:
 
       - name: Test with latest nextest release
         run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
-  
+
   book-test:
     name: Build book
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # To push a branch 
+      contents: write  # To push a branch
       pull-requests: write  # To create a PR from that branch
     steps:
       - uses: actions/checkout@master
-      
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: taiki-e/install-action@v2

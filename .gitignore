@@ -5,3 +5,4 @@
 /book
 .direnv/**
 *.log
+.antithesis/config/volumes

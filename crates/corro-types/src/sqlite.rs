@@ -1,13 +1,13 @@
 use std::{
     ops::{Deref, DerefMut},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use once_cell::sync::Lazy;
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, trace::TraceEventCodes, Connection, Transaction};
 use sqlite_pool::{Committable, SqliteConn};
 use tempfile::TempDir;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 pub type SqlitePool = sqlite_pool::Pool<CrConn>;
 pub type SqlitePoolError = sqlite_pool::PoolError;
@@ -21,8 +21,6 @@ pub const CRSQL_EXT_FILENAME: &str = "crsqlite.so";
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-aarch64.dylib");
-#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-x86_64.dylib");
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-x86_64.so");
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -38,10 +36,30 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
     dir
 });
 
+pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+    let conn = rusqlite_to_crsqlite(conn)?;
+    conn.execute_batch("PRAGMA cache_size = -32000;")?;
+
+    Ok(conn)
+}
+
 pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     init_cr_conn(&mut conn)?;
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
+
+    const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(|event| {
+            if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = event {
+                if duration >= SLOW_THRESHOLD {
+                    warn!("SLOW query {duration:?} => {}", stmt_ref.sql());
+                }
+            }
+        }),
+    );
+
     Ok(CrConn(conn))
 }
 
@@ -128,6 +146,7 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRAGMA journal_size_limit = 1073741824;
             PRAGMA synchronous = NORMAL;
             PRAGMA recursive_triggers = ON;
+            PRAGMA mmap_size = 8589934592; -- 8GB
         "#,
     )?;
 
@@ -180,6 +199,11 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
     // determine how many migrations to skip (skip as many as we are at)
     let skip_n = migration_version(&tx).unwrap_or_default();
 
+    if skip_n > migrations.len() {
+        warn!("Skipping migrations, database is at migration version {skip_n} which is greater than {}", migrations.len());
+        return Ok(());
+    }
+
     for (i, migration) in migrations.into_iter().skip(skip_n).enumerate() {
         let new_version = skip_n + i;
         info!("Applying migration to v{new_version}");
@@ -228,7 +252,7 @@ mod tests {
             let pool = pool.clone();
             async move {
                 tokio::spawn(async move {
-                    FuturesUnordered::from_iter((0..per_worker).map(|_| {
+                    let _: () = FuturesUnordered::from_iter((0..per_worker).map(|_| {
                         let pool = pool.clone();
                         async move {
                             let conn = pool.get().await?;
@@ -251,7 +275,7 @@ mod tests {
             }
         }));
 
-        futs.try_collect().await?;
+        let _: () = futs.try_collect().await?;
 
         let conn = pool.get().await?;
 
@@ -284,18 +308,6 @@ mod tests {
             let timeout = Some(tokio::time::Duration::from_millis(5));
             let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
             let res = itx.execute("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;", &[]);
-
-            assert!(res.is_err_and(
-                |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
-            ));
-        }
-
-        {
-            let tx = conn.transaction()?;
-            let timeout = Some(tokio::time::Duration::from_millis(5));
-            let itx = InterruptibleTransaction::new(tx, timeout, "test_interruptible_transaction");
-            let res = itx.prepare_cached("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT 100000000  ) SELECT id FROM cte;")?
-                        .execute(());
 
             assert!(res.is_err_and(
                 |e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)

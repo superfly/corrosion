@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
+use antithesis_sdk::prelude::*;
 use build_info::VersionControl;
 use camino::Utf8PathBuf;
 use corro_admin::{AdminConfig, TracingHandle};
@@ -10,6 +11,8 @@ use metrics_util::MetricKindMask;
 use spawn::wait_for_all_pending_handles;
 use tokio_metrics::RuntimeMonitor;
 use tracing::{error, info};
+// use tracing_filter::{legacy::Filter, FilterLayer};
+// use tracing_subscriber::{reload::Handle, Registry};
 
 use crate::VERSION;
 
@@ -57,9 +60,10 @@ pub async fn run(
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
-    let (agent, bookie) = corro_agent::agent::start_with_config(config.clone(), tripwire.clone())
-        .await
-        .expect("could not start agent");
+    let (agent, bookie, _) =
+        corro_agent::agent::start_with_config(config.clone(), tripwire.clone())
+            .await
+            .expect("could not start agent");
 
     corro_admin::start_server(
         agent.clone(),
@@ -90,6 +94,7 @@ pub async fn run(
         }
     }
 
+    antithesis_init();
     tripwire_worker.await;
 
     wait_for_all_pending_handles().await;

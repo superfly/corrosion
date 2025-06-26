@@ -77,30 +77,28 @@ pub fn spawn_bipayload_handler(
                                     match BiPayload::read_from_buffer(&b) {
                                         Ok(payload) => {
                                             match payload {
-                                                BiPayload::V1 {
-                                                    data:
-                                                        BiPayloadV1::SyncStart {
-                                                            actor_id,
-                                                            trace_ctx,
-                                                        },
-                                                    cluster_id,
-                                                } => {
-                                                    trace!(
-                                                        "framed read buffer len: {}",
-                                                        framed.read_buffer().len()
-                                                    );
+                                                BiPayload::V1 { data, cluster_id } => match data {
+                                                    BiPayloadV1::SyncStart {
+                                                        actor_id,
+                                                        trace_ctx,
+                                                    } => {
+                                                        trace!(
+                                                            "framed read buffer len: {}",
+                                                            framed.read_buffer().len()
+                                                        );
 
-                                                    // println!("got sync state: {state:?}");
-                                                    if let Err(e) = serve_sync(
-                                                        &agent, &bookie, actor_id, trace_ctx,
-                                                        cluster_id, framed, tx,
-                                                    )
-                                                    .await
-                                                    {
-                                                        warn!("could not complete receiving sync: {e}");
+                                                        // println!("got sync state: {state:?}");
+                                                        if let Err(e) = serve_sync(
+                                                            &agent, &bookie, actor_id, trace_ctx,
+                                                            cluster_id, framed, tx,
+                                                        )
+                                                        .await
+                                                        {
+                                                            warn!("could not complete receiving sync: {e}");
+                                                        }
+                                                        break;
                                                     }
-                                                    break;
-                                                }
+                                                },
                                             }
                                         }
 

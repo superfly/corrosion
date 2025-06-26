@@ -17,5 +17,6 @@ serde_json = { workspace = true }
 smallvec = { workspace = true }
 speedy = { workspace = true }
 strum = { workspace = true }
-thiserror = { workspace = true } 
+thiserror = { workspace = true }
 tokio = { workspace = true }
+corro-base-types = { path = "../corro-base-types" }

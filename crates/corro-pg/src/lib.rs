@@ -1486,21 +1486,9 @@ pub async fn start(
                                                                     .raw_bind_parameter(idx, dt)?;
                                                             }
 
-                                                            // t @ &Type::TIMESTAMP => {
-                                                            //     let value: time::OffsetDateTime =
-                                                            //         from_type_and_format(
-                                                            //             t,
-                                                            //             b,
-                                                            //             format_code,
-                                                            //         )?;
-
-                                                            //     trace!("binding idx {idx} w/ value: {value}");
-                                                            //     prepped
-                                                            //         .raw_bind_parameter(idx, value)?;
-                                                            // }
-                                                            t => {
-                                                                warn!("unsupported type: {t:?}");
-                                                                back_tx.blocking_send(
+                                                        t => {
+                                                            warn!("unsupported type: {t:?}");
+                                                            back_tx.blocking_send(
                                                                 (
                                                                     PgWireBackendMessage::ErrorResponse(
                                                                         ErrorInfo::new(
@@ -2312,7 +2300,6 @@ impl<'conn> Session<'conn> {
             })?;
 
         if let Some(InsertChangesInfo {
-            version,
             db_version,
             last_seq,
             ts,
@@ -2325,9 +2312,7 @@ impl<'conn> Session<'conn> {
 
             let agent = self.agent.clone();
 
-            spawn_counted(async move {
-                broadcast_changes(agent, db_version, last_seq, version, ts).await
-            });
+            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
         }
 
         Ok(())
@@ -2582,6 +2567,7 @@ impl<'a> SqliteNameRef<'a> {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 enum SqliteName {
     Id(Id),
     Name(Name),
@@ -3262,7 +3248,7 @@ fn field_types(
     let mut field_type_overrides = HashMap::new();
 
     match parsed_cmd {
-        ParsedCmd::Sqlite(Cmd::Stmt(stmt)) => match stmt {
+        ParsedCmd::Sqlite(Cmd::Stmt(
             Stmt::Select(Select {
                 body:
                     SelectBody {
@@ -3282,51 +3268,49 @@ fn field_types(
             | Stmt::Update {
                 returning: Some(cols),
                 ..
-            } => {
-                for (i, col) in cols.iter().enumerate() {
-                    if let ResultColumn::Expr(expr, _as) = col {
-                        let type_override = match expr {
-                            Expr::Cast { type_name, .. } => Some(name_to_type(&type_name.name)?),
-                            Expr::FunctionCall { name, .. }
-                            | Expr::FunctionCallStar { name, .. } => {
-                                match name.0.as_str().to_uppercase().as_ref() {
-                                    "COUNT" => Some(Type::INT8),
-                                    _ => None,
-                                }
-                            }
-                            Expr::Literal(lit) => match lit {
-                                Literal::Numeric(s) => Some(if s.contains('.') {
-                                    Type::FLOAT8
-                                } else {
-                                    Type::INT8
-                                }),
-                                Literal::String(_) => Some(Type::TEXT),
-                                Literal::Blob(_) => Some(Type::BYTEA),
-                                Literal::Keyword(_) => None,
-                                Literal::Null => None,
-                                Literal::CurrentDate => Some(Type::DATE),
-                                Literal::CurrentTime => Some(Type::TIME),
-                                Literal::CurrentTimestamp => Some(Type::TIMESTAMP),
-                            },
-                            _ => None,
-                        };
-                        if let Some(type_override) = type_override {
-                            match prepped.column_name(i) {
-                                Ok(col_name) => {
-                                    field_type_overrides.insert(col_name, type_override);
-                                }
-                                Err(e) => {
-                                    error!("col index didn't exist at {i}, attempted to override type as: {type_override}: {e}");
-                                }
+            },
+        )) => {
+            for (i, col) in cols.iter().enumerate() {
+                if let ResultColumn::Expr(expr, _as) = col {
+                    let type_override = match expr {
+                        Expr::Cast { type_name, .. } => Some(name_to_type(&type_name.name)?),
+                        Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => {
+                            match name.0.as_str().to_uppercase().as_ref() {
+                                "COUNT" => Some(Type::INT8),
+                                _ => None,
                             }
                         }
-                    } else {
-                        break;
+                        Expr::Literal(lit) => match lit {
+                            Literal::Numeric(s) => Some(if s.contains('.') {
+                                Type::FLOAT8
+                            } else {
+                                Type::INT8
+                            }),
+                            Literal::String(_) => Some(Type::TEXT),
+                            Literal::Blob(_) => Some(Type::BYTEA),
+                            Literal::Keyword(_) => None,
+                            Literal::Null => None,
+                            Literal::CurrentDate => Some(Type::DATE),
+                            Literal::CurrentTime => Some(Type::TIME),
+                            Literal::CurrentTimestamp => Some(Type::TIMESTAMP),
+                        },
+                        _ => None,
+                    };
+                    if let Some(type_override) = type_override {
+                        match prepped.column_name(i) {
+                            Ok(col_name) => {
+                                field_type_overrides.insert(col_name, type_override);
+                            }
+                            Err(e) => {
+                                error!("col index didn't exist at {i}, attempted to override type as: {type_override}: {e}");
+                            }
+                        }
                     }
+                } else {
+                    break;
                 }
             }
-            _ => {}
-        },
+        }
         ParsedCmd::Postgres(_stmt) => {
             // TODO: handle type overrides here too
             // let cols = match stmt {
@@ -3510,11 +3494,6 @@ mod tests {
             let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
             println!("CHANGE ROW: {row:?}");
 
-            let row = client
-                .query_one("SELECT * FROM __corro_bookkeeping", &[])
-                .await?;
-            println!("BK ROW: {row:?}");
-
             client
                 .batch_execute("SELECT 1; SELECT 2; SELECT 3;")
                 .await?;
@@ -3570,13 +3549,12 @@ mod tests {
             println!("t2text: {:?}", row.try_get::<_, String>(2));
 
             let now: DateTime<Utc> = Utc::now();
-            let now = NaiveDateTime::from_timestamp_micros(now.timestamp_micros()).unwrap();
             println!("NOW: {now:?}");
 
             let row = client
                 .query_one(
                     "INSERT INTO kitchensink (other_ts, id, updated_at) VALUES (?1, ?2, ?1) RETURNING updated_at",
-                    &[&now, &1i64],
+                    &[&now.naive_utc(), &1i64],
                 )
                 .await?;
 
@@ -3584,16 +3562,18 @@ mod tests {
             let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
             println!("updated_at: {updated_at:?}");
 
-            assert_eq!(now, updated_at);
+            assert_eq!(
+                now.timestamp_micros(),
+                updated_at.and_utc().timestamp_micros()
+            );
 
             let future: DateTime<Utc> = Utc::now() + Duration::from_secs(1);
-            let future = NaiveDateTime::from_timestamp_micros(future.timestamp_micros()).unwrap();
             println!("NOW: {future:?}");
 
             let row = client
                 .query_one(
                     "UPDATE kitchensink SET other_ts = $ts, updated_at = $ts WHERE id = $id AND updated_at > ? RETURNING updated_at",
-                    &[&future, &1i64, &(now - Duration::from_secs(1))],
+                    &[&future.naive_utc(), &1i64, &(now - Duration::from_secs(1)).naive_utc()],
                 )
                 .await?;
 
@@ -3601,7 +3581,10 @@ mod tests {
             let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
             println!("updated_at: {updated_at:?}");
 
-            assert_eq!(future, updated_at);
+            assert_eq!(
+                future.timestamp_micros(),
+                updated_at.and_utc().timestamp_micros()
+            );
 
             let row = client
                 .query_one(

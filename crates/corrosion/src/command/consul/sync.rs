@@ -482,7 +482,6 @@ enum ConsulCheckOp {
     Delete { id: String },
 }
 
-///
 fn update_services(
     mut services: HashMap<String, AgentService>,
     hashes: &HashMap<String, u64>,
@@ -759,7 +758,7 @@ mod tests {
                 port INTEGER NOT NULL DEFAULT 0,
                 address TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER NOT NULL DEFAULT 0,
-                app_id INTEGER AS (CAST(JSON_EXTRACT(meta, '$.app_id') AS INTEGER)),        
+                app_id INTEGER AS (CAST(JSON_EXTRACT(meta, '$.app_id') AS INTEGER)),
                 source TEXT,
 
                 PRIMARY KEY (node, id)

@@ -2,9 +2,6 @@
 //!
 //! This module is _big_ and maybe should be split up further.
 
-use std::collections::HashMap;
-use std::ops::RangeInclusive;
-
 use std::{
     cmp,
     collections::VecDeque,
@@ -21,28 +18,27 @@ use crate::{
     api::peer::parallel_sync,
     transport::Transport,
 };
+use antithesis_sdk::{assert_always, assert_sometimes};
 use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{get_last_cleared_ts, Agent, Bookie, SplitPool},
+    agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, Changeset, FocaInput},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
     channel::CorroReceiver,
     members::MemberAddedResult,
     sync::generate_sync,
 };
 
 use bytes::Bytes;
-use corro_types::agent::ChangeError;
-use corro_types::base::Version;
 use corro_types::broadcast::Timestamp;
-use corro_types::change::store_empty_changeset;
 use foca::Notification;
 use indexmap::map::Entry;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
+use serde_json::json;
 use spawn::spawn_counted;
 use tokio::time::sleep;
 use tokio::{
@@ -232,6 +228,8 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire
                             } else {
                                 debug!("successfully sent announce message");
                             }
+
+                            assert_sometimes!(true, "Corrosion bootstraps with other nodes")
                         }
                     }
                     Err(e) => {
@@ -295,26 +293,7 @@ pub async fn handle_notifications(
                         debug!("Member Added {actor:?}");
                         counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
 
-                        let last_cleared_ts = {
-                            match agent.pool().read().await {
-                                Ok(conn) => {
-                                    get_last_cleared_ts(&conn, actor.id()).unwrap_or_else(|e| {
-                                        error!("could not get last_empty_ts: {e}");
-                                        None
-                                    })
-                                }
-                                Err(e) => {
-                                    error!("could not get read conn: {e}");
-                                    None
-                                }
-                            }
-                        };
-
-                        let members_len = {
-                            let mut members = agent.members().write();
-                            members.update_last_empty(&actor.id(), last_cleared_ts);
-                            members.states.len() as u32
-                        };
+                        let members_len = { agent.members().read().states.len() as u32 };
 
                         // actually added a member
                         // notify of new cluster size
@@ -395,6 +374,7 @@ fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()>
     debug!("handling db_cleanup (WAL truncation)");
     let start = Instant::now();
 
+    assert_sometimes!(true, "Corrosion truncates WAL");
     let orig: u64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
     conn.pragma_update(None, "busy_timeout", timeout)?;
 
@@ -481,7 +461,7 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
     let pool = agent.pool().clone();
 
     tokio::spawn(async move {
-        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024 * 1024;
+        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024;
 
         // try to initially truncate the WAL
         match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold).await
@@ -523,7 +503,16 @@ async fn wal_checkpoint_over_threshold(
     pool: &SplitPool,
     threshold: u64,
 ) -> eyre::Result<bool> {
-    let should_truncate = wal_path.metadata()?.len() > threshold;
+    let wal_size = wal_path.metadata()?.len();
+    let should_truncate = wal_size > threshold;
+    let warn_threshold = 25 * 1024 * 1024 * 1024;
+    let wal_size_gb = wal_size / 1024 / 1024 / 1024;
+    let details = json!({"wal_size": wal_size_gb});
+    assert_always!(
+        wal_size < warn_threshold,
+        "wal_size is under 25gb",
+        &details
+    );
     if should_truncate {
         let timeout = calc_busy_timeout(wal_path.metadata()?.len(), threshold);
         let conn = pool.write_low().await?;
@@ -550,206 +539,6 @@ fn calc_busy_timeout(wal_size: u64, threshold: u64) -> u64 {
         warn!("WAL size is too large, setting busy timeout {timeout}ms");
     }
     timeout
-}
-
-/// Handle incoming emptyset received during syncs
-///_
-#[allow(dead_code)]
-pub async fn handle_emptyset(
-    agent: Agent,
-    bookie: Bookie,
-    mut rx_emptysets: CorroReceiver<ChangeV1>,
-    mut tripwire: Tripwire,
-) {
-    type EmptyQueue = VecDeque<(Vec<RangeInclusive<Version>>, Timestamp)>;
-    let mut buf: HashMap<ActorId, EmptyQueue> = HashMap::new();
-
-    let mut join_set: JoinSet<HashMap<ActorId, EmptyQueue>> = JoinSet::new();
-
-    loop {
-        tokio::select! {
-            res = join_set.join_next(), if !join_set.is_empty() => {
-                debug!("processed emptysets!");
-                if let Some(Ok(res)) = res {
-                    for (actor_id, mut changes) in res {
-                        if !changes.is_empty() {
-                            let curr = buf.entry(actor_id).or_default();
-                            changes.append(curr);
-                            *curr = changes;
-                        }
-                    }
-                }
-            },
-            maybe_change_src = rx_emptysets.recv() => match maybe_change_src {
-                Some(change) => {
-                    if let Changeset::EmptySet { versions, ts } = change.changeset {
-                        buf.entry(change.actor_id).or_default().push_back((versions.clone(), ts));
-                    } else {
-                        warn!("received non-emptyset changes in emptyset channel from {}", change.actor_id);
-                    }
-                },
-                None => break,
-            },
-            _ = &mut tripwire => {
-                break;
-            }
-        }
-
-        if join_set.is_empty() && !buf.is_empty() {
-            let mut to_process = std::mem::take(&mut buf);
-            let agent = agent.clone();
-            let bookie = bookie.clone();
-            join_set.spawn(async move {
-                for (actor, changes) in &mut to_process {
-                    while !changes.is_empty() {
-                        let change = changes.pop_front().unwrap();
-                        if let Some(booked) = bookie
-                            .read("process_emptyset(check ts)",actor.as_simple())
-                            .await
-                            .get(actor)
-                        {
-                            let booked_read = booked
-                                .read("process_emptyset(booked writer, ts timestamp)", actor.as_simple())
-                                .await;
-
-                            if let Some(seen_ts) = booked_read.last_cleared_ts() {
-                                if seen_ts > change.1 {
-                                    warn!("skipping change because last cleared ts '{:?}' is greater than empty ts: {:?}",
-                                        seen_ts, change.1);
-                                    continue;
-                                }
-                            }
-                        }
-                        match process_emptyset(agent.clone(), bookie.clone(), *actor, &change).await
-                        {
-                            Ok(()) => {}
-                            Err(e) => {
-                                warn!("encountered error when processing emptyset - {e}");
-                                changes.push_front(change);
-                                break;
-                            }
-                        }
-                    }
-                }
-                to_process
-            });
-        };
-    }
-
-    info!("shutting down handle empties loop");
-}
-
-#[allow(dead_code)]
-pub async fn process_emptyset(
-    agent: Agent,
-    bookie: Bookie,
-    actor_id: ActorId,
-    changes: &(Vec<RangeInclusive<Version>>, Timestamp),
-) -> Result<(), ChangeError> {
-    let (versions, ts) = changes;
-
-    let version_iter = versions.chunks(100);
-
-    for chunk in version_iter {
-        let mut conn = agent.pool().write_low().await?;
-        debug!("processing emptyset from {:?}", actor_id);
-        let booked = {
-            bookie
-                .write(
-                    "process_emptyset(booked writer, updates timestamp)",
-                    actor_id.as_simple(),
-                )
-                .await
-                .ensure(actor_id)
-        };
-
-        let mut booked_write = booked
-            .write(
-                "process_emptyset(booked writer, updates timestamp)",
-                actor_id.as_simple(),
-            )
-            .await;
-
-        let mut snap = booked_write.snapshot();
-
-        debug!(self_actor_id = %agent.actor_id(), "processing emptyset changes, len: {}", versions.len());
-        block_in_place(|| {
-            let tx = conn
-                .immediate_transaction()
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: None,
-                    version: None,
-                })?;
-
-            for version in chunk {
-                store_empty_changeset(&tx, actor_id, version.clone(), *ts)?;
-            }
-
-            snap.insert_db(&tx, RangeInclusiveSet::from_iter(chunk.iter().cloned()))
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: None,
-                    version: None,
-                })?;
-
-            tx.commit().map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: None,
-                version: None,
-            })?;
-
-            booked_write.commit_snapshot(snap);
-            counter!("corro.sync.empties.count", "actor" => format!("{}", actor_id.to_string()))
-                .increment(chunk.len() as u64);
-
-            Ok::<_, ChangeError>(())
-        })?;
-    }
-
-    let mut conn = agent.pool().write_low().await?;
-    let booked = {
-        bookie
-            .write(
-                "process_emptyset(booked writer, updates timestamp)",
-                actor_id.as_simple(),
-            )
-            .await
-            .ensure(actor_id)
-    };
-
-    let mut booked_write = booked
-        .write(
-            "process_emptyset(booked writer, updates timestamp)",
-            actor_id.as_simple(),
-        )
-        .await;
-
-    let tx = conn
-        .immediate_transaction()
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
-        })?;
-
-    let mut snap = booked_write.snapshot();
-    snap.update_cleared_ts(&tx, *ts)
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
-        })?;
-
-    tx.commit().map_err(|source| ChangeError::Rusqlite {
-        source,
-        actor_id: None,
-        version: None,
-    })?;
-
-    booked_write.commit_snapshot(snap);
-
-    Ok(())
 }
 
 /// Bundle incoming changes to optimise transaction sizes with SQLite
@@ -853,6 +642,7 @@ pub async fn handle_changes(
                 if buf_cost < max_changes_chunk && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     // we can process this right away
                     debug!(%buf_cost, "spawning processing multiple changes from max wait interval");
+                    assert_sometimes!(true, "Corrosion processes changes");
                     let changes: Vec<_> = queue.drain(..).collect();
                     let agent = agent.clone();
                     let bookie = bookie.clone();
@@ -960,7 +750,12 @@ pub async fn handle_changes(
             }
         }
 
+        assert_sometimes!(
+            matches!(src, ChangeSource::Sync),
+            "Corrosion receives changes through sync"
+        );
         if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
+            assert_sometimes!(true, "Corrosion rebroadcasts changes");
             if let Err(_e) =
                 agent
                     .tx_bcast()
@@ -1028,7 +823,8 @@ pub async fn handle_sync(
 
         debug!("found {} candidates to synchronize with", candidates.len());
 
-        let desired_count = cmp::max(cmp::min(candidates.len() / 100, 10), 3);
+        assert_sometimes!(true, "Corrosion syncs with other nodes");
+        let desired_count = (candidates.len() / 100).clamp(3, 10);
         debug!("Selected {desired_count} nodes to sync with");
 
         let mut rng = StdRng::from_entropy();
@@ -1060,19 +856,8 @@ pub async fn handle_sync(
         return Ok(());
     }
 
-    let mut last_cleared: HashMap<ActorId, Option<Timestamp>> = HashMap::new();
-
-    for (actor_id, _) in chosen.clone() {
-        let last_ts = match agent.members().read().states.get(&actor_id) {
-            Some(state) => state.last_empty_ts,
-            None => None,
-        };
-
-        last_cleared.insert(actor_id, last_ts);
-    }
-
     let start = Instant::now();
-    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state, last_cleared).await {
+    let n = match parallel_sync(agent, transport, chosen.clone(), sync_state).await {
         Ok(n) => n,
         Err(e) => {
             error!("failed to execute parallel sync: {e:?}");
@@ -1107,7 +892,8 @@ mod tests {
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::{
-        base::CrsqlDbVersion, base::Version, change::Change, config::Config, pubsub::pack_columns,
+        base::CrsqlDbVersion, broadcast::Changeset, change::Change, config::Config,
+        pubsub::pack_columns,
     };
     use rusqlite::Connection;
     use std::sync::Arc;
@@ -1187,7 +973,7 @@ mod tests {
                     ChangeV1 {
                         actor_id: other_actor,
                         changeset: Changeset::Full {
-                            version: Version(i as u64),
+                            version: CrsqlDbVersion(i as u64),
                             changes: vec![crsql_row.clone()],
                             seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                             last_seq: CrsqlSeq(0),
@@ -1209,10 +995,10 @@ mod tests {
             .unwrap()
             .read::<&str, _>("test", None)
             .await;
-        assert!(booked.contains_all(Version(6)..=Version(10), None));
-        assert!(booked.contains_all(Version(1)..=Version(3), None));
-        assert!(!booked.contains_version(&Version(5)));
-        assert!(!booked.contains_version(&Version(4)));
+        assert!(booked.contains_all(CrsqlDbVersion(6)..=CrsqlDbVersion(10), None));
+        assert!(booked.contains_all(CrsqlDbVersion(1)..=CrsqlDbVersion(3), None));
+        assert!(!booked.contains_version(&CrsqlDbVersion(5)));
+        assert!(!booked.contains_version(&CrsqlDbVersion(4)));
 
         Ok(())
     }

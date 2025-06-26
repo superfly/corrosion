@@ -1,0 +1,45 @@
+steps:
+  - label: "🔨 Build Corrosion and Workload"
+    priority: 70
+    key: build-corrosion
+    commands:
+      - docker build -f .antithesis/corrosion/Dockerfile -t corrosion .
+      - docker tag corrosion ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT:0:8}
+      - docker push ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT:0:8}
+      # client image is built from corrosion image
+      - docker build -f .antithesis/client/Dockerfile -t ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT:0:8} .
+      - docker push ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT:0:8}
+    plugins:
+      - docker-login#v3.0.0:
+          username: _json_key
+          password-env: ANTITHESIS_REGISTRY_PASSWORD
+          server: https://us-central1-docker.pkg.dev
+    agents:
+      queue: "high-concurrency"
+    env:
+      ANTITHESIS_REGISTRY_PASSWORD: "$ANTITHESIS_REGISTRY_PASSWORD"
+      ANTITHESIS_REGISTRY: "$ANTITHESIS_REGISTRY"
+
+  - label: "🔨 Build Config"
+    priority: 70
+    key: build-config
+    commands:
+      - export SHORT_COMMIT=${BUILDKITE_COMMIT:0:8}
+      - envsubst < .antithesis/config/docker-compose.yaml.tmpl > .antithesis/config/docker-compose.yaml
+      - docker build -f .antithesis/Dockerfile -t ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT:0:8} .
+      - docker push ${ANTITHESIS_REGISTRY}/antithesis-config:${BUILDKITE_COMMIT:0:8}
+    plugins:
+      - docker-login#v3.0.0:
+          username: _json_key
+          password-env: ANTITHESIS_REGISTRY_PASSWORD
+          server: https://us-central1-docker.pkg.dev
+    agents:
+      queue: "high-concurrency"
+    depends_on: [build-corrosion]
+
+  - label: "☁️ Test on Antithesis"
+    priority: 50
+    key: deploy
+    commands:
+      - .buildkite-antithesis/scripts/test.sh
+    depends_on: [build-config]
