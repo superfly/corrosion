@@ -466,7 +466,7 @@ fn handle_need(
                                 SELECT 1
                                 FROM __corro_buffered_changes
                                     WHERE site_id = :actor_id
-                                      AND version = :version
+                                      AND db_version = :version
                             ) AS buffered",
                         )?
                         .query_row(
@@ -487,10 +487,10 @@ fn handle_need(
 
                     let seqs = tx
                         .prepare_cached("
-                        SELECT start_seq, end_seq, last_seq FROM __corro_seq_bookkeeping WHERE site_id = :actor_id AND version = :version
+                        SELECT start_seq, end_seq, last_seq FROM __corro_seq_bookkeeping WHERE site_id = :actor_id AND db_version = :db_version
                         ")?.query_map(named_params!{
                             ":actor_id": actor_id,
-                            ":version": version
+                            ":db_version": version
                         },|row| Ok((row.get(0)?..=row.get(1)?, row.get(2)?)))?.collect::<rusqlite::Result<Vec<(RangeInclusive<CrsqlSeq>, CrsqlSeq)>>>()?;
 
                     for (range_needed, last_seq) in seqs {
@@ -499,7 +499,7 @@ fn handle_need(
                                 SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                                     FROM __corro_buffered_changes
                                     WHERE site_id = :actor_id
-                                        AND version = :version
+                                        AND db_version = :db_version
                                         AND seq BETWEEN :start_seq AND :end_seq
                                     ORDER BY seq ASC
                             "#,
@@ -511,7 +511,7 @@ fn handle_need(
                         let rows = prepped.query_map(
                             named_params! {
                                 ":actor_id": actor_id,
-                                ":version": version,
+                                ":db_version": version,
                                 ":start_seq": start_seq,
                                 ":end_seq": end_seq
                             },
@@ -602,7 +602,7 @@ fn handle_need(
                                 SELECT 1
                                 FROM __corro_buffered_changes
                                     WHERE site_id = :actor_id
-                                      AND version = :version
+                                      AND db_version = :version
                             ) AS buffered",
                         )?
                         .query_row(
@@ -627,7 +627,7 @@ fn handle_need(
                                     FROM __corro_seq_bookkeeping
                                     WHERE
                                         site_id = :actor_id AND
-                                        version = :version AND
+                                        db_version = :db_version AND
                                         (
                                             -- [:start]---[start_seq]---[:end]
                                             ( start_seq BETWEEN :start AND :end ) OR
@@ -646,7 +646,7 @@ fn handle_need(
                             .query_map(
                                 named_params! {
                                     ":actor_id": actor_id,
-                                    ":version": version,
+                                    ":db_version": version,
                                     ":start": seqs_range.start(),
                                     ":end": seqs_range.end(),
                                 },
@@ -663,7 +663,7 @@ fn handle_need(
                                     SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                                         FROM __corro_buffered_changes
                                         WHERE site_id = :actor_id
-                                            AND version = :version
+                                            AND db_version = :version
                                             AND seq BETWEEN :start_seq AND :end_seq
                                         ORDER BY seq ASC
                                 "#,

@@ -1620,7 +1620,7 @@ mod tests {
         {
             let conn = ta1.agent.pool().read().await?;
             let end = conn.query_row(
-                "SELECT end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version = ?",
+                "SELECT end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version = ?",
                 (actor_id, 2),
                 |row| row.get::<_, CrsqlSeq>(0),
             )?;

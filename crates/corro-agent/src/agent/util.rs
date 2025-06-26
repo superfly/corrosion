@@ -445,12 +445,12 @@ pub async fn clear_buffered_meta_loop(
 
                         // sub query required due to DELETE and LIMIT interaction
                         let seq_count = tx
-                            .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id,version, start_seq) IN (SELECT site_id, version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+                            .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, db_version, start_seq) IN (SELECT site_id, db_version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version >= ? AND db_version <= ? LIMIT ?)")?
                             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
                         // sub query required due to DELETE and LIMIT interaction
                         let buf_count = tx
-                            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, version, seq) IN (SELECT site_id, db_version, version, seq FROM __corro_buffered_changes WHERE site_id = ? AND version >= ? AND version <= ? LIMIT ?)")?
+                            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, seq) IN (SELECT site_id, db_version, seq FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ? LIMIT ?)")?
                             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
                         tx.commit()?;
@@ -613,7 +613,7 @@ pub async fn process_fully_buffered_changes(
                             SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq
                                 FROM __corro_buffered_changes
                                     WHERE site_id = ?
-                                    AND version = ?
+                                    AND db_version = ?
                                     ORDER BY db_version ASC, seq ASC
                                     "#,
                     ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
@@ -871,6 +871,8 @@ pub async fn process_multiple_changes(
         if elapsed >= PROCESSING_WARN_THRESHOLD {
             warn!("process_multiple_changes:: process_single_version took too long - {elapsed:?}");
         }
+
+        let sub_start = Instant::now();
         let mut snapshots = BTreeMap::new();
 
         for (actor_id, processed) in processed.iter() {
@@ -915,11 +917,27 @@ pub async fn process_multiple_changes(
 
         debug!("inserted {count} new changesets");
 
-        tx.commit().map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
+        tx.commit().map_err(|source| {
+            // only sqlite error we expect is SQLITE_FULL if disk is full
+            if source
+                .sqlite_error_code()
+                .is_some_and(|code| code != rusqlite::ErrorCode::DiskFull)
+            {
+                let details =
+                    json!({"elapsed": elapsed.as_secs_f32(), "error": source.to_string()});
+                assert_unreachable!("error committing transaction", &details);
+            }
+            ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            }
         })?;
+
+        let elapsed = sub_start.elapsed();
+        if elapsed >= PROCESSING_WARN_THRESHOLD {
+            warn!("process_multiple_changes: commiting transaction took too long - {elapsed:?}");
+        }
 
         for (_, changeset, _, _) in changesets.iter() {
             if let Some(ts) = changeset.ts() {
@@ -1029,10 +1047,10 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
             .prepare_cached(
                 r#"
                 INSERT INTO __corro_buffered_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, version)
+                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
                 VALUES
-                    (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq, :version)
-                ON CONFLICT (site_id, db_version, version, seq)
+                    (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq)
+                ON CONFLICT (site_id, db_version, seq)
                     DO NOTHING
             "#,
             )?
@@ -1046,7 +1064,6 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
                 ":site_id": &change.site_id,
                 ":cl": change.cl,
                 ":seq": change.seq,
-                ":version": version,
             })?;
 
         inserted += new_insertion;
@@ -1064,7 +1081,7 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
         .prepare_cached(
             "
             DELETE FROM __corro_seq_bookkeeping
-                WHERE site_id = :actor_id AND version = :version AND
+                WHERE site_id = :actor_id AND db_version = :db_version AND
                 (
                     -- [:start]---[start_seq]---[:end]
                     ( start_seq BETWEEN :start AND :end ) OR
@@ -1090,7 +1107,7 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
         .query_map(
             named_params![
                 ":actor_id": actor_id,
-                ":version": version,
+                ":db_version": version,
                 ":start": seqs.start(),
                 ":end": seqs.end(),
             ],
@@ -1102,6 +1119,12 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
     new_ranges.insert(seqs.clone());
 
+    let details = json!({"new_ranges": new_ranges});
+    assert_always!(
+        new_ranges.len() == 1,
+        "deleted non-contiguous seq ranges!",
+        &details
+    );
     // we should never have deleted non-contiguous seq ranges, abort!
     if new_ranges.len() > 1 {
         warn!("deleted non-contiguous seq ranges! {new_ranges:?}");
@@ -1114,7 +1137,7 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
         sp
         .prepare_cached(
             "
-                INSERT INTO __corro_seq_bookkeeping (site_id, version, start_seq, end_seq, last_seq, ts)
+                INSERT INTO __corro_seq_bookkeeping (site_id, db_version, start_seq, end_seq, last_seq, ts)
                     VALUES (?, ?, ?, ?, ?, ?);
             ",
         )?
@@ -1150,7 +1173,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     let len = changes.len();
 
-    debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, max db version: {max_db_version}");
+    debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, db version: {version}");
 
     let details = json!({"len": len, "seqs": seqs.start().0, "seqs_end": seqs.end().0});
     assert_always!(
@@ -1245,7 +1268,7 @@ pub fn check_buffered_meta_to_clear(
         return Ok(true);
     }
 
-    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND version >= ? AND version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version >= ? AND db_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
 }
 
 pub fn log_at_pow_10(msg: &str, count: &mut u64) {

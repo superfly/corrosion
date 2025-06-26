@@ -277,7 +277,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 -- remote actor / site id
                 site_id BLOB NOT NULL,
                 -- remote internal version
-                version INTEGER NOT NULL,
+                db_version INTEGER NOT NULL,
 
                 -- start and end seq for this bookkept record
                 start_seq INTEGER NOT NULL,
@@ -288,7 +288,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 -- timestamp, need to propagate...
                 ts TEXT NOT NULL,
 
-                PRIMARY KEY (site_id, version, start_seq)
+                PRIMARY KEY (site_id, db_version, start_seq)
             ) WITHOUT ROWID;
 
             -- buffered changes (similar schema as crsql_changes)
@@ -303,9 +303,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 seq INTEGER NOT NULL,
                 cl INTEGER NOT NULL, -- causal length
 
-                version INTEGER NOT NULL,
-
-                PRIMARY KEY (site_id, db_version, version, seq)
+                PRIMARY KEY (site_id, db_version, seq)
             ) WITHOUT ROWID;
 
             -- SWIM memberships
@@ -1225,7 +1223,7 @@ impl BookedVersions {
         {
             // fetch known partial sequences
             let mut prepped = conn.prepare_cached(
-            "SELECT version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
+            "SELECT db_version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
             )?;
             let mut rows = prepped.query([actor_id])?;
 

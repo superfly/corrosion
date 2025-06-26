@@ -36,10 +36,11 @@ use crate::{
     },
     transport::Transport,
 };
-use corro_types::updates::UpdatesManager;
 use corro_types::{
     actor::ActorId,
-    agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, SplitPool},
+    agent::{
+        migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool,
+    },
     base::CrsqlDbVersion,
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
@@ -48,6 +49,7 @@ use corro_types::{
     pubsub::{Matcher, SubsManager},
     schema::{init_schema, Schema},
     sqlite::CrConn,
+    updates::UpdatesManager,
 };
 
 /// Runtime state for the Corrosion agent
@@ -205,19 +207,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
                 if top.values().any(|meta| {
                     let duration = meta.started_at.elapsed();
-                    if matches!(meta.state, LockState::Locked) {
-                        let details = json!({
-                            "duration": duration,
-                            "label": meta.label,
-                            "kind": meta.kind,
-                            "state": meta.state,
-                        });
-                        assert_always!(
-                            duration < Duration::from_secs(1 * 60),
-                            "bookie lock held for too long",
-                            &details
-                        );
-                    }
                     duration >= WARNING_THRESHOLD
                 }) {
                     warn!(
@@ -231,6 +220,20 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                             "{} (id: {id}, type: {:?}, state: {:?}) locked for: {duration:?}",
                             lock.label, lock.kind, lock.state
                         );
+
+                        if matches!(lock.state, LockState::Locked) {
+                            let details = json!({
+                                "duration": duration,
+                                "label": lock.label,
+                                "kind": lock.kind,
+                                "state": lock.state,
+                            });
+                            assert_always!(
+                                duration < Duration::from_secs(1 * 60),
+                                "bookie lock held for too long",
+                                &details
+                            );
+                        }
 
                         if duration >= WARNING_THRESHOLD {
                             counter!("corro.agent.lock.slow.count", "name" => lock.label)

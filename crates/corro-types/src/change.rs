@@ -5,7 +5,7 @@ pub use corro_api_types::{row_to_change, Change, SqliteValue};
 use corro_base_types::CrsqlDbVersion;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::{
     agent::{Agent, BookedVersions, ChangeError, VersionsSnapshot},
@@ -177,7 +177,7 @@ pub fn insert_local_changes(
     match version_max_seq {
         None => Ok(None),
         Some(last_seq) => {
-            trace!("found db_version {db_version} (last seq: {last_seq})");
+            debug!("found db_version {db_version} (last seq: {last_seq})");
 
             let db_versions = db_version..=db_version;
 

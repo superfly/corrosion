@@ -39,8 +39,11 @@ def main():
         print(f"getting sync state for {config}")
         result = subprocess.run(f"corrosion --config {config} sync generate", shell=True, capture_output=True, text=True)
         if result.returncode != 0:
+            print(f"failed to generate sync data for {config}: {result.stderr}")
             exit(1)
         print(result.stdout)
+        data = json.loads('\n'.join(result.stdout.strip().split("\n")[1:]))
+        actor_id = data["actor_id"]
         sync_states[actor_id] = data
         need_count = calculate_need(data)
         if need_count > 0:

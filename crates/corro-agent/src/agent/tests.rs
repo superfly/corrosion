@@ -732,7 +732,9 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         if count as usize != expected_count {
             let buf_count: Vec<(CrsqlDbVersion, u64)> = conn
-                .prepare("select version,count(*) from __corro_buffered_changes group by version")?
+                .prepare(
+                    "select db_version,count(*) from __corro_buffered_changes group by db_version",
+                )?
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             println!(
@@ -1209,7 +1211,7 @@ async fn check_bookie_versions(
         for version in versions.0.clone() {
             let bk: Vec<(ActorId, CrsqlDbVersion, CrsqlSeq, CrsqlSeq)> = conn
                 .prepare(
-                    "SELECT site_id, version, start_seq, end_seq FROM __corro_seq_bookkeeping where version = ?",
+                    "SELECT site_id, db_version, start_seq, end_seq FROM __corro_seq_bookkeeping where db_version = ?",
                 )?
                 .query_map([version], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
