@@ -508,7 +508,7 @@ pub async fn api_v1_queries(
     }
 }
 
-async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
+pub(crate) async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
     let new_sql: String = statements.join(";");
 
     let partial_schema = parse_sql(&new_sql)?;
