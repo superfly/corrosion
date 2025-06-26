@@ -1,5 +1,6 @@
 pub mod sub;
 
+use corro_agent::agent::util::read_files_from_paths;
 use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
 use hickory_resolver::{
     error::{ResolveError, ResolveErrorKind},
@@ -21,7 +22,7 @@ use tokio::{
     sync::{RwLock, RwLockReadGuard},
     time::timeout,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 const HTTP2_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -344,80 +345,12 @@ impl CorrosionApiClient {
         &self,
         schema_paths: &[P],
     ) -> Result<Option<ExecResponse>, Error> {
-        let mut statements = vec![];
-
-        for schema_path in schema_paths.iter() {
-            match tokio::fs::metadata(schema_path).await {
-                Ok(meta) => {
-                    if meta.is_dir() {
-                        match tokio::fs::read_dir(schema_path).await {
-                            Ok(mut dir) => {
-                                let mut entries = vec![];
-
-                                while let Ok(Some(entry)) = dir.next_entry().await {
-                                    entries.push(entry);
-                                }
-
-                                let mut entries: Vec<_> = entries
-                                    .into_iter()
-                                    .filter_map(|entry| {
-                                        entry.path().extension().and_then(|ext| {
-                                            if ext == "sql" {
-                                                Some(entry)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                    })
-                                    .collect();
-
-                                entries.sort_by_key(|entry| entry.path());
-
-                                for entry in entries.iter() {
-                                    match tokio::fs::read_to_string(entry.path()).await {
-                                        Ok(s) => {
-                                            statements.push(Statement::Simple(s));
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "could not read schema file '{}', error: {e}",
-                                                entry.path().display()
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "could not read dir '{}', error: {e}",
-                                    schema_path.as_ref().display()
-                                );
-                            }
-                        }
-                    } else if meta.is_file() {
-                        match tokio::fs::read_to_string(schema_path).await {
-                            Ok(s) => {
-                                statements.push(Statement::Simple(s));
-                                // pushed.push(schema_path.clone());
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "could not read schema file '{}', error: {e}",
-                                    schema_path.as_ref().display()
-                                );
-                            }
-                        }
-                    }
-                }
-
-                Err(e) => {
-                    warn!(
-                        "could not read schema file meta '{}', error: {e}",
-                        schema_path.as_ref().display()
-                    );
-                }
-            }
-        }
+        let statements: Vec<Statement> = read_files_from_paths(schema_paths)
+            .await
+            .map_err(|e| Error::ResponseError(e.to_string()))?
+            .into_iter()
+            .map(Statement::Simple)
+            .collect();
 
         if statements.is_empty() {
             return Ok(None);

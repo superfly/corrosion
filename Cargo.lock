@@ -870,6 +870,7 @@ name = "corro-client"
 version = "0.1.0-alpha.1"
 dependencies = [
  "bytes",
+ "corro-agent",
  "corro-api-types",
  "futures",
  "hickory-resolver",

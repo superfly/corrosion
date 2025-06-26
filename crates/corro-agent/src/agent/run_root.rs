@@ -2,6 +2,7 @@
 
 use std::time::Instant;
 
+use crate::api::public::execute_schema;
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
@@ -91,6 +92,14 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
 
     // Load existing cluster members into the SWIM runtime
     util::initialise_foca(&agent).await;
+
+    // Load schema from paths
+    let stmts = util::read_files_from_paths(&agent.config().db.schema_paths).await?;
+    if !stmts.is_empty() {
+        if let Err(e) = execute_schema(&agent, stmts).await {
+            error!("could not execute schema: {e}");
+        }
+    }
 
     // Setup client http API
     util::setup_http_api_handler(
