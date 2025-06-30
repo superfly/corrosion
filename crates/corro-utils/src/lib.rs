@@ -82,4 +82,3 @@ pub async fn read_files_from_paths<P: AsRef<Path>>(
 
     Ok(contents)
 }
-
