@@ -1,6 +1,5 @@
 pub mod sub;
 
-use corro_agent::agent::util::read_files_from_paths;
 use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
 use hickory_resolver::{
     error::{ResolveError, ResolveErrorKind},
@@ -345,7 +344,7 @@ impl CorrosionApiClient {
         &self,
         schema_paths: &[P],
     ) -> Result<Option<ExecResponse>, Error> {
-        let statements: Vec<Statement> = read_files_from_paths(schema_paths)
+        let statements: Vec<Statement> = corro_utils::read_files_from_paths(schema_paths)
             .await
             .map_err(|e| Error::ResponseError(e.to_string()))?
             .into_iter()
