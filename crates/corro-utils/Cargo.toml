@@ -1,0 +1,9 @@
+[package]
+name = "corro-utils"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eyre = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
