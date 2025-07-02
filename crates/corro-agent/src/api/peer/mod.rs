@@ -848,12 +848,17 @@ async fn process_sync(
                     for need in needs {
                         match &need {
                             SyncNeedV1::Full { versions } => {
-                                if versions.clone().all(|v| booked_read.needed().contains(&v)) {
+                                if versions.clone().all(|v| {
+                                    booked_read.needed().contains(&v)
+                                        || booked_read.last().is_some_and(|max| v > max)
+                                }) {
                                     continue;
                                 }
                             }
                             SyncNeedV1::Partial { version, .. } => {
-                                if booked_read.needed().contains(version) {
+                                if booked_read.needed().contains(version)
+                                    || booked_read.last().is_some_and(|max| *version > max)
+                                {
                                     continue;
                                 }
                             }
@@ -1334,9 +1339,10 @@ pub async fn parallel_sync(
                                 .increment(changes_len as u64);
 
                             debug!(
-                                "handling versions: {:?}, seqs: {:?}, len: {changes_len}",
+                                "handling versions: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}) from {actor_id}",
                                 change.versions(),
-                                change.seqs()
+                                change.seqs(),
+                                change.is_empty()
                             );
                             // only accept emptyset that's from the same node that's syncing
                             if change.is_empty_set() {
