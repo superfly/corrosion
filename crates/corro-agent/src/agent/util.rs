@@ -844,16 +844,15 @@ pub async fn process_multiple_changes(
                         }
                     };
 
-                    let versions = changeset.versions();
                     if let KnownDbVersion::Current(CurrentVersion { db_version, .. }) = &known {
                         // last_db_version = Some(*db_version);
                         changesets.push((actor_id, changeset, *db_version, src));
                     }
 
-                    debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "got known to insert: {known:?}");
                     known
                 };
 
+                debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "got known to insert: {known:?}");
                 let partial = match known {
                     KnownDbVersion::Partial(partial) => Some(partial),
                     _ => None,
