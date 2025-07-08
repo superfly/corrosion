@@ -374,7 +374,7 @@ fn handle_need(
     need: SyncNeedV1,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
-    debug!(%actor_id, "handle known versions! need: {need:?}");
+    let start = Instant::now();
 
     let mut empties: RangeInclusiveSet<CrsqlDbVersion> = RangeInclusiveSet::new();
 
@@ -393,7 +393,7 @@ fn handle_need(
     ",
     )?;
 
-    match need {
+    match need.clone() {
         SyncNeedV1::Full { versions } => {
             let mut rows = prepped.query(named_params! {
                 ":actor_id": actor_id,
@@ -717,6 +717,7 @@ fn handle_need(
         }
     }
 
+    debug!(%actor_id, "handle known versions! need: {need:?} in {:?}", start.elapsed());
     Ok(())
 }
 
