@@ -3,9 +3,9 @@ use std::{iter::Peekable, ops::RangeInclusive};
 use antithesis_sdk::assert_always;
 pub use corro_api_types::{row_to_change, Change, SqliteValue};
 use corro_base_types::CrsqlDbVersion;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde_json::json;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::{
     agent::{Agent, BookedVersions, ChangeError, VersionsSnapshot},
@@ -142,7 +142,6 @@ pub fn insert_local_changes(
     book_writer: &mut tokio::sync::RwLockWriteGuard<'_, BookedVersions>,
 ) -> Result<Option<InsertChangesInfo>, ChangeError> {
     let actor_id = agent.actor_id();
-    let ts = Timestamp::from(agent.clock().new_timestamp());
 
     let db_version: CrsqlDbVersion = tx
         .prepare_cached("SELECT crsql_peek_next_db_version()")
@@ -158,26 +157,37 @@ pub fn insert_local_changes(
             version: None,
         })?;
 
-    let version_max_seq: Option<CrsqlSeq> = tx
-        .prepare_cached("SELECT MAX(seq) FROM crsql_changes WHERE site_id = ? AND db_version = ?;")
+    let version_info: (Option<CrsqlSeq>, Option<Timestamp>) = tx
+        .prepare_cached(
+            "SELECT MAX(seq), MAX(ts) FROM crsql_changes WHERE site_id = ? AND db_version = ?;",
+        )
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
             version: None,
         })?
-        .query_row((agent.actor_id(), db_version), |row| row.get(0))
-        .optional()
+        .query_row((agent.actor_id(), db_version), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
             version: None,
-        })?
-        .flatten();
+        })?;
 
-    match version_max_seq {
-        None => Ok(None),
-        Some(last_seq) => {
-            debug!("found db_version {db_version} (last seq: {last_seq})");
+    match version_info {
+        (None, None) => Ok(None),
+        (None, Some(ts)) => {
+            warn!("found db_version {db_version} without seq, last ts: {ts:?})");
+            Ok(None)
+        }
+        (Some(last_seq), ts) => {
+            let ts = ts.unwrap_or_else(|| {
+                warn!("found db_version {db_version} without seq, last ts: {ts:?}");
+                Timestamp::from(agent.clock().new_timestamp())
+            });
+
+            debug!("found db_version {db_version} (last seq: {last_seq}, last ts: {ts})");
 
             let db_versions = db_version..=db_version;
 

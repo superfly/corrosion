@@ -16,7 +16,7 @@ use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
-    broadcast::broadcast_changes,
+    broadcast::{broadcast_changes, Timestamp},
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
@@ -2003,6 +2003,8 @@ impl<'conn> Session<'conn> {
                 trace!("query statement writes, acquiring permit...");
                 self.tx_state
                     .set_write_permit(self.agent.write_permit_blocking()?);
+
+                self.set_ts()?;
             }
 
             let mut rows = prepped.raw_query();
@@ -2118,6 +2120,8 @@ impl<'conn> Session<'conn> {
                 trace!("statement writes, acquiring permit...");
                 self.tx_state
                     .set_write_permit(self.agent.write_permit_blocking()?);
+
+                self.set_ts()?;
             }
             let mut rows = prepped.raw_query();
             loop {
@@ -2314,6 +2318,17 @@ impl<'conn> Session<'conn> {
 
             spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
         }
+
+        Ok(())
+    }
+
+    fn set_ts(&self) -> Result<(), rusqlite::Error> {
+        let ts = Timestamp::from(self.agent.clock().new_timestamp());
+
+        let _ = self
+            .conn
+            .prepare_cached("SELECT crsql_set_ts(?)")?
+            .query_row([&ts], |row| row.get::<_, String>(0))?;
 
         Ok(())
     }

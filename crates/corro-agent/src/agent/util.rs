@@ -609,8 +609,8 @@ pub async fn process_fully_buffered_changes(
                 let count = tx
                     .prepare_cached(
                         r#"
-                        INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
-                            SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq
+                        INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
+                            SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts
                                 FROM __corro_buffered_changes
                                     WHERE site_id = ?
                                     AND db_version = ?
@@ -1046,9 +1046,9 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
             .prepare_cached(
                 r#"
                 INSERT INTO __corro_buffered_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
                 VALUES
-                    (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq)
+                    (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq, :ts)
                 ON CONFLICT (site_id, db_version, seq)
                     DO NOTHING
             "#,
@@ -1063,6 +1063,7 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
                 ":site_id": &change.site_id,
                 ":cl": change.cl,
                 ":seq": change.seq,
+                ":ts": ts,
             })?;
 
         inserted += new_insertion;
@@ -1194,9 +1195,9 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
         sp.prepare_cached(
             r#"
                 INSERT INTO crsql_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq)
+                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
                 VALUES
-                    (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?)
+                    (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?, ?)
             "#,
         )?
         .execute(params![
@@ -1210,6 +1211,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
             change.cl,
             // increment the seq by the start_seq or else we'll have multiple change rows with the same seq
             change.seq,
+            ts,
         ])?;
         let rows_impacted: i64 = sp
             .prepare_cached("SELECT crsql_rows_impacted()")?

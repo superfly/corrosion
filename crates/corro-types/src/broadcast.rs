@@ -1,6 +1,7 @@
 use std::{
     cmp, fmt, io,
     num::NonZeroU32,
+    num::ParseIntError,
     ops::{Deref, RangeInclusive},
     time::Duration,
 };
@@ -23,7 +24,7 @@ use tokio::{
     task::block_in_place,
 };
 use tracing::{debug, error, trace};
-use uhlc::{ParseNTP64Error, NTP64};
+use uhlc::NTP64;
 
 use crate::{
     actor::{Actor, ActorId, ClusterId},
@@ -285,7 +286,7 @@ impl Changeset {
 #[derive(Debug, thiserror::Error)]
 pub enum TimestampParseError {
     #[error("could not parse timestamp: {0:?}")]
-    Parse(ParseNTP64Error),
+    Parse(ParseIntError),
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord)]
@@ -361,8 +362,8 @@ impl FromSql for Timestamp {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         match value {
             rusqlite::types::ValueRef::Text(b) => match std::str::from_utf8(b) {
-                Ok(s) => match s.parse::<NTP64>() {
-                    Ok(ntp) => Ok(Timestamp(ntp)),
+                Ok(s) => match s.parse::<u64>() {
+                    Ok(ntp) => Ok(Timestamp(NTP64(ntp))),
                     Err(e) => Err(FromSqlError::Other(Box::new(TimestampParseError::Parse(e)))),
                 },
                 Err(e) => Err(FromSqlError::Other(Box::new(e))),
@@ -375,7 +376,7 @@ impl FromSql for Timestamp {
 impl ToSql for Timestamp {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         Ok(rusqlite::types::ToSqlOutput::Owned(
-            rusqlite::types::Value::Text(self.0.to_string()),
+            rusqlite::types::Value::Text(self.0.as_u64().to_string()),
         ))
     }
 }

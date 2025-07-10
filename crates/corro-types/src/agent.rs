@@ -259,9 +259,10 @@ impl Agent {
 }
 
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
-    let migrations: Vec<Box<dyn Migration>> = vec![Box::new(
-        init_migration as fn(&Transaction) -> rusqlite::Result<()>,
-    )];
+    let migrations: Vec<Box<dyn Migration>> = vec![
+        Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(crsqlite_v0_17_migration as fn(&Transaction) -> rusqlite::Result<()>),
+    ];
 
     crate::sqlite::migrate(conn, migrations)
 }
@@ -270,10 +271,11 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch(
         r#"
             -- key/value for internal corrosion data (e.g. 'schema_version' => INT)
+            -- can be pre-created before corrosion starts so we get a cluster id.
             CREATE TABLE IF NOT EXISTS __corro_state (key TEXT NOT NULL PRIMARY KEY, value);
 
             -- internal per-db-version seq bookkeeping
-            CREATE TABLE IF NOT EXISTS __corro_seq_bookkeeping (
+            CREATE TABLE  __corro_seq_bookkeeping (
                 -- remote actor / site id
                 site_id BLOB NOT NULL,
                 -- remote internal version
@@ -292,7 +294,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
             ) WITHOUT ROWID;
 
             -- buffered changes (similar schema as crsql_changes)
-            CREATE TABLE IF NOT EXISTS __corro_buffered_changes (
+            CREATE TABLE __corro_buffered_changes (
                 "table" TEXT NOT NULL,
                 pk BLOB NOT NULL,
                 cid TEXT NOT NULL,
@@ -302,12 +304,13 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
                 seq INTEGER NOT NULL,
                 cl INTEGER NOT NULL, -- causal length
+                ts TEXT NOT NULL,
 
                 PRIMARY KEY (site_id, db_version, seq)
             ) WITHOUT ROWID;
 
             -- SWIM memberships
-            CREATE TABLE IF NOT EXISTS __corro_members (
+            CREATE TABLE __corro_members (
                 actor_id BLOB PRIMARY KEY NOT NULL,
                 address TEXT NOT NULL,
 
@@ -330,7 +333,7 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
             ) WITHOUT ROWID;
 
             -- store known needed versions
-            CREATE TABLE IF NOT EXISTS __corro_bookkeeping_gaps (
+            CREATE TABLE __corro_bookkeeping_gaps (
                 actor_id BLOB NOT NULL,
                 start INTEGER NOT NULL,
                 end INTEGER NOT NULL,
@@ -345,6 +348,52 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
         [],
         |row| row.get(0),
     )?;
+
+    Ok(())
+}
+
+// since crsqlite 0.17, ts is now stored as TEXT in clock tables
+// also sets the new 'merge-equal-values' config to true.
+fn crsqlite_v0_17_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    for table in tables {
+        let indexes: Vec<String> = tx
+            .prepare(&format!(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name LIKE '{table}%'"
+            ))?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        tx.execute_batch(
+            &format!(r#"
+                CREATE TABLE {table}_new (
+                    key INTEGER NOT NULL,
+                    col_name TEXT NOT NULL,
+                    col_version INTEGER NOT NULL,
+                    db_version INTEGER NOT NULL,
+                    site_id INTEGER NOT NULL DEFAULT 0,
+                    seq INTEGER NOT NULL,
+                    ts TEXT NOT NULL DEFAULT '0',
+                    PRIMARY KEY (key, col_name)
+                ) WITHOUT ROWID, STRICT;
+
+                INSERT INTO {table}_new SELECT key, col_name, col_version, db_version, COALESCE(site_id, 0), seq FROM {table};
+
+                ALTER TABLE {table} RENAME TO {table}_old;
+                ALTER TABLE {table}_new RENAME TO {table};
+
+                DROP TABLE {table}_old;
+
+                CREATE INDEX IF NOT EXISTS corro_{table}_site_id_dbv ON {table} (site_id, db_version);
+            "#),
+        )?;
+
+        // recreate the indexes
+        for sql in indexes {
+            tx.execute_batch(&sql)?;
+        }
+    }
 
     Ok(())
 }

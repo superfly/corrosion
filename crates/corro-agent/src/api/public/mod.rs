@@ -17,6 +17,7 @@ use corro_types::{
         TableStatResponse,
     },
     base::CrsqlDbVersion,
+    broadcast::Timestamp,
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
@@ -72,6 +73,8 @@ where
         .await;
 
     let start = Instant::now();
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+
     block_in_place(move || {
         let tx = conn
             .immediate_transaction()
@@ -83,6 +86,20 @@ where
 
         let timeout = timeout.map(Duration::from_secs);
         let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
+
+        let _ = tx
+            .prepare_cached("SELECT crsql_set_ts(?)")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?
+            .query_row([&ts], |row| row.get::<_, String>(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
 
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
