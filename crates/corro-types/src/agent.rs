@@ -258,10 +258,10 @@ impl Agent {
     }
 }
 
-pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result<()> {
     let migrations: Vec<Box<dyn Migration>> = vec![
         Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
-        Box::new(crsqlite_v0_17_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(crsqlite_v0_17_migration(clock)),
     ];
 
     crate::sqlite::migrate(conn, migrations)
@@ -354,48 +354,54 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
 
 // since crsqlite 0.17, ts is now stored as TEXT in clock tables
 // also sets the new 'merge-equal-values' config to true.
-fn crsqlite_v0_17_migration(tx: &Transaction) -> rusqlite::Result<()> {
-    let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+fn crsqlite_v0_17_migration(
+    clock: Arc<uhlc::HLC>,
+) -> impl Fn(&Transaction) -> rusqlite::Result<()> {
+    let ts = Timestamp::from(clock.new_timestamp()).as_u64().to_string();
 
-    for table in tables {
-        let indexes: Vec<String> = tx
-            .prepare(&format!(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name LIKE '{table}%'"
-            ))?
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+    move |tx: &Transaction| -> rusqlite::Result<()> {
+        let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
 
-        tx.execute_batch(
-            &format!(r#"
-                CREATE TABLE {table}_new (
-                    key INTEGER NOT NULL,
-                    col_name TEXT NOT NULL,
-                    col_version INTEGER NOT NULL,
-                    db_version INTEGER NOT NULL,
-                    site_id INTEGER NOT NULL DEFAULT 0,
-                    seq INTEGER NOT NULL,
-                    ts TEXT NOT NULL DEFAULT '0',
-                    PRIMARY KEY (key, col_name)
-                ) WITHOUT ROWID, STRICT;
+        for table in tables {
+            let indexes: Vec<String> = tx
+                .prepare(&format!(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name LIKE '{table}%'"
+                ))?
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
 
-                INSERT INTO {table}_new SELECT key, col_name, col_version, db_version, COALESCE(site_id, 0), seq FROM {table};
+            tx.execute_batch(
+                &format!(r#"
+                    CREATE TABLE {table}_new (
+                        key INTEGER NOT NULL,
+                        col_name TEXT NOT NULL,
+                        col_version INTEGER NOT NULL,
+                        db_version INTEGER NOT NULL,
+                        site_id INTEGER NOT NULL DEFAULT 0,
+                        seq INTEGER NOT NULL,
+                        ts TEXT NOT NULL DEFAULT '0',
+                        PRIMARY KEY (key, col_name)
+                    ) WITHOUT ROWID, STRICT;
 
-                ALTER TABLE {table} RENAME TO {table}_old;
-                ALTER TABLE {table}_new RENAME TO {table};
+                    INSERT INTO {table}_new (key, col_name, col_version, db_version, site_id, seq, ts) SELECT key, col_name, col_version, db_version, site_id, seq, '{ts}' FROM {table};
 
-                DROP TABLE {table}_old;
+                    ALTER TABLE {table} RENAME TO {table}_old;
+                    ALTER TABLE {table}_new RENAME TO {table};
 
-                CREATE INDEX IF NOT EXISTS corro_{table}_site_id_dbv ON {table} (site_id, db_version);
-            "#),
-        )?;
+                    DROP TABLE {table}_old;
 
-        // recreate the indexes
-        for sql in indexes {
-            tx.execute_batch(&sql)?;
+                    CREATE INDEX IF NOT EXISTS corro_{table}_site_id_dbv ON {table} (site_id, db_version);
+                "#),
+            )?;
+
+            // recreate the indexes
+            for sql in indexes {
+                tx.execute_batch(&sql)?;
+            }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1584,7 +1590,8 @@ mod tests {
 
         let mut conn = CrConn::init(Connection::open_in_memory()?)?;
         setup_conn(&conn)?;
-        migrate(&mut conn)?;
+        let clock = Arc::new(uhlc::HLC::default());
+        migrate(clock, &mut conn)?;
 
         let actor_id = ActorId::default();
         let mut bv = BookedVersions::new(actor_id);
