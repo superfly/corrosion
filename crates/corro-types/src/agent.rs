@@ -256,6 +256,18 @@ impl Agent {
     pub fn cluster_id(&self) -> ClusterId {
         *self.0.cluster_id.load().as_ref()
     }
+
+    pub fn update_clock_with_timestamp(
+        &self,
+        actor_id: ActorId,
+        ts: Timestamp,
+    ) -> Result<(), String> {
+        let id = actor_id
+            .try_into()
+            .map_err(|e| format!("could not convert ActorId to uhlc ID: {e}"))?;
+        self.clock()
+            .update_with_timestamp(&uhlc::Timestamp::new(ts.0, id))
+    }
 }
 
 pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result<()> {

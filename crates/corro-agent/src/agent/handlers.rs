@@ -687,9 +687,23 @@ pub async fn handle_changes(
             }
         }
 
+        let src_str: &'static str = src.into();
         let recv_lag = change
             .ts()
-            .map(|ts| (agent.clock().new_timestamp().get_time() - ts.0).to_duration());
+            .map(|ts| {
+                let mut our_ts = Timestamp::from(agent.clock().new_timestamp());
+                if ts > our_ts {
+                    if let Err(e) = agent.update_clock_with_timestamp(change.actor_id, ts) {
+                        error!("could not update clock from actor {}: {e}", change.actor_id);
+                        return None;
+                    }
+                    counter!("corro.agent.clock.update", "source" => src_str).increment(1);
+                    // update our_ts to the new timestamp
+                    our_ts = Timestamp::from(agent.clock().new_timestamp());
+                }
+                Some((our_ts.0 - ts.0).to_duration())
+            })
+            .flatten();
 
         if matches!(src, ChangeSource::Broadcast) {
             counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
@@ -737,17 +751,6 @@ pub async fn handle_changes(
         }
 
         if let Some(recv_lag) = recv_lag {
-            if matches!(src, ChangeSource::Broadcast) && recv_lag.as_secs_f64() > 60.0 {
-                let ts = change.ts().unwrap();
-                let actor_id = change.actor_id;
-                let version = change.versions();
-                let got = recv_lag.as_secs_f64();
-                let our_ts = agent.clock().new_timestamp();
-                let our_ts_ntp = our_ts.get_time();
-                let test = (our_ts_ntp - ts.0).to_duration();
-                warn!(?got, %ts, %actor_id, ?version, %our_ts_ntp, ?test,"broadcast change received with lag of more than 60s");
-            }
-            let src_str: &'static str = src.into();
             histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str)
                 .record(recv_lag.as_secs_f64());
         }

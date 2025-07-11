@@ -1072,17 +1072,12 @@ pub async fn parallel_sync(
                     trace!(%actor_id, self_actor_id = %agent.actor_id(), "read state payload: {their_sync_state:?}");
 
                     match timeout(Duration::from_secs(2), read_sync_msg(&mut read)).instrument(info_span!("read_sync_clock")).await.map_err(SyncRecvError::from)??  {
-                        Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => match actor_id.try_into() {
-                            Ok(id) => {
-                                if let Err(e) = agent
-                                    .clock()
-                                    .update_with_timestamp(&uhlc::Timestamp::new(ts.to_ntp64(), id))
-                                {
+                        Some(SyncMessage::V1(SyncMessageV1::Clock(ts))) => {
+                            match agent.update_clock_with_timestamp(actor_id, ts) {
+                                Ok(()) => (),
+                                Err(e) => {
                                     warn!("could not update clock from actor {actor_id}: {e}");
                                 }
-                            }
-                            Err(e) => {
-                                error!("could not convert ActorId to uhlc ID: {e}");
                             }
                         },
                         Some(_) => return Err(SyncRecvError::ExpectedClockMessage.into()),
