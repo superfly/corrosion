@@ -737,6 +737,12 @@ pub async fn handle_changes(
         }
 
         if let Some(recv_lag) = recv_lag {
+            if matches!(src, ChangeSource::Broadcast) && recv_lag.as_secs_f64() > 60.0 {
+                let ts = change.ts().unwrap();
+                let actor_id = change.actor_id;
+                let version = change.versions();
+                warn!(?recv_lag, ?ts, %actor_id, ?version, "broadcast change received with lag of more than 60s");
+            }
             let src_str: &'static str = src.into();
             histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str)
                 .record(recv_lag.as_secs_f64());
