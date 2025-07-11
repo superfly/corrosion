@@ -6,7 +6,7 @@
 //! be pulled out of this file in future.
 
 use crate::{
-    agent::{handlers, CountedExecutor, MAX_SYNC_BACKOFF, TO_CLEAR_COUNT},
+    agent::{handlers, CountedExecutor, TO_CLEAR_COUNT},
     api::public::{
         api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
         pubsub::{api_v1_sub_by_id, api_v1_subs},
@@ -345,8 +345,10 @@ async fn require_authz<B>(
 /// Actual sync logic is handled by
 /// [`handle_sync`](crate::agent::handlers::handle_sync).
 pub async fn sync_loop(agent: Agent, bookie: Bookie, transport: Transport, mut tripwire: Tripwire) {
+    let min_sync_backoff = Duration::from_secs(agent.config().perf.min_sync_backoff as u64);
+    let max_sync_backoff = Duration::from_secs(agent.config().perf.max_sync_backoff as u64);
     let mut sync_backoff = backoff::Backoff::new(0)
-        .timeout_range(Duration::from_secs(1), MAX_SYNC_BACKOFF)
+        .timeout_range(min_sync_backoff, max_sync_backoff)
         .iter();
     let next_sync_at = tokio::time::sleep(sync_backoff.next().unwrap());
     tokio::pin!(next_sync_at);
