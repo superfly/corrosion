@@ -741,7 +741,11 @@ pub async fn handle_changes(
                 let ts = change.ts().unwrap();
                 let actor_id = change.actor_id;
                 let version = change.versions();
-                warn!(?recv_lag, ?ts, %actor_id, ?version, "broadcast change received with lag of more than 60s");
+                let got = recv_lag.as_secs_f64();
+                let our_ts = agent.clock().new_timestamp();
+                let our_ts_ntp = our_ts.get_time();
+                let test = (our_ts_ntp - ts.0).to_duration();
+                warn!(?got, %ts, %actor_id, ?version, %our_ts_ntp, ?test,"broadcast change received with lag of more than 60s");
             }
             let src_str: &'static str = src.into();
             histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str)

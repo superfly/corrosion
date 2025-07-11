@@ -577,3 +577,20 @@ pub async fn broadcast_changes(
 
     Ok(())
 }
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_timestamp_from_uhlc_timestamp() {
+        let clock = uhlc::HLC::default();
+        let num_64 = 7525824361892586256;
+        let ts = Timestamp::from(NTP64(num_64));
+
+        let clock_new_ts = clock.new_timestamp();
+        let new_ts = clock_new_ts.get_time();
+        println!("ts: {:?}, {:x}", new_ts.as_u64() - num_64, num_64);
+        let t = (new_ts - ts.0).to_duration();
+        println!("t: {t:?}");
+    }
+}
