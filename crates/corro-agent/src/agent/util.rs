@@ -824,9 +824,10 @@ pub async fn process_multiple_changes(
                             }
                             Err(e) => {
                                 error!("error processing single version: {e}");
-                                if e.sqlite_error_code()
-                                    .is_some_and(|code| code != rusqlite::ErrorCode::DiskFull)
-                                {
+                                if e.sqlite_error_code().is_some_and(|code| {
+                                    code != rusqlite::ErrorCode::DiskFull
+                                        && code != rusqlite::ErrorCode::OperationInterrupted
+                                }) {
                                     let details = json!({"error": e.to_string()});
                                     assert_unreachable!("error committing transaction", &details);
                                 }
@@ -920,10 +921,10 @@ pub async fn process_multiple_changes(
 
         tx.commit().map_err(|source| {
             // only sqlite error we expect is SQLITE_FULL if disk is full
-            if source
-                .sqlite_error_code()
-                .is_some_and(|code| code != rusqlite::ErrorCode::DiskFull)
-            {
+            if source.sqlite_error_code().is_some_and(|code| {
+                code != rusqlite::ErrorCode::DiskFull
+                    && code != rusqlite::ErrorCode::OperationInterrupted
+            }) {
                 let details =
                     json!({"elapsed": elapsed.as_secs_f32(), "error": source.to_string()});
                 assert_unreachable!("error committing transaction", &details);
