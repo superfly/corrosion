@@ -5,7 +5,7 @@ use std::{
 };
 
 use admin::AdminConn;
-use antithesis_sdk::assert_sometimes;
+// use antithesis_sdk::assert_sometimes;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use command::{
@@ -233,7 +233,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 eyre::bail!("corrosion is currently running, shut it down before restoring!");
             }
 
-            assert_sometimes!(true, "Corrosion restores database from backup");
+            // assert_sometimes!(true, "Corrosion restores database from backup");
             let config = match cli.config() {
                 Ok(config) => config,
                 Err(_e) => {

@@ -786,6 +786,7 @@ dependencies = [
  "corro-speedy",
  "corro-tests",
  "corro-types",
+ "corro-utils",
  "eyre",
  "foca",
  "futures",
@@ -877,6 +878,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "bytes",
  "corro-api-types",
+ "corro-utils",
  "futures",
  "hickory-resolver",
  "http",
@@ -1047,6 +1049,15 @@ dependencies = [
  "tripwire",
  "uhlc",
  "uuid",
+]
+
+[[package]]
+name = "corro-utils"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

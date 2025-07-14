@@ -14,6 +14,7 @@ camino = { workspace = true }
 compact_str = { workspace = true }
 config = { workspace = true }
 corro-types = { path = "../corro-types" }
+corro-utils = { path = "../corro-utils" }
 eyre = { workspace = true }
 foca = { workspace = true }
 futures = { workspace = true }
