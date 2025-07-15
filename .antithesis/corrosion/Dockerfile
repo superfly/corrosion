@@ -37,7 +37,7 @@ ENV RUSTFLAGS="--cfg tokio_unstable -C link-arg=-fuse-ld=mold -C force-frame-poi
 # Will build and cache the binary and dependent crates in release mode
 RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/local/cargo \
     --mount=type=cache,target=target \
-    cargo build --release --features running_in_antithesis && mv target/release/corrosion ./ && mv target/release/rust-load-generator ./
+    cargo build --release --features running_in_antithesis && mv target/release/corrosion ./ && mv target/release/rust-load-generator ./ && mv target/release/tokio-dump ./
 
 # Runtime image
 FROM debian:bookworm-slim
@@ -54,6 +54,7 @@ COPY .antithesis/libvoidstar.so /usr/lib/antithesis/lib/libvoidstar.so
 RUN mkdir -p /symbols
 COPY --from=builder /usr/src/app/corrosion /symbols/corrosion
 COPY --from=builder /usr/src/app/rust-load-generator /symbols/rust-load-generator
+COPY --from=builder /usr/src/app/tokio-dump /symbols/tokio-dump
 
 COPY .antithesis/corrosion/entrypoint.sh /entrypoint.sh
 COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl

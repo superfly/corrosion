@@ -1,5 +1,5 @@
 [workspace]
-members = [ ".antithesis/client/rust-load-generator",
+members = [ ".antithesis/client/rust-load-generator", ".antithesis/client/tokio-dump",
 	"crates/*",
 	"integration-tests"
 ]
@@ -67,7 +67,9 @@ strum = { version = "0.24.1", features = ["derive"] }
 tempfile = "3.5.0"
 thiserror = "1.0.40"
 time = { version = "0.3.15", features = ["macros", "serde-well-known"] }
-tokio = { version = "1.41", features = ["full"] }
+tokio = { version = "1.41", features = ["full", "tracing" ] }
+tokio-console = "0.1.13"
+console-subscriber = "0.4.1"
 tokio-metrics = "0.3.0"
 tokio-serde = { version = "0.8", features = ["json"] }
 tokio-stream = { version = "0.1.12", features = ["sync"] }

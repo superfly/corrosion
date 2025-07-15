@@ -35,6 +35,9 @@ use opentelemetry::{
 use opentelemetry_otlp::WithExportConfig;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::Layer;
+
 use tracing_subscriber::{
     fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
     EnvFilter,
@@ -56,7 +59,9 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
     let mut tracing_handle = None;
+
     if matches!(cli.command, Command::Agent) {
+        let console_layer = console_subscriber::spawn();
         let config = cli.config()?;
 
         let directives: String = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
@@ -68,9 +73,14 @@ fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
         global::set_text_map_propagator(TraceContextPropagator::new());
 
         // Tracing
-        let (env_filter, handle) = tracing_subscriber::reload::Layer::new(filter.layer());
-        tracing_handle = Some(handle);
-        let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
+        // let fmt_layer = tracing_subscriber::fmt::layer();
+        // let (env_filter, handle) = tracing_subscriber::reload::Layer::new(filter.layer());
+        // tracing_handle = Some(handle);
+        let sub = tracing_subscriber::registry::Registry::default()
+            // .with(fmt_layer.with_filter(LevelFilter::INFO))
+            .with(
+                console_layer.with_filter(EnvFilter::try_new("tokio=trace,runtime=trace").unwrap()),
+            );
 
         if let Some(otel) = &config.telemetry.open_telemetry {
             let otlp_exporter = opentelemetry_otlp::new_exporter().tonic().with_env();
@@ -120,16 +130,22 @@ fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
                 }
             }
         } else {
+            println!("no otel, {:?}", config.log.format);
             match config.log.format {
                 LogFormat::Plaintext => {
-                    sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
-                        .init();
+                    sub.with(
+                        tracing_subscriber::fmt::Layer::new()
+                            .with_ansi(config.log.colors)
+                            .with_filter(LevelFilter::INFO),
+                    )
+                    .init();
                 }
                 LogFormat::Json => {
                     sub.with(
                         tracing_subscriber::fmt::Layer::new()
                             .json()
-                            .with_span_list(false),
+                            .with_span_list(false)
+                            .with_filter(filter),
                     )
                     .init();
                 }

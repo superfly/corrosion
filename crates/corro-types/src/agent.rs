@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use antithesis_sdk::assert_always;
+use antithesis_sdk::{assert_always, assert_unreachable};
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
@@ -38,8 +38,9 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use tripwire::Tripwire;
+use uuid::Uuid;
 
 use crate::{
     actor::{Actor, ActorId, ClusterId},
@@ -427,9 +428,9 @@ struct SplitPoolInner {
     read: SqlitePool,
     write: SqlitePool,
 
-    priority_tx: CorroSender<oneshot::Sender<DropGuard>>,
-    normal_tx: CorroSender<oneshot::Sender<DropGuard>>,
-    low_tx: CorroSender<oneshot::Sender<DropGuard>>,
+    priority_tx: CorroSender<(oneshot::Sender<DropGuard>, Uuid)>,
+    normal_tx: CorroSender<(oneshot::Sender<DropGuard>, Uuid)>,
+    low_tx: CorroSender<(oneshot::Sender<DropGuard>, Uuid)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -442,8 +443,8 @@ pub enum PoolError {
     CallbackClosed,
     #[error("could not acquire write permit")]
     Permit(#[from] AcquireError),
-    #[error("timed out acquiring write permit while {op:?}")]
-    TimedOut { op: String },
+    #[error("timed out acquiring write permit while {op:?} (uuid: {uuid:?})")]
+    TimedOut { op: String, uuid: Uuid },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -504,15 +505,15 @@ impl SplitPool {
 
         tokio::spawn(async move {
             loop {
-                let (tx, channel) = tokio::select! {
+                let (tx, channel, uuid) = tokio::select! {
                     biased;
 
-                    Some(tx) = priority_rx.recv() => (tx, "priority"),
-                    Some(tx) = normal_rx.recv() => (tx, "normal"),
-                    Some(tx) = low_rx.recv() => (tx, "low"),
+                    Some((tx, uuid)) = priority_rx.recv() => (tx, "priority", uuid),
+                    Some((tx, uuid)) = normal_rx.recv() => (tx, "normal", uuid),
+                    Some((tx, uuid)) = low_rx.recv() => (tx, "low", uuid),
                 };
 
-                wait_conn_drop(tx, channel).await
+                wait_conn_drop(tx, channel, uuid).await
             }
         });
 
@@ -573,48 +574,79 @@ impl SplitPool {
     // get a high priority write connection (e.g. client input)
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_priority(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.priority_tx, "priority").await
+        self.write_inner(&self.0.priority_tx, "priority", uuid::Uuid::new_v4())
+            .await
     }
 
     // get a normal priority write connection (e.g. sync process)
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_normal(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.normal_tx, "normal").await
+        self.write_inner(&self.0.normal_tx, "normal", uuid::Uuid::new_v4())
+            .await
     }
 
     // get a low priority write connection (e.g. background tasks)
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn write_low(&self) -> Result<WriteConn, PoolError> {
-        self.write_inner(&self.0.low_tx, "low").await
+        self.write_inner(&self.0.low_tx, "low", uuid::Uuid::new_v4())
+            .await
     }
 
     async fn write_inner(
         &self,
-        chan: &CorroSender<oneshot::Sender<DropGuard>>,
+        chan: &CorroSender<(oneshot::Sender<DropGuard>, Uuid)>,
         queue: &'static str,
+        uuid: Uuid,
     ) -> Result<WriteConn, PoolError> {
         let (tx, rx) = oneshot::channel();
         let max_timeout = Duration::from_secs(5 * 60);
 
-        timeout_fut("tx to oneshot channel", max_timeout, chan.send(tx))
-            .await?
-            .map_err(|_| PoolError::QueueClosed)?;
+        info!("sending token to oneshot channel for uuid - {uuid:?}");
+        timeout_fut(
+            "tx to oneshot channel",
+            max_timeout,
+            chan.send((tx, uuid)),
+            uuid,
+        )
+        .await?
+        .map_err(|_| {
+            error!("could not send token to oneshot channel for uuid - {uuid:?}");
+            PoolError::QueueClosed
+        })?;
 
         let start = Instant::now();
 
-        let _drop_guard = timeout_fut("rx from oneshot channel", max_timeout, rx)
-            .await?
-            .map_err(|_| PoolError::CallbackClosed)?;
+        info!("waiting for token from oneshot channel for uuid - {uuid:?}");
 
+        let _drop_guard = timeout_fut("rx from oneshot channel", max_timeout, rx, uuid)
+            .await?
+            .map_err(|_| {
+                error!("could not receive token from oneshot channel for uuid - {uuid:?}");
+                PoolError::CallbackClosed
+            })?;
+
+        info!("received token from oneshot channel for uuid - {uuid:?}");
         histogram!("corro.sqlite.pool.queue.seconds", "queue" => queue)
             .record(start.elapsed().as_secs_f64());
-        let conn = timeout_fut("acquiring write conn", max_timeout, self.0.write.get()).await??;
+        let conn = timeout_fut(
+            "acquiring write conn",
+            max_timeout,
+            self.0.write.get(),
+            uuid,
+        )
+        .await?
+        .map_err(|e| {
+            error!("could not acquire write conn for uuid - {uuid:?}");
+            e
+        })?;
 
+        debug!("acquired write conn for uuid - {uuid:?}");
         let start = Instant::now();
         let _permit = timeout_fut(
             "acquiring write semaphore",
             max_timeout,
             self.0.write_sema.clone().acquire_owned(),
+            uuid,
         )
         .await??;
 
@@ -629,13 +661,15 @@ impl SplitPool {
     }
 }
 
-async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str) {
+async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str, uuid: Uuid) {
     let cancel = CancellationToken::new();
 
     if let Err(_e) = tx.send(cancel.clone().drop_guard()) {
-        error!("could not send back drop guard for pooled conn, oneshot channel likely closed");
+        error!("could not send back drop guard for pooled conn, oneshot channel likely closed, uuid - {uuid:?}");
         return;
     }
+
+    info!("sent drop guard to oneshot channel for uuid - {uuid:?}");
 
     let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
     // skip first tick
@@ -643,36 +677,39 @@ async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str) {
     let start = Instant::now();
 
     loop {
-        let details = json!({
-            "channel": channel,
-            "elapsed": start.elapsed().as_secs_f64()
-        });
-        assert_always!(
-            start.elapsed() < Duration::from_secs(5 * 60),
-            "wait_conn_drop has been running for too long",
-            &details
-        );
-
         tokio::select! {
             _ = cancel.cancelled() => {
                 break;
             }
             _ = interval.tick() => {
+                let details = json!({"channel": channel, "elapsed": start.elapsed(), "uuid": uuid});
+                assert_unreachable!(
+                    "wait_conn_drop has been running for too long",
+                    &details
+                );
                 let elapsed = start.elapsed();
-                warn!("wait_conn_drop has been running since {elapsed:?}, token_is_cancelled - {:?}, channel - {channel}", cancel.is_cancelled());
+                warn!("wait_conn_drop has been running since {elapsed:?}, token_is_cancelled - {:?}, channel - {channel}, uuid - {uuid:?}", cancel.is_cancelled());
                 continue;
             }
         }
     }
 }
 
-async fn timeout_fut<T, F>(op: &'static str, duration: Duration, fut: F) -> Result<T, PoolError>
+async fn timeout_fut<T, F>(
+    op: &'static str,
+    duration: Duration,
+    fut: F,
+    uuid: Uuid,
+) -> Result<T, PoolError>
 where
     F: Future<Output = T>,
 {
     timeout(duration, fut)
         .await
-        .map_err(|_| PoolError::TimedOut { op: op.to_string() })
+        .map_err(|_| PoolError::TimedOut {
+            op: op.to_string(),
+            uuid,
+        })
 }
 
 pub struct WriteConn {

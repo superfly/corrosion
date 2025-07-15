@@ -1,0 +1,10 @@
+[package]
+name = "tokio-dump"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+console-api = "0.8.1"
+tokio.workspace = true
+tonic = "0.12.3"
+futures.workspace = true

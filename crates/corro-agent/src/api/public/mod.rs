@@ -64,6 +64,8 @@ where
     let mut conn = agent.pool().write_priority().await?;
     trace!("got conn");
 
+    // tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+
     let actor_id = agent.actor_id();
     // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
     // so it probably doesn't matter too much, except for reads of internal state
