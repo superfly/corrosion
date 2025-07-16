@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use antithesis_sdk::assert_always;
+use antithesis_sdk::{assert_always, assert_unreachable};
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
@@ -643,21 +643,20 @@ async fn wait_conn_drop(tx: oneshot::Sender<DropGuard>, channel: &'static str) {
     let start = Instant::now();
 
     loop {
-        let details = json!({
-            "channel": channel,
-            "elapsed": start.elapsed().as_secs_f64()
-        });
-        assert_always!(
-            start.elapsed() < Duration::from_secs(5 * 60),
-            "wait_conn_drop has been running for too long",
-            &details
-        );
-
         tokio::select! {
             _ = cancel.cancelled() => {
                 break;
             }
             _ = interval.tick() => {
+                let details = json!({
+                    "channel": channel,
+                    "elapsed": start.elapsed().as_secs_f64()
+                });
+                assert_unreachable!(
+                    "wait_conn_drop has been running for too long",
+                    &details
+                );
+
                 let elapsed = start.elapsed();
                 warn!("wait_conn_drop has been running since {elapsed:?}, token_is_cancelled - {:?}, channel - {channel}", cancel.is_cancelled());
                 continue;
