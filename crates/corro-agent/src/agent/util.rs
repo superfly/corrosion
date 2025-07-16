@@ -763,6 +763,8 @@ pub async fn process_multiple_changes(
 
         let sub_start = Instant::now();
         for (actor_id, changes) in unknown_changes {
+            let sub_start = Instant::now();
+
             let booked = {
                 bookie
                     .blocking_write(
@@ -775,9 +777,14 @@ pub async fn process_multiple_changes(
                 "process_multiple_changes(booked writer, unknown changes)",
                 actor_id.as_simple(),
             );
+            let elapsed = sub_start.elapsed();
+            if elapsed >= PROCESSING_WARN_THRESHOLD {
+                warn!("process_multiple_changes(booked writer, unknown changes) took too long - {elapsed:?}");
+            }
 
             let mut seen = RangeInclusiveMap::new();
 
+            let sub_start = Instant::now();
             for (change, src) in changes {
                 trace!("handling a single changeset: {change:?}");
                 let seqs = change.seqs();
@@ -866,6 +873,11 @@ pub async fn process_multiple_changes(
                     .entry(actor_id)
                     .or_default()
                     .push((versions, partial));
+            }
+
+            let elapsed = sub_start.elapsed();
+            if elapsed >= PROCESSING_WARN_THRESHOLD {
+                warn!("process_multiple_changes(booked writer, unknown changes) took too long - {elapsed:?}");
             }
         }
 

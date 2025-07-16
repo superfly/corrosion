@@ -640,7 +640,7 @@ impl SplitPool {
             e
         })?;
 
-        debug!("acquired write conn for uuid - {uuid:?}");
+        info!("acquired write conn for uuid - {uuid:?}");
         let start = Instant::now();
         let _permit = timeout_fut(
             "acquiring write semaphore",
@@ -649,6 +649,8 @@ impl SplitPool {
             uuid,
         )
         .await??;
+
+        info!("acquired write semaphore for uuid - {uuid:?}");
 
         histogram!("corro.sqlite.write_permit.acquisition.seconds")
             .record(start.elapsed().as_secs_f64());
