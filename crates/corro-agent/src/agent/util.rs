@@ -850,7 +850,7 @@ pub async fn process_multiple_changes(
                                     error!("error processing single version: {e}");
                                     continue;
                                 }
-                            }
+                        }
                         }
                     };
 

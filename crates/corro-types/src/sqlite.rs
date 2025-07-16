@@ -48,17 +48,17 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
 
-    const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
-    conn.trace_v2(
-        TraceEventCodes::SQLITE_TRACE_PROFILE,
-        Some(|event| {
-            if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = event {
-                if duration >= SLOW_THRESHOLD {
-                    warn!("SLOW query {duration:?} => {}", stmt_ref.sql());
-                }
-            }
-        }),
-    );
+    // const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
+    // conn.trace_v2(
+    //     TraceEventCodes::SQLITE_TRACE_PROFILE,
+    //     Some(|event| {
+    //         if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = event {
+    //             if duration >= SLOW_THRESHOLD {
+    //                 warn!("SLOW query {duration:?} => {}", stmt_ref.sql());
+    //             }
+    //         }
+    //     }),
+    // );
 
     Ok(CrConn(conn))
 }
