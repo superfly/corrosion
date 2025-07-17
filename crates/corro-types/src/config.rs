@@ -7,6 +7,11 @@ use serde_with::{formats::PreferOne, serde_as, OneOrMany};
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
 
+#[cfg(test)]
+pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 2;
+#[cfg(not(test))]
+pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 15;
+
 const fn default_apply_queue() -> usize {
     50
 }
@@ -43,6 +48,14 @@ const fn default_apply_timeout() -> usize {
 
 fn default_sql_tx_timeout() -> usize {
     60
+}
+
+fn default_min_sync_backoff() -> u32 {
+    1
+}
+
+fn default_max_sync_backoff() -> u32 {
+    DEFAULT_MAX_SYNC_BACKOFF
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +223,10 @@ pub struct PerfConfig {
     pub processing_queue_len: usize,
     #[serde(default = "default_sql_tx_timeout")]
     pub sql_tx_timeout: usize,
+    #[serde(default = "default_min_sync_backoff")]
+    pub min_sync_backoff: u32,
+    #[serde(default = "default_max_sync_backoff")]
+    pub max_sync_backoff: u32,
 }
 
 impl Default for PerfConfig {
@@ -229,6 +246,8 @@ impl Default for PerfConfig {
             wal_threshold_gb: default_wal_threshold(),
             processing_queue_len: default_processing_queue(),
             sql_tx_timeout: default_sql_tx_timeout(),
+            min_sync_backoff: default_min_sync_backoff(),
+            max_sync_backoff: default_max_sync_backoff(),
         }
     }
 }

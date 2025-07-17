@@ -77,7 +77,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
     tokio::fs::create_dir(&schema_path).await?;
     tokio::fs::write(schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes()).await?;
 
-    let (agent, bookie) = start_with_config(conf.clone(), tripwire).await?;
+    let (agent, bookie, _) = start_with_config(conf.clone(), tripwire).await?;
 
     Ok(TestAgent {
         agent,
@@ -85,4 +85,12 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
         tmpdir: Arc::new(tmpdir),
         config: conf,
     })
+}
+
+impl Drop for TestAgent {
+    fn drop(&mut self) {
+        if std::env::var_os("NO_TEMPDIR_CLEANUP").is_some() {
+            println!("Dropping test agent {}", self.agent.actor_id());
+        }
+    }
 }

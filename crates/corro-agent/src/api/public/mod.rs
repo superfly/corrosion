@@ -16,7 +16,8 @@ use corro_types::{
         ColumnName, ExecResponse, ExecResult, QueryEvent, Statement, TableStatRequest,
         TableStatResponse,
     },
-    base::Version,
+    base::CrsqlDbVersion,
+    broadcast::Timestamp,
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
@@ -55,7 +56,7 @@ pub async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     timeout: Option<u64>,
     f: F,
-) -> Result<(T, Option<Version>, Duration), ChangeError>
+) -> Result<(T, Option<CrsqlDbVersion>, Duration), ChangeError>
 where
     F: Fn(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
@@ -72,6 +73,8 @@ where
         .await;
 
     let start = Instant::now();
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+
     block_in_place(move || {
         let tx = conn
             .immediate_transaction()
@@ -84,6 +87,20 @@ where
         let timeout = timeout.map(Duration::from_secs);
         let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
 
+        let _ = tx
+            .prepare_cached("SELECT crsql_set_ts(?)")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?
+            .query_row([&ts], |row| row.get::<_, String>(0))
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
 
@@ -91,7 +108,7 @@ where
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
-            version: insert_info.as_ref().map(|info| info.version),
+            version: insert_info.as_ref().map(|info| info.db_version),
         })?;
 
         let elapsed = start.elapsed();
@@ -101,7 +118,6 @@ where
         match insert_info {
             None => Ok((ret, None, elapsed)),
             Some(InsertChangesInfo {
-                version,
                 db_version,
                 last_seq,
                 ts,
@@ -113,11 +129,11 @@ where
 
                 let agent = agent.clone();
 
-                spawn_counted(async move {
-                    broadcast_changes(agent, db_version, last_seq, version, ts).await
-                });
+                spawn_counted(
+                    async move { broadcast_changes(agent, db_version, last_seq, ts).await },
+                );
 
-                Ok::<_, ChangeError>((ret, Some(version), elapsed))
+                Ok::<_, ChangeError>((ret, Some(db_version), elapsed))
             }
         }
     })
@@ -532,7 +548,9 @@ pub(crate) async fn execute_schema(agent: &Agent, statements: Vec<String>) -> ey
 
     new_schema.constrain()?;
 
-    block_in_place(|| {
+    // conn.trace(Some(|sql| debug!(sql)));
+
+    let apply_res = block_in_place(|| {
         let tx = conn.immediate_transaction()?;
 
         apply_schema(&tx, &schema_write, &mut new_schema)?;
@@ -546,8 +564,15 @@ pub(crate) async fn execute_schema(agent: &Agent, statements: Vec<String>) -> ey
 
         tx.commit()?;
 
+        // drain the pool of RO connections because they might not get the new tables in cr-sqlite!
+        agent.pool().drain_read();
+
         Ok::<_, eyre::Report>(())
-    })?;
+    });
+
+    // conn.trace(None);
+
+    apply_res?;
 
     *schema_write = new_schema;
 
@@ -665,7 +690,7 @@ mod tests {
     use bytes::Bytes;
     use corro_types::{
         api::RowId,
-        base::Version,
+        base::CrsqlDbVersion,
         broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
         config::Config,
         schema::SqliteType,
@@ -746,7 +771,7 @@ mod tests {
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
                 changeset: Changeset::Full {
-                    version: Version(1),
+                    version: CrsqlDbVersion(1),
                     ..
                 },
                 ..
@@ -755,7 +780,7 @@ mod tests {
 
         assert_eq!(
             agent.booked().read::<&str, _>("test", None).await.last(),
-            Some(Version(1))
+            Some(CrsqlDbVersion(1))
         );
 
         println!("second req...");

@@ -17,7 +17,6 @@ pub struct MemberState {
 
     pub ring: Option<u8>,
     pub last_sync_ts: Option<Timestamp>,
-    pub last_empty_ts: Option<Timestamp>,
 }
 
 impl MemberState {
@@ -28,7 +27,6 @@ impl MemberState {
             cluster_id,
             ring: None,
             last_sync_ts: None,
-            last_empty_ts: None,
         }
     }
 
@@ -66,14 +64,6 @@ impl Members {
     pub fn update_sync_ts(&mut self, actor_id: &ActorId, ts: Timestamp) {
         if let Some(state) = self.states.get_mut(actor_id) {
             state.last_sync_ts = Some(ts);
-        }
-    }
-
-    pub fn update_last_empty(&mut self, actor_id: &ActorId, ts: Option<Timestamp>) {
-        if let Some(state) = self.states.get_mut(actor_id) {
-            if ts > state.last_empty_ts {
-                state.last_empty_ts = ts;
-            }
         }
     }
 

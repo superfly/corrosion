@@ -1,12 +1,14 @@
 use std::{
     cmp, fmt, io,
     num::NonZeroU32,
+    num::ParseIntError,
     ops::{Deref, RangeInclusive},
     time::Duration,
 };
 
 use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
+use corro_api_types::{row_to_change, Change, ColumnName, SqliteValue};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use itertools::Itertools;
 use metrics::counter;
@@ -22,13 +24,13 @@ use tokio::{
     task::block_in_place,
 };
 use tracing::{debug, error, trace};
-use uhlc::{ParseNTP64Error, NTP64};
+use uhlc::NTP64;
 
 use crate::{
     actor::{Actor, ActorId, ClusterId},
     agent::Agent,
-    base::{CrsqlDbVersion, CrsqlSeq, Version},
-    change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
+    base::{CrsqlDbVersion, CrsqlSeq},
+    change::{ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
     sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
@@ -93,6 +95,15 @@ pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub struct ColumnChange {
+    pub cid: ColumnName,
+    pub val: SqliteValue,
+    pub col_version: i64,
+    pub seq: CrsqlSeq,
+    pub cl: i64,
+}
+
 #[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum ChangeSource {
@@ -100,7 +111,6 @@ pub enum ChangeSource {
     Sync,
 }
 
-// TODO: shrink this by mapping primary keys to integers instead of repeating them
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
@@ -118,12 +128,12 @@ impl Deref for ChangeV1 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum Changeset {
     Empty {
-        versions: RangeInclusive<Version>,
+        versions: RangeInclusive<CrsqlDbVersion>,
         #[speedy(default_on_eof)]
         ts: Option<Timestamp>,
     },
     Full {
-        version: Version,
+        version: CrsqlDbVersion,
         changes: Vec<Change>,
         // cr-sqlite sequences contained in this changeset
         seqs: RangeInclusive<CrsqlSeq>,
@@ -132,7 +142,7 @@ pub enum Changeset {
         ts: Timestamp,
     },
     EmptySet {
-        versions: Vec<RangeInclusive<Version>>,
+        versions: Vec<RangeInclusive<CrsqlDbVersion>>,
         ts: Timestamp,
     },
 }
@@ -150,7 +160,7 @@ impl From<ChangesetParts> for Changeset {
 }
 
 pub struct ChangesetParts {
-    pub version: Version,
+    pub version: CrsqlDbVersion,
     pub changes: Vec<Change>,
     pub seqs: RangeInclusive<CrsqlSeq>,
     pub last_seq: CrsqlSeq,
@@ -158,12 +168,12 @@ pub struct ChangesetParts {
 }
 
 impl Changeset {
-    pub fn versions(&self) -> RangeInclusive<Version> {
+    pub fn versions(&self) -> RangeInclusive<CrsqlDbVersion> {
         match self {
             Changeset::Empty { versions, .. } => versions.clone(),
             // todo: this returns dummy version because empty set has an array of versions.
             // probably shouldn't be doing this
-            Changeset::EmptySet { .. } => Version(0)..=Version(0),
+            Changeset::EmptySet { .. } => CrsqlDbVersion(0)..=CrsqlDbVersion(0),
             Changeset::Full { version, .. } => *version..=*version,
         }
     }
@@ -276,7 +286,7 @@ impl Changeset {
 #[derive(Debug, thiserror::Error)]
 pub enum TimestampParseError {
     #[error("could not parse timestamp: {0:?}")]
-    Parse(ParseNTP64Error),
+    Parse(ParseIntError),
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord)]
@@ -294,7 +304,11 @@ impl Timestamp {
     }
 
     pub fn zero() -> Self {
-        Timestamp(NTP64(0))
+        Timestamp::from(0u64)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0 .0 == 0
     }
 }
 
@@ -338,12 +352,18 @@ impl From<NTP64> for Timestamp {
     }
 }
 
+impl From<u64> for Timestamp {
+    fn from(value: u64) -> Self {
+        Self(NTP64(value))
+    }
+}
+
 impl FromSql for Timestamp {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         match value {
             rusqlite::types::ValueRef::Text(b) => match std::str::from_utf8(b) {
-                Ok(s) => match s.parse::<NTP64>() {
-                    Ok(ntp) => Ok(Timestamp(ntp)),
+                Ok(s) => match s.parse::<u64>() {
+                    Ok(ntp) => Ok(Timestamp(NTP64(ntp))),
                     Err(e) => Err(FromSqlError::Other(Box::new(TimestampParseError::Parse(e)))),
                 },
                 Err(e) => Err(FromSqlError::Other(Box::new(e))),
@@ -356,7 +376,7 @@ impl FromSql for Timestamp {
 impl ToSql for Timestamp {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         Ok(rusqlite::types::ToSqlOutput::Owned(
-            rusqlite::types::Value::Text(self.0.to_string()),
+            rusqlite::types::Value::Text(self.0.as_u64().to_string()),
         ))
     }
 }
@@ -492,11 +512,11 @@ pub async fn broadcast_changes(
     agent: Agent,
     db_version: CrsqlDbVersion,
     last_seq: CrsqlSeq,
-    version: Version,
     ts: Timestamp,
 ) -> Result<(), BroadcastError> {
     let actor_id = agent.actor_id();
     let conn = agent.pool().read().await?;
+    trace!("got conn for broadcast");
 
     block_in_place(|| {
         // TODO: make this more generic so both sync and local changes can use it.
@@ -505,6 +525,7 @@ pub async fn broadcast_changes(
                 SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
                     FROM crsql_changes
                     WHERE db_version = ?
+                    AND site_id = crsql_site_id()
                     ORDER BY seq ASC
             "#,
         )?;
@@ -531,7 +552,7 @@ pub async fn broadcast_changes(
                                 ChangeV1 {
                                     actor_id,
                                     changeset: Changeset::Full {
-                                        version,
+                                        version: db_version,
                                         changes,
                                         seqs,
                                         last_seq,

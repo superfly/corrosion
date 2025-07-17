@@ -18,7 +18,7 @@ use corro_client::CorrosionApiClient;
 use corro_types::{
     actor::{ActorId, ClusterId},
     api::{ExecResult, QueryEvent, Statement},
-    base::Version,
+    base::CrsqlDbVersion,
     config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
 };
 use futures::StreamExt;
@@ -462,13 +462,6 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
-        Command::Sync(SyncCommand::ReconcileGaps) => {
-            let mut conn = AdminConn::connect(cli.admin_path()).await?;
-            conn.send_command(corro_admin::Command::Sync(
-                corro_admin::SyncCommand::ReconcileGaps,
-            ))
-            .await?;
-        }
         Command::Locks { top } => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Locks { top: *top })
@@ -493,7 +486,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             conn.send_command(corro_admin::Command::Actor(
                 corro_admin::ActorCommand::Version {
                     actor_id: ActorId(*actor_id),
-                    version: Version(*version),
+                    version: CrsqlDbVersion(*version),
                 },
             ))
             .await?;
@@ -514,6 +507,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(db_path)?;
 
             info!("Acquiring lock...");
@@ -757,8 +751,6 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
-    /// Reconcile gaps between memory and DB
-    ReconcileGaps,
 }
 
 #[derive(Subcommand)]

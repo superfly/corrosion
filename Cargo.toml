@@ -53,7 +53,7 @@ rand = { version = "0.8.5", features = ["small_rng"] }
 rangemap = { version = "1.5.1", features = ["serde1"] }
 rcgen = { version = "0.11.1", features = ["x509-parser"] }
 rhai = { version = "1.15.1", features = ["sync"] }
-rusqlite = { version = "0.30.0", features = ["serde_json", "time", "bundled", "uuid", "array", "load_extension", "column_decltype", "vtab", "functions", "chrono", "series"] }
+rusqlite = { version = "0.32.1", features = ["serde_json", "time", "bundled", "uuid", "array", "load_extension", "column_decltype", "vtab", "functions", "chrono", "series", "trace"], git = "https://github.com/rusqlite/rusqlite", rev = "c9f77814ddc99825f9c8eb52a0acb8d00f447f17" }
 rustls = { version = "0.21.0", features = ["dangerous_configuration", "quic"] }
 rustls-pemfile = "1.0.2"
 seahash = "4.1.0"
