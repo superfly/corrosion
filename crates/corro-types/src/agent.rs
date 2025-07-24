@@ -1332,7 +1332,11 @@ impl BookedVersions {
 
                         // TODO: don't do this manually...
                         snap.needed.insert(start_v..=end_v);
-                        snap.max = cmp::max(snap.max, Some(end_v));
+                        // max for booked versions shouldn't come from gaps
+                        if Some(end_v) > snap.max {
+                            warn!("max for actor {actor_id} is being set from gaps: {end_v}, previous max: {:?}", snap.max);
+                            snap.max = Some(end_v);
+                        }
                     }
                 }
             }
