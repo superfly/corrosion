@@ -376,6 +376,13 @@ impl CorrosionClient {
         }
     }
 
+    pub fn with_sqlite_pool(api_addr: SocketAddr, pool: sqlite_pool::RusqlitePool) -> Self {
+        Self {
+            api_client: CorrosionApiClient::new(api_addr),
+            pool,
+        }
+    }
+
     pub fn pool(&self) -> &sqlite_pool::RusqlitePool {
         &self.pool
     }
