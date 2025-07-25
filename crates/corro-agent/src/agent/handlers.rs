@@ -461,7 +461,7 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
     let pool = agent.pool().clone();
 
     tokio::spawn(async move {
-        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024;
+        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024 * 1024;
 
         // try to initially truncate the WAL
         match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold).await
