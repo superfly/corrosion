@@ -1,5 +1,10 @@
 use std::{
-    collections::{HashMap, HashSet}, env::current_dir, io::ErrorKind, net::SocketAddr, path::Path, time::{Duration, Instant}
+    collections::{HashMap, HashSet},
+    env::current_dir,
+    io::ErrorKind,
+    net::SocketAddr,
+    path::Path,
+    time::{Duration, Instant},
 };
 
 use camino::Utf8PathBuf;
@@ -235,12 +240,11 @@ pub async fn run(
     Ok(())
 }
 
-async fn atomic_rename_or_copy(
-    tmp: &Path, dst: &Utf8PathBuf
-) -> eyre::Result<()> {
+async fn atomic_rename_or_copy(tmp: &Path, dst: &Utf8PathBuf) -> eyre::Result<()> {
     match tokio::fs::rename(tmp, dst).await {
         Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(18) => { // libc::EXDEV cross link
+        Err(e) if e.raw_os_error() == Some(18) => {
+            // libc::EXDEV cross link
             info!("cross-device rename, falling back to copy");
             tokio::fs::copy(tmp, dst).await?;
             tokio::fs::remove_file(tmp).await?;
