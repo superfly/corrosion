@@ -20,7 +20,10 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
-        rust-latest = fenix.packages."${system}".latest;
+        rust-toolchain = fenix.packages."${system}".fromToolchainFile {
+          file = ./rust-toolchain.toml;
+          sha256 = "sha256-3aoA7PuH09g8F+60uTUQhnHrb/ARDLueSOD08ZVsWe0=";
+        };
       in
         {
           packages.mdbook-shell = pkgs.mkShell {
@@ -63,7 +66,7 @@
                 pkgs.pkg-config
                 pkgs.mold
                 pkgs.clang
-                rust-latest.toolchain
+                rust-toolchain
               ];
 
               ## Dependencies for the linked binary
