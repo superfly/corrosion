@@ -18,7 +18,7 @@ use crate::{
     api::peer::parallel_sync,
     transport::Transport,
 };
-use antithesis_sdk::{assert_always, assert_sometimes};
+use antithesis_sdk::assert_sometimes;
 use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
@@ -38,7 +38,6 @@ use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
-use serde_json::json;
 use spawn::spawn_counted;
 use tokio::time::sleep;
 use tokio::{
@@ -461,7 +460,7 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
     let pool = agent.pool().clone();
 
     tokio::spawn(async move {
-        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024;
+        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024 * 1024;
 
         // try to initially truncate the WAL
         match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold).await
@@ -505,17 +504,16 @@ async fn wal_checkpoint_over_threshold(
 ) -> eyre::Result<bool> {
     let wal_size = wal_path.metadata()?.len();
     let should_truncate = wal_size > threshold;
-    let warn_threshold = 25 * 1024 * 1024 * 1024;
-    let wal_size_gb = wal_size / 1024 / 1024 / 1024;
-    let details = json!({"wal_size": wal_size_gb});
-    assert_always!(
-        wal_size < warn_threshold,
-        "wal_size is under 25gb",
-        &details
-    );
+
     if should_truncate {
+        let conn = if wal_size > (5 * threshold) {
+            warn!("wal_size is over 5x the threshold, trying to get a priority conn");
+            pool.write_priority().await?
+        } else {
+            pool.write_low().await?
+        };
+
         let timeout = calc_busy_timeout(wal_path.metadata()?.len(), threshold);
-        let conn = pool.write_low().await?;
         block_in_place(|| wal_checkpoint(&conn, timeout))?;
     }
     Ok(should_truncate)
@@ -529,10 +527,10 @@ fn calc_busy_timeout(wal_size: u64, threshold: u64) -> u64 {
         return base_timeout;
     }
 
-    // Double the timeout every 10gb and cap at 64 minutes
-    let diff = cmp::min(5, wal_size_gb / 10);
-    // add extra (five * diff) seconds for every extra 1gb over 10gb
-    let linear_increase = (wal_size_gb % 10) * 5000 * diff;
+    // Double the timeout every 5gb and cap at 16 minutes
+    let diff = cmp::min(5, (wal_size_gb - threshold_gb) / 5);
+    // add extra (five * diff) seconds for every extra 1gb over 4gb
+    let linear_increase = (wal_size_gb % 5) * 5000 * (diff + 1);
     let timeout = base_timeout * 2_u64.pow(diff as u32) + linear_increase;
     // we are using a 16min timeout, something is wrong if we get here
     if diff >= 5 {
@@ -1076,29 +1074,36 @@ mod tests {
         assert_eq!(calc_busy_timeout(to_bytes(1), to_bytes(5)), 30000); // 30s
         assert_eq!(calc_busy_timeout(to_bytes(4), to_bytes(5)), 30000); // 30s
         assert_eq!(calc_busy_timeout(to_bytes(5), to_bytes(5)), 30000); // 30s
-        assert_eq!(calc_busy_timeout(to_bytes(9), to_bytes(5)), 30000); // 30s
+        assert_eq!(calc_busy_timeout(to_bytes(9), to_bytes(5)), 50000); // 50s
 
-        // At 10GB we hit first doubling + linear increases (5s per GB)
+        // At 10GB we hit first doubling + linear increases (10s per GB)
         assert_eq!(calc_busy_timeout(to_bytes(10), to_bytes(5)), 60000); // 1m
-        assert_eq!(calc_busy_timeout(to_bytes(11), to_bytes(5)), 65000); // 1m10s
-        assert_eq!(calc_busy_timeout(to_bytes(15), to_bytes(5)), 85000); // 1m50s
+        assert_eq!(calc_busy_timeout(to_bytes(11), to_bytes(5)), 70000); // 1m10s
 
-        // At 20GB we hit second doubling + linear increases (10s per GB)
-        assert_eq!(calc_busy_timeout(to_bytes(20), to_bytes(5)), 120000); // 2m
-        assert_eq!(calc_busy_timeout(to_bytes(21), to_bytes(5)), 130000); // 2m10s
-        assert_eq!(calc_busy_timeout(to_bytes(25), to_bytes(5)), 170000); // 2m50s
+        // At 15GB we hit second doubling + linear increases (15s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(15), to_bytes(5)), 120000); // 2m
+        assert_eq!(calc_busy_timeout(to_bytes(17), to_bytes(5)), 150000); // 2m30s
+        assert_eq!(calc_busy_timeout(to_bytes(19), to_bytes(5)), 180000); // 3m
 
-        // At 30GB we hit third doubling + linear increases (15s per GB)
-        assert_eq!(calc_busy_timeout(to_bytes(30), to_bytes(5)), 240000); // 4m
-        assert_eq!(calc_busy_timeout(to_bytes(31), to_bytes(5)), 255000); // 4m15s
+        // At 20GB we hit third doubling + linear increases (20s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(20), to_bytes(5)), 240000); // 4m
+        assert_eq!(calc_busy_timeout(to_bytes(21), to_bytes(5)), 260000); // 4m20s
 
-        // At 40GB we hit fourth doubling + linear increases (20s per GB)
-        assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(5)), 480000); // 8m
-        assert_eq!(calc_busy_timeout(to_bytes(41), to_bytes(5)), 500000); // 8m20s
+        // At 25GB we hit third doubling + linear increases (25s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(25), to_bytes(5)), 480000); // 8m
+        assert_eq!(calc_busy_timeout(to_bytes(27), to_bytes(5)), 530000); // 8m50s
+
+        // At 30GB we hit third doubling + linear increases (30s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(30), to_bytes(5)), 960000); // 16m
+        assert_eq!(calc_busy_timeout(to_bytes(31), to_bytes(5)), 990000); // 16m30s
+
+        // At 40GB we hit the cap + linear increases (40s per GB)
+        assert_eq!(calc_busy_timeout(to_bytes(40), to_bytes(5)), 960000); // 16m
+        assert_eq!(calc_busy_timeout(to_bytes(41), to_bytes(5)), 990000); // 16m30s
 
         // At 50GB we hit fifth doubling and cap at 16m
         assert_eq!(calc_busy_timeout(to_bytes(50), to_bytes(5)), 960000); // 16m
-        assert_eq!(calc_busy_timeout(to_bytes(51), to_bytes(5)), 985000); // 16m25s (capped)
+        assert_eq!(calc_busy_timeout(to_bytes(51), to_bytes(5)), 990000); // 16m25s (capped)
         assert_eq!(calc_busy_timeout(to_bytes(100), to_bytes(5)), 960000); // 16m (capped)
     }
 
