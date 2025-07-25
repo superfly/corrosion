@@ -1,8 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    env::current_dir,
-    net::SocketAddr,
-    time::{Duration, Instant},
+    collections::{HashMap, HashSet}, env::current_dir, io::ErrorKind, net::SocketAddr, path::Path, time::{Duration, Instant}
 };
 
 use camino::Utf8PathBuf;
@@ -131,7 +128,10 @@ pub async fn run(
 
                 debug!("rendered template");
 
-                tokio::fs::rename(&tmp_filepath, &dst).await?;
+                if let Err(e) = atomic_rename_or_copy(&tmp_filepath, &dst).await {
+                    error!("failed to write {}: {e}", dst);
+                    break;
+                }
 
                 debug!("wrote file");
 
@@ -226,16 +226,28 @@ pub async fn run(
     tokio::spawn(async_watch(filepaths));
 
     while let Some(res) = futs.next().await {
-        match res {
-            Ok(_) => {
-                info!("")
-            }
-            Err(_) => todo!(),
+        if let Err(ref err) = res {
+            error!("template task failed: {err:#}");
         }
         println!("got a res: {res:?}");
     }
 
     Ok(())
+}
+
+async fn atomic_rename_or_copy(
+    tmp: &Path, dst: &Utf8PathBuf
+) -> eyre::Result<()> {
+    match tokio::fs::rename(tmp, dst).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(18) => { // libc::EXDEV cross link
+            info!("cross-device rename, falling back to copy");
+            tokio::fs::copy(tmp, dst).await?;
+            tokio::fs::remove_file(tmp).await?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn async_watcher() -> notify::Result<(Debouncer<RecommendedWatcher>, Receiver<DebounceEventResult>)>
