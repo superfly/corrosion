@@ -776,6 +776,7 @@ pub async fn process_multiple_changes(
                 actor_id.as_simple(),
             );
 
+            let max = booked_write.last();
             let mut seen = RangeInclusiveMap::new();
 
             for (change, src) in changes {
@@ -807,6 +808,19 @@ pub async fn process_multiple_changes(
 
                 // optimizing this, insert later!
                 let known = if change.is_complete() && change.is_empty() {
+                    let versions = change.versions();
+                    let end = *versions.end();
+                    // update db_version in db if it's greater than the max
+                    // since we aren't passing any changes to crsql
+                    if Some(end) > max {
+                        process_empty_version(&tx, change.actor_id, &end).map_err(|e| {
+                            ChangeError::Rusqlite {
+                                source: e,
+                                actor_id: Some(change.actor_id),
+                                version: Some(end),
+                            }
+                        })?;
+                    }
                     KnownDbVersion::Cleared
                 } else {
                     if let Some(seqs) = change.seqs() {
@@ -1018,6 +1032,19 @@ pub async fn process_multiple_changes(
     histogram!("corro.agent.changes.processing.time.seconds", "source" => "remote")
         .record(start.elapsed());
     histogram!("corro.agent.changes.processing.chunk_size").record(change_chunk_size as f64);
+
+    Ok(())
+}
+
+#[tracing::instrument(skip(tx), err)]
+pub fn process_empty_version<T: Deref<Target = rusqlite::Connection> + Committable>(
+    tx: &InterruptibleTransaction<T>,
+    actor_id: ActorId,
+    end_version: &CrsqlDbVersion,
+) -> rusqlite::Result<()> {
+    let _ = tx
+        .prepare_cached("SELECT crsql_set_db_version(?, ?)")?
+        .query_row((actor_id, end_version), |row| row.get::<_, String>(0))?;
 
     Ok(())
 }
