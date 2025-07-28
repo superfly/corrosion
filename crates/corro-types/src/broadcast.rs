@@ -8,7 +8,7 @@ use std::{
 
 use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
-use corro_api_types::{row_to_change, Change, ColumnName, SqliteValue};
+use corro_api_types::{ColumnName, SqliteValue};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use itertools::Itertools;
 use metrics::counter;
@@ -30,7 +30,7 @@ use crate::{
     actor::{Actor, ActorId, ClusterId},
     agent::Agent,
     base::{CrsqlDbVersion, CrsqlSeq},
-    change::{ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
+    change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
     sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
