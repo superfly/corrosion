@@ -1101,6 +1101,10 @@ impl VersionsSnapshot {
         &self.needed
     }
 
+    pub fn insert_gaps(&mut self, db_versions: RangeInclusiveSet<CrsqlDbVersion>) {
+        self.needed.extend(db_versions);
+    }
+
     pub fn insert_db(
         &mut self,         // only because we want 1 mt a time here
         conn: &Connection, // usually a `Transaction`

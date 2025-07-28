@@ -1,9 +1,12 @@
-use std::{fmt::Display, time::Duration};
+use std::{
+    fmt::Display,
+    time::{Duration, Instant},
+};
 
 use camino::Utf8PathBuf;
 use corro_types::{
     actor::{ActorId, ClusterId},
-    agent::{Agent, Bookie, LockKind, LockMeta, LockState},
+    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{FocaCmd, FocaInput},
     sqlite::SqlitePoolError,
@@ -11,7 +14,7 @@ use corro_types::{
     updates::Handle,
 };
 use futures::{SinkExt, TryStreamExt};
-use rusqlite::{named_params, OptionalExtension};
+use rusqlite::{named_params, params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spawn::spawn_counted;
@@ -110,6 +113,7 @@ pub enum Command {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncCommand {
     Generate,
+    ReconcileGaps,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +238,46 @@ async fn handle_conn(
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
                         Err(e) => send_error(&mut stream, e).await,
                     }
+                    send_success(&mut stream).await;
+                }
+                Command::Sync(SyncCommand::ReconcileGaps) => {
+                    info_log(&mut stream, "reconciling gaps...").await;
+                    let mut conn = match agent.pool().write_low().await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    };
+
+                    let actor_ids = {
+                        match get_gaps_actor_ids(&conn) {
+                            Ok(actor_ids) => actor_ids,
+                            Err(e) => {
+                                send_error(&mut stream, e).await;
+                                continue;
+                            }
+                        }
+                    };
+                    for actor_id in actor_ids {
+                        let booked = bookie
+                            .read("admin sync reconcile gaps get actor", actor_id.as_simple())
+                            .await
+                            .get(&actor_id)
+                            .unwrap()
+                            .clone();
+
+                        let mut bv = booked
+                            .write::<&str, _>("admin sync reconcile gaps booked versions", None)
+                            .await;
+                        debug_log(&mut stream, format!("got bookie for actor id: {actor_id}"))
+                            .await;
+                        if let Err(e) = collapse_gaps(&mut stream, &mut conn, &mut bv).await {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    }
+
                     send_success(&mut stream).await;
                 }
                 Command::Locks { top } => {
@@ -612,4 +656,62 @@ async fn send_error<E: Display>(stream: &mut FramedStream, error: E) {
         },
     )
     .await
+}
+
+fn get_gaps_actor_ids(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ActorId>> {
+    conn.prepare_cached("SELECT DISTINCT actor_id FROM __corro_bookkeeping_gaps")?
+        .query_map([], |row| row.get::<_, ActorId>(0))?
+        .collect::<Result<Vec<_>, _>>()
+}
+
+async fn collapse_gaps(
+    stream: &mut FramedStream,
+    conn: &mut rusqlite::Connection,
+    bv: &mut BookedVersions,
+) -> rusqlite::Result<()> {
+    let actor_id = bv.actor_id();
+    let mut snap = bv.snapshot();
+    _ = info_log(stream, format!("collapsing ranges for {actor_id}")).await;
+    let start = Instant::now();
+    let (deleted, inserted) = block_in_place(|| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let versions = tx
+            .prepare_cached("SELECT start, end FROM __corro_bookkeeping_gaps WHERE actor_id = ?")?
+            .query_map(rusqlite::params![actor_id], |row| {
+                Ok(row.get(0)?..=row.get(1)?)
+            })?
+            .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<CrsqlDbVersion>>>()?;
+
+        let deleted = tx.execute(
+            "DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
+            [actor_id],
+        )?;
+
+        snap.insert_gaps(versions);
+
+        let mut inserted = 0;
+        for range in snap.needed().iter() {
+            tx.prepare_cached(
+                "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?,?,?);",
+            )?
+            .execute(params![actor_id, range.start(), range.end()])?;
+            inserted += 1;
+        }
+
+        tx.commit()?;
+
+        Ok::<_, rusqlite::Error>((deleted, inserted))
+    })?;
+
+    _ = info_log(
+        stream,
+        format!(
+            "collapsed ranges in {:?} (deleted: {deleted}, inserted: {inserted})",
+            start.elapsed()
+        ),
+    )
+    .await;
+
+    bv.commit_snapshot(snap);
+    Ok(())
 }
