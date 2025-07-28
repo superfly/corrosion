@@ -1101,6 +1101,10 @@ impl VersionsSnapshot {
         &self.needed
     }
 
+    pub fn insert_gaps(&mut self, db_versions: RangeInclusiveSet<CrsqlDbVersion>) {
+        self.needed.extend(db_versions);
+    }
+
     pub fn insert_db(
         &mut self,         // only because we want 1 mt a time here
         conn: &Connection, // usually a `Transaction`
@@ -1334,8 +1338,7 @@ impl BookedVersions {
                         snap.needed.insert(start_v..=end_v);
                         // max for booked versions shouldn't come from gaps
                         if Some(end_v) > snap.max {
-                            warn!("max for actor {actor_id} is being set from gaps: {end_v}, previous max: {:?}", snap.max);
-                            snap.max = Some(end_v);
+                            warn!(%actor_id, %start_v, %end_v, max = ?snap.max, "max for actor is less than gap");
                         }
                     }
                 }
