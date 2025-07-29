@@ -10,7 +10,7 @@ use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
 use compact_str::{format_compact, ToCompactString};
 use corro_api_types::{
-    Change, ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
+    ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
 use enquote::unquote;
 use fallible_iterator::FallibleIterator;
@@ -44,6 +44,7 @@ use crate::{
     agent::SplitPool,
     api::QueryEvent,
     base::CrsqlDbVersion,
+    change::Change,
     schema::{Schema, Table},
     sqlite::CrConn,
     updates::HandleMetrics,
