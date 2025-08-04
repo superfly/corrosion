@@ -180,6 +180,7 @@ pub async fn api_v1_transactions(
     axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
+    let actor_id = agent.actor_id().to_string();
     if statements.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -189,6 +190,7 @@ pub async fn api_v1_transactions(
                 }],
                 time: 0.0,
                 version: None,
+                actor_id: Some(actor_id),
             }),
         );
     }
@@ -236,6 +238,7 @@ pub async fn api_v1_transactions(
                     }],
                     time: 0.0,
                     version: None,
+                    actor_id: Some(actor_id),
                 }),
             );
         }
@@ -247,6 +250,7 @@ pub async fn api_v1_transactions(
             results,
             time: elapsed.as_secs_f64(),
             version: version.map(Into::into),
+            actor_id: Some(actor_id),
         }),
     )
 }
@@ -592,6 +596,7 @@ pub async fn api_v1_db_schema(
     Extension(agent): Extension<Agent>,
     axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
+    let actor_id = agent.actor_id().to_string();
     if statements.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -601,6 +606,7 @@ pub async fn api_v1_db_schema(
                 }],
                 time: 0.0,
                 version: None,
+                actor_id: Some(actor_id),
             }),
         );
     }
@@ -618,6 +624,7 @@ pub async fn api_v1_db_schema(
                 }],
                 time: 0.0,
                 version: None,
+                actor_id: Some(actor_id),
             }),
         );
     }
@@ -628,6 +635,7 @@ pub async fn api_v1_db_schema(
             results: vec![],
             time: start.elapsed().as_secs_f64(),
             version: None,
+            actor_id: Some(actor_id),
         }),
     )
 }
