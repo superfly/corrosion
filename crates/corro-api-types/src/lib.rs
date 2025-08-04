@@ -220,6 +220,7 @@ pub struct ExecResponse {
     pub results: Vec<ExecResult>,
     pub time: f64,
     pub version: Option<u64>,
+    pub actor_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
