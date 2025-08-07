@@ -268,10 +268,7 @@ mod tests {
         // empty interator
         let mut chunker = ChunkedChanges::new(vec![].into_iter(), 0, 100, 50);
 
-        assert_eq!(
-            chunker.next(),
-            Some(Ok((vec![], 0..=100)))
-        );
+        assert_eq!(chunker.next(), Some(Ok((vec![], 0..=100))));
         assert_eq!(chunker.next(), None);
 
         let changes: Vec<Change> = (0..100)
@@ -296,10 +293,7 @@ mod tests {
 
         assert_eq!(
             chunker.next(),
-            Some(Ok((
-                vec![changes[0].clone(), changes[1].clone()],
-                0..=1
-            )))
+            Some(Ok((vec![changes[0].clone(), changes[1].clone()], 0..=1)))
         );
         assert_eq!(
             chunker.next(),
@@ -314,10 +308,7 @@ mod tests {
             changes[0].estimated_byte_size(),
         );
 
-        assert_eq!(
-            chunker.next(),
-            Some(Ok((vec![changes[0].clone()], 0..=0)))
-        );
+        assert_eq!(chunker.next(), Some(Ok((vec![changes[0].clone()], 0..=0))));
         assert_eq!(chunker.next(), None);
 
         // gaps
@@ -330,10 +321,7 @@ mod tests {
 
         assert_eq!(
             chunker.next(),
-            Some(Ok((
-                vec![changes[0].clone(), changes[2].clone()],
-                0..=100
-            )))
+            Some(Ok((vec![changes[0].clone(), changes[2].clone()], 0..=100)))
         );
 
         assert_eq!(chunker.next(), None);
@@ -383,18 +371,12 @@ mod tests {
 
         assert_eq!(
             chunker.next(),
-            Some(Ok((
-                vec![changes[2].clone(), changes[4].clone(),],
-                0..=4
-            )))
+            Some(Ok((vec![changes[2].clone(), changes[4].clone(),], 0..=4)))
         );
 
         assert_eq!(
             chunker.next(),
-            Some(Ok((
-                vec![changes[7].clone(), changes[8].clone(),],
-                5..=10
-            )))
+            Some(Ok((vec![changes[7].clone(), changes[8].clone(),], 5..=10)))
         );
 
         assert_eq!(chunker.next(), None);

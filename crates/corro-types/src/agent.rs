@@ -1616,20 +1616,10 @@ mod tests {
 
         let mut all = RangeInclusiveSet::new();
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![1..=20],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![1..=20])?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![1..=10],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![1..=10])?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
         // try from an empty state again
@@ -1637,32 +1627,11 @@ mod tests {
         let mut all = RangeInclusiveSet::new();
 
         // create 2:=3 gap
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![
-                1..=1,
-                4..=4
-            ],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![2..=3],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![1..=1, 4..=4])?;
+        expect_gaps(&conn, &bv, &all, vec![2..=3])?;
 
         // fill gap
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![
-                3..=3,
-                2..=2
-            ],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![3..=3, 2..=2])?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
         // try from an empty state again
@@ -1670,192 +1639,60 @@ mod tests {
         let mut all = RangeInclusiveSet::new();
 
         // insert a non-1 first version
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![5..=20],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![1..=4],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![5..=20])?;
+        expect_gaps(&conn, &bv, &all, vec![1..=4])?;
 
         // insert a further change that does not overlap a gap
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![6..=7],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![1..=4],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![6..=7])?;
+        expect_gaps(&conn, &bv, &all, vec![1..=4])?;
 
         // insert a further change that does overlap a gap
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![3..=7],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![1..=2],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![3..=7])?;
+        expect_gaps(&conn, &bv, &all, vec![1..=2])?;
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![1..=2],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![1..=2])?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![25..=25],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![21..=24],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![25..=25])?;
+        expect_gaps(&conn, &bv, &all, vec![21..=24])?;
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![30..=35],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![
-                21..=24,
-                26..=29,
-            ],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![30..=35])?;
+        expect_gaps(&conn, &bv, &all, vec![21..=24, 26..=29])?;
 
         // NOTE: overlapping partially from the end
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![19..=22],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![
-                23..=24,
-                26..=29,
-            ],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![19..=22])?;
+        expect_gaps(&conn, &bv, &all, vec![23..=24, 26..=29])?;
 
         // NOTE: overlapping partially from the start
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![24..=25],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![
-                23..=23,
-                26..=29,
-            ],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![24..=25])?;
+        expect_gaps(&conn, &bv, &all, vec![23..=23, 26..=29])?;
 
         // NOTE: overlapping 2 ranges
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![23..=27],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![28..=29],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![23..=27])?;
+        expect_gaps(&conn, &bv, &all, vec![28..=29])?;
 
         // NOTE: ineffective insert of already known ranges
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![1..=20],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![28..=29],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![1..=20])?;
+        expect_gaps(&conn, &bv, &all, vec![28..=29])?;
 
         // NOTE: overlapping no ranges, but encompassing a full range
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![27..=30],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![27..=30])?;
         expect_gaps(&conn, &bv, &all, vec![])?;
 
         // NOTE: touching multiple ranges, partially
 
         // create gap 36..=39
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![40..=45],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![40..=45])?;
         // create gap 46..=49
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![50..=55],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![50..=55])?;
 
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![38..=47],
-        )?;
-        expect_gaps(
-            &conn,
-            &bv,
-            &all,
-            vec![
-                36..=37,
-                48..=49,
-            ],
-        )?;
+        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![38..=47])?;
+        expect_gaps(&conn, &bv, &all, vec![36..=37, 48..=49])?;
 
         // test loading a bv from the conn, they should be identical!
         let mut bv2 = BookedVersions::from_conn(&conn, actor_id)?;

@@ -1046,9 +1046,7 @@ mod tests {
     use super::*;
     use crate::agent::spawn_unipayload_handler;
     use corro_tests::launch_test_agent;
-    use corro_types::{
-        broadcast::{BroadcastV1, ChangeV1, Changeset},
-    };
+    use corro_types::broadcast::{BroadcastV1, ChangeV1, Changeset};
     use uuid::Uuid;
 
     #[test]

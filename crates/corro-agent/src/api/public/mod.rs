@@ -786,10 +786,7 @@ mod tests {
         assert!(matches!(
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
-                changeset: Changeset::Full {
-                    version: 1,
-                    ..
-                },
+                changeset: Changeset::Full { version: 1, .. },
                 ..
             }))
         ));

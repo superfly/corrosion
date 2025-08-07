@@ -216,9 +216,7 @@ impl Changeset {
         match self {
             Changeset::Empty { .. } => true,
             Changeset::EmptySet { .. } => true,
-            Changeset::Full { seqs, last_seq, .. } => {
-                *seqs.start() == 0 && seqs.end() == last_seq
-            }
+            Changeset::Full { seqs, last_seq, .. } => *seqs.start() == 0 && seqs.end() == last_seq,
         }
     }
 

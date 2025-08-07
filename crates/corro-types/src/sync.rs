@@ -140,8 +140,7 @@ impl SyncStateV1 {
                 continue;
             }
             let other_haves = {
-                let mut haves =
-                    RangeInclusiveSet::from_iter([(1..=*head)].into_iter());
+                let mut haves = RangeInclusiveSet::from_iter([(1..=*head)].into_iter());
 
                 // remove needs
                 if let Some(other_need) = other.need.get(actor_id) {
@@ -195,8 +194,7 @@ impl SyncStateV1 {
                         let end_seq = cmp::max(max_other_seq, max_our_seq);
 
                         if let Some(end) = end_seq {
-                            let mut other_seqs_haves =
-                                RangeInclusiveSet::from_iter([0..=end]);
+                            let mut other_seqs_haves = RangeInclusiveSet::from_iter([0..=end]);
 
                             for seqs in other_seqs.iter() {
                                 other_seqs_haves.remove(seqs.clone());
@@ -239,10 +237,9 @@ impl SyncStateV1 {
             };
 
             if let Some(missing) = missing {
-                needs
-                    .entry(*actor_id)
-                    .or_default()
-                    .push(SyncNeedV1::Full { versions: missing.into() });
+                needs.entry(*actor_id).or_default().push(SyncNeedV1::Full {
+                    versions: missing.into(),
+                });
             }
         }
 
@@ -318,13 +315,11 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
                 // don't set partial if it is effectively complete
                 .filter(|(_, partial)| !partial.is_complete())
             {
-                state.partial_need.entry(actor_id).or_default().insert(
-                    *v,
-                    partial
-                        .seqs
-                        .gaps(&(0..=partial.last_seq))
-                        .collect(),
-                );
+                state
+                    .partial_need
+                    .entry(actor_id)
+                    .or_default()
+                    .insert(*v, partial.seqs.gaps(&(0..=partial.last_seq)).collect());
             }
         }
         state.heads.insert(actor_id, last_version);
@@ -435,14 +430,9 @@ mod tests {
             .into()
         );
 
-        our_state.partial_need.insert(
-            actor1,
-            [(
-                9,
-                vec![100..=120, 130..=132],
-            )]
-            .into(),
-        );
+        our_state
+            .partial_need
+            .insert(actor1, [(9, vec![100..=120, 130..=132])].into());
 
         assert_eq!(
             our_state.compute_available_needs(&other_state),
@@ -467,14 +457,9 @@ mod tests {
             .into()
         );
 
-        other_state.partial_need.insert(
-            actor1,
-            [(
-                9,
-                vec![100..=110, 130..=130],
-            )]
-            .into(),
-        );
+        other_state
+            .partial_need
+            .insert(actor1, [(9, vec![100..=110, 130..=130])].into());
 
         assert_eq!(
             our_state.compute_available_needs(&other_state),

@@ -884,7 +884,7 @@ mod tests {
     use corro_types::actor::ActorId;
     use corro_types::api::NotifyEvent;
     use corro_types::api::{ColumnName, TableName};
-    use corro_types::base::{CrsqlSeq};
+    use corro_types::base::CrsqlSeq;
     use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
     use corro_types::change::Change;
     use corro_types::pubsub::pack_columns;

@@ -805,11 +805,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     // make about 50 transactions to ta1
     insert_rows(ta1.agent.clone(), 1, 50).await;
     // send them all
-    let rows = get_rows(
-        ta1.agent.clone(),
-        vec![(1..=50, None)],
-    )
-    .await?;
+    let rows = get_rows(ta1.agent.clone(), vec![(1..=50, None)]).await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
 
     // overwrite different version ranges
@@ -858,12 +854,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         vec![],
         vec![],
         vec![],
-        vec![
-            1..=5,
-            10..=10,
-            23..=25,
-            30..=31,
-        ],
+        vec![1..=5, 10..=10, 23..=25, 30..=31],
     )
     .await?;
 
@@ -910,11 +901,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
         .await;
         assert_eq!(status_code, StatusCode::OK);
     }
-    let mut good_changes = get_rows(
-        ta2.agent.clone(),
-        vec![(1..=5, None)],
-    )
-    .await?;
+    let mut good_changes = get_rows(ta2.agent.clone(), vec![(1..=5, None)]).await?;
 
     let change6 = Change {
         table: TableName("tests".into()),
@@ -1027,11 +1014,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     insert_rows(ta1.agent.clone(), 1, 50).await;
 
     // sent 1-5
-    let rows = get_rows(
-        ta1.agent.clone(),
-        vec![(1..=5, None)],
-    )
-    .await?;
+    let rows = get_rows(ta1.agent.clone(), vec![(1..=5, None)]).await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check ta2 bookie
     check_bookie_versions(
@@ -1045,11 +1028,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     .await?;
 
     // sent: 1-5, 9-10
-    let rows = get_rows(
-        ta1.agent.clone(),
-        vec![(9..=10, None)],
-    )
-    .await?;
+    let rows = get_rows(ta1.agent.clone(), vec![(9..=10, None)]).await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check for gap 6-8
     check_bookie_versions(
@@ -1067,13 +1046,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     // * indicates partial version
     let rows = get_rows(
         ta1.agent.clone(),
-        vec![
-            (20..=20, None),
-            (
-                15..=16,
-                Some(0..=0),
-            ),
-        ],
+        vec![(20..=20, None), (15..=16, Some(0..=0))],
     )
     .await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
@@ -1082,14 +1055,8 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ta2.clone(),
         ta1.agent.actor_id(),
         vec![],
-        vec![
-            11..=14,
-            17..=19,
-        ],
-        vec![(
-            15..=16,
-            0..=0,
-        )],
+        vec![11..=14, 17..=19],
+        vec![(15..=16, 0..=0)],
         vec![],
     )
     .await?;
@@ -1098,14 +1065,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     insert_rows(ta1.agent.clone(), 21, 25).await;
     // send non-contiguous cleared versions
     // sent 1-5, 9-10, 15-16*, 20, 21, 25
-    let rows = get_rows(
-        ta1.agent.clone(),
-        vec![
-            (21..=21, None),
-            (25..=25, None),
-        ],
-    )
-    .await?;
+    let rows = get_rows(ta1.agent.clone(), vec![(21..=21, None), (25..=25, None)]).await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
 
     check_bookie_versions(
@@ -1114,10 +1074,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         vec![],
         vec![],
         vec![],
-        vec![
-            21..=21,
-            25..=25,
-        ],
+        vec![21..=21, 25..=25],
     )
     .await?;
 
@@ -1125,29 +1082,15 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     // sent 1-5, 9-10, 14-18, 20, 23-25
     let rows = get_rows(
         ta1.agent.clone(),
-        vec![
-            (14..=18, None),
-            (
-                15..=16,
-                Some(1..=3),
-            ),
-            (23..=24, None),
-        ],
+        vec![(14..=18, None), (15..=16, Some(1..=3)), (23..=24, None)],
     )
     .await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        vec![
-            14..=18,
-            15..=16,
-        ],
-        vec![
-            11..=13,
-            19..=19,
-            22..=22,
-        ],
+        vec![14..=18, 15..=16],
+        vec![11..=13, 19..=19, 22..=22],
         vec![],
         vec![23..=25],
     )
@@ -1156,11 +1099,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     // sent 1-25
     let rows = get_rows(
         ta1.agent.clone(),
-        vec![
-            (6..=8, None),
-            (11..=19, None),
-            (22..=22, None),
-        ],
+        vec![(6..=8, None), (11..=19, None), (22..=22, None)],
     )
     .await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
