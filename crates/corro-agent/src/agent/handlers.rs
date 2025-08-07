@@ -802,7 +802,7 @@ pub async fn handle_sync(
             .set(needed.len() as f64);
     }
     for (actor_id, version) in sync_state.heads.iter() {
-        gauge!("corro.sync.client.head", "actor_id" => actor_id.to_string()).set(version.0 as f64);
+        gauge!("corro.sync.client.head", "actor_id" => actor_id.to_string()).set(*version as f64);
     }
 
     let chosen: Vec<(ActorId, SocketAddr)> = {
@@ -903,7 +903,7 @@ mod tests {
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::{
-        base::CrsqlDbVersion, broadcast::Changeset, change::Change, config::Config,
+        broadcast::Changeset, change::Change, config::Config,
         pubsub::pack_columns,
     };
     use rusqlite::Connection;
@@ -974,7 +974,7 @@ mod tests {
                     cid: ColumnName("text".into()),
                     val: "two override".into(),
                     col_version: 1,
-                    db_version: CrsqlDbVersion(i as u64),
+                    db_version: i as u64,
                     seq: CrsqlSeq(0),
                     site_id: agent.actor_id().to_bytes(),
                     cl: 1,
@@ -984,7 +984,7 @@ mod tests {
                     ChangeV1 {
                         actor_id: other_actor,
                         changeset: Changeset::Full {
-                            version: CrsqlDbVersion(i as u64),
+                            version: i as u64,
                             changes: vec![crsql_row.clone()],
                             seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                             last_seq: CrsqlSeq(0),
@@ -1006,10 +1006,10 @@ mod tests {
             .unwrap()
             .read::<&str, _>("test", None)
             .await;
-        assert!(booked.contains_all(CrsqlDbVersion(6)..=CrsqlDbVersion(10), None));
-        assert!(booked.contains_all(CrsqlDbVersion(1)..=CrsqlDbVersion(3), None));
-        assert!(!booked.contains_version(&CrsqlDbVersion(5)));
-        assert!(!booked.contains_version(&CrsqlDbVersion(4)));
+        assert!(booked.contains_all(6..=10, None));
+        assert!(booked.contains_all(1..=3, None));
+        assert!(!booked.contains_version(&5));
+        assert!(!booked.contains_version(&4));
 
         Ok(())
     }

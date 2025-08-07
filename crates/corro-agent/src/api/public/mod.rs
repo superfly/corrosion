@@ -707,7 +707,6 @@ mod tests {
     use bytes::Bytes;
     use corro_types::{
         api::RowId,
-        base::CrsqlDbVersion,
         broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
         config::Config,
         schema::SqliteType,
@@ -788,7 +787,7 @@ mod tests {
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
                 changeset: Changeset::Full {
-                    version: CrsqlDbVersion(1),
+                    version: 1,
                     ..
                 },
                 ..
@@ -797,7 +796,7 @@ mod tests {
 
         assert_eq!(
             agent.booked().read::<&str, _>("test", None).await.last(),
-            Some(CrsqlDbVersion(1))
+            Some(1)
         );
 
         println!("second req...");

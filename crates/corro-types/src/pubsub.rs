@@ -2751,7 +2751,7 @@ mod tests {
             }
 
             println!("processing change...");
-            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(2)).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 2).unwrap();
             println!("processed changes");
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
@@ -2772,7 +2772,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(3)).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 3).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
@@ -2795,7 +2795,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(4)).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 4).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
@@ -2854,7 +2854,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(5)).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 5).unwrap();
 
             let start = Instant::now();
             for _ in range {

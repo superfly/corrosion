@@ -173,7 +173,7 @@ impl Changeset {
             Changeset::Empty { versions, .. } => versions.clone(),
             // todo: this returns dummy version because empty set has an array of versions.
             // probably shouldn't be doing this
-            Changeset::EmptySet { .. } => CrsqlDbVersion(0)..=CrsqlDbVersion(0),
+            Changeset::EmptySet { .. } => 0..=0,
             Changeset::Full { version, .. } => *version..=*version,
         }
     }
@@ -182,11 +182,11 @@ impl Changeset {
     pub fn processing_cost(&self) -> usize {
         match self {
             Changeset::Empty { versions, .. } => {
-                cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)
+                cmp::min((*versions.end() - *versions.start()) as usize + 1, 20)
             }
             Changeset::EmptySet { versions, .. } => versions
                 .iter()
-                .map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20))
+                .map(|versions| cmp::min((*versions.end() - *versions.start()) as usize + 1, 20))
                 .sum::<usize>(),
             Changeset::Full { changes, .. } => changes.len(),
         }
