@@ -1,6 +1,4 @@
-use std::{
-    fmt,
-};
+use std::fmt;
 
 use speedy::{Context, Readable, Writable};
 
@@ -19,10 +17,12 @@ impl InclusiveRange {
     /// Returns an iterator of ranges with a maximum `chunk_size`
     #[inline]
     pub fn chunked(self, chunk_size: usize) -> InclusiveRangeChunkIter {
+        let chunk_size = chunk_size as u64;
+
         InclusiveRangeChunkIter {
             current: self.start,
             end: self.end,
-            chunk_size: chunk_size as u64,
+            chunk_size,
         }
     }
 
@@ -41,12 +41,15 @@ pub struct InclusiveRangeChunkIter {
 impl Iterator for InclusiveRangeChunkIter {
     type Item = InclusiveRange;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.current > self.end {
             return None;
         }
 
-        let next_step = self.current + self.chunk_size;
+        // Avoid overflows if the end of the range happens to be within chunk_size
+        // of u64::MAX
+        let next_step = self.current.saturating_add(self.chunk_size);
 
         let next = InclusiveRange {
             start: self.current,
@@ -63,10 +66,7 @@ impl From<std::ops::RangeInclusive<u64>> for InclusiveRange {
     #[inline]
     fn from(value: std::ops::RangeInclusive<u64>) -> Self {
         let (start, end) = value.into_inner();
-        Self {
-            start,
-            end,
-        }
+        Self { start, end }
     }
 }
 
@@ -89,30 +89,30 @@ impl fmt::Debug for InclusiveRange {
     }
 }
 
-impl< C: Context> Writable< C > for InclusiveRange {
+impl<C: Context> Writable<C> for InclusiveRange {
     #[inline]
-    fn write_to< W: ?Sized + speedy::Writer< C > >( &self, writer: &mut W ) -> Result< (), C::Error > {
-        self.start.write_to( writer )?;
-        self.end.write_to( writer )
+    fn write_to<W: ?Sized + speedy::Writer<C>>(&self, writer: &mut W) -> Result<(), C::Error> {
+        self.start.write_to(writer)?;
+        self.end.write_to(writer)
     }
 
     #[inline]
-    fn bytes_needed( &self ) -> Result< usize, C::Error > {
-        Ok( Writable::< C >::bytes_needed( &self.start )? + Writable::< C >::bytes_needed( &self.end )? )
+    fn bytes_needed(&self) -> Result<usize, C::Error> {
+        Ok(Writable::<C>::bytes_needed(&self.start)? + Writable::<C>::bytes_needed(&self.end)?)
     }
 }
 
-impl< 'a, C: Context > Readable< 'a, C > for InclusiveRange {
+impl<'a, C: Context> Readable<'a, C> for InclusiveRange {
     #[inline]
-    fn read_from< R: speedy::Reader< 'a, C > >( reader: &mut R ) -> Result< Self, C::Error > {
+    fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
         let start = reader.read_value()?;
         let end = reader.read_value()?;
-        Ok( Self { start, end} )
+        Ok(Self { start, end })
     }
 
     #[inline]
     fn minimum_bytes_needed() -> usize {
-        <u64 as Readable< 'a, C >>::minimum_bytes_needed() * 2
+        <u64 as Readable<'a, C>>::minimum_bytes_needed() * 2
     }
 }
 
@@ -124,20 +124,23 @@ mod test {
     fn chunked_iter() {
         // a range is always emitted, even on empty ranges
         {
-            let r = InclusiveRange {start: 0, end: 0};
+            let r = InclusiveRange { start: 0, end: 0 };
             assert_eq!(r.chunked(10).next().unwrap(), 0..=0);
 
-            let r = InclusiveRange {start: 1987, end: 1987};
+            let r = InclusiveRange {
+                start: 1987,
+                end: 1987,
+            };
             assert_eq!(r.chunked(2).next().unwrap(), 1987..=1987);
 
             // ...unless the start > end
-            let r = InclusiveRange {start: 2, end: 0};
+            let r = InclusiveRange { start: 2, end: 0 };
             assert!(r.chunked(1).next().is_none());
         }
 
         // exact
         {
-            let r = InclusiveRange {start: 1, end: 10};
+            let r = InclusiveRange { start: 1, end: 10 };
             let mut iter = r.chunked(10);
             assert_eq!(iter.next().unwrap(), 1..=10);
             assert!(iter.next().is_none());
@@ -145,7 +148,10 @@ mod test {
 
         // remainder
         {
-            let r = InclusiveRange {start: 2001, end: 11000};
+            let r = InclusiveRange {
+                start: 2001,
+                end: 11000,
+            };
             let mut iter = r.chunked(13);
 
             let mut full_chunks = (r.end - r.start) / 13;
