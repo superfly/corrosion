@@ -1,18 +1,13 @@
-#![feature(step_trait)]
-
 use std::{
     fmt,
-    iter::Step,
-    ops::{Add, Sub},
 };
 
-use rangemap::StepLite;
-use rusqlite::{types::FromSql, ToSql};
-use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Writable};
 
 pub type CrsqlDbVersion = u64;
 pub type CrsqlDbVersionRange = InclusiveRange;
+
+pub type CrsqlSeq = u64;
 
 #[derive(Copy, Clone, PartialEq)]
 pub struct InclusiveRange {
@@ -121,91 +116,6 @@ impl< 'a, C: Context > Readable< 'a, C > for InclusiveRange {
     }
 }
 
-#[derive(
-    Copy, Clone, Debug, Default, Ord, PartialOrd, Eq, PartialEq, Hash, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct CrsqlSeq(pub u64);
-
-impl Step for CrsqlSeq {
-    fn steps_between(start: &Self, end: &Self) -> Option<usize> {
-        u64::steps_between(&start.0, &end.0)
-    }
-
-    fn forward_checked(start: Self, count: usize) -> Option<Self> {
-        u64::forward_checked(start.0, count).map(Self)
-    }
-
-    fn backward_checked(start: Self, count: usize) -> Option<Self> {
-        u64::backward_checked(start.0, count).map(Self)
-    }
-}
-
-impl StepLite for CrsqlSeq {
-    fn add_one(&self) -> Self {
-        Self(self.0 + 1)
-    }
-
-    fn sub_one(&self) -> Self {
-        Self(self.0 - 1)
-    }
-}
-
-impl ToSql for CrsqlSeq {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        self.0.to_sql()
-    }
-}
-
-impl FromSql for CrsqlSeq {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        u64::column_result(value).map(Self)
-    }
-}
-
-impl Add<u64> for CrsqlSeq {
-    type Output = Self;
-
-    fn add(self, rhs: u64) -> Self::Output {
-        Self(self.0.add(rhs))
-    }
-}
-
-impl Sub<u64> for CrsqlSeq {
-    type Output = Self;
-
-    fn sub(self, rhs: u64) -> Self::Output {
-        Self(self.0.sub(rhs))
-    }
-}
-
-impl<'a, C> Readable<'a, C> for CrsqlSeq
-where
-    C: Context,
-{
-    fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, <C as Context>::Error> {
-        u64::read_from(reader).map(Self)
-    }
-}
-
-impl<C> Writable<C> for CrsqlSeq
-where
-    C: Context,
-{
-    fn write_to<T: ?Sized + speedy::Writer<C>>(
-        &self,
-        writer: &mut T,
-    ) -> Result<(), <C as Context>::Error> {
-        self.0.write_to(writer)
-    }
-}
-
-impl fmt::Display for CrsqlSeq {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -219,6 +129,10 @@ mod test {
 
             let r = InclusiveRange {start: 1987, end: 1987};
             assert_eq!(r.chunked(2).next().unwrap(), 1987..=1987);
+
+            // ...unless the start > end
+            let r = InclusiveRange {start: 2, end: 0};
+            assert!(r.chunked(1).next().is_none());
         }
 
         // exact

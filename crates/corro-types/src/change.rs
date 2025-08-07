@@ -82,7 +82,7 @@ where
         Self {
             iter: iter.peekable(),
             changes: vec![],
-            last_pushed_seq: CrsqlSeq(0),
+            last_pushed_seq: 0,
             last_start_seq: start_seq,
             last_seq,
             max_buf_size,
@@ -266,15 +266,15 @@ mod tests {
     #[test]
     fn test_change_chunker() {
         // empty interator
-        let mut chunker = ChunkedChanges::new(vec![].into_iter(), CrsqlSeq(0), CrsqlSeq(100), 50);
+        let mut chunker = ChunkedChanges::new(vec![].into_iter(), 0, 100, 50);
 
         assert_eq!(
             chunker.next(),
-            Some(Ok((vec![], CrsqlSeq(0)..=CrsqlSeq(100))))
+            Some(Ok((vec![], 0..=100)))
         );
         assert_eq!(chunker.next(), None);
 
-        let changes: Vec<Change> = (CrsqlSeq(0)..CrsqlSeq(100))
+        let changes: Vec<Change> = (0..100)
             .map(|seq| Change {
                 seq,
                 ..Default::default()
@@ -289,8 +289,8 @@ mod tests {
                 Ok(changes[2].clone()),
             ]
             .into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(100),
+            0,
+            100,
             changes[0].estimated_byte_size() + changes[1].estimated_byte_size(),
         );
 
@@ -298,33 +298,33 @@ mod tests {
             chunker.next(),
             Some(Ok((
                 vec![changes[0].clone(), changes[1].clone()],
-                CrsqlSeq(0)..=CrsqlSeq(1)
+                0..=1
             )))
         );
         assert_eq!(
             chunker.next(),
-            Some(Ok((vec![changes[2].clone()], CrsqlSeq(2)..=CrsqlSeq(100))))
+            Some(Ok((vec![changes[2].clone()], 2..=100)))
         );
         assert_eq!(chunker.next(), None);
 
         let mut chunker = ChunkedChanges::new(
             vec![Ok(changes[0].clone()), Ok(changes[1].clone())].into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(0),
+            0,
+            0,
             changes[0].estimated_byte_size(),
         );
 
         assert_eq!(
             chunker.next(),
-            Some(Ok((vec![changes[0].clone()], CrsqlSeq(0)..=CrsqlSeq(0))))
+            Some(Ok((vec![changes[0].clone()], 0..=0)))
         );
         assert_eq!(chunker.next(), None);
 
         // gaps
         let mut chunker = ChunkedChanges::new(
             vec![Ok(changes[0].clone()), Ok(changes[2].clone())].into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(100),
+            0,
+            100,
             changes[0].estimated_byte_size() + changes[2].estimated_byte_size(),
         );
 
@@ -332,7 +332,7 @@ mod tests {
             chunker.next(),
             Some(Ok((
                 vec![changes[0].clone(), changes[2].clone()],
-                CrsqlSeq(0)..=CrsqlSeq(100)
+                0..=100
             )))
         );
 
@@ -347,8 +347,8 @@ mod tests {
                 Ok(changes[8].clone()),
             ]
             .into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(100),
+            0,
+            100,
             100000, // just send them all!
         );
 
@@ -361,7 +361,7 @@ mod tests {
                     changes[7].clone(),
                     changes[8].clone()
                 ],
-                CrsqlSeq(0)..=CrsqlSeq(100)
+                0..=100
             )))
         );
 
@@ -376,8 +376,8 @@ mod tests {
                 Ok(changes[8].clone()),
             ]
             .into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(10),
+            0,
+            10,
             changes[2].estimated_byte_size() + changes[4].estimated_byte_size(),
         );
 
@@ -385,7 +385,7 @@ mod tests {
             chunker.next(),
             Some(Ok((
                 vec![changes[2].clone(), changes[4].clone(),],
-                CrsqlSeq(0)..=CrsqlSeq(4)
+                0..=4
             )))
         );
 
@@ -393,7 +393,7 @@ mod tests {
             chunker.next(),
             Some(Ok((
                 vec![changes[7].clone(), changes[8].clone(),],
-                CrsqlSeq(5)..=CrsqlSeq(10)
+                5..=10
             )))
         );
 

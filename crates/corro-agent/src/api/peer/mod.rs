@@ -442,7 +442,7 @@ fn handle_need(
 
                 send_change_chunks(
                     sender,
-                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
+                    ChunkedChanges::new(rows, 0, last_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
                     actor_id,
                     version,
                     last_seq,
@@ -743,7 +743,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
             Some(Ok((changes, seqs))) => {
                 let start = Instant::now();
 
-                if changes.is_empty() && *seqs.start() == CrsqlSeq(0) && *seqs.end() == last_seq {
+                if changes.is_empty() && *seqs.start() == 0 && *seqs.end() == last_seq {
                     warn!(%actor_id, %version, "got an empty changes we should've had");
                     return Ok(());
                 } else {
@@ -1751,7 +1751,7 @@ mod tests {
             val: "one".into(),
             col_version: 1,
             db_version: 1,
-            seq: CrsqlSeq(0),
+            seq: 0,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1763,7 +1763,7 @@ mod tests {
             val: "two".into(),
             col_version: 1,
             db_version: 2,
-            seq: CrsqlSeq(0),
+            seq: 0,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1780,8 +1780,8 @@ mod tests {
                         changeset: Changeset::Full {
                             version: 1,
                             changes: vec![change1.clone()],
-                            seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                            last_seq: CrsqlSeq(0),
+                            seqs: 0..=0,
+                            last_seq: 0,
                             ts,
                         },
                     },
@@ -1794,8 +1794,8 @@ mod tests {
                         changeset: Changeset::Full {
                             version: 2,
                             changes: vec![change2.clone()],
-                            seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                            last_seq: CrsqlSeq(0),
+                            seqs: 0..=0,
+                            last_seq: 0,
                             ts,
                         },
                     },
@@ -1858,8 +1858,8 @@ mod tests {
                     changeset: Changeset::Full {
                         version: 1,
                         changes: vec![change1],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
+                        seqs: 0..=0,
+                        last_seq: 0,
                         ts: ts,
                     }
                 }))
@@ -1872,7 +1872,7 @@ mod tests {
                     actor_id,
                     SyncNeedV1::Partial {
                         version: 2,
-                        seqs: vec![CrsqlSeq(0)..=CrsqlSeq(0)],
+                        seqs: vec![0..=0],
                     },
                     &tx,
                 )
@@ -1886,8 +1886,8 @@ mod tests {
                     changeset: Changeset::Full {
                         version: 2,
                         changes: vec![change2.clone()],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
+                        seqs: 0..=0,
+                        last_seq: 0,
                         ts: ts,
                     }
                 }))
@@ -1901,7 +1901,7 @@ mod tests {
             val: "one override".into(),
             col_version: 2,
             db_version: 3,
-            seq: CrsqlSeq(0),
+            seq: 0,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1915,8 +1915,8 @@ mod tests {
                     changeset: Changeset::Full {
                         version: 3,
                         changes: vec![change3.clone()],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
+                        seqs: 0..=0,
+                        last_seq: 0,
                         ts,
                     },
                 },
@@ -1951,7 +1951,7 @@ mod tests {
                     actor_id,
                     SyncNeedV1::Partial {
                         version: 1,
-                        seqs: vec![CrsqlSeq(0)..=CrsqlSeq(0)],
+                        seqs: vec![0..=0],
                     },
                     &tx,
                 )
@@ -1995,8 +1995,8 @@ mod tests {
                     changeset: Changeset::Full {
                         version: 3,
                         changes: vec![change3.clone()],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
+                        seqs: 0..=0,
+                        last_seq: 0,
                         ts: ts,
                     }
                 }))
@@ -2010,8 +2010,8 @@ mod tests {
                     changeset: Changeset::Full {
                         version: 2,
                         changes: vec![change2.clone()],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
+                        seqs: 0..=0,
+                        last_seq: 0,
                         ts: ts,
                     }
                 }))
@@ -2040,7 +2040,7 @@ mod tests {
             val: "two override".into(),
             col_version: 2,
             db_version: 4,
-            seq: CrsqlSeq(0),
+            seq: 0,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -2054,8 +2054,8 @@ mod tests {
                     changeset: Changeset::Full {
                         version: 4,
                         changes: vec![change4.clone()],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
+                        seqs: 0..=0,
+                        last_seq: 0,
                         ts,
                     },
                 },
@@ -2096,7 +2096,7 @@ mod tests {
                         val,
                         col_version: 1,
                         db_version: 5,
-                        seq: CrsqlSeq(last_seq),
+                        seq: last_seq,
                         site_id: actor_id.to_bytes(),
                         cl: 1,
                     };
@@ -2108,7 +2108,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         last_seq -= 1;
-        let last_seq = CrsqlSeq(last_seq);
+        let last_seq = last_seq;
 
         let changes_v1 = changes
             .iter()
@@ -2161,8 +2161,8 @@ mod tests {
                     changeset: Changeset::Full {
                         version: 4,
                         changes: vec![change4],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
+                        seqs: 0..=0,
+                        last_seq: 0,
                         ts,
                     }
                 }))
@@ -2176,8 +2176,8 @@ mod tests {
                     changeset: Changeset::Full {
                         version: 3,
                         changes: vec![change3],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
+                        seqs: 0..=0,
+                        last_seq: 0,
                         ts,
                     }
                 }))
@@ -2191,7 +2191,7 @@ mod tests {
                     changeset: Changeset::Full {
                         version: 5,
                         changes: changes.iter().flatten().cloned().collect(),
-                        seqs: CrsqlSeq(0)..=last_seq,
+                        seqs: 0..=last_seq,
                         last_seq,
                         ts,
                     }
@@ -2223,7 +2223,7 @@ mod tests {
                     actor_id,
                     SyncNeedV1::Partial {
                         version: 5,
-                        seqs: vec![CrsqlSeq(4)..=CrsqlSeq(7)],
+                        seqs: vec![4..=7],
                     },
                     &tx,
                 )
@@ -2246,7 +2246,7 @@ mod tests {
                                 None
                             })
                             .collect(),
-                        seqs: CrsqlSeq(4)..=CrsqlSeq(7),
+                        seqs: 4..=7,
                         last_seq,
                         ts: ts,
                     }
@@ -2259,7 +2259,7 @@ mod tests {
                     actor_id,
                     SyncNeedV1::Partial {
                         version: 5,
-                        seqs: vec![CrsqlSeq(2)..=CrsqlSeq(2), CrsqlSeq(15)..=CrsqlSeq(24)],
+                        seqs: vec![2..=2, 15..=24],
                     },
                     &tx,
                 )
@@ -2278,7 +2278,7 @@ mod tests {
                             .enumerate()
                             .filter_map(|(i, c)| if i == 2 { Some(c.clone()) } else { None })
                             .collect(),
-                        seqs: CrsqlSeq(2)..=CrsqlSeq(2),
+                        seqs: 2..=2,
                         last_seq,
                         ts: ts,
                     }
@@ -2302,7 +2302,7 @@ mod tests {
                                 None
                             })
                             .collect(),
-                        seqs: CrsqlSeq(15)..=CrsqlSeq(24),
+                        seqs: 15..=24,
                         last_seq,
                         ts: ts,
                     }

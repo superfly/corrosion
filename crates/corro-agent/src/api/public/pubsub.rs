@@ -1483,7 +1483,7 @@ mod tests {
             val: "one".into(),
             col_version: 1,
             db_version: 1,
-            seq: CrsqlSeq(0),
+            seq: 0,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1495,7 +1495,7 @@ mod tests {
             val: "one line".into(),
             col_version: 1,
             db_version: 1,
-            seq: CrsqlSeq(1),
+            seq: 1,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1505,8 +1505,8 @@ mod tests {
             changeset: Changeset::Full {
                 version: 1,
                 changes: vec![change1, change2],
-                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(1)),
-                last_seq: CrsqlSeq(1),
+                seqs: RangeInclusive::new(0, 1),
+                last_seq: 1,
                 ts: Default::default(),
             },
         };
@@ -1592,7 +1592,7 @@ mod tests {
             val: "two".into(),
             col_version: 1,
             db_version: 2,
-            seq: CrsqlSeq(0),
+            seq: 0,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1602,8 +1602,8 @@ mod tests {
             changeset: Changeset::Full {
                 version: 2,
                 changes: vec![change3],
-                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(0)),
-                last_seq: CrsqlSeq(1),
+                seqs: RangeInclusive::new(0, 0),
+                last_seq: 1,
                 ts: Default::default(),
             },
         };
@@ -1624,7 +1624,7 @@ mod tests {
                 (actor_id, 2),
                 |row| row.get::<_, CrsqlSeq>(0),
             )?;
-            assert_eq!(end, CrsqlSeq(0));
+            assert_eq!(end, 0);
         }
 
         let change4 = Change {
@@ -1634,7 +1634,7 @@ mod tests {
             val: "two line".into(),
             col_version: 1,
             db_version: 2,
-            seq: CrsqlSeq(1),
+            seq: 1,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1644,8 +1644,8 @@ mod tests {
             changeset: Changeset::Full {
                 version: 2,
                 changes: vec![change4],
-                seqs: RangeInclusive::new(CrsqlSeq(1), CrsqlSeq(1)),
-                last_seq: CrsqlSeq(1),
+                seqs: RangeInclusive::new(1, 1),
+                last_seq: 1,
                 ts: Default::default(),
             },
         };

@@ -975,7 +975,7 @@ mod tests {
                     val: "two override".into(),
                     col_version: 1,
                     db_version: i as u64,
-                    seq: CrsqlSeq(0),
+                    seq: 0,
                     site_id: agent.actor_id().to_bytes(),
                     cl: 1,
                 };
@@ -986,8 +986,8 @@ mod tests {
                         changeset: Changeset::Full {
                             version: i as u64,
                             changes: vec![crsql_row.clone()],
-                            seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                            last_seq: CrsqlSeq(0),
+                            seqs: 0..=0,
+                            last_seq: 0,
                             ts: agent.clock().new_timestamp().into(),
                         },
                     },

@@ -168,8 +168,8 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
     assert_eq!(
         bk,
         vec![
-            (ta1.agent.actor_id(), 1, Some(CrsqlSeq(0))),
-            (ta1.agent.actor_id(), 2, Some(CrsqlSeq(0)))
+            (ta1.agent.actor_id(), 1, Some(0)),
+            (ta1.agent.actor_id(), 2, Some(0))
         ]
     );
 
@@ -923,7 +923,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
         val: "six".into(),
         col_version: 1,
         db_version: 6,
-        seq: CrsqlSeq(0),
+        seq: 0,
         site_id: actor_id.to_bytes(),
         cl: 1,
     };
@@ -935,7 +935,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
         val: "six".into(),
         col_version: 1,
         db_version: 6,
-        seq: CrsqlSeq(1),
+        seq: 1,
         site_id: actor_id.to_bytes(),
         cl: 1,
     };
@@ -946,8 +946,8 @@ async fn process_failed_changes() -> eyre::Result<()> {
             changeset: Changeset::Full {
                 version: 1,
                 changes: vec![change6.clone(), bad_change],
-                seqs: CrsqlSeq(0)..=CrsqlSeq(1),
-                last_seq: CrsqlSeq(1),
+                seqs: 0..=1,
+                last_seq: 1,
                 ts: Default::default(),
             },
         },
@@ -1071,7 +1071,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
             (20..=20, None),
             (
                 15..=16,
-                Some(CrsqlSeq(0)..=CrsqlSeq(0)),
+                Some(0..=0),
             ),
         ],
     )
@@ -1088,7 +1088,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ],
         vec![(
             15..=16,
-            CrsqlSeq(0)..=CrsqlSeq(0),
+            0..=0,
         )],
         vec![],
     )
@@ -1129,7 +1129,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
             (14..=18, None),
             (
                 15..=16,
-                Some(CrsqlSeq(1)..=CrsqlSeq(3)),
+                Some(1..=3),
             ),
             (23..=24, None),
         ],
@@ -1204,7 +1204,7 @@ async fn check_bookie_versions(
                 "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping_gaps WHERE actor_id = ? and ? between start and end)")?
                 .query_row((actor_id, version), |row| row.get(0))?);
         }
-        bookedv.contains_all(versions.clone(), Some(&(CrsqlSeq(0)..=CrsqlSeq(3))));
+        bookedv.contains_all(versions.clone(), Some(&(0..=3)));
     }
 
     for versions in partials {
@@ -1234,7 +1234,7 @@ async fn check_bookie_versions(
             let partial = bookedv.get_partial(&version);
             assert_ne!(partial, None);
         }
-        bookedv.contains_all(versions.0.clone(), Some(&(CrsqlSeq(0)..=CrsqlSeq(3))));
+        bookedv.contains_all(versions.0.clone(), Some(&(0..=3)));
     }
 
     for versions in gap {
@@ -1301,7 +1301,7 @@ async fn get_rows(
                 changes = prepped
                     .query_map([version], row_to_change)?
                     .collect::<Result<Vec<_>, _>>()?;
-                CrsqlSeq(0)..=CrsqlSeq(last)
+                0..=last
             };
 
             result.push((
@@ -1311,7 +1311,7 @@ async fn get_rows(
                         version,
                         changes,
                         seqs,
-                        last_seq: CrsqlSeq(last),
+                        last_seq: last,
                         ts: agent.clock().new_timestamp().into(),
                     },
                 },

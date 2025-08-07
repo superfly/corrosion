@@ -100,7 +100,7 @@ impl SyncStateV1 {
                         partials.values().flat_map(|ranges| {
                             ranges
                                 .iter()
-                                .map(|range| (range.end().0 - range.start().0) + 1)
+                                .map(|range| (*range.end() - *range.start()) + 1)
                         })
                     })
                     .sum::<u64>()
@@ -196,7 +196,7 @@ impl SyncStateV1 {
 
                         if let Some(end) = end_seq {
                             let mut other_seqs_haves =
-                                RangeInclusiveSet::from_iter([CrsqlSeq(0)..=end]);
+                                RangeInclusiveSet::from_iter([0..=end]);
 
                             for seqs in other_seqs.iter() {
                                 other_seqs_haves.remove(seqs.clone());
@@ -322,7 +322,7 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
                     *v,
                     partial
                         .seqs
-                        .gaps(&(CrsqlSeq(0)..=partial.last_seq))
+                        .gaps(&(0..=partial.last_seq))
                         .collect(),
                 );
             }
@@ -439,7 +439,7 @@ mod tests {
             actor1,
             [(
                 9,
-                vec![CrsqlSeq(100)..=CrsqlSeq(120), CrsqlSeq(130)..=CrsqlSeq(132)],
+                vec![100..=120, 130..=132],
             )]
             .into(),
         );
@@ -457,7 +457,7 @@ mod tests {
                     },
                     SyncNeedV1::Partial {
                         version: 9,
-                        seqs: vec![CrsqlSeq(100)..=CrsqlSeq(120), CrsqlSeq(130)..=CrsqlSeq(132)]
+                        seqs: vec![100..=120, 130..=132]
                     },
                     SyncNeedV1::Full {
                         versions: (11..=13).into(),
@@ -471,7 +471,7 @@ mod tests {
             actor1,
             [(
                 9,
-                vec![CrsqlSeq(100)..=CrsqlSeq(110), CrsqlSeq(130)..=CrsqlSeq(130)],
+                vec![100..=110, 130..=130],
             )]
             .into(),
         );
@@ -489,7 +489,7 @@ mod tests {
                     },
                     SyncNeedV1::Partial {
                         version: 9,
-                        seqs: vec![CrsqlSeq(111)..=CrsqlSeq(120), CrsqlSeq(131)..=CrsqlSeq(132)]
+                        seqs: vec![111..=120, 131..=132]
                     },
                     SyncNeedV1::Full {
                         versions: (11..=13).into(),

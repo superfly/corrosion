@@ -569,8 +569,8 @@ pub async fn process_fully_buffered_changes(
             let last_seq = {
                 match bookedw.partials.get(&version) {
                     Some(PartialVersion { seqs, last_seq, .. }) => {
-                        if seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).count() != 0 {
-                            error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
+                        if seqs.gaps(&(0..=*last_seq)).count() != 0 {
+                            error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(0..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
                             // TODO: return an error here
                             return Ok(false);
                         }
@@ -989,7 +989,7 @@ pub async fn process_multiple_changes(
                     let PartialVersion { seqs, last_seq, .. } =
                         booked_write.insert_partial(version, partial);
 
-                    let full_seqs_range = CrsqlSeq(0)..=last_seq;
+                    let full_seqs_range = 0..=last_seq;
                     let gaps_count = seqs.gaps(&full_seqs_range).count();
                     if gaps_count == 0 {
                         // if we have no gaps, then we can schedule applying all these changes.
@@ -1205,13 +1205,13 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, db version: {version}");
 
-    let details = json!({"len": len, "seqs": seqs.start().0, "seqs_end": seqs.end().0});
+    let details = json!({"len": len, "seqs": *seqs.start(), "seqs_end": *seqs.end()});
     assert_always!(
-        len <= (seqs.end().0 - seqs.start().0 + 1) as usize,
+        len <= (*seqs.end() - *seqs.start() + 1) as usize,
         "number of changes is greater than the seq num",
         &details
     );
-    debug_assert!(len <= (seqs.end().0 - seqs.start().0 + 1) as usize, "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
+    debug_assert!(len <= (*seqs.end() - *seqs.start() + 1) as usize, "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
 
     let mut impactful_changeset = vec![];
 

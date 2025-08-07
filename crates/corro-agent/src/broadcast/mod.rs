@@ -1047,7 +1047,6 @@ mod tests {
     use crate::agent::spawn_unipayload_handler;
     use corro_tests::launch_test_agent;
     use corro_types::{
-        base::{CrsqlSeq},
         broadcast::{BroadcastV1, ChangeV1, Changeset},
     };
     use uuid::Uuid;
@@ -1134,8 +1133,8 @@ mod tests {
             changeset: Changeset::Full {
                 version: 0,
                 changes: vec![],
-                seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                last_seq: CrsqlSeq(0),
+                seqs: 0..=0,
+                last_seq: 0,
                 ts: Default::default(),
             },
         });
@@ -1167,8 +1166,8 @@ mod tests {
                     changeset: Changeset::Full {
                         version: i,
                         changes: vec![],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
+                        seqs: 0..=0,
+                        last_seq: 0,
                         ts: Default::default(),
                     },
                 })))

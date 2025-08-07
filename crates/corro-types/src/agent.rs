@@ -1070,7 +1070,7 @@ impl PartialVersion {
     }
 
     pub fn full_range(&self) -> RangeInclusive<CrsqlSeq> {
-        CrsqlSeq(1)..=self.last_seq
+        1..=self.last_seq
     }
 }
 
