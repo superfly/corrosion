@@ -400,16 +400,8 @@ mod tests {
             .into()
         );
 
-        our_state
-            .need
-            .entry(actor1)
-            .or_default()
-            .push((2..=5).into());
-        our_state
-            .need
-            .entry(actor1)
-            .or_default()
-            .push((7..=7).into());
+        our_state.need.entry(actor1).or_default().push(2..=5);
+        our_state.need.entry(actor1).or_default().push(7..=7);
 
         assert_eq!(
             our_state.compute_available_needs(&other_state),

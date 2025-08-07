@@ -279,7 +279,7 @@ pub enum MatcherUpsertError {
     #[error("could not expand sql statement")]
     CouldNotExpand,
     #[error(transparent)]
-    NormalizeStatement(#[from] NormalizeStatementError),
+    NormalizeStatement(#[from] Box<NormalizeStatementError>),
     #[error(transparent)]
     Matcher(#[from] MatcherError),
     #[error("a `from` query param was supplied, but no existing subscription found")]

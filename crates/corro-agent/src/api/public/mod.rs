@@ -249,7 +249,7 @@ pub async fn api_v1_transactions(
         axum::Json(ExecResponse {
             results,
             time: elapsed.as_secs_f64(),
-            version: version.map(Into::into),
+            version,
             actor_id: Some(actor_id),
         }),
     )

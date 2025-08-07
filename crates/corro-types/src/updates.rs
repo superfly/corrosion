@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use crate::actor::ActorId;
 use crate::agent::SplitPool;
 use crate::change::Change;
@@ -171,6 +173,7 @@ impl UpdatesManager {
         None
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn get_or_insert(
         &self,
         tbl_name: &str,
