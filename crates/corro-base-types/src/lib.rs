@@ -374,13 +374,16 @@ macro_rules! range {
             #[inline]
             fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
                 let start = reader.read_value()?;
-                let end = reader.read_value()?;
-                Ok(Self { start, end })
+                let end: u64 = reader.read_value()?;
+                Ok(Self {
+                    start,
+                    end: std::num::NonZeroU64::new(end),
+                })
             }
 
             #[inline]
             fn minimum_bytes_needed() -> usize {
-                <u64 as Readable<'a, C>>::minimum_bytes_needed() * 2
+                16
             }
         }
 
@@ -391,13 +394,12 @@ macro_rules! range {
                 writer: &mut W,
             ) -> Result<(), C::Error> {
                 self.start.write_to(writer)?;
-                self.end.write_to(writer)
+                self.end.map_or(0, |e| e.get()).write_to(writer)
             }
 
             #[inline]
             fn bytes_needed(&self) -> Result<usize, C::Error> {
-                Ok(Writable::<C>::bytes_needed(&self.start)?
-                    + Writable::<C>::bytes_needed(&self.end)?)
+                Ok(16)
             }
         }
     };
@@ -495,5 +497,26 @@ mod test {
             CrsqlDbVersionRange::from(CrsqlDbVersion(u64::MAX - 1)..=CrsqlDbVersion(u64::MAX));
         assert_eq!(max.len(), 2);
         assert_eq!(max.into_iter().count(), 2);
+    }
+
+    #[test]
+    fn serialization() {
+        #[track_caller]
+        fn speedy(input: CrsqlDbVersionRange) {
+            let ser = input.write_to_vec().unwrap();
+            let deser = CrsqlDbVersionRange::read_from_buffer(&ser).unwrap();
+
+            assert_eq!(input, deser);
+        }
+
+        speedy(CrsqlDbVersionRange::empty());
+        speedy(CrsqlDbVersionRange::new(
+            CrsqlDbVersion(0),
+            CrsqlDbVersion(u64::MAX),
+        ));
+        speedy(CrsqlDbVersionRange::new(
+            CrsqlDbVersion(110),
+            CrsqlDbVersion(0),
+        ));
     }
 }
