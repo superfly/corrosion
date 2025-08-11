@@ -166,14 +166,6 @@ impl fmt::Display for CrsqlDbVersion {
 #[serde(transparent)]
 pub struct CrsqlSeq(pub u64);
 
-impl CrsqlSeq {
-    #[inline]
-    pub fn iter(range: RangeInclusive<Self>) -> impl Iterator<Item = Self> {
-        let (start, end) = range.into_inner();
-        (start.0..=end.0).map(Self)
-    }
-}
-
 impl StepLite for CrsqlSeq {
     fn add_one(&self) -> Self {
         Self(self.0 + 1)
@@ -376,15 +368,8 @@ macro_rules! range {
 
             #[inline]
             fn size_hint(&self) -> (usize, Option<usize>) {
-                let Some(end) = self.end else {
-                    return (0, Some(0));
-                };
-                if self.start < end.get() {
-                    let diff = (end.get() - self.start) as usize;
-                    (diff, Some(diff))
-                } else {
-                    (0, Some(0))
-                }
+                let len = self.len();
+                (len, Some(len))
             }
         }
 
