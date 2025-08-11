@@ -9,12 +9,7 @@ use metrics::counter;
 use parking_lot::RwLock;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
-use std::{
-    net::SocketAddr,
-    ops::{DerefMut, RangeInclusive},
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, ops::DerefMut, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{
@@ -41,7 +36,7 @@ use corro_types::{
     agent::{
         migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool,
     },
-    base::CrsqlDbVersion,
+    base::{CrsqlDbVersion, CrsqlDbVersionRange},
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
     config::Config,
@@ -60,7 +55,7 @@ pub struct AgentOptions {
     pub api_listeners: Vec<TcpListener>,
     pub rx_bcast: CorroReceiver<BroadcastInput>,
     pub rx_apply: CorroReceiver<(ActorId, CrsqlDbVersion)>,
-    pub rx_clear_buf: CorroReceiver<(ActorId, RangeInclusive<CrsqlDbVersion>)>,
+    pub rx_clear_buf: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
     pub rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
     pub rx_foca: CorroReceiver<FocaInput>,
     pub rtt_rx: TokioReceiver<(SocketAddr, Duration)>,
