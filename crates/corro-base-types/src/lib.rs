@@ -294,20 +294,17 @@ macro_rules! range {
             /// The length of this range, ie the number of values
             /// that would be yielded on iteration
             #[inline]
-            pub fn len(self) -> usize {
-                if let Some(end) = self.end.map(|e| e.get()) {
-                    if end > self.start {
-                        (end - self.start) as usize + 1
-                    } else {
-                        0
-                    }
+            pub fn len(&self) -> usize {
+                let end = self.end.map_or(0, |e| e.get());
+                if end >= self.start {
+                    (end - self.start) as usize + 1
                 } else {
                     0
                 }
             }
 
             #[inline]
-            pub fn is_empty(self) -> bool {
+            pub fn is_empty(&self) -> bool {
                 self.len() == 0
             }
         }
