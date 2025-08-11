@@ -262,21 +262,19 @@ pub fn insert_local_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::dbsri;
 
     #[test]
     fn test_change_chunker() {
         // empty interator
         let mut chunker = ChunkedChanges::new(vec![].into_iter(), CrsqlSeq(0), CrsqlSeq(100), 50);
 
-        assert_eq!(
-            chunker.next(),
-            Some(Ok((vec![], CrsqlSeq(0)..=CrsqlSeq(100))))
-        );
+        assert_eq!(chunker.next(), Some(Ok((vec![], dbsri!(0, 100)))));
         assert_eq!(chunker.next(), None);
 
-        let changes: Vec<Change> = (CrsqlSeq(0)..CrsqlSeq(100))
+        let changes: Vec<Change> = (0..100)
             .map(|seq| Change {
-                seq,
+                seq: CrsqlSeq(seq),
                 ..Default::default()
             })
             .collect();
@@ -298,12 +296,12 @@ mod tests {
             chunker.next(),
             Some(Ok((
                 vec![changes[0].clone(), changes[1].clone()],
-                CrsqlSeq(0)..=CrsqlSeq(1)
+                dbsri!(0, 1)
             )))
         );
         assert_eq!(
             chunker.next(),
-            Some(Ok((vec![changes[2].clone()], CrsqlSeq(2)..=CrsqlSeq(100))))
+            Some(Ok((vec![changes[2].clone()], dbsri!(2, 100))))
         );
         assert_eq!(chunker.next(), None);
 
@@ -316,7 +314,7 @@ mod tests {
 
         assert_eq!(
             chunker.next(),
-            Some(Ok((vec![changes[0].clone()], CrsqlSeq(0)..=CrsqlSeq(0))))
+            Some(Ok((vec![changes[0].clone()], dbsri!(0, 0))))
         );
         assert_eq!(chunker.next(), None);
 
@@ -332,7 +330,7 @@ mod tests {
             chunker.next(),
             Some(Ok((
                 vec![changes[0].clone(), changes[2].clone()],
-                CrsqlSeq(0)..=CrsqlSeq(100)
+                dbsri!(0, 100)
             )))
         );
 
@@ -361,7 +359,7 @@ mod tests {
                     changes[7].clone(),
                     changes[8].clone()
                 ],
-                CrsqlSeq(0)..=CrsqlSeq(100)
+                dbsri!(0, 100)
             )))
         );
 
@@ -385,7 +383,7 @@ mod tests {
             chunker.next(),
             Some(Ok((
                 vec![changes[2].clone(), changes[4].clone(),],
-                CrsqlSeq(0)..=CrsqlSeq(4)
+                dbsri!(0, 4)
             )))
         );
 
@@ -393,7 +391,7 @@ mod tests {
             chunker.next(),
             Some(Ok((
                 vec![changes[7].clone(), changes[8].clone(),],
-                CrsqlSeq(5)..=CrsqlSeq(10)
+                dbsri!(5, 10)
             )))
         );
 

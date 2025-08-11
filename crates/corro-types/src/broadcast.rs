@@ -1,14 +1,9 @@
-use std::{
-    cmp, fmt, io,
-    num::NonZeroU32,
-    num::ParseIntError,
-    ops::{Deref, RangeInclusive},
-    time::Duration,
-};
+use std::{cmp, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref, time::Duration};
 
 use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
 use corro_api_types::{ColumnName, SqliteValue};
+use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use itertools::Itertools;
 use metrics::counter;
@@ -128,7 +123,7 @@ impl Deref for ChangeV1 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum Changeset {
     Empty {
-        versions: RangeInclusive<CrsqlDbVersion>,
+        versions: CrsqlDbVersionRange,
         #[speedy(default_on_eof)]
         ts: Option<Timestamp>,
     },
@@ -136,13 +131,13 @@ pub enum Changeset {
         version: CrsqlDbVersion,
         changes: Vec<Change>,
         // cr-sqlite sequences contained in this changeset
-        seqs: RangeInclusive<CrsqlSeq>,
+        seqs: CrsqlSeqRange,
         // last cr-sqlite sequence for the complete changeset
         last_seq: CrsqlSeq,
         ts: Timestamp,
     },
     EmptySet {
-        versions: Vec<RangeInclusive<CrsqlDbVersion>>,
+        versions: Vec<CrsqlDbVersionRange>,
         ts: Timestamp,
     },
 }
@@ -162,31 +157,30 @@ impl From<ChangesetParts> for Changeset {
 pub struct ChangesetParts {
     pub version: CrsqlDbVersion,
     pub changes: Vec<Change>,
-    pub seqs: RangeInclusive<CrsqlSeq>,
+    pub seqs: CrsqlSeqRange,
     pub last_seq: CrsqlSeq,
     pub ts: Timestamp,
 }
 
 impl Changeset {
-    pub fn versions(&self) -> RangeInclusive<CrsqlDbVersion> {
+    #[inline]
+    pub fn versions(&self) -> CrsqlDbVersionRange {
         match self {
-            Changeset::Empty { versions, .. } => versions.clone(),
+            Changeset::Empty { versions, .. } => *versions,
             // todo: this returns dummy version because empty set has an array of versions.
             // probably shouldn't be doing this
-            Changeset::EmptySet { .. } => CrsqlDbVersion(0)..=CrsqlDbVersion(0),
-            Changeset::Full { version, .. } => *version..=*version,
+            Changeset::EmptySet { .. } => CrsqlDbVersionRange::empty(),
+            Changeset::Full { version, .. } => (*version..=*version).into(),
         }
     }
 
     // determine the estimated resource cost of processing a change
     pub fn processing_cost(&self) -> usize {
         match self {
-            Changeset::Empty { versions, .. } => {
-                cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20)
-            }
+            Changeset::Empty { versions, .. } => cmp::min(versions.len(), 20),
             Changeset::EmptySet { versions, .. } => versions
                 .iter()
-                .map(|versions| cmp::min((versions.end().0 - versions.start().0) as usize + 1, 20))
+                .map(|versions| cmp::min(versions.len(), 20))
                 .sum::<usize>(),
             Changeset::Full { changes, .. } => changes.len(),
         }
@@ -196,11 +190,12 @@ impl Changeset {
         self.changes().iter().map(|c| c.db_version).max()
     }
 
-    pub fn seqs(&self) -> Option<&RangeInclusive<CrsqlSeq>> {
+    #[inline]
+    pub fn seqs(&self) -> Option<CrsqlSeqRange> {
         match self {
             Changeset::Empty { .. } => None,
             Changeset::EmptySet { .. } => None,
-            Changeset::Full { seqs, .. } => Some(seqs),
+            Changeset::Full { seqs, .. } => Some(*seqs),
         }
     }
 
@@ -217,14 +212,14 @@ impl Changeset {
             Changeset::Empty { .. } => true,
             Changeset::EmptySet { .. } => true,
             Changeset::Full { seqs, last_seq, .. } => {
-                *seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq
+                seqs.start_int() == 0 && seqs.end_int() == last_seq.0
             }
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
-            Changeset::Empty { .. } => 0, //(versions.end().0 - versions.start().0 + 1) as usize,
+            Changeset::Empty { .. } => 0,
             Changeset::EmptySet { versions, .. } => versions.len(),
             Changeset::Full { changes, .. } => changes.len(),
         }
@@ -554,7 +549,7 @@ pub async fn broadcast_changes(
                                     changeset: Changeset::Full {
                                         version: db_version,
                                         changes,
-                                        seqs,
+                                        seqs: seqs.into(),
                                         last_seq,
                                         ts,
                                     },
