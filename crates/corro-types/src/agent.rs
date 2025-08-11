@@ -1377,10 +1377,8 @@ impl BookedVersions {
     pub fn contains(&self, version: CrsqlDbVersion, seqs: Option<CrsqlSeqRange>) -> bool {
         self.contains_version(&version)
             && seqs
-                .map(|check_seqs| match self.partials.get(&version) {
-                    Some(partial) => check_seqs
-                        .into_iter()
-                        .all(|seq| partial.seqs.contains(&seq)),
+                .map(|mut check_seqs| match self.partials.get(&version) {
+                    Some(partial) => check_seqs.all(|seq| partial.seqs.contains(&seq)),
                     // if `contains_version` is true but we don't have a partial version,
                     // then we must have it as a fully applied or cleared version
                     None => true,
