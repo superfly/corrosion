@@ -3623,6 +3623,75 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pg_readonly() -> Result<(), BoxError> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let (ta, server) = setup_pg_test_server(tripwire.clone(), None).await?;
+
+        let readonly_server = start(
+            ta.agent.clone(),
+            PgConfig {
+                bind_addr: "127.0.0.1:0".parse()?,
+                tls: None,
+                readonly: true,
+            },
+            tripwire,
+        )
+        .await?;
+
+        // Do some writes first
+        {
+            let conn_str = format!(
+                "host={} port={} user=testuser",
+                server.local_addr.ip(),
+                server.local_addr.port()
+            );
+
+            let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
+            println!("client is ready!");
+            tokio::spawn(client_conn);
+            client
+                .execute("INSERT INTO tests VALUES (1,2)", &[])
+                .await?;
+        }
+
+        // Then use the readonly conn
+        {
+            let conn_str = format!(
+                "host={} port={} user=testuser",
+                readonly_server.local_addr.ip(),
+                readonly_server.local_addr.port()
+            );
+
+            let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
+            println!("readonly client is ready!");
+            tokio::spawn(client_conn);
+            assert_eq!(
+                client
+                    .query_one("SELECT * FROM tests", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, String>(1),
+                "2"
+            );
+            assert!(client
+                .execute("INSERT INTO tests VALUES (3,4)", &[])
+                .await
+                .unwrap_err()
+                .as_db_error()
+                .unwrap()
+                .message()
+                .contains("readonly database"));
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
     struct TestCertificates {
         ca_cert: Certificate,
         client_cert_signed: String,
