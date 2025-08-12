@@ -144,8 +144,9 @@ pub struct ApiConfig {
     pub bind_addr: Vec<SocketAddr>,
     #[serde(alias = "authz", default)]
     pub authorization: Option<AuthzConfig>,
+    #[serde_as(deserialize_as = "Option<OneOrMany<_, PreferOne>>")]
     #[serde(default)]
-    pub pg: Option<PgConfig>,
+    pub pg: Option<Vec<PgConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
