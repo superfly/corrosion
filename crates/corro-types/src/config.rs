@@ -154,6 +154,8 @@ pub struct PgConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
     pub tls: Option<PgTlsConfig>,
+    #[serde(default)]
+    pub readonly: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

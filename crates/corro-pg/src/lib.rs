@@ -548,6 +548,7 @@ pub async fn start(
     pg: PgConfig,
     mut tripwire: Tripwire,
 ) -> Result<PgServer, PgStartError> {
+    let readonly = pg.readonly;
     let server = TcpListener::bind(pg.bind_addr).await?;
     let (tls_acceptor, ssl_required) = setup_tls(pg).await?;
     let local_addr = server.local_addr()?;
@@ -743,7 +744,11 @@ pub async fn start(
                 let res = tokio::task::spawn_blocking({
                     let back_tx = back_tx.clone();
                     move || {
-                        let conn = agent.pool().client_dedicated().unwrap();
+                        let conn = if readonly {
+                            agent.pool().client_dedicated_readonly().unwrap()
+                        } else {
+                            agent.pool().client_dedicated().unwrap()
+                        };
                         trace!("opened connection");
 
                         let int_handle = conn.get_interrupt_handle();
@@ -3432,6 +3437,7 @@ mod tests {
             PgConfig {
                 bind_addr: "127.0.0.1:0".parse()?,
                 tls: tls_config,
+                readonly: false,
             },
             tripwire,
         )

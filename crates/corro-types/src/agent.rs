@@ -22,7 +22,7 @@ use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
+use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
@@ -568,6 +568,15 @@ impl SplitPool {
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
         rusqlite_to_crsqlite_write(conn)
+    }
+
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub fn client_dedicated_readonly(&self) -> rusqlite::Result<CrConn> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &self.0.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        rusqlite_to_crsqlite(conn)
     }
 
     // get a high priority write connection (e.g. client input)
