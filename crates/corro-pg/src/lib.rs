@@ -548,6 +548,7 @@ pub async fn start(
     pg: PgConfig,
     mut tripwire: Tripwire,
 ) -> Result<PgServer, PgStartError> {
+    let readonly = pg.readonly;
     let server = TcpListener::bind(pg.bind_addr).await?;
     let (tls_acceptor, ssl_required) = setup_tls(pg).await?;
     let local_addr = server.local_addr()?;
@@ -743,7 +744,11 @@ pub async fn start(
                 let res = tokio::task::spawn_blocking({
                     let back_tx = back_tx.clone();
                     move || {
-                        let conn = agent.pool().client_dedicated().unwrap();
+                        let conn = if readonly {
+                            agent.pool().client_dedicated_readonly().unwrap()
+                        } else {
+                            agent.pool().client_dedicated().unwrap()
+                        };
                         trace!("opened connection");
 
                         let int_handle = conn.get_interrupt_handle();
@@ -3432,6 +3437,7 @@ mod tests {
             PgConfig {
                 bind_addr: "127.0.0.1:0".parse()?,
                 tls: tls_config,
+                readonly: false,
             },
             tripwire,
         )
@@ -3608,6 +3614,75 @@ mod tests {
                 )
                 .await?;
             println!("COUNT ROW: {row:?}");
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pg_readonly() -> Result<(), BoxError> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+        let (ta, server) = setup_pg_test_server(tripwire.clone(), None).await?;
+
+        let readonly_server = start(
+            ta.agent.clone(),
+            PgConfig {
+                bind_addr: "127.0.0.1:0".parse()?,
+                tls: None,
+                readonly: true,
+            },
+            tripwire,
+        )
+        .await?;
+
+        // Do some writes first
+        {
+            let conn_str = format!(
+                "host={} port={} user=testuser",
+                server.local_addr.ip(),
+                server.local_addr.port()
+            );
+
+            let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
+            println!("client is ready!");
+            tokio::spawn(client_conn);
+            client
+                .execute("INSERT INTO tests VALUES (1,2)", &[])
+                .await?;
+        }
+
+        // Then use the readonly conn
+        {
+            let conn_str = format!(
+                "host={} port={} user=testuser",
+                readonly_server.local_addr.ip(),
+                readonly_server.local_addr.port()
+            );
+
+            let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
+            println!("readonly client is ready!");
+            tokio::spawn(client_conn);
+            assert_eq!(
+                client
+                    .query_one("SELECT * FROM tests", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, String>(1),
+                "2"
+            );
+            assert!(client
+                .execute("INSERT INTO tests VALUES (3,4)", &[])
+                .await
+                .unwrap_err()
+                .as_db_error()
+                .unwrap()
+                .message()
+                .contains("readonly database"));
         }
 
         tripwire_tx.send(()).await.ok();
