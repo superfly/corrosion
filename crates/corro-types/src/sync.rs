@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::{
     actor::ActorId,
     agent::{Booked, Bookie},
-    base::{CrsqlDbVersion, CrsqlSeq},
+    base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
     broadcast::{ChangeV1, Timestamp},
 };
 
@@ -167,7 +167,7 @@ impl SyncStateV1 {
                         let start = cmp::max(range.start(), overlap.start());
                         let end = cmp::min(range.end(), overlap.end());
                         needs.entry(*actor_id).or_default().push(SyncNeedV1::Full {
-                            versions: *start..=*end,
+                            versions: (*start..=*end).into(),
                         })
                     }
                 }
@@ -181,7 +181,7 @@ impl SyncStateV1 {
                             .or_default()
                             .push(SyncNeedV1::Partial {
                                 version: *v,
-                                seqs: seqs.clone(),
+                                seqs: seqs.iter().map(CrsqlSeqRange::from).collect(),
                             });
                     } else if let Some(other_seqs) = other
                         .partial_need
@@ -204,16 +204,13 @@ impl SyncStateV1 {
                             let seqs = seqs
                                 .iter()
                                 .flat_map(|range| {
-                                    other_seqs_haves
-                                        .overlapping(range)
-                                        .map(|overlap| {
-                                            let start = cmp::max(range.start(), overlap.start());
-                                            let end = cmp::min(range.end(), overlap.end());
-                                            *start..=*end
-                                        })
-                                        .collect::<Vec<RangeInclusive<CrsqlSeq>>>()
+                                    other_seqs_haves.overlapping(range).map(|overlap| {
+                                        let start = cmp::max(range.start(), overlap.start());
+                                        let end = cmp::min(range.end(), overlap.end());
+                                        CrsqlSeqRange::new(*start, *end)
+                                    })
                                 })
-                                .collect::<Vec<RangeInclusive<CrsqlSeq>>>();
+                                .collect::<Vec<CrsqlSeqRange>>();
 
                             if !seqs.is_empty() {
                                 needs
@@ -238,10 +235,9 @@ impl SyncStateV1 {
             };
 
             if let Some(missing) = missing {
-                needs
-                    .entry(*actor_id)
-                    .or_default()
-                    .push(SyncNeedV1::Full { versions: missing });
+                needs.entry(*actor_id).or_default().push(SyncNeedV1::Full {
+                    versions: missing.into(),
+                });
             }
         }
 
@@ -252,11 +248,11 @@ impl SyncStateV1 {
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub enum SyncNeedV1 {
     Full {
-        versions: RangeInclusive<CrsqlDbVersion>,
+        versions: CrsqlDbVersionRange,
     },
     Partial {
         version: CrsqlDbVersion,
-        seqs: Vec<RangeInclusive<CrsqlSeq>>,
+        seqs: Vec<CrsqlSeqRange>,
     },
     Empty {
         ts: Option<Timestamp>,
@@ -264,9 +260,10 @@ pub enum SyncNeedV1 {
 }
 
 impl SyncNeedV1 {
+    #[inline]
     pub fn count(&self) -> usize {
         match self {
-            SyncNeedV1::Full { versions } => (versions.end().0 - versions.start().0) as usize + 1,
+            SyncNeedV1::Full { versions } => versions.len(),
             SyncNeedV1::Partial { .. } => 1,
             SyncNeedV1::Empty { .. } => 1,
         }
@@ -379,6 +376,7 @@ impl SyncMessage {
 
 #[cfg(test)]
 mod tests {
+    use crate::base::{dbsr, dbsri, dbvr, dbvri};
     use uuid::Uuid;
 
     use super::*;
@@ -398,22 +396,14 @@ mod tests {
             [(
                 actor1,
                 vec![SyncNeedV1::Full {
-                    versions: CrsqlDbVersion(11)..=CrsqlDbVersion(13)
+                    versions: dbvr!(11, 13)
                 }]
             )]
             .into()
         );
 
-        our_state
-            .need
-            .entry(actor1)
-            .or_default()
-            .push(CrsqlDbVersion(2)..=CrsqlDbVersion(5));
-        our_state
-            .need
-            .entry(actor1)
-            .or_default()
-            .push(CrsqlDbVersion(7)..=CrsqlDbVersion(7));
+        our_state.need.entry(actor1).or_default().push(dbvri!(2, 5));
+        our_state.need.entry(actor1).or_default().push(dbvri!(7, 7));
 
         assert_eq!(
             our_state.compute_available_needs(&other_state),
@@ -421,13 +411,13 @@ mod tests {
                 actor1,
                 vec![
                     SyncNeedV1::Full {
-                        versions: CrsqlDbVersion(2)..=CrsqlDbVersion(5)
+                        versions: dbvr!(2, 5)
                     },
                     SyncNeedV1::Full {
-                        versions: CrsqlDbVersion(7)..=CrsqlDbVersion(7)
+                        versions: dbvr!(7, 7)
                     },
                     SyncNeedV1::Full {
-                        versions: CrsqlDbVersion(11)..=CrsqlDbVersion(13)
+                        versions: dbvr!(11, 13)
                     }
                 ]
             )]
@@ -436,11 +426,7 @@ mod tests {
 
         our_state.partial_need.insert(
             actor1,
-            [(
-                CrsqlDbVersion(9),
-                vec![CrsqlSeq(100)..=CrsqlSeq(120), CrsqlSeq(130)..=CrsqlSeq(132)],
-            )]
-            .into(),
+            [(CrsqlDbVersion(9), vec![dbsri!(100, 120), dbsri!(130, 132)])].into(),
         );
 
         assert_eq!(
@@ -449,17 +435,17 @@ mod tests {
                 actor1,
                 vec![
                     SyncNeedV1::Full {
-                        versions: CrsqlDbVersion(2)..=CrsqlDbVersion(5)
+                        versions: dbvr!(2, 5)
                     },
                     SyncNeedV1::Full {
-                        versions: CrsqlDbVersion(7)..=CrsqlDbVersion(7)
+                        versions: dbvr!(7, 7)
                     },
                     SyncNeedV1::Partial {
                         version: CrsqlDbVersion(9),
-                        seqs: vec![CrsqlSeq(100)..=CrsqlSeq(120), CrsqlSeq(130)..=CrsqlSeq(132)]
+                        seqs: vec![dbsr!(100, 120), dbsr!(130, 132)]
                     },
                     SyncNeedV1::Full {
-                        versions: CrsqlDbVersion(11)..=CrsqlDbVersion(13)
+                        versions: dbvr!(11, 13)
                     }
                 ]
             )]
@@ -468,11 +454,7 @@ mod tests {
 
         other_state.partial_need.insert(
             actor1,
-            [(
-                CrsqlDbVersion(9),
-                vec![CrsqlSeq(100)..=CrsqlSeq(110), CrsqlSeq(130)..=CrsqlSeq(130)],
-            )]
-            .into(),
+            [(CrsqlDbVersion(9), vec![dbsri!(100, 110), dbsri!(130, 130)])].into(),
         );
 
         assert_eq!(
@@ -481,17 +463,17 @@ mod tests {
                 actor1,
                 vec![
                     SyncNeedV1::Full {
-                        versions: CrsqlDbVersion(2)..=CrsqlDbVersion(5)
+                        versions: dbvr!(2, 5)
                     },
                     SyncNeedV1::Full {
-                        versions: CrsqlDbVersion(7)..=CrsqlDbVersion(7)
+                        versions: dbvr!(7, 7)
                     },
                     SyncNeedV1::Partial {
                         version: CrsqlDbVersion(9),
-                        seqs: vec![CrsqlSeq(111)..=CrsqlSeq(120), CrsqlSeq(131)..=CrsqlSeq(132)]
+                        seqs: vec![dbsr!(111, 120), dbsr!(131, 132)]
                     },
                     SyncNeedV1::Full {
-                        versions: CrsqlDbVersion(11)..=CrsqlDbVersion(13)
+                        versions: dbvr!(11, 13)
                     }
                 ]
             )]
