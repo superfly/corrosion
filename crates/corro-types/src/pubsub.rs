@@ -43,7 +43,6 @@ use uuid::Uuid;
 use crate::{
     agent::SplitPool,
     api::QueryEvent,
-    base::CrsqlDbVersion,
     change::Change,
     schema::{Schema, Table},
     sqlite::CrConn,
@@ -262,7 +261,7 @@ struct InnerMatcherHandle {
     parsed: ParsedSelect,
     col_names: Vec<ColumnName>,
     cancel: CancellationToken,
-    changes_tx: mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>,
+    changes_tx: mpsc::Sender<MatchCandidates>,
     last_change_rx: watch::Receiver<ChangeId>,
     // some state from the matcher so we can take a look later
     subs_path: String,
@@ -282,7 +281,7 @@ impl Handle for MatcherHandle {
         self.inner.cancel.cancelled()
     }
 
-    fn changes_tx(&self) -> mpsc::Sender<(MatchCandidates, CrsqlDbVersion)> {
+    fn changes_tx(&self) -> mpsc::Sender<MatchCandidates> {
         self.inner.changes_tx.clone()
     }
 
@@ -519,7 +518,7 @@ pub struct Matcher {
     cancel: CancellationToken,
     state: StateLock,
     last_change_tx: watch::Sender<ChangeId>,
-    changes_rx: mpsc::Receiver<(MatchCandidates, CrsqlDbVersion)>,
+    changes_rx: mpsc::Receiver<MatchCandidates>,
 }
 
 #[derive(Debug, Clone)]
@@ -1065,7 +1064,6 @@ impl Matcher {
         }
         trace!("set state!");
 
-        let mut last_db_version = None;
         let mut buf = MatchCandidates::new();
         let mut buf_count = 0;
 
@@ -1077,7 +1075,7 @@ impl Matcher {
 
         loop {
             enum Branch {
-                NewCandidates((MatchCandidates, CrsqlDbVersion)),
+                NewCandidates(MatchCandidates),
                 PurgeOldChanges,
             }
 
@@ -1089,7 +1087,7 @@ impl Matcher {
                     info!(sub_id = %self.id, "Acknowledged subscription cancellation, breaking loop.");
                     break;
                 }
-                Some((candidates, db_version)) = self.changes_rx.recv() => {
+                Some(candidates) = self.changes_rx.recv() => {
                     for (table, pks) in  candidates {
                         let buffed = buf.entry(table).or_default();
                         for (pk, cl) in pks {
@@ -1098,14 +1096,10 @@ impl Matcher {
                             }
                         }
                     }
-                    last_db_version = Some(db_version);
 
                     if buf_count >= PROCESS_CHANGES_THRESHOLD {
-                        if let Some(db_version) = last_db_version.take() {
-                            Branch::NewCandidates((std::mem::take(&mut buf), db_version))
-                        } else {
-                            continue;
-                        }
+                        buf_count = 0;
+                        Branch::NewCandidates(std::mem::take(&mut buf))
                     } else {
                         continue;
                     }
@@ -1117,11 +1111,7 @@ impl Matcher {
                     if buf_count == 0 {
                         continue;
                     }
-                    if let Some(db_version) = last_db_version.take(){
-                        Branch::NewCandidates((std::mem::take(&mut buf), db_version))
-                    } else {
-                        continue;
-                    }
+                    Branch::NewCandidates(std::mem::take(&mut buf))
                 },
                 _ = &mut tripwire => {
                     info!(sub_id = %self.id, "tripped cmd_loop, returning");
@@ -1135,7 +1125,7 @@ impl Matcher {
             };
 
             match branch {
-                Branch::NewCandidates((candidates, _db_version)) => {
+                Branch::NewCandidates(candidates) => {
                     let start = Instant::now();
                     if let Err(e) =
                         block_in_place(|| self.handle_candidates(&mut state_conn, candidates))
@@ -1200,20 +1190,18 @@ impl Matcher {
         };
 
         let mut buf = MatchCandidates::new();
-        let mut last_db_version = None;
         info!(sub_id = %self.id, "draining changes channel");
-        while let Ok((candidates, db_version)) = self.changes_rx.try_recv() {
+        while let Ok(candidates) = self.changes_rx.try_recv() {
             for (table, pks) in candidates {
                 let buffed = buf.entry(table).or_default();
                 for (pk, cl) in pks {
                     buffed.insert(pk, cl);
                 }
-                last_db_version = Some(db_version);
             }
         }
 
         if !buf.is_empty() {
-            info!(sub_id = %self.id, "handling buffered candidates {last_db_version:?}");
+            info!(sub_id = %self.id, "handling buffered candidates");
             let start = Instant::now();
             if let Err(e) = block_in_place(|| self.handle_candidates(&mut state_conn, buf)) {
                 if !matches!(e, MatcherError::EventReceiverClosed) {
@@ -2626,7 +2614,7 @@ mod tests {
 
         setup_conn(&matcher_conn).unwrap();
 
-        let mut last_change_id: Option<ChangeId> = None;
+        let mut last_change_id = None;
 
         let id = {
             // let (db_v_tx, db_v_rx) = watch::channel(0);
@@ -2942,7 +2930,7 @@ mod tests {
             matcher.filter_matchable_change(&mut candidates, (&change).into());
         }
 
-        if let Err(e) = matcher.inner.changes_tx.try_send((candidates, db_version)) {
+        if let Err(e) = matcher.inner.changes_tx.try_send(candidates) {
             error!(sub_id = %matcher.inner.id, "could not send candidates to matcher: {e}");
         }
         Ok(())
