@@ -799,7 +799,7 @@ impl Matcher {
     }
 
     pub fn cleanup(id: Uuid, sub_path: Utf8PathBuf) -> rusqlite::Result<()> {
-        info!(sub_id = %id, "Attempting to cleanup...");
+        info!(sub_id = %id, "Attempting to cleanup... {}", sub_path);
 
         block_in_place(|| {
             if let Err(e) = std::fs::remove_dir_all(&sub_path) {
@@ -1006,32 +1006,15 @@ impl Matcher {
             return;
         }
 
-        let catch_up_res = block_in_place(|| {
-            let db_version: CrsqlDbVersion =
-                state_conn.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
-
-            let last_db_version: CrsqlDbVersion = self.conn.query_row(
-                "SELECT value FROM meta WHERE key = 'db_version'",
-                (),
-                |row| row.get(0),
-            )?;
-
-            if last_db_version < db_version {
-                self.handle_change(&mut state_conn, last_db_version, db_version)?;
-            }
-
-            Ok::<_, MatcherError>(())
-        });
-
-        if let Err(e) = catch_up_res {
-            error!(sub_id = %self.id, "could not catch up: {e}");
-            _ = self
-                .evt_tx
-                .try_send(QueryEvent::Error(e.to_compact_string()));
-            return;
-        }
-
         self.cmd_loop(state_conn, tripwire).await
+    }
+
+    fn set_status(&self, status: &str) -> Result<(), MatcherError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('state', ?)",
+            [status],
+        )?;
+        Ok(())
     }
 
     fn setup(&self, state_conn: &mut Connection) -> Result<(), MatcherError> {
@@ -1143,7 +1126,7 @@ impl Matcher {
                 _ = &mut tripwire => {
                     info!(sub_id = %self.id, "tripped cmd_loop, returning");
                     // just return!
-                    return;
+                    break;
                 }
                 _ = purge_changes_interval.tick() => Branch::PurgeOldChanges,
                 else => {
@@ -1152,15 +1135,19 @@ impl Matcher {
             };
 
             match branch {
-                Branch::NewCandidates((candidates, db_version)) => {
+                Branch::NewCandidates((candidates, _db_version)) => {
                     let start = Instant::now();
-                    if let Err(e) = block_in_place(|| {
-                        self.handle_candidates(&mut state_conn, candidates, db_version)
-                    }) {
+                    if let Err(e) =
+                        block_in_place(|| self.handle_candidates(&mut state_conn, candidates))
+                    {
                         if !matches!(e, MatcherError::EventReceiverClosed) {
                             error!(sub_id = %self.id, "could not handle change: {e}");
                         }
-                        break;
+                        info!(sub_id = %self.id, "attempting to cleanup");
+                        if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                            error!("could not handle cleanup: {e}");
+                        }
+                        return;
                     }
                     let elapsed = start.elapsed();
 
@@ -1204,11 +1191,44 @@ impl Matcher {
             }
         }
 
-        debug!(id = %self.id, "matcher loop is done");
+        // set the status to lagging so we know it is lagging on reboot
+        // TODO: make the state an enum?
+        if let Err(e) = self.set_status("lagging") {
+            error!(sub_id = %self.id, "could not set subscription status: {e}");
+            Self::cleanup(self.id, self.base_path.clone()).unwrap();
+            return;
+        };
 
-        if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
-            error!("could not handle cleanup: {e}");
+        let mut buf = MatchCandidates::new();
+        let mut last_db_version = None;
+        info!(sub_id = %self.id, "draining changes channel");
+        while let Ok((candidates, db_version)) = self.changes_rx.try_recv() {
+            for (table, pks) in candidates {
+                let buffed = buf.entry(table).or_default();
+                for (pk, cl) in pks {
+                    buffed.insert(pk, cl);
+                }
+                last_db_version = Some(db_version);
+            }
         }
+
+        if !buf.is_empty() {
+            info!(sub_id = %self.id, "handling buffered candidates {last_db_version:?}");
+            let start = Instant::now();
+            if let Err(e) = block_in_place(|| self.handle_candidates(&mut state_conn, buf)) {
+                if !matches!(e, MatcherError::EventReceiverClosed) {
+                    error!(sub_id = %self.id, "could not handle change: {e}");
+                }
+            }
+            let elapsed = start.elapsed();
+            info!(sub_id = %self.id, "handled final buffered candidates in {elapsed:?}");
+        }
+
+        if let Err(e) = self.set_status("running") {
+            error!(sub_id = %self.id, "could not set status: {e}");
+        };
+
+        debug!(id = %self.id, "matcher loop is done");
     }
 
     async fn run(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
@@ -1226,11 +1246,6 @@ impl Matcher {
         for i in 0..(self.parsed.columns.len()) {
             query_cols.push(format!("col_{i}"));
         }
-
-        let mut first_buffered_db_version = None;
-
-        let mut candidates = MatchCandidates::new();
-        let mut last_db_version = None;
 
         let res = block_in_place(|| {
             let tx = self.conn.transaction()?;
@@ -1331,25 +1346,10 @@ impl Matcher {
                                 return Err(e.into());
                             }
                         }
-
-                        // drain this channel so it doesn't fill up
-                        while let Ok((new_candidates, db_version)) = self.changes_rx.try_recv() {
-                            last_db_version = Some(db_version);
-                            if first_buffered_db_version.is_none() {
-                                first_buffered_db_version = Some(db_version);
-                            }
-                            for (table, pks) in new_candidates {
-                                candidates.entry(table).or_default().extend(pks);
-                            }
-                        }
                     }
                 }
 
                 tx.execute_batch("DROP TABLE IF EXISTS state_rows;")?;
-
-                let db_version: CrsqlDbVersion =
-                    state_tx.query_row("SELECT crsql_db_version()", [], |row| row.get(0))?;
-                update_last_db_version(&tx, db_version)?;
 
                 tx.execute(
                     "INSERT OR REPLACE INTO meta (key, value) VALUES ('state', 'running')",
@@ -1358,7 +1358,7 @@ impl Matcher {
 
                 tx.commit()?;
 
-                (elapsed, db_version)
+                elapsed
             };
 
             self.last_rowid = last_rowid;
@@ -1366,8 +1366,8 @@ impl Matcher {
             Ok::<_, MatcherError>(elapsed)
         });
 
-        let db_version = match res {
-            Ok((elapsed, db_version)) => {
+        match res {
+            Ok(elapsed) => {
                 trace!(
                     "done w/ block_in_place for initial query, elapsed: {:?}",
                     elapsed
@@ -1383,7 +1383,7 @@ impl Matcher {
                     error!(sub_id = %self.id, "could not return end of query event: {e}");
                     return;
                 }
-                db_version
+                // db_version
             }
             Err(e) => {
                 warn!(sub_id = %self.id, "could not complete initial query: {e}");
@@ -1401,33 +1401,6 @@ impl Matcher {
             return;
         }
 
-        if let Some(first_db_version) = first_buffered_db_version {
-            if db_version < first_db_version {
-                info!(sub_id = %self.id, "processing missed changes between {db_version} and {first_db_version}");
-                if let Err(e) = block_in_place(|| {
-                    self.handle_change(&mut state_conn, db_version + 1, first_db_version - 1)
-                }) {
-                    error!(sub_id = %self.id, "could not catch up from last db version {db_version} to first buffered db version {first_db_version}: {e}");
-                    _ = self
-                        .evt_tx
-                        .try_send(QueryEvent::Error(e.to_compact_string()));
-                    return;
-                }
-            }
-            if let Some(last_db_version) = last_db_version {
-                info!(sub_id = %self.id, "handling buffered candidates while performing initial query");
-                if let Err(e) = block_in_place(|| {
-                    self.handle_candidates(&mut state_conn, candidates, last_db_version)
-                }) {
-                    error!(sub_id = %self.id, "could not catch up from buffered candidates: {e}");
-                    _ = self
-                        .evt_tx
-                        .try_send(QueryEvent::Error(e.to_compact_string()));
-                    return;
-                }
-            }
-        }
-
         self.cmd_loop(state_conn, tripwire).await
     }
 
@@ -1435,12 +1408,10 @@ impl Matcher {
         &mut self,
         state_conn: &mut Connection,
         candidates: MatchCandidates,
-        last_db_version: CrsqlDbVersion,
     ) -> Result<(), MatcherError> {
         let mut tables = IndexSet::new();
 
         if candidates.is_empty() {
-            update_last_db_version(&self.conn, last_db_version)?;
             return Ok(());
         }
 
@@ -1695,10 +1666,6 @@ impl Matcher {
             }
         }
 
-        update_last_db_version(&tx, last_db_version)?;
-
-        trace!("inserted new db version: {last_db_version}");
-
         tx.commit()?;
 
         trace!("committed!");
@@ -1706,39 +1673,6 @@ impl Matcher {
         self.last_rowid = new_last_rowid;
 
         Ok(())
-    }
-
-    fn handle_change(
-        &mut self,
-        state_conn: &mut Connection,
-        start_db_version: CrsqlDbVersion,
-        end_db_version: CrsqlDbVersion,
-    ) -> Result<(), MatcherError> {
-        debug!(sub_id = %self.id, "handling change from version {start_db_version} to {end_db_version}");
-
-        let mut candidates = MatchCandidates::new();
-        {
-            let mut changes_prepped = state_conn.prepare_cached(
-                r#"
-            SELECT DISTINCT "table", pk, cl
-                FROM crsql_changes
-                    WHERE db_version > ?
-                      AND db_version <= ? -- TODO: allow going over?
-                      AND ("table", cid) IN __corro_sub.columns -- only care about table/columns touched by the query
-                    GROUP BY "table", pk
-        "#,
-            )?;
-
-            let mut rows = changes_prepped.query([start_db_version, end_db_version])?;
-            while let Ok(Some(row)) = rows.next() {
-                candidates
-                    .entry(row.get(0)?)
-                    .or_default()
-                    .insert(row.get(1)?, row.get(2)?);
-            }
-        }
-
-        self.handle_candidates(state_conn, candidates, end_db_version)
     }
 }
 
@@ -1766,17 +1700,6 @@ fn dump_query_plan(
     }
 
     Ok(output)
-}
-
-fn update_last_db_version(
-    conn: &Connection,
-    last_db_version: CrsqlDbVersion,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO meta (key,value) VALUES ('db_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value WHERE excluded.value > value",
-        [last_db_version],
-    )?;
-    Ok(())
 }
 
 fn interrupt_deadline_guard(conn: &Connection, dur: Duration) -> DropGuard {
@@ -2703,7 +2626,7 @@ mod tests {
 
         setup_conn(&matcher_conn).unwrap();
 
-        let mut last_change_id = None;
+        let mut last_change_id: Option<ChangeId> = None;
 
         let id = {
             // let (db_v_tx, db_v_rx) = watch::channel(0);
@@ -2902,20 +2825,9 @@ mod tests {
             matcher.id()
         };
 
-        // delete a record while nothing is matching
-        {
-            let tx = conn.transaction().unwrap();
-            tx.execute_batch(
-                r#"
-                    DELETE FROM consul_services where node = 'test-hostname' AND id = 'service-3';
-                "#,
-            )
-            .unwrap();
-            tx.commit().unwrap();
-        }
-
         tokio::time::sleep(Duration::from_secs(1)).await;
 
+        // restore subscription
         {
             let (matcher, created) = subs
                 .restore(id, &subscriptions_path, &schema, &pool, tripwire.clone())
@@ -2962,8 +2874,20 @@ mod tests {
                 }
             }
 
-            assert_eq!(rows_count, 996);
-            assert_eq!(eoq_change_id, Some(Some(ChangeId(1000))));
+            assert_eq!(rows_count, 997);
+            assert_eq!(eoq_change_id, Some(Some(ChangeId(999))));
+
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(2)).unwrap();
+            {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(
+                    r#"
+                        DELETE FROM consul_services where node = 'test-hostname' AND id = 'service-3';
+                    "#,
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
 
             println!("waiting for a change (A)");
 
@@ -2975,7 +2899,25 @@ mod tests {
             );
 
             assert!(rx.try_recv().is_err());
+
+            {
+                let conn = rusqlite::Connection::open(
+                    subscriptions_path
+                        .join(matcher.id().as_simple().to_string())
+                        .join("sub.sqlite"),
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('state', 'lagging')",
+                    (),
+                )
+                .unwrap();
+            }
         }
+
+        // attempting restore if subs state is lagging should fail
+        let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
+        assert!(res.is_err());
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
