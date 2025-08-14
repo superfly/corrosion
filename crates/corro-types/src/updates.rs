@@ -41,7 +41,7 @@ pub trait Handle {
         candidates: &mut MatchCandidates,
         change: MatchableChange,
     ) -> bool;
-    fn changes_tx(&self) -> mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>;
+    fn changes_tx(&self) -> mpsc::Sender<MatchCandidates>;
     async fn cleanup(&self);
     fn get_counter(&self, table: &str) -> &HandleMetrics;
 }
@@ -120,7 +120,7 @@ impl Handle for UpdateHandle {
         }
     }
 
-    fn changes_tx(&self) -> mpsc::Sender<(MatchCandidates, CrsqlDbVersion)> {
+    fn changes_tx(&self) -> mpsc::Sender<MatchCandidates> {
         self.inner.changes_tx.clone()
     }
 
@@ -218,7 +218,7 @@ pub struct InnerUpdateHandle {
     id: Uuid,
     name: String,
     cancel: CancellationToken,
-    changes_tx: mpsc::Sender<(MatchCandidates, CrsqlDbVersion)>,
+    changes_tx: mpsc::Sender<MatchCandidates>,
     counters: HandleMetrics,
 }
 
@@ -308,7 +308,7 @@ async fn batch_candidates(
     id: Uuid,
     cancel: CancellationToken,
     evt_tx: mpsc::Sender<NotifyEvent>,
-    mut changes_rx: mpsc::Receiver<(MatchCandidates, CrsqlDbVersion)>,
+    mut changes_rx: mpsc::Receiver<MatchCandidates>,
     mut tripwire: Tripwire,
 ) {
     const PROCESS_CHANGES_THRESHOLD: usize = 1000;
@@ -341,7 +341,7 @@ async fn batch_candidates(
                 info!(sub_id = %id, "Acknowledged updates cancellation, breaking loop.");
                 break;
             }
-            Some((candidates, _)) = changes_rx.recv() => {
+            Some(candidates) = changes_rx.recv() => {
                 debug!(sub_id = %id, "updates got candidates: {candidates:?}");
                 for (table, pk_map) in  candidates {
                     let buffed = buf.entry(table.clone()).or_default();
@@ -457,7 +457,7 @@ where
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
-        if let Err(e) = handle.changes_tx().try_send((candidates, db_version)) {
+        if let Err(e) = handle.changes_tx().try_send(candidates) {
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
             match e {
                 mpsc::error::TrySendError::Full(item) => {
@@ -549,7 +549,7 @@ where
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
 
-        if let Err(e) = handle.changes_tx().try_send((candidates, db_version)) {
+        if let Err(e) = handle.changes_tx().try_send(candidates) {
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
             match e {
                 mpsc::error::TrySendError::Full(item) => {
