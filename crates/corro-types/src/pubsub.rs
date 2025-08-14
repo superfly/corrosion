@@ -2373,6 +2373,7 @@ mod tests {
     use crate::{
         actor::ActorId,
         agent::migrate,
+        base::CrsqlDbVersion,
         change::row_to_change,
         schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
