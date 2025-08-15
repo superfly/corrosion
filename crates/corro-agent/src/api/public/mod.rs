@@ -249,7 +249,7 @@ pub async fn api_v1_transactions(
         axum::Json(ExecResponse {
             results,
             time: elapsed.as_secs_f64(),
-            version: version.map(Into::into),
+            version,
             actor_id: Some(actor_id),
         }),
     )
@@ -707,7 +707,6 @@ mod tests {
     use bytes::Bytes;
     use corro_types::{
         api::RowId,
-        base::CrsqlDbVersion,
         broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
         config::Config,
         schema::SqliteType,
@@ -787,17 +786,14 @@ mod tests {
         assert!(matches!(
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
-                changeset: Changeset::Full {
-                    version: CrsqlDbVersion(1),
-                    ..
-                },
+                changeset: Changeset::Full { version: 1, .. },
                 ..
             }))
         ));
 
         assert_eq!(
             agent.booked().read::<&str, _>("test", None).await.last(),
-            Some(CrsqlDbVersion(1))
+            Some(1)
         );
 
         println!("second req...");

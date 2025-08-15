@@ -1046,10 +1046,7 @@ mod tests {
     use super::*;
     use crate::agent::spawn_unipayload_handler;
     use corro_tests::launch_test_agent;
-    use corro_types::{
-        base::{CrsqlDbVersion, CrsqlSeq},
-        broadcast::{BroadcastV1, ChangeV1, Changeset},
-    };
+    use corro_types::broadcast::{BroadcastV1, ChangeV1, Changeset};
     use uuid::Uuid;
 
     #[test]
@@ -1132,15 +1129,15 @@ mod tests {
         let bcast = BroadcastV1::Change(ChangeV1 {
             actor_id: ta1.agent.actor_id(),
             changeset: Changeset::Full {
-                version: CrsqlDbVersion(0),
+                version: 0,
                 changes: vec![],
-                seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                last_seq: CrsqlSeq(0),
+                seqs: 0..=0,
+                last_seq: 0,
                 ts: Default::default(),
             },
         });
         let mut ser_buf = BytesMut::new();
-        let _ = UniPayload::V1 {
+        UniPayload::V1 {
             data: UniPayloadV1::Broadcast(bcast),
             cluster_id: ta1.agent.cluster_id(),
         }
@@ -1165,10 +1162,10 @@ mod tests {
                 .send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
                     actor_id,
                     changeset: Changeset::Full {
-                        version: CrsqlDbVersion(i),
+                        version: i,
                         changes: vec![],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                        last_seq: CrsqlSeq(0),
+                        seqs: 0..=0,
+                        last_seq: 0,
                         ts: Default::default(),
                     },
                 })))
@@ -1187,7 +1184,7 @@ mod tests {
                 let changes = tokio::time::timeout(Duration::from_secs(5), rx_changes.recv())
                     .await?
                     .unwrap();
-                assert_eq!(changes.0.versions(), CrsqlDbVersion(i)..=CrsqlDbVersion(i));
+                assert_eq!(changes.0.versions(), i..=i);
             }
         }
 

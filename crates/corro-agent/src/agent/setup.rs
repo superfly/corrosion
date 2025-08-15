@@ -229,7 +229,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                                 "state": lock.state,
                             });
                             assert_always!(
-                                duration < Duration::from_secs(1 * 60),
+                                duration < Duration::from_secs(60),
                                 "bookie lock held for too long",
                                 &details
                             );

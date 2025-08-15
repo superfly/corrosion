@@ -93,7 +93,7 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
             .read()
             .await?
             .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-    assert_eq!(db_version, CrsqlDbVersion(1));
+    assert_eq!(db_version, 1);
 
     println!("body: {body:?}");
 
@@ -168,8 +168,8 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
     assert_eq!(
         bk,
         vec![
-            (ta1.agent.actor_id(), CrsqlDbVersion(1), Some(CrsqlSeq(0))),
-            (ta1.agent.actor_id(), CrsqlDbVersion(2), Some(CrsqlSeq(0)))
+            (ta1.agent.actor_id(), 1, Some(0)),
+            (ta1.agent.actor_id(), 2, Some(0))
         ]
     );
 
@@ -232,7 +232,7 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
             .read()
             .await?
             .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-    assert_eq!(db_version, CrsqlDbVersion(3));
+    assert_eq!(db_version, 3);
 
     let expected_count: i64 =
         ta1.agent
@@ -538,7 +538,7 @@ pub async fn configurable_stress_test(
 
                 for (actor_id, versions) in per_actor {
                     if let Some(versions_len) = actor_versions.get(&actor_id) {
-                        let full_range = CrsqlDbVersion(1)..=CrsqlDbVersion(*versions_len as u64);
+                        let full_range = 1..=*versions_len as u64;
                         let gaps = versions.gaps(&full_range);
                         for gap in gaps {
                             println!("{} db gap! {actor_id} => {gap:?}", ta.agent.actor_id());
@@ -647,7 +647,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
             .read()
             .await?
             .query_row("SELECT crsql_db_version();", (), |row| row.get(0))?;
-    assert_eq!(db_version, CrsqlDbVersion(counts.len() as u64));
+    assert_eq!(db_version, counts.len() as u64);
 
     println!("expected count: {expected_count}");
 
@@ -805,11 +805,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     // make about 50 transactions to ta1
     insert_rows(ta1.agent.clone(), 1, 50).await;
     // send them all
-    let rows = get_rows(
-        ta1.agent.clone(),
-        vec![(CrsqlDbVersion(1)..=CrsqlDbVersion(50), None)],
-    )
-    .await?;
+    let rows = get_rows(ta1.agent.clone(), vec![(1..=50, None)]).await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
 
     // overwrite different version ranges
@@ -821,10 +817,10 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     let rows = get_rows(
         ta1.agent.clone(),
         vec![
-            (CrsqlDbVersion(51)..=CrsqlDbVersion(55), None),
-            (CrsqlDbVersion(56)..=CrsqlDbVersion(56), None),
-            (CrsqlDbVersion(57)..=CrsqlDbVersion(59), None),
-            (CrsqlDbVersion(60)..=CrsqlDbVersion(60), None),
+            (51..=55, None),
+            (56..=56, None),
+            (57..=59, None),
+            (60..=60, None),
         ],
     )
     .await?;
@@ -832,7 +828,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        vec![CrsqlDbVersion(1)..=CrsqlDbVersion(50)],
+        vec![1..=50],
         vec![],
         vec![],
         vec![],
@@ -858,12 +854,7 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
         vec![],
         vec![],
         vec![],
-        vec![
-            CrsqlDbVersion(1)..=CrsqlDbVersion(5),
-            CrsqlDbVersion(10)..=CrsqlDbVersion(10),
-            CrsqlDbVersion(23)..=CrsqlDbVersion(25),
-            CrsqlDbVersion(30)..=CrsqlDbVersion(31),
-        ],
+        vec![1..=5, 10..=10, 23..=25, 30..=31],
     )
     .await?;
 
@@ -910,11 +901,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
         .await;
         assert_eq!(status_code, StatusCode::OK);
     }
-    let mut good_changes = get_rows(
-        ta2.agent.clone(),
-        vec![(CrsqlDbVersion(1)..=CrsqlDbVersion(5), None)],
-    )
-    .await?;
+    let mut good_changes = get_rows(ta2.agent.clone(), vec![(1..=5, None)]).await?;
 
     let change6 = Change {
         table: TableName("tests".into()),
@@ -922,8 +909,8 @@ async fn process_failed_changes() -> eyre::Result<()> {
         cid: ColumnName("text".into()),
         val: "six".into(),
         col_version: 1,
-        db_version: CrsqlDbVersion(6),
-        seq: CrsqlSeq(0),
+        db_version: 6,
+        seq: 0,
         site_id: actor_id.to_bytes(),
         cl: 1,
     };
@@ -934,8 +921,8 @@ async fn process_failed_changes() -> eyre::Result<()> {
         cid: ColumnName("nonexistent".into()),
         val: "six".into(),
         col_version: 1,
-        db_version: CrsqlDbVersion(6),
-        seq: CrsqlSeq(1),
+        db_version: 6,
+        seq: 1,
         site_id: actor_id.to_bytes(),
         cl: 1,
     };
@@ -944,10 +931,10 @@ async fn process_failed_changes() -> eyre::Result<()> {
         ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: CrsqlDbVersion(1),
+                version: 1,
                 changes: vec![change6.clone(), bad_change],
-                seqs: CrsqlSeq(0)..=CrsqlSeq(1),
-                last_seq: CrsqlSeq(1),
+                seqs: 0..=1,
+                last_seq: 1,
                 ts: Default::default(),
             },
         },
@@ -978,7 +965,7 @@ async fn process_failed_changes() -> eyre::Result<()> {
             )?
             .query_row((pk, ta2.agent.actor_id()), |row| row.get::<_, CrsqlDbVersion>(0))?;
 
-        assert_eq!(crsql_dbv, CrsqlDbVersion(i as u64));
+        assert_eq!(crsql_dbv, i as u64);
 
         let conn = ta1.agent.pool().read().await?;
         conn.prepare_cached("SELECT text from tests where id = ?")?
@@ -1027,17 +1014,13 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     insert_rows(ta1.agent.clone(), 1, 50).await;
 
     // sent 1-5
-    let rows = get_rows(
-        ta1.agent.clone(),
-        vec![(CrsqlDbVersion(1)..=CrsqlDbVersion(5), None)],
-    )
-    .await?;
+    let rows = get_rows(ta1.agent.clone(), vec![(1..=5, None)]).await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check ta2 bookie
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        vec![CrsqlDbVersion(1)..=CrsqlDbVersion(5)],
+        vec![1..=5],
         vec![],
         vec![],
         vec![],
@@ -1045,18 +1028,14 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     .await?;
 
     // sent: 1-5, 9-10
-    let rows = get_rows(
-        ta1.agent.clone(),
-        vec![(CrsqlDbVersion(9)..=CrsqlDbVersion(10), None)],
-    )
-    .await?;
+    let rows = get_rows(ta1.agent.clone(), vec![(9..=10, None)]).await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     // check for gap 6-8
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
         vec![],
-        vec![CrsqlDbVersion(6)..=CrsqlDbVersion(8)],
+        vec![6..=8],
         vec![],
         vec![],
     )
@@ -1067,13 +1046,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     // * indicates partial version
     let rows = get_rows(
         ta1.agent.clone(),
-        vec![
-            (CrsqlDbVersion(20)..=CrsqlDbVersion(20), None),
-            (
-                CrsqlDbVersion(15)..=CrsqlDbVersion(16),
-                Some(CrsqlSeq(0)..=CrsqlSeq(0)),
-            ),
-        ],
+        vec![(20..=20, None), (15..=16, Some(0..=0))],
     )
     .await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
@@ -1082,14 +1055,8 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         ta2.clone(),
         ta1.agent.actor_id(),
         vec![],
-        vec![
-            CrsqlDbVersion(11)..=CrsqlDbVersion(14),
-            CrsqlDbVersion(17)..=CrsqlDbVersion(19),
-        ],
-        vec![(
-            CrsqlDbVersion(15)..=CrsqlDbVersion(16),
-            CrsqlSeq(0)..=CrsqlSeq(0),
-        )],
+        vec![11..=14, 17..=19],
+        vec![(15..=16, 0..=0)],
         vec![],
     )
     .await?;
@@ -1098,14 +1065,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     insert_rows(ta1.agent.clone(), 21, 25).await;
     // send non-contiguous cleared versions
     // sent 1-5, 9-10, 15-16*, 20, 21, 25
-    let rows = get_rows(
-        ta1.agent.clone(),
-        vec![
-            (CrsqlDbVersion(21)..=CrsqlDbVersion(21), None),
-            (CrsqlDbVersion(25)..=CrsqlDbVersion(25), None),
-        ],
-    )
-    .await?;
+    let rows = get_rows(ta1.agent.clone(), vec![(21..=21, None), (25..=25, None)]).await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
 
     check_bookie_versions(
@@ -1114,10 +1074,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
         vec![],
         vec![],
         vec![],
-        vec![
-            CrsqlDbVersion(21)..=CrsqlDbVersion(21),
-            CrsqlDbVersion(25)..=CrsqlDbVersion(25),
-        ],
+        vec![21..=21, 25..=25],
     )
     .await?;
 
@@ -1125,52 +1082,34 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     // sent 1-5, 9-10, 14-18, 20, 23-25
     let rows = get_rows(
         ta1.agent.clone(),
-        vec![
-            (CrsqlDbVersion(14)..=CrsqlDbVersion(18), None),
-            (
-                CrsqlDbVersion(15)..=CrsqlDbVersion(16),
-                Some(CrsqlSeq(1)..=CrsqlSeq(3)),
-            ),
-            (CrsqlDbVersion(23)..=CrsqlDbVersion(24), None),
-        ],
+        vec![(14..=18, None), (15..=16, Some(1..=3)), (23..=24, None)],
     )
     .await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        vec![
-            CrsqlDbVersion(14)..=CrsqlDbVersion(18),
-            CrsqlDbVersion(15)..=CrsqlDbVersion(16),
-        ],
-        vec![
-            CrsqlDbVersion(11)..=CrsqlDbVersion(13),
-            CrsqlDbVersion(19)..=CrsqlDbVersion(19),
-            CrsqlDbVersion(22)..=CrsqlDbVersion(22),
-        ],
+        vec![14..=18, 15..=16],
+        vec![11..=13, 19..=19, 22..=22],
         vec![],
-        vec![CrsqlDbVersion(23)..=CrsqlDbVersion(25)],
+        vec![23..=25],
     )
     .await?;
 
     // sent 1-25
     let rows = get_rows(
         ta1.agent.clone(),
-        vec![
-            (CrsqlDbVersion(6)..=CrsqlDbVersion(8), None),
-            (CrsqlDbVersion(11)..=CrsqlDbVersion(19), None),
-            (CrsqlDbVersion(22)..=CrsqlDbVersion(22), None),
-        ],
+        vec![(6..=8, None), (11..=19, None), (22..=22, None)],
     )
     .await?;
     process_multiple_changes(ta2.agent.clone(), ta2.bookie.clone(), rows, tx_timeout).await?;
     check_bookie_versions(
         ta2.clone(),
         ta1.agent.actor_id(),
-        vec![CrsqlDbVersion(1)..=CrsqlDbVersion(20)],
+        vec![1..=20],
         vec![],
         vec![],
-        vec![CrsqlDbVersion(21)..=CrsqlDbVersion(25)],
+        vec![21..=25],
     )
     .await?;
 
@@ -1204,7 +1143,7 @@ async fn check_bookie_versions(
                 "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping_gaps WHERE actor_id = ? and ? between start and end)")?
                 .query_row((actor_id, version), |row| row.get(0))?);
         }
-        bookedv.contains_all(versions.clone(), Some(&(CrsqlSeq(0)..=CrsqlSeq(3))));
+        bookedv.contains_all(versions.clone(), Some(&(0..=3)));
     }
 
     for versions in partials {
@@ -1234,7 +1173,7 @@ async fn check_bookie_versions(
             let partial = bookedv.get_partial(&version);
             assert_ne!(partial, None);
         }
-        bookedv.contains_all(versions.0.clone(), Some(&(CrsqlSeq(0)..=CrsqlSeq(3))));
+        bookedv.contains_all(versions.0.clone(), Some(&(0..=3)));
     }
 
     for versions in gap {
@@ -1301,7 +1240,7 @@ async fn get_rows(
                 changes = prepped
                     .query_map([version], row_to_change)?
                     .collect::<Result<Vec<_>, _>>()?;
-                CrsqlSeq(0)..=CrsqlSeq(last)
+                0..=last
             };
 
             result.push((
@@ -1311,7 +1250,7 @@ async fn get_rows(
                         version,
                         changes,
                         seqs,
-                        last_seq: CrsqlSeq(last),
+                        last_seq: last,
                         ts: agent.clock().new_timestamp().into(),
                     },
                 },
@@ -1345,7 +1284,7 @@ async fn insert_rows(agent: Agent, start: i64, n: i64) {
         assert_eq!(status_code, StatusCode::OK);
 
         // let version = body.0.version.unwrap();
-        // assert_eq!(version, CrsqlDbVersion(i as u64));
+        // assert_eq!(version, i as u64);
     }
 }
 

@@ -14,7 +14,6 @@ use crate::{
 use corro_types::{
     actor::ActorId,
     agent::{Agent, BookedVersions, Bookie},
-    base::CrsqlSeq,
     channel::bounded,
     config::{Config, PerfConfig},
 };
@@ -181,7 +180,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
 
         while let Some((actor_id, bv)) = TryStreamExt::try_next(&mut buf).await? {
             for (version, partial) in bv.partials.iter() {
-                let gaps_count = partial.seqs.gaps(&(CrsqlSeq(0)..=partial.last_seq)).count();
+                let gaps_count = partial.seqs.gaps(&(0..=partial.last_seq)).count();
 
                 if gaps_count == 0 {
                     info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");

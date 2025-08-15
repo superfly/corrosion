@@ -1630,7 +1630,7 @@ impl Matcher {
                     while let Ok(Some(row)) = rows.next() {
                         let rowid: RowId = row.get(0)?;
 
-                        let change_type = change_type.clone().take().unwrap_or({
+                        let change_type = change_type.unwrap_or({
                             if rowid.0 > self.last_rowid {
                                 ChangeType::Insert
                             } else {
@@ -2218,7 +2218,7 @@ pub enum MatcherError {
     #[error("aggregate missing primary key {0}.{1}")]
     AggPrimaryKeyMissing(String, String),
     #[error("JOIN .. ON expression is not supported for join on table '{table}': {expr:?}")]
-    JoinOnExprUnsupported { table: String, expr: Expr },
+    JoinOnExprUnsupported { table: String, expr: Box<Expr> },
     #[error("expression is not supported: {expr:?}")]
     UnsupportedExpr { expr: Expr },
     #[error("could not find table for {tbl_name}.* in corrosion's schema")]
@@ -2268,7 +2268,7 @@ pub enum NormalizeStatementError {
     #[error(transparent)]
     Parse(#[from] sqlite3_parser::lexer::sql::Error),
     #[error("unexpected statement: {0}")]
-    UnexpectedStatement(Cmd),
+    UnexpectedStatement(Box<Cmd>),
     #[error("only 1 statement is supported")]
     Multiple,
     #[error("at least 1 statement is required")]
@@ -2281,7 +2281,7 @@ pub fn normalize_sql(sql: &str) -> Result<String, NormalizeStatementError> {
     let stmt = match parser.next()? {
         Some(Cmd::Stmt(stmt)) => stmt,
         Some(cmd) => {
-            return Err(NormalizeStatementError::UnexpectedStatement(cmd));
+            return Err(NormalizeStatementError::UnexpectedStatement(Box::new(cmd)));
         }
         None => {
             return Err(NormalizeStatementError::NoStatement);
@@ -2751,7 +2751,7 @@ mod tests {
             }
 
             println!("processing change...");
-            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(2)).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 2).unwrap();
             println!("processed changes");
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
@@ -2772,7 +2772,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(3)).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 3).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.1:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-1\"}}".into())];
 
@@ -2795,7 +2795,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(4)).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 4).unwrap();
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
 
@@ -2854,7 +2854,7 @@ mod tests {
                 tx.commit().unwrap();
             }
 
-            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(5)).unwrap();
+            filter_changes_from_db(&matcher, &conn, None, 5).unwrap();
 
             let start = Instant::now();
             for _ in range {

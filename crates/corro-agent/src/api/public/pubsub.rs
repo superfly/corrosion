@@ -279,7 +279,7 @@ pub enum MatcherUpsertError {
     #[error("could not expand sql statement")]
     CouldNotExpand,
     #[error(transparent)]
-    NormalizeStatement(#[from] NormalizeStatementError),
+    NormalizeStatement(#[from] Box<NormalizeStatementError>),
     #[error(transparent)]
     Matcher(#[from] MatcherError),
     #[error("a `from` query param was supplied, but no existing subscription found")]
@@ -884,7 +884,7 @@ mod tests {
     use corro_types::actor::ActorId;
     use corro_types::api::NotifyEvent;
     use corro_types::api::{ColumnName, TableName};
-    use corro_types::base::{CrsqlDbVersion, CrsqlSeq};
+    use corro_types::base::CrsqlSeq;
     use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
     use corro_types::change::Change;
     use corro_types::pubsub::pack_columns;
@@ -1482,8 +1482,8 @@ mod tests {
             cid: ColumnName("col1".into()),
             val: "one".into(),
             col_version: 1,
-            db_version: CrsqlDbVersion(1),
-            seq: CrsqlSeq(0),
+            db_version: 1,
+            seq: 0,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1494,8 +1494,8 @@ mod tests {
             cid: ColumnName("col2".into()),
             val: "one line".into(),
             col_version: 1,
-            db_version: CrsqlDbVersion(1),
-            seq: CrsqlSeq(1),
+            db_version: 1,
+            seq: 1,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1503,10 +1503,10 @@ mod tests {
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: CrsqlDbVersion(1),
+                version: 1,
                 changes: vec![change1, change2],
-                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(1)),
-                last_seq: CrsqlSeq(1),
+                seqs: RangeInclusive::new(0, 1),
+                last_seq: 1,
                 ts: Default::default(),
             },
         };
@@ -1591,8 +1591,8 @@ mod tests {
             cid: ColumnName("col1".into()),
             val: "two".into(),
             col_version: 1,
-            db_version: CrsqlDbVersion(2),
-            seq: CrsqlSeq(0),
+            db_version: 2,
+            seq: 0,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1600,10 +1600,10 @@ mod tests {
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: CrsqlDbVersion(2),
+                version: 2,
                 changes: vec![change3],
-                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(0)),
-                last_seq: CrsqlSeq(1),
+                seqs: RangeInclusive::new(0, 0),
+                last_seq: 1,
                 ts: Default::default(),
             },
         };
@@ -1624,7 +1624,7 @@ mod tests {
                 (actor_id, 2),
                 |row| row.get::<_, CrsqlSeq>(0),
             )?;
-            assert_eq!(end, CrsqlSeq(0));
+            assert_eq!(end, 0);
         }
 
         let change4 = Change {
@@ -1633,8 +1633,8 @@ mod tests {
             cid: ColumnName("col2".into()),
             val: "two line".into(),
             col_version: 1,
-            db_version: CrsqlDbVersion(2),
-            seq: CrsqlSeq(1),
+            db_version: 2,
+            seq: 1,
             site_id: actor_id.to_bytes(),
             cl: 1,
         };
@@ -1642,10 +1642,10 @@ mod tests {
         let changes = ChangeV1 {
             actor_id,
             changeset: Changeset::Full {
-                version: CrsqlDbVersion(2),
+                version: 2,
                 changes: vec![change4],
-                seqs: RangeInclusive::new(CrsqlSeq(1), CrsqlSeq(1)),
-                last_seq: CrsqlSeq(1),
+                seqs: RangeInclusive::new(1, 1),
+                last_seq: 1,
                 ts: Default::default(),
             },
         };

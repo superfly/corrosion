@@ -686,22 +686,19 @@ pub async fn handle_changes(
         }
 
         let src_str: &'static str = src.into();
-        let recv_lag = change
-            .ts()
-            .map(|ts| {
-                let mut our_ts = Timestamp::from(agent.clock().new_timestamp());
-                if ts > our_ts {
-                    if let Err(e) = agent.update_clock_with_timestamp(change.actor_id, ts) {
-                        error!("could not update clock from actor {}: {e}", change.actor_id);
-                        return None;
-                    }
-                    counter!("corro.agent.clock.update", "source" => src_str).increment(1);
-                    // update our_ts to the new timestamp
-                    our_ts = Timestamp::from(agent.clock().new_timestamp());
+        let recv_lag = change.ts().and_then(|ts| {
+            let mut our_ts = Timestamp::from(agent.clock().new_timestamp());
+            if ts > our_ts {
+                if let Err(e) = agent.update_clock_with_timestamp(change.actor_id, ts) {
+                    error!("could not update clock from actor {}: {e}", change.actor_id);
+                    return None;
                 }
-                Some((our_ts.0 - ts.0).to_duration())
-            })
-            .flatten();
+                counter!("corro.agent.clock.update", "source" => src_str).increment(1);
+                // update our_ts to the new timestamp
+                our_ts = Timestamp::from(agent.clock().new_timestamp());
+            }
+            Some((our_ts.0 - ts.0).to_duration())
+        });
 
         if matches!(src, ChangeSource::Broadcast) {
             counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
@@ -802,7 +799,7 @@ pub async fn handle_sync(
             .set(needed.len() as f64);
     }
     for (actor_id, version) in sync_state.heads.iter() {
-        gauge!("corro.sync.client.head", "actor_id" => actor_id.to_string()).set(version.0 as f64);
+        gauge!("corro.sync.client.head", "actor_id" => actor_id.to_string()).set(*version as f64);
     }
 
     let chosen: Vec<(ActorId, SocketAddr)> = {
@@ -902,10 +899,7 @@ mod tests {
     use axum::{http::StatusCode, Extension, Json};
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
-    use corro_types::{
-        base::CrsqlDbVersion, broadcast::Changeset, change::Change, config::Config,
-        pubsub::pack_columns,
-    };
+    use corro_types::{broadcast::Changeset, change::Change, config::Config, pubsub::pack_columns};
     use rusqlite::Connection;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
@@ -974,8 +968,8 @@ mod tests {
                     cid: ColumnName("text".into()),
                     val: "two override".into(),
                     col_version: 1,
-                    db_version: CrsqlDbVersion(i as u64),
-                    seq: CrsqlSeq(0),
+                    db_version: i as u64,
+                    seq: 0,
                     site_id: agent.actor_id().to_bytes(),
                     cl: 1,
                 };
@@ -984,10 +978,10 @@ mod tests {
                     ChangeV1 {
                         actor_id: other_actor,
                         changeset: Changeset::Full {
-                            version: CrsqlDbVersion(i as u64),
+                            version: i as u64,
                             changes: vec![crsql_row.clone()],
-                            seqs: CrsqlSeq(0)..=CrsqlSeq(0),
-                            last_seq: CrsqlSeq(0),
+                            seqs: 0..=0,
+                            last_seq: 0,
                             ts: agent.clock().new_timestamp().into(),
                         },
                     },
@@ -1006,10 +1000,10 @@ mod tests {
             .unwrap()
             .read::<&str, _>("test", None)
             .await;
-        assert!(booked.contains_all(CrsqlDbVersion(6)..=CrsqlDbVersion(10), None));
-        assert!(booked.contains_all(CrsqlDbVersion(1)..=CrsqlDbVersion(3), None));
-        assert!(!booked.contains_version(&CrsqlDbVersion(5)));
-        assert!(!booked.contains_version(&CrsqlDbVersion(4)));
+        assert!(booked.contains_all(6..=10, None));
+        assert!(booked.contains_all(1..=3, None));
+        assert!(!booked.contains_version(&5));
+        assert!(!booked.contains_version(&4));
 
         Ok(())
     }
@@ -1024,7 +1018,7 @@ mod tests {
             db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
         }
 
-        println!("temp db: {:?}", db_path);
+        println!("temp db: {db_path:?}");
         let write_sema = Arc::new(Semaphore::new(1));
         let pool = SplitPool::create(db_path, write_sema.clone()).await?;
 

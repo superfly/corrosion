@@ -53,12 +53,10 @@ impl CorrosionApiClient {
         statement: &Statement,
         timeout: Option<u64>,
     ) -> Result<QueryStream<T>, Error> {
-        let params = timeout
-            .map(|t| format!("?timeout={}", t))
-            .unwrap_or_default();
+        let params = timeout.map(|t| format!("?timeout={t}")).unwrap_or_default();
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
-            .uri(format!("http://{}/v1/queries{}", self.api_addr, params))
+            .uri(format!("http://{}/v1/queries{params}", self.api_addr))
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::ACCEPT, "application/json")
             .body(Body::from(serde_json::to_vec(statement)?))?;
@@ -110,12 +108,12 @@ impl CorrosionApiClient {
     ) -> Result<SubscriptionStream<T>, Error> {
         let p_and_q: PathAndQuery = if let Some(change_id) = from {
             format!(
-                "/v1/subscriptions?skip_rows={}&from={}",
-                skip_rows, change_id.0
+                "/v1/subscriptions?skip_rows={skip_rows}&from={}",
+                change_id.0
             )
             .try_into()?
         } else {
-            format!("/v1/subscriptions?skip_rows={}", skip_rows).try_into()?
+            format!("/v1/subscriptions?skip_rows={skip_rows}").try_into()?
         };
         let url = hyper::Uri::builder()
             .scheme("http")
@@ -174,12 +172,12 @@ impl CorrosionApiClient {
     ) -> Result<SubscriptionStream<T>, Error> {
         let p_and_q: PathAndQuery = if let Some(change_id) = from {
             format!(
-                "/v1/subscriptions/{id}?skip_rows={}&from={}",
-                skip_rows, change_id.0
+                "/v1/subscriptions/{id}?skip_rows={skip_rows}&from={}",
+                change_id.0
             )
             .try_into()?
         } else {
-            format!("/v1/subscriptions/{id}?skip_rows={}", skip_rows).try_into()?
+            format!("/v1/subscriptions/{id}?skip_rows={skip_rows}").try_into()?
         };
         let url = hyper::Uri::builder()
             .scheme("http")
@@ -227,7 +225,7 @@ impl CorrosionApiClient {
         &self,
         table: &str,
     ) -> Result<UpdatesStream<T>, Error> {
-        let p_and_q: PathAndQuery = format!("/v1/updates/{}", table).try_into()?;
+        let p_and_q: PathAndQuery = format!("/v1/updates/{table}").try_into()?;
 
         let url = hyper::Uri::builder()
             .scheme("http")
@@ -288,18 +286,18 @@ impl CorrosionApiClient {
         let status = res.status();
         if !status.is_success() {
             match hyper::body::to_bytes(res.into_body()).await {
-                Ok(b) => match serde_json::from_slice(&b) {
-                    Ok(res) => match res {
-                        ExecResponse { results, .. } => {
-                            if let Some(ExecResult::Error { error }) = results
-                                .into_iter()
-                                .find(|r| matches!(r, ExecResult::Error { .. }))
-                            {
-                                return Err(Error::ResponseError(error));
-                            }
-                            return Err(Error::UnexpectedStatusCode(status));
-                        }
-                    },
+                Ok(b) => match serde_json::from_slice::<ExecResponse>(&b) {
+                    Ok(res) => {
+                        return if let Some(ExecResult::Error { error }) = res
+                            .results
+                            .into_iter()
+                            .find(|r| matches!(r, ExecResult::Error { .. }))
+                        {
+                            Err(Error::ResponseError(error))
+                        } else {
+                            Err(Error::UnexpectedStatusCode(status))
+                        };
+                    }
                     Err(e) => {
                         debug!(
                             error = %e,
