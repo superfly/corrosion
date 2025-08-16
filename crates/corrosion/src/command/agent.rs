@@ -60,7 +60,7 @@ pub async fn run(
 
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
-    let (agent, bookie, _) =
+    let (agent, bookie, _, handles) =
         corro_agent::agent::start_with_config(config.clone(), tripwire.clone())
             .await
             .expect("could not start agent");
@@ -96,6 +96,15 @@ pub async fn run(
 
     antithesis_init();
     tripwire_worker.await;
+
+    // wait for handles to finish
+    for handle in handles {
+        if let Err(e) = handle.await {
+            error!("error from task handle: {e:?}");
+        }
+    }
+    // wind down subs when handles are dropped
+    agent.subs_manager().drop_handles().await;
 
     wait_for_all_pending_handles().await;
 
