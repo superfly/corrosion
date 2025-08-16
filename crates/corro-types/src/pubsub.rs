@@ -104,6 +104,16 @@ impl SubsManager {
         self.0.read().handles.clone()
     }
 
+    pub async fn drop_handles(&self) {
+        let handles = {
+            let mut inner = self.0.write();
+            std::mem::take(&mut inner.handles)
+        };
+        for (_, handle) in handles.iter() {
+            handle.cleanup().await;
+        }
+    }
+
     pub fn get_or_insert(
         &self,
         sql: &str,
@@ -1085,6 +1095,9 @@ impl Matcher {
                 biased;
                 _ = self.cancel.cancelled() => {
                     info!(sub_id = %self.id, "Acknowledged subscription cancellation, breaking loop.");
+                    if let Err(e) = self.set_status("cancelled") {
+                        error!(sub_id = %self.id, "could not set status during cancellation: {e}");
+                    }
                     break;
                 }
                 Some(candidates) = self.changes_rx.recv() => {
@@ -1127,9 +1140,9 @@ impl Matcher {
             match branch {
                 Branch::NewCandidates(candidates) => {
                     let start = Instant::now();
-                    if let Err(e) =
-                        block_in_place(|| self.handle_candidates(&mut state_conn, candidates))
-                    {
+                    if let Err(e) = block_in_place(|| {
+                        self.handle_candidates(&mut state_conn, candidates, false)
+                    }) {
                         if !matches!(e, MatcherError::EventReceiverClosed) {
                             error!(sub_id = %self.id, "could not handle change: {e}");
                         }
@@ -1191,7 +1204,7 @@ impl Matcher {
 
         let mut buf = MatchCandidates::new();
         info!(sub_id = %self.id, "draining changes channel");
-        while let Ok(candidates) = self.changes_rx.try_recv() {
+        while let Some(candidates) = self.changes_rx.recv().await {
             for (table, pks) in candidates {
                 let buffed = buf.entry(table).or_default();
                 for (pk, cl) in pks {
@@ -1203,7 +1216,7 @@ impl Matcher {
         if !buf.is_empty() {
             info!(sub_id = %self.id, "handling buffered candidates");
             let start = Instant::now();
-            if let Err(e) = block_in_place(|| self.handle_candidates(&mut state_conn, buf)) {
+            if let Err(e) = block_in_place(|| self.handle_candidates(&mut state_conn, buf, true)) {
                 if !matches!(e, MatcherError::EventReceiverClosed) {
                     error!(sub_id = %self.id, "could not handle change: {e}");
                 }
@@ -1216,7 +1229,7 @@ impl Matcher {
             error!(sub_id = %self.id, "could not set status: {e}");
         };
 
-        debug!(id = %self.id, "matcher loop is done");
+        info!(id = %self.id, "matcher loop is done");
     }
 
     async fn run(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
@@ -1396,6 +1409,7 @@ impl Matcher {
         &mut self,
         state_conn: &mut Connection,
         candidates: MatchCandidates,
+        skip_send: bool,
     ) -> Result<(), MatcherError> {
         let mut tables = IndexSet::new();
 
@@ -1620,14 +1634,16 @@ impl Matcher {
 
                                 trace!("got change id: {change_id}");
 
-                                if let Err(e) = self.evt_tx.blocking_send(QueryEvent::Change(
-                                    change_type,
-                                    rowid,
-                                    cells,
-                                    change_id,
-                                )) {
-                                    debug!("could not send back row to matcher sub sender: {e}");
-                                    return Err(MatcherError::EventReceiverClosed);
+                                if !skip_send {
+                                    if let Err(e) = self.evt_tx.blocking_send(QueryEvent::Change(
+                                        change_type,
+                                        rowid,
+                                        cells,
+                                        change_id,
+                                    )) {
+                                        warn!("could not send back row to matcher sub sender: {e}");
+                                        return Err(MatcherError::EventReceiverClosed);
+                                    }
                                 }
                                 _ = self.last_change_tx.send(change_id);
                             }
@@ -2378,6 +2394,7 @@ mod tests {
         schema::{apply_schema, parse_sql},
         sqlite::{setup_conn, CrConn},
     };
+    use corro_tests::tempdir::TempDir;
 
     use super::*;
 
@@ -2392,8 +2409,9 @@ mod tests {
 
         let subs = SubsManager::default();
 
-        let tmpdir = tempfile::tempdir()?;
+        let tmpdir = TempDir::new(tempfile::tempdir()?);
         let db_path = tmpdir.path().join("test.db");
+        println!("db_path: {}", db_path.display());
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
@@ -2512,7 +2530,7 @@ mod tests {
         let mut schema = parse_sql(schema_sql).unwrap();
         let subs = SubsManager::default();
 
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = TempDir::new(tempfile::tempdir().unwrap());
         let db_path = tmpdir.path().join("test.db");
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
@@ -2817,13 +2835,14 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         // restore subscription
-        {
+        let matcher_id = {
             let (matcher, created) = subs
                 .restore(id, &subscriptions_path, &schema, &pool, tripwire.clone())
                 .unwrap();
             let mut rx = created.evt_rx;
 
-            println!("matcher restored w/ id: {}", matcher.id().as_simple());
+            let matcher_id = matcher.id().as_simple().to_string();
+            println!("matcher restored w/ id: {}", matcher_id);
 
             let (catch_up_tx, mut catch_up_rx) = mpsc::channel(1);
 
@@ -2866,7 +2885,6 @@ mod tests {
             assert_eq!(rows_count, 997);
             assert_eq!(eoq_change_id, Some(Some(ChangeId(999))));
 
-            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(2)).unwrap();
             {
                 let tx = conn.transaction().unwrap();
                 tx.execute_batch(
@@ -2877,7 +2895,7 @@ mod tests {
                 .unwrap();
                 tx.commit().unwrap();
             }
-
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(6)).unwrap();
             println!("waiting for a change (A)");
 
             let cells = vec![SqliteValue::Text("{\"targets\":[\"127.0.0.2:1\"],\"labels\":{\"__metrics_path__\":\"/1\",\"app\":null,\"vm_account_id\":null,\"instance\":\"m-3\"}}".into())];
@@ -2889,28 +2907,68 @@ mod tests {
 
             assert!(rx.try_recv().is_err());
 
+            // initiate shutdown
+            tripwire_tx.send(()).await.ok();
+            tripwire_worker.await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
             {
-                let conn = rusqlite::Connection::open(
-                    subscriptions_path
-                        .join(matcher.id().as_simple().to_string())
-                        .join("sub.sqlite"),
-                )
-                .unwrap();
-                conn.execute(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('state', 'lagging')",
-                    (),
-                )
-                .unwrap();
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(r#"
+                INSERT INTO consul_services (node, id, name, address, port, meta) VALUES ('test-hostname', 'service-1001', 'app-prometheus', '127.0.0.1001', 1, '{"path": "/1", "machine_id": "m-1001"}');
+
+                INSERT INTO machines (id, machine_version_id) VALUES ('m-1001', 'mv-1001');
+
+                INSERT INTO machine_versions (machine_id, id) VALUES ('m-1001', 'mv-1001');
+
+                INSERT INTO machine_version_statuses (machine_id, id, status) VALUES ('m-1001', 'mv-1001', 'started');
+            "#).unwrap();
+                tx.commit().unwrap();
             }
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(7)).unwrap();
+
+            matcher_id
+        };
+
+        subs.drop_handles().await;
+        wait_for_all_pending_handles().await;
+        info!("tripwire worker finished");
+
+        // check that changes were persisted to db after shutdown
+
+        {
+            let conn = rusqlite::Connection::open(
+                subscriptions_path
+                    .join(matcher_id.clone())
+                    .join("sub.sqlite"),
+            )
+            .unwrap();
+
+            let mut prepped = conn.prepare("SELECT max(id) FROM changes").unwrap();
+            let max_id = prepped.query_row([], |row| row.get::<_, i64>(0)).unwrap();
+            assert_eq!(max_id, 1001);
+
+            let mut prepped = conn
+                .prepare("SELECT 1 from query where __corro_pk_cs_id = 'service-1001'")
+                .unwrap();
+            let max_db_version = prepped.query_row([], |row| row.get::<_, i64>(0)).unwrap();
+            assert_eq!(max_db_version, 1);
         }
 
-        // attempting restore if subs state is lagging should fail
+        {
+            let conn =
+                rusqlite::Connection::open(subscriptions_path.join(matcher_id).join("sub.sqlite"))
+                    .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('state', 'lagging')",
+                (),
+            )
+            .unwrap();
+        }
+
+        // // attempting restore if subs state is lagging should fail
         let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
         assert!(res.is_err());
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
     }
 
     fn filter_changes_from_db(

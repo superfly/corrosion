@@ -1013,6 +1013,7 @@ dependencies = [
  "corro-api-types",
  "corro-base-types",
  "corro-speedy",
+ "corro-tests",
  "deadpool",
  "enquote",
  "fallible-iterator 0.3.0",

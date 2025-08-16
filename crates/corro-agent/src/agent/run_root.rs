@@ -21,6 +21,7 @@ use corro_types::{
 
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use spawn::spawn_counted;
+use tokio::task::JoinHandle;
 use tracing::{error, info};
 use tripwire::Tripwire;
 
@@ -31,16 +32,20 @@ use tripwire::Tripwire;
 pub async fn start_with_config(
     conf: Config,
     tripwire: Tripwire,
-) -> eyre::Result<(Agent, Bookie, Transport)> {
+) -> eyre::Result<(Agent, Bookie, Transport, Vec<JoinHandle<()>>)> {
     let (agent, opts) = setup(conf.clone(), tripwire.clone()).await?;
     let transport = opts.transport.clone();
 
-    let bookie = run(agent.clone(), opts, conf.perf).await?;
+    let (bookie, handles) = run(agent.clone(), opts, conf.perf).await?;
 
-    Ok((agent, bookie, transport))
+    Ok((agent, bookie, transport, handles))
 }
 
-async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Result<Bookie> {
+async fn run(
+    agent: Agent,
+    opts: AgentOptions,
+    pconf: PerfConfig,
+) -> eyre::Result<(Bookie, Vec<JoinHandle<()>>)> {
     let AgentOptions {
         gossip_server_endpoint,
         transport,
@@ -107,8 +112,9 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         }
     }
 
+    let mut handles = vec![];
     // Setup client http API
-    util::setup_http_api_handler(
+    let mut http_handles = util::setup_http_api_handler(
         &agent,
         &tripwire,
         subs_bcast_cache,
@@ -117,6 +123,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         api_listeners,
     )
     .await?;
+    handles.append(&mut http_handles);
 
     tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
 
@@ -230,10 +237,11 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     //// future tree spawns additional message type sub-handlers
     handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
 
-    spawn_counted(
+    let changes_handle = spawn_counted(
         handlers::handle_changes(agent.clone(), bookie.clone(), rx_changes, tripwire.clone())
             .inspect(|_| info!("corrosion handle changes loop is done")),
     );
+    handles.push(changes_handle);
 
-    Ok(bookie)
+    Ok((bookie, handles))
 }
