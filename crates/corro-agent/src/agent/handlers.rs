@@ -651,7 +651,7 @@ pub async fn handle_changes(
 
                 if seen.len() > max_seen_cache_len {
                     // we don't want to keep too many entries in here.
-                    seen = seen.split_off(seen.len() - keep_seen_cache_size);
+                    seen.drain(..seen.len() - keep_seen_cache_size);
                 }
                 continue
             },
