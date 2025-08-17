@@ -843,7 +843,7 @@ impl Matcher {
                     row.get(0)
                 })
                 .optional()?;
-            if !matches!(state.as_deref(), Some("running")) {
+            if !matches!(state.as_deref(), Some("completed")) {
                 return Err(MatcherError::NotRunning);
             }
 
@@ -1012,6 +1012,11 @@ impl Matcher {
 
         if let Err(e) = block_in_place(|| self.setup(&mut state_conn)) {
             error!(sub_id = %self.id, "could not setup connection: {e}");
+            return;
+        }
+
+        if let Err(e) = self.set_status("running") {
+            error!(sub_id = %self.id, "could not set status: {e}");
             return;
         }
 
@@ -1194,14 +1199,6 @@ impl Matcher {
             }
         }
 
-        // set the status to lagging so we know it is lagging on reboot
-        // TODO: make the state an enum?
-        if let Err(e) = self.set_status("lagging") {
-            error!(sub_id = %self.id, "could not set subscription status: {e}");
-            Self::cleanup(self.id, self.base_path.clone()).unwrap();
-            return;
-        };
-
         let mut buf = MatchCandidates::new();
         info!(sub_id = %self.id, "draining changes channel");
         while let Some(candidates) = self.changes_rx.recv().await {
@@ -1225,7 +1222,7 @@ impl Matcher {
             info!(sub_id = %self.id, "handled final buffered candidates in {elapsed:?}");
         }
 
-        if let Err(e) = self.set_status("running") {
+        if let Err(e) = self.set_status("completed") {
             error!(sub_id = %self.id, "could not set status: {e}");
         };
 
@@ -2828,7 +2825,9 @@ mod tests {
                     println!("{}", s.join(", "));
                 }
             }
-            subs.remove(&matcher.id());
+            if let Some(handle) = subs.remove(&matcher.id()) {
+                handle.cleanup().await;
+            }
             matcher.id()
         };
 
@@ -2934,7 +2933,7 @@ mod tests {
         wait_for_all_pending_handles().await;
         info!("tripwire worker finished");
 
-        // check that changes were persisted to db after shutdown
+        // check that changes sent after tripping the wire were persisted to db
 
         {
             let conn = rusqlite::Connection::open(
@@ -2955,20 +2954,26 @@ mod tests {
             assert_eq!(max_db_version, 1);
         }
 
+        // a restore should start ok if we shutdown properly
+        {
+            let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
+            assert!(res.is_ok());
+        }
+
+        // restore should fail if we don't shutdown properly
         {
             let conn =
                 rusqlite::Connection::open(subscriptions_path.join(matcher_id).join("sub.sqlite"))
                     .unwrap();
             conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('state', 'lagging')",
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('state', 'running')",
                 (),
             )
             .unwrap();
-        }
 
-        // // attempting restore if subs state is lagging should fail
-        let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
-        assert!(res.is_err());
+            let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
+            assert!(res.is_err());
+        }
     }
 
     fn filter_changes_from_db(
