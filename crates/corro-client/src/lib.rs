@@ -297,7 +297,7 @@ impl CorrosionApiClient {
                             return Err(Error::ResponseError(error));
                         }
                         return Err(Error::UnexpectedStatusCode(status));
-                    },
+                    }
                     Err(e) => {
                         debug!(
                             error = %e,
