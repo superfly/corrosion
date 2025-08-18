@@ -1578,7 +1578,7 @@ impl Bookie {
         &self,
         label: &'static str,
         extra: E,
-    ) -> CountedTokioRwLockReadGuard<BookieInner> {
+    ) -> CountedTokioRwLockReadGuard<'_, BookieInner> {
         self.0.read(label, extra).await
     }
 
@@ -1586,7 +1586,7 @@ impl Bookie {
         &self,
         label: &'static str,
         extra: E,
-    ) -> CountedTokioRwLockWriteGuard<BookieInner> {
+    ) -> CountedTokioRwLockWriteGuard<'_, BookieInner> {
         self.0.write(label, extra).await
     }
 
@@ -1594,7 +1594,7 @@ impl Bookie {
         &self,
         label: &'static str,
         extra: E,
-    ) -> CountedTokioRwLockWriteGuard<BookieInner> {
+    ) -> CountedTokioRwLockWriteGuard<'_, BookieInner> {
         self.0.blocking_write(label, extra)
     }
 
