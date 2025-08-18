@@ -155,7 +155,7 @@ async fn build_quinn_server_config(config: &GossipConfig) -> eyre::Result<quinn:
             .ok_or_else(|| eyre::eyre!("either plaintext or a tls config is required"))?;
 
         let key = tokio::fs::read(&tls.key_file).await?;
-        let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
+        let key = if tls.key_file.extension() == Some("der") {
             rustls::PrivateKey(key)
         } else {
             let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
@@ -174,7 +174,7 @@ async fn build_quinn_server_config(config: &GossipConfig) -> eyre::Result<quinn:
         };
 
         let certs = tokio::fs::read(&tls.cert_file).await?;
-        let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
+        let certs = if tls.cert_file.extension() == Some("der") {
             vec![rustls::Certificate(certs)]
         } else {
             rustls_pemfile::certs(&mut &*certs)?
@@ -196,7 +196,7 @@ async fn build_quinn_server_config(config: &GossipConfig) -> eyre::Result<quinn:
             };
 
             let ca_certs = tokio::fs::read(&ca_file).await?;
-            let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
+            let ca_certs = if ca_file.extension() == Some("der") {
                 vec![rustls::Certificate(ca_certs)]
             } else {
                 rustls_pemfile::certs(&mut &*ca_certs)?
@@ -274,7 +274,7 @@ async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn:
 
         let client_crypto = if let Some(ca_file) = &tls.ca_file {
             let ca_certs = tokio::fs::read(&ca_file).await?;
-            let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
+            let ca_certs = if ca_file.extension() == Some("der") {
                 vec![rustls::Certificate(ca_certs)]
             } else {
                 rustls_pemfile::certs(&mut &*ca_certs)?
