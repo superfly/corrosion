@@ -179,7 +179,7 @@ enum Prepared {
         sql: String,
         param_types: Vec<Type>,
         fields: Vec<FieldInfo>,
-        cmd: ParsedCmd,
+        cmd: Box<ParsedCmd>,
     },
 }
 
@@ -191,7 +191,7 @@ enum Portal<'a> {
         stmt_name: CompactString,
         stmt: Statement<'a>,
         result_formats: Vec<FieldFormat>,
-        cmd: ParsedCmd,
+        cmd: Box<ParsedCmd>,
     },
 }
 
@@ -476,7 +476,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
     let ssl_required = tls.verify_client;
 
     let key = tokio::fs::read(&tls.key_file).await?;
-    let key = if tls.key_file.extension().map_or(false, |x| x == "der") {
+    let key = if tls.key_file.extension() == Some("der") {
         rustls::PrivateKey(key)
     } else {
         let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
@@ -495,7 +495,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
     };
 
     let certs = tokio::fs::read(&tls.cert_file).await?;
-    let certs = if tls.cert_file.extension().map_or(false, |x| x == "der") {
+    let certs = if tls.cert_file.extension() == Some("der") {
         vec![rustls::Certificate(certs)]
     } else {
         rustls_pemfile::certs(&mut &*certs)?
@@ -517,7 +517,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
         };
 
         let ca_certs = tokio::fs::read(&ca_file).await?;
-        let ca_certs = if ca_file.extension().map_or(false, |x| x == "der") {
+        let ca_certs = if ca_file.extension() == Some("der") {
             vec![rustls::Certificate(ca_certs)]
         } else {
             rustls_pemfile::certs(&mut &*ca_certs)?
@@ -1016,7 +1016,7 @@ pub async fn start(
                                                     sql: parse.query().clone(),
                                                     param_types,
                                                     fields,
-                                                    cmd: parsed_cmd,
+                                                    cmd: Box::new(parsed_cmd),
                                                 },
                                             );
                                         }
@@ -2518,34 +2518,39 @@ fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
     })
 }
 
-fn compute_schema(conn: &Connection) -> Result<Schema, SchemaError> {
-    let mut dump = String::new();
+fn compute_schema(conn: &Connection) -> Result<Schema, Box<SchemaError>> {
+    fn dump_sql(conn: &Connection) -> Result<String, rusqlite::Error> {
+        let mut dump = String::new();
 
-    let tables: HashMap<String, String> = conn
-        .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "table" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
-        .query_map((), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+        let tables: HashMap<String, String> = conn
+            .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "table" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
 
-    for sql in tables.values() {
-        dump.push_str(sql.as_str());
-        dump.push(';');
+        for sql in tables.values() {
+            dump.push_str(sql.as_str());
+            dump.push(';');
+        }
+
+        let indexes: HashMap<String, String> = conn
+            .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "index" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        for sql in indexes.values() {
+            dump.push_str(sql.as_str());
+            dump.push(';');
+        }
+
+        Ok(dump)
     }
 
-    let indexes: HashMap<String, String> = conn
-        .prepare(r#"SELECT name, sql FROM sqlite_schema WHERE type = "index" AND name IS NOT NULL AND sql IS NOT NULL ORDER BY tbl_name"#)?
-        .query_map((), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-
-    for sql in indexes.values() {
-        dump.push_str(sql.as_str());
-        dump.push(';');
-    }
-
-    parse_sql(dump.as_str())
+    let dump = dump_sql(conn).map_err(|err| Box::new(SchemaError::from(err)))?;
+    parse_sql(&dump)
 }
 
 #[derive(Debug)]

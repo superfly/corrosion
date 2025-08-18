@@ -193,7 +193,7 @@ pub enum ConstrainedSchemaError {
     #[error("unique indexes are not supported: {0}")]
     UniqueIndex(String),
     #[error("table as select arenot supported: {0}")]
-    TableAsSelect(Cmd),
+    TableAsSelect(Box<Cmd>),
     #[error("not nullable column '{name}' on table '{tbl_name}' needs a default value for forward schema compatibility")]
     NotNullableColumnNeedsDefault { tbl_name: String, name: String },
     #[error("foreign keys are not supported (table: '{tbl_name}', column: '{name}')")]
@@ -202,35 +202,57 @@ pub enum ConstrainedSchemaError {
     PrimaryKeyExpr,
 }
 
-#[allow(clippy::result_large_err)]
-pub fn init_schema(conn: &Connection) -> Result<Schema, SchemaError> {
-    let mut dump = String::new();
+pub fn init_schema(conn: &Connection) -> Result<Schema, Box<SchemaError>> {
+    fn dump(conn: &Connection) -> Result<String, rusqlite::Error> {
+        let mut dump = String::new();
 
-    let tables: HashMap<String, String> = conn
-        .prepare(r#"SELECT name, sql FROM __corro_schema WHERE type = "table" ORDER BY tbl_name"#)?
-        .query_map((), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+        let tables: HashMap<String, String> = conn
+            .prepare(
+                r#"SELECT name, sql FROM __corro_schema WHERE type = "table" ORDER BY tbl_name"#,
+            )?
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
 
-    for sql in tables.values() {
-        dump.push_str(sql.as_str());
-        dump.push(';');
+        for sql in tables.values() {
+            dump.push_str(sql.as_str());
+            dump.push(';');
+        }
+
+        let indexes: HashMap<String, String> = conn
+            .prepare(
+                r#"SELECT name, sql FROM __corro_schema WHERE type = "index" ORDER BY tbl_name"#,
+            )?
+            .query_map((), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        for sql in indexes.values() {
+            dump.push_str(sql.as_str());
+            dump.push(';');
+        }
+
+        Ok(dump)
     }
 
-    let indexes: HashMap<String, String> = conn
-        .prepare(r#"SELECT name, sql FROM __corro_schema WHERE type = "index" ORDER BY tbl_name"#)?
-        .query_map((), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    let dump = dump(conn).map_err(|err| Box::new(SchemaError::from(err)))?;
+    parse_sql(&dump)
+}
 
-    for sql in indexes.values() {
-        dump.push_str(sql.as_str());
-        dump.push(';');
-    }
+#[derive(Debug)]
+pub struct ImportedSchemaPkMismatch {
+    pub tbl_name: String,
+    pub expected: IndexSet<String>,
+    pub got: IndexSet<String>,
+}
 
-    parse_sql(dump.as_str())
+#[derive(Debug)]
+pub struct ImportedSchemaColumnsMismatch {
+    pub tbl_name: String,
+    pub expected: IndexMap<String, Column>,
+    pub got: IndexMap<String, Column>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -238,9 +260,9 @@ pub enum ApplySchemaError {
     #[error(transparent)]
     Rusqlite(#[from] rusqlite::Error),
     #[error(transparent)]
-    Schema(#[from] SchemaError),
+    Schema(#[from] Box<SchemaError>),
     #[error(transparent)]
-    ConstrainedSchema(#[from] ConstrainedSchemaError),
+    ConstrainedSchema(#[from] Box<ConstrainedSchemaError>),
     #[error("won't drop table without the destructive flag set (table: '{0}')")]
     DropTableWithoutDestructiveFlag(String),
     #[error("won't remove column without the destructive flag set (table: '{0}', column: '{1}')")]
@@ -255,22 +277,13 @@ pub enum ApplySchemaError {
     #[error("tried importing an existing schema for table '{0}' due to a failed CREATE TABLE but didn't find anything (this should never happen)")]
     ImportedSchemaNotFound(String),
 
-    #[error("existing schema for table '{tbl_name}' primary keys mismatched, expected: {expected:?}, got: {got:?}")]
-    ImportedSchemaPkMismatch {
-        tbl_name: String,
-        expected: IndexSet<String>,
-        got: IndexSet<String>,
-    },
+    #[error("existing schema for table '{}' primary keys mismatched, expected: {:?}, got: {:?}", .0.tbl_name, .0.expected, .0.got)]
+    ImportedSchemaPkMismatch(Box<ImportedSchemaPkMismatch>),
 
-    #[error("existing schema for table '{tbl_name}' columns mismatched, expected: {expected:?}, got: {got:?}")]
-    ImportedSchemaColumnsMismatch {
-        tbl_name: String,
-        expected: IndexMap<String, Column>,
-        got: IndexMap<String, Column>,
-    },
+    #[error("existing schema for table '{}' columns mismatched, expected: {:?}, got: {:?}", .0.tbl_name, .0.expected, .0.got)]
+    ImportedSchemaColumnsMismatch(Box<ImportedSchemaColumnsMismatch>),
 }
 
-#[allow(clippy::result_large_err)]
 pub fn apply_schema(
     tx: &Transaction,
     schema: &Schema,
@@ -341,19 +354,23 @@ pub fn apply_schema(
                     .ok_or_else(|| ApplySchemaError::ImportedSchemaNotFound(name.clone()))?;
 
                 if parsed_table.pk != table.pk {
-                    return Err(ApplySchemaError::ImportedSchemaPkMismatch {
-                        tbl_name: name.clone(),
-                        expected: table.pk.clone(),
-                        got: parsed_table.pk,
-                    });
+                    return Err(ApplySchemaError::ImportedSchemaPkMismatch(Box::new(
+                        ImportedSchemaPkMismatch {
+                            tbl_name: name.clone(),
+                            expected: table.pk.clone(),
+                            got: parsed_table.pk,
+                        },
+                    )));
                 }
 
                 if parsed_table.columns != table.columns {
-                    return Err(ApplySchemaError::ImportedSchemaColumnsMismatch {
-                        tbl_name: name.clone(),
-                        expected: table.columns.clone(),
-                        got: parsed_table.columns,
-                    });
+                    return Err(ApplySchemaError::ImportedSchemaColumnsMismatch(Box::new(
+                        ImportedSchemaColumnsMismatch {
+                            tbl_name: name.clone(),
+                            expected: table.columns.clone(),
+                            got: parsed_table.columns,
+                        },
+                    )));
                 }
 
                 schema_to_merge.tables.insert(name.clone(), parsed_table);
@@ -494,10 +511,12 @@ pub fn apply_schema(
                         ));
                     }
                     if !col.nullable && col.default_value.is_none() {
-                        return Err(ConstrainedSchemaError::NotNullableColumnNeedsDefault {
-                            tbl_name: name.clone(),
-                            name: col_name.clone(),
-                        }
+                        return Err(Box::new(
+                            ConstrainedSchemaError::NotNullableColumnNeedsDefault {
+                                tbl_name: name.clone(),
+                                name: col_name.clone(),
+                            },
+                        )
                         .into());
                     }
                     tx.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {col}"))?;
@@ -652,8 +671,7 @@ pub fn apply_schema(
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
-pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), SchemaError> {
+pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), Box<SchemaError>> {
     trace!("parsing {sql}");
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
 
@@ -662,16 +680,16 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), SchemaE
             Ok(None) => break,
             Err(err) => {
                 eprintln!("Err: {err}");
-                return Err(err.into());
+                return Err(Box::new(err.into()));
             }
             Ok(Some(ref cmd @ Cmd::Stmt(ref stmt))) => match stmt {
                 Stmt::CreateTable {
                     temporary: true, ..
-                } => return Err(SchemaError::TemporaryTable(cmd.clone())),
+                } => return Err(Box::new(SchemaError::TemporaryTable(cmd.clone()))),
                 Stmt::CreateTable {
                     body: CreateTableBody::AsSelect(_),
                     ..
-                } => return Err(SchemaError::TemporaryTable(cmd.clone())),
+                } => return Err(Box::new(SchemaError::TemporaryTable(cmd.clone()))),
                 Stmt::CreateTable {
                     temporary: false,
                     if_not_exists: _,
@@ -711,23 +729,22 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), SchemaE
                             },
                         );
                     } else {
-                        return Err(SchemaError::IndexWithoutTable {
+                        return Err(Box::new(SchemaError::IndexWithoutTable {
                             tbl_name: tbl_name.clone(),
                             name: idx_name.clone(),
-                        });
+                        }));
                     }
                 }
-                _ => return Err(SchemaError::UnsupportedCmd(cmd.clone())),
+                _ => return Err(Box::new(SchemaError::UnsupportedCmd(cmd.clone()))),
             },
-            Ok(Some(cmd)) => return Err(SchemaError::UnsupportedCmd(cmd)),
+            Ok(Some(cmd)) => return Err(Box::new(SchemaError::UnsupportedCmd(cmd))),
         }
     }
 
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
-pub fn parse_sql(sql: &str) -> Result<Schema, SchemaError> {
+pub fn parse_sql(sql: &str) -> Result<Schema, Box<SchemaError>> {
     let mut schema = Schema::default();
 
     parse_sql_to_schema(&mut schema, sql)?;
