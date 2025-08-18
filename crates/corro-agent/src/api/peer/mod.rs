@@ -1870,7 +1870,7 @@ mod tests {
                         changes: vec![change1],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
-                        ts: ts,
+                        ts,
                     }
                 }))
             );
@@ -1898,7 +1898,7 @@ mod tests {
                         changes: vec![change2.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
-                        ts: ts,
+                        ts,
                     }
                 }))
             );
@@ -2007,7 +2007,7 @@ mod tests {
                         changes: vec![change3.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
-                        ts: ts,
+                        ts,
                     }
                 }))
             );
@@ -2022,7 +2022,7 @@ mod tests {
                         changes: vec![change2.clone()],
                         seqs: CrsqlSeq(0)..=CrsqlSeq(0),
                         last_seq: CrsqlSeq(0),
-                        ts: ts,
+                        ts,
                     }
                 }))
             );
@@ -2258,7 +2258,7 @@ mod tests {
                             .collect(),
                         seqs: CrsqlSeq(4)..=CrsqlSeq(7),
                         last_seq,
-                        ts: ts,
+                        ts,
                     }
                 }))
             );
@@ -2290,7 +2290,7 @@ mod tests {
                             .collect(),
                         seqs: CrsqlSeq(2)..=CrsqlSeq(2),
                         last_seq,
-                        ts: ts,
+                        ts,
                     }
                 }))
             );
@@ -2314,7 +2314,7 @@ mod tests {
                             .collect(),
                         seqs: CrsqlSeq(15)..=CrsqlSeq(24),
                         last_seq,
-                        ts: ts,
+                        ts,
                     }
                 }))
             );

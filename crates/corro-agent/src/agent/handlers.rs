@@ -688,7 +688,7 @@ pub async fn handle_changes(
         let src_str: &'static str = src.into();
         let recv_lag = change
             .ts()
-            .map(|ts| {
+            .and_then(|ts| {
                 let mut our_ts = Timestamp::from(agent.clock().new_timestamp());
                 if ts > our_ts {
                     if let Err(e) = agent.update_clock_with_timestamp(change.actor_id, ts) {
@@ -700,8 +700,7 @@ pub async fn handle_changes(
                     our_ts = Timestamp::from(agent.clock().new_timestamp());
                 }
                 Some((our_ts.0 - ts.0).to_duration())
-            })
-            .flatten();
+            });
 
         if matches!(src, ChangeSource::Broadcast) {
             counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);

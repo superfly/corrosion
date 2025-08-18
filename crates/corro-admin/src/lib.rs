@@ -569,7 +569,7 @@ async fn handle_conn(
 
                             match handle.reload(filter.layer()) {
                                 Ok(_) => {
-                                    info_log(&mut stream, format!("reloaded tracing handle")).await;
+                                    info_log(&mut stream, "reloaded tracing handle".to_string()).await;
                                     send_success(&mut stream).await;
                                 }
                                 Err(e) => {

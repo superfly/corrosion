@@ -3735,7 +3735,7 @@ mod tests {
             server_cert_file: cert_file,
             server_key_file: key_file,
             ca_cert,
-            client_cert_signed: client_cert_signed,
+            client_cert_signed,
             client_key: client_cert.serialize_private_key_der(),
             ca_file,
         })

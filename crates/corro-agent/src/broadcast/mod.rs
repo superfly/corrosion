@@ -1140,7 +1140,7 @@ mod tests {
             },
         });
         let mut ser_buf = BytesMut::new();
-        let _ = UniPayload::V1 {
+        UniPayload::V1 {
             data: UniPayloadV1::Broadcast(bcast),
             cluster_id: ta1.agent.cluster_id(),
         }
