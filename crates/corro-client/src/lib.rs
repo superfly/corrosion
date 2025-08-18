@@ -289,17 +289,15 @@ impl CorrosionApiClient {
         if !status.is_success() {
             match hyper::body::to_bytes(res.into_body()).await {
                 Ok(b) => match serde_json::from_slice(&b) {
-                    Ok(res) => match res {
-                        ExecResponse { results, .. } => {
-                            if let Some(ExecResult::Error { error }) = results
-                                .into_iter()
-                                .find(|r| matches!(r, ExecResult::Error { .. }))
-                            {
-                                return Err(Error::ResponseError(error));
-                            }
-                            return Err(Error::UnexpectedStatusCode(status));
+                    Ok(ExecResponse { results, .. }) => {
+                        if let Some(ExecResult::Error { error }) = results
+                            .into_iter()
+                            .find(|r| matches!(r, ExecResult::Error { .. }))
+                        {
+                            return Err(Error::ResponseError(error));
                         }
-                    },
+                        return Err(Error::UnexpectedStatusCode(status));
+                    }
                     Err(e) => {
                         debug!(
                             error = %e,
