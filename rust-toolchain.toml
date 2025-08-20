@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable-2024-10-17"
+targets = [
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu"
+]
