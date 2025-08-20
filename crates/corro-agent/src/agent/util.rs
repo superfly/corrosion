@@ -57,7 +57,10 @@ use std::{
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
-use tokio::{net::TcpListener, task::block_in_place};
+use tokio::{
+    net::TcpListener,
+    task::{block_in_place, JoinHandle},
+};
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
@@ -175,7 +178,7 @@ pub async fn setup_http_api_handler(
     updates_bcast_cache: SharedUpdateBroadcastCache,
     subs_manager: &SubsManager,
     api_listeners: Vec<TcpListener>,
-) -> eyre::Result<()> {
+) -> eyre::Result<Vec<JoinHandle<()>>> {
     let api = Router::new()
         // transactions
         .route(
@@ -290,29 +293,31 @@ pub async fn setup_http_api_handler(
         .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http());
 
+    let mut handles: Vec<JoinHandle<()>> = vec![];
     for api_listener in api_listeners {
         let api_addr = api_listener.local_addr()?;
         info!("Starting API listener on tcp/{api_addr}");
         let mut incoming = AddrIncoming::from_listener(api_listener)?;
-
         incoming.set_nodelay(true);
-        spawn_counted(
-            axum::Server::builder(incoming)
-                .executor(CountedExecutor)
-                .serve(
-                    api.clone()
-                        .into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .with_graceful_shutdown(
-                    tripwire
-                        .clone()
-                        .inspect(move |_| info!("corrosion api http tripped {api_addr}")),
-                )
-                .inspect(|_| info!("corrosion api is done")),
-        );
+
+        let fut = axum::Server::builder(incoming)
+            .executor(CountedExecutor)
+            .serve(
+                api.clone()
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(
+                tripwire
+                    .clone()
+                    .inspect(move |_| info!("corrosion api http tripped {api_addr}")),
+            )
+            .inspect(|_| info!("corrosion api is done"));
+        handles.push(spawn_counted(async move {
+            let _ = fut.await;
+        }));
     }
 
-    Ok(())
+    Ok(handles)
 }
 
 async fn require_authz<B>(
@@ -667,6 +672,7 @@ pub async fn process_fully_buffered_changes(
 
     if rows_impacted {
         let conn = agent.pool().read().await?;
+        info!(%actor_id, %version, "matching changes for subs from db version {version} actor {actor_id}");
         block_in_place(|| {
             if let Err(e) =
                 match_changes_from_db_version(agent.subs_manager(), &conn, version, actor_id)
@@ -1023,8 +1029,9 @@ pub async fn process_multiple_changes(
 
     let mut change_chunk_size = 0;
 
-    for (_actor_id, changeset, db_version, _src) in changesets {
+    for (actor_id, changeset, db_version, _src) in changesets {
         change_chunk_size += changeset.changes().len();
+        info!(%actor_id, %db_version, "(process_multiple_changes) matching changes for subs from db version {db_version} actor {actor_id}");
         match_changes(agent.subs_manager(), changeset.changes(), db_version);
         match_changes(agent.updates_manager(), changeset.changes(), db_version);
     }

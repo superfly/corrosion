@@ -24,11 +24,11 @@ steps:
       - "builds/*.tar.gz"
     agents:
       queue: "high-concurrency"
-    depends_on: [lint]
+    depends_on: [test]
 
   - label: "☁️ Upload"
     priority: 50
     key: upload
     commands:
       - .buildkite/upload.sh
-    depends_on: [test, build]
+    depends_on: [build]

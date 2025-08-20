@@ -117,7 +117,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let subs_manager = SubsManager::default();
 
     let updates_manager = UpdatesManager::default();
-    // Setup subscription handlers
+    // Setup subscription handlers, this is before we start processing changes.
     let subs_bcast_cache = setup_spawn_subscriptions(
         &subs_manager,
         conf.db.subscriptions_path(),
