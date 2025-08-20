@@ -464,8 +464,11 @@ where
                     warn!("channel is full, falling back to async send");
 
                     let changes_tx = handle.changes_tx();
+                    let id = *id;
                     tokio::spawn(async move {
-                        _ = changes_tx.send(item).await;
+                        if let Err(e) = changes_tx.send(item).await {
+                            error!(sub_id = %id, "could not send match_change candidates to handler: {e}");
+                        }
                     });
                 }
                 mpsc::error::TrySendError::Closed(_) => {
@@ -555,8 +558,11 @@ where
                 mpsc::error::TrySendError::Full(item) => {
                     warn!("channel is full, falling back to async send");
                     let changes_tx = handle.changes_tx();
+                    let id = *id;
                     tokio::spawn(async move {
-                        _ = changes_tx.send(item).await;
+                        if let Err(e) = changes_tx.send(item).await {
+                            error!(sub_id = %id, "could not send change candidates to handler: {e}");
+                        }
                     });
                 }
                 mpsc::error::TrySendError::Closed(_) => {

@@ -1199,7 +1199,6 @@ impl Matcher {
             }
         }
 
-        let mut buf = MatchCandidates::new();
         info!(sub_id = %self.id, "draining changes channel");
         while let Some(candidates) = self.changes_rx.recv().await {
             for (table, pks) in candidates {
@@ -1214,9 +1213,11 @@ impl Matcher {
             info!(sub_id = %self.id, "handling buffered candidates");
             let start = Instant::now();
             if let Err(e) = block_in_place(|| self.handle_candidates(&mut state_conn, buf, true)) {
-                if !matches!(e, MatcherError::EventReceiverClosed) {
-                    error!(sub_id = %self.id, "could not handle change: {e}");
+                error!(sub_id = %self.id, "could not handle final buffered candidates: {e}");
+                if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                    error!(sub_id = %self.id, "could not handle cleanup: {e}");
                 }
+                return;
             }
             let elapsed = start.elapsed();
             info!(sub_id = %self.id, "handled final buffered candidates in {elapsed:?}");
@@ -1226,7 +1227,7 @@ impl Matcher {
             error!(sub_id = %self.id, "could not set status: {e}");
         };
 
-        info!(id = %self.id, "matcher loop is done");
+        info!(sub_id = %self.id, "matcher loop is done");
     }
 
     async fn run(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
@@ -2906,25 +2907,43 @@ mod tests {
 
             assert!(rx.try_recv().is_err());
 
-            // initiate shutdown
-            tripwire_tx.send(()).await.ok();
-            tripwire_worker.await;
-            tokio::time::sleep(Duration::from_secs(5)).await;
-
             {
                 let tx = conn.transaction().unwrap();
-                tx.execute_batch(r#"
-                INSERT INTO consul_services (node, id, name, address, port, meta) VALUES ('test-hostname', 'service-1001', 'app-prometheus', '127.0.0.1001', 1, '{"path": "/1", "machine_id": "m-1001"}');
+                for n in 1001..=1005 {
+                    tx.execute_batch(format!(r#"
+                        INSERT INTO consul_services (node, id, name, address, port, meta) VALUES ('test-hostname', 'service-{n}', 'app-prometheus', '127.0.0.{n}', 1, '{{"path": "/1", "machine_id": "m-{n}"}}');
 
-                INSERT INTO machines (id, machine_version_id) VALUES ('m-1001', 'mv-1001');
+                        INSERT INTO machines (id, machine_version_id) VALUES ('m-{n}', 'mv-{n}');
 
-                INSERT INTO machine_versions (machine_id, id) VALUES ('m-1001', 'mv-1001');
+                        INSERT INTO machine_versions (machine_id, id) VALUES ('m-{n}', 'mv-{n}');
 
-                INSERT INTO machine_version_statuses (machine_id, id, status) VALUES ('m-1001', 'mv-1001', 'started');
-            "#).unwrap();
+                        INSERT INTO machine_version_statuses (machine_id, id, status) VALUES ('m-{n}', 'mv-{n}', 'started');
+                    "#).as_str()).unwrap();
+                }
                 tx.commit().unwrap();
             }
             filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(7)).unwrap();
+
+            // initiate shutdown
+            tripwire_tx.send(()).await.ok();
+            tripwire_worker.await;
+
+            {
+                let tx = conn.transaction().unwrap();
+                for n in 1006..=1010 {
+                    tx.execute_batch(format!(r#"
+                        INSERT INTO consul_services (node, id, name, address, port, meta) VALUES ('test-hostname', 'service-{n}', 'app-prometheus', '127.0.0.{n}', 1, '{{"path": "/1", "machine_id": "m-{n}"}}');
+
+                        INSERT INTO machines (id, machine_version_id) VALUES ('m-{n}', 'mv-{n}');
+
+                        INSERT INTO machine_versions (machine_id, id) VALUES ('m-{n}', 'mv-{n}');
+
+                        INSERT INTO machine_version_statuses (machine_id, id, status) VALUES ('m-{n}', 'mv-{n}', 'started');
+                    "#).as_str()).unwrap();
+                }
+                tx.commit().unwrap();
+            }
+            filter_changes_from_db(&matcher, &conn, None, CrsqlDbVersion(8)).unwrap();
 
             matcher_id
         };
@@ -2945,13 +2964,18 @@ mod tests {
 
             let mut prepped = conn.prepare("SELECT max(id) FROM changes").unwrap();
             let max_id = prepped.query_row([], |row| row.get::<_, i64>(0)).unwrap();
-            assert_eq!(max_id, 1001);
+            assert_eq!(max_id, 1010);
 
-            let mut prepped = conn
-                .prepare("SELECT 1 from query where __corro_pk_cs_id = 'service-1001'")
-                .unwrap();
-            let max_db_version = prepped.query_row([], |row| row.get::<_, i64>(0)).unwrap();
-            assert_eq!(max_db_version, 1);
+            for n in 1001..=1010 {
+                let mut prepped = conn
+                    .prepare(
+                        format!("SELECT 1 from query where __corro_pk_cs_id = 'service-{n}'")
+                            .as_str(),
+                    )
+                    .unwrap();
+                let max_db_version = prepped.query_row([], |row| row.get::<_, i64>(0)).unwrap();
+                assert_eq!(max_db_version, 1);
+            }
         }
 
         // a restore should start ok if we shutdown properly
