@@ -3,6 +3,9 @@ name = "corro-pg"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 bytes = { workspace = true }
 compact_str = { workspace = true }
