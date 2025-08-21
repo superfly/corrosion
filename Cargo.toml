@@ -112,3 +112,6 @@ codegen-units = 16
 # backtraces are super expensive to compute in development,
 # always optimize that crate
 opt-level = 2
+
+[workspace.lints.clippy]
+

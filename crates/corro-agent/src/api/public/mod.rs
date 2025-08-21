@@ -704,7 +704,6 @@ pub async fn api_v1_table_stats(
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use corro_types::{
         api::RowId,
         base::CrsqlDbVersion,
@@ -712,8 +711,7 @@ mod tests {
         config::Config,
         schema::SqliteType,
     };
-    use futures::Stream;
-    use http_body::{combinators::UnsyncBoxBody, Body};
+    use http_body::Body;
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
@@ -721,19 +719,6 @@ mod tests {
     use super::*;
 
     use crate::agent::setup;
-
-    struct UnsyncBodyStream(std::pin::Pin<Box<UnsyncBoxBody<Bytes, axum::Error>>>);
-
-    impl Stream for UnsyncBodyStream {
-        type Item = Result<Bytes, axum::Error>;
-
-        fn poll_next(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Self::Item>> {
-            self.0.as_mut().poll_data(cx)
-        }
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_execute() -> eyre::Result<()> {
