@@ -287,7 +287,7 @@ impl Handle for MatcherHandle {
         self.inner.id
     }
 
-    fn cancelled(&self) -> WaitForCancellationFuture {
+    fn cancelled(&self) -> WaitForCancellationFuture<'_> {
         self.inner.cancel.cancelled()
     }
 
@@ -2318,7 +2318,7 @@ pub enum UnpackError {
     Misuse,
 }
 
-pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef>, UnpackError> {
+pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef<'_>>, UnpackError> {
     let mut ret = vec![];
     let num_columns = buf.get_u8();
 

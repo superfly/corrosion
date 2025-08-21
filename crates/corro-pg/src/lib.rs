@@ -2554,7 +2554,7 @@ enum ParamKind<'a> {
     Positional,
 }
 
-fn as_param(expr: &Expr) -> Option<ParamKind> {
+fn as_param(expr: &Expr) -> Option<ParamKind<'_>> {
     if let Expr::Variable(name) = expr {
         if name.is_empty() {
             Some(ParamKind::Positional)
@@ -2595,7 +2595,7 @@ enum SqliteName {
     DoublyQualified(Name, Name, Name),
 }
 
-fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef> {
+fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef<'_>> {
     match expr {
         Expr::Id(id) => Some(SqliteNameRef::Id(id)),
         Expr::Name(name) => Some(SqliteNameRef::Name(name)),
