@@ -114,8 +114,4 @@ codegen-units = 16
 opt-level = 2
 
 [workspace.lints.clippy]
-io_other_error = "allow"
-large_enum_variant = "allow"
-needless_option_take = "allow"
-result_large_err = "allow"
-unnecessary_map_or = "allow"
+
