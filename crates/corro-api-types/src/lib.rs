@@ -511,7 +511,7 @@ impl SqliteValue {
         }
     }
 
-    pub fn as_ref(&self) -> SqliteValueRef {
+    pub fn as_ref(&self) -> SqliteValueRef<'_> {
         match self {
             SqliteValue::Null => SqliteValueRef(ValueRef::Null),
             SqliteValue::Integer(i) => SqliteValueRef(ValueRef::Integer(*i)),
