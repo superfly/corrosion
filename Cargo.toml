@@ -112,3 +112,10 @@ codegen-units = 16
 # backtraces are super expensive to compute in development,
 # always optimize that crate
 opt-level = 2
+
+[workspace.lints.clippy]
+io_other_error = "allow"
+large_enum_variant = "allow"
+needless_option_take = "allow"
+result_large_err = "allow"
+unnecessary_map_or = "allow"
