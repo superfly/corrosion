@@ -23,16 +23,9 @@ use corro_types::{
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
-use opentelemetry::{
-    global,
-    sdk::{
-        propagation::TraceContextPropagator,
-        trace::{self, BatchConfig},
-        Resource,
-    },
-    KeyValue,
-};
+use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk as os;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{
@@ -65,7 +58,7 @@ fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
             eprintln!("While parsing env filters: {diags}, using default");
         }
 
-        global::set_text_map_propagator(TraceContextPropagator::new());
+        global::set_text_map_propagator(os::propagation::TraceContextPropagator::new());
 
         // Tracing
         let (env_filter, handle) = tracing_subscriber::reload::Layer::new(filter.layer());
@@ -73,36 +66,49 @@ fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
         let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
 
         if let Some(otel) = &config.telemetry.open_telemetry {
-            let otlp_exporter = opentelemetry_otlp::new_exporter().tonic().with_env();
+            let otlp_exporter = opentelemetry_otlp::SpanExporter::builder().with_tonic();
             let otlp_exporter = match otel {
                 OtelConfig::FromEnv => otlp_exporter,
                 OtelConfig::Exporter { endpoint } => otlp_exporter.with_endpoint(endpoint),
-            };
+            }
+            .build()
+            .map_err(|err| config::ConfigError::Foreign(Box::new(err)))?;
 
-            let batch_config = BatchConfig::default().with_max_queue_size(10240);
-
-            let trace_config = trace::config().with_resource(Resource::new([
-                KeyValue::new(
+            let trace_config = os::Resource::builder()
+                .with_attribute(KeyValue::new(
                     opentelemetry_semantic_conventions::resource::SERVICE_NAME,
                     "corrosion",
-                ),
-                KeyValue::new(
+                ))
+                .with_attribute(KeyValue::new(
                     opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
                     VERSION,
-                ),
-                KeyValue::new(
+                ))
+                .with_attribute(KeyValue::new(
                     opentelemetry_semantic_conventions::resource::HOST_NAME,
                     hostname::get().unwrap().to_string_lossy().into_owned(),
-                ),
-            ]));
+                ))
+                .build();
 
-            let tracer = opentelemetry_otlp::new_pipeline()
-                .tracing()
-                .with_exporter(otlp_exporter)
-                .with_trace_config(trace_config)
-                .with_batch_config(batch_config)
-                .install_batch(opentelemetry::runtime::Tokio)
-                .expect("Failed to initialize OpenTelemetry OTLP exporter.");
+            let batch_processor =
+                os::trace::span_processor_with_async_runtime::BatchSpanProcessor::builder(
+                    otlp_exporter,
+                    os::runtime::Tokio,
+                )
+                .with_batch_config(
+                    os::trace::BatchConfigBuilder::default()
+                        .with_max_queue_size(10240)
+                        .build(),
+                )
+                .build();
+
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_resource(trace_config)
+                .with_span_processor(batch_processor)
+                .build();
+
+            use opentelemetry::trace::TracerProvider;
+            let tracer = provider.tracer("");
+            global::set_tracer_provider(provider);
 
             let sub = sub.with(tracing_opentelemetry::layer().with_tracer(tracer));
             match config.log.format {
