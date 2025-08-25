@@ -114,7 +114,7 @@ pub async fn run(
 fn setup_prometheus(addr: SocketAddr) -> eyre::Result<()> {
     PrometheusBuilder::new()
         .with_http_listener(addr)
-        .idle_timeout(MetricKindMask::GAUGE, Some(Duration::from_secs(120)))
+        // .idle_timeout(MetricKindMask::GAUGE, Some(Duration::from_secs(120)))
         .set_buckets_for_metric(
             Matcher::Suffix("chunk_size".into()),
             &[1.0, 10.0, 75.0, 250.0, 375.0, 500.0, 650.0],
