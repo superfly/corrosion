@@ -116,8 +116,11 @@ pub async fn initialise_foca(agent: &Agent) {
                     .tx_foca()
                     .send(FocaInput::Cmd(FocaCmd::Rejoin(cb_tx)))
                     .await?;
-                cb_rx.await??;
-                Ok(())
+                // Foca errors have 3 variants that are + Send but not + Sync,
+                // so do a conversion here, which is unfortunate
+                cb_rx
+                    .await?
+                    .map_err(|foca_err| eyre::eyre!("foca error: {foca_err}"))
             }
 
             if let Err(e) = apply_rejoin(&agent).await {

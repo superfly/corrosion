@@ -2078,7 +2078,7 @@ mod tests {
         )
         .await?;
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         let len = 10u64;
         let mut last_seq = 0u64;
@@ -2088,8 +2088,8 @@ mod tests {
                 let mut b = vec![0u8; 16];
                 rng.fill_bytes(&mut b);
 
-                let int: i64 = rng.sample(rand::distributions::Standard);
-                let float: f64 = rng.sample(rand::distributions::Standard);
+                let int: i64 = rng.sample(rand::distr::StandardUniform);
+                let float: f64 = rng.sample(rand::distr::StandardUniform);
                 [
                     ("int", int.into()),
                     ("float", float.into()),
