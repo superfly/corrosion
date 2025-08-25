@@ -4,7 +4,7 @@ use corro_api_types::{sqlite::ChangeType, Statement, TypedQueryEvent};
 use corro_client::CorrosionClient;
 use eyre::{eyre, Result};
 use futures::StreamExt;
-use hickory_resolver::AsyncResolver;
+use hickory_resolver::Resolver;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -334,7 +334,7 @@ async fn create_client(addr: &str) -> Result<CorrosionClient> {
     let mut host_port = addr.split(':');
     let host_name = host_port.next().unwrap_or("localhost");
 
-    let system_resolver = AsyncResolver::tokio_from_system_conf()?;
+    let system_resolver = Resolver::builder_tokio()?.build();
     match system_resolver.lookup_ip(host_name).await?.iter().next() {
         Some(ip_addr) => {
             let addr =

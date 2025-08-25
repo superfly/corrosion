@@ -435,13 +435,13 @@ pub enum BroadcastInput {
 pub struct DispatchRuntime<T> {
     pub to_send: CorroSender<(T, Bytes)>,
     pub to_schedule: CorroSender<(Duration, Timer<T>)>,
-    pub notifications: CorroSender<Notification<T>>,
+    pub notifications: CorroSender<foca::OwnedNotification<T>>,
     pub active: bool,
     pub buf: BytesMut,
 }
 
 impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
-    fn notify(&mut self, notification: Notification<T>) {
+    fn notify(&mut self, notification: Notification<'_, T>) {
         match &notification {
             Notification::Active => {
                 self.active = true;
@@ -452,7 +452,7 @@ impl<T: Identity> Runtime<T> for DispatchRuntime<T> {
             _ => {}
         };
 
-        if let Err(e) = self.notifications.try_send(notification) {
+        if let Err(e) = self.notifications.try_send(notification.to_owned()) {
             counter!("corro.channel.error", "type" => "full", "name" => "dispatch.notifications")
                 .increment(1);
             error!("error dispatching notification: {e}");
@@ -483,7 +483,7 @@ impl<T> DispatchRuntime<T> {
     pub fn new(
         to_send: CorroSender<(T, Bytes)>,
         to_schedule: CorroSender<(Duration, Timer<T>)>,
-        notifications: CorroSender<Notification<T>>,
+        notifications: CorroSender<foca::OwnedNotification<T>>,
     ) -> Self {
         Self {
             to_send,
