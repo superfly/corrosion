@@ -2,8 +2,8 @@ use crate::agent::RANDOM_NODES_CHOICES;
 use corro_types::{agent::SplitPool, config::DEFAULT_GOSSIP_PORT};
 
 use hickory_resolver::{
-    error::ResolveErrorKind,
     proto::rr::{RData, RecordType},
+    ResolveErrorKind,
 };
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use std::{collections::HashSet, net::SocketAddr};
@@ -48,7 +48,7 @@ pub async fn generate_bootstrap(
         })?;
     }
 
-    let mut rng = StdRng::from_entropy();
+    let mut rng = StdRng::from_os_rng();
 
     Ok(addrs
         .into_iter()
@@ -59,8 +59,10 @@ async fn resolve_bootstrap(
     bootstrap: &[String],
     our_addr: SocketAddr,
 ) -> eyre::Result<HashSet<SocketAddr>> {
-    use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-    use hickory_resolver::{AsyncResolver, TokioAsyncResolver};
+    use hickory_resolver::{
+        config::{NameServerConfigGroup, ResolverConfig},
+        Resolver,
+    };
 
     let mut addrs = HashSet::new();
 
@@ -68,7 +70,7 @@ async fn resolve_bootstrap(
         return Ok(addrs);
     }
 
-    let system_resolver = AsyncResolver::tokio_from_system_conf()?;
+    let system_resolver = Resolver::builder_tokio()?.build();
 
     for s in bootstrap {
         if let Ok(addr) = s.parse() {
@@ -85,14 +87,17 @@ async fn resolve_bootstrap(
                 } else {
                     (dns_server.parse()?, 53)
                 };
-                resolver = Some(TokioAsyncResolver::tokio(
-                    ResolverConfig::from_parts(
-                        None,
-                        vec![],
-                        NameServerConfigGroup::from_ips_clear(&[ip], port, true),
-                    ),
-                    ResolverOpts::default(),
-                ));
+                resolver = Some(
+                    Resolver::builder_with_config(
+                        ResolverConfig::from_parts(
+                            None,
+                            vec![],
+                            NameServerConfigGroup::from_ips_clear(&[ip], port, true),
+                        ),
+                        hickory_resolver::name_server::TokioConnectionProvider::default(),
+                    )
+                    .build(),
+                );
                 debug!("using resolver: {dns_server}");
             }
             if let Some(hostname) = host_port.next() {
@@ -133,8 +138,13 @@ async fn resolve_bootstrap(
                         }
                     }
                     Err(e) => match e.kind() {
-                        ResolveErrorKind::NoRecordsFound { .. } => {
-                            // do nothing, that might be fine!
+                        ResolveErrorKind::Proto(e) => {
+                            if matches!(
+                                e.kind(),
+                                hickory_resolver::proto::ProtoErrorKind::NoRecordsFound { .. }
+                            ) {
+                                // do nothing, that might be fine!
+                            }
                         }
                         _ => {
                             error!("could not resolve '{hostname}': {e}");

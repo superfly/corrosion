@@ -32,7 +32,7 @@ use corro_types::{
 
 use bytes::Bytes;
 use corro_types::broadcast::Timestamp;
-use foca::Notification;
+use foca::OwnedNotification;
 use indexmap::map::Entry;
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
@@ -278,12 +278,12 @@ pub async fn handle_gossip_to_send(
 /// and apply any incoming changes to the local actor/ agent state.
 pub async fn handle_notifications(
     agent: Agent,
-    mut notification_rx: CorroReceiver<Notification<Actor>>,
+    mut notification_rx: CorroReceiver<OwnedNotification<Actor>>,
 ) {
     while let Some(notification) = notification_rx.recv().await {
         trace!("handle notification");
         match notification {
-            Notification::MemberUp(actor) => {
+            OwnedNotification::MemberUp(actor) => {
                 let member_added_res = agent.members().write().add_member(&actor);
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 
@@ -327,7 +327,7 @@ pub async fn handle_notifications(
                 }
                 counter!("corro.swim.notification", "type" => "memberup").increment(1);
             }
-            Notification::MemberDown(actor) => {
+            OwnedNotification::MemberDown(actor) => {
                 let removed = { agent.members().write().remove_member(&actor) };
                 info!("Member Down {actor:?} (removed: {removed})");
                 if removed {
@@ -344,20 +344,25 @@ pub async fn handle_notifications(
                 }
                 counter!("corro.swim.notification", "type" => "memberdown").increment(1);
             }
-            Notification::Active => {
+            OwnedNotification::Rename(a, b) => {
+                let mut lock = agent.members().write();
+                lock.remove_member(&a);
+                lock.add_member(&b);
+            }
+            OwnedNotification::Active => {
                 info!("Current node is considered ACTIVE");
                 counter!("corro.swim.notification", "type" => "active").increment(1);
             }
-            Notification::Idle => {
+            OwnedNotification::Idle => {
                 warn!("Current node is considered IDLE");
                 counter!("corro.swim.notification", "type" => "idle").increment(1);
             }
             // this happens when we leave the cluster
-            Notification::Defunct => {
+            OwnedNotification::Defunct => {
                 debug!("Current node is considered DEFUNCT");
                 counter!("corro.swim.notification", "type" => "defunct").increment(1);
             }
-            Notification::Rejoin(id) => {
+            OwnedNotification::Rejoin(id) => {
                 info!("Rejoined the cluster with id: {id:?}");
                 counter!("corro.swim.notification", "type" => "rejoin").increment(1);
             }
@@ -668,8 +673,8 @@ pub async fn handle_changes(
             continue;
         }
 
-        if let Some(mut seqs) = change.seqs().cloned() {
-            let v = *change.versions().start();
+        if let Some(mut seqs) = change.seqs() {
+            let v = change.versions().start();
             if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
                 if seqs.all(|seq| seen_seqs.contains(&seq)) {
                     continue;
@@ -729,10 +734,10 @@ pub async fn handle_changes(
             if let Some((dropped_change, _, _)) = queue.pop_front() {
                 for v in dropped_change.versions() {
                     if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
-                        if let Some(seqs) = dropped_change.seqs().cloned() {
-                            entry.get_mut().remove(seqs);
+                        if let Some(seqs) = dropped_change.seqs() {
+                            entry.get_mut().remove(seqs.into());
                         } else {
-                            entry.remove_entry();
+                            entry.swap_remove_entry();
                         }
                     };
                 }
@@ -753,8 +758,8 @@ pub async fn handle_changes(
         // this will only run once for a non-empty changeset
         for v in change.versions() {
             let entry = seen.entry((change.actor_id, v)).or_default();
-            if let Some(seqs) = change.seqs().cloned() {
-                entry.extend([seqs]);
+            if let Some(seqs) = change.seqs() {
+                entry.extend([seqs.into()]);
             }
         }
 
@@ -835,7 +840,7 @@ pub async fn handle_sync(
         let desired_count = (candidates.len() / 100).clamp(3, 10);
         debug!("Selected {desired_count} nodes to sync with");
 
-        let mut rng = StdRng::from_entropy();
+        let mut rng = StdRng::from_os_rng();
 
         let mut choices = candidates
             .into_iter()
@@ -900,7 +905,10 @@ mod tests {
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::{
-        base::CrsqlDbVersion, broadcast::Changeset, change::Change, config::Config,
+        base::{dbsr, dbvr, CrsqlDbVersion},
+        broadcast::Changeset,
+        change::Change,
+        config::Config,
         pubsub::pack_columns,
     };
     use rusqlite::Connection;
@@ -983,7 +991,7 @@ mod tests {
                         changeset: Changeset::Full {
                             version: CrsqlDbVersion(i as u64),
                             changes: vec![crsql_row.clone()],
-                            seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                            seqs: dbsr!(0, 0),
                             last_seq: CrsqlSeq(0),
                             ts: agent.clock().new_timestamp().into(),
                         },
@@ -1003,8 +1011,8 @@ mod tests {
             .unwrap()
             .read::<&str, _>("test", None)
             .await;
-        assert!(booked.contains_all(CrsqlDbVersion(6)..=CrsqlDbVersion(10), None));
-        assert!(booked.contains_all(CrsqlDbVersion(1)..=CrsqlDbVersion(3), None));
+        assert!(booked.contains_all(dbvr!(6, 10), None));
+        assert!(booked.contains_all(dbvr!(1, 3), None));
         assert!(!booked.contains_version(&CrsqlDbVersion(5)));
         assert!(!booked.contains_version(&CrsqlDbVersion(4)));
 
@@ -1014,7 +1022,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn ensure_vacuum_works() -> eyre::Result<()> {
         let tmpdir = tempfile::tempdir()?;
-        let db_path = tmpdir.into_path().join("db.sqlite");
+        let db_path = tmpdir.keep().join("db.sqlite");
 
         {
             let db_conn = Connection::open(db_path.clone())?;

@@ -11,9 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bincode::DefaultOptions;
 use bytes::{BufMut, Bytes, BytesMut};
-use foca::{BincodeCodec, Foca, Identity, NoCustomBroadcast, Notification, Timer};
+use foca::{BincodeCodec, Foca, Identity, NoCustomBroadcast, OwnedNotification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future,
@@ -94,7 +93,7 @@ impl TimerSpawner {
 }
 
 fn handle_timer(
-    foca: &mut Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, NoCustomBroadcast>,
+    foca: &mut Foca<Actor, BincodeCodec<bincode::config::Configuration>, StdRng, NoCustomBroadcast>,
     runtime: &mut DispatchRuntime<Actor>,
     timer_rx: &mut mpsc::Receiver<(Timer<Actor>, Instant)>,
     timer: Timer<Actor>,
@@ -126,11 +125,11 @@ pub fn runtime_loop(
     mut rx_foca: CorroReceiver<FocaInput>,
     rx_bcast: CorroReceiver<BroadcastInput>,
     to_send_tx: CorroSender<(Actor, Bytes)>,
-    notifications_tx: CorroSender<Notification<Actor>>,
+    notifications_tx: CorroSender<OwnedNotification<Actor>>,
     tripwire: Tripwire,
 ) {
     debug!("starting runtime loop for actor: {actor:?}");
-    let rng = StdRng::from_entropy();
+    let rng = StdRng::from_os_rng();
 
     let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
 
@@ -138,7 +137,7 @@ pub fn runtime_loop(
         actor,
         config.read().clone(),
         rng,
-        foca::BincodeCodec(bincode::DefaultOptions::new()),
+        foca::BincodeCodec(bincode::config::Configuration::default()),
         NoCustomBroadcast,
     );
 
@@ -256,7 +255,8 @@ pub fn runtime_loop(
                         }
                         FocaInput::ApplyMany(updates) => {
                             trace!("handling FocaInput::ApplyMany");
-                            if let Err(e) = foca.apply_many(updates.into_iter(), &mut runtime) {
+                            if let Err(e) = foca.apply_many(updates.into_iter(), true, &mut runtime)
+                            {
                                 error!("foca apply_many error: {e}");
                             }
                         }
@@ -430,7 +430,7 @@ async fn handle_broadcasts(
 
     let mut metrics_interval = interval(Duration::from_secs(10));
 
-    let mut rng = StdRng::from_entropy();
+    let mut rng = StdRng::from_os_rng();
 
     let mut idle_pendings =
         FuturesUnordered::<Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>>::new();
@@ -813,7 +813,7 @@ fn drop_oldest_broadcast(
 
 fn diff_member_states(
     agent: &Agent,
-    foca: &Foca<Actor, BincodeCodec<DefaultOptions>, StdRng, NoCustomBroadcast>,
+    foca: &Foca<Actor, BincodeCodec<bincode::config::Configuration>, StdRng, NoCustomBroadcast>,
     last_states: &mut HashMap<ActorId, (foca::Member<Actor>, Option<u64>)>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut foca_states = HashMap::new();
@@ -1047,7 +1047,7 @@ mod tests {
     use crate::agent::spawn_unipayload_handler;
     use corro_tests::launch_test_agent;
     use corro_types::{
-        base::{CrsqlDbVersion, CrsqlSeq},
+        base::{dbsr, CrsqlDbVersion, CrsqlSeq},
         broadcast::{BroadcastV1, ChangeV1, Changeset},
     };
     use uuid::Uuid;
@@ -1134,7 +1134,7 @@ mod tests {
             changeset: Changeset::Full {
                 version: CrsqlDbVersion(0),
                 changes: vec![],
-                seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                seqs: dbsr!(0, 0),
                 last_seq: CrsqlSeq(0),
                 ts: Default::default(),
             },
@@ -1167,7 +1167,7 @@ mod tests {
                     changeset: Changeset::Full {
                         version: CrsqlDbVersion(i),
                         changes: vec![],
-                        seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                        seqs: dbsr!(0, 0),
                         last_seq: CrsqlSeq(0),
                         ts: Default::default(),
                     },
@@ -1187,7 +1187,10 @@ mod tests {
                 let changes = tokio::time::timeout(Duration::from_secs(5), rx_changes.recv())
                     .await?
                     .unwrap();
-                assert_eq!(changes.0.versions(), CrsqlDbVersion(i)..=CrsqlDbVersion(i));
+                assert_eq!(
+                    changes.0.versions(),
+                    (CrsqlDbVersion(i)..=CrsqlDbVersion(i)).into()
+                );
             }
         }
 

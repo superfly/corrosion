@@ -11,10 +11,7 @@ use std::{
 };
 use tracing::warn;
 
-use deadpool::{
-    async_trait,
-    managed::{self, Object},
-};
+use deadpool::managed::{self, Object};
 use metrics::counter;
 use rusqlite::{CachedStatement, InterruptHandle, Params, Transaction};
 use tokio::time::{sleep, Duration};
@@ -88,7 +85,6 @@ impl SqliteConn for rusqlite::Connection {
     }
 }
 
-#[async_trait]
 impl<T> managed::Manager for Manager<T>
 where
     T: SqliteConn,
@@ -157,7 +153,10 @@ where
         res
     }
 
-    pub fn prepare(&self, sql: &str) -> Result<InterruptibleStatement<Statement>, rusqlite::Error> {
+    pub fn prepare(
+        &self,
+        sql: &str,
+    ) -> Result<InterruptibleStatement<Statement<'_>>, rusqlite::Error> {
         let stmt = self.conn.prepare(sql)?;
         self.current_sql.store(Arc::new(Some(sql.to_string())));
         Ok(InterruptibleStatement::new(
@@ -171,7 +170,7 @@ where
     pub fn prepare_cached(
         &self,
         sql: &str,
-    ) -> Result<InterruptibleStatement<CachedStatement>, rusqlite::Error> {
+    ) -> Result<InterruptibleStatement<CachedStatement<'_>>, rusqlite::Error> {
         let stmt = self.conn.prepare_cached(sql)?;
         self.current_sql.store(Arc::new(Some(sql.to_string())));
         Ok(InterruptibleStatement::new(
