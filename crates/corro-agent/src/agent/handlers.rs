@@ -62,26 +62,39 @@ pub fn spawn_gossipserver_handler(
         let mut tripwire = tripwire.clone();
         async move {
             loop {
-                let connecting = match gossip_server_endpoint
+                let incoming = match gossip_server_endpoint
                     .accept()
                     .preemptible(&mut tripwire)
                     .await
                 {
-                    Outcome::Completed(Some(connecting)) => connecting,
+                    Outcome::Completed(Some(incoming)) => incoming,
                     Outcome::Completed(None) => return,
                     Outcome::Preempted(_) => break,
                 };
 
                 // Spawn incoming connection handlers
-                spawn_incoming_connection_handlers(&agent, &bookie, &tripwire, connecting);
+                spawn_incoming_connection_handlers(&agent, &bookie, &tripwire, incoming);
             }
 
             // graceful shutdown
-            gossip_server_endpoint.reject_new_connections();
-            _ = gossip_server_endpoint
+            let idle = gossip_server_endpoint
                 .wait_idle()
-                .with_timeout(Duration::from_secs(5))
-                .await;
+                .with_timeout(Duration::from_secs(5));
+            tokio::pin!(idle);
+
+            loop {
+                tokio::select! {
+                    _ = &mut idle => {
+                        break;
+                    }
+                    incoming = gossip_server_endpoint.accept() => {
+                        if let Some(inc) = incoming {
+                            inc.refuse();
+                        }
+                    }
+                }
+            }
+
             gossip_server_endpoint.close(0u32.into(), b"shutting down");
         }
     });
@@ -94,7 +107,7 @@ pub fn spawn_incoming_connection_handlers(
     agent: &Agent,
     bookie: &Bookie,
     tripwire: &Tripwire,
-    connecting: quinn::Connecting,
+    connecting: quinn::Incoming,
 ) {
     let agent = agent.clone();
     let bookie = bookie.clone();

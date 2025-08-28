@@ -4,10 +4,9 @@ use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement
 use hickory_resolver::{
     name_server::TokioConnectionProvider, ResolveError, ResolveErrorKind, Resolver,
 };
-use http::uri::PathAndQuery;
-use hyper::{client::HttpConnector, http::HeaderName, Body, StatusCode};
 use serde::de::DeserializeOwned;
 use std::{
+    fmt::Write as _,
     net::SocketAddr,
     ops::Deref,
     path::Path,
@@ -29,21 +28,20 @@ const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Clone)]
 pub struct CorrosionApiClient {
     api_addr: SocketAddr,
-    api_client: hyper::Client<HttpConnector, Body>,
+    api_client: reqwest::Client,
 }
 
 impl CorrosionApiClient {
-    pub fn new(api_addr: SocketAddr) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(Some(HTTP2_CONNECT_TIMEOUT));
-        Self {
+    pub fn new(api_addr: SocketAddr) -> Result<Self, reqwest::Error> {
+        Ok(Self {
             api_addr,
-            api_client: hyper::Client::builder()
-                .http2_only(true)
+            api_client: reqwest::ClientBuilder::new()
+                .http2_prior_knowledge()
+                .connect_timeout(HTTP2_CONNECT_TIMEOUT)
                 .http2_keep_alive_interval(Some(HTTP2_KEEP_ALIVE_INTERVAL))
                 .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_INTERVAL / 2)
-                .build(connector),
-        }
+                .build()?,
+        })
     }
 
     pub async fn query_typed<T: DeserializeOwned + Unpin>(
@@ -51,35 +49,40 @@ impl CorrosionApiClient {
         statement: &Statement,
         timeout: Option<u64>,
     ) -> Result<QueryStream<T>, Error> {
-        let params = timeout.map(|t| format!("?timeout={t}")).unwrap_or_default();
-        let req = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(format!("http://{}/v1/queries{}", self.api_addr, params))
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::ACCEPT, "application/json")
-            .body(Body::from(serde_json::to_vec(statement)?))?;
+        let mut uri = format!("http://{}/v1/queries", self.api_addr);
 
-        let res = self.api_client.request(req).await?;
+        if let Some(t) = timeout {
+            write!(&mut uri, "?timeout={t}").unwrap();
+        }
+
+        let res = self
+            .api_client
+            .post(uri)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::ACCEPT, "application/json")
+            .body(serde_json::to_vec(statement)?)
+            .send()
+            .await?;
 
         if !res.status().is_success() {
             let status = res.status();
-            match hyper::body::to_bytes(res.into_body()).await {
+            match res.bytes().await {
                 Ok(b) => match serde_json::from_slice(&b) {
                     Ok(res) => match res {
                         ExecResult::Error { error } => return Err(Error::ResponseError(error)),
                         res => return Err(Error::UnexpectedResult(res)),
                     },
-                    Err(e) => {
+                    Err(error) => {
                         debug!(
-                            error = %e,
+                            %error,
                             "could not deserialize response body, sending generic error..."
                         );
                         return Err(Error::UnexpectedStatusCode(status));
                     }
                 },
-                Err(e) => {
+                Err(error) => {
                     debug!(
-                        error = %e,
+                        %error,
                         "could not aggregate response body bytes, sending generic error..."
                     );
                     return Err(Error::UnexpectedStatusCode(status));
@@ -87,7 +90,7 @@ impl CorrosionApiClient {
             }
         }
 
-        Ok(QueryStream::new(res.into_body()))
+        Ok(QueryStream::new(res.into()))
     }
 
     pub async fn query(
@@ -104,29 +107,23 @@ impl CorrosionApiClient {
         skip_rows: bool,
         from: Option<ChangeId>,
     ) -> Result<SubscriptionStream<T>, Error> {
-        let p_and_q: PathAndQuery = if let Some(change_id) = from {
-            format!(
-                "/v1/subscriptions?skip_rows={}&from={}",
-                skip_rows, change_id.0
-            )
-            .try_into()?
-        } else {
-            format!("/v1/subscriptions?skip_rows={skip_rows}").try_into()?
-        };
-        let url = hyper::Uri::builder()
-            .scheme("http")
-            .authority(self.api_addr.to_string())
-            .path_and_query(p_and_q)
-            .build()?;
+        let mut uri = format!(
+            "http://{}/v1/subscriptions?skip_rows={skip_rows}",
+            self.api_addr
+        );
 
-        let req = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(url)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::ACCEPT, "application/json")
-            .body(Body::from(serde_json::to_vec(statement)?))?;
+        if let Some(change_id) = from {
+            write!(&mut uri, "&from={change_id}").unwrap();
+        }
 
-        let res = self.api_client.request(req).await?;
+        let res = self
+            .api_client
+            .post(uri)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::ACCEPT, "application/json")
+            .body(serde_json::to_vec(statement)?)
+            .send()
+            .await?;
 
         if !res.status().is_success() {
             return Err(Error::UnexpectedStatusCode(res.status()));
@@ -135,12 +132,12 @@ impl CorrosionApiClient {
         // TODO: make that header name a const in corro-types
         let id = res
             .headers()
-            .get(HeaderName::from_static("corro-query-id"))
+            .get("corro-query-id")
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
             .ok_or(Error::ExpectedQueryId)?;
         let hash = res
             .headers()
-            .get(HeaderName::from_static("corro-query-hash"))
+            .get("corro-query-hash")
             .and_then(|v| v.to_str().map(ToOwned::to_owned).ok());
 
         Ok(SubscriptionStream::new(
@@ -148,7 +145,7 @@ impl CorrosionApiClient {
             hash,
             self.api_client.clone(),
             self.api_addr,
-            res.into_body(),
+            res.into(),
             from,
         ))
     }
@@ -168,28 +165,21 @@ impl CorrosionApiClient {
         skip_rows: bool,
         from: Option<ChangeId>,
     ) -> Result<SubscriptionStream<T>, Error> {
-        let p_and_q: PathAndQuery = if let Some(change_id) = from {
-            format!(
-                "/v1/subscriptions/{id}?skip_rows={}&from={}",
-                skip_rows, change_id.0
-            )
-            .try_into()?
-        } else {
-            format!("/v1/subscriptions/{id}?skip_rows={skip_rows}").try_into()?
-        };
-        let url = hyper::Uri::builder()
-            .scheme("http")
-            .authority(self.api_addr.to_string())
-            .path_and_query(p_and_q)
-            .build()?;
+        let mut uri = format!(
+            "http://{}/v1/subscriptions/{id}?skip_rows={skip_rows}",
+            self.api_addr
+        );
 
-        let req = hyper::Request::builder()
-            .method(hyper::Method::GET)
-            .uri(url)
-            .header(hyper::header::ACCEPT, "application/json")
-            .body(hyper::Body::empty())?;
+        if let Some(change_id) = from {
+            write!(&mut uri, "&from={change_id}").unwrap();
+        }
 
-        let res = self.api_client.request(req).await?;
+        let res = self
+            .api_client
+            .get(uri)
+            .header(http::header::ACCEPT, "application/json")
+            .send()
+            .await?;
 
         if !res.status().is_success() {
             return Err(Error::UnexpectedStatusCode(res.status()));
@@ -197,7 +187,7 @@ impl CorrosionApiClient {
 
         let hash = res
             .headers()
-            .get(HeaderName::from_static("corro-query-hash"))
+            .get("corro-query-hash")
             .and_then(|v| v.to_str().map(ToOwned::to_owned).ok());
 
         Ok(SubscriptionStream::new(
@@ -205,7 +195,7 @@ impl CorrosionApiClient {
             hash,
             self.api_client.clone(),
             self.api_addr,
-            res.into_body(),
+            res.into(),
             from,
         ))
     }
@@ -223,22 +213,13 @@ impl CorrosionApiClient {
         &self,
         table: &str,
     ) -> Result<UpdatesStream<T>, Error> {
-        let p_and_q: PathAndQuery = format!("/v1/updates/{table}").try_into()?;
-
-        let url = hyper::Uri::builder()
-            .scheme("http")
-            .authority(self.api_addr.to_string())
-            .path_and_query(p_and_q)
-            .build()?;
-
-        let req = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(url)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::ACCEPT, "application/json")
-            .body(hyper::Body::empty())?;
-
-        let res = self.api_client.request(req).await?;
+        let res = self
+            .api_client
+            .post(format!("http://{}/v1/updates/{table}", self.api_addr))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::ACCEPT, "application/json")
+            .send()
+            .await?;
 
         if !res.status().is_success() {
             return Err(Error::UnexpectedStatusCode(res.status()));
@@ -247,11 +228,11 @@ impl CorrosionApiClient {
         // TODO: make that header name a const in corro-types
         let id = res
             .headers()
-            .get(HeaderName::from_static("corro-query-id"))
+            .get("corro-query-id")
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
             .ok_or(Error::ExpectedQueryId)?;
 
-        Ok(UpdatesStream::new(id, res.into_body()))
+        Ok(UpdatesStream::new(id, res.into()))
     }
 
     pub async fn updates(&self, table: &str) -> Result<UpdatesStream<Vec<SqliteValue>>, Error> {
@@ -264,26 +245,23 @@ impl CorrosionApiClient {
         timeout: Option<u64>,
     ) -> Result<ExecResponse, Error> {
         let uri = if let Some(timeout) = timeout {
-            format!(
-                "http://{}/v1/transactions?timeout={}",
-                self.api_addr, timeout
-            )
+            format!("http://{}/v1/transactions?timeout={timeout}", self.api_addr)
         } else {
             format!("http://{}/v1/transactions", self.api_addr)
         };
         // println!("uri: {:?}", uri);
-        let req = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(uri)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::ACCEPT, "application/json")
-            .body(Body::from(serde_json::to_vec(statements)?))?;
-
-        let res = self.api_client.request(req).await?;
+        let res = self
+            .api_client
+            .post(uri)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::ACCEPT, "application/json")
+            .body(serde_json::to_vec(statements)?)
+            .send()
+            .await?;
 
         let status = res.status();
         if !status.is_success() {
-            match hyper::body::to_bytes(res.into_body()).await {
+            match res.bytes().await {
                 Ok(b) => match serde_json::from_slice(&b) {
                     Ok(ExecResponse { results, .. }) => {
                         if let Some(ExecResult::Error { error }) = results
@@ -294,44 +272,42 @@ impl CorrosionApiClient {
                         }
                         return Err(Error::UnexpectedStatusCode(status));
                     }
-                    Err(e) => {
+                    Err(error) => {
                         debug!(
-                            error = %e,
+                            %error,
                             "could not deserialize response body, sending generic error..."
                         );
                         return Err(Error::UnexpectedStatusCode(status));
                     }
                 },
-                Err(e) => {
+                Err(error) => {
                     debug!(
-                        error = %e,
+                        %error,
                         "could not aggregate response body bytes, sending generic error..."
                     );
                     return Err(Error::UnexpectedStatusCode(status));
                 }
             }
         }
-        let bytes = hyper::body::to_bytes(res.into_body()).await?;
-        Ok(serde_json::from_slice(&bytes)?)
+
+        Ok(serde_json::from_slice(&res.bytes().await?)?)
     }
 
     pub async fn schema(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
-        let req = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(format!("http://{}/v1/migrations", self.api_addr))
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::ACCEPT, "application/json")
-            .body(Body::from(serde_json::to_vec(statements)?))?;
-
-        let res = self.api_client.request(req).await?;
+        let res = self
+            .api_client
+            .post(format!("http://{}/v1/migrations", self.api_addr))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::ACCEPT, "application/json")
+            .body(serde_json::to_vec(statements)?)
+            .send()
+            .await?;
 
         if !res.status().is_success() {
             return Err(Error::UnexpectedStatusCode(res.status()));
         }
 
-        let bytes = hyper::body::to_bytes(res.into_body()).await?;
-
-        Ok(serde_json::from_slice(&bytes)?)
+        Ok(serde_json::from_slice(&res.bytes().await?)?)
     }
 
     pub async fn schema_from_paths<P: AsRef<Path>>(
@@ -360,21 +336,24 @@ pub struct CorrosionClient {
 }
 
 impl CorrosionClient {
-    pub fn new<P: AsRef<Path>>(api_addr: SocketAddr, db_path: P) -> Self {
-        Self {
-            api_client: CorrosionApiClient::new(api_addr),
+    pub fn new<P: AsRef<Path>>(api_addr: SocketAddr, db_path: P) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            api_client: CorrosionApiClient::new(api_addr)?,
             pool: sqlite_pool::Config::new(db_path.as_ref())
                 .max_size(5)
                 .create_pool()
                 .expect("could not build pool, this can't fail because we specified a runtime"),
-        }
+        })
     }
 
-    pub fn with_sqlite_pool(api_addr: SocketAddr, pool: sqlite_pool::RusqlitePool) -> Self {
-        Self {
-            api_client: CorrosionApiClient::new(api_addr),
+    pub fn with_sqlite_pool(
+        api_addr: SocketAddr,
+        pool: sqlite_pool::RusqlitePool,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            api_client: CorrosionApiClient::new(api_addr)?,
             pool,
-        }
+        })
     }
 
     pub fn pool(&self) -> &sqlite_pool::RusqlitePool {
@@ -441,7 +420,7 @@ impl CorrosionPooledClient {
             (response, generation)
         };
 
-        if matches!(response, Err(Error::Hyper(_))) {
+        if matches!(response, Err(Error::Reqwest(_))) {
             // We only care about I/O related errors
             self.handle_error(generation).await;
         } else {
@@ -465,7 +444,7 @@ impl CorrosionPooledClient {
             (response, generation)
         };
 
-        if matches!(response, Err(Error::Hyper(_))) {
+        if matches!(response, Err(Error::Reqwest(_))) {
             // We only care about I/O related errors
             self.handle_error(generation).await;
         } else {
@@ -489,7 +468,7 @@ impl CorrosionPooledClient {
             (response, generation)
         };
 
-        if matches!(response, Err(Error::Hyper(_))) {
+        if matches!(response, Err(Error::Reqwest(_))) {
             // We only care about I/O related errors
             self.handle_error(generation).await;
         } else {
@@ -510,7 +489,7 @@ impl CorrosionPooledClient {
                 "next Corrosion server to attempt: {}, generation: {}",
                 addr, generation
             );
-            inner.client = Some(CorrosionApiClient::new(addr))
+            inner.client = Some(CorrosionApiClient::new(addr)?)
         }
 
         Ok((
@@ -660,16 +639,16 @@ pub enum Error {
     #[error(transparent)]
     Dns(#[from] ResolveError),
     #[error(transparent)]
-    Hyper(#[from] hyper::Error),
+    Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
     InvalidUri(#[from] http::uri::InvalidUri),
     #[error(transparent)]
-    Http(#[from] hyper::http::Error),
+    Http(#[from] http::Error),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
 
     #[error("received unexpected response code: {0}")]
-    UnexpectedStatusCode(StatusCode),
+    UnexpectedStatusCode(http::StatusCode),
 
     #[error("{0}")]
     ResponseError(String),
@@ -686,7 +665,7 @@ mod tests {
     use crate::{CorrosionPooledClient, Error};
     use corro_api_types::SqliteValue;
     use hickory_resolver::Resolver;
-    use hyper::{header::HeaderValue, service::service_fn, Body, Request, Response};
+    use hyper::{header::HeaderValue, service::service_fn, Request, Response};
     use std::{
         convert::Infallible,
         net::SocketAddr,
@@ -698,6 +677,33 @@ mod tests {
     };
     use tokio::{net::TcpListener, pin, sync::broadcast};
     use uuid::Uuid;
+
+    struct Empty<D>(std::marker::PhantomData<D>);
+
+    impl Empty<bytes::Bytes> {
+        fn new() -> Self {
+            Self(std::marker::PhantomData)
+        }
+    }
+
+    impl<D: bytes::Buf> http_body::Body for Empty<D> {
+        type Data = D;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(None)
+        }
+        fn is_end_stream(&self) -> bool {
+            true
+        }
+
+        fn size_hint(&self) -> http_body::SizeHint {
+            http_body::SizeHint::with_exact(0)
+        }
+    }
 
     struct Server {
         id: Uuid,
@@ -724,13 +730,14 @@ mod tests {
                             continue;
                         }
 
+                        let io = hyper_util::rt::TokioIo::new(stream);
+
                         let mut drop_conn_rx = drop_conn_rx.resubscribe();
                         tokio::spawn(async move {
-                            let http = hyper::server::conn::Http::new();
-                            let conn = http.serve_connection(
-                                stream,
-                                service_fn(move |_: Request<Body>| async move {
-                                    let mut res = Response::new(Body::empty());
+                            let conn = hyper::server::conn::http1::Builder::new().serve_connection(
+                                io,
+                                service_fn(move |_: Request<hyper::body::Incoming>| async move {
+                                    let mut res = Response::new(Empty::new());
                                     res.headers_mut().insert(
                                         "corro-query-id",
                                         HeaderValue::from_str(&id.to_string()).unwrap(),
@@ -742,7 +749,9 @@ mod tests {
 
                             tokio::select! {
                                 _ = conn.as_mut() => (),
-                                _ = drop_conn_rx.recv() => (),
+                                _ = drop_conn_rx.recv() => {
+                                    conn.as_mut().graceful_shutdown()
+                                },
                             }
                         });
                     }
@@ -799,7 +808,7 @@ mod tests {
         let res = client
             .subscribe_typed::<SqliteValue>(&statement, false, None)
             .await;
-        assert!(matches!(res, Result::Err(Error::Hyper(_))));
+        assert!(matches!(res, Result::Err(Error::Reqwest(_))));
 
         // But the new one should succeed
         let sub = client
@@ -824,7 +833,7 @@ mod tests {
         let res = client
             .subscribe_typed::<SqliteValue>(&statement, false, None)
             .await;
-        assert!(matches!(res, Result::Err(Error::Hyper(_))));
+        assert!(matches!(res, Result::Err(Error::Reqwest(_))));
 
         // Second one should succeed
         let sub = client
@@ -843,7 +852,7 @@ mod tests {
             let res = client
                 .subscribe_typed::<SqliteValue>(&statement, false, None)
                 .await;
-            assert!(matches!(res, Result::Err(Error::Hyper(_))));
+            assert!(matches!(res, Result::Err(Error::Reqwest(_))));
         }
 
         // The next one should succeed
@@ -869,7 +878,7 @@ mod tests {
         let res = client
             .subscribe_typed::<SqliteValue>(&statement, false, None)
             .await;
-        assert!(matches!(res, Result::Err(Error::Hyper(_))));
+        assert!(matches!(res, Result::Err(Error::Reqwest(_))));
 
         // Second one should succeed
         let sub = client
@@ -923,7 +932,7 @@ mod tests {
             let res = client
                 .subscribe_typed::<SqliteValue>(&statement, false, None)
                 .await;
-            assert!(matches!(res, Result::Err(Error::Hyper(_))));
+            assert!(matches!(res, Result::Err(Error::Reqwest(_))));
         }
 
         // Accept connections on first server in the backup pool
@@ -953,7 +962,7 @@ mod tests {
             let res = client
                 .subscribe_typed::<SqliteValue>(&statement, false, None)
                 .await;
-            assert!(matches!(res, Result::Err(Error::Hyper(_))));
+            assert!(matches!(res, Result::Err(Error::Reqwest(_))));
         }
 
         // Thirst one should succeed

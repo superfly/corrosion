@@ -1,5 +1,6 @@
+use crate::streaming_body;
 use corro_types::gauge::PersistentGauge;
-use hyper::body::{Body, HttpBody, Sender, SizeHint};
+use http_body::Body as HttpBody;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -29,10 +30,10 @@ impl<B: HttpBody> CountedBody<B> {
     }
 }
 
-impl CountedBody<Body> {
+impl CountedBody<streaming_body::Channel<bytes::Bytes>> {
     // Channel bodies need to be counted as they can be long lived
-    pub fn channel(gauge: PersistentGauge) -> (Sender, Self) {
-        let (tx, body) = hyper::Body::channel();
+    pub fn channel(gauge: PersistentGauge) -> (streaming_body::Sender<bytes::Bytes>, Self) {
+        let (tx, body) = streaming_body::Channel::<bytes::Bytes>::new(16);
         (tx, Self::new(body, Some(gauge)))
     }
 }
@@ -41,27 +42,12 @@ impl<B: HttpBody> HttpBody for CountedBody<B> {
     type Data = B::Data;
     type Error = B::Error;
 
-    fn poll_data(
+    fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
-        this.body.poll_data(cx)
-    }
-
-    fn poll_trailers(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<hyper::HeaderMap>, Self::Error>> {
-        let this = self.project();
-        this.body.poll_trailers(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
-    fn size_hint(&self) -> SizeHint {
-        self.body.size_hint()
+        this.body.poll_frame(cx)
     }
 }
 

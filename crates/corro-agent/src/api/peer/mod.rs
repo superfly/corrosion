@@ -13,11 +13,12 @@ use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
 use corro_types::change::{row_to_change, Change, ChunkedChanges};
-use corro_types::config::{GossipConfig, TlsClientConfig};
+use corro_types::config::GossipConfig;
 use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
     SyncRequestV1, SyncStateV1, SyncTraceContextV1,
 };
+use eyre::{ContextCompat, WrapErr};
 use futures::stream::FuturesUnordered;
 use futures::{Future, Stream, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
@@ -25,6 +26,7 @@ use metrics::counter;
 use quinn::{RecvStream, SendStream, WriteError};
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection};
+use rustls::pki_types::pem::PemObject as _;
 use speedy::Writable;
 use std::string::String;
 use tokio::io::AsyncWriteExt;
@@ -152,73 +154,59 @@ async fn build_quinn_server_config(config: &GossipConfig) -> eyre::Result<quinn:
         let tls = config
             .tls
             .as_ref()
-            .ok_or_else(|| eyre::eyre!("either plaintext or a tls config is required"))?;
+            .context("either plaintext or a tls config is required")?;
 
-        let key = tokio::fs::read(&tls.key_file).await?;
+        let key_data = tokio::fs::read(&tls.key_file).await?;
         let key = if tls.key_file.extension() == Some("der") {
-            rustls::PrivateKey(key)
+            rustls::pki_types::PrivateKeyDer::try_from(key_data).map_err(|e| eyre::eyre!("{e}"))?
         } else {
-            let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
-            match pkcs8.into_iter().next() {
-                Some(x) => rustls::PrivateKey(x),
-                None => {
-                    let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
-                    match rsa.into_iter().next() {
-                        Some(x) => rustls::PrivateKey(x),
-                        None => {
-                            eyre::bail!("no private keys found");
-                        }
-                    }
-                }
-            }
+            rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_data)?
         };
 
         let certs = tokio::fs::read(&tls.cert_file).await?;
         let certs = if tls.cert_file.extension() == Some("der") {
-            vec![rustls::Certificate(certs)]
+            vec![rustls::pki_types::CertificateDer::from(certs)]
         } else {
-            rustls_pemfile::certs(&mut &*certs)?
-                .into_iter()
-                .map(rustls::Certificate)
-                .collect()
+            rustls::pki_types::CertificateDer::pem_slice_iter(&certs)
+                .map(|res| {
+                    res.wrap_err_with(|| format!("failed to read certs from {}", tls.key_file))
+                })
+                .collect::<eyre::Result<Vec<_>>>()?
         };
 
-        let server_crypto = rustls::ServerConfig::builder().with_safe_defaults();
+        let server_crypto = rustls::ServerConfig::builder();
 
         let server_crypto = if tls.client.is_some() {
-            let ca_file = match &tls.ca_file {
-                None => {
-                    eyre::bail!(
-                        "ca_file required in tls config for server client cert auth verification"
-                    );
-                }
-                Some(ca_file) => ca_file,
-            };
+            let ca_file = tls.ca_file.as_ref().context(
+                "ca_file required in tls config for server client cert auth verification",
+            )?;
 
             let ca_certs = tokio::fs::read(&ca_file).await?;
-            let ca_certs = if ca_file.extension() == Some("der") {
-                vec![rustls::Certificate(ca_certs)]
-            } else {
-                rustls_pemfile::certs(&mut &*ca_certs)?
-                    .into_iter()
-                    .map(rustls::Certificate)
-                    .collect()
-            };
 
             let mut root_store = rustls::RootCertStore::empty();
 
-            for cert in ca_certs {
-                root_store.add(&cert)?;
+            if ca_file.extension() == Some("der") {
+                root_store.add(rustls::pki_types::CertificateDer::from_slice(&ca_certs))?;
+            } else {
+                for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&ca_certs) {
+                    root_store.add(
+                        cert.wrap_err_with(|| format!("failed to read certs from {ca_file}"))?,
+                    )?;
+                }
             }
 
-            server_crypto.with_client_cert_verifier(Arc::new(
-                rustls::server::AllowAnyAuthenticatedClient::new(root_store),
-            ))
+            server_crypto.with_client_cert_verifier(
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store)).build()?,
+            )
         } else {
             server_crypto.with_no_client_auth()
         };
 
-        quinn::ServerConfig::with_crypto(Arc::new(server_crypto.with_single_cert(certs, key)?))
+        quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(
+                server_crypto.with_single_cert(certs, key)?,
+            )?,
+        ))
     };
 
     let transport_config = build_quinn_transport_config(config);
@@ -234,33 +222,6 @@ pub async fn gossip_server_endpoint(config: &GossipConfig) -> eyre::Result<quinn
     Ok(quinn::Endpoint::server(server_config, config.bind_addr)?)
 }
 
-fn client_cert_auth(
-    config: &TlsClientConfig,
-) -> eyre::Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
-    let mut cert_file = std::io::BufReader::new(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .open(&config.cert_file)?,
-    );
-    let certs = rustls_pemfile::certs(&mut cert_file)?
-        .into_iter()
-        .map(rustls::Certificate)
-        .collect();
-
-    let mut key_file = std::io::BufReader::new(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .open(&config.key_file)?,
-    );
-    let key = rustls_pemfile::pkcs8_private_keys(&mut key_file)?
-        .into_iter()
-        .map(rustls::PrivateKey)
-        .next()
-        .ok_or_else(|| eyre::eyre!("could not find client tls key"))?;
-
-    Ok((certs, key))
-}
-
 async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn::ClientConfig> {
     let mut client_config = if config.plaintext {
         quinn_plaintext::client_config()
@@ -270,50 +231,64 @@ async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn:
             .as_ref()
             .ok_or_else(|| eyre::eyre!("tls config required"))?;
 
-        let client_crypto = rustls::ClientConfig::builder().with_safe_defaults();
+        let client_crypto = rustls::ClientConfig::builder();
 
         let client_crypto = if let Some(ca_file) = &tls.ca_file {
-            let ca_certs = tokio::fs::read(&ca_file).await?;
-            let ca_certs = if ca_file.extension() == Some("der") {
-                vec![rustls::Certificate(ca_certs)]
-            } else {
-                rustls_pemfile::certs(&mut &*ca_certs)?
-                    .into_iter()
-                    .map(rustls::Certificate)
-                    .collect()
-            };
-
             let mut root_store = rustls::RootCertStore::empty();
-
-            for cert in ca_certs {
-                root_store.add(&cert)?;
-            }
-
-            let client_crypto = client_crypto.with_root_certificates(root_store);
-
-            if let Some(client_config) = &tls.client {
-                let (certs, key) = client_cert_auth(client_config)?;
-                client_crypto.with_client_auth_cert(certs, key)?
+            let ca_certs = tokio::fs::read(&ca_file).await?;
+            if ca_file.extension() == Some("der") {
+                root_store.add(rustls::pki_types::CertificateDer::from_slice(&ca_certs))?;
             } else {
-                client_crypto.with_no_client_auth()
+                for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&ca_certs) {
+                    root_store.add(
+                        cert.wrap_err_with(|| format!("failed to read certs from {ca_file}"))?,
+                    )?;
+                }
             }
+
+            client_crypto.with_root_certificates(root_store)
         } else {
             if !tls.insecure {
                 eyre::bail!(
                     "insecure setting needs to be explicitly true if no ca_file is provided"
                 );
             }
-            let client_crypto =
-                client_crypto.with_custom_certificate_verifier(SkipServerVerification::new());
-            if let Some(client_config) = &tls.client {
-                let (certs, key) = client_cert_auth(client_config)?;
-                client_crypto.with_client_auth_cert(certs, key)?
-            } else {
-                client_crypto.with_no_client_auth()
-            }
+
+            client_crypto
+                .dangerous()
+                .with_custom_certificate_verifier(SkipServerVerification::new(
+                    rustls::crypto::CryptoProvider::get_default()
+                        .context("crypto not configured correctly")?
+                        .clone(),
+                ))
         };
 
-        quinn::ClientConfig::new(Arc::new(client_crypto))
+        let client_crypto = if let Some(config) = &tls.client {
+            let certs = rustls::pki_types::CertificateDer::pem_reader_iter(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&config.cert_file)?,
+            );
+            let certs = certs
+                .map(|res| {
+                    res.wrap_err_with(|| format!("failed to read cert from {}", config.cert_file))
+                })
+                .collect::<eyre::Result<Vec<_>>>()?;
+
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_reader(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&config.key_file)?,
+            )?;
+
+            client_crypto.with_client_auth_cert(certs, key)?
+        } else {
+            client_crypto.with_no_client_auth()
+        };
+
+        quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(
+            client_crypto,
+        )?))
     };
 
     let mut transport_config = build_quinn_transport_config(config);
@@ -339,25 +314,57 @@ pub async fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn
 
 /// Dummy certificate verifier that treats any certificate as valid.
 /// NOTE, such verification is vulnerable to MITM attacks, but convenient for testing.
-struct SkipServerVerification;
+#[derive(Debug)]
+struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
 impl SkipServerVerification {
-    fn new() -> Arc<Self> {
-        Arc::new(Self)
+    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Arc<Self> {
+        Arc::new(Self(provider))
     }
 }
 
-impl rustls::client::ServerCertVerifier for SkipServerVerification {
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 
@@ -1304,9 +1311,12 @@ pub async fn parallel_sync(
                 }
 
                 if needs.is_empty() {
-                    if let Err(e) = tx.finish().instrument(info_span!("quic_finish")).await {
+                    if let Err(e) = tx.finish() {
                         warn!("could not finish stream while sending sync requests: {e}");
+                    } else if let Err(e) = tx.stopped().instrument(info_span!("quic_stopped")).await {
+                        warn!("could not wait for stream stopped while sending sync requests: {e}");
                     }
+
                     debug!(%server_actor_id, %addr, "done trying to sync w/ actor after {:?}", start.elapsed());
                     continue;
                 }
@@ -1537,9 +1547,12 @@ pub async fn serve_sync(
 
                     stopped_res = write.stopped() => {
                         match stopped_res {
-                            Ok(code) => {
+                            Ok(Some(code)) => {
                                 debug!(actor_id = %their_actor_id, "send stream was stopped by peer, code: {code}");
                             },
+                            Ok(None) => {
+                                debug!(actor_id = %their_actor_id, "send stream was stopped by us");
+                            }
                             Err(e) => {
                                 warn!(actor_id = %their_actor_id, "error waiting for stop from stream: {e}");
                             }
@@ -1577,8 +1590,10 @@ pub async fn serve_sync(
                     write_buf(&mut send_buf, &mut write).await.map_err(SyncSendError::from)?;
                 }
 
-                if let Err(e) = write.finish().await {
+                if let Err(e) = write.finish() {
                     warn!("could not properly finish QUIC send stream: {e}");
+                } else if let Err(e) = write.stopped().await {
+                    warn!("could not properly wait for QUIC send stream to stop: {e}");
                 }
             }
 
@@ -1660,7 +1675,7 @@ mod tests {
     use corro_types::{
         api::{ColumnName, TableName},
         broadcast::ChangesetPerTable,
-        config::{Config, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
+        config::{Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
@@ -2442,15 +2457,12 @@ mod tests {
         let client_conn_peer_id = client_conn
             .peer_identity()
             .unwrap()
-            .downcast::<Vec<rustls::Certificate>>()
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'_>>>()
             .unwrap();
 
-        let mut server_cert_signed_buf =
-            std::io::Cursor::new(server_cert_signed.as_bytes().to_vec());
-
         assert_eq!(
-            client_conn_peer_id[0].0,
-            rustls_pemfile::certs(&mut server_cert_signed_buf)?[0]
+            client_conn_peer_id[0],
+            rustls::pki_types::CertificateDer::from_pem_slice(server_cert_signed.as_bytes())?,
         );
 
         let server_conn = res.1;
@@ -2458,15 +2470,12 @@ mod tests {
         let server_conn_peer_id = server_conn
             .peer_identity()
             .unwrap()
-            .downcast::<Vec<rustls::Certificate>>()
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'_>>>()
             .unwrap();
 
-        let mut client_cert_signed_buf =
-            std::io::Cursor::new(client_cert_signed.as_bytes().to_vec());
-
         assert_eq!(
-            server_conn_peer_id[0].0,
-            rustls_pemfile::certs(&mut client_cert_signed_buf)?[0]
+            server_conn_peer_id[0],
+            rustls::pki_types::CertificateDer::from_pem_slice(client_cert_signed.as_bytes())?,
         );
 
         Ok(())

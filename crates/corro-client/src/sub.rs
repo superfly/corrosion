@@ -10,7 +10,6 @@ use std::{
 use bytes::{Buf, Bytes, BytesMut};
 use corro_api_types::{ChangeId, QueryEvent, TypedNotifyEvent, TypedQueryEvent};
 use futures::{ready, Future, Stream};
-use hyper::{client::HttpConnector, Body};
 use pin_project_lite::pin_project;
 use serde::de::DeserializeOwned;
 use tokio::time::{sleep, Sleep};
@@ -24,7 +23,7 @@ use uuid::Uuid;
 pin_project! {
     pub struct IoBodyStream {
         #[pin]
-        body: Body
+        body: reqwest::Body
     }
 }
 
@@ -32,10 +31,14 @@ impl Stream for IoBodyStream {
     type Item = io::Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use http_body::Body;
         let this = self.project();
-        let res = ready!(this.body.poll_next(cx));
+        let res = ready!(this.body.poll_frame(cx));
         match res {
-            Some(Ok(b)) => Poll::Ready(Some(Ok(b))),
+            Some(Ok(b)) => Poll::Ready(Some(
+                b.into_data()
+                    .map_err(|_| io::Error::other("not a data frame")),
+            )),
             Some(Err(e)) => {
                 let io_err = match e
                     .source()
@@ -53,18 +56,20 @@ impl Stream for IoBodyStream {
 
 type IoBodyStreamReader = StreamReader<IoBodyStream, Bytes>;
 type FramedBody = FramedRead<IoBodyStreamReader, LinesBytesCodec>;
+type ResponseFuture =
+    Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>> + Unpin + Send + Sync>;
 
 pub struct SubscriptionStream<T> {
     id: Uuid,
     hash: Option<String>,
-    client: hyper::Client<HttpConnector, Body>,
+    client: reqwest::Client,
     api_addr: SocketAddr,
     observed_eoq: bool,
     last_change_id: Option<ChangeId>,
     stream: Option<FramedBody>,
     backoff: Option<Pin<Box<Sleep>>>,
     backoff_count: u32,
-    response: Option<hyper::client::ResponseFuture>,
+    response: Option<ResponseFuture>,
     _deser: std::marker::PhantomData<T>,
 }
 
@@ -93,9 +98,9 @@ where
     pub fn new(
         id: Uuid,
         hash: Option<String>,
-        client: hyper::Client<HttpConnector, Body>,
+        client: reqwest::Client,
         api_addr: SocketAddr,
-        body: hyper::Body,
+        body: reqwest::Body,
         change_id: Option<ChangeId>,
     ) -> Self {
         Self {
@@ -225,9 +230,7 @@ where
 
                 return match res {
                     Ok(res) => Poll::Ready(Ok(FramedRead::new(
-                        StreamReader::new(IoBodyStream {
-                            body: res.into_body(),
-                        }),
+                        StreamReader::new(IoBodyStream { body: res.into() }),
                         LinesBytesCodec::default(),
                     ))),
                     Err(e) => {
@@ -242,19 +245,18 @@ where
                     }
                 };
             } else if self.observed_eoq {
-                let req = hyper::Request::builder()
-                    .method(hyper::Method::GET)
-                    .uri(format!(
+                let response = self
+                    .client
+                    .get(format!(
                         "http://{}/v1/subscriptions/{}?from={}",
                         self.api_addr,
                         self.id,
                         self.last_change_id.unwrap_or_default()
                     ))
-                    .header(hyper::header::ACCEPT, "application/json")
-                    .body(hyper::Body::empty())?;
+                    .header(http::header::ACCEPT, "application/json")
+                    .send();
 
-                let response = self.client.request(req);
-                self.response = Some(response);
+                self.response = Some(Box::new(response));
                 // loop around!
             } else {
                 return Poll::Ready(Err(SubscriptionError::UnfinishedQuery));
@@ -327,7 +329,7 @@ impl<T> UpdatesStream<T>
 where
     T: DeserializeOwned + Unpin,
 {
-    pub fn new(id: Uuid, body: hyper::Body) -> Self {
+    pub fn new(id: Uuid, body: reqwest::Body) -> Self {
         Self {
             id,
             stream: FramedRead::new(
@@ -386,7 +388,7 @@ impl<T> QueryStream<T>
 where
     T: DeserializeOwned + Unpin,
 {
-    pub fn new(body: hyper::Body) -> Self {
+    pub fn new(body: reqwest::Body) -> Self {
         Self {
             stream: FramedRead::new(
                 StreamReader::new(IoBodyStream { body }),
