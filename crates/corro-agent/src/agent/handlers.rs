@@ -732,7 +732,7 @@ pub async fn handle_changes(
                         if let Some(seqs) = dropped_change.seqs().cloned() {
                             entry.get_mut().remove(seqs);
                         } else {
-                            entry.remove_entry();
+                            entry.swap_remove_entry();
                         }
                     };
                 }

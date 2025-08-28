@@ -337,7 +337,7 @@ pub fn apply_schema(
 
                 let parsed_table = parse_sql(&sql)?
                     .tables
-                    .remove(name)
+                    .shift_remove(name)
                     .ok_or_else(|| ApplySchemaError::ImportedSchemaNotFound(name.clone()))?;
 
                 if parsed_table.pk != table.pk {
